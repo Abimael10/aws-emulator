@@ -25,6 +25,8 @@ mod batch_write_failure_count;
 mod batch_write_validation;
 #[path = "all/capacity_mode.rs"]
 mod capacity_mode;
+#[path = "all/cbor_representation.rs"]
+mod cbor_representation;
 #[path = "all/channel_configuration_updates.rs"]
 mod channel_configuration_updates;
 #[path = "all/channel_cursor_refusal.rs"]

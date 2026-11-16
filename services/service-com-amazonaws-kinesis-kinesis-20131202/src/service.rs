@@ -89,9 +89,32 @@
 //! [`Service::override_refusal`] below, which is the same module and therefore the same
 //! sentence — and it asks the authorization gate itself, through
 //! [`authorization_refusal`], for the same reason.
+//!
+//! ## This service's fourth edited seam: the ENCODING a request asked for
+//!
+//! `awsJson1_1` is a body-only RPC protocol, and which ENCODING the body is in is the
+//! caller's choice, stated in `Content-Type`: `application/x-amz-json-1.1` carries the
+//! input's members as JSON and `application/x-amz-cbor-1.1` carries the same members as
+//! CBOR. The framework selects a codec per request from the protocols the MODEL declares,
+//! and a model declares a protocol rather than an encoding of one, so every request was
+//! handed to the JSON codec whatever it asked for. [`cbor`] serves the second encoding —
+//! the framework's own CBOR codec, through the framework's own RPC protocol and its own
+//! per-request sequence, so an operation behaves identically in the two — and every answer,
+//! a success, a modelled error and a refusal alike, is encoded as the request was
+//! ([`answered_before_the_handler`], [`StatedPerOperation::run`]).
+//!
+//! ## This service's fifth edited seam: a value no member could be read from
+//!
+//! A body value the modelled member it is bound to cannot be read from never becomes a
+//! value, so no constraint on it is ever reached: it is a SERIALIZATION fault and a
+//! different error class from a constraint refusal, which is what a client branches on.
+//! [`unreadable_values`] answers that class — in the encoding the request arrived in — ahead
+//! of the constraint walk above, because that is the order the two layers run in.
 
 mod authorization;
+mod cbor;
 mod submitted_batch;
+mod unreadable_values;
 mod validation;
 
 /// This service's authorization gate, as the one hand-authored operation asks it: every other
@@ -102,10 +125,12 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse}
 use aws_smithy_schema_server::ProtocolError;
 use service_common::event_stream::EventStreamRoute;
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
-    Refused, ServerHttpProtocol, Service, Violation,
+    http, BoxFuture, ErasedOperation, ErasedServiceDefinition, Operation, OperationContext,
+    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation,
 };
 use std::sync::Arc;
+
+use unreadable_values::Wire;
 
 /// The `com-amazonaws-kinesis-kinesis-20131202` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -113,7 +138,10 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The one generated definition of this service, held behind an [`Arc`] because the view
+    /// of it that serves the CBOR representation ([`cbor::ServedInCbor`]) is the SAME
+    /// definition — one identity, one routing table, one set of model-derived facts.
+    entry: Arc<crate::ServiceDefinition<Eng>>,
     /// The same operations the generated table holds, each wrapped in
     /// [`authorization::Authorized`] (IAM decides the call) inside [`StatedPerOperation`] (a
     /// refused request is worded the way this service words it). Keyed by the routing key the
@@ -138,14 +166,17 @@ const SUBSCRIBE_TO_SHARD_OPERATION: &str = "SubscribeToShard";
 /// name — the routing key `ServerHttpProtocol::routing_key` resolves and the generated table
 /// is keyed by.
 macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+    ($table:expr, $engine:expr, $in_cbor:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(StatedPerOperation::new(authorization::Authorized::new(
-                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                    ::std::sync::Arc::clone(&$engine),
-                ))) as ::std::boxed::Box<dyn ErasedOperation>,
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    authorization::Authorized::new(
+                        crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                        ::std::sync::Arc::clone(&$engine),
+                    ),
+                    ::std::sync::Arc::clone(&$in_cbor),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
     };
@@ -156,6 +187,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let entry = Arc::new(crate::ServiceDefinition::new(Arc::clone(&engine)));
+        // The same service, as the framework's per-request sequence reads it for a request
+        // in the CBOR representation of this service's protocol: type-erased, so an
+        // operation wrapper names no engine.
+        let in_cbor: Arc<dyn Service> = Arc::new(cbor::ServedInCbor::new(Arc::clone(&entry)));
         let mut stated = OperationRoutingTable::new();
         // EVERY operation this crate serves (one per file in `src/ops/`), because the rule is
         // the service's and not one operation's: an operation whose input declares no
@@ -166,6 +202,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         wrap_operations!(
             stated,
             engine,
+            in_cbor,
             add_tags_to_stream::AddTagsToStream,
             create_channel::CreateChannel,
             create_stream::CreateStream,
@@ -212,7 +249,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_stream_warm_throughput::UpdateStreamWarmThroughput,
         );
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            entry,
             stated,
             subscribe_to_shard: EventStreamRoute(
                 crate::ops::subscribe_to_shard::SubscribeToShard::new(Arc::clone(&engine)),
@@ -236,12 +273,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// seam this re-read exists only until.
 struct StatedPerOperation<O> {
     operation: O,
+    /// This service as the framework's per-request sequence reads it for a request in the
+    /// CBOR representation of its protocol ([`cbor::ServedInCbor`]), type-erased so this
+    /// wrapper names no engine. Held here because the framework's codec seam is per SERVICE
+    /// rather than per request, so the encoding a request asked for is served by running it
+    /// against this view of the same service.
+    in_cbor: Arc<dyn Service>,
 }
 
 impl<O> StatedPerOperation<O> {
     /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+    fn new(operation: O, in_cbor: Arc<dyn Service>) -> Self {
+        Self { operation, in_cbor }
     }
 }
 
@@ -293,6 +336,40 @@ fn stated_refusal<O: Operation>(
     Some((violations, stated))
 }
 
+/// This service's whole answer to `req` BEFORE the handler runs, for the operation `O` it
+/// was routed to, in the encoding `wire` names — or `None` when nothing refuses it and the
+/// operation is to serve it.
+///
+/// The two refusals are different error CLASSES and happen in this order, which is the order
+/// the two layers run in: a value the body could not be read from never becomes a value, so
+/// no constraint on it is ever reached ([`unreadable_values`]); only a body that WAS read has
+/// constraints to break ([`stated_refusal`]). Both are answered in the encoding the request
+/// arrived in, so a client reads its own refusal.
+///
+/// It takes the definition rather than the service because `&dyn ErasedServiceDefinition` is
+/// not `Sync`: the whole answer is computed in one statement, so nothing non-`Sync` is held
+/// across the await in [`StatedPerOperation::run`].
+fn answered_before_the_handler<O: Operation>(
+    definition: &dyn ErasedServiceDefinition,
+    wire: Wire,
+    req: &RtRequest,
+) -> Option<RtResponse> {
+    let protocol: &dyn ServerHttpProtocol = match wire {
+        Wire::Cbor => cbor::protocol(),
+        Wire::Json => definition.protocol(),
+    };
+    if let Some(answer) = unreadable_values::refusal_for::<O>(protocol, wire, req) {
+        return Some(answer);
+    }
+    let (violations, stated) = stated_refusal::<O>(protocol, req)?;
+    Some(match wire {
+        Wire::Cbor => cbor::refusal_response(violations, stated),
+        Wire::Json => {
+            definition.refusal_response(ProtocolError::Invalid(violations), Some(stated), req)
+        }
+    })
+}
+
 impl<O> ErasedOperation for StatedPerOperation<O>
 where
     O: Operation + ErasedOperation,
@@ -304,16 +381,24 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // The definition is read, used and dropped inside each statement:
+            // The encoding of this service's protocol the caller asked for. Every step of
+            // the request — what refuses it, what reads its body, what its answer is encoded
+            // as — is that one encoding.
+            let wire = Wire::of(req);
+            // The definition is read, used and dropped inside this one statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
             // below would make this future non-`Send`.
-            let refused = stated_refusal::<O>(svc.definition().protocol(), req);
-            if let Some((violations, stated)) = refused {
-                return svc
-                    .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
+            if let Some(answer) = answered_before_the_handler::<O>(svc.definition(), wire, req) {
+                return answer;
             }
-            self.operation.run(svc, req, ctx).await
+            match wire {
+                // The framework's own per-request sequence, read in the encoding the caller
+                // asked for: the operation, its state and its modelled errors are the same.
+                Wire::Cbor => {
+                    cbor::answer::<O>(&self.operation, self.in_cbor.as_ref(), req, ctx).await
+                }
+                Wire::Json => self.operation.run(svc, req, ctx).await,
+            }
         })
     }
 
@@ -329,7 +414,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
-        &self.entry
+        self.entry.as_ref()
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {

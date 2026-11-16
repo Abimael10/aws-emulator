@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: this header, the one inner attribute below
+// it, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
+// `tests/all/`, sorted by name, and no other line.
+//
+// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
+// place its name sorts to. The list holds those pairs and nothing else: no prose between
+// them, no blank line, and nothing at all after the last one — so two branches landing at
+// once insert two lines in two places and have no prose here to duplicate, re-word or
+// mistype. That is what had gone wrong in this file before: re-typed copies of these
+// paragraphs had grown both in the tail of the list and inside this block, and no suite of
+// the target ran.
 // Single integration-test target for the router: this header, the one inner attribute at its
 // end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
 // `tests/all/`, sorted by name, and no other line — no prose between the pairs, no blank line,
@@ -73,19 +84,34 @@
 // pin that shape; `all/appended_prose.rs` keeps what landings had appended here.
 // Single integration-test target for the router: the declaration list, and nothing else.
 //
-// Below this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
-// Single integration-test target for the router: the canonical DECLARATION LIST of every
-// cross-service suite under `tests/all/`, and nothing else.
-// Single integration-test target for the router: a declaration list, and nothing else.
-// Single integration-test target for the router: this header, then one
-// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
-// name, and no other line — no prose between the pairs, no blank line, and nothing after the
-// last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
-// sorts to, so two branches landing at once insert two lines in two places and have no prose
-// to duplicate, re-word or mistype, which is what had gone wrong here: both this header and
-// the tail of the list had grown hundreds of re-typed copies of these paragraphs.
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains; a
+// note about THIS file belongs in `all/appended_notes.rs` and its siblings
+// (`all/appended_header_notes.rs`, `all/appended_notes_tail.rs`, `all/appended_prose.rs`),
+// which keep what earlier landings had appended here and are declared below like any other
+// file.
+//
+// Every comment in this file is an ORDINARY `//` one, this block included: a doc comment of
+// the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
+// copy left among or below the declarations compiles no suite of this target at all rather
+// than failing one test, and with none anywhere in the file there is no such line for a merge
+// to leave there. A suite file no declaration names is compiled nowhere and its tests never
+// run; a name declared twice compiles neither copy; and a suite left at the top level of
+// `tests/` fails the build. Some of the files declared below are shared harnesses or probes
+// rather than suites, and each is declared for that reason.
+//
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it
+// under `tests/`, which the layout check refuses: the `#[path]` above each declaration is
+// what points it into `tests/all/`.
+//
+// The `all/all_rs_*` suites, `all/declaration_roots_*` and
+// `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+//
+// The module headers of the suites this root compiles wrap a paragraph without the
+// indentation `clippy::doc_lazy_continuation` asks of a doc list item, so that lint is
+// allowed for the whole target below; being an inner attribute it is legal only ahead of the
+// first item, which is why it stands with this header.
 // note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // file, which is where the prose earlier landings had left in the list already lives.
 // EVERY comment in this file is an ordinary `//` one, this header included: an inner doc

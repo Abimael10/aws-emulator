@@ -21,6 +21,12 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Reads the top-level members of a request body in the CBOR representation of this service's
+# protocol: the CBOR implementation the framework's own codec is built on, pinned to the same
+# release that codec carries so the two cannot disagree about where one item ends and the next
+# begins (`crate::service::unreadable_values`), and the encoder the CBOR suite builds request
+# bodies with.
+aws-smithy-cbor = "=0.62.2"
 # Encodes the opaque pagination token a truncated shard listing hands back.
 hex = { workspace = true }
 # The hash that places a data record in a shard: "an MD5 hash function is used to map
