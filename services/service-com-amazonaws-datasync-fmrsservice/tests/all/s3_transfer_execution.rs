@@ -1805,7 +1805,7 @@ impl Aws {
 
     /// The object's `Last-Modified`, in the unit a preserved modification time is kept in:
     /// whole seconds since the epoch.
-    async fn object_modified_at(&self, bucket: &str, key: &str, case: &str) -> String {
+    pub(crate) async fn object_modified_at(&self, bucket: &str, key: &str, case: &str) -> String {
         let head = self
             .s3()
             .head_object()
