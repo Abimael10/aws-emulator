@@ -75,14 +75,32 @@ pub fn summary_of<'a>(
         &covering,
         &evaluation.evaluation_mode,
         &evaluation.resource_details,
+        idled_out(evaluation, now),
     );
+    // A running execution has placed the resource nowhere yet; only a terminal one
+    // reports where it stands.
+    let places_the_resource = status != RESOURCE_EVALUATION_STATUS_IN_PROGRESS;
     (
         EvaluationStatus {
             status,
             failure_reason,
         },
-        Some(compliance),
+        places_the_resource.then_some(compliance),
     )
+}
+
+/// Whether the invocation this execution waits for has IDLED OUT as of `now`: the wait
+/// the request itself asked for ([`ResourceEvaluationEntry::evaluation_timeout_seconds`],
+/// `StartResourceEvaluationRequest$EvaluationTimeout`: "The timeout for an Amazon Web
+/// Services resource evaluation operation in seconds") has passed since the execution
+/// started.
+///
+/// The duration is the CALLER's, so it keeps the value the request carried (the documented
+/// default where the request asked for none, applied by
+/// `crate::ops::start_resource_evaluation`) rather than a span this emulator chooses.
+fn idled_out(evaluation: &ResourceEvaluationEntry, now: SystemTime) -> bool {
+    let timeout = Duration::from_secs(u64::try_from(evaluation.evaluation_timeout_seconds).unwrap_or(0));
+    now >= evaluation.started_at + timeout
 }
 
 /// The rules an execution runs: the account's Config rules that evaluate in
@@ -218,9 +236,10 @@ pub fn execution_compliance(results: &[&str], a_covering_rule_is_undecided: bool
 ///   evaluate in this mode, so there was no execution to run and the evaluation
 ///   terminates in the modelled `FAILED` status (recorded behaviour of a bare account);
 /// * a covering rule has no recorded verdict for the resource — its verdict comes from
-///   EXECUTING its implementation (a managed rule's, a custom Lambda's, or a Guard
-///   policy's), which this emulator has no rule engine for, so the execution ends
-///   `FAILED` naming those rules instead of synthesising a verdict;
+///   an on-demand INVOCATION of its implementation (a managed rule's, a custom Lambda's,
+///   or a Guard policy's) that nothing performed — so the execution WAITS for it and is
+///   still `IN_PROGRESS` until the wait the request asked for has passed
+///   (`idled_out`), at which point it terminates `FAILED` for the timeout it ran out of;
 /// * otherwise it SUCCEEDS.
 ///
 /// The compliance it reports is [`execution_compliance`] over the verdicts the
@@ -232,6 +251,7 @@ pub fn execution_outcome(
     covering: &[&ConfigRuleEntry],
     evaluation_mode: &str,
     details: &ResourceDetails,
+    idled_out: bool,
 ) -> (String, Option<String>, String) {
     // A rule holds one result per (resource type, resource id, evaluation mode), so
     // the verdict this execution would have produced is the one recorded for the
@@ -242,20 +262,24 @@ pub fn execution_outcome(
         evaluation_mode.to_string(),
     );
     let mut results = Vec::new();
-    let mut unrunnable = Vec::new();
+    let mut awaited = 0usize;
     for rule in covering {
         match rule.evaluation_results.get(&recorded_for) {
             Some(recorded) => results.push(recorded.compliance_type.as_str()),
-            None => unrunnable.push(rule.name.as_str()),
+            None => awaited += 1,
         }
     }
-    let compliance = execution_compliance(&results, !unrunnable.is_empty()).to_string();
-    if !unrunnable.is_empty() {
-        return (
-            RESOURCE_EVALUATION_STATUS_FAILED.to_string(),
-            Some(unrunnable_rules_failure_reason(&unrunnable)),
-            compliance,
-        );
+    let compliance = execution_compliance(&results, awaited > 0).to_string();
+    if awaited > 0 {
+        let (status, failure_reason) = if idled_out {
+            (
+                RESOURCE_EVALUATION_STATUS_FAILED,
+                Some(EVALUATION_TIMED_OUT_FAILURE_REASON.to_string()),
+            )
+        } else {
+            (RESOURCE_EVALUATION_STATUS_IN_PROGRESS, None)
+        };
+        return (status.to_string(), failure_reason, compliance);
     }
     if !account_evaluates_in_mode {
         return (
@@ -282,16 +306,13 @@ pub fn execution_outcome(
 pub const NO_RULE_CONFIGURATION_FAILURE_REASON: &str =
     "No Config rule is enabled in proactive mode for the given resource type.";
 
-/// Why an execution failed when it had rule implementations to run: this emulator
-/// runs no rule logic, so it says so and names the rules whose verdicts are missing
-/// rather than inventing them.
-fn unrunnable_rules_failure_reason(rules: &[&str]) -> String {
-    format!(
-        "the proactive evaluation could not be completed: this emulator does not execute the \
-         evaluation logic of the Config rule(s) {}, so no verdict was produced for the resource",
-        rules.join(", "),
-    )
-}
+/// Why an execution failed when the invocation its covering rules needed never happened:
+/// the on-demand evaluation idled out the wait the request asked for
+/// (`StartResourceEvaluationRequest$EvaluationTimeout`).
+///
+/// The sentence Config answers with, verbatim and carrying no part of the request — not
+/// the rules it waited on, not the timeout it ran out of.
+pub const EVALUATION_TIMED_OUT_FAILURE_REASON: &str = "Resource evaluation timed out.";
 
 /// How a request that named a resource evaluation this account does not hold is
 /// refused: a not-found, worded as the recorded refusals of this operation are, with
@@ -473,21 +494,27 @@ mod tests {
                 matched.len()
             );
 
+            // The invocation the covering rules wait for never happened and the wait
+            // the request asked for has passed, so a covering rule's execution is
+            // terminal here.
             let (status, reason, compliance) = execution_outcome(
                 !in_mode.is_empty(),
                 &matched,
                 EVALUATION_MODE_PROACTIVE,
                 &evaluated,
+                true,
             );
             if expected {
                 assert_eq!(
                     status, RESOURCE_EVALUATION_STATUS_FAILED,
-                    "case {case:?}: an execution with rule logic to run cannot succeed, \
-                     got {status}"
+                    "case {case:?}: an execution whose rule was never invoked cannot \
+                     succeed, got {status}"
                 );
-                assert!(
-                    reason.is_some_and(|reason| reason.contains("rule")),
-                    "case {case:?}: a failed execution must say why"
+                assert_eq!(
+                    reason.as_deref(),
+                    Some(EVALUATION_TIMED_OUT_FAILURE_REASON),
+                    "case {case:?}: expected the failure reason Config answers an \
+                     evaluation that idled out with, got {reason:?}"
                 );
                 assert_eq!(
                     compliance, COMPLIANCE_TYPE_INSUFFICIENT_DATA,
@@ -594,7 +621,7 @@ mod tests {
                 &evaluated,
             );
             let (status, _, compliance) =
-                execution_outcome(true, &matched, EVALUATION_MODE_PROACTIVE, &evaluated);
+                execution_outcome(true, &matched, EVALUATION_MODE_PROACTIVE, &evaluated, true);
             assert_eq!(
                 (status.as_str(), compliance.as_str()),
                 (expected_status, expected_compliance),
@@ -647,6 +674,83 @@ mod tests {
                 places_the_resource,
                 "case {case:?}: a running execution reports no compliance, a finished one \
                  does; got {compliance:?}"
+            );
+        }
+    }
+
+    /// An execution whose covering rule was never invoked waits out the timeout the
+    /// REQUEST asked for, and then fails for having timed out.
+    #[test]
+    fn an_uninvoked_execution_waits_out_the_timeout_the_request_asked_for() {
+        let evaluated = details("AWS::S3::Bucket", "bucket-1");
+        let held = rule("rule", &[EVALUATION_MODE_PROACTIVE], None, &[]);
+
+        // Rows differ along the timeout the request carried and how far the clock has
+        // moved past the start: short of the timeout the execution is still running,
+        // from the timeout on it has failed for timing out.
+        let cases: [(&str, i32, Duration, &str); 6] = [
+            (
+                "a one-second timeout, just started",
+                1,
+                EXECUTION_SETTLES_AFTER,
+                RESOURCE_EVALUATION_STATUS_IN_PROGRESS,
+            ),
+            (
+                "a one-second timeout, at the timeout",
+                1,
+                Duration::from_secs(1),
+                RESOURCE_EVALUATION_STATUS_FAILED,
+            ),
+            (
+                "a one-minute timeout, a second in",
+                60,
+                Duration::from_secs(1),
+                RESOURCE_EVALUATION_STATUS_IN_PROGRESS,
+            ),
+            (
+                "a one-minute timeout, one second short of it",
+                60,
+                Duration::from_secs(59),
+                RESOURCE_EVALUATION_STATUS_IN_PROGRESS,
+            ),
+            (
+                "a one-minute timeout, past it",
+                60,
+                Duration::from_secs(61),
+                RESOURCE_EVALUATION_STATUS_FAILED,
+            ),
+            (
+                // The published maximum (`EvaluationTimeout` is @range 0..3600).
+                "the published maximum timeout, an hour in",
+                3600,
+                Duration::from_secs(3600),
+                RESOURCE_EVALUATION_STATUS_FAILED,
+            ),
+        ];
+
+        for (case, timeout, elapsed, expected_status) in cases {
+            let started = ResourceEvaluationEntry {
+                evaluation_timeout_seconds: timeout,
+                ..evaluation(evaluated.clone())
+            };
+            let (status, compliance) =
+                summary_of(&started, [&held].into_iter(), started.started_at + elapsed);
+            assert_eq!(
+                status.status, expected_status,
+                "case {case:?}: expected {expected_status}, got {status:?}"
+            );
+            let expected_reason = (expected_status == RESOURCE_EVALUATION_STATUS_FAILED)
+                .then_some(EVALUATION_TIMED_OUT_FAILURE_REASON);
+            assert_eq!(
+                status.failure_reason.as_deref(),
+                expected_reason,
+                "case {case:?}: expected the failure reason {expected_reason:?}, got {status:?}"
+            );
+            assert_eq!(
+                compliance.is_some(),
+                expected_status == RESOURCE_EVALUATION_STATUS_FAILED,
+                "case {case:?}: only a terminal execution places the resource, got \
+                 {compliance:?}"
             );
         }
     }

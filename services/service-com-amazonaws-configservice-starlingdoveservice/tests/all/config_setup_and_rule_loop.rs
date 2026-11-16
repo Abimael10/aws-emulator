@@ -213,6 +213,49 @@ pub(crate) fn with_verdicts(
     }
 }
 
+/// The `GetResourceEvaluationSummary` of `id`, read until its execution has left
+/// `IN_PROGRESS` or `deadline` has passed.
+///
+/// The move out of `IN_PROGRESS` is owed by the CLOCK — an execution waiting for an
+/// invocation nothing performs runs until the `EvaluationTimeout` its request asked for
+/// has passed — so a suite waiting for it looks again until it has happened rather than
+/// sleeping for a fixed span and reading once. ONE copy, reached by every suite that waits
+/// for a terminal summary.
+pub(crate) async fn settled_evaluation_summary(
+    emulator: &Emulator,
+    case: &str,
+    id: &str,
+    deadline: Duration,
+) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let reported = emulator
+            .ok(
+                "GetResourceEvaluationSummary",
+                &json!({ "ResourceEvaluationId": id }),
+            )
+            .await;
+        if reported["EvaluationStatus"]["Status"].as_str() != Some(EVALUATION_IN_PROGRESS) {
+            return reported;
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "case {case:?}: the execution never left {EVALUATION_IN_PROGRESS}, last read \
+             {reported}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The `ResourceEvaluationStatus` an execution carries while it is still running, from
+/// `smithy_query(query="shape", shape="ResourceEvaluationStatus")`: `IN_PROGRESS`,
+/// `FAILED`, `SUCCEEDED`.
+pub(crate) const EVALUATION_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// How long [`settled_evaluation_summary`] waits between reads: short enough that a
+/// suite's wait is the condition's own, long enough not to spin.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Put the recorder and the delivery channel every rule case needs.
 pub(crate) async fn with_recorder_and_channel(emulator: &Emulator) {
     emulator

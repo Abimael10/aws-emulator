@@ -16,10 +16,10 @@
 //! 3. the terminal status and compliance follow the proactive Config rules the
 //!    account holds: an execution the account configured no proactive rule for ends
 //!    `FAILED` (nothing ran), one whose covering rules all already placed the resource
-//!    SUCCEEDS, one that would have to run a rule's implementation ends `FAILED`
-//!    naming that rule (this emulator has no rule engine), and the compliance is
-//!    `NOT_APPLICABLE` where no rule verdict applies to the resource and
-//!    `INSUFFICIENT_DATA` only where one applies but decided nothing;
+//!    SUCCEEDS, one whose covering rules were never invoked waits out the
+//!    `EvaluationTimeout` the request asked for and then ends `FAILED` for timing out,
+//!    and the compliance is `NOT_APPLICABLE` where no rule verdict applies to the
+//!    resource and `INSUFFICIENT_DATA` only where one applies but decided nothing;
 //!
 //! plus the modelled refusal for an evaluation id this account does not hold.
 //!
@@ -30,7 +30,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config_setup_and_rule_loop::{with_recorder_and_channel, Emulator};
+use crate::config_setup_and_rule_loop::{
+    settled_evaluation_summary, with_recorder_and_channel, Emulator, EVALUATION_IN_PROGRESS,
+};
 
 /// The only `EvaluationMode` `StartResourceEvaluation` runs, from
 /// `smithy_query(query="shape", shape="EvaluationMode")` (`DETECTIVE` is the other
@@ -39,8 +41,10 @@ const PROACTIVE: &str = "PROACTIVE";
 
 /// Every published `ResourceEvaluationStatus` value, from
 /// `smithy_query(query="shape", shape="ResourceEvaluationStatus")`: `IN_PROGRESS`,
-/// `FAILED`, `SUCCEEDED`.
-const IN_PROGRESS: &str = "IN_PROGRESS";
+/// `FAILED`, `SUCCEEDED`. The running one is the harness's
+/// ([`EVALUATION_IN_PROGRESS`]), so the suite that waits for the move out of it and the
+/// one that reads it name the same value.
+const IN_PROGRESS: &str = EVALUATION_IN_PROGRESS;
 /// See [`IN_PROGRESS`].
 const SUCCEEDED: &str = "SUCCEEDED";
 /// See [`IN_PROGRESS`].
@@ -67,6 +71,16 @@ const RESOURCE_EVALUATION_ID_MAX: usize = 128;
 /// rule for: a fixed sentence carrying no part of the request.
 const NO_PROACTIVE_RULE_REASON: &str =
     "No Config rule is enabled in proactive mode for the given resource type.";
+
+/// The `FailureReason` Config answers for an execution whose proactive rules were never
+/// invoked and which idled out the wait the request asked for: the other of the two fixed
+/// sentences, carrying no part of the request either.
+const TIMED_OUT_REASON: &str = "Resource evaluation timed out.";
+
+/// How long this suite is willing to wait for a status the clock owes. Generous: it
+/// bounds a wait that is normally the one-second `EvaluationTimeout` the rows ask for,
+/// so a loaded host does not turn into a failure.
+const SETTLES_WITHIN: Duration = Duration::from_secs(60);
 
 /// One row of the round-trip table.
 struct SummaryCase {
@@ -117,6 +131,15 @@ fn bucket_body() -> Value {
         "EvaluationMode": PROACTIVE,
         "EvaluationTimeout": 0,
     })
+}
+
+/// [`bucket_body`] with the shortest wait a caller can ask the evaluation to run under,
+/// so an execution waiting for an invocation nothing performs reaches its terminal status
+/// within the suite rather than after the documented default of 900 seconds.
+fn bucket_body_waiting(seconds: i64) -> Value {
+    let mut body = bucket_body();
+    body["EvaluationTimeout"] = json!(seconds);
+    body
 }
 
 /// Start an evaluation and return the id it minted, checked against the modelled
@@ -302,13 +325,13 @@ async fn an_execution_reports_in_progress_until_the_clock_owes_it_a_terminal_sta
 }
 
 /// One row of the terminal-outcome table: the rule the account holds when the
-/// execution runs, the status it ends in, what its failure reason must name (nothing
+/// execution runs, the status it ends in, the whole failure reason it carries (nothing
 /// when it did not fail) and where it places the resource.
 struct OutcomeCase {
     name: &'static str,
     rule: Option<Value>,
     terminal_status: &'static str,
-    reason_names: Option<&'static str>,
+    reason: Option<&'static str>,
     compliance: &'static str,
 }
 
@@ -333,14 +356,14 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
             name: "no rules at all",
             rule: None,
             terminal_status: FAILED,
-            reason_names: Some(NO_PROACTIVE_RULE_REASON),
+            reason: Some(NO_PROACTIVE_RULE_REASON),
             compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
             name: "a rule in the default detective mode only",
             rule: Some(rule("detective-only", json!({}))),
             terminal_status: FAILED,
-            reason_names: Some(NO_PROACTIVE_RULE_REASON),
+            reason: Some(NO_PROACTIVE_RULE_REASON),
             compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
@@ -355,7 +378,7 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: SUCCEEDED,
-            reason_names: None,
+            reason: None,
             compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
@@ -371,7 +394,7 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: SUCCEEDED,
-            reason_names: None,
+            reason: None,
             compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
@@ -386,7 +409,7 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: SUCCEEDED,
-            reason_names: None,
+            reason: None,
             compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
@@ -396,7 +419,7 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 json!({ "EvaluationModes": [{ "Mode": PROACTIVE }] }),
             )),
             terminal_status: FAILED,
-            reason_names: Some("proactive-everywhere"),
+            reason: Some(TIMED_OUT_REASON),
             compliance: INSUFFICIENT_DATA,
         },
         OutcomeCase {
@@ -409,7 +432,7 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: FAILED,
-            reason_names: Some("proactive-buckets"),
+            reason: Some(TIMED_OUT_REASON),
             compliance: INSUFFICIENT_DATA,
         },
         OutcomeCase {
@@ -425,7 +448,7 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: FAILED,
-            reason_names: Some("proactive-this-bucket"),
+            reason: Some(TIMED_OUT_REASON),
             compliance: INSUFFICIENT_DATA,
         },
     ];
@@ -439,9 +462,10 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
             emulator.ok("PutConfigRule", rule).await;
         }
 
-        let id = start(&emulator, name, &bucket_body()).await;
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let reported = summary(&emulator, &id).await;
+        // One second is the shortest wait a caller can ask for, and an execution whose
+        // rules nothing invokes runs until that wait has passed.
+        let id = start(&emulator, name, &bucket_body_waiting(1)).await;
+        let reported = settled_evaluation_summary(&emulator, name, &id, SETTLES_WITHIN).await;
 
         let status = &reported["EvaluationStatus"];
         assert_eq!(
@@ -450,22 +474,12 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
             "case {name:?}: expected the execution to end {:?}, got {reported}",
             case.terminal_status
         );
-        match case.reason_names {
-            Some(named) => {
-                let reason = status["FailureReason"].as_str().unwrap_or_else(|| {
-                    panic!("case {name:?}: a failed execution must say why, got {reported}")
-                });
-                assert!(
-                    reason.contains(named),
-                    "case {name:?}: the failure reason must name {named:?}, got {reason:?}"
-                );
-            }
-            None => assert!(
-                status.get("FailureReason").is_none(),
-                "case {name:?}: an execution that did not fail carries no failure \
-                 reason, got {reported}"
-            ),
-        }
+        assert_eq!(
+            status.get("FailureReason").and_then(Value::as_str),
+            case.reason,
+            "case {name:?}: expected the failure reason {:?}, got {reported}",
+            case.reason
+        );
         assert_eq!(
             reported["Compliance"].as_str(),
             Some(case.compliance),

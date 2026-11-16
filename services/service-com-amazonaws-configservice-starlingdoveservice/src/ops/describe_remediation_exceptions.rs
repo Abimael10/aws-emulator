@@ -6,12 +6,16 @@
 //! remediation exception for a set of resources that includes an explanation of an
 //! exception and the time when the exception will be deleted").
 //!
-//! The rules this handler applies: a request naming resource keys reports the exceptions
-//! the rule holds for exactly those resources, and a request naming none reports every
-//! exception the rule holds, paged ("Limit and next token are not applicable if you
-//! request resources in batch. It is only applicable, when you request all resources");
-//! an exception the clock has already taken past its `ExpirationTime` is reported by
-//! neither.
+//! The rules this handler applies: a remediation exception exempts a resource from the
+//! remediation ONE rule's remediation configuration would run ("Config generates a
+//! remediation exception when a problem occurs executing a remediation action to a
+//! specific resource"), so a rule holding no remediation configuration has no exception
+//! list to read at all and the read is refused rather than answered empty; a request
+//! naming resource keys reports the exceptions the rule holds for exactly those
+//! resources, and a request naming none reports every exception the rule holds, paged
+//! ("Limit and next token are not applicable if you request resources in batch. It is
+//! only applicable, when you request all resources"); an exception the clock has already
+//! taken past its `ExpirationTime` is reported by neither.
 //!
 //! ## Shape of an operation
 //!
@@ -238,6 +242,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised before this report says what the rule holds.
         store.expire_remediation_exceptions(now);
 
+        // A remediation exception hangs off the rule's remediation CONFIGURATION — it
+        // exempts a resource from the remediation that configuration would run — so a
+        // rule holding none has no exception list to read: the read is refused, because
+        // an empty list would claim the rule is remediation-enabled and currently holds
+        // no exception. This covers a rule the account does not hold at all, which holds
+        // no remediation configuration either, and it is the same precondition the WRITE
+        // path applies (`crate::ops::put_remediation_exceptions`).
+        if !store
+            .remediation_configurations
+            .contains_key(&input.config_rule_name)
+        {
+            return Err(
+                DescribeRemediationExceptionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(NO_REMEDIATION_CONFIGURATION_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Page over the store's own key ordering, so a token holds the resource key the
         // next page resumes at and survives exceptions added or removed between pages.
         // The key carries the rule first, so one rule's exceptions are a contiguous run
@@ -280,6 +305,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// How Config words `InvalidParameterValueException` for a read of the remediation
+/// exceptions of a rule that holds no remediation configuration.
+///
+/// RECORDED behaviour of this READ: HTTP 400, `InvalidParameterValueException`, and this
+/// one sentence. It is FIXED and carries no part of the request — what is missing is the
+/// remediation configuration the exceptions would hang off, not the rule name the caller
+/// sent, so the refusal names the resource class and nothing of the request. The sibling
+/// WRITE path words its own refusal for the same precondition
+/// (`crate::ops::put_remediation_exceptions`), whose recorded message DOES name the rule,
+/// because that one refuses a write it was asked to place UNDER that rule.
+const NO_REMEDIATION_CONFIGURATION_MESSAGE: &str = "No Remediation Configuration found for exception";
 
 /// The page this report serves a request that asks for no size of its own
 /// (`DescribeRemediationExceptionsRequest$Limit`: "The maximum number of

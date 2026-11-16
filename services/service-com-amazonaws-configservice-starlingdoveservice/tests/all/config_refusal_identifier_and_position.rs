@@ -7,9 +7,9 @@
 //! rules are pinned here, each over a TABLE of inputs rather than one recorded call:
 //!
 //! 1. a command this service cannot read as a Config query is a SYNTAX error, reported at
-//!    the position of the submitted expression where the reading stopped — the first token
-//!    that could not be read as part of a Config query — and nothing else: no prose of
-//!    whatever read the text;
+//!    the position of the submitted expression where the reading stopped — the token the
+//!    reading could not get past, or, for a command cut short, the position one past its
+//!    last character — and nothing else: no prose of whatever read the text;
 //! 2. `GetAggregateResourceConfig` refuses an identifier the aggregator holds no current
 //!    configuration item for with ONE fixed sentence, which quotes none of the four
 //!    members that identifier carries, whatever they are;
@@ -108,35 +108,33 @@ async fn refused_expression(case: &str, emulator: &Emulator, expression: &str) -
 }
 
 #[tokio::test]
-async fn an_unreadable_query_is_a_syntax_error_at_the_token_the_reading_stopped_at() {
+async fn an_unreadable_query_is_a_syntax_error_at_the_position_the_reading_stopped_at() {
     let emulator = Emulator::new();
 
-    // Rows differ along what makes the command unreadable — a clause cut short, a clause
-    // the Config query form has no place for, a keyword standing where a property
-    // belongs, a selected item that is no property, a command that is not a SELECT at all
-    // — and along WHERE in the text that happens: the offending token is named per row,
-    // and the column expected is the one that token starts at in the expression the row
-    // sends, so no row carries a position written by hand.
-    let cases: [(&str, &str, &str); 8] = [
+    // A command whose reading stopped AT A TOKEN of it reports that token's position.
+    // Rows differ along what makes the command unreadable — a keyword standing where a
+    // property belongs, a command that opens with something other than a Config query's
+    // own keyword, a clause the Config query form has no place for, an alias — and along
+    // WHERE in the text that happens: the token is named per row and the column expected
+    // is the one that token starts at in the expression the row sends, so no row carries
+    // a position written by hand.
+    let cases: [(&str, &str, &str); 7] = [
         (
-            "a WHERE clause with nothing to compare",
-            "SELECT resourceId WHERE (",
+            "a keyword standing where the first property belongs",
+            "SELECT WHERE",
             "WHERE",
         ),
         (
-            "a WHERE clause cut off after the keyword",
-            "SELECT resourceId WHERE",
-            "WHERE",
+            "a command that is not a SELECT at all",
+            "DELETE resourceId",
+            "DELETE",
         ),
         (
-            "a FROM clause, which a Config query has no place for",
-            "SELECT resourceId FROM aws",
-            "FROM",
-        ),
-        (
-            "a HAVING clause, which a Config query has no place for",
-            "SELECT resourceType GROUP BY resourceType HAVING COUNT(*) > 1",
-            "HAVING",
+            // The recorded case of a stored query whose expression is not the language
+            // at all: the reading stops at the very first token.
+            "text that is no command of the language",
+            "NOT VALID CONFIG SQL ((()",
+            "NOT",
         ),
         (
             "a DISTINCT a Config query has no place for",
@@ -144,9 +142,9 @@ async fn an_unreadable_query_is_a_syntax_error_at_the_token_the_reading_stopped_
             "DISTINCT",
         ),
         (
-            "a keyword standing where the first property belongs",
-            "SELECT WHERE",
-            "WHERE",
+            "a FROM clause, which a Config query has no place for",
+            "SELECT resourceId FROM aws",
+            "FROM",
         ),
         (
             "an alias on a selected property",
@@ -154,9 +152,9 @@ async fn an_unreadable_query_is_a_syntax_error_at_the_token_the_reading_stopped_
             "AS",
         ),
         (
-            "a command that is not a SELECT at all",
-            "DELETE resourceId",
-            "DELETE",
+            "a HAVING clause, which a Config query has no place for",
+            "SELECT resourceType GROUP BY resourceType HAVING COUNT(*) > 1",
+            "HAVING",
         ),
     ];
 
@@ -180,54 +178,47 @@ async fn an_unreadable_query_is_a_syntax_error_at_the_token_the_reading_stopped_
         );
     }
 
-    // The line is counted too, so the same fault reads differently when the command is
-    // written over several lines. Rows differ along which line the reading stops on and
-    // the column within it.
-    for (case, expression, line, column) in [
-        (
-            "a clause on the second line",
-            "SELECT resourceId\nWHERE (",
-            2,
-            1,
-        ),
-        (
-            "a clause indented on the second line",
-            "SELECT resourceId\n  FROM aws",
-            2,
-            3,
-        ),
-        (
-            "a clause on the third line",
-            "SELECT resourceId\n\nORDER",
-            3,
-            1,
-        ),
-    ] {
-        let expected = format!("syntax error at line {line}, column {column}");
-        let message = refused_expression(case, &emulator, expression).await;
-        assert_eq!(
-            message, expected,
-            "case {case:?}: expected {expected:?}, got {message:?}"
-        );
-    }
+    // The line is counted too where the reading stops at a token: the same fault reads
+    // differently when the command is written over several lines.
+    let case = "a clause indented on the second line";
+    let message = refused_expression(case, &emulator, "SELECT resourceId\n  FROM aws").await;
+    assert_eq!(
+        message, "syntax error at line 2, column 3",
+        "case {case:?}: expected the position of the clause on the second line, got {message:?}"
+    );
+    let case = "a keyword the reading could not get past, on the third line";
+    let message = refused_expression(case, &emulator, "SELECT resourceId\n\nORDER").await;
+    assert_eq!(
+        message, "syntax error at line 3, column 1",
+        "case {case:?}: expected the position of the keyword on the third line, got {message:?}"
+    );
 
-    // A command that runs out of text stopped where the text ran out: one past its last
-    // character. Rows differ along the length of what was written.
+    // A command CUT SHORT stopped at no token of itself — it needed one more than was
+    // sent — so it is reported where the text ran out: one past its last character. Rows
+    // differ along what was left open (a construct, a clause, a keyword), along the
+    // length of what was written, and along how many lines it was written over, so the
+    // line is counted too.
     for (case, expression) in [
+        ("an unclosed construct", "SELECT ((( invalid"),
+        ("a clause cut off after the keyword", "SELECT resourceId WHERE"),
+        ("a condition left open", "SELECT resourceId WHERE ("),
+        ("a condition with no value", "SELECT resourceId WHERE resourceType ="),
         ("the keyword alone", "SELECT"),
         ("the keyword and a space", "SELECT "),
         ("a second line opened and left empty", "SELECT\n"),
+        ("a clause left open on the second line", "SELECT resourceId\nWHERE ("),
     ] {
         let message = refused_expression(case, &emulator, expression).await;
-        let lines = expression.split('\n').count();
+        let line = expression.split('\n').count();
         let column = expression
             .rsplit('\n')
             .next()
             .map_or(1, |last| last.chars().count() + 1);
-        let expected = format!("syntax error at line {lines}, column {column}");
+        let expected = format!("syntax error at line {line}, column {column}");
         assert_eq!(
             message, expected,
-            "case {case:?}: expected {expected:?}, got {message:?}"
+            "case {case:?}: expected {expression:?} to be reported where its text ran out, \
+             {expected:?}, got {message:?}"
         );
     }
 
@@ -259,7 +250,9 @@ async fn the_same_syntax_error_position_is_reported_wherever_the_language_is_rea
     // command is refused the same way by all three.
     let aggregator = "cross-read";
     let emulator = emulator_with_an_aggregator(aggregator).await;
-    let expression = "SELECT resourceId WHERE (";
+    // Eighteen characters, none of which closes the construct the command opened, so the
+    // reading ran out of text at the nineteenth position.
+    let expression = "SELECT ((( invalid";
     let expected = "syntax error at line 1, column 19";
 
     let selected = refused_expression("the select path", &emulator, expression).await;

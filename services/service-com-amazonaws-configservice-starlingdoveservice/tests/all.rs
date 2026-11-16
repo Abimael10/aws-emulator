@@ -256,3 +256,5 @@ mod recorded_queue_across_every_read_surface;
 mod configuration_item_relationships_are_reported;
 #[path = "all/change_triggered_queue_rule_admission.rs"]
 mod change_triggered_queue_rule_admission;
+#[path = "all/submitted_list_and_exception_read_refusals.rs"]
+mod submitted_list_and_exception_read_refusals;

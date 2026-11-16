@@ -35,7 +35,9 @@ use service_com_amazonaws_configservice_starlingdoveservice::state::{
     service_state, EvaluationResultEntry,
 };
 
-use crate::config_setup_and_rule_loop::{with_recorder_and_channel, Emulator};
+use crate::config_setup_and_rule_loop::{
+    settled_evaluation_summary, with_recorder_and_channel, Emulator,
+};
 
 /// The published `EvaluationMode` values, from
 /// `smithy_query(query="shape", shape="EvaluationMode")`: `DETECTIVE`, `PROACTIVE`.
@@ -45,7 +47,9 @@ const PROACTIVE: &str = "PROACTIVE";
 
 /// The published `ResourceEvaluationStatus` values, from
 /// `smithy_query(query="shape", shape="ResourceEvaluationStatus")`: `IN_PROGRESS`,
-/// `FAILED`, `SUCCEEDED`.
+/// `FAILED`, `SUCCEEDED`. The running one is the harness's own
+/// (`config_setup_and_rule_loop::EVALUATION_IN_PROGRESS`), where the wait for the move out
+/// of it lives, so no suite spells it twice.
 const SUCCEEDED: &str = "SUCCEEDED";
 /// See [`SUCCEEDED`].
 const FAILED: &str = "FAILED";
@@ -68,9 +72,10 @@ const RESOURCE_ID: &str = "surface-bucket";
 /// A resource type no rule of these cases is scoped to.
 const OTHER_RESOURCE_TYPE: &str = "AWS::DynamoDB::Table";
 
-/// Longer than `EXECUTION_SETTLES_AFTER`, the span after which the clock owes a
-/// started execution its terminal status.
-const PAST_THE_SETTLING_SPAN: Duration = Duration::from_millis(700);
+/// How long this suite is willing to wait for a status the clock owes. Generous: the
+/// wait it bounds is normally the one-second `EvaluationTimeout` every row asks for, so
+/// a loaded host does not turn into a failure.
+const SETTLES_WITHIN: Duration = Duration::from_secs(60);
 
 /// One Config rule a row of the terminal-verdict table puts into the account.
 struct RuleRow {
@@ -96,6 +101,11 @@ struct TerminalCase {
 }
 
 /// The `StartResourceEvaluation` body every case uses.
+///
+/// One second is the shortest wait a caller can ask the evaluation to run under
+/// (`EvaluationTimeout` is @range 0..3600, and 0 is the documented default of 900
+/// seconds), and an execution whose rules nothing invokes runs until that wait has
+/// passed — so the rows reach their terminal status inside this suite.
 fn start_body() -> Value {
     json!({
         "EvaluationMode": PROACTIVE,
@@ -104,6 +114,7 @@ fn start_body() -> Value {
             "ResourceType": RESOURCE_TYPE,
             "ResourceConfiguration": json!({ "BucketName": RESOURCE_ID }).to_string(),
         },
+        "EvaluationTimeout": 1,
     })
 }
 
@@ -311,13 +322,7 @@ async fn the_terminal_verdict_follows_the_rules_that_cover_the_resource() {
         }
 
         let id = start(name, &emulator, &start_body()).await;
-        tokio::time::sleep(PAST_THE_SETTLING_SPAN).await;
-        let reported = emulator
-            .ok(
-                "GetResourceEvaluationSummary",
-                &json!({ "ResourceEvaluationId": id }),
-            )
-            .await;
+        let reported = settled_evaluation_summary(&emulator, name, &id, SETTLES_WITHIN).await;
 
         assert_eq!(
             reported["EvaluationStatus"]["Status"].as_str(),

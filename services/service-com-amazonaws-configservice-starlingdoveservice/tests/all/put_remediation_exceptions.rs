@@ -719,10 +719,24 @@ async fn a_rule_with_no_remediation_configuration_takes_no_exception() {
              reported, got {status} {code} {message:?}"
         );
 
+        // The READ applies the same precondition: a rule holding no remediation
+        // configuration has no exception list to report either, so it is refused rather
+        // than answered with an empty list.
+        let (status, parsed) = emulator
+            .call(
+                "DescribeRemediationExceptions",
+                &json!({ "ConfigRuleName": rule }),
+            )
+            .await;
+        let read_code = parsed["__type"]
+            .as_str()
+            .map(|wire| wire.rsplit('#').next().unwrap_or(wire))
+            .unwrap_or("<none>");
         assert_eq!(
-            described(case, &emulator, rule, None).await,
-            Vec::new(),
-            "case {case:?}: a rule with no remediation configuration holds no exception"
+            (status, read_code),
+            (400, "InvalidParameterValueException"),
+            "case {case:?}: a rule with no remediation configuration has no exception list \
+             to read, got {status} {parsed}"
         );
         assert_eq!(
             described(case, &emulator, RULE, None).await,

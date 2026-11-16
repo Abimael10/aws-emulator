@@ -48,7 +48,7 @@ use sqlparser::ast::{
     Select, SelectItem, SetExpr, Statement, UnaryOperator,
 };
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use super::{ComAmazonawsConfigserviceStarlingdoveserviceState, ConfigurationAggregatorEntry};
@@ -688,10 +688,15 @@ impl ExpressionRefusal {
 #[derive(Debug, Clone, Copy)]
 struct Unreadable;
 
-/// Why one reading did not produce a Config query: the command could not be READ as one,
-/// or it was read and breaks a RULE of the query language, which has its own sentence.
+/// Why one reading did not produce a Config query: the command could not be PARSED at
+/// all, so the parser itself says where it stopped; it parsed and could not be read as a
+/// Config query, which only the reader holding the whole command can place; or it was
+/// read and breaks a RULE of the query language, which has its own sentence.
 #[derive(Debug, Clone)]
 enum Unread {
+    /// The parser could not read the command as a SQL command at all, and stopped at
+    /// this position of the submitted expression ([`stopped_parsing_at`]).
+    Unparsed(Position),
     Unreadable,
     BrokenRule(String),
 }
@@ -839,14 +844,104 @@ pub fn read_expression(expression: &str) -> Result<SelectQuery, ExpressionRefusa
     if let Some(stopped_at) = passes_a_bound(expression) {
         return Err(ExpressionRefusal::syntax(stopped_at));
     }
+    // A Config query IS a `SELECT` ("SELECT property [, ...] [ WHERE condition ] …"), so a
+    // command opening with anything else is one whose reading could not begin: it stops at
+    // its very first token, however much of the rest some other command's grammar would
+    // accept.
+    if let Some(stopped_at) = opens_with_another_command(expression) {
+        return Err(ExpressionRefusal::syntax(stopped_at));
+    }
     match read_command(expression) {
         Ok(query) => Ok(query),
         Err(Unread::BrokenRule(message)) => Err(ExpressionRefusal::broken_rule(message)),
-        // A command that could not be read is a syntax error at the position the reading
-        // stopped at, which only a reader holding the WHOLE command can say.
+        // A command the parser could not read at all is a syntax error at the position
+        // the PARSE stopped at, which the parser itself reports.
+        Err(Unread::Unparsed(stopped_at)) => Err(ExpressionRefusal::syntax(stopped_at)),
+        // A command that parses and is still not a Config query is a syntax error at the
+        // position the reading stopped at, which only a reader holding the WHOLE command
+        // can say.
         Err(Unread::Unreadable) => Err(ExpressionRefusal::syntax(stopped_reading_at(expression))),
     }
 }
+
+/// The position of the FIRST token of `expression` when that token does not open a Config
+/// query, and `None` when it does.
+///
+/// A Config query's first token is its `SELECT` keyword, so a command opening with another
+/// one is refused at that token rather than wherever some other grammar stops reading it:
+/// the reading of a Config query never got past its beginning. An expression carrying no
+/// token at all has nothing to begin with, so it stops at the first position of any
+/// expression. Text the tokenizer cannot split into tokens at all yields `None`: the
+/// parser's own failure carries the position it stopped at ([`stopped_parsing_at`]).
+fn opens_with_another_command(expression: &str) -> Option<Position> {
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, expression)
+        .tokenize_with_location()
+        .ok()?;
+    let first = tokens
+        .iter()
+        .find(|token| !matches!(token.token, Token::Whitespace(_)));
+    match first {
+        Some(token) => (!token
+            .token
+            .to_string()
+            .eq_ignore_ascii_case(SELECT_KEYWORD))
+            .then(|| Position::from(token.span.start)),
+        None => Some(Position::START),
+    }
+}
+
+/// Where the PARSE of `expression` stopped, given the failure `error` the parser answered
+/// with.
+///
+/// A parser stops at the token it cannot read as part of the command it was reading, which
+/// is the position Config reports — so the position comes from the parser's own failure
+/// rather than from searching the text: the token it stopped at is the one the failure
+/// carries ([`reported_position`]). A parse that ran OUT OF INPUT stopped at no token of
+/// the expression at all — it needed one more than was sent — so its position is where the
+/// text ran out: one past the last character of the submitted expression, which is the
+/// position a command cut short is reported at.
+fn stopped_parsing_at(expression: &str, error: &ParserError) -> Position {
+    reported_position(&error.to_string()).unwrap_or_else(|| ran_out_at(expression))
+}
+
+/// The position a parser failure names, read off the failure's own rendering of it
+/// (`sqlparser::tokenizer::Location` renders as `" at Line: <line>, Column: <column>"`,
+/// appended to the message), or `None` for a failure that names no token — the parse that
+/// reached the end of the input.
+fn reported_position(failure: &str) -> Option<Position> {
+    let (_, located) = failure.rsplit_once(LOCATION_LINE)?;
+    let (line, column) = located.split_once(LOCATION_COLUMN)?;
+    Some(Position {
+        line: leading_number(line)?,
+        column: leading_number(column)?,
+    })
+}
+
+/// The number `text` opens with, ignoring whatever follows it — so a failure that renders
+/// anything after its position is still read.
+fn leading_number(text: &str) -> Option<u64> {
+    let digits: String = text
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Where the text of `expression` runs out: the position one past its last character,
+/// which is the greatest position the expression has.
+fn ran_out_at(expression: &str) -> Position {
+    expression
+        .chars()
+        .fold(Position::START, |at, character| at.after(character))
+}
+
+/// How a parser failure names the LINE of the position it stopped at.
+const LOCATION_LINE: &str = " at Line: ";
+
+/// How a parser failure names the COLUMN of that position, after [`LOCATION_LINE`].
+const LOCATION_COLUMN: &str = ", Column: ";
 
 /// Read `expression` as a Config query, or say why that reading did not produce one.
 ///
@@ -854,8 +949,8 @@ pub fn read_expression(expression: &str) -> Result<SelectQuery, ExpressionRefusa
 /// of a command is read ([`stopped_reading_at`]), and a prefix of an expression that
 /// passed them passes them too.
 fn read_command(expression: &str) -> Result<SelectQuery, Unread> {
-    let statements =
-        Parser::parse_sql(&GenericDialect {}, expression).map_err(|_| Unread::Unreadable)?;
+    let statements = Parser::parse_sql(&GenericDialect {}, expression)
+        .map_err(|error| Unread::Unparsed(stopped_parsing_at(expression, &error)))?;
     // Exactly one SQL SELECT command, and nothing else.
     let [Statement::Query(query)] = statements.as_slice() else {
         return Err(Unread::Unreadable);
@@ -1694,5 +1789,49 @@ pub fn select_query_info(query: &SelectQuery) -> QueryInfo {
                 .map(|name| FieldInfo { name: Some(name) })
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The position of a failed parse is READ OFF the parser's own failure, so this holds
+    /// the reading ([`reported_position`]) to what the parser actually reports: a failure
+    /// at a token of the command names that token's line and column, and a failure that
+    /// reached the end of the input names none, which is what sends the position to the
+    /// end of the submitted text ([`ran_out_at`]). A parser release that worded its
+    /// failures differently would fail here rather than silently reporting every position
+    /// as the end of the text.
+    #[test]
+    fn the_position_of_a_failed_parse_comes_from_the_parsers_own_failure() {
+        // (case, the command, the position its failure names, if any). Rows differ along
+        // whether the parse stopped AT a token or ran out of input, and along the line and
+        // column that token sits at.
+        type ParseFailureCase = (&'static str, &'static str, Option<(u64, u64)>);
+        let rows: [ParseFailureCase; 5] = [
+            ("a bracket where the next clause belongs", "SELECT resourceId )", Some((1, 19))),
+            (
+                "a bracket where the next clause belongs, on the second line",
+                "SELECT resourceId\n)",
+                Some((2, 1)),
+            ),
+            ("a construct left open", "SELECT ((( invalid", None),
+            ("a clause cut off after its keyword", "SELECT resourceId WHERE", None),
+            ("the keyword alone", "SELECT", None),
+        ];
+
+        for (case, command, expected) in rows {
+            let failure = Parser::parse_sql(&GenericDialect {}, command)
+                .err()
+                .unwrap_or_else(|| panic!("case {case:?}: {command:?} must not parse"));
+            let reported = reported_position(&failure.to_string());
+            assert_eq!(
+                reported.map(|at| (at.line, at.column)),
+                expected,
+                "case {case:?}: expected the failure {:?} to name {expected:?}",
+                failure.to_string()
+            );
+        }
     }
 }

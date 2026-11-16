@@ -84,10 +84,18 @@
 //! alone and never the request they came from, so each modelled operation is served
 //! through [`WithSubmittedValues`], which re-reads the request where the value still
 //! exists ([`MAX_QUOTED_VALUE`] bounds what one clause quotes).
+//!
+//! A clause stated at a LIST member is the same gap with another cause: a `@length` on a
+//! list is checked on the member, before the walk descends into the elements, so the only
+//! rendering the walk has for the rejected value is the collection's SIZE. Config prints
+//! the list itself there, element by element, each element of a list of modelled
+//! structures printed as the object the request was read into
+//! ([`quoting_the_submitted_list`]).
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{path, EnumTrait};
 use aws_smithy_schema_server::ProtocolError;
+use rand::Rng;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable,
     Refusal, Refused, Service, Violation, ViolationKind,
@@ -534,6 +542,211 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     }
 }
 
+/// The package Config's own request objects are printed under, as the recorded clause
+/// about a list of them spells it.
+///
+/// It is the service's internal model package — this service's own Smithy service shape
+/// is `com.amazonaws.configservice#StarlingDoveService` — and it is FIXED text of the
+/// clause rather than anything derived from a request: every element of such a list is
+/// printed under it, with the element shape's own name after it
+/// ([`structure_element_identity`]).
+const SERVICE_OBJECT_PACKAGE: &str = "com.amazonaws.starling.dove";
+
+/// The input list members of this model whose ELEMENT is a modelled structure: the
+/// operation input the member sits on, the member as a clause names it, and the element
+/// shape's OWN schema — so the class name a clause prints is read off the model rather
+/// than typed here, and a shape renamed upstream cannot silently take the rendering with
+/// it.
+///
+/// Keyed on the input as well as the member because one member name covers more than one
+/// element shape in this model (`smithy_query(query="operation",
+/// operation="BatchGetResourceConfig,DeleteRemediationExceptions")`: `resourceKeys`
+/// targets `ResourceKeys` of `ResourceKey` on one and
+/// `RemediationExceptionResourceKeys` of `RemediationExceptionResourceKey` on the other).
+/// Every row is one of the model's own list members declaring a `@length` bound, so each
+/// is a bound a caller can break; the inline test
+/// `every_structure_element_list_names_a_member_of_its_input` holds the member names to
+/// the model's own schemas. A list member NOT listed here keeps the framework's own
+/// rendering, which is the fail-safe direction.
+#[allow(clippy::type_complexity)]
+static STRUCTURE_ELEMENT_LISTS: &[(
+    &::aws_smithy_schema::Schema,
+    &str,
+    &::aws_smithy_schema::Schema,
+)] = &[
+    (
+        crate::ops::types::BATCH_GET_AGGREGATE_RESOURCE_CONFIG_INPUT_SCHEMA,
+        "resourceIdentifiers",
+        &crate::ops::types::AggregateResourceIdentifier::SCHEMA,
+    ),
+    (
+        crate::ops::types::BATCH_GET_RESOURCE_CONFIG_INPUT_SCHEMA,
+        "resourceKeys",
+        &crate::ops::types::ResourceKey::SCHEMA,
+    ),
+    (
+        crate::ops::types::START_REMEDIATION_EXECUTION_INPUT_SCHEMA,
+        "resourceKeys",
+        &crate::ops::types::ResourceKey::SCHEMA,
+    ),
+    (
+        crate::ops::types::DELETE_REMEDIATION_EXCEPTIONS_INPUT_SCHEMA,
+        "resourceKeys",
+        &crate::ops::types::RemediationExceptionResourceKey::SCHEMA,
+    ),
+    (
+        crate::ops::types::DESCRIBE_REMEDIATION_EXCEPTIONS_INPUT_SCHEMA,
+        "resourceKeys",
+        &crate::ops::types::RemediationExceptionResourceKey::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_REMEDIATION_EXCEPTIONS_INPUT_SCHEMA,
+        "resourceKeys",
+        &crate::ops::types::RemediationExceptionResourceKey::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_REMEDIATION_CONFIGURATIONS_INPUT_SCHEMA,
+        "remediationConfigurations",
+        &crate::ops::types::RemediationConfiguration::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_EVALUATIONS_INPUT_SCHEMA,
+        "evaluations",
+        &crate::ops::types::Evaluation::SCHEMA,
+    ),
+    (
+        crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA,
+        "tags",
+        &crate::ops::types::Tag::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_CONFIGURATION_AGGREGATOR_INPUT_SCHEMA,
+        "accountAggregationSources",
+        &crate::ops::types::AccountAggregationSource::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_CONFIGURATION_AGGREGATOR_INPUT_SCHEMA,
+        "tags",
+        &crate::ops::types::Tag::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_CONFORMANCE_PACK_INPUT_SCHEMA,
+        "conformancePackInputParameters",
+        &crate::ops::types::ConformancePackInputParameter::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_CONFORMANCE_PACK_INPUT_SCHEMA,
+        "tags",
+        &crate::ops::types::Tag::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_AGGREGATION_AUTHORIZATION_INPUT_SCHEMA,
+        "tags",
+        &crate::ops::types::Tag::SCHEMA,
+    ),
+    (
+        crate::ops::types::PUT_STORED_QUERY_INPUT_SCHEMA,
+        "tags",
+        &crate::ops::types::Tag::SCHEMA,
+    ),
+];
+
+/// The most elements one clause prints a list over.
+///
+/// A list member of this model admits at most 100 elements
+/// (`smithy_query(query="shape", shape="ResourceIdentifiersList")` and its siblings), and
+/// a value that BREAKS that bound carries more — so a ceiling able to print the refusal of
+/// this model's longest list sits above it. Ten times it, so a list some way past the
+/// bound is still printed whole while one clause can never carry request-sized content: a
+/// MODEL constant rather than a request-sized one. Past it the framework's own count
+/// summary stands, which is the fail-safe direction.
+const MAX_PRINTED_ELEMENTS: usize = 1_000;
+
+/// The element shape of the list member `path` of `input_schema`, when that member is one
+/// of this model's lists of structures ([`STRUCTURE_ELEMENT_LISTS`]).
+fn structure_element_shape(
+    input_schema: &::aws_smithy_schema::Schema,
+    path: &str,
+) -> Option<&'static ::aws_smithy_schema::Schema> {
+    STRUCTURE_ELEMENT_LISTS
+        .iter()
+        .find_map(|(input, member, element)| {
+            (*member == path
+                && input.shape_id().shape_name() == input_schema.shape_id().shape_name())
+            .then_some(*element)
+        })
+}
+
+/// How Config prints ONE element of a list of modelled structures inside a clause: the
+/// element's own class — this service's model package and the shape's name — and the
+/// identity of the object the request was read into.
+///
+/// The identity is drawn, not derived: it is the identity of one object of one request's
+/// reading, so it is a per-run value carrying nothing of the request, and two elements of
+/// one list are two objects. The CLASS is what identifies the value's shape, and it is
+/// read off the model's own schema.
+fn structure_element_identity(element: &::aws_smithy_schema::Schema) -> String {
+    let identity = ::rand::rng().random_range(1..=u32::try_from(i32::MAX).unwrap_or(u32::MAX));
+    format!(
+        "{SERVICE_OBJECT_PACKAGE}.{}@{identity:x}",
+        element.shape_id().shape_name()
+    )
+}
+
+/// `violation` with the value half of its clause replaced by the LIST the caller
+/// submitted, printed element by element, where the validating walk stored its own
+/// summary of the list's size.
+///
+/// A `@length` on a list is checked ON THE MEMBER, before the walk descends into the
+/// elements, so the only rendering the walk has for the rejected value is `<n> items` —
+/// which is not a value any caller sent. Config prints the list itself there, the way a
+/// list prints: `[<element>, <element>, …]`, one entry per submitted element, each element
+/// printed as the object the request was read into
+/// ([`structure_element_identity`]). Only that one clause is touched: a violation whose
+/// stored value is already the caller's own bytes keeps it, as does a list this file cannot
+/// name the element shape of and one longer than [`MAX_PRINTED_ELEMENTS`].
+fn quoting_the_submitted_list(
+    violation: Violation,
+    input_schema: &::aws_smithy_schema::Schema,
+) -> Violation {
+    let printed = printed_list(&violation, input_schema);
+    match printed {
+        Some(value) => Violation {
+            value: Some(value),
+            // The clause states the list the caller submitted, so this value is restored
+            // on purpose rather than one the walk withheld.
+            sensitive: false,
+            ..violation
+        },
+        None => violation,
+    }
+}
+
+/// The list `violation` is about, printed element by element, when it is a length clause
+/// about one of this model's lists of structures.
+fn printed_list(violation: &Violation, input_schema: &::aws_smithy_schema::Schema) -> Option<String> {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    ) {
+        return None;
+    }
+    // The count the walk's own summary states, which is how many elements the request
+    // carried at that member.
+    let elements =
+        ::service_common::validation_message::list_item_count(violation.value.as_deref()?)?;
+    if elements > MAX_PRINTED_ELEMENTS {
+        return None;
+    }
+    let element = structure_element_shape(input_schema, &violation.path)?;
+    let printed: Vec<String> = (0..elements)
+        .map(|_| structure_element_identity(element))
+        .collect();
+    Some(::service_common::validation::rendered_list(
+        &printed.iter().map(String::as_str).collect::<Vec<&str>>(),
+    ))
+}
+
 /// The `com-amazonaws-configservice-starlingdoveservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -756,6 +969,13 @@ impl<Op: Operation> ErasedOperation for WithSubmittedValues<Op> {
                         req,
                         MAX_QUOTED_VALUE,
                     );
+                // A clause stated at a LIST member quotes the list the request carried,
+                // which the walk has no rendering of: it stores the size of the
+                // collection instead ([`quoting_the_submitted_list`]).
+                let violations: Vec<Violation> = violations
+                    .into_iter()
+                    .map(|violation| quoting_the_submitted_list(violation, Op::INPUT_SCHEMA))
+                    .collect();
                 // A violation set this service has no wording for leaves the request to
                 // the layers behind this wrapper, which refuse it in the framework's own
                 // envelope: the fail-safe direction.
@@ -988,6 +1208,174 @@ mod tests {
         }
     }
 
+    /// Every row of [`STRUCTURE_ELEMENT_LISTS`] names a member its operation's input
+    /// really declares, so a member renamed upstream cannot silently take the rendering
+    /// with it.
+    #[test]
+    fn every_structure_element_list_names_a_member_of_its_input() {
+        for (input, member, element) in STRUCTURE_ELEMENT_LISTS {
+            let declared = input.members().iter().any(|declared| {
+                declared
+                    .member_name()
+                    .is_some_and(|name| path::member(name) == *member)
+            });
+            assert!(
+                declared,
+                "case {member:?} of {:?}: the input must declare the member a clause names",
+                input.shape_id().shape_name()
+            );
+            assert!(
+                !element.shape_id().shape_name().is_empty(),
+                "case {member:?}: the element shape must name a class"
+            );
+        }
+    }
+
+    /// A clause stated at a list member quotes the list the request carried, printed
+    /// element by element, and never the walk's own count summary.
+    #[test]
+    fn a_list_clause_prints_the_submitted_list_element_by_element() {
+        // Rows differ along what the rule generalises over: which operation and member
+        // the list sits at (and so which class its elements print as), how many elements
+        // were submitted, and the bound they broke.
+        let rows: [(&str, &'static ::aws_smithy_schema::Schema, &str, ViolationKind, usize, &str); 5] = [
+            (
+                "one past the aggregate batch maximum",
+                crate::ops::types::BATCH_GET_AGGREGATE_RESOURCE_CONFIG_INPUT_SCHEMA,
+                "resourceIdentifiers",
+                ViolationKind::MaxLength(100),
+                101,
+                "AggregateResourceIdentifier",
+            ),
+            (
+                "far past the aggregate batch maximum",
+                crate::ops::types::BATCH_GET_AGGREGATE_RESOURCE_CONFIG_INPUT_SCHEMA,
+                "resourceIdentifiers",
+                ViolationKind::MaxLength(100),
+                250,
+                "AggregateResourceIdentifier",
+            ),
+            (
+                "an empty batch, under the minimum",
+                crate::ops::types::BATCH_GET_RESOURCE_CONFIG_INPUT_SCHEMA,
+                "resourceKeys",
+                ViolationKind::MinLength(1),
+                0,
+                "ResourceKey",
+            ),
+            (
+                "one past the remediation-configuration maximum",
+                crate::ops::types::PUT_REMEDIATION_CONFIGURATIONS_INPUT_SCHEMA,
+                "remediationConfigurations",
+                ViolationKind::MaxLength(25),
+                26,
+                "RemediationConfiguration",
+            ),
+            (
+                "one past the tag maximum",
+                crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA,
+                "tags",
+                ViolationKind::MaxLength(50),
+                51,
+                "Tag",
+            ),
+        ];
+
+        for (case, input, member, kind, submitted, class) in rows {
+            let found = Violation {
+                path: member.to_string(),
+                kind,
+                value: Some(format!("{submitted} items")),
+                sensitive: false,
+            };
+            let stated = quoting_the_submitted_list(found.clone(), input);
+            let value = stated
+                .value
+                .unwrap_or_else(|| panic!("case {case:?}: expected the list to be quoted"));
+            let inside = value
+                .strip_prefix('[')
+                .and_then(|open| open.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("case {case:?}: a list prints in brackets, got {value:?}"));
+            let printed: Vec<&str> = if inside.is_empty() {
+                Vec::new()
+            } else {
+                inside.split(", ").collect()
+            };
+            assert_eq!(
+                printed.len(),
+                submitted,
+                "case {case:?}: expected one entry per submitted element, got {value:?}"
+            );
+            let expected_class = format!("{SERVICE_OBJECT_PACKAGE}.{class}@");
+            for entry in &printed {
+                assert!(
+                    entry.starts_with(&expected_class)
+                        && entry[expected_class.len()..]
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit())
+                        && entry.len() > expected_class.len(),
+                    "case {case:?}: expected each element printed as \
+                     {expected_class}<identity>, got {entry:?}"
+                );
+            }
+        }
+
+        // What keeps the framework's own text: a value that is already the caller's own
+        // bytes, a clause that is not about a length, a member no list of structures
+        // sits at, and a list longer than one clause prints.
+        let kept: [(&str, &'static ::aws_smithy_schema::Schema, Violation); 4] = [
+            (
+                "a scalar value",
+                crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA,
+                Violation {
+                    path: "resourceArn".to_string(),
+                    kind: ViolationKind::MaxLength(1000),
+                    value: Some("arn:aws:config:us-east-1:000000000000:config-rule/r".to_string()),
+                    sensitive: false,
+                },
+            ),
+            (
+                "a clause that is not about a length",
+                crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA,
+                Violation {
+                    path: "tags".to_string(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                    sensitive: false,
+                },
+            ),
+            (
+                "a member no list of structures sits at",
+                crate::ops::types::ASSOCIATE_RESOURCE_TYPES_INPUT_SCHEMA,
+                Violation {
+                    path: "resourceTypes".to_string(),
+                    kind: ViolationKind::MaxLength(100),
+                    value: Some("101 items".to_string()),
+                    sensitive: false,
+                },
+            ),
+            (
+                "a list longer than one clause prints",
+                crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA,
+                Violation {
+                    path: "tags".to_string(),
+                    kind: ViolationKind::MaxLength(50),
+                    value: Some(format!("{} items", MAX_PRINTED_ELEMENTS + 1)),
+                    sensitive: false,
+                },
+            ),
+        ];
+
+        for (case, input, found) in kept {
+            let stated = quoting_the_submitted_list(found.clone(), input);
+            assert_eq!(
+                stated.value, found.value,
+                "case {case:?}: expected the framework's own value to stand, got {:?}",
+                stated.value
+            );
+        }
+    }
+
     /// Every constraint class the framework can report is stated with this service's
     /// subject, path and requirement.
     #[test]
@@ -1064,6 +1452,11 @@ mod tests {
                  constraint: Member must have length less than or equal to 64",
             ),
             (
+                // THE REFUSAL SEAM's rendering: it is handed the violations alone, so
+                // the list a collection clause is about cannot be printed there and the
+                // walk's own summary of its size stands. The clause that quotes the
+                // submitted list is stated where the request is still readable
+                // ([`quoting_the_submitted_list`]).
                 "a length bound on a collection",
                 Violation {
                     path: "tags".to_string(),
