@@ -44,6 +44,16 @@ pub(crate) const SHORT_SETTLE: Duration = Duration::from_millis(50);
 /// Comfortably past [`SHORT_SETTLE`], so that case always observes the transition.
 pub(crate) const PAST_THE_SETTLE: Duration = Duration::from_millis(400);
 
+/// How long a case waits for the CLOCK to run a job before it gives up.
+///
+/// Generous: it is a deadline for a machine under load, not a span anything is expected to
+/// take (a case's own span is the one it pinned, e.g. [`SHORT_SETTLE`]).
+pub(crate) const RUN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one poll of [`Emulator::await_run`] pauses before it looks again. Only how
+/// often the condition is checked, never what a case asserts.
+const RUN_POLL_PAUSE: Duration = Duration::from_millis(20);
+
 /// One emulator: a single shared engine behind the multi-service router, exactly as the
 /// production router assembles it.
 pub(crate) struct Emulator {
@@ -264,6 +274,54 @@ impl Emulator {
 
     pub(crate) async fn create_job(&self, body: Value) -> Reply {
         self.send("POST", "/2017-08-29/jobs", Some(body)).await
+    }
+
+    /// Wait until the CLOCK has run the job `id` to a status nothing further is due from,
+    /// and every move it recorded has left the publication queue.
+    ///
+    /// The condition, not a duration: a job's run is the clock's business (two steps, each
+    /// owed the pinned span after the one before it, materialised by the store's own clock
+    /// pump), so a case that needs a job that has run looks again until the STORE the
+    /// handlers write to says so, or [`RUN_DEADLINE`] passes. The publication queue being
+    /// empty is part of the condition, because the event that reports the last step is
+    /// drained after the step itself is written. Reading the store makes no MediaConvert
+    /// request, so the wait itself cannot be what materialises the run.
+    pub(crate) async fn await_run(&self, case: &str, id: &str) {
+        let started = std::time::Instant::now();
+        loop {
+            let status = self.stored_job_status(id);
+            let ran = status != "SUBMITTED" && status != "PROGRESSING";
+            if ran && self.pending_job_events() == 0 {
+                return;
+            }
+            assert!(
+                started.elapsed() < RUN_DEADLINE,
+                "case {case:?}: the clock never ran the job {id} to a terminal status with \
+                 its moves published; it is {status:?} with {} change(s) still queued",
+                self.pending_job_events()
+            );
+            tokio::time::sleep(RUN_POLL_PAUSE).await;
+        }
+    }
+
+    /// How many job state changes the store has recorded and nothing has published yet.
+    pub(crate) fn pending_job_events(&self) -> usize {
+        self.engine
+            .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
+            .lock()
+            .pending_job_event_count()
+    }
+
+    /// The status the STORE holds for the job `id`, or an empty string when it holds no
+    /// such job.
+    pub(crate) fn stored_job_status(&self, id: &str) -> String {
+        self.engine
+            .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
+            .lock()
+            .jobs
+            .get(id)
+            .map(|job| job.status.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) async fn get_job(&self, id: &str) -> Reply {
@@ -1642,22 +1700,31 @@ async fn queue_job_counts_are_derived_from_the_stored_jobs() {
     }
 }
 
-/// `SUBMITTED` is not a terminal status, so the clock owes a submitted job its exit from
-/// it. Because this emulator has no transcoding engine, the job ends in the service's
-/// own modelled failure status with a reason that says so — and a terminal job can no
-/// longer be cancelled.
+/// `SUBMITTED` is not a terminal status, so the clock owes a submitted job the steps of its
+/// run. Because this emulator has no transcoding engine, the run ends in the service's own
+/// modelled failure status with a reason that says so — and a terminal job can no longer be
+/// cancelled.
 #[tokio::test]
 async fn a_submitted_job_leaves_submitted_once_the_clock_makes_it_due() {
-    // The span the service ships with is non-zero and inside the window the project
+    // The span the service ships with is non-zero and inside the window this project
     // allows for a clock-owed transition, so a caller acting straight after CreateJob
-    // always observes the transient status.
+    // always observes the transient status — and has a window to act inside it.
     let shipped = engine::InMemoryEngine::new()
         .state::<service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState>()
         .lock()
         .job_settles_after;
     assert!(
-        shipped >= Duration::from_millis(250) && shipped <= Duration::from_millis(750),
-        "the shipped settle span must be a non-zero 250-750ms, got {shipped:?}"
+        shipped >= Duration::from_secs(2) && shipped <= Duration::from_secs(5),
+        "the shipped settle span must be a non-zero 2-5s, got {shipped:?}"
+    );
+    // And the WHOLE run a client waits out is two of those steps — out of `SUBMITTED`, then
+    // on to the status the run ends in — so the end-to-end wait is a deliberate value too
+    // and not a by-product of the per-step one.
+    let whole_run = shipped * 2;
+    assert!(
+        whole_run >= Duration::from_secs(4) && whole_run <= Duration::from_secs(10),
+        "the shipped run must reach a terminal status in 4-10s over its two steps, got \
+         {whole_run:?}"
     );
 
     let emulator = Emulator::with_settle_span(SHORT_SETTLE);
@@ -1680,8 +1747,11 @@ async fn a_submitted_job_leaves_submitted_once_the_clock_makes_it_due() {
         created.body
     );
 
-    // The due instant is stored, not slept for by the handler; this suite waits past it.
-    tokio::time::sleep(PAST_THE_SETTLE).await;
+    // The due instants are stored, never slept for by a handler: this case waits for the
+    // CONDITION — the clock having run the job — rather than for a span.
+    emulator
+        .await_run("a submitted job leaves SUBMITTED on the clock", &id)
+        .await;
 
     let settled = emulator.get_job(&id).await;
     assert_eq!(

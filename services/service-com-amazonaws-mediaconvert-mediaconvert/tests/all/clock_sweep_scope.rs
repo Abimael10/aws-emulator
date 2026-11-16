@@ -6,9 +6,11 @@
 //! only when its own request path reads or writes the state that sweep touches — a job's
 //! status or timing, a queue projection's job counts, a jobs query, a share attempt or a
 //! queue hop. A door onto a resource the clock owes nothing (a preset, a job template, a
-//! record's tag set) answers from that resource alone and leaves the job lifecycle
-//! exactly as it found it, and no caller can observe the difference, because every door
-//! onto job state does settle.
+//! record's tag set) answers from that resource alone and writes no job state at all,
+//! whether the job's own due instant is still ahead or already behind it; and no caller can
+//! observe the difference, because the clock materialises what it owes anyway — by the
+//! store's own clock pump as the instant falls due, and by every door onto job state, which
+//! all settle.
 //!
 //! Each case drives the real restJson1 wire path — the router picks the service from the
 //! request's SigV4 scope, the framework deserializes and validates, the handler runs, and
@@ -24,9 +26,7 @@ use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMed
 // The router, the SigV4 scope, the reply decoding, the ARN helper and the request helpers
 // are the crate's ONE test harness, exported by `job_lifecycle`: this suite drives the
 // same wire path through it rather than keeping a second copy of it.
-use super::job_lifecycle::{
-    arn, settings as job_settings, Emulator, PAST_THE_SETTLE, ROLE, SHORT_SETTLE,
-};
+use super::job_lifecycle::{arn, settings as job_settings, Emulator, ROLE, SHORT_SETTLE};
 // One `JobTemplateSettings` fixture for every job-template suite, and one `@httpLabel`
 // encoding for every suite that addresses a resource by ARN.
 use super::job_template_crud::settings as template_settings;
@@ -235,16 +235,25 @@ fn stored_job(emulator: &Emulator, case: &str, id: &str) -> (String, bool) {
     (job.status.clone(), job.settles_at.is_some())
 }
 
-/// A door onto a resource the job-lifecycle clock owes nothing does not drive the sweep:
-/// after the seeded job's exit from `SUBMITTED` has come due, the door answers from its
-/// own resource and the stored job is left `SUBMITTED` with that exit still owed.
+/// A door onto a resource the job-lifecycle clock owes nothing never writes job state: the
+/// job it leaves behind is the job it found, whichever side of its due instant that job
+/// stands on.
+///
+/// The FIRST half is the sweep itself: with the job's exit from `SUBMITTED` not yet due,
+/// the door answers from its own resource and the stored job is left `SUBMITTED` with that
+/// exit still owed. The SECOND half is the same rule past the due instant: the CLOCK
+/// materialises the exit on its own (the store's clock pump, which is what lets this
+/// service publish a job's state change with no further call — see
+/// `job_events_without_a_later_call`), and the door still leaves the terminal record
+/// exactly as it found it. What is asserted is read off the STORE, because what a sweep
+/// moved is a property of the stored job rather than of the body a non-job door returns.
 ///
 /// The table spans the class: the verb (create, read, update, delete, list, tag, untag),
 /// the resource the door is onto (preset, job template, tag set) and — for the tag doors,
 /// which reach a tag set hanging off ANY record — the kind of resource addressed, a
 /// preset and a job in turn.
 #[tokio::test]
-async fn a_door_onto_a_resource_the_clock_owes_nothing_leaves_the_job_sweep_alone() {
+async fn a_door_onto_a_resource_the_clock_owes_nothing_writes_no_job_state() {
     let doors = [
         Door::CreatePreset,
         Door::GetPreset,
@@ -263,13 +272,12 @@ async fn a_door_onto_a_resource_the_clock_owes_nothing_leaves_the_job_sweep_alon
 
     for door in doors {
         let case = format!("{door:?}");
-        // The span is state, so the case pins it instead of racing the real clock.
-        let emulator = Emulator::with_settle_span(SHORT_SETTLE);
+        // Nothing is due while this half runs: the harness's own span holds the job in
+        // `SUBMITTED` for longer than any case takes, so the span is state rather than a
+        // race with the real clock.
+        let emulator = Emulator::new();
         let job_id = seeded_job(&emulator).await;
         seeded_resources(&emulator).await;
-        // Past the span: the job's exit from `SUBMITTED` is now due, so any handler that
-        // drove the sweep would move it.
-        tokio::time::sleep(PAST_THE_SETTLE).await;
 
         let call = door.call(&job_id);
         let reply = emulator.send(call.method, &call.uri, call.body).await;
@@ -287,13 +295,42 @@ async fn a_door_onto_a_resource_the_clock_owes_nothing_leaves_the_job_sweep_alon
         );
         assert!(
             exit_still_owed,
-            "case {case:?}: expected the job's due exit from {JOB_STATUS_SUBMITTED} to be \
+            "case {case:?}: expected the job's exit from {JOB_STATUS_SUBMITTED} to be \
              still owed, got settles_at cleared"
         );
 
-        // And no caller can observe that: the first door onto job state still answers the
-        // status the clock had made due, because every such door settles.
-        let read = emulator.get_job(&job_id).await;
+        // Past the due instants, on a second emulator whose span the clock really reaches:
+        // the clock runs the job — out of `SUBMITTED` and on to the end of the run — with
+        // no request of any kind, which is what this half waits for: the CONDITION, not a
+        // duration.
+        let settling = Emulator::with_settle_span(SHORT_SETTLE);
+        let job_id = seeded_job(&settling).await;
+        seeded_resources(&settling).await;
+        settling.await_run(&case, &job_id).await;
+        let settled = stored_job(&settling, &case, &job_id);
+        assert_eq!(
+            settled,
+            (JOB_STATUS_ERROR.to_string(), false),
+            "case {case:?}: expected the clock's own run to leave the job \
+             {JOB_STATUS_ERROR} owing nothing, got {settled:?}"
+        );
+
+        let call = door.call(&job_id);
+        let reply = settling.send(call.method, &call.uri, call.body).await;
+        assert_eq!(
+            reply.status, call.status,
+            "case {case:?}: expected HTTP {}, got {} with body {}",
+            call.status, reply.status, reply.body
+        );
+        assert_eq!(
+            stored_job(&settling, &case, &job_id),
+            settled,
+            "case {case:?}: the door must leave the settled job exactly as it found it"
+        );
+
+        // And what a caller reads is that same job: the door changed nothing a reader of
+        // job state can see.
+        let read = settling.get_job(&job_id).await;
         assert_eq!(
             read.status, 200,
             "case {case:?}: expected HTTP 200 from GetJob, got {} with body {}",
@@ -309,9 +346,9 @@ async fn a_door_onto_a_resource_the_clock_owes_nothing_leaves_the_job_sweep_alon
     }
 }
 
-/// The other half of the rule: a door whose own response reads job state DOES drive the
-/// sweep, so the change the clock had made due is materialised in the store by the call
-/// itself.
+/// The other half of the rule: a door whose own response reads job state settles the
+/// clock, so the change the clock had made due is materialised in the store — by this call
+/// when nothing has materialised it yet — and the job is left owing nothing further.
 ///
 /// The rows differ in how the door reaches job state: one job by id, the whole job set,
 /// the job set narrowed by a search, and a queue projection whose counts are derived from
@@ -334,7 +371,9 @@ async fn a_door_onto_job_state_drives_the_job_sweep() {
     for (case, uri) in doors {
         let emulator = Emulator::with_settle_span(SHORT_SETTLE);
         let job_id = seeded_job(&emulator).await;
-        tokio::time::sleep(PAST_THE_SETTLE).await;
+        // The CONDITION, not a span: the clock has run the job by the time the door below
+        // is called, so what the door answers from is a job whose run is over.
+        emulator.await_run(case, &job_id).await;
 
         let reply = emulator
             .send("GET", &uri.replace("{id}", &job_id), None)

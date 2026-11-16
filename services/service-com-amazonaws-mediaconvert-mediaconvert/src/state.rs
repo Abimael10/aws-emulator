@@ -110,9 +110,11 @@ use crate::ops::types::{
     OutputGroup, OutputGroupSettings, Policy, Preset, PresetSettings, Queue, QueueTransition,
     ReservationPlan, ReservationPlanSettings, Timing, VideoCodecSettings, VideoDescription,
 };
+mod job_clock;
 mod job_events;
 mod system_catalog;
 mod paging;
+pub use job_clock::*;
 pub use job_events::*;
 pub use paging::*;
 use system_catalog::*;
@@ -505,12 +507,16 @@ pub const MAX_CERTIFICATES: usize = 100;
 /// (an unsigned request to an emulator with authentication switched off).
 const FALLBACK_REGION: &str = "us-east-1";
 
-/// How long after `CreateJob` a job leaves the non-terminal `SUBMITTED` status.
+/// How long after `CreateJob` a job leaves the non-terminal `SUBMITTED` status — and, from
+/// there, how long its run then takes to end.
 ///
-/// A chosen span, not a documented one: real MediaConvert takes as long as the
-/// transcode takes. It is deliberately non-zero so a caller acting immediately after
-/// `CreateJob` still observes `SUBMITTED` and the state errors that go with it.
-const JOB_SETTLES_AFTER: Duration = Duration::from_millis(750);
+/// A chosen span, not a documented one: real MediaConvert takes as long as the transcode
+/// takes. It is deliberately non-zero, and long enough to act inside, so a caller acting
+/// immediately after `CreateJob` still observes `SUBMITTED` and the state errors that go
+/// with it, and one acting while the job runs still observes `PROGRESSING`. A job's run is
+/// two steps ([`ComAmazonawsMediaconvertMediaconvertState::settle_job`]), each owed this
+/// span after the one before it.
+const JOB_SETTLES_AFTER: Duration = Duration::from_secs(3);
 
 /// How long after `StartJobsQuery` a jobs query leaves the non-terminal `SUBMITTED`
 /// status for `COMPLETE`.
@@ -2752,9 +2758,10 @@ pub struct JobRecord {
     pub client_request_token: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub timing: JobTiming,
-    /// When the clock owes this job its exit from `SUBMITTED`; `None` once the job has
-    /// reached a status nothing further is due from, and `None` while the job's queue is
-    /// `PAUSED` and nothing is therefore due at all (see
+    /// When the clock owes this job the next step of its run — its exit from `SUBMITTED`
+    /// for a job that has not begun, and the end of the run for one that has; `None` once
+    /// the job has reached a status nothing further is due from, and `None` while the job's
+    /// queue is `PAUSED` and nothing is therefore due at all (see
     /// [`ComAmazonawsMediaconvertMediaconvertState::settle`]).
     pub settles_at: Option<SystemTime>,
     pub error_message: Option<String>,
@@ -3688,9 +3695,11 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// [`IDEMPOTENCY_WINDOW`]. One entry per stored job at most, so it is bounded by
     /// [`MAX_JOBS`].
     pub idempotency: BTreeMap<String, IdempotencyEntry>,
-    /// The jobs still owed their exit from `SUBMITTED`, ordered by the instant it comes
-    /// due. [`Self::settle`] drains the already-due prefix, which is why settling never
-    /// walks the job set.
+    /// The jobs still owed the next step of their run — the exit from `SUBMITTED` of one
+    /// that has not begun, the end of the run of one that has — ordered by the instant it
+    /// comes due. [`Self::settle`] drains the already-due prefix, which is why settling
+    /// never walks the job set. At most one entry per stored job, because a job is waiting
+    /// for ONE step at a time.
     pending: BTreeSet<(SystemTime, String)>,
     /// The jobs queries still owed their exit from `SUBMITTED`, ordered by the instant it
     /// comes due, drained by [`Self::settle`] exactly as `pending` is.
@@ -3736,6 +3745,15 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// ([`publish_pending`]). At most [`MAX_PENDING_EVENTS`] entries, the oldest dropped
     /// first.
     pending_job_events: VecDeque<JobStateChange>,
+    /// Whether a clock pump holds this store's single claim ([`drive_job_clock`]), so the
+    /// doors that arm the clock start one pump between them and not one per call.
+    clock_pump_running: bool,
+    /// The generation of that claim, so a pump releases its own claim and never a later
+    /// pump's.
+    clock_pump_generation: u64,
+    /// The running pump's task handle, kept so the pump it replaces is aborted rather than
+    /// merely forgotten.
+    clock_pump: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
@@ -3811,6 +3829,11 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             // Nothing has moved yet, so there is nothing to publish: the first transition
             // the clock materialises queues the first change.
             pending_job_events: VecDeque::new(),
+            // No pump until a door leaves the store owing a transition: a fresh store owes
+            // none, so there is nothing for one to wait for.
+            clock_pump_running: false,
+            clock_pump_generation: 0,
+            clock_pump: None,
         }
     }
 }
@@ -3819,7 +3842,8 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
 /// belongs to, so the one ordered walk over the pending indexes applies the right change.
 #[derive(Debug, Clone, Copy)]
 enum Due {
-    /// A job's exit from `SUBMITTED`.
+    /// A job's next step of its run: its exit from `SUBMITTED`, or the end of the run of a
+    /// job already `PROGRESSING`.
     Job,
     /// A jobs query's completion.
     JobsQuery,
@@ -3830,16 +3854,18 @@ enum Due {
 }
 
 impl ComAmazonawsMediaconvertMediaconvertState {
-    /// Materialise every status change the clock had already made due at `now` — a job's
-    /// exit from `SUBMITTED`, a jobs query's completion, a job's share attempt reaching
-    /// `SHARED` and a job's hop to one of its hop destinations.
+    /// Materialise every status change the clock had already made due at `now` — a step of
+    /// a job's run (its exit from `SUBMITTED`, or the end of a run already `PROGRESSING`),
+    /// a jobs query's completion, a job's share attempt reaching `SHARED` and a job's hop
+    /// to one of its hop destinations.
     ///
     /// Bounded by the number of records actually due, not by the size of the store: every
     /// pending index is ordered by due instant, so this drains their already-due prefix,
-    /// oldest first across the four, and stops at the first entry still in the future.
-    /// Each drained entry costs a bounded, constant amount of work — a job's status and
-    /// timing, a query's status flip, a share attempt's status flip or one move of a job
-    /// between two queues — so the cost of
+    /// oldest first across the four, and stops at the first entry still in the future. Each
+    /// drained entry costs a bounded, constant amount of work — a job's status and timing,
+    /// a query's status flip, a share attempt's status flip or one move of a job between
+    /// two queues — and the one entry a step of a run writes in its place is the NEXT step
+    /// of that same run, of which a job has one, so the cost of
     /// one call is the number of records that came due and nothing else; no kind re-reads
     /// the store. It is the only write a reporting operation makes, and every change it
     /// applies was owed at `now` whether or not anybody called.
@@ -3850,6 +3876,14 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// (a preset, a job template, a policy, a record's tag set, the version catalogue)
     /// does not settle: the job lifecycle is not its business, and nothing it reports or
     /// stores could differ either way.
+    ///
+    /// It is also what the store's own clock pump calls ([`drive_job_clock`]), at the
+    /// instants the due instants below name, so a transition — and the EventBridge event
+    /// that reports it — happens with no request waiting on it: this service is an event
+    /// source, and the client that drives work off a job's events makes no further
+    /// MediaConvert call at all. A reader arriving later therefore finds the change already
+    /// materialised rather than materialising it itself, which is the same state either
+    /// way, because every change applied here was owed at the instant it is applied.
     ///
     /// Whether a job may leave `SUBMITTED` at all is its QUEUE's decision, not the
     /// clock's: `QueueStatus` says "If you pause a queue, jobs in that queue won't
@@ -3944,19 +3978,39 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
     }
 
-    /// The exit from `SUBMITTED` the clock owed the job `id` at `due` — if its queue lets
+    /// The next step of its run the clock owed the job `id` at `due` — if its queue lets
     /// the job begin at all.
+    ///
+    /// A job RUNS in two steps, which is what `JobStatus` describes ("a job's status can be
+    /// SUBMITTED, PROGRESSING, COMPLETE, CANCELED, or ERROR") and what `Timing` reports two
+    /// separate instants for ("the time ... that transcoding for the job began" and "the
+    /// time ... that the transcoding job finished"):
+    ///
+    /// 1. it BEGINS — it leaves the backlog of its queue for the transcoder, which is
+    ///    `PROGRESSING`, and that is the instant `Timing$StartTime` carries;
+    /// 2. it ENDS — the run reaches a status nothing further is due from, and that is the
+    ///    instant `Timing$FinishTime` carries.
+    ///
+    /// Each step is owed the same span after the one before it, so a caller reading between
+    /// them observes the job PROGRESSING, exactly as a caller reading before the first
+    /// observes it `SUBMITTED`. A run of this emulator ends in `ERROR`, because nothing
+    /// transcoded (see the failure worded below); which status it ends in is the only thing
+    /// the second step decides.
     ///
     /// A job whose queue is `PAUSED` does not begin ("jobs in that queue won't begin"):
     /// it keeps `SUBMITTED` and is left with no due instant for that exit, and
     /// [`Self::rearm_queue`] gives it a fresh one when the queue is `ACTIVE` again. Its
-    /// hops are untouched, because a job held in a queue is still waiting in one.
+    /// hops are untouched, because a job held in a queue is still waiting in one. The gate
+    /// is on BEGINNING only — "jobs that are running when you pause a queue continue to run
+    /// until they finish or result in an error" — so a job that has begun ends whatever its
+    /// queue does afterwards.
     ///
-    /// A job that DOES leave `SUBMITTED` here has reached a terminal status, so every
-    /// clock-owed instant it carried goes with the transition — see
-    /// [`Self::retire_job_clock`], the one statement of that rule.
+    /// A job that BEGINS here has left its queue's backlog, so its hop destinations are
+    /// owed nothing further ([`Self::retire_job_hops`]) while the finish it is now owed is
+    /// indexed in its place; a job that ENDS here is owed nothing at all
+    /// ([`Self::retire_job_clock`], the one statement of that rule).
     ///
-    /// This is also the one place a job's status MOVES on its own, so it is where the move
+    /// This is also the one place a job's status MOVES on its own, so it is where each move
     /// is recorded for publication to EventBridge
     /// ([`Self::record_job_state_change`]): a job held back by a paused queue has not
     /// moved and records nothing, and neither does a job a cancel took out of the queue
@@ -3965,6 +4019,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         let held = self.jobs.get(id).is_some_and(|job| {
             job.status == JOB_STATUS_SUBMITTED && self.queue_is_paused(&job.queue)
         });
+        // Read before the record is borrowed for writing: the span the finish is owed after
+        // is the same one the start was owed after.
+        let settles_after = self.job_settles_after;
         let Some(job) = self.jobs.get_mut(id) else {
             return;
         };
@@ -3974,8 +4031,20 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             job.settles_at = None;
             return;
         }
-        let mut moved = false;
-        if job.status == JOB_STATUS_SUBMITTED {
+        let begins = job.status == JOB_STATUS_SUBMITTED;
+        let ends = job.status == JOB_STATUS_PROGRESSING;
+        // Where the finish lands, for the step that arms it. `checked_add` rather than `+`,
+        // so an instant near the end of the representable range cannot panic — it simply
+        // owes no finish.
+        let mut finishes_at = None;
+        if begins {
+            job.status = JOB_STATUS_PROGRESSING.to_string();
+            // `Timing$StartTime` is "the time ... that transcoding for the job began",
+            // which is this instant and not the one the run ends at.
+            job.timing.start_time = Some(due);
+            finishes_at = due.checked_add(settles_after);
+            job.settles_at = finishes_at;
+        } else if ends {
             job.status = JOB_STATUS_ERROR.to_string();
             // Why the job failed decides what it reports. An input THIS emulator
             // tried to read and could not is the service's own input-probe failure,
@@ -3993,42 +4062,60 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                     job.error_message = Some(NO_TRANSCODER_MESSAGE.to_string());
                 }
             }
-            job.timing.start_time = Some(due);
             job.timing.finish_time = Some(due);
-            moved = true;
         }
-        // The job has begun and finished processing, so the status it moved into is
-        // published; recorded from the record the write above left, with the instant the
-        // clock made the move due.
-        if moved {
+        // The status the job moved into is published, whichever step moved it; recorded
+        // from the record the write above left, with the instant the clock made the move
+        // due.
+        if begins || ends {
             self.record_job_state_change(id, due);
         }
-        // The job is not waiting in a queue any more, so nothing further is due from it.
-        self.retire_job_clock(id);
+        if begins {
+            // The job is out of its queue's backlog, so it hops nowhere — but the clock
+            // still owes it the end of its run, which the index entry just written is what
+            // materialises.
+            self.retire_job_hops(id);
+            if let Some(finishes_at) = finishes_at {
+                self.pending.insert((finishes_at, id.to_string()));
+            }
+        } else {
+            // The run has ended, or the job had already reached a status nothing is due
+            // from: either way nothing further is owed.
+            self.retire_job_clock(id);
+        }
     }
 
     /// Drop every change the clock still owed the job `id`, record fields and pending
     /// index entries together.
     ///
-    /// The one statement of the rule both terminal transitions follow: a job that is no
-    /// longer waiting in a queue is owed neither its exit from `SUBMITTED`
-    /// ([`JobRecord::settles_at`]) nor any of its hop destinations
-    /// ([`JobRecord::hops_at`], and the entries of `hop_destinations` from
-    /// [`JobRecord::next_hop`] on), because queue hopping moves a job "in the backlog of
-    /// the queue that you submit your job to" and a job that has left that backlog hops
-    /// nowhere. Both fields and the `pending`/`pending_hops` entries that mirror them are
-    /// dropped here, so no terminal job can be left indexed for a change that will never
-    /// be applied.
+    /// The one statement of the rule every terminal transition follows: a job whose run is
+    /// over is owed neither a step of that run ([`JobRecord::settles_at`]) nor any of its
+    /// hop destinations, so both halves go together.
     fn retire_job_clock(&mut self, id: &str) {
+        self.retire_job_hops(id);
         let Some(job) = self.jobs.get_mut(id) else {
             return;
         };
-        let due = job.settles_at.take();
-        let hop_due = job.hops_at.take();
-        job.next_hop = job.hop_destinations.len();
-        if let Some(due) = due {
+        if let Some(due) = job.settles_at.take() {
             self.pending.remove(&(due, id.to_string()));
         }
+    }
+
+    /// Drop every HOP the clock still owed the job `id`, record fields and pending index
+    /// entry together.
+    ///
+    /// Queue hopping moves a job "in the backlog of the queue that you submit your job to",
+    /// so a job that has left that backlog — by beginning its run, or by reaching a
+    /// terminal status — hops nowhere: its [`JobRecord::hops_at`] and the entries of
+    /// `hop_destinations` from [`JobRecord::next_hop`] on are dropped with the
+    /// `pending_hops` entry that mirrors them, so no such job can be left indexed for a
+    /// move that will never be applied.
+    fn retire_job_hops(&mut self, id: &str) {
+        let Some(job) = self.jobs.get_mut(id) else {
+            return;
+        };
+        let hop_due = job.hops_at.take();
+        job.next_hop = job.hop_destinations.len();
         if let Some(hop_due) = hop_due {
             self.pending_hops.remove(&(hop_due, id.to_string()));
         }
@@ -4157,8 +4244,10 @@ impl ComAmazonawsMediaconvertMediaconvertState {
 
         if !waiting {
             // The job is no longer waiting in a queue, so none of its hop destinations is
-            // owed anything further — the same rule the terminal transitions apply.
-            self.retire_job_clock(id);
+            // owed anything further — the same rule a job that BEGINS applies. Whatever
+            // step of its run the clock still owes it is untouched: a running job is not
+            // waiting in a backlog, and it still has to end.
+            self.retire_job_hops(id);
             return;
         }
         let Some(job) = self.jobs.get_mut(id) else {
@@ -4378,11 +4467,19 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// Cancel a stored job: "Permanently cancel a job. Once you have canceled a job, you
     /// can't start it again."
     ///
-    /// Only a job still waiting in its queue can be cancelled — with one exception that is
-    /// not a transition at all: a job ALREADY in the terminal `CANCELED` status is the
-    /// state the request asks for, so the call succeeds again and changes nothing. That
-    /// makes `CancelJob` retry-safe, which is what a client re-sending it after a timeout,
-    /// or a teardown path that runs twice, relies on.
+    /// A job can be cancelled while it is still WAITING in its queue and while it is
+    /// RUNNING — the two statuses a job has not finished in — with one exception that is not
+    /// a transition at all: a job ALREADY in the terminal `CANCELED` status is the state the
+    /// request asks for, so the call succeeds again and changes nothing. That makes
+    /// `CancelJob` retry-safe, which is what a client re-sending it after a timeout, or a
+    /// teardown path that runs twice, relies on. A job that has finished — in any other
+    /// terminal status — is past cancelling and conflicts.
+    ///
+    /// Whether the cancellation is PUBLISHED follows the one rule this service's event
+    /// stream has (`job_events`): a job that had begun processing moves into `CANCELED` from
+    /// `PROGRESSING`, so that move is announced like any other move of a running job, while
+    /// a job the cancel took out of its queue before it ever began has not moved at all and
+    /// announces nothing.
     pub fn cancel_job(&mut self, id: &str, now: SystemTime) -> CancelOutcome {
         let Some(job) = self.jobs.get_mut(id) else {
             return CancelOutcome::NotFound;
@@ -4394,13 +4491,17 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         if job.status == JOB_STATUS_CANCELED {
             return CancelOutcome::AlreadyCanceled;
         }
-        if job.status != JOB_STATUS_SUBMITTED {
+        let was_running = job.status == JOB_STATUS_PROGRESSING;
+        if job.status != JOB_STATUS_SUBMITTED && !was_running {
             return CancelOutcome::NotCancelable(job.status.clone());
         }
         job.status = JOB_STATUS_CANCELED.to_string();
         job.timing.finish_time = Some(now);
+        if was_running {
+            self.record_job_state_change(id, now);
+        }
         // A cancelled job is terminal and in no queue's backlog, so the clock owes it
-        // nothing further — neither its exit from `SUBMITTED` nor any hop.
+        // nothing further — neither a step of its run nor any hop.
         self.retire_job_clock(id);
         CancelOutcome::Canceled
     }

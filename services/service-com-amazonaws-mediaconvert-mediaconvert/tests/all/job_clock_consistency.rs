@@ -89,7 +89,9 @@ struct TerminalCase {
     settle_span: Duration,
     /// How the job stops waiting in its queue.
     terminal: Terminal,
-    /// How far the clock is advanced before the job is judged.
+    /// How far the clock is advanced before the job is judged. A row whose job runs has to
+    /// cover BOTH steps of that run — the exit from `SUBMITTED` and the end of the run, one
+    /// span each — and a hop's wait before them.
     advance_by: Duration,
     /// The status the job must report afterwards.
     expected_status: &'static str,
@@ -109,7 +111,7 @@ fn terminal_cases() -> Vec<TerminalCase> {
             hops: json!([]),
             settle_span: MINUTE,
             terminal: Terminal::Settle,
-            advance_by: 2 * MINUTE,
+            advance_by: 3 * MINUTE,
             expected_status: "ERROR",
             expected_queue: SOURCE,
             expected_transitions: 0,
@@ -120,7 +122,7 @@ fn terminal_cases() -> Vec<TerminalCase> {
             hops: json!([{ "queue": DESTINATION, "waitMinutes": 5 }]),
             settle_span: MINUTE,
             terminal: Terminal::Settle,
-            advance_by: 2 * MINUTE,
+            advance_by: 3 * MINUTE,
             expected_status: "ERROR",
             expected_queue: SOURCE,
             expected_transitions: 0,
@@ -134,7 +136,7 @@ fn terminal_cases() -> Vec<TerminalCase> {
             ]),
             settle_span: MINUTE,
             terminal: Terminal::Settle,
-            advance_by: 2 * MINUTE,
+            advance_by: 3 * MINUTE,
             expected_status: "ERROR",
             expected_queue: SOURCE,
             expected_transitions: 0,
@@ -145,7 +147,7 @@ fn terminal_cases() -> Vec<TerminalCase> {
             hops: json!([{ "queue": DESTINATION, "waitMinutes": 1 }]),
             settle_span: 3 * MINUTE,
             terminal: Terminal::Settle,
-            advance_by: 4 * MINUTE,
+            advance_by: 8 * MINUTE,
             expected_status: "ERROR",
             expected_queue: DESTINATION,
             expected_transitions: 1,
@@ -160,7 +162,7 @@ fn terminal_cases() -> Vec<TerminalCase> {
             ]),
             settle_span: 3 * MINUTE,
             terminal: Terminal::Settle,
-            advance_by: 4 * MINUTE,
+            advance_by: 8 * MINUTE,
             expected_status: "ERROR",
             expected_queue: DESTINATION,
             expected_transitions: 1,
@@ -541,8 +543,9 @@ async fn a_held_job_waits_its_whole_span_from_the_moment_it_can_begin() {
         waiting.body
     );
 
-    // Past the span counted from the hop: it begins, and then nothing is due from it.
-    advance(&emulator, MINUTE + span + Duration::from_secs(30));
+    // Past BOTH steps of the run counted from the hop — the exit from `SUBMITTED` and the
+    // end of the run, one span each: it has run, and then nothing is due from it.
+    advance(&emulator, MINUTE + span + span + Duration::from_secs(30));
     let begun = emulator.get_job(&id).await;
     assert_ne!(
         begun.string("/job/status"),

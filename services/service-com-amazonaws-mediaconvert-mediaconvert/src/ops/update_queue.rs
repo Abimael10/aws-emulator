@@ -392,6 +392,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that publishes it (`state::publish_job_state_changes`).
         drop(state);
 
+        // An activation leaves the store owing every job this queue was holding its exit
+        // from `SUBMITTED`, so the store's clock pump is started: it waits for those
+        // instants, materialises the moves and publishes the events that report them, with
+        // no further MediaConvert call from anybody (`state::drive_job_clock`). A pump
+        // already running is left to it, and an update that activated nothing arms nothing.
+        if activated {
+            crate::state::drive_job_clock(ctx, &self.engine, &region);
+        }
+
         Ok(UpdateQueueOutput { queue: Some(view) })
     }
 }

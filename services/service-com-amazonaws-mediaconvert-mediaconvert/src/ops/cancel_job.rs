@@ -176,9 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A status change the settle above materialised is a job state change, so it is
-        // published here (`state::publish_job_state_changes`). The CANCELLATION itself
-        // publishes nothing: a job cancelled while it was still waiting in its queue never
-        // began processing, and MediaConvert publishes no event for it.
+        // published here (`state::publish_job_state_changes`) — and so is the CANCELLATION
+        // itself when it took a job out of `PROGRESSING`, because a job that had begun
+        // processing moved. A job cancelled while it was still waiting in its queue never
+        // began, so it recorded nothing and publishes nothing.
         crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
 
         match outcome {

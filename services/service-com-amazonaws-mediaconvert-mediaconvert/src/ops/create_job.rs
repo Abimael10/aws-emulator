@@ -608,6 +608,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`state::publish_job_state_changes`).
         drop(state);
 
+        // This submission leaves the store owing this job its exit from `SUBMITTED`, so the
+        // store's clock pump is started: it waits for that instant, materialises the move
+        // and publishes the `MediaConvert Job State Change` event that reports it, with no
+        // further MediaConvert call from anybody — which is the documented workflow, where
+        // a client reacts to the job on an EventBridge rule instead of polling it
+        // (`state::drive_job_clock`).
+        crate::state::drive_job_clock(ctx, &self.engine, &region);
+
         Ok(CreateJobOutput { job: Some(view) })
     }
 }

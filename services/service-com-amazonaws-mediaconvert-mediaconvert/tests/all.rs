@@ -61,6 +61,8 @@ mod job_clock_consistency;
 mod job_engine_version_resolution;
 #[path = "all/job_engine_versions.rs"]
 mod job_engine_versions;
+#[path = "all/job_events_without_a_later_call.rs"]
+mod job_events_without_a_later_call;
 #[path = "all/job_from_template.rs"]
 mod job_from_template;
 #[path = "all/job_lifecycle.rs"]

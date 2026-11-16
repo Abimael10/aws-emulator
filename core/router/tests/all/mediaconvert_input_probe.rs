@@ -21,7 +21,7 @@
 //! the requests driven — on a sized thread.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 
@@ -43,9 +43,16 @@ const ABSENT_BUCKET: &str = "mediaconvert-probe-absent-bucket";
 /// MediaConvert's input-probe failure code, as the issue's recorded job reports it.
 const INPUT_PROBE_FAILURE_CODE: i64 = 1404;
 
-/// Comfortably past the span MediaConvert's emulator holds a new job in `SUBMITTED`
-/// (`JOB_SETTLES_AFTER`, 750 ms), so every job below has reached its terminal status.
-const PAST_THE_SETTLE: Duration = Duration::from_millis(2_500);
+/// How long this suite waits for a job's RUN to end before it gives up.
+///
+/// Generous: a deadline for a machine under load, not a span anything is expected to take.
+/// A job's run is two clock steps, each owed the service's own span after the one before
+/// it, so the rows below read the job again until it has run rather than waiting a fixed
+/// time.
+const RUN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one poll pauses before it reads the job again.
+const RUN_POLL_PAUSE: Duration = Duration::from_millis(50);
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`.
 /// The signature is never checked: this router runs with authentication off.
@@ -249,8 +256,8 @@ fn a_failed_job_reports_the_input_probe_failure_code_only_for_an_input_s3_could_
                 "setup: PutObject must succeed, got {status} {body}"
             );
 
-            // Every job is submitted first, then read once the clock has had its span,
-            // so the suite waits once rather than per row.
+            // Every job is submitted first, then read until its run has ended, so the
+            // suite drives the clock once per job rather than waiting a fixed time.
             let cases = cases();
             let mut ids = Vec::new();
             for case in &cases {
@@ -280,18 +287,28 @@ fn a_failed_job_reports_the_input_probe_failure_code_only_for_an_input_s3_could_
                 ids.push(id);
             }
 
-            // The due instant is stored, not slept for by a handler; this suite waits
-            // past it on its own thread.
-            std::thread::sleep(PAST_THE_SETTLE);
-
             for (case, id) in cases.iter().zip(&ids) {
-                let (status, body) = mediaconvert(
-                    &router,
-                    &runtime,
-                    "GET",
-                    &format!("/2017-08-29/jobs/{id}"),
-                    None,
-                );
+                // The CONDITION, not a span: the due instants are stored and never slept
+                // for by a handler, so this reads the job again until its run has ended or
+                // the deadline passes.
+                let started = Instant::now();
+                let (status, body) = loop {
+                    let (status, body) = mediaconvert(
+                        &router,
+                        &runtime,
+                        "GET",
+                        &format!("/2017-08-29/jobs/{id}"),
+                        None,
+                    );
+                    let ran = body
+                        .pointer("/job/status")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|status| status == "ERROR");
+                    if ran || started.elapsed() >= RUN_DEADLINE {
+                        break (status, body);
+                    }
+                    std::thread::sleep(RUN_POLL_PAUSE);
+                };
                 assert_eq!(
                     status, 200,
                     "case {:?}: GetJob must succeed, got {status} {body}",

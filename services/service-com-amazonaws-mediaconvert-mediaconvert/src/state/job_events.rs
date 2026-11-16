@@ -18,7 +18,8 @@
 //! A job that never begins is not a run: it publishes nothing. So the status a submit
 //! itself stores is not a transition, and neither is the terminal status a cancel writes
 //! onto a job still waiting in its queue — a job cancelled before it began processing
-//! leaves no event behind.
+//! leaves no event behind. A job that HAD begun is a different matter: a cancel moves it
+//! out of `PROGRESSING`, and a move of a running job is announced like any other.
 //!
 //! # How a transition becomes an event
 //!
@@ -123,11 +124,12 @@ struct RenderedEvent {
 impl ComAmazonawsMediaconvertMediaconvertState {
     /// Queue the transition the job `id` made at `due`, for publication to EventBridge.
     ///
-    /// Called from the ONE place a job's exit from `SUBMITTED` is written
-    /// ([`Self::settle_job`]), so every transition a processing job makes is recorded
-    /// exactly once and none can be published twice. The status a submit STORES is not a
-    /// transition and is never recorded here, and neither is the terminal status a cancel
-    /// writes onto a job that never began.
+    /// Called from the places a job's status MOVES while it is running — the step of a run
+    /// the clock materialises ([`Self::settle_job`]) and the cancel of a job that had begun
+    /// ([`Self::cancel_job`]) — so every move a processing job makes is recorded exactly
+    /// once and none can be published twice. The status a submit STORES is not a transition
+    /// and is never recorded here, and neither is the terminal status a cancel writes onto a
+    /// job that never began.
     pub(super) fn record_job_state_change(&mut self, id: &str, due: SystemTime) {
         let Some(job) = self.jobs.get(id) else {
             return;
