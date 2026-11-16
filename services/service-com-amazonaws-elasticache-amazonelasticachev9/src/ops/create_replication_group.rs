@@ -363,16 +363,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // enforced here.
         let replication_group_id = input.replication_group_id.to_ascii_lowercase();
         // The identifier rule, worded by the one helper every identifier
-        // refusal of this service goes through
-        // (`crate::state::identifier_refusal`), against the bound THIS member
+        // refusal of this service goes through, against the bound THIS member
         // documents — a create mints the member cluster ids from the group id,
-        // so its bound is the stricter one.
-        if let Some(message) = crate::state::identifier_refusal(
-            "Replication Group ID",
-            "ReplicationGroupIdentifier",
-            &replication_group_id,
-            crate::state::REPLICATION_GROUP_ID_MAX_LEN,
-        ) {
+        // so the bound it enforces is the one every operation that states this
+        // member's bound in the same words states
+        // (`crate::service::identifier_length_rules::replication_group_id_prose_refusal`).
+        if let Some(message) =
+            crate::service::identifier_length_rules::replication_group_id_prose_refusal(
+                &replication_group_id,
+            )
+        {
             return Err(invalid_value(message));
         }
 

@@ -197,13 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The identifier before the group is resolved: a value past the bound this
         // service states names no group it could have stored, so the refusal reports
-        // the bound rather than the group being absent.
-        if let Some(message) = crate::state::identifier_refusal(
-            "Replication Group ID",
-            "ReplicationGroupIdentifier",
-            &input.replication_group_id,
-            crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
-        ) {
+        // the bound rather than the group being absent. The bound is the
+        // replication-group name maximum — the one a create enforces, stated once in
+        // `crate::service::identifier_length_rules::replication_group_id_prose_refusal`
+        // — and this operation words it with the PROSE name of the member.
+        if let Some(message) =
+            crate::service::identifier_length_rules::replication_group_id_prose_refusal(
+                &input.replication_group_id,
+            )
+        {
             return Err(invalid_value(message));
         }
         // "Indicates that the shard reconfiguration process begins immediately. At

@@ -16,9 +16,10 @@
 //! in either, so an over-long identifier is never echoed back.
 //!
 //! The templates the service words with the PROSE name of a member ("<Member> cannot be
-//! longer than <n> characters.") stay with [`crate::state::identifier_refusal`], which the
-//! handlers whose own wording is that template call directly with the bound their operation
-//! states.
+//! longer than <n> characters.") are formatted by [`crate::state::identifier_refusal`],
+//! which the handlers whose own wording is that template call with the bound their
+//! operation states — except for the member whose bound more than one of them states in
+//! that wording, which is stated here too so the NUMBER cannot drift between them.
 
 /// Why `replication_group_id` cannot name a replication group, or `None` when it can.
 ///
@@ -41,6 +42,28 @@ pub fn replication_group_id_refusal(replication_group_id: &str) -> Option<String
             crate::state::REPLICATION_GROUP_ID_MAX_LEN
         ));
     }
+    // Within the bound the two wordings have nothing to disagree about: what is left to
+    // judge is the FORM every identifier of this service shares, so it is asked for through
+    // the sibling rule rather than stated a second time here — which is also what keeps the
+    // bound the two measure against one number.
+    replication_group_id_prose_refusal(replication_group_id)
+}
+
+/// Why `replication_group_id` cannot name a replication group for an operation that words
+/// the bound with the PROSE name of the member ("Replication Group ID cannot be longer than
+/// <n> characters."), or `None` when it can.
+///
+/// The BOUND is the same one [`replication_group_id_refusal`] applies and the same one a
+/// create enforces — the 40-character maximum a replication-group name may have
+/// ([`crate::state::REPLICATION_GROUP_ID_MAX_LEN`]) — so an id past it names no group this
+/// service could ever have stored whichever operation was asked, and no operation may
+/// advertise a wider ceiling than the one a create accepts. The two functions differ only
+/// in the SENTENCE: the service words this member's bound one way on some operations and
+/// another way on others, and each handler calls the one it states.
+///
+/// Stated once so the operations that word it this way cannot drift apart about the number,
+/// which is the whole difference a client that trims its id to the advertised limit sees.
+pub fn replication_group_id_prose_refusal(replication_group_id: &str) -> Option<String> {
     crate::state::identifier_refusal(
         "Replication Group ID",
         "ReplicationGroupIdentifier",

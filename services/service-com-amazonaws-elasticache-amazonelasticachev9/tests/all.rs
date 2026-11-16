@@ -309,6 +309,10 @@ mod replication_group_delete;
 mod serverless_major_engine_version_catalog;
 #[path = "all/parameter_batch_refusal_template.rs"]
 mod parameter_batch_refusal_template;
+// Appended for the same reason: the suite about the ONE length bound a `ReplicationGroupId`
+// is held to, at every operation that states that bound in the same words.
+#[path = "all/replication_group_id_length_bound.rs"]
+mod replication_group_id_length_bound;
 // Appended for the same reason: the suite about the refusal a serverless usage-limit
 // bound OUTSIDE its member's published range is owed, at both operations that would
 // store one.

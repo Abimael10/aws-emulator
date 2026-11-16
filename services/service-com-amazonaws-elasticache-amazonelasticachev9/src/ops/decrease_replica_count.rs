@@ -198,18 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored, so this operation states the bound it was given rather than
         // reporting the group as missing. This operation words that bound with
         // the PROSE name of the member, which is the template every identifier
-        // refusal of this service goes through
-        // (`crate::state::identifier_refusal`).
+        // refusal of this service goes through, applied to the one bound a
+        // replication-group name has
+        // (`crate::service::identifier_length_rules::replication_group_id_prose_refusal`).
         //
         // The bound is this operation's own: `IncreaseReplicaCount` states NONE
         // and reports an over-long id as a group that does not exist, so the rule
         // is not shared with it.
-        if let Some(message) = crate::state::identifier_refusal(
-            "Replication Group ID",
-            "ReplicationGroupIdentifier",
-            &input.replication_group_id,
-            crate::state::REPLICATION_GROUP_ID_MAX_LEN,
-        ) {
+        if let Some(message) =
+            crate::service::identifier_length_rules::replication_group_id_prose_refusal(
+                &input.replication_group_id,
+            )
+        {
             return Err(DecreaseReplicaCountErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),
