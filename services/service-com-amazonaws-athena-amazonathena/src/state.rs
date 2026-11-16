@@ -43,6 +43,15 @@
 //! Amazon S3 location) and `ExportNotebook` answers with that same content, so an export
 //! reports what an import persisted rather than anything rebuilt from the reading request.
 //!
+//! SESSIONS live in the [`SessionRegistry`] of
+//! [`ComAmazonawsAthenaAmazonathenaState::sessions`], each belonging to the workgroup it
+//! runs in and, when the request that started it bound it to one ([`NOTEBOOK_ID_CONFIG`]),
+//! to one notebook: `ListNotebookSessions` reports a notebook's active sessions out of
+//! those records. A session has a lifecycle the clock owes — a start stores when its
+//! resources are due and every read derives the state from that instant
+//! ([`SessionRecord::state_at`]) — so a session a caller reads straight back is still
+//! CREATING and becomes idle whether or not anybody polls it.
+//!
 //! PREPARED STATEMENTS live in the [`PreparedStatementRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::prepared_statements`], scoped to the workgroup
 //! each belongs to: `CreatePreparedStatement` writes a [`PreparedStatementRecord`] there
@@ -85,6 +94,11 @@ pub mod query_results;
 /// The notebooks a Spark enabled workgroup holds, and the ipynb content of each.
 mod notebooks;
 pub use notebooks::*;
+
+/// The sessions this account's workgroups run, and the notebook each notebook session
+/// was started in.
+mod sessions;
+pub use sessions::*;
 
 /// The provisioned capacity this account reserved, and each reservation's lifecycle.
 mod capacity_reservations;
@@ -2103,6 +2117,10 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// `ImportNotebook` writes it and `ExportNotebook` reads it; see
     /// [`NotebookRegistry`].
     pub notebooks: NotebookRegistry,
+    /// Every session this account holds, each belonging to one workgroup and, for a
+    /// notebook session, to one notebook. The request that starts a session writes it and
+    /// `ListNotebookSessions` reads it; see [`SessionRegistry`].
+    pub sessions: SessionRegistry,
     /// Every capacity reservation this account holds. `CreateCapacityReservation` writes
     /// it and `GetCapacityReservation` reads it; see [`CapacityReservationRegistry`].
     pub capacity_reservations: CapacityReservationRegistry,
@@ -2134,6 +2152,7 @@ impl Default for ComAmazonawsAthenaAmazonathenaState {
             idempotency_tokens: HashMap::new(),
             query_databases: BTreeMap::new(),
             notebooks: NotebookRegistry::default(),
+            sessions: SessionRegistry::default(),
             capacity_reservations: CapacityReservationRegistry::default(),
             prepared_statements: PreparedStatementRegistry::default(),
             named_queries: NamedQueryRegistry::default(),

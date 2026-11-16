@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotebook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotebook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotebook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An EMPTY ipynb file in a Spark enabled workgroup: the create mints a `NotebookId`, writes
+//! a [`crate::state::NotebookRecord`] holding [`crate::state::EMPTY_IPYNB`] into the
+//! notebook registry, and `ExportNotebook` answers out of that same record — so the notebook
+//! a later read reports is the one this call persisted. The content comes from no part of
+//! the request; the workgroup, the name and the idempotency token are what the request
+//! decides.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotebook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotebookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotebook"))
+        // A notebook belongs to a workgroup, and the workgroup is the IAM resource this
+        // action is scoped by, so the create is authorized against that workgroup's ARN
+        // before anything is stored. See `crate::state::authorization`.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::work_group_arn(ctx, &input.work_group),
+        )
+        .map_err(CreateNotebookError::AccessDenied)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateNotebookErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is "a unique case-sensitive string used to ensure the request
+        // to create the notebook is idempotent (executes only once)", so a repeat under the
+        // same token answers with the notebook that token already minted and creates nothing
+        // further. A token reused for OTHER parameters describes another notebook, which is
+        // what this service's `ClientRequestToken` refusal reports.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(minted) = store.notebooks.notebook_of_token(token) {
+                if minted.name != input.name || minted.work_group != input.work_group {
+                    return Err(invalid_request(
+                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+                    ));
+                }
+                return Ok(CreateNotebookOutput {
+                    notebook_id: Some(minted.id.clone()),
+                });
+            }
+        }
+
+        // A notebook lives in a workgroup, so one this account does not hold holds no
+        // notebooks either.
+        if !store.holds_work_group(&input.work_group) {
+            return Err(invalid_request(crate::state::WORK_GROUP_NOT_FOUND));
+        }
+        // "Creates an empty ipynb file in the specified Apache Spark enabled workgroup": an
+        // Athena SQL workgroup runs no notebook engine, and Athena's own default workgroup
+        // is one.
+        let spark_enabled = store
+            .work_groups
+            .get(&input.work_group)
+            .is_some_and(crate::state::is_spark_enabled);
+        if !spark_enabled {
+            return Err(invalid_request(
+                crate::state::work_group_not_spark_enabled(&input.work_group),
+            ));
+        }
+
+        // "Throws an error if a file in the workgroup with the same name already exists": a
+        // second create under that name would either replace a notebook this call never made
+        // or report success for one it did not create.
+        if store.notebooks.holds_name(&input.work_group, &input.name) {
+            return Err(invalid_request(crate::state::notebook_name_exists(
+                &input.work_group,
+                &input.name,
+            )));
+        }
+
+        let payload = crate::state::EMPTY_IPYNB.to_string();
+        if store.notebooks.would_exceed_capacity(payload.len()) {
+            return Err(invalid_request(format!(
+                "Cannot create another notebook: this emulator holds at most {} notebooks \
+                 and {} bytes of notebook content.",
+                crate::state::MAX_NOTEBOOKS,
+                crate::state::MAX_NOTEBOOK_BYTES_TOTAL
+            )));
+        }
+
+        // Athena hands back a notebook that can already be read, so there is no transition
+        // the clock owes afterwards: the record is stored complete.
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::NotebookRecord {
+            id: crate::state::new_notebook_id(),
+            name: input.name,
+            work_group: input.work_group,
+            // "The type of notebook. Currently, the only valid type is IPYNB", and the file
+            // this call creates is one.
+            notebook_type: crate::state::NOTEBOOK_TYPE_IPYNB.to_string(),
+            payload,
+            created_at: now,
+            last_modified_at: now,
+        };
+        let notebook_id = record.id.clone();
+        store.notebooks.insert(record, input.client_request_token);
+
+        Ok(CreateNotebookOutput {
+            notebook_id: Some(notebook_id),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> CreateNotebookError {
+    CreateNotebookError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

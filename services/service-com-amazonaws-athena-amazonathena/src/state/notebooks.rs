@@ -29,6 +29,18 @@ use crate::ops::types::NotebookMetadata;
 /// every other spelling before a handler runs.
 pub const NOTEBOOK_TYPE_IPYNB: &str = "IPYNB";
 
+/// The content of the ipynb file a CREATE makes.
+///
+/// `CreateNotebook` "Creates an empty ipynb file in the specified Apache Spark enabled
+/// workgroup", so this content comes from no part of the request: it is the EMPTY document
+/// of that format, which is what an export of a notebook nothing has written to answers
+/// with. An ipynb file is a JSON document of the nbformat schema, whose required top-level
+/// fields are `cells`, `metadata`, `nbformat` and `nbformat_minor`; an empty notebook holds
+/// no cells and no metadata of its own, at nbformat 4 — the format version of the notebooks
+/// Jupyter writes today.
+pub const EMPTY_IPYNB: &str =
+    "{\n \"cells\": [],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}";
+
 /// The largest ipynb file an import may carry.
 ///
 /// `ImportNotebook` documents it: "The maximum file size that can be imported is 10
@@ -107,9 +119,10 @@ pub struct NotebookRegistry {
     /// one stable order.
     notebooks: BTreeMap<String, NotebookRecord>,
     /// Which `NotebookId` each `ClientRequestToken` already minted, so the documented
-    /// idempotency of an import ("ensure the request to import the notebook is idempotent
-    /// (executes only once)") is answered from state rather than by importing twice.
-    import_tokens: BTreeMap<String, String>,
+    /// idempotency of a create or an import ("ensure the request to import the notebook is
+    /// idempotent (executes only once)") is answered from state rather than by writing a
+    /// second notebook.
+    request_tokens: BTreeMap<String, String>,
 }
 
 impl NotebookRegistry {
@@ -120,7 +133,7 @@ impl NotebookRegistry {
 
     /// The notebook a `ClientRequestToken` already minted, if it did.
     pub fn notebook_of_token(&self, token: &str) -> Option<&NotebookRecord> {
-        self.notebooks.get(self.import_tokens.get(token)?)
+        self.notebooks.get(self.request_tokens.get(token)?)
     }
 
     /// Whether `work_group` already holds a notebook called `name`.
@@ -164,7 +177,7 @@ impl NotebookRegistry {
         for id in &removed {
             self.notebooks.remove(id);
         }
-        self.import_tokens
+        self.request_tokens
             .retain(|_, minted| !removed.iter().any(|id| id == minted));
         removed.len()
     }
@@ -197,7 +210,7 @@ impl NotebookRegistry {
     /// the map does not hold.
     pub fn insert(&mut self, record: NotebookRecord, token: Option<String>) {
         if let Some(token) = token {
-            self.import_tokens.insert(token, record.id.clone());
+            self.request_tokens.insert(token, record.id.clone());
         }
         self.notebooks.insert(record.id.clone(), record);
     }
@@ -233,6 +246,15 @@ pub fn is_spark_enabled(record: &WorkGroupRecord) -> bool {
         || configuration.additional_configuration.is_some()
         || configuration.engine_configuration.is_some()
 }
+
+/// The error code of a refusal whose cause is that the `NotebookId` names no notebook this
+/// account holds.
+///
+/// Its own class, beside [`ERROR_CODE_INVALID_INPUT`], so a client can tell a notebook that
+/// is simply absent — a permanent miss it must not repeat — from a request that is
+/// malformed in some other way, both of which travel as `InvalidRequestException` (HTTP
+/// 400) under the same status.
+pub const ERROR_CODE_NOTEBOOK_NOT_FOUND: &str = "NOTEBOOK_NOT_FOUND";
 
 /// The message a read or an export of a notebook no import or create minted answers with.
 ///

@@ -41,8 +41,12 @@ mod hive_table_registration;
 mod lake_formation_table_reads;
 #[path = "all/named_query_work_group_state.rs"]
 mod named_query_work_group_state;
+#[path = "all/notebook_create.rs"]
+mod notebook_create;
 #[path = "all/notebook_import_export.rs"]
 mod notebook_import_export;
+#[path = "all/notebook_session_listing.rs"]
+mod notebook_session_listing;
 #[path = "all/prepared_statement_lifecycle.rs"]
 mod prepared_statement_lifecycle;
 #[path = "all/query_execution_detail.rs"]
