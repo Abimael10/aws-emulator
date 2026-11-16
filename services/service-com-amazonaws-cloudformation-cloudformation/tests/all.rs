@@ -545,6 +545,8 @@ mod section_loop_expansion;
 mod secretsmanager_reference_missing_json_key;
 #[path = "all/secretsmanager_secret_stack_provenance.rs"]
 mod secretsmanager_secret_stack_provenance;
+#[path = "all/service_discovery_resources.rs"]
+mod service_discovery_resources;
 #[path = "all/service_role_permissions.rs"]
 mod service_role_permissions;
 #[path = "all/signalling_instance_gates.rs"]

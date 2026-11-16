@@ -606,53 +606,20 @@ const BOOLEAN_MEMBERS: &[&str] = &[
     "ScheduledScalingSuspended",
 ];
 
-/// The number `text` names, read as the WHOLE number it is where it names one — a capacity is
-/// an integer member, and `1` is not the same JSON value as `1.0` — and as a fractional one
-/// otherwise. `None` for text that names no number at all.
-fn as_number(text: &str) -> Option<Value> {
-    let text = text.trim();
-    if let Ok(whole) = text.parse::<i64>() {
-        return Some(Value::Number(whole.into()));
-    }
-    ::serde_json::Number::from_f64(text.parse::<f64>().ok()?).map(Value::Number)
-}
-
-/// One declared value as the TYPE the owning API models that member as.
-///
-/// A template's scalar is text wherever the author quoted it or fed it through a `Ref` to a
-/// `String` parameter — "you can write CloudFormation templates in JSON or YAML", and neither
-/// spelling makes a quoted number a number — while the API's member is a number or a boolean.
-/// So a member the model types as one is read from the text the declaration carries, here,
-/// for every member of every structure these types declare: a value that is already of that
-/// type travels as written, and one that is NO such value is left exactly as the template
-/// wrote it, because the owning service's own validation is what judges it.
+/// One declared value as the TYPE the owning API models that member as, through the one walk
+/// every provisioning arm in this position shares ([`super::modelled_declaration`]): the
+/// members these types declare as NUMBERS are [`NUMERIC_MEMBERS`] and the ones they declare as
+/// BOOLEANS are [`BOOLEAN_MEMBERS`], and every other member travels as the template wrote it.
 fn modelled(member: &str, value: &Value) -> Value {
-    match value {
-        Value::String(text) if NUMERIC_MEMBERS.contains(&member) => {
-            as_number(text).unwrap_or_else(|| value.clone())
+    super::modelled_declaration(member, value, &|member| {
+        if NUMERIC_MEMBERS.contains(&member) {
+            super::ModelledScalar::Number
+        } else if BOOLEAN_MEMBERS.contains(&member) {
+            super::ModelledScalar::Boolean
+        } else {
+            super::ModelledScalar::AsWritten
         }
-        Value::String(text) if BOOLEAN_MEMBERS.contains(&member) => match text.trim() {
-            flag if flag.eq_ignore_ascii_case("true") => Value::Bool(true),
-            flag if flag.eq_ignore_ascii_case("false") => Value::Bool(false),
-            _ => value.clone(),
-        },
-        Value::Object(members) => Value::Object(
-            members
-                .iter()
-                .map(|(name, held)| (name.clone(), modelled(name, held)))
-                .collect(),
-        ),
-        // A list's entries are values of the member the list belongs to, so each is read
-        // under that same member name — which is what makes a `StepAdjustments` entry's own
-        // members reachable.
-        Value::Array(entries) => Value::Array(
-            entries
-                .iter()
-                .map(|entry| modelled(member, entry))
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
+    })
 }
 
 /// The refusal for a declaration that states none of a required property.

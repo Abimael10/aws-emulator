@@ -210,6 +210,14 @@ impl Owner {
                 appsync_event_and_merged_apis::create(ctx, region, kind, resource, propagated)
                     .await
             }
+            // A namespace and a service are both taggable: each type publishes a `Tags`
+            // property and its create takes that list, so the resource carries the tags
+            // CloudFormation gives it beside its own. An INSTANCE is not: it publishes no
+            // `Tags` property and `RegisterInstance` takes none, so CloudFormation propagates
+            // no tag to one.
+            Self::ServiceDiscovery(kind) => {
+                service_discovery::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -343,6 +351,11 @@ impl Owner {
                 appsync_event_and_merged_apis::readiness(ctx, region, kind, physical_resource_id)
                     .await
             }
+            // Cloud Map holds a namespace, a service and an instance from the moment the call
+            // that makes it has answered, and none of those shapes publishes a status member at
+            // all, so nothing is asked and nothing waits
+            // ([`service_discovery::ready`]).
+            Self::ServiceDiscovery(_) => Ok(service_discovery::ready()),
         }
     }
 
@@ -413,6 +426,14 @@ impl Owner {
                     physical_resource_id,
                 )
                 .await
+            }
+            // A DNS namespace publishes the Route 53 hosted zone Cloud Map created WITH it,
+            // which lives in another service and is therefore read again; a service's id, ARN
+            // and name are the ones its own create answered with, and an instance publishes
+            // nothing ([`service_discovery::ready_attributes`]).
+            Self::ServiceDiscovery(kind) => {
+                service_discovery::ready_attributes(ctx, region, kind, physical_resource_id)
+                    .await
             }
             // A task-definition revision's `TaskDefinitionArn` is the one its own
             // registration answered with, so there is nothing left to read once it is up.
@@ -617,6 +638,10 @@ impl Owner {
                 appsync_event_and_merged_apis::removal(ctx, region, kind, physical_resource_id)
                     .await
             }
+            // `DeleteNamespace`, `DeleteService` and `DeregisterInstance` each take the resource
+            // away as they answer, so there is nothing to wait for
+            // ([`service_discovery::removal`]).
+            Self::ServiceDiscovery(_) => Ok(service_discovery::removal()),
         }
     }
 
@@ -789,6 +814,13 @@ impl Owner {
             Self::AppSyncEventOrMergedApi(kind) => {
                 appsync_event_and_merged_apis::update(ctx, region, kind, resource, declared).await
             }
+            // Each namespace takes its description — and a DNS namespace its SOA record —
+            // which is what its own update carries; a service takes what `UpdateService`
+            // carries, and an instance is re-registered under the same id, which is the one
+            // call that changes its attributes ([`service_discovery::update`]).
+            Self::ServiceDiscovery(kind) => {
+                service_discovery::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -898,6 +930,10 @@ impl Owner {
             // reconciled by no arm here yet ([`Provisioner::retag`]'s own default), and an
             // association is not taggable at all, so nothing is asked about them.
             Self::AppSyncEventOrMergedApi(_) => Ok(()),
+            // The tags of a namespace or a service that already exists are reconciled by no arm
+            // here yet ([`Provisioner::retag`]'s own default), and an instance is not taggable
+            // at all, so nothing is asked about them.
+            Self::ServiceDiscovery(_) => Ok(()),
         }
     }
 
@@ -1066,6 +1102,12 @@ impl Owner {
             Self::AppSyncEventOrMergedApi(kind) => {
                 appsync_event_and_merged_apis::delete(ctx, region, kind, resource).await
             }
+            // Cloud Map takes no snapshot of a namespace, a service or an instance on the way
+            // out: there is no such call, so a `Snapshot` deletion policy on one of them deletes
+            // the resource with no snapshot invented for it.
+            Self::ServiceDiscovery(kind) => {
+                service_discovery::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1203,6 +1245,9 @@ impl Owner {
                 appsync_event_and_merged_apis::actual_configuration(ctx, region, kind, resource)
                     .await?
             }
+            Self::ServiceDiscovery(kind) => {
+                service_discovery::actual_configuration(ctx, region, kind, resource).await?
+            }
         };
         Ok(ActualConfiguration::read(reported))
     }
@@ -1256,6 +1301,8 @@ impl Owner {
             Self::AppSyncDomainName(_) => message.to_string(),
             // And so does its Event API and merged-API provider.
             Self::AppSyncEventOrMergedApi(_) => message.to_string(),
+            // And so does AWS Cloud Map's.
+            Self::ServiceDiscovery(_) => message.to_string(),
         }
     }
 

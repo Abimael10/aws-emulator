@@ -14,12 +14,16 @@ mod type_names;
 // The AWS AppSync types' return values, in a module of their own for the reason it records.
 // Re-exported, so the one path every caller of a type name uses is unchanged.
 mod appsync;
+// The AWS Cloud Map types' return values, in a module of their own for the same reason, and
+// re-exported the same way.
+mod service_discovery;
 mod edge_and_api_identities;
 // The per-type `Ref`/`Fn::GetAtt` table itself, split out for the same reason and
 // re-exported the same way.
 mod ref_and_get_att;
 pub(crate) use ref_and_get_att::*;
 pub use appsync::*;
+pub use service_discovery::*;
 pub use edge_and_api_identities::*;
 pub use type_names::*;
 pub use outputs::*;
@@ -297,6 +301,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         | APPSYNC_API
         | APPSYNC_CHANNEL_NAMESPACE
         | APPSYNC_SOURCE_API_ASSOCIATION => appsync::published_attributes(resource_type),
+        // The AWS Cloud Map types' own half of the catalogue, beside their return values.
+        SERVICEDISCOVERY_HTTP_NAMESPACE
+        | SERVICEDISCOVERY_PUBLIC_DNS_NAMESPACE
+        | SERVICEDISCOVERY_PRIVATE_DNS_NAMESPACE
+        | SERVICEDISCOVERY_SERVICE
+        | SERVICEDISCOVERY_INSTANCE => service_discovery::published_attributes(resource_type),
         APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
         APIGATEWAY_API_KEY => &["APIKeyId"],
         APIGATEWAY_AUTHORIZER => &["AuthorizerId"],
@@ -463,6 +473,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // that service generated — none of which a naming rule could compute, and all of
         // which every later call on the resource takes.
         || appsync::is_appsync_type(resource_type)
+        // A Cloud Map NAMESPACE and a SERVICE are two more, for the reason
+        // [`service_discovery`] records: each namespace create takes the namespace's name and
+        // no identifier and reports the `ns-…` id Cloud Map minted through its operation's
+        // `Targets`, `CreateService` answers the `srv-…` id it minted, and each type's `Ref`
+        // returns that id — which every later call on the resource takes. (An
+        // `AWS::ServiceDiscovery::Instance` is NOT one of them: `RegisterInstance$InstanceId`
+        // is "an identifier that you want to associate with the instance", so the id in force
+        // is the declaration's own.)
+        || service_discovery::identity_is_assigned(resource_type)
         // An Amazon EKS pod identity association is one more: that create takes no
         // identifier and answers the ARN and the id Amazon EKS minted for the association,
         // and "Ref returns the association ARN" — a template declares the cluster, the

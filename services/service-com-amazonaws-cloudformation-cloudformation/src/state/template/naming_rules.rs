@@ -718,6 +718,14 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
             Some("DomainName")
         }
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
+        // `RegisterInstance$InstanceId` is "an identifier that you want to associate with the
+        // instance", which is what identifies a registered instance in Cloud Map and what
+        // "Ref returns" for the type — so the declaration's own `InstanceId` is this
+        // resource's name. The type's last segment is `Instance`, so neither `InstanceName`
+        // nor `Name` finds it, and the type publishes no name property at all.
+        crate::state::template::SERVICEDISCOVERY_INSTANCE => {
+            Some(crate::state::template::SERVICEDISCOVERY_INSTANCE_ID_PROPERTY)
+        }
         // Amazon SES's `CreateReceiptRuleSet` takes a `RuleSetName` — "Ref returns the rule
         // set name" — so the type publishes `RuleSetName`; the type's last segment is
         // `ReceiptRuleSet`, so neither `ReceiptRuleSetName` nor `Name` finds it.

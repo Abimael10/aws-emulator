@@ -306,6 +306,20 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // AWS Cloud Map, for the `AWS::ServiceDiscovery::HttpNamespace`,
+    // `::PublicDnsNamespace`, `::PrivateDnsNamespace`, `::Service` and `::Instance` a stack
+    // really creates there, so a suite that deploys a namespace's estate reads every one of
+    // them back through that service's own wire, by the ids the stack publishes. Amazon
+    // Route 53 comes with it because a DNS namespace IS a hosted zone of that service: the
+    // `HostedZoneId` such a namespace publishes is the id of a zone Route 53 holds.
+    router.register_service(
+        service_com_amazonaws_servicediscovery_route53autonaming_v20170314::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

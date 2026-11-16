@@ -272,6 +272,16 @@ service-com-amazonaws-eks-awswesleyfrontend = { workspace = true }
 # the graph and the snapshot the stack published are read back through that service's own
 # wire.
 service-com-amazonaws-neptunegraph-amazonneptunegraph = { workspace = true }
+# AWS Cloud Map, for the `AWS::ServiceDiscovery::HttpNamespace`, `::PublicDnsNamespace`,
+# `::PrivateDnsNamespace`, `::Service` and `::Instance` a stack really creates there
+# (`state::provisioning::service_discovery`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails — and the
+# ids the stack publishes are read back through that service's own wire.
+service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { workspace = true }
+# Amazon Route 53, which a Cloud Map DNS namespace's hosted zone is created in: the
+# `HostedZoneId` such a namespace publishes is the id of a zone that service holds, so it is
+# mounted beside Cloud Map.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 
 [lints]
 workspace = true

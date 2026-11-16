@@ -1960,6 +1960,16 @@ pub(crate) fn return_values(
         | APPSYNC_SOURCE_API_ASSOCIATION => {
             appsync_return_values(resource_type, name, properties, scope, budget)
         }
+        // The five AWS Cloud Map types a namespace's estate is declared with, whose return
+        // values — the `ns-…`/`srv-…` ids Cloud Map mints, the ARNs it builds on them and the
+        // hosted zone only that service can report — are [`service_discovery`]'s.
+        SERVICEDISCOVERY_HTTP_NAMESPACE
+        | SERVICEDISCOVERY_PUBLIC_DNS_NAMESPACE
+        | SERVICEDISCOVERY_PRIVATE_DNS_NAMESPACE
+        | SERVICEDISCOVERY_SERVICE
+        | SERVICEDISCOVERY_INSTANCE => {
+            service_discovery_return_values(resource_type, name, properties, scope, budget)
+        }
         // "Ref returns the ARN of the cluster" for both kinds of Amazon MSK cluster, and
         // that ARN is the type's one published `Fn::GetAtt` attribute too. Amazon MSK
         // MINTS it: its resource path is `cluster/<name>/<id>`, where the id is the

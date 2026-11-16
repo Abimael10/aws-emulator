@@ -2771,6 +2771,28 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // `CreateGraphSnapshot`, and that service publishes no call that changes a snapshot at
         // all, so a declaration naming another graph asks for a different snapshot.
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => &["GraphIdentifier"],
+        // A Cloud Map SERVICE lives in the namespace its `NamespaceId` names, is of the kind
+        // its `Type` states and has the custom health check its create configured: each is a
+        // member of `CreateService` and of no member of `ServiceChange` (`UpdateService` takes
+        // the description, the DNS records and the Route 53 health check), and that service
+        // publishes no call that moves a service to another namespace — so a declaration
+        // restating one of them asks for a DIFFERENT service, which CloudFormation replaces.
+        crate::state::template::SERVICEDISCOVERY_SERVICE => {
+            &["HealthCheckCustomConfig", "NamespaceId", "Type"]
+        }
+        // An INSTANCE is registered IN one service: `RegisterInstance$ServiceId` addresses the
+        // instance rather than being a value of it, and Cloud Map publishes no call that moves
+        // an instance to another service, so a declaration naming another service asks for a
+        // different instance. (Its `InstanceId` is in the same position through
+        // [`name_is_create_only`]: that id is what identifies the instance.)
+        crate::state::template::SERVICEDISCOVERY_INSTANCE => {
+            &[crate::state::template::SERVICEDISCOVERY_SERVICE_ID_PROPERTY]
+        }
+        // A PRIVATE DNS namespace's hosted zone is associated with the VPC its create named:
+        // `Vpc` is a member of `CreatePrivateDnsNamespace` and of no member of
+        // `PrivateDnsNamespaceChange` (that update takes the description and the SOA record), so
+        // a declaration naming another VPC asks for a different namespace.
+        crate::state::template::SERVICEDISCOVERY_PRIVATE_DNS_NAMESPACE => &["Vpc"],
         // A maintenance window TARGET belongs to the window it was registered with and is of
         // the kind the register stated: `WindowId` addresses the target rather than being a
         // value of it, and `ResourceType` is a member of the register and of no update

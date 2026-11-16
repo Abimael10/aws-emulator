@@ -217,6 +217,15 @@ mod appsync_event_and_merged_apis;
 /// schema, its data sources, its resolvers, its pipeline functions and its API keys: created
 /// in AWS AppSync itself ([`appsync_resources`]).
 mod appsync_resources;
+/// Reading a declared property document as the TYPES the owning API models its members as —
+/// the one walk every provisioning arm whose owning model types a member as a number or a
+/// boolean reaches ([`modelled_declaration`]).
+mod modelled_declaration;
+use modelled_declaration::{modelled_declaration, ModelledScalar};
+/// The five `AWS::ServiceDiscovery::*` types a Cloud Map namespace's estate is declared with —
+/// an HTTP, a public DNS and a private DNS namespace, a service of one, and an instance
+/// registered in a service: created in AWS Cloud Map itself ([`service_discovery`]).
+mod service_discovery;
 /// The two `AWS::ApplicationAutoScaling::*` types a stack declares — the scalable target and
 /// the policy that steers it: visible to the rest of this service's state because the types'
 /// own NAMES live here, beside the arms that provision them
@@ -1077,6 +1086,11 @@ pub(super) enum Owner {
     /// and the link of a source API into a Merged API. Which of them it is travels with the
     /// owner, as it does for the types above.
     AppSyncEventOrMergedApi(appsync_event_and_merged_apis::Kind),
+    /// One of the five `AWS::ServiceDiscovery::*` types [`service_discovery`] creates in AWS
+    /// Cloud Map: an HTTP, a public DNS or a private DNS namespace, a service of one, and an
+    /// instance registered in a service. Which of them it is travels with the owner, as it
+    /// does for the types above.
+    ServiceDiscovery(service_discovery::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1168,6 +1182,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = appsync_event_and_merged_apis::kind_of(resource_type) {
         return Some(Owner::AppSyncEventOrMergedApi(kind));
+    }
+    if let Some(kind) = service_discovery::kind_of(resource_type) {
+        return Some(Owner::ServiceDiscovery(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -4413,6 +4430,17 @@ const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // Attempt Count: …)`).
     ("route53", "Route53", SdkDiagnostic::Attempts),
     ("s3", "S3", SdkDiagnostic::Attempts),
+    // AWS Cloud Map's SDK names it by that model's own `sdkId` (`ServiceDiscovery`,
+    // `smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` the type names of its resources carry. The shape is the
+    // ATTEMPT-counting one, as Amazon Route 53's above is — the two services' resource handlers
+    // are the same generation — and the five resource types this emulator provisions over this
+    // signing name are all that service's ([`provisioning::service_discovery`]).
+    (
+        "servicediscovery",
+        "ServiceDiscovery",
+        SdkDiagnostic::Attempts,
+    ),
 ];
 
 /// The SHAPE of the parenthesis an SDK appends to the message of the exception it raises for
