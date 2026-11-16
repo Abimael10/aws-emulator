@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteAttachmentUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteAttachmentUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteAttachmentUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Confirms the upload `StartAttachmentUpload` published a target for: the attachment moves
+//! to `APPROVED`, which is the status `GetAttachment` serves a download URL for, and the
+//! file joins the conversation as an `ATTACHMENT` transcript item.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteAttachmentUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteAttachmentUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteAttachmentUpload"))
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CompleteAttachmentUploadErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reclaim what the clock has already retired before anything is confirmed.
+        state.prune_expired(now);
+
+        let Some(session) = state.session_for_connection_token(&input.connection_token, now) else {
+            return Err(CompleteAttachmentUploadErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+        let contact_id = session.contact_id.clone();
+        let has_transcript_room = session.has_room();
+
+        // A repeated `ClientToken` is the same confirmation, so it is answered as the first
+        // one was rather than as a second confirmation of an attachment already uploaded.
+        // The replay has to name the SAME attachment: one token confirms one upload, and a
+        // request naming another attachment is another request whatever token it carries.
+        let key =
+            crate::state::attachment_idempotency_key(&contact_id, Self::NAME, &input.client_token);
+        let replayed = state
+            .replayed_attachment(&key)
+            .map(|attachment| attachment.id.clone());
+        if replayed.is_some_and(|id| input.attachment_ids.contains(&id)) {
+            return Ok(CompleteAttachmentUploadOutput::default());
+        }
+
+        // `AttachmentIdList` is modelled `len 1..1`, so the list the boundary validator let
+        // through names exactly one attachment.
+        let Some(attachment_id) = input.attachment_ids.first().cloned() else {
+            return Err(CompleteAttachmentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: "AttachmentIds must name one attachment".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let Some(attachment) = state.attachment_of_contact(&attachment_id, &contact_id) else {
+            return Err(CompleteAttachmentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Attachment with id {attachment_id} does not exist for this contact"
+                    ),
+                },
+            )
+            .into());
+        };
+        // "A conflict exception is thrown when an attachment with that identifier is
+        // already being uploaded": the upload of one attachment is confirmed once, so a
+        // further confirmation of it conflicts with the state it is already in.
+        if attachment.is_approved() {
+            return Err(CompleteAttachmentUploadErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The attachment with id {attachment_id} has already been uploaded."
+                    ),
+                },
+            )
+            .into());
+        }
+        let content_type = attachment.content_type.clone();
+
+        // The confirmed attachment joins the conversation, so it needs a transcript item;
+        // refused before anything is confirmed when this chat holds the item limit this
+        // emulator bounds a transcript at, exactly as `SendMessage` and `SendEvent` refuse a
+        // further item there.
+        if !has_transcript_room {
+            return Err(CompleteAttachmentUploadErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: format!(
+                        "this chat's transcript holds its {} item limit",
+                        crate::state::MAX_TRANSCRIPT_ITEMS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        if let Some(attachment) = state.attachment_of_contact_mut(&attachment_id, &contact_id) {
+            attachment.status = crate::state::ARTIFACT_STATUS_APPROVED.to_string();
+        }
+        // The confirmed attachment joins the conversation: `GetTranscript` "Retrieves a
+        // transcript of the session, including details about any attachments", which it
+        // reports as the `Attachments` of an `ATTACHMENT` item.
+        if let Some(session) = state.sessions.get_mut(&contact_id) {
+            session.append_attachment(attachment_id.clone(), content_type, now);
+        }
+        state.record_attachment_idempotency(key, attachment_id);
+
+        // `CompleteAttachmentUploadResponse` carries no members: the confirmation is the
+        // whole answer.
+        Ok(CompleteAttachmentUploadOutput::default())
     }
 }

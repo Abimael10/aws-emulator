@@ -19,6 +19,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 
+mod attachments;
+pub use attachments::*;
+
 /// How long a connection token stays usable.
 ///
 /// `CreateParticipantConnection`'s own documentation: "The expiry time for the
@@ -71,6 +74,10 @@ pub const CHAT_ITEM_TYPE_EVENT: &str = "EVENT";
 /// participant token obtained from `StartChatContact`.
 pub const PARTICIPANT_ROLE_CUSTOMER: &str = "CUSTOMER";
 
+/// `ParticipantRole$CUSTOM_BOT`, from `PARTICIPANT_ROLE_VALUES`: the role `GetAttachment`
+/// documents as "not permitted to access attachments customers may upload".
+pub const PARTICIPANT_ROLE_CUSTOM_BOT: &str = "CUSTOM_BOT";
+
 /// The `AccessDeniedException$Message` this service answers with.
 ///
 /// The text is fixed: this service tells a caller whose token does not authenticate it
@@ -100,6 +107,11 @@ pub struct TranscriptItem {
     pub participant_role: String,
     /// `Item$ContactId`.
     pub contact_id: String,
+    /// The ids of the attachments this item carries, which `Item$Attachments` reports.
+    /// Only an [`CHAT_ITEM_TYPE_ATTACHMENT`] item has any; the attachment itself lives in
+    /// [`ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState::attachments`],
+    /// so an item reports the status the attachment currently has rather than a copy of it.
+    pub attachments: Vec<String>,
 }
 
 /// What one connection token authenticates, and when it stops doing so.
@@ -226,6 +238,7 @@ impl ChatSession {
             display_name: self.display_name.clone(),
             participant_role: self.participant_role.clone(),
             contact_id: self.contact_id.clone(),
+            attachments: Vec::new(),
         };
         let stored = (item.id.clone(), item.absolute_time.clone());
         if let Some(key) = key {
@@ -233,6 +246,36 @@ impl ChatSession {
         }
         self.transcript.push(item);
         stored
+    }
+
+    /// Append the `ATTACHMENT` item one confirmed upload adds to the conversation: an
+    /// attachment is part of the chat, which is why a transcript `Item` carries
+    /// `Attachments` at all.
+    ///
+    /// Attributed to this session's participant exactly as a message is, and carrying no
+    /// `Content` of its own — the file is the content, and it is reached through the
+    /// attachment's own download URL. Returns the `Id` the item was stored with.
+    pub fn append_attachment(
+        &mut self,
+        attachment_id: String,
+        content_type: String,
+        now: SystemTime,
+    ) -> String {
+        let item = TranscriptItem {
+            id: new_id(),
+            absolute_time: format_instant(now),
+            content: None,
+            content_type,
+            item_type: CHAT_ITEM_TYPE_ATTACHMENT.to_string(),
+            participant_id: self.participant_id.clone(),
+            display_name: self.display_name.clone(),
+            participant_role: self.participant_role.clone(),
+            contact_id: self.contact_id.clone(),
+            attachments: vec![attachment_id],
+        };
+        let id = item.id.clone();
+        self.transcript.push(item);
+        id
     }
 }
 
@@ -252,6 +295,16 @@ pub struct ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaSt
     /// by the sessions it belongs to — [`State::prune_expired`] drops a view with the
     /// session whose chat it was shown in.
     pub shown_views: HashMap<String, ShownView>,
+    /// Attachment id -> the attachment it names: what `StartAttachmentUpload` mints,
+    /// `CompleteAttachmentUpload` confirms and `GetAttachment` reports. Bounded by the
+    /// sessions the attachments belong to — [`State::prune_expired`] drops an attachment
+    /// with the session whose chat it was uploaded in — and by
+    /// [`MAX_ATTACHMENTS_PER_CONTACT`] per contact.
+    pub attachments: HashMap<String, Attachment>,
+    /// Idempotency for the attachment operations:
+    /// [`attachment_idempotency_key`] -> the id of the attachment that request answered
+    /// for. Gains an entry only alongside an attachment, so the attachment bound bounds it.
+    pub attachment_idempotency: HashMap<String, String>,
 }
 
 impl ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState {
@@ -326,6 +379,12 @@ impl ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState {
         // chat's session is.
         self.shown_views
             .retain(|_, view| sessions.contains_key(&view.contact_id));
+        // And an attachment was uploaded inside one chat, for the same reason.
+        self.attachments
+            .retain(|_, attachment| sessions.contains_key(&attachment.contact_id));
+        let attachments = &self.attachments;
+        self.attachment_idempotency
+            .retain(|_, attachment_id| attachments.contains_key(attachment_id));
     }
 
     /// Drop every connection token that reaches `contact_id`: a disconnected

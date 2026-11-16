@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the pre-signed address a completed attachment is downloaded from, and the size
+//! the upload declared for it. A read: the attachment itself is minted by
+//! `StartAttachmentUpload` and confirmed by `CompleteAttachmentUpload`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAttachment"))
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAttachmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // A read of the store, apart from the window this call announces (recorded below).
+        let mut state = store.lock();
+
+        let Some(session) = state.session_for_connection_token(&input.connection_token, now) else {
+            return Err(GetAttachmentErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "The participant role CUSTOM_BOT is not permitted to access attachments customers
+        // may upload. An AccessDeniedException can indicate that the participant may be a
+        // CUSTOM_BOT, and it doesn't have access to attachments." The role is the session's,
+        // so the same bot reading its own chat's transcript is still refused an attachment.
+        if session.participant_role == crate::state::PARTICIPANT_ROLE_CUSTOM_BOT {
+            return Err(GetAttachmentErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(attachment) =
+            state.attachment_of_contact(&input.attachment_id, &session.contact_id)
+        else {
+            return Err(GetAttachmentErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Attachment with id {} does not exist for this contact",
+                    input.attachment_id
+                ),
+            })
+            .into());
+        };
+        // "Provides a pre-signed URL for download of a COMPLETED attachment": an upload
+        // nothing has confirmed yet has no download at all.
+        if !attachment.is_approved() {
+            return Err(GetAttachmentErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Attachment with id {} is not available for download; its status is {}",
+                    attachment.id, attachment.status
+                ),
+            })
+            .into());
+        }
+
+        // Which attachment, and what is reported for it, come from the stored record; the
+        // identifiers are taken by value so the record's borrow ends before the window this
+        // call announces is recorded on it.
+        let (contact_id, attachment_id, size_in_bytes) = (
+            attachment.contact_id.clone(),
+            attachment.id.clone(),
+            attachment.size_in_bytes,
+        );
+
+        // "The expiration time of the URL": the window the caller asked for, or the longest
+        // one the member allows when it asked for none. The modelled range is already
+        // enforced before this handler runs; the clamp keeps the signed window inside it
+        // whatever reaches here.
+        let expiry_seconds = i64::from(
+            input
+                .url_expiry_in_seconds
+                .unwrap_or(crate::state::MAX_URL_EXPIRY_SECONDS as i32),
+        )
+        .clamp(
+            crate::state::MIN_URL_EXPIRY_SECONDS,
+            crate::state::MAX_URL_EXPIRY_SECONDS,
+        );
+        let Some(signed) = crate::state::attachment_url(
+            ctx,
+            http::Method::GET,
+            &contact_id,
+            &attachment_id,
+            None,
+            std::time::Duration::from_secs(expiry_seconds as u64),
+        ) else {
+            return Err(GetAttachmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "no download URL could be signed for this attachment".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The ONE write this operation makes, and it is part of minting what the operation is
+        // documented to provide: the window of the URL just reported, so the plane serves the
+        // file for exactly as long as the longest window a caller was handed and refuses a
+        // download offered after it — the judgement a pre-signed URL's own signature makes.
+        // Nothing else a later caller sees changes.
+        if let Some(attachment) = state.attachment_of_contact_mut(&attachment_id, &contact_id) {
+            attachment.downloadable_until(signed.expires_at());
+        }
+
+        Ok(GetAttachmentOutput {
+            url: Some(signed.as_str().to_string()),
+            url_expiry: Some(crate::state::format_instant(signed.expires_at())),
+            attachment_size_in_bytes: size_in_bytes,
+        })
     }
 }

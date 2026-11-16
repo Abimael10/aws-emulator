@@ -39,11 +39,18 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One data plane is mounted here as well: the pre-signed attachment URLs
+//! `StartAttachmentUpload` and `GetAttachment` publish name no modelled operation, so they
+//! are claimed by `can_handle` (their path is inside this service's own modelled path
+//! space) and served by [`Service::override_routing_error`]. See [`attachment_plane`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+mod attachment_plane;
 
 /// Whether this service serves the request these `parts` came from.
 ///
@@ -90,6 +97,13 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the attachment plane is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read and write the one store the operations use,
+    /// not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -98,7 +112,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -115,6 +130,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The signing name `execute-api` is SHARED with the API Gateway Management API,
         // so the claim is the signing name AND this service's own modelled path space.
         // See [`can_handle_parts`] for why, and for who owns the rule.
+        //
+        // That claim also covers a request to an ATTACHMENT URL this service published,
+        // because the published path is inside this service's own modelled path space
+        // (`crate::state::ATTACHMENT_PATH_PREFIX`); `override_routing_error` serves it.
         can_handle_parts(parts)
     }
 
@@ -152,10 +171,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to an ATTACHMENT URL this service published is exactly that case by
+        // construction — the path is not in the model — so this is where the documented
+        // upload and download of an attachment are served. The PATH decides, and WHICH
+        // attachment it names is read by the one reader of that form
+        // (`crate::state::parse_attachment_path`), so the URL this service hands out and
+        // the request it serves back cannot disagree. See `attachment_plane`.
+        let (contact_id, attachment_id) =
+            crate::state::parse_attachment_path(::service_common::request_path(req.uri()))?;
+        Some(attachment_plane::serve(
+            &*self.engine,
+            req,
+            &contact_id,
+            &attachment_id,
+        ))
     }
 
     fn override_framework_error(

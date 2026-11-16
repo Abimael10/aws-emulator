@@ -1,0 +1,1339 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the attachment slice: `StartAttachmentUpload`,
+//! `CompleteAttachmentUpload`, `GetAttachment` and the pre-signed plane both of them
+//! publish URLs into.
+//!
+//! The rule under test: one attachment is a STORED resource of one chat with a lifecycle —
+//! started (`IN_PROGRESS`), confirmed (`APPROVED`), then downloadable — and every URL these
+//! operations report is a pre-signed address of this emulator that really serves the file
+//! that was uploaded to it. So each case drives the whole path over the wire, through the
+//! same `MultiServiceRouter` the production router dispatches with: the control-plane call,
+//! the `PUT` to the published target, the read back, and the `GET` of the download URL.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+use service_com_amazonaws_connectparticipant_amazonconnectparticipantservicelambda as participant;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The endpoint host the modelled requests address.
+const HOST: &str = "participant.connect.us-east-1.amazonaws.com";
+
+/// A SigV4 credential scope naming this service's signing name, which is what the router
+/// resolves a request's target service from.
+const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/\
+                             execute-api/aws4_request, SignedHeaders=host, Signature=00";
+
+/// A router with just this service mounted on one shared engine.
+fn router() -> MultiServiceRouter {
+    router_and_engine().0
+}
+
+/// [`router`], plus the shared engine behind it — the store the component that starts a chat
+/// writes its session into, and the one every handler reads.
+fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.register_service(participant::EmulatedService::new(engine.clone()));
+    (router, engine)
+}
+
+/// This service's store in the shared engine.
+fn store(
+    engine: &Arc<engine::InMemoryEngine>,
+) -> ::engine::ServiceState<
+    participant::state::ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState,
+> {
+    participant::state::service_state(&**engine).expect("the connectparticipant store")
+}
+
+/// POST `path` with an optional `X-Amz-Bearer` token, returning the status and the decoded
+/// JSON body (`Value::Null` for an empty body).
+async fn post(
+    router: &MultiServiceRouter,
+    path: &str,
+    bearer: Option<&str>,
+    body: &Value,
+) -> (u16, Value) {
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{HOST}{path}"))
+        .header("host", HOST)
+        .header("content-type", "application/json")
+        .header("authorization", AUTHORIZATION);
+    if let Some(bearer) = bearer {
+        request = request.header("x-amz-bearer", bearer);
+    }
+    let request = request
+        .body(Bytes::from(
+            serde_json::to_vec(body).expect("serialize the request body"),
+        ))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let bytes = response.into_body();
+    let decoded = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, decoded)
+}
+
+/// What a request to a published attachment URL answered: the status, the body and the
+/// `content-type` it was served under.
+struct Fetched {
+    status: u16,
+    body: Vec<u8>,
+    content_type: Option<String>,
+}
+
+impl Fetched {
+    /// The body decoded as JSON, for a refusal of the attachment plane.
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+/// Follow a URL this emulator published, exactly as a client holding it would: the URL as
+/// signed, carrying no `Authorization` header of its own, plus `headers`.
+async fn fetch(
+    router: &MultiServiceRouter,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Fetched {
+    let mut request = http::Request::builder().method(method).uri(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let request = request
+        .body(Bytes::from(body))
+        .expect("build the request to the published URL");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    Fetched {
+        status,
+        body: response.into_body().to_vec(),
+        content_type,
+    }
+}
+
+/// The `__type` discriminator of a restJson1 error body.
+fn error_type(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// Assert `value` is an `ISO8601Datetime` / `Instant`: `yyyy-MM-ddThh:mm:ss.SSSZ`, the form
+/// every timestamp in this model documents (e.g. `2019-11-08T02:41:28.172Z`). Checked here
+/// independently of the service's own formatter.
+fn assert_iso8601_millis(case: &str, value: &str) {
+    assert_eq!(
+        value.len(),
+        24,
+        "case {case:?}: expected a 24-character yyyy-MM-ddThh:mm:ss.SSSZ timestamp, got {value:?}"
+    );
+    let chars: Vec<char> = value.chars().collect();
+    for (at, expected) in [
+        (4, '-'),
+        (7, '-'),
+        (10, 'T'),
+        (13, ':'),
+        (16, ':'),
+        (19, '.'),
+        (23, 'Z'),
+    ] {
+        assert_eq!(
+            chars[at], expected,
+            "case {case:?}: expected {expected:?} at index {at} of {value:?}, got {:?}",
+            chars[at]
+        );
+    }
+    for at in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22] {
+        assert!(
+            chars[at].is_ascii_digit(),
+            "case {case:?}: expected a digit at index {at} of {value:?}, got {:?}",
+            chars[at]
+        );
+    }
+}
+
+/// The value of query parameter `name` in `url`, still percent-encoded.
+fn query_param(url: &str, name: &str) -> Option<String> {
+    url.split_once('?')?.1.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+/// Open a connection for `participant_token` and return its `ConnectionToken`.
+async fn connect(router: &MultiServiceRouter, participant_token: &str) -> String {
+    let (status, body) = post(
+        router,
+        "/participant/connection",
+        Some(participant_token),
+        &json!({"Type": ["CONNECTION_CREDENTIALS"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateParticipantConnection: got {body:?}");
+    body["ConnectionCredentials"]["ConnectionToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateParticipantConnection returned no ConnectionToken: {body:?}"))
+        .to_string()
+}
+
+/// One started upload: the id the attachment is named by, and the published target.
+struct Started {
+    attachment_id: String,
+    url: String,
+    url_expiry: String,
+    headers: Vec<(String, String)>,
+}
+
+/// `StartAttachmentUpload` for one file, asserting it was served, and reading the published
+/// target out of the response.
+async fn start(
+    router: &MultiServiceRouter,
+    connection_token: &str,
+    case: &str,
+    name: &str,
+    content_type: &str,
+    size: usize,
+    client_token: &str,
+) -> Started {
+    let (status, body) = start_raw(
+        router,
+        connection_token,
+        name,
+        content_type,
+        size as i64,
+        client_token,
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: StartAttachmentUpload got {body:?}");
+    Started {
+        attachment_id: body["AttachmentId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no AttachmentId in {body:?}"))
+            .to_string(),
+        url: body["UploadMetadata"]["Url"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no UploadMetadata.Url in {body:?}"))
+            .to_string(),
+        url_expiry: body["UploadMetadata"]["UrlExpiry"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no UploadMetadata.UrlExpiry in {body:?}"))
+            .to_string(),
+        headers: body["UploadMetadata"]["HeadersToInclude"]
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: no HeadersToInclude in {body:?}"))
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value.as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// `StartAttachmentUpload` as sent, without asserting the outcome.
+async fn start_raw(
+    router: &MultiServiceRouter,
+    connection_token: &str,
+    name: &str,
+    content_type: &str,
+    size: i64,
+    client_token: &str,
+) -> (u16, Value) {
+    post(
+        router,
+        "/participant/start-attachment-upload",
+        Some(connection_token),
+        &json!({
+            "AttachmentName": name,
+            "AttachmentSizeInBytes": size,
+            "ContentType": content_type,
+            "ClientToken": client_token,
+        }),
+    )
+    .await
+}
+
+/// `CompleteAttachmentUpload` for one attachment.
+async fn complete(
+    router: &MultiServiceRouter,
+    connection_token: &str,
+    attachment_id: &str,
+    client_token: &str,
+) -> (u16, Value) {
+    post(
+        router,
+        "/participant/complete-attachment-upload",
+        Some(connection_token),
+        &json!({"AttachmentIds": [attachment_id], "ClientToken": client_token}),
+    )
+    .await
+}
+
+/// `GetAttachment` for one attachment, with an optional `UrlExpiryInSeconds`.
+async fn get_attachment(
+    router: &MultiServiceRouter,
+    connection_token: &str,
+    attachment_id: &str,
+    url_expiry_in_seconds: Option<i64>,
+) -> (u16, Value) {
+    let mut body = json!({"AttachmentId": attachment_id});
+    if let Some(seconds) = url_expiry_in_seconds {
+        body["UrlExpiryInSeconds"] = json!(seconds);
+    }
+    post(router, "/participant/attachment", Some(connection_token), &body).await
+}
+
+/// One file an upload is started for. The rows differ along what the rule generalises over:
+/// the media type, the name, and the size of the file.
+struct File {
+    case: &'static str,
+    name: &'static str,
+    content_type: &'static str,
+    /// The bytes the file holds, built by repeating `fill` `size` times, so a case can be
+    /// as large as it likes without a literal that long.
+    fill: u8,
+    size: usize,
+}
+
+/// The files every table in this suite is driven over.
+const FILES: &[File] = &[
+    File {
+        case: "one byte of text",
+        name: "note.txt",
+        content_type: "text/plain",
+        fill: b'a',
+        size: 1,
+    },
+    File {
+        case: "a small csv",
+        name: "Quarterly Report, final.csv",
+        content_type: "text/csv",
+        fill: b',',
+        size: 512,
+    },
+    File {
+        case: "a binary document",
+        name: "scan.pdf",
+        content_type: "application/pdf",
+        fill: 0x7f,
+        size: 4096,
+    },
+    File {
+        case: "an opaque stream",
+        name: "capture.bin",
+        content_type: "application/octet-stream",
+        fill: 0x00,
+        size: 65_536,
+    },
+];
+
+impl File {
+    /// The bytes this file carries.
+    fn bytes(&self) -> Vec<u8> {
+        vec![self.fill; self.size]
+    }
+}
+
+#[tokio::test]
+async fn an_upload_publishes_a_presigned_target_for_the_file_it_declares() {
+    let router = router();
+    let connection_token = connect(&router, "participant-upload-targets").await;
+
+    let mut seen_ids: Vec<String> = Vec::new();
+    for (index, file) in FILES.iter().enumerate() {
+        let started = start(
+            &router,
+            &connection_token,
+            file.case,
+            file.name,
+            file.content_type,
+            file.size,
+            &format!("start-{index}"),
+        )
+        .await;
+
+        assert!(
+            !seen_ids.contains(&started.attachment_id),
+            "case {:?}: expected a fresh AttachmentId, got the already-issued {:?}",
+            file.case,
+            started.attachment_id
+        );
+        seen_ids.push(started.attachment_id.clone());
+
+        // The target is an address of THIS emulator, pre-signed, naming this attachment's
+        // own object path.
+        assert!(
+            started.url.starts_with("https://"),
+            "case {:?}: expected an https upload URL, got {:?}",
+            file.case,
+            started.url
+        );
+        assert!(
+            started.url.contains("/participant/attachments/"),
+            "case {:?}: expected the attachment object path in {:?}",
+            file.case,
+            started.url
+        );
+        assert!(
+            started.url.contains(&started.attachment_id),
+            "case {:?}: expected the upload URL to name attachment {:?}, got {:?}",
+            file.case,
+            started.attachment_id,
+            started.url
+        );
+        for parameter in ["X-Amz-Credential", "X-Amz-Signature", "X-Amz-Expires"] {
+            assert!(
+                query_param(&started.url, parameter).is_some(),
+                "case {:?}: expected a pre-signed {parameter} on {:?}",
+                file.case,
+                started.url
+            );
+        }
+        // The upload target carries no window parameter of its own, so it is signed for the
+        // longest window `UrlExpiryInSeconds` allows (300 seconds).
+        assert_eq!(
+            query_param(&started.url, "X-Amz-Expires").as_deref(),
+            Some("300"),
+            "case {:?}: expected the published upload window on {:?}",
+            file.case,
+            started.url
+        );
+        assert_iso8601_millis(file.case, &started.url_expiry);
+
+        // "The headers to be provided while uploading the file to the URL": the media type
+        // the signature bound, and the length of the declared file.
+        let header = |name: &str| {
+            started
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            header("content-type").as_deref(),
+            Some(file.content_type),
+            "case {:?}: expected HeadersToInclude to bind the declared ContentType, got {:?}",
+            file.case,
+            started.headers
+        );
+        assert_eq!(
+            header("content-length").as_deref(),
+            Some(file.size.to_string().as_str()),
+            "case {:?}: expected HeadersToInclude to carry the declared size, got {:?}",
+            file.case,
+            started.headers
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_client_token_replays_the_attachment_the_first_call_minted() {
+    let router = router();
+    let connection_token = connect(&router, "participant-idempotent-upload").await;
+
+    for file in FILES {
+        let first = start(
+            &router,
+            &connection_token,
+            file.case,
+            file.name,
+            file.content_type,
+            file.size,
+            "one-and-only-token",
+        )
+        .await;
+        let second = start(
+            &router,
+            &connection_token,
+            file.case,
+            file.name,
+            file.content_type,
+            file.size,
+            "one-and-only-token",
+        )
+        .await;
+        assert_eq!(
+            (second.attachment_id.as_str(), second.url.as_str()),
+            (first.attachment_id.as_str(), first.url.as_str()),
+            "case {:?}: expected the repeat to replay the first attachment and its target",
+            file.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_file_uploaded_to_the_published_target_is_the_file_downloaded_back() {
+    let router = router();
+    let connection_token = connect(&router, "participant-attachment-lifecycle").await;
+
+    for (index, file) in FILES.iter().enumerate() {
+        let started = start(
+            &router,
+            &connection_token,
+            file.case,
+            file.name,
+            file.content_type,
+            file.size,
+            &format!("lifecycle-start-{index}"),
+        )
+        .await;
+
+        // Before the upload is confirmed there is no download at all.
+        let (status, body) =
+            get_attachment(&router, &connection_token, &started.attachment_id, None).await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {:?}: expected GetAttachment before completion to be refused, got {body:?}",
+            file.case
+        );
+
+        // The file goes to the published target with the headers that were reported.
+        let uploaded = fetch(
+            &router,
+            "PUT",
+            &started.url,
+            &started.headers,
+            file.bytes(),
+        )
+        .await;
+        assert_eq!(
+            uploaded.status,
+            200,
+            "case {:?}: expected the upload to be stored, got {:?}",
+            file.case,
+            uploaded.json()
+        );
+
+        let (status, body) = complete(
+            &router,
+            &connection_token,
+            &started.attachment_id,
+            &format!("lifecycle-complete-{index}"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: CompleteAttachmentUpload got {body:?}",
+            file.case
+        );
+
+        // The read back reports the stored size and a pre-signed download address.
+        let (status, body) =
+            get_attachment(&router, &connection_token, &started.attachment_id, None).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: GetAttachment got {body:?}",
+            file.case
+        );
+        assert_eq!(
+            body["AttachmentSizeInBytes"].as_u64(),
+            Some(file.size as u64),
+            "case {:?}: expected the declared size, got {body:?}",
+            file.case
+        );
+        let download_url = body["Url"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {:?}: no Url in {body:?}", file.case))
+            .to_string();
+        assert_iso8601_millis(
+            file.case,
+            body["UrlExpiry"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {:?}: no UrlExpiry in {body:?}", file.case)),
+        );
+
+        // And that address serves the very bytes that were uploaded.
+        let downloaded = fetch(&router, "GET", &download_url, &[], Vec::new()).await;
+        assert_eq!(
+            downloaded.status,
+            200,
+            "case {:?}: expected the download to be served, got {:?}",
+            file.case,
+            downloaded.json()
+        );
+        assert_eq!(
+            downloaded.body,
+            file.bytes(),
+            "case {:?}: expected the uploaded bytes back, got {} bytes",
+            file.case,
+            downloaded.body.len()
+        );
+        assert_eq!(
+            downloaded.content_type.as_deref(),
+            Some(file.content_type),
+            "case {:?}: expected the declared media type on the download",
+            file.case
+        );
+
+        // A `HEAD` reports the object without its bytes.
+        let headed = fetch(&router, "HEAD", &download_url, &[], Vec::new()).await;
+        assert_eq!(
+            (headed.status, headed.body.len()),
+            (200, 0),
+            "case {:?}: expected HEAD to report the object with no body",
+            file.case
+        );
+
+        // The confirmed attachment is part of the conversation, so the transcript carries it.
+        let (status, transcript) = post(
+            &router,
+            "/participant/transcript",
+            Some(&connection_token),
+            &json!({"MaxResults": 100}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: GetTranscript got {transcript:?}",
+            file.case
+        );
+        let item = transcript["Transcript"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {:?}: no Transcript in {transcript:?}", file.case))
+            .iter()
+            .find(|item| {
+                item["Attachments"][0]["AttachmentId"].as_str() == Some(&started.attachment_id)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: no transcript item for attachment {:?} in {transcript:?}",
+                    file.case, started.attachment_id
+                )
+            })
+            .clone();
+        assert_eq!(
+            (
+                item["Type"].as_str(),
+                item["Attachments"][0]["AttachmentName"].as_str(),
+                item["Attachments"][0]["ContentType"].as_str(),
+                item["Attachments"][0]["Status"].as_str(),
+            ),
+            (
+                Some("ATTACHMENT"),
+                Some(file.name),
+                Some(file.content_type),
+                Some("APPROVED"),
+            ),
+            "case {:?}: unexpected transcript item {item:?}",
+            file.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn confirming_one_upload_twice_conflicts() {
+    let router = router();
+    let connection_token = connect(&router, "participant-complete-twice").await;
+
+    for (index, file) in FILES.iter().enumerate() {
+        let started = start(
+            &router,
+            &connection_token,
+            file.case,
+            file.name,
+            file.content_type,
+            file.size,
+            &format!("twice-start-{index}"),
+        )
+        .await;
+        let (status, body) = complete(
+            &router,
+            &connection_token,
+            &started.attachment_id,
+            &format!("twice-first-{index}"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the first confirmation got {body:?}",
+            file.case
+        );
+
+        // A second confirmation of the same attachment, as its own request.
+        let (status, body) = complete(
+            &router,
+            &connection_token,
+            &started.attachment_id,
+            &format!("twice-second-{index}"),
+        )
+        .await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (409, "ConflictException"),
+            "case {:?}: expected the second confirmation to conflict, got {body:?}",
+            file.case
+        );
+
+        // While a REPEAT of the first request — the same client token — is the same
+        // confirmation, so it is answered as the first one was.
+        let (status, body) = complete(
+            &router,
+            &connection_token,
+            &started.attachment_id,
+            &format!("twice-first-{index}"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the repeated confirmation to replay, got {body:?}",
+            file.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_attachment_is_reachable_only_through_its_own_chats_connection() {
+    let router = router();
+    let mine = connect(&router, "participant-owner").await;
+    let other = connect(&router, "participant-bystander").await;
+
+    for (index, file) in FILES.iter().enumerate() {
+        let started = start(
+            &router,
+            &mine,
+            file.case,
+            file.name,
+            file.content_type,
+            file.size,
+            &format!("scope-start-{index}"),
+        )
+        .await;
+        let (status, body) = complete(
+            &router,
+            &mine,
+            &started.attachment_id,
+            &format!("scope-complete-{index}"),
+        )
+        .await;
+        assert_eq!(status, 200, "case {:?}: confirmation got {body:?}", file.case);
+
+        // Another chat's participant cannot read it, and cannot confirm it either: an
+        // attachment of one contact is not an attachment of another's.
+        let (status, body) = get_attachment(&router, &other, &started.attachment_id, None).await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {:?}: expected another chat's GetAttachment to be refused, got {body:?}",
+            file.case
+        );
+        let (status, body) = complete(
+            &router,
+            &other,
+            &started.attachment_id,
+            &format!("scope-foreign-{index}"),
+        )
+        .await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {:?}: expected another chat's confirmation to be refused, got {body:?}",
+            file.case
+        );
+
+        // And a connection token that authenticates nobody is denied outright.
+        let unknown = format!("not-a-connection-token-{index}");
+        let (status, body) =
+            start_raw(&router, &unknown, file.name, file.content_type, 1, "denied").await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (403, "AccessDeniedException"),
+            "case {:?}: expected StartAttachmentUpload to deny an unknown token, got {body:?}",
+            file.case
+        );
+        let (status, body) = complete(&router, &unknown, &started.attachment_id, "denied").await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (403, "AccessDeniedException"),
+            "case {:?}: expected CompleteAttachmentUpload to deny an unknown token, got {body:?}",
+            file.case
+        );
+        let (status, body) = get_attachment(&router, &unknown, &started.attachment_id, None).await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (403, "AccessDeniedException"),
+            "case {:?}: expected GetAttachment to deny an unknown token, got {body:?}",
+            file.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_attachment_nobody_minted_is_refused() {
+    let router = router();
+    let connection_token = connect(&router, "participant-unknown-attachment").await;
+
+    // `ArtifactId` is `len 1..256`, so each of these satisfies the model and names no
+    // attachment this chat holds.
+    for id in [
+        "00000000-0000-4000-8000-000000000000",
+        "not-an-id",
+        &"a".repeat(256),
+    ] {
+        let (status, body) = get_attachment(&router, &connection_token, id, None).await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {id:?}: expected GetAttachment to refuse an unknown attachment, got {body:?}"
+        );
+        let (status, body) = complete(&router, &connection_token, id, "unknown").await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {id:?}: expected CompleteAttachmentUpload to refuse an unknown attachment, \
+             got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_download_window_is_the_one_the_caller_asked_for() {
+    let router = router();
+    let connection_token = connect(&router, "participant-download-window").await;
+    let started = start(
+        &router,
+        &connection_token,
+        "download window",
+        "note.txt",
+        "text/plain",
+        1,
+        "window-start",
+    )
+    .await;
+    let (status, body) = complete(
+        &router,
+        &connection_token,
+        &started.attachment_id,
+        "window-complete",
+    )
+    .await;
+    assert_eq!(status, 200, "CompleteAttachmentUpload got {body:?}");
+
+    // `UrlExpiryInSeconds` is modelled `range 5..300`: both published bounds, a value
+    // inside them, and the absent member, which takes the longest window the range allows.
+    for (case, requested, signed_for) in [
+        ("the published minimum", Some(5), "5"),
+        ("inside the range", Some(60), "60"),
+        ("the published maximum", Some(300), "300"),
+        ("no window asked for", None, "300"),
+    ] {
+        let (status, body) =
+            get_attachment(&router, &connection_token, &started.attachment_id, requested).await;
+        assert_eq!(status, 200, "case {case:?}: GetAttachment got {body:?}");
+        let url = body["Url"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no Url in {body:?}"));
+        assert_eq!(
+            query_param(url, "X-Amz-Expires").as_deref(),
+            Some(signed_for),
+            "case {case:?}: expected the download URL signed for {signed_for} seconds, got {url:?}"
+        );
+    }
+
+    // One past each bound is outside the modelled range, so the request is refused.
+    for (case, requested) in [("one below the minimum", 4), ("one above the maximum", 301)] {
+        let (status, body) = get_attachment(
+            &router,
+            &connection_token,
+            &started.attachment_id,
+            Some(requested),
+        )
+        .await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected UrlExpiryInSeconds {requested} to be refused, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_attachment_larger_than_this_emulator_holds_is_refused() {
+    let router = router();
+    let connection_token = connect(&router, "participant-attachment-size").await;
+    let max = participant::state::MAX_ATTACHMENT_BYTES;
+
+    // The bound itself is accepted — nothing is uploaded for it here, so only the
+    // declaration is judged — and one byte past it is refused.
+    let (status, body) = start_raw(
+        &router,
+        &connection_token,
+        "at the bound.bin",
+        "application/octet-stream",
+        max,
+        "size-at-bound",
+    )
+    .await;
+    assert_eq!(status, 200, "case \"at the bound\": got {body:?}");
+
+    let (status, body) = start_raw(
+        &router,
+        &connection_token,
+        "past the bound.bin",
+        "application/octet-stream",
+        max + 1,
+        "size-past-bound",
+    )
+    .await;
+    assert_eq!(
+        (status, error_type(&body).as_str()),
+        (400, "ValidationException"),
+        "case \"one past the bound\": expected a refusal, got {body:?}"
+    );
+
+    // And zero is outside `AttachmentSizeInBytes`' own modelled range of 1..
+    let (status, body) = start_raw(
+        &router,
+        &connection_token,
+        "nothing.bin",
+        "application/octet-stream",
+        0,
+        "size-zero",
+    )
+    .await;
+    assert_eq!(
+        (status, error_type(&body).as_str()),
+        (400, "ValidationException"),
+        "case \"zero bytes\": expected a refusal, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_contact_holds_at_most_its_attachment_quota() {
+    let router = router();
+    let connection_token = connect(&router, "participant-attachment-quota").await;
+    let quota = participant::state::MAX_ATTACHMENTS_PER_CONTACT;
+
+    for index in 0..quota {
+        let (status, body) = start_raw(
+            &router,
+            &connection_token,
+            "note.txt",
+            "text/plain",
+            1,
+            &format!("quota-{index}"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case \"attachment {index} of the quota\": got {body:?}"
+        );
+    }
+    let (status, body) = start_raw(
+        &router,
+        &connection_token,
+        "note.txt",
+        "text/plain",
+        1,
+        "quota-past",
+    )
+    .await;
+    assert_eq!(
+        (status, error_type(&body).as_str()),
+        (402, "ServiceQuotaExceededException"),
+        "case \"one past the quota\": expected a refusal, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_content_type_that_is_not_a_media_type_is_refused() {
+    let router = router();
+    let connection_token = connect(&router, "participant-content-type").await;
+
+    // Each of these satisfies `ContentType`'s modelled `len 1..255` and none of them
+    // describes a MIME file type the upload target could declare: a header value carries no
+    // control characters.
+    for (case, content_type) in [
+        ("a newline", "text/plain\nx: y"),
+        ("a carriage return", "text/plain\r"),
+        ("a NUL", "text/\0plain"),
+    ] {
+        let (status, body) = start_raw(
+            &router,
+            &connection_token,
+            "note.txt",
+            content_type,
+            1,
+            &format!("content-type-{case}"),
+        )
+        .await;
+        assert_eq!(
+            (status, error_type(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected the ContentType to be refused, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_custom_bot_participant_is_denied_the_attachments_of_its_own_chat() {
+    let (router, engine) = router_and_engine();
+
+    // `PARTICIPANT_ROLE_VALUES`: every role a session's participant can hold. A chat's human
+    // and system participants read their attachments; `GetAttachment` documents CUSTOM_BOT as
+    // "not permitted to access attachments customers may upload".
+    for (index, (role, expected_status, expected_error)) in [
+        ("CUSTOMER", 200, None),
+        ("AGENT", 200, None),
+        ("SUPERVISOR", 200, None),
+        ("SYSTEM", 200, None),
+        ("CUSTOM_BOT", 403, Some("AccessDeniedException")),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let participant_token = format!("participant-role-{index}");
+        let connection_token = connect(&router, &participant_token).await;
+        let started = start(
+            &router,
+            &connection_token,
+            role,
+            "note.txt",
+            "text/plain",
+            1,
+            &format!("role-start-{index}"),
+        )
+        .await;
+        let (status, body) = complete(
+            &router,
+            &connection_token,
+            &started.attachment_id,
+            &format!("role-complete-{index}"),
+        )
+        .await;
+        assert_eq!(status, 200, "case {role:?}: confirmation got {body:?}");
+
+        // The role is the session's, written by the component that started the chat.
+        let contact_id = store(&engine)
+            .lock()
+            .participant_tokens
+            .get(&participant_token)
+            .cloned()
+            .unwrap_or_else(|| panic!("case {role:?}: no session for {participant_token:?}"));
+        store(&engine)
+            .lock()
+            .sessions
+            .get_mut(&contact_id)
+            .unwrap_or_else(|| panic!("case {role:?}: no session for {contact_id:?}"))
+            .participant_role = (*role).to_string();
+
+        let (status, body) =
+            get_attachment(&router, &connection_token, &started.attachment_id, None).await;
+        assert_eq!(
+            status, *expected_status,
+            "case {role:?}: expected HTTP {expected_status} from GetAttachment, got {body:?}"
+        );
+        match expected_error {
+            Some(error) => assert_eq!(
+                error_type(&body).as_str(),
+                *error,
+                "case {role:?}: expected {error}, got {body:?}"
+            ),
+            None => assert!(
+                body["Url"].as_str().is_some(),
+                "case {role:?}: expected a download URL, got {body:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_client_token_naming_another_attachment_is_judged_on_its_own() {
+    let router = router();
+    let connection_token = connect(&router, "participant-replay-scope").await;
+    let first = start(
+        &router,
+        &connection_token,
+        "the confirmed attachment",
+        "note.txt",
+        "text/plain",
+        1,
+        "scope-start-first",
+    )
+    .await;
+    let second = start(
+        &router,
+        &connection_token,
+        "the other attachment",
+        "other.txt",
+        "text/plain",
+        1,
+        "scope-start-second",
+    )
+    .await;
+
+    let (status, body) = complete(&router, &connection_token, &first.attachment_id, "one-token").await;
+    assert_eq!(status, 200, "the first confirmation got {body:?}");
+
+    // The same client token, naming ANOTHER attachment: one token confirms one upload, so
+    // this is its own request and the attachment it names is really confirmed — not answered
+    // with the stored success of the first one.
+    let (status, body) =
+        complete(&router, &connection_token, &second.attachment_id, "one-token").await;
+    assert_eq!(
+        status, 200,
+        "case \"another attachment under the same token\": got {body:?}"
+    );
+    let (status, body) =
+        get_attachment(&router, &connection_token, &second.attachment_id, None).await;
+    assert_eq!(
+        status, 200,
+        "case \"the other attachment after its own confirmation\": got {body:?}"
+    );
+
+    // And the first attachment is still confirmed, so confirming it again conflicts.
+    let (status, body) = complete(&router, &connection_token, &first.attachment_id, "one-token").await;
+    assert_eq!(
+        (status, error_type(&body).as_str()),
+        (409, "ConflictException"),
+        "case \"the first attachment again\": got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_download_is_served_only_inside_the_window_that_was_announced_for_it() {
+    let (router, engine) = router_and_engine();
+    let connection_token = connect(&router, "participant-download-window-plane").await;
+    let file = &FILES[0];
+    let started = start(
+        &router,
+        &connection_token,
+        file.case,
+        file.name,
+        file.content_type,
+        file.size,
+        "window-plane-start",
+    )
+    .await;
+    let uploaded = fetch(&router, "PUT", &started.url, &started.headers, file.bytes()).await;
+    assert_eq!(
+        uploaded.status,
+        200,
+        "the upload got {:?}",
+        uploaded.json()
+    );
+    let (status, body) = complete(
+        &router,
+        &connection_token,
+        &started.attachment_id,
+        "window-plane-complete",
+    )
+    .await;
+    assert_eq!(status, 200, "CompleteAttachmentUpload got {body:?}");
+
+    // Inside the window `GetAttachment` announced, the file is served.
+    let (status, body) =
+        get_attachment(&router, &connection_token, &started.attachment_id, Some(300)).await;
+    assert_eq!(status, 200, "GetAttachment got {body:?}");
+    let download_url = body["Url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no Url in {body:?}"))
+        .to_string();
+    let served = fetch(&router, "GET", &download_url, &[], Vec::new()).await;
+    assert_eq!(
+        (served.status, served.body.len()),
+        (200, file.size),
+        "case \"inside the announced window\": got {:?}",
+        served.json()
+    );
+
+    // Past it, the same URL is refused the way a pre-signed URL whose signature has expired
+    // is. The window is moved into the past in the store rather than waited out, so the case
+    // is decided by the rule and not by how long the test takes.
+    store(&engine)
+        .lock()
+        .attachments
+        .get_mut(&started.attachment_id)
+        .unwrap_or_else(|| panic!("no attachment {:?}", started.attachment_id))
+        .download_url_expiry = Some(std::time::SystemTime::UNIX_EPOCH);
+    let expired = fetch(&router, "GET", &download_url, &[], Vec::new()).await;
+    assert_eq!(
+        (
+            expired.status,
+            expired.json()["code"].as_str(),
+            expired.json()["message"].as_str()
+        ),
+        (403, Some("AccessDenied"), Some("Request has expired")),
+        "case \"past the announced window\": got {:?}",
+        expired.json()
+    );
+
+    // And an attachment confirmed with nothing ever uploaded to its target names no object,
+    // inside its announced window or not: no bytes are invented for it.
+    let empty = start(
+        &router,
+        &connection_token,
+        "a confirmation with no upload",
+        "empty.txt",
+        "text/plain",
+        1,
+        "window-plane-empty-start",
+    )
+    .await;
+    let (status, body) = complete(
+        &router,
+        &connection_token,
+        &empty.attachment_id,
+        "window-plane-empty-complete",
+    )
+    .await;
+    assert_eq!(status, 200, "CompleteAttachmentUpload got {body:?}");
+    let (status, body) =
+        get_attachment(&router, &connection_token, &empty.attachment_id, None).await;
+    assert_eq!(status, 200, "GetAttachment got {body:?}");
+    let url = body["Url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no Url in {body:?}"))
+        .to_string();
+    let nothing = fetch(&router, "GET", &url, &[], Vec::new()).await;
+    assert_eq!(
+        (nothing.status, nothing.json()["code"].as_str()),
+        (404, Some("NoSuchKey")),
+        "case \"a confirmed attachment with no file\": got {:?}",
+        nothing.json()
+    );
+}
+
+#[tokio::test]
+async fn the_published_target_takes_only_the_upload_it_was_minted_for() {
+    let router = router();
+    let connection_token = connect(&router, "participant-upload-plane").await;
+    let file = &FILES[1];
+
+    let started = start(
+        &router,
+        &connection_token,
+        file.case,
+        file.name,
+        file.content_type,
+        file.size,
+        "plane-start",
+    )
+    .await;
+
+    // No download URL has been reported for this attachment, so no request carries a window
+    // for it: the only call that announces one is `GetAttachment`.
+    let unannounced = fetch(&router, "GET", &started.url, &[], Vec::new()).await;
+    assert_eq!(
+        (unannounced.status, unannounced.json()["code"].as_str()),
+        (403, Some("AccessDenied")),
+        "case \"a download no URL was reported for\": got {:?}",
+        unannounced.json()
+    );
+
+    // A body of another length than the attachment declared is refused on the declared
+    // length and on the length that arrived.
+    for (case, body, expected_code) in [
+        ("one byte short", file.bytes()[1..].to_vec(), "IncompleteBody"),
+        (
+            "one byte long",
+            [file.bytes(), vec![file.fill]].concat(),
+            "EntityTooLarge",
+        ),
+    ] {
+        let headers: Vec<(String, String)> = vec![
+            ("content-type".to_string(), file.content_type.to_string()),
+            ("content-length".to_string(), body.len().to_string()),
+        ];
+        let refused = fetch(&router, "PUT", &started.url, &headers, body).await;
+        assert_eq!(
+            (refused.status, refused.json()["code"].as_str()),
+            (400, Some(expected_code)),
+            "case {case:?}: got {:?}",
+            refused.json()
+        );
+    }
+
+    // An upload declaring no length at all is refused rather than taken on trust.
+    let undeclared = fetch(
+        &router,
+        "PUT",
+        &started.url,
+        &[("content-type".to_string(), file.content_type.to_string())],
+        file.bytes(),
+    )
+    .await;
+    assert_eq!(
+        (undeclared.status, undeclared.json()["code"].as_str()),
+        (411, Some("MissingContentLength")),
+        "case \"no declared length\": got {:?}",
+        undeclared.json()
+    );
+
+    // A method neither published URL describes is refused as the method it is.
+    let posted = fetch(&router, "POST", &started.url, &[], Vec::new()).await;
+    assert_eq!(
+        (posted.status, posted.json()["code"].as_str()),
+        (405, Some("MethodNotAllowed")),
+        "case \"a method the target does not describe\": got {:?}",
+        posted.json()
+    );
+
+    // The upload itself, then a second one after it was confirmed: the target described one
+    // upload, and the confirmation closed it.
+    let stored = fetch(
+        &router,
+        "PUT",
+        &started.url,
+        &started.headers,
+        file.bytes(),
+    )
+    .await;
+    assert_eq!(
+        stored.status,
+        200,
+        "case \"the upload\": got {:?}",
+        stored.json()
+    );
+    let (status, body) = complete(
+        &router,
+        &connection_token,
+        &started.attachment_id,
+        "plane-complete",
+    )
+    .await;
+    assert_eq!(status, 200, "CompleteAttachmentUpload got {body:?}");
+    let after = fetch(
+        &router,
+        "PUT",
+        &started.url,
+        &started.headers,
+        file.bytes(),
+    )
+    .await;
+    assert_eq!(
+        (after.status, after.json()["code"].as_str()),
+        (403, Some("AccessDenied")),
+        "case \"an upload after the confirmation\": got {:?}",
+        after.json()
+    );
+
+    // And a path naming an attachment of nobody's chat names no object.
+    let elsewhere = started.url.replace(&started.attachment_id, "00000000-0000-4000-8000-000000000000");
+    let unknown = fetch(&router, "GET", &elsewhere, &[], Vec::new()).await;
+    assert_eq!(
+        (unknown.status, unknown.json()["code"].as_str()),
+        (404, Some("NoSuchKey")),
+        "case \"an attachment nobody minted\": got {:?}",
+        unknown.json()
+    );
+}

@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let transcript: Vec<Item> = page
             .iter()
-            .map(|&index| transcript_item(&session.transcript[index]))
+            .map(|&index| transcript_item(&state, &session.transcript[index]))
             .collect();
         // A continuation is reported only when the next page would make progress: a page
         // size of 0 consumes nothing, so it reports no `NextToken` rather than a token
@@ -512,7 +512,14 @@ impl TranscriptCursor {
 }
 
 /// One stored transcript item as the modelled `Item`.
-fn transcript_item(stored: &crate::state::TranscriptItem) -> Item {
+///
+/// `state` is read for the item's ATTACHMENTS: an attachment lives in the store rather than
+/// on the item, so what is reported for one is the record's current name, type and
+/// `ArtifactStatus` rather than a copy taken when the item was appended.
+fn transcript_item(
+    state: &crate::state::ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState,
+    stored: &crate::state::TranscriptItem,
+) -> Item {
     Item {
         absolute_time: Some(stored.absolute_time.clone()),
         content: stored.content.clone(),
@@ -522,9 +529,23 @@ fn transcript_item(stored: &crate::state::TranscriptItem) -> Item {
         participant_id: Some(stored.participant_id.clone()),
         display_name: stored.display_name.clone(),
         participant_role: Some(stored.participant_role.clone()),
-        // Attachments and message receipts belong to the attachment and receipt
-        // operations, which are still their own gap issues.
-        attachments: None,
+        // Only an `ATTACHMENT` item carries any; an attachment the store no longer holds is
+        // reported by neither this item nor anything else.
+        attachments: (!stored.attachments.is_empty()).then(|| {
+            stored
+                .attachments
+                .iter()
+                .filter_map(|id| state.attachments.get(id))
+                .map(|attachment| AttachmentItem {
+                    content_type: Some(attachment.content_type.clone()),
+                    attachment_id: Some(attachment.id.clone()),
+                    attachment_name: Some(attachment.name.clone()),
+                    status: Some(attachment.status.clone()),
+                })
+                .collect()
+        }),
+        // Message receipts belong to the receipt operations, which are still their own gap
+        // issues.
         message_metadata: None,
         // Only populated for a persistent chat whose item came from an earlier session.
         related_contact_id: None,

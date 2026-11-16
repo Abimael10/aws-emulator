@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The workspace's one reader of a request URI's path, which the attachment plane's claim and
+# its serving seam both read a request through.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

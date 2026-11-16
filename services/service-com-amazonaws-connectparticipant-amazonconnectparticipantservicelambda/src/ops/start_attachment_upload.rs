@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAttachmentUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAttachmentUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAttachmentUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes the pre-signed target one attachment is uploaded to, and records the
+//! attachment the rest of its lifecycle (`CompleteAttachmentUpload`, `GetAttachment`) is
+//! served from. The record lives in [`crate::state::Attachment`]; the plane that receives
+//! the file at the published target is in `crate::service`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAttachmentUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAttachmentUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAttachmentUpload"))
+        let now = std::time::SystemTime::now();
+
+        // An attachment this emulator cannot hold is refused on the size the request
+        // DECLARES, before any upload target is published for it.
+        if input.attachment_size_in_bytes > crate::state::MAX_ATTACHMENT_BYTES {
+            return Err(StartAttachmentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "AttachmentSizeInBytes {} exceeds the maximum attachment size of {} bytes",
+                        input.attachment_size_in_bytes,
+                        crate::state::MAX_ATTACHMENT_BYTES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `ContentType` "Describes the MIME file type of the attachment", and the published
+        // upload target binds it as the media type the caller must declare, so a value that
+        // is not a header value at all describes no MIME type and is refused as the input it
+        // is — never carried into a stored record, where it would later be served back.
+        if http::HeaderValue::from_str(&input.content_type).is_err() {
+            return Err(StartAttachmentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: "ContentType must be a MIME file type, with no control characters"
+                        .to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(StartAttachmentUploadErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reclaim what the clock has already retired before anything new is minted.
+        state.prune_expired(now);
+
+        let Some(session) = state.session_for_connection_token(&input.connection_token, now) else {
+            return Err(StartAttachmentUploadErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+        let contact_id = session.contact_id.clone();
+
+        // A repeated `ClientToken` must answer with the attachment the first call minted —
+        // including the very upload target it published — and must not mint a second one.
+        let key = crate::state::attachment_idempotency_key(
+            &contact_id,
+            Self::NAME,
+            &input.client_token,
+        );
+        if let Some(replayed) = state.replayed_attachment(&key) {
+            return Ok(upload_output(replayed));
+        }
+
+        if state.attachment_count(&contact_id) >= crate::state::MAX_ATTACHMENTS_PER_CONTACT {
+            return Err(
+                StartAttachmentUploadErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: ATTACHMENT_QUOTA_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The upload target is an address the CALLER follows, so it is pre-signed against
+        // this emulator's own endpoint and carries the attachment's own path; the plane in
+        // `crate::service` receives the file there.
+        let attachment_id = crate::state::new_id();
+        let Some(signed) = crate::state::attachment_url(
+            ctx,
+            http::Method::PUT,
+            &contact_id,
+            &attachment_id,
+            Some(&input.content_type),
+            crate::state::DEFAULT_URL_EXPIRY,
+        ) else {
+            return Err(StartAttachmentUploadErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "no upload URL could be signed for this attachment".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let attachment = crate::state::Attachment {
+            id: attachment_id.clone(),
+            contact_id,
+            name: input.attachment_name.clone(),
+            content_type: input.content_type.clone(),
+            size_in_bytes: input.attachment_size_in_bytes,
+            // The upload has been started and nothing has confirmed it yet, which is what
+            // `CompleteAttachmentUpload` is for.
+            status: crate::state::ARTIFACT_STATUS_IN_PROGRESS.to_string(),
+            upload_url: signed.as_str().to_string(),
+            upload_url_expiry: signed.expires_at(),
+            upload_headers: crate::state::upload_headers(
+                &signed,
+                input.attachment_size_in_bytes,
+            ),
+            uploaded: None,
+            // No download URL has been reported for it yet; `GetAttachment` is what does
+            // that, and the plane serves the file only inside the window it announced.
+            download_url_expiry: None,
+        };
+        let output = upload_output(&attachment);
+        state.attachments.insert(attachment_id.clone(), attachment);
+        state.record_attachment_idempotency(key, attachment_id);
+        Ok(output)
+    }
+}
+
+/// The `ServiceQuotaExceededException$Message` an upload past
+/// [`crate::state::MAX_ATTACHMENTS_PER_CONTACT`] is refused with: the sentence the modelled
+/// error itself states ("The number of attachments per contact exceeds the quota").
+const ATTACHMENT_QUOTA_MESSAGE: &str = "The number of attachments per contact exceeds the quota.";
+
+/// One stored attachment as the response its upload is reported with: the id every later
+/// call names it by, and the pre-signed target the file is uploaded to.
+///
+/// Built from the STORED record rather than from the request, so a repeated `ClientToken`
+/// is answered with exactly what the first call reported.
+fn upload_output(attachment: &crate::state::Attachment) -> StartAttachmentUploadOutput {
+    StartAttachmentUploadOutput {
+        attachment_id: Some(attachment.id.clone()),
+        upload_metadata: Some(UploadMetadata {
+            url: Some(attachment.upload_url.clone()),
+            url_expiry: Some(crate::state::format_instant(attachment.upload_url_expiry)),
+            headers_to_include: Some(attachment.upload_headers.iter().cloned().collect()),
+        }),
     }
 }
