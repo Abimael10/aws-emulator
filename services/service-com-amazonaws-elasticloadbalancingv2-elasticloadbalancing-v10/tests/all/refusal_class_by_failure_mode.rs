@@ -319,13 +319,14 @@ async fn an_attribute_value_outside_its_domain_is_refused_for_how_it_missed() {
             refused: None,
         },
         // A target group's attributes: a range, a boolean and a range-or-literal domain.
+        // Its validator states the WHOLE range, as a listener's does.
         DomainRow {
             owner: Owner::TargetGroup,
             key: "deregistration_delay.timeout_seconds",
             value: "3601",
             refused: Some(
-                "The value of 'deregistration_delay.timeout_seconds' cannot be greater than 3600 \
-                 characters"
+                "'deregistration_delay.timeout_seconds' value '3601' must be between '0-3600' \
+                 inclusive"
                     .to_string(),
             ),
         },
@@ -333,6 +334,12 @@ async fn an_attribute_value_outside_its_domain_is_refused_for_how_it_missed() {
             owner: Owner::TargetGroup,
             key: "deregistration_delay.timeout_seconds",
             value: "3600",
+            refused: None,
+        },
+        DomainRow {
+            owner: Owner::TargetGroup,
+            key: "deregistration_delay.timeout_seconds",
+            value: "0",
             refused: None,
         },
         DomainRow {
@@ -360,9 +367,8 @@ async fn an_attribute_value_outside_its_domain_is_refused_for_how_it_missed() {
             key: "target_group_health.dns_failover.minimum_healthy_targets.percentage",
             value: "0",
             refused: Some(
-                "The value of \
-                 'target_group_health.dns_failover.minimum_healthy_targets.percentage' cannot be \
-                 less than 1 characters"
+                "'target_group_health.dns_failover.minimum_healthy_targets.percentage' value '0' \
+                 must be between '1-100' inclusive"
                     .to_string(),
             ),
         },

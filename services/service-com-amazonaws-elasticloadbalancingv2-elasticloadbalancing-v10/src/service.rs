@@ -97,6 +97,11 @@ pub mod data_plane;
 
 pub mod access_logs;
 
+/// Whether the Amazon S3 destination a load balancer's log attributes name is one the
+/// delivery could write into, which is what an attribute write that switches one on is
+/// judged against before it is stored.
+pub mod access_log_destination;
+
 pub mod lambda_target;
 
 pub mod invalid_header_fields;

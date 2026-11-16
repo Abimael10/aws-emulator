@@ -147,7 +147,11 @@ pub(super) fn destination(record: &LoadBalancerRecord) -> Option<Destination> {
 /// What `key` holds for `record`: a caller's own write, else the value the attribute is
 /// carried at — read through the ONE catalog of load balancer attributes. `None` for a load
 /// balancer of a family that carries no such attribute.
-fn attribute(record: &LoadBalancerRecord, key: &str) -> Option<String> {
+///
+/// `pub(super)` because the destination judging beside this module
+/// ([`super::access_log_destination`]) reads the same attributes of the same record: one
+/// reading, so what a write is judged against and what is delivered cannot drift.
+pub(super) fn attribute(record: &LoadBalancerRecord, key: &str) -> Option<String> {
     let spec = crate::state::load_balancer_attribute(key)?;
     if !spec.applies_to(record) {
         return None;
@@ -479,17 +483,81 @@ pub(super) async fn deliver(
     }
 }
 
-/// The prefix EVERY access-log file of one load balancer lands under:
-/// `<prefix>/AWSLogs/<account-id>/elasticloadbalancing/<region>/`, with a trailing separator.
-pub(super) fn log_file_prefix(destination: &Destination) -> String {
+/// What Elastic Load Balancing names the file it VERIFIES a log destination with, in the
+/// account folder of the layout: a load balancer told to deliver its access logs writes this
+/// object into the destination to show the destination can receive one.
+pub(super) const TEST_FILE_NAME: &str = "ELBAccessLogTestFile";
+
+/// What that file CARRIES: one plain-text line saying what wrote it and why, which is what a
+/// client reading the object finds — a marker, not a log, so it is neither empty nor the gzip
+/// stream a record is ([`LOG_FILE_SUFFIX`]).
+pub(super) const TEST_FILE_CONTENT: &[u8] =
+    b"Enabling Elastic Load Balancing access logs: this file verifies that logs can be \
+      delivered to this location.\n";
+
+/// The media type that file is: plain text.
+const TEXT_MEDIA_TYPE: &str = "text/plain";
+
+/// The key that file takes: the destination's own root ([`delivery_prefix`]) and the
+/// documented name — `<prefix>/AWSLogs/<account-id>/ELBAccessLogTestFile`.
+pub(super) fn test_file_key(destination: &Destination) -> String {
+    format!("{}{TEST_FILE_NAME}", delivery_prefix(destination))
+}
+
+/// Write that file into the bucket `destination` names, which is what a load balancer does
+/// when a write leaves its access logs enabled.
+///
+/// Best effort, as [`deliver`] is — an emulator with no object store mounted has nowhere to
+/// write, and the attribute write that asked for it still stands.
+pub(super) async fn deliver_test_file(ctx: &OperationContext<'_>, destination: &Destination) {
+    let key = test_file_key(destination);
+    let client = ::service_common::s3_client::s3_client(ctx.callback(), &destination.region);
+    let answer = client
+        .put_object()
+        .bucket(&destination.bucket)
+        .key(&key)
+        .content_type(TEXT_MEDIA_TYPE)
+        .body(::aws_sdk_s3::primitives::ByteStream::from_static(
+            TEST_FILE_CONTENT,
+        ))
+        .send()
+        .await;
+    if let Err(error) = answer {
+        ::tracing::warn!(
+            bucket = %destination.bucket,
+            key = %key,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "a load balancer's access-log destination could not be verified"
+        );
+    }
+}
+
+/// The prefix EVERY object a load balancer's log delivery writes lands under:
+/// `<prefix>/AWSLogs/<account-id>/`, with a trailing separator — the attribute's own prefix
+/// followed by the two segments the delivery itself writes.
+///
+/// It is where the DESTINATION is rooted rather than where one file goes, which is why both
+/// the log files below and the file the delivery verifies the destination with
+/// ([`test_file_key`]) are keyed from it.
+pub(super) fn delivery_prefix(destination: &Destination) -> String {
     let prefix = destination
         .prefix
         .as_deref()
         .map(|prefix| format!("{prefix}/"))
         .unwrap_or_default();
     format!(
-        "{prefix}{LOG_FILE_ROOT_SEGMENT}/{}/{LOG_FILE_SERVICE_SEGMENT}/{}/",
-        destination.account_id, destination.region
+        "{prefix}{LOG_FILE_ROOT_SEGMENT}/{}/",
+        destination.account_id
+    )
+}
+
+/// The prefix EVERY access-log file of one load balancer lands under:
+/// `<prefix>/AWSLogs/<account-id>/elasticloadbalancing/<region>/`, with a trailing separator.
+pub(super) fn log_file_prefix(destination: &Destination) -> String {
+    format!(
+        "{}{LOG_FILE_SERVICE_SEGMENT}/{}/",
+        delivery_prefix(destination),
+        destination.region
     )
 }
 

@@ -2755,17 +2755,18 @@ impl AttributeDomain {
     ///
     /// * a value that is no integer at all: "The value of '<key>' must be a valid integer",
     ///   with the literal the domain also admits named where it has one;
-    /// * an integer outside the documented range: the bound it missed — "The value of
+    /// * an integer outside the documented range: the whole range — "'<key>' value '<value>'
+    ///   must be between '<min>-<max>' inclusive" — except on a LOAD BALANCER's attributes,
+    ///   whose own validator states only the bound the value missed instead: "The value of
     ///   '<key>' cannot be less than <min> characters" and the `greater than <max>` form
-    ///   beside it — except on a LISTENER's attributes, whose own validator states the
-    ///   whole range instead: "'<key>' value '<value>' must be between '<min>-<max>'
-    ///   inclusive";
+    ///   beside it;
     /// * a value outside an enumerated set, of which a boolean is the two-value case: "The
     ///   value of '<key>' must be 'true' or 'false', but was '<value>'".
     ///
     /// The one difference between the owners is the range sentence, and it is recorded
-    /// behaviour: the answers this service is checked against word a load balancer
-    /// attribute's bound and a listener attribute's range that way.
+    /// behaviour: the answers this service is checked against word a listener attribute's
+    /// and a target group attribute's range as the whole range, and a load balancer
+    /// attribute's as the single bound the value missed.
     pub fn check(&self, owner: AttributeOwner, key: &str, value: &str) -> Result<(), String> {
         // An integer domain misses in two ways, and each has its own sentence: the value
         // is not an integer, or it is one the range does not admit. `alternative` names
@@ -2783,7 +2784,7 @@ impl AttributeDomain {
                 return Ok(());
             }
             Err(match (owner, parsed < min) {
-                (AttributeOwner::Listener, _) => {
+                (AttributeOwner::Listener | AttributeOwner::TargetGroup, _) => {
                     format!("'{key}' value '{value}' must be between '{min}-{max}' inclusive")
                 }
                 (_, true) => format!("The value of '{key}' cannot be less than {min} characters"),

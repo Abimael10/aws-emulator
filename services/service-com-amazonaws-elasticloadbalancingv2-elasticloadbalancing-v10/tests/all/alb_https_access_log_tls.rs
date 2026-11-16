@@ -61,6 +61,10 @@ const ENABLED_ATTRIBUTE: &str = "access_logs.s3.enabled";
 const BUCKET_ATTRIBUTE: &str = "access_logs.s3.bucket";
 const PREFIX_ATTRIBUTE: &str = "access_logs.s3.prefix";
 
+/// What an access-log file's name ends with: the log, gzipped — which is what tells a record
+/// apart from the file the delivery verified the destination with.
+const LOG_FILE_SUFFIX: &str = ".log.gz";
+
 /// What a record's field carries where it does not apply.
 const ABSENT: &str = "-";
 
@@ -122,7 +126,8 @@ fn s3(router: &MultiServiceRouter) -> aws_sdk_s3::Client {
 }
 
 /// Create the bucket the access log is delivered into, in the Region every request here is
-/// signed for.
+/// signed for, and write the grant that admits the delivery into it — setup a client does on
+/// AWS before it can turn logging on at all, through the crate's one spelling of that policy.
 async fn log_bucket(router: &MultiServiceRouter) {
     s3(router)
         .create_bucket()
@@ -135,6 +140,7 @@ async fn log_bucket(router: &MultiServiceRouter) {
         .send()
         .await
         .unwrap_or_else(|error| panic!("setup: creating {LOG_BUCKET} must succeed, got {error:?}"));
+    crate::access_log_destination::grant_log_delivery(router, LOG_BUCKET).await;
 }
 
 /// Turn access logging on for `lb_arn`, into the bucket above under `prefix`.
@@ -155,8 +161,12 @@ async fn enable_access_logs(router: &MultiServiceRouter, lb_arn: &str, prefix: &
     );
 }
 
-/// Every object the log bucket holds under `prefix`, by key, with the record each one
+/// Every access-log FILE the log bucket holds under `prefix`, by key, with the record each one
 /// carries — the gzip stream decompressed, as a reader of the log decompresses it.
+///
+/// The file the delivery verified the destination with when logging was switched on is no
+/// record and carries no log line, so it is not read here; that object is pinned in
+/// `all/access_log_destination.rs`.
 async fn delivered(router: &MultiServiceRouter, prefix: &str) -> Vec<(String, String)> {
     let listed = s3(router)
         .list_objects_v2()
@@ -168,6 +178,9 @@ async fn delivered(router: &MultiServiceRouter, prefix: &str) -> Vec<(String, St
     let mut records = Vec::new();
     for object in listed.contents() {
         let key = object.key().unwrap_or_default().to_string();
+        if !key.ends_with(LOG_FILE_SUFFIX) {
+            continue;
+        }
         let fetched = s3(router)
             .get_object()
             .bucket(LOG_BUCKET)

@@ -24,6 +24,16 @@
 //! request that writes that key records what this store now holds in the shared registry
 //! that service reads (`crate::state::record_zonal_shift_registration`).
 //!
+//! One group of attributes names a resource of another service as a DESTINATION: the
+//! `<name>.s3.{enabled,bucket,prefix}` triples that say where a load balancer delivers its
+//! logs. A write that leaves one of them switched on is judged against that destination
+//! before it is stored (`crate::service::access_log_destination`) — the bucket has to be one
+//! Amazon S3 holds, its policy has to admit the delivery's write under the path the
+//! attributes send it to, and the prefix may not open with the segment the layout itself
+//! writes — and a destination the delivery could never write into is the modelled
+//! `InvalidConfigurationRequestException`. A destination the write accepted is then verified
+//! the way Elastic Load Balancing verifies one, by writing its own test file into it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,10 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         // The store's lock lives in this block and is released with it: what follows reads
-        // ANOTHER service (the Availability Zone IDs are EC2's), and nothing holds this
-        // store while it does.
-        let (output, registration) = {
-            let mut guard = state.lock();
+        // ANOTHER service (the bucket a log destination names is Amazon S3's), and nothing
+        // holds this store while it does.
+        let (writes, pending) = {
+            let guard = state.lock();
             let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
                 return Err(
                     ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
@@ -251,9 +261,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 writes.push((key, value));
             }
 
-            // The validated writes land under the SAME lock the lookup was made under, so
-            // the record is still there; the refusal below is the lookup's own, restated
-            // rather than assumed away.
+            // Where the write leaves each of this load balancer's log destinations pointing,
+            // read under the same lock the validated writes were judged under. Resolving
+            // them is Amazon S3's answer and happens below, with no lock held.
+            let pending =
+                crate::service::access_log_destination::pending_destinations(load_balancer, &writes);
+            (writes, pending)
+        };
+
+        // A destination the delivery could never write into is a configuration this load
+        // balancer cannot hold, so it is refused BEFORE anything is stored — a caller is
+        // told at the API boundary rather than left with a load balancer that believes it
+        // is logging somewhere no object can land.
+        for destination in &pending {
+            if let Some(refusal) = destination.refusal(ctx).await {
+                return Err(refuse(refusal));
+            }
+        }
+
+        let (output, registration) = {
+            let mut guard = state.lock();
+            // The validated writes land under a FRESH lock, and the record is looked up
+            // again under it; the refusal below is the first lookup's own, restated rather
+            // than assumed away.
             let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn)
             else {
                 return Err(
@@ -289,6 +319,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then(|| guard.zonal_shift_registration(&input.load_balancer_arn));
             (output, registration)
         };
+        // A destination this write accepted is VERIFIED the way Elastic Load Balancing
+        // verifies one, by writing the file it names for exactly that into it — which is
+        // what a client reading the bucket sees once logging is on.
+        for destination in &pending {
+            destination.verify(ctx).await;
+        }
         if let Some(registration) = registration {
             crate::state::record_zonal_shift_registration(&*self.engine, ctx, &registration).await;
         }
