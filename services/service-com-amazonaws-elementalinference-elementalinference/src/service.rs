@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: a feed's MEDIA data plane (`POST
+//!   /v1/feed/{id}/input/{n}/metadata`, the path space the endpoint `dataEndpoints`
+//!   advertises is rooted at) names no modelled operation, so it is routed to
+//!   [`feed_media_plane`]; every other request resolves through the generated routing
+//!   table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -39,6 +42,8 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+
+pub mod feed_media_plane;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -141,6 +146,14 @@ fn as_this_service_states_it(violation: &Violation) -> Violation {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The one operation a feed's MEDIA data plane is served as
+    /// ([`feed_media_plane::FeedMediaPlane`]), built from the SAME shared engine the
+    /// generated entry threads into every control-plane operation, so a metadata query
+    /// reads exactly the feeds those operations persisted.
+    ///
+    /// Held on the service rather than built per request because
+    /// [`Service::override_operation`] hands the router a BORROW of it.
+    feed_media_plane: feed_media_plane::FeedMediaPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -149,7 +162,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            feed_media_plane: feed_media_plane::FeedMediaPlane::new(engine),
         }
     }
 }
@@ -180,7 +194,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // A feed's MEDIA data plane is exactly such a request: a metadata query is
+        // addressed by path and method on the endpoint `dataEndpoints` advertises
+        // (`POST /v1/feed/{id}/input/{n}/metadata`) and names no modelled operation of
+        // this service, so the generated routing table can never resolve it and the
+        // front door would report the one address the control plane told the client to
+        // use as an unimplemented operation. Routed here, it is served against stored
+        // feed state, and it gets this plane's own auth schemes so the credential it
+        // carries is verified as every other call of this service is.
+        if feed_media_plane::claims_request(req) {
+            return Some(&self.feed_media_plane);
+        }
         None
     }
 

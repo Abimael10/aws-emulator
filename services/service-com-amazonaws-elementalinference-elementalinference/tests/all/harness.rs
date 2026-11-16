@@ -43,6 +43,19 @@ pub fn message_of(error: &Value) -> &str {
 /// resolves the claiming service from it.
 pub const SIGNING_NAME: &str = "elemental-inference";
 
+/// The data endpoint every feed advertises (`GetFeedResponse$dataEndpoints`): the base
+/// URL this emulator is reached on, with the root path and the trailing slash a client
+/// concatenates a media path onto.
+///
+/// A suite drives the service IN PROCESS, on no socket, so the base the framework
+/// reports is its unserved one ([`smithy_server_runtime::UNSERVED_URL_BASE`]) — the same
+/// value `ctx.endpoint()` answers a handler; a served emulator reports the `host:port`
+/// it answers on there and the endpoint is rooted on that instead. Either way the
+/// authority is this responder's own, which is the rule under test.
+pub fn expected_data_endpoint() -> String {
+    format!("{}/", smithy_server_runtime::UNSERVED_URL_BASE)
+}
+
 /// Long enough for a clock-owed feed transition to have fallen due.
 pub fn past_the_transition_span() {
     // A plain blocking sleep: the test's runtime has nothing else to run, and the

@@ -383,7 +383,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: existing.arn.clone(),
                 name: existing.name.clone(),
                 id: existing.id.clone(),
-                data_endpoints: existing.data_endpoints.clone(),
+                // Rooted at the endpoint this emulator is reached on, like every
+                // other read of the field: the address a feed's media plane answers at
+                // is a property of where this process serves, not of the record.
+                data_endpoints: crate::state::feed_data_endpoints(ctx.endpoint().as_str()),
                 outputs: existing.get_outputs(),
                 access_role_arn: existing.access_role_arn.clone(),
                 status: existing.status.as_wire().to_string(),
@@ -413,7 +416,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let due = now + crate::state::FEED_CREATION_SPAN;
         let feed = crate::state::Feed {
             arn: crate::state::feed_arn(&region, &id),
-            data_endpoints: crate::state::feed_data_endpoints(&region, &id),
             name: input.name,
             id,
             // This service is REGIONAL: the feed belongs to the endpoint it was created
@@ -462,7 +464,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: feed.arn.clone(),
             name: feed.name.clone(),
             id: feed.id.clone(),
-            data_endpoints: feed.data_endpoints.clone(),
+            data_endpoints: crate::state::feed_data_endpoints(ctx.endpoint().as_str()),
             outputs: feed.get_outputs(),
             access_role_arn: feed.access_role_arn.clone(),
             status: feed.status.as_wire().to_string(),

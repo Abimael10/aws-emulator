@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: feed.arn.clone(),
             name: feed.name.clone(),
             id: feed.id.clone(),
-            data_endpoints: feed.data_endpoints.clone(),
+            // The address a client sends this feed's media to and reads its metadata
+            // back from: the endpoint THIS request reached, which is the only one a
+            // caller holding this response can dial
+            // (`crate::state::feed_data_endpoints`).
+            data_endpoints: crate::state::feed_data_endpoints(ctx.endpoint().as_str()),
             // The media inputs the feed exposes, built from the stored input set: a
             // client reading a feed learns the names an output's `audioInput` may carry
             // and where it pushes media, from the one copy of that fact

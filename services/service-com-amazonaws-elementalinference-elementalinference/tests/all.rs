@@ -43,6 +43,8 @@ mod feed_association_retry;
 mod feed_audio_binding;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
+#[path = "all/feed_media_data_plane.rs"]
+mod feed_media_data_plane;
 #[path = "all/feed_output_validation.rs"]
 mod feed_output_validation;
 #[path = "all/feed_policy.rs"]

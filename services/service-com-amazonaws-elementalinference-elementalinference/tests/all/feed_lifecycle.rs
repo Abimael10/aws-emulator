@@ -30,8 +30,8 @@
 //! * a feed whose deletion has been accepted cannot be updated (`ConflictException`).
 
 use crate::harness::{
-    call, config_with_resolved_audio_input, create_feed, message_of, output_config,
-    past_the_transition_span, router, REGION, SIGNING_NAME,
+    call, config_with_resolved_audio_input, create_feed, expected_data_endpoint, message_of,
+    output_config, past_the_transition_span, router, REGION, SIGNING_NAME,
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
@@ -196,14 +196,9 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
             .cloned()
             .unwrap_or_default();
         assert!(
-            !endpoints.is_empty()
-                && endpoints.iter().all(|e| e
-                    .as_str()
-                    .is_some_and(|e| e.starts_with("https://")
-                        && e.ends_with(&format!(
-                            ".{SIGNING_NAME}-data.{REGION}.api.aws/"
-                        )))),
-            "case {label:?}: dataEndpoints is a non-empty list of data-plane URLs, got {:?}",
+            endpoints.len() == 1 && endpoints[0] == json!(expected_data_endpoint()),
+            "case {label:?}: dataEndpoints is the endpoint this emulator is reached on, \
+             got {:?}",
             created["dataEndpoints"]
         );
         assert_eq!(

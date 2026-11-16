@@ -424,7 +424,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: feed.arn.clone(),
             name: feed.name.clone(),
             id: feed.id.clone(),
-            data_endpoints: feed.data_endpoints.clone(),
+            // An update to the output list does not move the feed's data plane: the
+            // endpoint is the address this emulator is reached on, reported exactly as
+            // every other read of the feed reports it.
+            data_endpoints: crate::state::feed_data_endpoints(ctx.endpoint().as_str()),
             outputs: feed.get_outputs(),
             access_role_arn: feed.access_role_arn.clone(),
             // HTTP 200, not 202: the update is COMPLETE when this call answers, so the

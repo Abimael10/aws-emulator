@@ -667,6 +667,17 @@ pub fn cannot_find_audio_input_message(audio_input: &str) -> String {
     format!("Can't find audio input {audio_input} in the feed. Use a different audioInput and try again.")
 }
 
+/// An output name the feed does not hold, named by a media data-plane request — the
+/// output's counterpart of [`cannot_find_audio_input_message`], and likewise built from
+/// the name the request supplied.
+///
+/// A metadata query is for the metadata of ONE of the feed's outputs, so a name that is
+/// not one of them names nothing the feed has metadata for, and the query is refused
+/// rather than answered for an output that does not exist.
+pub fn cannot_find_output_message(output_name: &str) -> String {
+    format!("Can't find output {output_name} in the feed. Use a different outputName and try again.")
+}
+
 /// The id of the dictionary an output config references, if it references one.
 ///
 /// Only a subtitling output can: `SubtitlingConfig$dictionary` is "The ID of a custom
@@ -942,7 +953,6 @@ pub struct Feed {
     /// exists for: the Region of the request that minted it ([`request_region`]), which
     /// is also the Region field of [`Self::arn`].
     pub region: String,
-    pub data_endpoints: Vec<String>,
     /// The media inputs this feed exposes, by name: the calling application sends media
     /// to them and each output names the one it consumes
     /// ([`audio_input_reference`]). Minted WITH the feed
@@ -1113,6 +1123,22 @@ impl Feed {
                 .map(|name| AudioInput { name: name.clone() })
                 .collect(),
         }
+    }
+
+    /// The media input at `position` in this feed's input set, or `None` when the feed
+    /// exposes no input there.
+    ///
+    /// The media data plane addresses an input by its position
+    /// (`/v1/feed/{id}/input/{n}/…`), while a read of the feed reports the same inputs
+    /// by name ([`Self::inputs`]) — one input set, read two ways, so a position that
+    /// names no input of the feed is exactly a position past what a read reports.
+    pub fn audio_input_at(&self, position: usize) -> Option<&str> {
+        self.audio_inputs.get(position).map(String::as_str)
+    }
+
+    /// The output of this feed named `name`, or `None` when it holds none.
+    pub fn output_named(&self, name: &str) -> Option<&Output> {
+        self.outputs.iter().find(|output| output.name == name)
     }
 
     /// This feed's SETTLED lifecycle status: the status the clock settles it into while
@@ -2280,48 +2306,92 @@ pub fn dictionary_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(SERVICE_NAMESPACE, region, &format!("dictionary/{id}"))
 }
 
-/// The top-level domain every data endpoint of this service sits under.
+/// The data endpoints of a feed, rooted at the endpoint this emulator is reached on.
 ///
-/// The media data plane is reached on a DEDICATED per-region domain,
-/// `<signing-name>-data.<region>.api.aws`, not on the control-plane service domain
-/// the control API itself answers on: a client routes media by the endpoint's domain
-/// suffix, so that suffix is part of the contract even though the host label is not.
-/// This constant is its last two labels; the rest are built from the signing name and
-/// the request's region in [`feed_data_endpoints`].
-const DATA_ENDPOINT_TLD: &str = "api.aws";
-
-/// How many hex characters the opaque host label of a data endpoint carries.
+/// One endpoint per feed ("Typically, there is only one endpoint"), as an absolute
+/// data-plane URL whose path is the root and which ends in the slash a client
+/// concatenates a path onto — the shape the recorded service publishes. The AUTHORITY
+/// is `endpoint_base`, the base
+/// [`::smithy_server_runtime::OperationContext::endpoint`] reports ("the base URL a
+/// later request addresses… Callers send normally signed requests to it"): the member
+/// is documented as the endpoint the feed "receives source media at" and "returns the
+/// resulting metadata to", so a client SENDS signed requests to this very value, and
+/// an authority this process does not answer on takes every one of them off the
+/// emulator, where nothing serves them. The opaque host label a recording shows is
+/// that environment's own addressing and is not part of the contract.
 ///
-/// The label itself is environment-specific — it is assigned by the data plane and is
-/// deliberately NOT the feed id, so a client cannot read a feed id out of an endpoint
-/// it was handed.
-const DATA_ENDPOINT_LABEL_LEN: usize = 10;
-
-/// The data endpoints of a feed in `region`.
-///
-/// One endpoint per feed ("Typically, there is only one endpoint"), as a data-plane
-/// URL: `https://<opaque-label>.<signing-name>-data.<region>.api.aws/`, with the
-/// trailing slash a client concatenates a path onto. The label is derived from the
-/// feed id, so it is stable for the life of the feed and distinct per feed, while
-/// being opaque rather than the id itself. The media data plane those endpoints serve
-/// (`PutMedia` / `GetMetadata`) is not part of this service's Smithy model, so no
-/// listener backs them — the field reports where the feed would be reached, which is
-/// all the control plane models.
-pub fn feed_data_endpoints(region: &str, id: &str) -> Vec<String> {
-    let label = data_endpoint_label(id);
-    vec![format!(
-        "https://{label}.{SERVICE_NAMESPACE}-data.{region}.{DATA_ENDPOINT_TLD}/"
-    )]
+/// What answers under it is [`crate::service::feed_media_plane`], mounted on the path
+/// space [`parse_feed_metadata_path`] reads, so the endpoint this service advertises
+/// and the path space it serves cannot drift apart. The Region is not in the host —
+/// one emulator serves every Region — it stays on the feed's ARN, which is what names
+/// the Region a feed belongs to.
+pub fn feed_data_endpoints(endpoint_base: &str) -> Vec<String> {
+    vec![format!("{}/", endpoint_base.trim_end_matches('/'))]
 }
 
-/// The opaque host label a feed's data endpoint carries: [`DATA_ENDPOINT_LABEL_LEN`]
-/// hex characters derived from the feed id (FNV-1a, then mixed), so two feeds get two
-/// labels and one feed keeps its own for life without the label spelling the id.
-fn data_endpoint_label(id: &str) -> String {
-    let mut hash = fnv1a64(id.as_bytes());
-    let mut label = format!("{:016x}", splitmix64(&mut hash));
-    label.truncate(DATA_ENDPOINT_LABEL_LEN);
-    label
+/// The first segment of every path of this service's API, control plane and media data
+/// plane alike (`CreateFeed` is `POST /v1/feed`, `GetFeed` `GET /v1/feed/{id}`:
+/// `smithy_query(query="digest")`).
+const API_VERSION_SEGMENT: &str = "v1";
+
+/// The segment naming the feed resource in a path (`/v1/feed/{id}`).
+const FEED_PATH_SEGMENT: &str = "feed";
+
+/// The segment naming one media INPUT of a feed on the media data plane, ahead of the
+/// segment that says WHICH input: `/v1/feed/{id}/input/{n}/…`.
+const FEED_INPUT_PATH_SEGMENT: &str = "input";
+
+/// The last segment of the path an output's metadata is queried at:
+/// `POST /v1/feed/{id}/input/{n}/metadata`.
+const FEED_METADATA_PATH_SEGMENT: &str = "metadata";
+
+/// What a request path says about a feed's media METADATA endpoint: the feed it
+/// addresses, and which of that feed's media inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedMetadataPath {
+    /// The `FeedId` the path names. Whether a feed with that id exists in the
+    /// request's Region is the handler's question, not this reader's.
+    pub feed_id: String,
+    /// The input the path names, exactly as the path spelled it. A feed's inputs are
+    /// addressed here by their POSITION in the feed's input set
+    /// (`GetFeedResponse$inputs`), which is what the path carries; whether that
+    /// spelling names an input the feed exposes is likewise the handler's question, so
+    /// a value that is not a position still reaches the plane and is refused there
+    /// rather than read as some other service's path.
+    pub input: String,
+}
+
+/// Read the feed media-metadata path a request addresses, or `None` when the request is
+/// not on that path space at all.
+///
+/// The path space is the one rooted at [`feed_data_endpoints`], so the endpoint this
+/// service advertises and the path the plane serves are written from the same constants
+/// and cannot drift. EMPTY segments are skipped, so a client that concatenates
+/// `/v1/feed/…` onto an endpoint already ending in `/` (yielding `//v1/feed/…`)
+/// addresses the same feed as one that does not. Segments are read RAW: every value
+/// this path space carries — a `FeedId` is modelled `[a-zA-Z0-9]{1,19}`, an input
+/// position is digits — is drawn from an alphabet no client percent-encodes.
+pub fn parse_feed_metadata_path(path: &str) -> Option<FeedMetadataPath> {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    if segments.next()? != API_VERSION_SEGMENT {
+        return None;
+    }
+    if segments.next()? != FEED_PATH_SEGMENT {
+        return None;
+    }
+    let feed_id = segments.next()?.to_string();
+    if segments.next()? != FEED_INPUT_PATH_SEGMENT {
+        return None;
+    }
+    let input = segments.next()?.to_string();
+    if segments.next()? != FEED_METADATA_PATH_SEGMENT {
+        return None;
+    }
+    // Nothing follows the metadata segment: a longer path addresses something else.
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(FeedMetadataPath { feed_id, input })
 }
 
 /// The name of the audio input a feed is minted with.

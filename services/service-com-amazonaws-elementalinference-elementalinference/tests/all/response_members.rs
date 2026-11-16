@@ -13,10 +13,10 @@
 //! * a map member the resource HAS is serialized even when it is empty: an untagged
 //!   feed or dictionary reports `"tags": {}`, never an absent member, so the member
 //!   does not start existing the moment the first tag is added;
-//! * every `dataEndpoints` entry is a data-plane URL on this service's own data
-//!   domain, `https://<opaque-label>.<signing-name>-data.<region>.api.aws/`: the
-//!   trailing slash a client concatenates a path onto, a host label that is opaque
-//!   (not the feed id) yet stable per feed and distinct between feeds;
+//! * every `dataEndpoints` entry is an absolute URL rooted at the endpoint this
+//!   emulator is REACHED on, with the root path and the trailing slash a client
+//!   concatenates a media path onto — the address a caller holding the response can
+//!   actually send media to and read metadata from;
 //! * an optional output-config member the service resolves itself is MATERIALISED on
 //!   the stored output, so every later read reports the configuration the service
 //!   applied and a `GetFeed` -> `UpdateFeed` round trip cannot drop it (the audio
@@ -25,8 +25,8 @@
 //!   member never report the same id.
 
 use crate::harness::{
-    call, config_with_resolved_audio_input, output_config, past_the_transition_span, router,
-    REGION, SIGNING_NAME,
+    call, config_with_resolved_audio_input, expected_data_endpoint, output_config,
+    past_the_transition_span, router,
 };
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -181,23 +181,20 @@ async fn dictionary_responses_carry_an_empty_tag_map_rather_than_omitting_tags()
 }
 
 // ---------------------------------------------------------------------------
-// The data-plane endpoint template.
+// The data-plane endpoint a feed advertises.
 // ---------------------------------------------------------------------------
 
-/// The domain suffix every data endpoint of this service sits under: a DEDICATED
-/// per-region data domain, not the control-plane service domain the control API
-/// itself answers on.
-fn data_domain_suffix() -> String {
-    format!(".{SIGNING_NAME}-data.{REGION}.api.aws/")
-}
-
-/// Every `dataEndpoints` entry is a URL on the data-plane domain, with a trailing
-/// slash and an opaque host label that is not the feed id.
+/// Every `dataEndpoints` entry is an absolute URL rooted at the endpoint this emulator
+/// is reached on, whose path is the root and which ends in the slash a client
+/// concatenates a media path onto — reported alike by the create, the read and the
+/// update.
 #[tokio::test]
-async fn data_endpoints_are_data_plane_urls_with_an_opaque_host_label() {
+async fn data_endpoints_are_rooted_at_the_endpoint_the_emulator_is_reached_on() {
     let router = router();
     // The rows differ along what the rule generalises over: how many outputs the feed
-    // carries and how long its name is — neither of which the endpoint depends on.
+    // carries, which features those outputs are for and how long its name is — the
+    // endpoint depends on none of them, because it is a property of where this process
+    // serves and not of the record.
     let rows: [(&str, &str, Value); 3] = [
         (
             "one cropping output",
@@ -219,64 +216,58 @@ async fn data_endpoints_are_data_plane_urls_with_an_opaque_host_label() {
         ),
     ];
 
-    let mut seen_endpoints: Vec<String> = Vec::new();
+    let expected = json!([expected_data_endpoint()]);
     for (label, name, outputs) in rows {
-        let (id, created) = create_feed(&router, feed_body(name, outputs, None), label).await;
-        let endpoints: Vec<String> = created["dataEndpoints"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|e| e.as_str().unwrap_or_default().to_string())
-            .collect();
-        assert!(
-            !endpoints.is_empty(),
-            "case {label:?}: dataEndpoints is a non-empty list, got {:?}",
+        let (id, created) = create_feed(&router, feed_body(name, outputs.clone(), None), label).await;
+        assert_eq!(
+            created["dataEndpoints"], expected,
+            "case {label:?}: CreateFeed advertises the endpoint this emulator is reached \
+             on, got {:?}",
             created["dataEndpoints"]
         );
-        for endpoint in &endpoints {
-            let suffix = data_domain_suffix();
-            assert!(
-                endpoint.ends_with(&suffix),
-                "case {label:?}: the endpoint sits on {suffix} and ends in a slash, \
-                 got {endpoint:?}"
-            );
-            let label_part = endpoint
-                .strip_prefix("https://")
-                .and_then(|rest| rest.strip_suffix(&suffix))
-                .unwrap_or_else(|| {
-                    panic!("case {label:?}: the endpoint is an https URL, got {endpoint:?}")
-                });
-            assert!(
-                !label_part.is_empty()
-                    && label_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
-                "case {label:?}: the host label is a non-empty lower-case hex label, \
-                 got {label_part:?}"
-            );
-            assert_ne!(
-                label_part, id,
-                "case {label:?}: the host label is opaque, not the feed id, got \
-                 {label_part:?}"
-            );
-            assert!(
-                !endpoint.contains("amazonaws.com"),
-                "case {label:?}: the data endpoint is not on the control-plane domain, \
-                 got {endpoint:?}"
-            );
-            assert!(
-                !seen_endpoints.contains(endpoint),
-                "case {label:?}: each feed gets its own endpoint, got the already-issued \
-                 {endpoint:?}"
-            );
-            seen_endpoints.push(endpoint.clone());
-        }
+        let endpoint = created["dataEndpoints"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label:?}: the entry is a string"));
+        assert!(
+            endpoint.ends_with('/') && endpoint.starts_with("https://"),
+            "case {label:?}: the endpoint is an absolute URL ending in the slash a client \
+             concatenates a path onto, got {endpoint:?}"
+        );
+        assert_eq!(
+            endpoint.trim_end_matches('/').matches('/').count(),
+            2,
+            "case {label:?}: the endpoint's path is the root, so the only slashes are the \
+             scheme's and the trailing one, got {endpoint:?}"
+        );
+        assert!(
+            !endpoint.contains("amazonaws.com") && !endpoint.contains("api.aws"),
+            "case {label:?}: the endpoint names no host of AWS's own, got {endpoint:?}"
+        );
 
-        // Stable for the life of the feed: a read reports the very same endpoints.
+        // Stable for the life of the feed: a read and an update report the very same
+        // endpoint, so a client that re-reads the feed after reconfiguring it is handed
+        // the address it was already using.
         let fetched = get_feed(&router, &id, label).await;
         assert_eq!(
-            fetched["dataEndpoints"], created["dataEndpoints"],
-            "case {label:?}: GetFeed reports the stored endpoints, got {:?}",
+            fetched["dataEndpoints"], expected,
+            "case {label:?}: GetFeed reports the same endpoint, got {:?}",
             fetched["dataEndpoints"]
+        );
+        let (status, updated) = call(
+            &router,
+            "PUT",
+            &format!("/v1/feed/{id}"),
+            Some(json!({"name": name, "outputs": outputs})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: UpdateFeed answers 200, got {status} with {updated}"
+        );
+        assert_eq!(
+            updated["dataEndpoints"], expected,
+            "case {label:?}: UpdateFeed echoes the same endpoint, got {:?}",
+            updated["dataEndpoints"]
         );
     }
 }
