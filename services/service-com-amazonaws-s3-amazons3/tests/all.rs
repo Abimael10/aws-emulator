@@ -461,6 +461,8 @@ mod signature_refusal_wording;
 mod sse_kms_data_key_authorization;
 #[path = "all/sse_kms_decrypt_authorization.rs"]
 mod sse_kms_decrypt_authorization;
+#[path = "all/sse_kms_encryption_context_scope.rs"]
+mod sse_kms_encryption_context_scope;
 #[path = "all/sse_kms_key_identity.rs"]
 mod sse_kms_key_identity;
 #[path = "all/sse_kms_read_key_state.rs"]

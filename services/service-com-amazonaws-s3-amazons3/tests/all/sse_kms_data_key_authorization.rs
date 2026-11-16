@@ -89,8 +89,13 @@ const ARN_CONTEXT_ENTRY: &str = "aws:s3:arn";
 const BUCKET: &str = "sse-kms-write-authz";
 
 /// WHY a refused write was refused, which decides the sentence KMS words for it.
+///
+/// `pub(crate)`, with the key, key-policy and policy-document helpers below it: the
+/// encryption-context suite beside this one ([`super::sse_kms_encryption_context_scope`])
+/// judges the same keys under the same documents and reads the same refusal sentence, so it
+/// asks through these rather than a second copy of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Denial {
+pub(crate) enum Denial {
     /// The key's own policy allows the action to neither the caller nor its account, so that
     /// document is the one that has to change.
     NoResourcePolicy,
@@ -102,7 +107,7 @@ impl Denial {
     /// The sentence KMS words this refusal in, written out here rather than built from the
     /// service's own helper so the wording has something to be wrong about: who was refused,
     /// which action, on which key, and the clause naming the document that decided it.
-    fn message(self, action: &str, key_arn: &str) -> String {
+    pub(crate) fn message(self, action: &str, key_arn: &str) -> String {
         let head =
             format!("User: {} is not authorized to perform: {action} on resource: {key_arn}", principal());
         match self {
@@ -131,7 +136,7 @@ fn principal() -> String {
 /// need not leave the creating caller a path to a later `kms:PutKeyPolicy` and KMS's policy
 /// lockout safety check would refuse it. That check has its own tests in the KMS crate, so the
 /// key is created the way the KMS model provides for.
-async fn key_with(
+pub(crate) async fn key_with(
     router: &MultiServiceRouter,
     case: &str,
     document: Option<&str>,
@@ -158,7 +163,12 @@ async fn key_with(
 
 /// Attach `document` to `key_id` — the one call that changes who may store an object under the
 /// key.
-async fn put_key_policy(router: &MultiServiceRouter, case: &str, key_id: &str, document: &str) {
+pub(crate) async fn put_key_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    key_id: &str,
+    document: &str,
+) {
     let (status, payload) = kms(
         router,
         "PutKeyPolicy",
@@ -176,7 +186,7 @@ async fn put_key_policy(router: &MultiServiceRouter, case: &str, key_id: &str, d
 }
 
 /// A key policy document carrying exactly `statements`.
-fn policy(statements: Vec<Value>) -> String {
+pub(crate) fn policy(statements: Vec<Value>) -> String {
     json!({"Version": "2012-10-17", "Statement": statements}).to_string()
 }
 
@@ -184,7 +194,7 @@ fn policy(statements: Vec<Value>) -> String {
 /// account's root user — the principal the DEFAULT key policy names, which delegates the
 /// decision to that account's own identity-based policies (no `Condition` when it is
 /// [`Value::Null`]).
-fn account_statement(effect: &str, actions: Value, condition: Value) -> Value {
+pub(crate) fn account_statement(effect: &str, actions: Value, condition: Value) -> Value {
     let mut statement = json!({
         "Effect": effect,
         "Principal": {"AWS": format!("arn:aws:iam::{}:root", engine::emulator_account_id())},
@@ -199,20 +209,20 @@ fn account_statement(effect: &str, actions: Value, condition: Value) -> Value {
 
 /// The statement the default key policy carries: the account's root user over every KMS
 /// action.
-fn allow_account() -> Value {
+pub(crate) fn allow_account() -> Value {
     account_statement("Allow", json!("kms:*"), Value::Null)
 }
 
 /// The ARN of one bucket, asked of the one helper this test binary already names a bucket ARN
 /// with — which is the value of the encryption-context entry a Bucket Key write binds its data
 /// key to.
-fn bucket_arn(name: &str) -> String {
+pub(crate) fn bucket_arn(name: &str) -> String {
     super::bucket_analytics_configuration::bucket_arn(name)
 }
 
 /// The ARN of one object, which is that entry's value for a write with no S3 Bucket Key: the
 /// bucket's own ARN with the key as the rest of the resource part.
-fn object_arn(name: &str, key: &str) -> String {
+pub(crate) fn object_arn(name: &str, key: &str) -> String {
     format!("{}/{key}", bucket_arn(name))
 }
 
