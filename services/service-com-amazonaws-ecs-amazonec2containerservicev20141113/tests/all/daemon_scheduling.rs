@@ -26,8 +26,11 @@
 //!   captures snapshots exactly the members the request stated, with each optional member it
 //!   left out at the default its own documentation gives;
 //! * "Amazon ECS daemons are cluster specific and Region specific" — every daemon operation
-//!   resolves its `daemonArn` and refuses what it cannot resolve: the cluster first, then
-//!   the daemon, and a value that is no daemon ARN at all last;
+//!   reads its `daemonArn` as the whole identifier it is, and what it answers for one it
+//!   cannot resolve follows what the operation DOES: a call that acts in the daemon's
+//!   cluster is refused about that cluster, the read of one daemon is refused about the
+//!   daemon, and the listing of a daemon's rollouts selects none of them and answers the
+//!   empty page;
 //! * `DeleteDaemon`: "Deleting a daemon stops all running daemon tasks on the associated
 //!   container instances", the daemon is answered `DELETE_IN_PROGRESS`, and it leaves
 //!   `ListDaemons` on the clock;
@@ -900,7 +903,7 @@ async fn a_delete_drains_the_daemon_tasks_and_the_daemon_leaves_the_listing() {
 }
 
 #[tokio::test]
-async fn every_daemon_operation_refuses_an_arn_it_cannot_resolve() {
+async fn every_daemon_operation_answers_an_arn_it_cannot_resolve_as_its_own_rule_says() {
     let router = service();
     const CLUSTER: &str = "daemon-refusals";
     const CASE: &str = "setup";
@@ -913,39 +916,42 @@ async fn every_daemon_operation_refuses_an_arn_it_cannot_resolve() {
     };
     // The rows differ along WHICH part of the identifier fails to resolve: the cluster the
     // ARN carries, the daemon within a cluster that is there, and the value's being no
-    // daemon ARN at all. Which refusal each earns follows what the operation DOES: one that
-    // acts in the daemon's cluster resolves that cluster first and is refused about it,
-    // while the read of the one daemon the ARN identifies answers about the daemon.
-    let identifiers: [(&str, String, bool); 3] = [
+    // daemon ARN at all. What each earns follows what the operation DOES with it: a call
+    // that ACTS in the daemon's cluster resolves that cluster and is refused about it, the
+    // read of the one daemon the ARN identifies answers about the daemon, and the listing of
+    // a daemon's rollouts SELECTS them, so an ARN it cannot resolve selects none.
+    let identifiers: [(&str, String, bool, bool); 3] = [
         (
             "a daemon ARN under a cluster this account does not hold",
             daemon_of("daemon-nowhere", "agents"),
+            true,
             true,
         ),
         (
             "a daemon name no daemon of an existing cluster answers to",
             daemon_of(CLUSTER, "nosuchdaemon"),
             false,
+            true,
         ),
         (
             "a value that is no daemon ARN at all",
             "agents".to_string(),
             false,
+            false,
         ),
     ];
-    for (identifier_case, daemon_arn, cluster_missing) in identifiers {
+    for (identifier_case, daemon_arn, cluster_missing, shaped_like_an_arn) in identifiers {
         // Every operation addressed to ONE daemon by ARN, each with the smallest request
-        // the model accepts beside it — so the refusal is the identifier's and not another
-        // member's — paired with what it does with the daemon's cluster and the error it
-        // answers for a daemon that is not there. `ListDaemonDeployments` models no
-        // not-found error for a daemon, so it reports that condition as the invalid
-        // identifier it is.
-        let operations: [(&str, Value, bool, &str); 4] = [
+        // the model accepts beside it — so the answer is the identifier's and not another
+        // member's — paired with what it does with the daemon's cluster and the sentence it
+        // words for a daemon that is not there: a READ states the identifier it could not
+        // resolve, while the DELETE states that no metadata backs the daemon at all.
+        let operations: [(&str, Value, bool, &str); 3] = [
             (
                 "DescribeDaemon",
                 json!({ "daemonArn": daemon_arn }),
                 false,
-                "DaemonNotFoundException",
+                "Daemon not found: ",
             ),
             (
                 "UpdateDaemon",
@@ -955,33 +961,60 @@ async fn every_daemon_operation_refuses_an_arn_it_cannot_resolve() {
                     "capacityProviderArns": [provider],
                 }),
                 true,
-                "DaemonNotFoundException",
+                "Daemon not found: ",
             ),
             (
                 "DeleteDaemon",
                 json!({ "daemonArn": daemon_arn }),
                 true,
-                "DaemonNotFoundException",
-            ),
-            (
-                "ListDaemonDeployments",
-                json!({ "daemonArn": daemon_arn }),
-                true,
-                "ClientException",
+                "No daemon metadata found.",
             ),
         ];
-        for (operation, request, acts_in_the_cluster, not_found_code) in operations {
+        for (operation, request, acts_in_the_cluster, not_found_sentence) in operations {
             let case = format!("{operation} on {identifier_case}");
             let (code, message) = refusal(&router, operation, request, &case).await;
             let (expected_code, expected_message) = if cluster_missing && acts_in_the_cluster {
                 ("ClusterNotFoundException", "Cluster not found.".to_string())
+            } else if not_found_sentence.ends_with(' ') {
+                (
+                    "DaemonNotFoundException",
+                    format!("{not_found_sentence}{daemon_arn}"),
+                )
             } else {
-                (not_found_code, format!("Daemon not found: {daemon_arn}"))
+                ("DaemonNotFoundException", not_found_sentence.to_string())
             };
             assert_eq!(
                 (code.as_str(), message.as_str()),
                 (expected_code, expected_message.as_str()),
                 "case {case:?}: expected the refusal the identifier earns"
+            );
+        }
+
+        // `ListDaemonDeployments` SELECTS the rollouts of the daemon the ARN names: an ARN
+        // of the daemon form that resolves to no stored daemon — whatever part of it does
+        // not resolve — selects none of them, and is answered with the empty page it
+        // selects. Only a value that is no daemon ARN at all identifies no daemon of any
+        // account, and this operation models no not-found error for a daemon, so that is
+        // answered as the invalid identifier it is.
+        let case = format!("ListDaemonDeployments on {identifier_case}");
+        if shaped_like_an_arn {
+            let listed = list_deployments(&router, &daemon_arn, &case).await;
+            assert!(
+                listed.is_empty(),
+                "case {case:?}: expected the empty page the ARN selects, got {listed:?}"
+            );
+        } else {
+            let (code, message) = refusal(
+                &router,
+                "ListDaemonDeployments",
+                json!({ "daemonArn": daemon_arn }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                ("ClientException", format!("Daemon not found: {daemon_arn}").as_str()),
+                "case {case:?}: expected the invalid identifier to be answered"
             );
         }
     }

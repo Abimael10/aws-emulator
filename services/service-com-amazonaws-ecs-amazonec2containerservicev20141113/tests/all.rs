@@ -89,10 +89,10 @@ mod container_secret_injection;
 mod container_secret_values;
 #[path = "all/continue_service_deployment_validation.rs"]
 mod continue_service_deployment_validation;
-// The PAGE a `ListDaemonDeployments` request is served: the page size it may ask for, the
-// documented default when it asks for none, and the token that walks the rest.
 #[path = "all/daemon_deployment_listing_pages.rs"]
 mod daemon_deployment_listing_pages;
+#[path = "all/daemon_read_arn_rules.rs"]
+mod daemon_read_arn_rules;
 #[path = "all/daemon_reference_family_refusals.rs"]
 mod daemon_reference_family_refusals;
 #[path = "all/daemon_scheduling.rs"]

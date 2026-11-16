@@ -309,52 +309,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        let Some(cluster) = guard.active_cluster(&cluster_name) else {
-            return Err(CreateDaemonErrorModeled::ClusterNotFoundException(
-                ClusterNotFoundException {
-                    message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
-                    )),
-                },
-            )
-            .into());
-        };
-        let cluster_arn = cluster.arn.clone();
-
-        // Every entry of `capacityProviderArns` is resolved against the providers this
-        // account holds, and each one has to be a MANAGED INSTANCES provider: "ECS
-        // Managed Daemons is only supported for Amazon ECS Managed Instances Capacity
-        // Providers". A provider of any other kind — the Fargate providers Amazon ECS
-        // publishes, or one bound onto a caller's Auto Scaling group — cannot carry a
-        // daemon, so the whole call is refused and nothing is stored. The one resolution
-        // `UpdateDaemon` makes too
-        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::resolve_daemon_capacity_providers`]).
-        let capacity_provider_names = match guard
-            .resolve_daemon_capacity_providers(&input.capacity_provider_arns, &region)
-        {
-            Ok(names) => names,
-            Err(refusal) => {
-                let message = match refusal {
-                    crate::state::DaemonCapacityRefusal::NotFound => {
-                        crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE
-                    }
-                    crate::state::DaemonCapacityRefusal::NotManagedInstances => {
-                        crate::state::DAEMON_MANAGED_INSTANCES_REQUIRED_MESSAGE
-                    }
-                };
-                return Err(CreateDaemonErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message.to_string()),
-                    },
-                )
-                .into());
-            }
-        };
-
         // "The Amazon Resource Name (ARN) of the daemon task definition to use for the
-        // daemon": the revision is resolved ONCE, here, so a registration made later in
-        // the same family does not move the daemon onto it — the one resolution
-        // `UpdateDaemon` makes too.
+        // daemon": the revision this call would put to work is a resource of the ACCOUNT
+        // rather than of the cluster the daemon is created in, so it is resolved from the
+        // request before any resource the call acts on is — a reference that names no
+        // revision is refused for the resource it names and not for whichever cluster the
+        // other members happen to name. The revision is resolved ONCE, here, so a
+        // registration made later in the same family does not move the daemon onto it; the
+        // one resolution `UpdateDaemon` makes too.
         let daemon_task_definition_arn = match guard
             .resolve_daemon_task_definition(&input.daemon_task_definition_arn)
         {
@@ -390,6 +352,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into())
+            }
+        };
+
+        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+            return Err(CreateDaemonErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::cluster_refusal_message(
+                        guard.clusters.get(&cluster_name),
+                    )),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        // Every entry of `capacityProviderArns` is resolved against the providers this
+        // account holds, and each one has to be a MANAGED INSTANCES provider: "ECS
+        // Managed Daemons is only supported for Amazon ECS Managed Instances Capacity
+        // Providers". A provider of any other kind — the Fargate providers Amazon ECS
+        // publishes, or one bound onto a caller's Auto Scaling group — cannot carry a
+        // daemon, so the whole call is refused and nothing is stored. The one resolution
+        // `UpdateDaemon` makes too
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::resolve_daemon_capacity_providers`]).
+        let capacity_provider_names = match guard
+            .resolve_daemon_capacity_providers(&input.capacity_provider_arns, &region)
+        {
+            Ok(names) => names,
+            Err(refusal) => {
+                let message = match refusal {
+                    crate::state::DaemonCapacityRefusal::NotFound => {
+                        crate::state::DAEMON_CAPACITY_PROVIDERS_INVALID_MESSAGE
+                    }
+                    crate::state::DaemonCapacityRefusal::NotManagedInstances => {
+                        crate::state::DAEMON_MANAGED_INSTANCES_REQUIRED_MESSAGE
+                    }
+                };
+                return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
             }
         };
 

@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 return Err(DeleteDaemonErrorModeled::DaemonNotFoundException(
                     DaemonNotFoundException {
-                        message: Some(crate::state::daemon_not_found_message(&input.daemon_arn)),
+                        message: Some(crate::state::DAEMON_METADATA_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into())
@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = guard.daemons.get(&daemon.arn) else {
             return Err(DeleteDaemonErrorModeled::DaemonNotFoundException(
                 DaemonNotFoundException {
-                    message: Some(crate::state::daemon_not_found_message(&input.daemon_arn)),
+                    message: Some(crate::state::DAEMON_METADATA_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

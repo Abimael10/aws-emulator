@@ -5,12 +5,13 @@
 //! deployment is reported beside the one under way — narrowed by the statuses and the
 //! creation window the request names, NEWEST first, and paged by `maxResults`/`nextToken`.
 //!
-//! A daemon ARN carries the cluster that hosts it, and this listing is of that cluster's
-//! work: a `daemonArn` whose cluster this account does not hold is refused about the cluster
-//! (`ClusterNotFoundException`). It models no not-found error of its own for the daemon, so
-//! an ARN under a cluster that IS there naming no stored daemon — and a value that is no
-//! daemon ARN at all — is answered as the identifier that is not valid it is
-//! (`ClientException`).
+//! A daemon ARN carries the cluster that hosts it, and this listing SELECTS that daemon's
+//! rollouts rather than acting in the cluster: a well-formed daemon ARN that resolves to no
+//! stored daemon — a cluster this account does not hold, a daemon the cluster does not hold,
+//! or a daemon with no rollout yet — selects no deployment and is answered with the empty
+//! page it selects. A value that is no daemon ARN at all identifies no daemon of any
+//! account; the operation models no not-found error for a daemon, so that is answered as
+//! the identifier that is not valid it is (`ClientException`).
 //!
 //! ## Shape of an operation
 //!
@@ -211,6 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The Amazon Resource Name (ARN) of the daemon to list deployments for": the member
+        // takes an ARN and nothing else, so the SHAPE of the identifier is settled before
+        // any state is consulted ([`crate::state::is_daemon_arn`]) — a value that could name
+        // no daemon of any account names no history either, and this operation models no
+        // not-found error for a daemon, so it is answered as the identifier that is not
+        // valid it is ("it might be specifying an identifier that isn't valid").
+        if !crate::state::is_daemon_arn(&input.daemon_arn) {
+            return Err(ListDaemonDeploymentsErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::daemon_not_found_message(&input.daemon_arn)),
+                },
+            )
+            .into());
+        }
+
         // Everything the CLOCK owes this read, materialised before the deployments are
         // listed: the rollout that starts or ends, the daemon tasks its placements and
         // stops move, and the launch steps the START of such a task waits on — the whole
@@ -222,38 +238,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        // A daemon's deployments are its cluster's work, and this listing models
-        // `ClusterNotFoundException` and no not-found error for the daemon — so the cluster
-        // the ARN carries is resolved first and a cluster this account does not hold is
-        // what the listing is refused about.
-        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&input.daemon_arn) {
-            return Err(
-                ListDaemonDeploymentsErrorModeled::ClusterNotFoundException(
-                    ClusterNotFoundException {
-                        message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        let daemon_arn = match guard.daemon_from_arn(&input.daemon_arn) {
-            Some(daemon) => daemon.arn.clone(),
-            // The deployments listed are ONE daemon's history, so an ARN that resolves to
-            // no stored daemon names no history either. This operation models no not-found
-            // error for a daemon, so such an identifier is answered as the identifier that
-            // is not valid it is ("it might be specifying an identifier that isn't valid"),
-            // with the sentence the daemon surface words for a daemon that is not there.
-            None => {
-                return Err(ListDaemonDeploymentsErrorModeled::ClientException(
-                    ClientException {
-                        message: Some(crate::state::daemon_not_found_message(&input.daemon_arn)),
-                    },
-                )
-                .into())
-            }
-        };
+        // This listing SELECTS the deployments of the daemon the ARN names rather than
+        // acting in that daemon's cluster, so a well-formed daemon ARN that resolves to no
+        // stored daemon — because this account holds no such cluster, or the cluster holds
+        // no such daemon, or the daemon has not had a rollout yet — selects no deployment
+        // and is answered with the empty page it selects: the state "no deployments yet" is
+        // what a client enumerating a daemon's rollouts before the first one sees, and the
+        // sweep it is making over a set of daemon ARNs completes. The same reading
+        // `ListDaemons` makes of the cluster it filters by.
+        let daemon_arn = input.daemon_arn.trim().to_string();
 
         // "An optional filter to narrow the ListDaemonDeployments results by creation
         // time", as a `before`/`after` window on each deployment's own `createdAt`. A bound

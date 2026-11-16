@@ -8,10 +8,13 @@
 //! "Daemon revisions are immutable": nothing rewrites one.
 //!
 //! A daemon-revision ARN carries the cluster whose daemon the revision belongs to
-//! (`daemon-revision/<cluster>/<daemon>/<id>`), so this read resolves that cluster before it
-//! reports on anything; an ARN under a cluster that IS there naming no stored revision is a
-//! `MISSING` failure of its own entry rather than a refusal that would lose the revisions
-//! the request did resolve.
+//! (`daemon-revision/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
+//! before anything is looked up: an entry that is not shaped like such an ARN, and one whose
+//! cluster this account holds no record of, could name no revision of this account at all,
+//! and both are refused as the invalid revision ARN they are
+//! (`InvalidParameterException`). An ARN that COULD name a revision of this account and names
+//! none is a `MISSING` failure of its own entry rather than a refusal that would lose the
+//! revisions the request did resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -180,6 +183,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Each entry is "the ARN of the daemon revision" and nothing else, so what it can
+        // identify is settled before any revision is looked up: a value that is not shaped
+        // like a revision's ARN ([`crate::state::is_daemon_revision_arn`]), and one whose
+        // cluster this account holds no record of, could name no revision of this account at
+        // all, and both are refused as the unusable ARN the member was given rather than
+        // reported as a revision that happens to be missing or as the cluster the ARN
+        // carries. The `failures` channel answers for an ARN that COULD name a revision of
+        // this account and names none.
+        if input
+            .daemon_revision_arns
+            .iter()
+            .any(|reference| !crate::state::is_daemon_revision_arn(reference))
+        {
+            return Err(
+                DescribeDaemonRevisionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::DAEMON_REVISION_ARN_INVALID_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
@@ -188,9 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DAEMON_REVISION_RESOURCE_TYPE,
         ) {
             return Err(
-                DescribeDaemonRevisionsErrorModeled::ClusterNotFoundException(
-                    ClusterNotFoundException {
-                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                DescribeDaemonRevisionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::DAEMON_REVISION_ARN_INVALID_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

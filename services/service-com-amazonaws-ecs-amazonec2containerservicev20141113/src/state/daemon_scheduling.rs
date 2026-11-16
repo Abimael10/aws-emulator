@@ -60,14 +60,27 @@ pub const DAEMON_DEPLOYMENT_SUCCESSFUL: &str = "SUCCESSFUL";
 /// daemon leaves an open rollout in.
 pub const DAEMON_DEPLOYMENT_STOPPED: &str = "STOPPED";
 
-/// `DaemonNotFoundException$message` for a `daemonArn` that resolves to no stored daemon.
+/// `DaemonNotFoundException$message` for a `daemonArn` that resolves to no stored daemon,
+/// as the operations that READ a daemon state it — `DescribeDaemon`, and the listing of a
+/// daemon's rollouts under the error it models instead.
 ///
-/// The template AWS words for this error class: the fixed text with the identifier the
-/// request carried after it — the only value a client can match the refusal back to, since
-/// the daemon it names is not there to report anything else about.
+/// The template AWS words for those calls: the fixed text with the identifier the request
+/// carried after it — the only value a client can match the refusal back to, since the
+/// daemon it names is not there to report anything else about. The call that DELETES the
+/// daemon states the same condition in its own words
+/// ([`DAEMON_METADATA_NOT_FOUND_MESSAGE`]): the sentence belongs to the call that was
+/// refused, not to the store it looked in.
 pub fn daemon_not_found_message(reference: &str) -> String {
     format!("Daemon not found: {}", reference.trim())
 }
+
+/// `DaemonNotFoundException$message` for the DELETE of a daemon no stored metadata backs.
+///
+/// A delete is answered from the daemon's own metadata — the record the create wrote, which
+/// is what the delete would move to `DELETE_IN_PROGRESS` — so Amazon ECS states that there
+/// is none of it to act on: ONE fixed sentence, naming neither the daemon nor the cluster
+/// the request carried.
+pub const DAEMON_METADATA_NOT_FOUND_MESSAGE: &str = "No daemon metadata found.";
 
 /// `DaemonNotActiveException$message` for a `daemonArn` this store HOLDS in a status that
 /// is not [`DAEMON_ACTIVE`] — the error shape's own doc: "The specified daemon isn't
@@ -94,6 +107,93 @@ pub fn daemon_revision_arn(
         &format!("{DAEMON_REVISION_RESOURCE_TYPE}/{cluster_name}/{daemon_name}/{revision_id}"),
     )
 }
+
+/// How many characters the id a daemon's deployments and revisions are numbered by is
+/// spelled in: the fixed width [`ComAmazonawsEcsAmazonec2containerservicev20141113State::next_daemon_deployment_arn`]
+/// and [`ComAmazonawsEcsAmazonec2containerservicev20141113State::next_daemon_revision_arn`]
+/// render their counter at, so sorting two such ARNs orders what they name oldest first.
+pub const DAEMON_SEQUENCE_ID_WIDTH: usize = 19;
+
+/// Whether `token` is an id token of a daemon deployment's or a daemon revision's ARN: the
+/// decimal token of [`DAEMON_SEQUENCE_ID_WIDTH`] digits those ARNs are numbered by.
+pub fn is_daemon_sequence_id(token: &str) -> bool {
+    token.len() == DAEMON_SEQUENCE_ID_WIDTH && token.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The segments of the RESOURCE PATH `arn` carries when it is an ARN of a `resource_type`
+/// resource of THIS service — `arn:<partition>:ecs:<region>:<account>:<type>/<path>` — and
+/// `None` for anything else: a value that is no ARN, an ARN of another vendor, one that
+/// names no Region or account, and one of another resource type.
+///
+/// A SYNTAX question, not a lookup, as [`is_service_deployment_arn`] is for the service
+/// side: WHICH Region and account the ARN names is part of the resource's identity rather
+/// than of its shape (an ARN of another Region names a resource this store does not hold),
+/// but an ARN that names neither identifies no resource at all. The ARN is read through the
+/// project's ONE parse of a caller-supplied ARN (`service_common::arn`).
+fn daemon_scoped_arn_path<'a>(arn: &'a str, resource_type: &str) -> Option<Vec<&'a str>> {
+    let arn = arn.trim();
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.vendor != ARN_NAMESPACE || parsed.region.is_empty() || parsed.account.is_empty() {
+        return None;
+    }
+    let path = ::service_common::arn::resource_id_of_type(arn, resource_type)?;
+    Some(path.split('/').collect())
+}
+
+/// Whether `arn` is SHAPED like the ARN of a `resource_type` resource BELOW a daemon —
+/// `<type>/<cluster>/<daemon>/<id>` ([`daemon_scoped_arn_path`]), with names a cluster and a
+/// daemon may carry ([`is_valid_name`]) and an id token the numbering of these resources
+/// produces ([`is_daemon_sequence_id`]).
+fn is_daemon_scoped_arn(arn: &str, resource_type: &str) -> bool {
+    daemon_scoped_arn_path(arn, resource_type).is_some_and(|segments| {
+        matches!(
+            segments.as_slice(),
+            [cluster_name, daemon_name, id]
+                if is_valid_name(cluster_name)
+                    && is_valid_name(daemon_name)
+                    && is_daemon_sequence_id(id)
+        )
+    })
+}
+
+/// Whether `arn` is shaped like a DAEMON DEPLOYMENT's ARN
+/// (`daemon-deployment/<cluster>/<daemon>/<id>`, [`is_daemon_scoped_arn`]).
+pub fn is_daemon_deployment_arn(arn: &str) -> bool {
+    is_daemon_scoped_arn(arn, DAEMON_DEPLOYMENT_RESOURCE_TYPE)
+}
+
+/// Whether `arn` is shaped like a DAEMON REVISION's ARN
+/// (`daemon-revision/<cluster>/<daemon>/<id>`, [`is_daemon_scoped_arn`]).
+pub fn is_daemon_revision_arn(arn: &str) -> bool {
+    is_daemon_scoped_arn(arn, DAEMON_REVISION_RESOURCE_TYPE)
+}
+
+/// Whether `arn` is shaped like a DAEMON's own ARN — `daemon/<cluster>/<name>`, with names
+/// a cluster and a daemon may carry.
+///
+/// The same syntax question one resource up: a value of this shape identifies a daemon of
+/// some account, whether or not THIS store holds the cluster or the daemon it names.
+pub fn is_daemon_arn(arn: &str) -> bool {
+    daemon_scoped_arn_path(arn, DAEMON_RESOURCE_TYPE).is_some_and(|segments| {
+        matches!(
+            segments.as_slice(),
+            [cluster_name, daemon_name]
+                if is_valid_name(cluster_name) && is_valid_name(daemon_name)
+        )
+    })
+}
+
+/// `InvalidParameterException$message` for a `daemonDeploymentArns` entry that is not
+/// shaped like a daemon deployment's ARN ([`is_daemon_deployment_arn`]): the whole sentence
+/// is fixed text, stating that the request's parameters are not usable and echoing none of
+/// the values it carried.
+pub const DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE: &str = "Request parameter(s) are invalid.";
+
+/// `InvalidParameterException$message` for a `daemonRevisionArns` entry that is not shaped
+/// like a daemon revision's ARN ([`is_daemon_revision_arn`]): fixed text naming the
+/// parameter whose syntax is wrong, as [`invalid_service_deployment_arn_message`] does one
+/// resource along.
+pub const DAEMON_REVISION_ARN_INVALID_MESSAGE: &str = "The Daemon Revision ARN is invalid.";
 
 /// How many deployments this emulator keeps for ONE daemon, and how many revisions with
 /// them. EMULATOR-CHOSEN, for the same reason as
@@ -419,7 +519,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// created names no daemon just as a name no daemon of an existing cluster answers to
     /// does ("Amazon ECS daemons are cluster specific and Region specific"), and a value
     /// that is no daemon ARN at all names none either. Every operation addressed to ONE
-    /// daemon refuses all three the same way ([`daemon_not_found_message`]).
+    /// daemon refuses all three the same way, in the sentence that call words for the
+    /// condition ([`daemon_not_found_message`] for a read,
+    /// [`DAEMON_METADATA_NOT_FOUND_MESSAGE`] for the delete).
     pub fn daemon_from_arn(&self, reference: &str) -> Option<&DaemonRecord> {
         let reference = reference.trim();
         Self::daemon_arn_parts(reference)?;

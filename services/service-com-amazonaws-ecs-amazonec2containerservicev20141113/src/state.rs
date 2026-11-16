@@ -1064,6 +1064,17 @@ pub const DAEMON_CRITICAL_DEFAULT: bool = true;
 /// same reason as [`MAX_SERVICES`].
 pub const MAX_DAEMONS: usize = MAX_SERVICES;
 
+/// `InvalidParameterException$message` for a `capacityProviderArns` entry that names a
+/// capacity provider this account holds none of.
+///
+/// The sentence Amazon ECS words for the DAEMON surface's list member: it states the
+/// condition over the LIST ("one or more") rather than naming the entry at fault, and
+/// carries nothing the request sent — so it is not the sentence the operations that resolve
+/// ONE provider by name answer ([`CAPACITY_PROVIDER_NOT_FOUND_MESSAGE`]). Shared by every
+/// daemon write that takes the member, so a create and an update refuse the same list alike.
+pub const DAEMON_CAPACITY_PROVIDERS_INVALID_MESSAGE: &str =
+    "One or more capacity providers not found or invalid";
+
 /// `InvalidParameterException$message` for a `capacityProviderArns` that names a capacity
 /// provider whose type is not [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`].
 ///

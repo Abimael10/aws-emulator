@@ -236,100 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "Amazon ECS deploys exactly one daemon task on each container instance of the
-        // specified capacity providers": the providers ARE the capacity the daemon runs
-        // on, so a request that names none describes no deployment at all — and the list is
-        // bounded before any per-entry work, because a daemon's providers all belong to the
-        // one cluster it lives in, which holds at most this many of them.
-        if input.capacity_provider_arns.is_empty() {
-            return Err(UpdateDaemonErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(
-                        "capacityProviderArns must name at least one capacity provider"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-        if input.capacity_provider_arns.len() > crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS {
-            return Err(UpdateDaemonErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(crate::state::at_most_items_message(
-                        "capacity providers",
-                        crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS,
-                    )),
-                },
-            )
-            .into());
-        }
-
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        // "Amazon ECS drains existing container instances and provisions new instances with
-        // the updated daemon": the update ACTS in the daemon's cluster, so that cluster is
-        // resolved first and a cluster this account does not hold is what the call is
-        // refused about.
-        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&input.daemon_arn) {
-            return Err(UpdateDaemonErrorModeled::ClusterNotFoundException(
-                ClusterNotFoundException {
-                    message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
-                    )),
-                },
-            )
-            .into());
-        }
-        let daemon = match guard.daemon_from_arn(&input.daemon_arn) {
-            Some(daemon) => daemon.clone(),
-            // The ARN identifies the daemon by itself, so anything it does not resolve to
-            // is a daemon that is not there — the one refusal every operation addressed to
-            // one daemon answers.
-            None => {
-                return Err(UpdateDaemonErrorModeled::DaemonNotFoundException(
-                    DaemonNotFoundException {
-                        message: Some(crate::state::daemon_not_found_message(&input.daemon_arn)),
-                    },
-                )
-                .into())
-            }
-        };
-        // "The specified daemon isn't active. You can't update a daemon that's inactive" —
-        // which is a daemon whose delete has been asked for: it is on its way out, so there
-        // is no rollout to start on it.
-        if daemon.status != crate::state::DAEMON_ACTIVE {
-            return Err(UpdateDaemonErrorModeled::DaemonNotActiveException(
-                DaemonNotActiveException {
-                    message: Some(crate::state::DAEMON_NOT_ACTIVE_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        let capacity_provider_names = match guard
-            .resolve_daemon_capacity_providers(&input.capacity_provider_arns, &region)
-        {
-            Ok(names) => names,
-            Err(refusal) => {
-                let message = match refusal {
-                    crate::state::DaemonCapacityRefusal::NotFound => {
-                        crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE
-                    }
-                    crate::state::DaemonCapacityRefusal::NotManagedInstances => {
-                        crate::state::DAEMON_MANAGED_INSTANCES_REQUIRED_MESSAGE
-                    }
-                };
-                return Err(UpdateDaemonErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message.to_string()),
-                    },
-                )
-                .into());
-            }
-        };
+        // "The Amazon Resource Name (ARN) of the daemon task definition to use for the
+        // daemon": the revision this call would put to work is a resource of the ACCOUNT
+        // rather than of the daemon's cluster, so it is resolved from the request before any
+        // resource the call acts on is — a reference that names no revision is refused for
+        // the resource it names and not for whichever cluster or daemon the other members
+        // happen to name. The one resolution `CreateDaemon` makes too
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::resolve_daemon_task_definition`]).
         let daemon_task_definition_arn = match guard
             .resolve_daemon_task_definition(&input.daemon_task_definition_arn)
         {
@@ -367,6 +285,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
+
+        // "Amazon ECS deploys exactly one daemon task on each container instance of the
+        // specified capacity providers": the providers ARE the capacity the daemon runs
+        // on, so a request that names none describes no deployment at all — and the list is
+        // bounded before any per-entry work, because a daemon's providers all belong to the
+        // one cluster it lives in, which holds at most this many of them.
+        if input.capacity_provider_arns.is_empty() {
+            return Err(UpdateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "capacityProviderArns must name at least one capacity provider"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if input.capacity_provider_arns.len() > crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS {
+            return Err(UpdateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::at_most_items_message(
+                        "capacity providers",
+                        crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every entry of `capacityProviderArns` is resolved against the providers this
+        // account holds, and each one has to be a MANAGED INSTANCES provider: "ECS Managed
+        // Daemons is only supported for Amazon ECS Managed Instances Capacity Providers".
+        // The list is a parameter of the REQUEST, so it is resolved with the task definition
+        // above and before the daemon the ARN identifies — a list that names no usable
+        // provider is refused for the providers it names, whatever the daemon's own state is
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::resolve_daemon_capacity_providers`]).
+        let capacity_provider_names = match guard
+            .resolve_daemon_capacity_providers(&input.capacity_provider_arns, &region)
+        {
+            Ok(names) => names,
+            Err(refusal) => {
+                let message = match refusal {
+                    crate::state::DaemonCapacityRefusal::NotFound => {
+                        crate::state::DAEMON_CAPACITY_PROVIDERS_INVALID_MESSAGE
+                    }
+                    crate::state::DaemonCapacityRefusal::NotManagedInstances => {
+                        crate::state::DAEMON_MANAGED_INSTANCES_REQUIRED_MESSAGE
+                    }
+                };
+                return Err(UpdateDaemonErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "Amazon ECS drains existing container instances and provisions new instances with
+        // the updated daemon": the update ACTS in the daemon's cluster, so that cluster is
+        // resolved once the request's own parameters are settled, and a cluster this account
+        // does not hold is what the call is refused about.
+        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&input.daemon_arn) {
+            return Err(UpdateDaemonErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::cluster_refusal_message(
+                        guard.clusters.get(&cluster_name),
+                    )),
+                },
+            )
+            .into());
+        }
+        let daemon = match guard.daemon_from_arn(&input.daemon_arn) {
+            Some(daemon) => daemon.clone(),
+            // The ARN identifies the daemon by itself, so anything it does not resolve to
+            // is a daemon that is not there — the one refusal every operation addressed to
+            // one daemon answers.
+            None => {
+                return Err(UpdateDaemonErrorModeled::DaemonNotFoundException(
+                    DaemonNotFoundException {
+                        message: Some(crate::state::daemon_not_found_message(&input.daemon_arn)),
+                    },
+                )
+                .into())
+            }
+        };
+        // "The specified daemon isn't active. You can't update a daemon that's inactive" —
+        // which is a daemon whose delete has been asked for: it is on its way out, so there
+        // is no rollout to start on it.
+        if daemon.status != crate::state::DAEMON_ACTIVE {
+            return Err(UpdateDaemonErrorModeled::DaemonNotActiveException(
+                DaemonNotActiveException {
+                    message: Some(crate::state::DAEMON_NOT_ACTIVE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // Every member this request carries is one the updated daemon runs under, so the
         // stored record takes them all: `UpdateDaemon` states the whole configuration

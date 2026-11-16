@@ -7,11 +7,13 @@
 //! deployment configuration turned on.
 //!
 //! A daemon-deployment ARN carries the cluster whose daemon the rollout belongs to
-//! (`daemon-deployment/<cluster>/<daemon>/<id>`), so this read resolves that cluster before
-//! it reports on anything — a cluster this account holds no record of leaves the read
-//! nothing to answer about, which is the condition `ClusterNotFoundException` states. An ARN
-//! under a cluster that IS there naming no stored rollout is a `MISSING` failure of its own
-//! entry rather than a refusal that would lose the deployments the request did resolve.
+//! (`daemon-deployment/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
+//! before anything is looked up: an entry that is not shaped like such an ARN, and one
+//! whose cluster this account holds no record of, could name no rollout of this account at
+//! all, and both are refused as the unusable parameter the member was given
+//! (`InvalidParameterException`). An ARN that COULD name a rollout of this account and names
+//! none is a `MISSING` failure of its own entry rather than a refusal that would lose the
+//! deployments the request did resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -180,6 +182,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Each entry is "the ARN of the daemon deployment" and nothing else, so the SHAPE of
+        // every one of them is settled before any state is consulted: a value that could
+        // name no rollout of this account is refused for what it IS
+        // ([`crate::state::is_daemon_deployment_arn`]) rather than resolved against the
+        // cluster it appears to carry or reported as a rollout that happens to be missing.
+        if input
+            .daemon_deployment_arns
+            .iter()
+            .any(|reference| !crate::state::is_daemon_deployment_arn(reference))
+        {
+            return Err(
+                DescribeDaemonDeploymentsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Everything the CLOCK owes this read, materialised before the rollouts are
         // reported: the rollout that starts or ends, the daemon tasks its placements and
         // stops move, and the launch steps the START of such a task waits on — the whole
@@ -191,14 +215,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
+        // An entry whose CLUSTER this account holds no record of could name no rollout of
+        // this account either, so it is the same unusable ARN and earns the same refusal;
+        // the `failures` channel answers for an ARN that COULD name a rollout of this
+        // account and names none.
         if guard.names_a_missing_cluster(
             input.daemon_deployment_arns.iter().map(String::as_str),
             crate::state::DAEMON_DEPLOYMENT_RESOURCE_TYPE,
         ) {
             return Err(
-                DescribeDaemonDeploymentsErrorModeled::ClusterNotFoundException(
-                    ClusterNotFoundException {
-                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                DescribeDaemonDeploymentsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
