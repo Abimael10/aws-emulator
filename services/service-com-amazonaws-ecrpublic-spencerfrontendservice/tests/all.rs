@@ -39,6 +39,8 @@ mod layer_upload_convergence;
 mod layer_upload_refusal_messages;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
+#[path = "all/logo_asset_wire_probe.rs"]
+mod logo_asset_wire_probe;
 #[path = "all/logo_blob_constraints.rs"]
 mod logo_blob_constraints;
 #[path = "all/pagination_filter_exclusion.rs"]
@@ -73,6 +75,8 @@ mod repository_policy_and_catalog_data;
 mod repository_policy_canonical_form;
 #[path = "all/repository_policy_condition_values.rs"]
 mod repository_policy_condition_values;
+#[path = "all/repository_policy_resource_deny.rs"]
+mod repository_policy_resource_deny;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_field_fidelity.rs"]

@@ -13,11 +13,15 @@
 //! repository policy would prevent you from setting another policy in the future, you must
 //! force the SetRepositoryPolicy operation". Once such a policy IS in place, the lockout is
 //! real — the next `SetRepositoryPolicy` call on that repository is refused, with or without
-//! `force`, until `DeleteRepositoryPolicy` removes it. That refusal is reported as
-//! `InvalidParameterException` for want of a better code: a denied call is not invalid
-//! input, but this service's model declares no access-denied shape, and every other code it
-//! declares would claim something untrue (a missing repository, a server fault). If the
-//! model ever gains one, that refusal is the line to change.
+//! `force`, until `DeleteRepositoryPolicy` removes it. That refusal is an AUTHORIZATION
+//! decision, not a statement about the input: an explicit `Deny` in the policy attached to
+//! the repository is what withholds the grant, so it is answered the way an explicit `Deny`
+//! in the caller's own policies is — the AWS-common `AccessDeniedException` with AWS's
+//! authorization sentence, through [`crate::state::authorization::denied_by_resource_policy`]
+//! — and NOT as one of this operation's modelled input errors. The separate refusal of an
+//! UNFORCED document that would cause such a lockout stays an `InvalidParameterException`:
+//! there the stored policy denies nothing yet, and what the service refuses is the request's
+//! own combination of a locking document and an absent `force`.
 //!
 //! The lockout is enforced on the policy-setting action ALONE, even when the stored `Deny`
 //! covers `ecr-public:*`: real IAM would deny the reads and the delete too, which would
@@ -243,18 +247,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(parse_policy)
             .is_some_and(|current| current.denies_policy_management(&registry_id));
         if locked_out {
-            return Err(SetRepositoryPolicyErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "The repository policy on the repository with name '{}' in the \
-                         registry with id '{registry_id}' denies \
-                         {POLICY_MANAGEMENT_ACTION} to this account, so the policy can no \
-                         longer be set; delete the repository policy first",
-                        input.repository_name
-                    )),
-                },
-            )
-            .into());
+            // An AUTHORIZATION refusal, not an input error: the request is well formed and
+            // what withheld the grant is an explicit `Deny` in the policy attached to this
+            // repository. It travels the same path an identity-based `Deny` does —
+            // `AccessDeniedException` with AWS's authorization sentence, whose reason
+            // clause names the resource-based policy the deny was written in — so a client
+            // branching on the error code reads "this principal is not permitted" rather
+            // than "your request is malformed". The document itself is untouched, and
+            // `DeleteRepositoryPolicy` stays the way back.
+            let resource = crate::state::authorization::repository_resource(&input.repository_name);
+            drop(store);
+            return Err(crate::state::authorization::denied_by_resource_policy(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &resource,
+            ));
         }
 
         // The document being applied would deny the policy-setting action in the future,

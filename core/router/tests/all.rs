@@ -1017,6 +1017,8 @@ mod ec2_network;
 mod ec2_volume_notification_reaches_its_queue;
 #[path = "all/ecr_public_action_scoped_iam_identity.rs"]
 mod ecr_public_action_scoped_iam_identity;
+#[path = "all/ecr_public_logo_asset_is_served_anonymously.rs"]
+mod ecr_public_logo_asset_is_served_anonymously;
 #[path = "all/ecr_push_triggers_its_pipeline.rs"]
 mod ecr_push_triggers_its_pipeline;
 #[path = "all/ecr_repository_policy_principal.rs"]

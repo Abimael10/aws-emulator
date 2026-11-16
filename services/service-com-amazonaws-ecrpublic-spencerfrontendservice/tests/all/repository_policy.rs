@@ -747,7 +747,12 @@ async fn a_document_that_would_lock_the_policy_needs_force_and_then_really_locks
         // With `force` it is stored...
         assert_round_trip_forced(&router, &name, document, case).await;
 
-        // ...and the lockout is real: the next call is refused however it is made.
+        // ...and the lockout is real: the next call is refused however it is made. That
+        // refusal is an AUTHORIZATION decision — an explicit `Deny` in the policy attached
+        // to the repository is what withholds the grant — so it carries the AWS-common
+        // `AccessDeniedException` rather than one of the operation's input errors; the
+        // sentence it states is pinned over its own table by
+        // `tests/all/repository_policy_resource_deny.rs`.
         for forced in [false, true] {
             refused(
                 &router,
@@ -757,7 +762,7 @@ async fn a_document_that_would_lock_the_policy_needs_force_and_then_really_locks
                     "policyText": PULL_POLICY,
                     "force": forced,
                 }),
-                "InvalidParameterException",
+                "AccessDeniedException",
                 case,
             )
             .await;

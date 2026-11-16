@@ -45,6 +45,17 @@
 //! before anything is looked up, so the decision never depends on whether the resource
 //! exists and a refused call leaves no trace.
 //!
+//! ## The two policy CLASSES a refusal can come from
+//!
+//! The documents above are the caller's own — identity-based. A policy attached to a
+//! RESOURCE (this service stores one per repository, written by `SetRepositoryPolicy`) is
+//! the other class, and the service holding it is what evaluates it. Either class refusing
+//! a call produces the SAME kind of answer: the AWS-common `AccessDeniedException` worded
+//! with AWS's authorization sentence ([`denied_by_resource_policy`] for the resource class,
+//! [`denied`] for the identity one), differing only in the clause that names which class
+//! carried the deny. A refusal of either class is an authorization decision about the
+//! caller, never a statement that the request was malformed.
+//!
 //! ## The two callers the identity decision cannot refuse
 //!
 //! * **The account's own published credential.** A request whose access key id neither STS
@@ -134,19 +145,46 @@ impl Caller {
     }
 }
 
-/// The refusal AWS words an identity-based decision with: who was refused, which action, on
-/// which resource, and why the grant was withheld — an explicit `Deny` in a policy in
-/// force, or no policy allowing the action at all. Every value in it comes from the request
-/// and the stored policies.
-fn not_authorized(principal: &str, action: &str, resource: &str, explicit: bool) -> String {
-    let reason = if explicit {
-        "with an explicit deny in an identity-based policy".to_string()
-    } else {
-        format!("because no identity-based policy allows the {action} action")
-    };
+/// The sentence AWS words EVERY authorization refusal with: who was refused, which action,
+/// on which resource, and the `reason` the grant was withheld. Every value in it comes from
+/// the request and the stored policies.
+///
+/// The one place the sentence is written, so a refusal decided from an identity-based
+/// document ([`not_authorized`]) and one decided from a policy attached to the resource
+/// ([`not_authorized_by_resource_policy`]) state the same thing about the same call and
+/// differ only in the reason clause.
+fn not_authorized_for(principal: &str, action: &str, resource: &str, reason: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
     )
+}
+
+/// The reason clause an explicit `Deny` carries, which names the CLASS of policy the deny
+/// was written in: that is where the caller has to go to lift it, and the two classes are
+/// lifted in different places.
+const EXPLICIT_DENY_IN_IDENTITY_POLICY: &str =
+    "with an explicit deny in an identity-based policy";
+
+/// [`EXPLICIT_DENY_IN_IDENTITY_POLICY`] for a `Deny` written in a policy attached to the
+/// RESOURCE rather than to the caller.
+const EXPLICIT_DENY_IN_RESOURCE_POLICY: &str = "with an explicit deny in a resource-based policy";
+
+/// The refusal AWS words an identity-based decision with: an explicit `Deny` in a policy in
+/// force on the caller, or no policy allowing the action at all.
+fn not_authorized(principal: &str, action: &str, resource: &str, explicit: bool) -> String {
+    let reason = if explicit {
+        EXPLICIT_DENY_IN_IDENTITY_POLICY.to_string()
+    } else {
+        format!("because no identity-based policy allows the {action} action")
+    };
+    not_authorized_for(principal, action, resource, &reason)
+}
+
+/// The refusal AWS words a decision taken on a policy attached to the RESOURCE with: the
+/// same authorization sentence, whose reason clause names a resource-based policy as the
+/// one carrying the explicit `Deny`.
+fn not_authorized_by_resource_policy(principal: &str, action: &str, resource: &str) -> String {
+    not_authorized_for(principal, action, resource, EXPLICIT_DENY_IN_RESOURCE_POLICY)
 }
 
 /// `Some(message)` when the calling principal's identity-based policies do not allow
@@ -264,6 +302,46 @@ pub fn denied_on_registry<Eng: Send + Sync + 'static, E>(
     operation: &str,
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
     denied(engine, ctx, operation, &[])
+}
+
+/// The refusal an operation returns for a call an explicit `Deny` in a policy attached to
+/// the RESOURCE withholds the grant for.
+///
+/// A resource-based policy is attached to the resource rather than to the caller, so the
+/// service holding it is what evaluates it — but the refusal is the same KIND of answer an
+/// identity-based `Deny` gets: an authorization refusal, carried by the AWS-common
+/// `AccessDeniedException` ([`crate::scaffolded::Scaffolded::access_denied`]) and worded
+/// with AWS's authorization sentence, whose reason clause names the resource-based policy
+/// the deny was written in. It is never an input error: the request is well formed, and what
+/// refused it is a policy decision about the caller.
+///
+/// `resource` is the ARN of the resource whose own policy carries the `Deny`, and the
+/// principal is the one the request speaks for ([`caller`]) — the same principal an
+/// identity-based refusal of the same call would name.
+pub fn denied_by_resource_policy<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    let action = action_for(operation);
+    let principal = caller(engine, ctx).arn;
+    // Logged for the reason an identity-based refusal is (see [`refusal`]): the refusal is
+    // the security-relevant event of the call, so who asked, for what, and the outcome are
+    // attributable. The policy document itself is not logged.
+    ::tracing::info!(
+        audit = true,
+        operation,
+        principal = %principal,
+        action = %action,
+        resource = %resource,
+        explicit_deny = true,
+        outcome = "refused_access_denied",
+        "a resource-based policy in force on the resource explicitly denies this call"
+    );
+    crate::scaffolded::Scaffolded::access_denied(not_authorized_by_resource_policy(
+        &principal, &action, resource,
+    ))
 }
 
 /// The principal this request speaks for, and the identity-based policies in force on it.
@@ -474,32 +552,34 @@ mod tests {
     fn the_refusal_names_the_principal_the_action_the_resource_and_the_reason() {
         let principal = "arn:aws:iam::000000000000:user/noperm-probe";
         let resource = repository("probe");
-        // (case, explicit deny, the clause the message must carry)
-        let rows: &[(&str, bool, &str)] = &[
+        // One row per reason a grant can be withheld, across BOTH policy classes: the
+        // sentence is the same and only the reason clause differs.
+        // (case, the message, the clause it must carry)
+        let action = action_for("CreateRepository");
+        let rows: &[(&str, String, &str)] = &[
             (
-                "no policy allows it",
-                false,
+                "no identity-based policy allows it",
+                not_authorized(principal, &action, &resource, false),
                 "because no identity-based policy allows the ecr-public:CreateRepository action",
             ),
             (
-                "a policy denies it",
-                true,
-                "with an explicit deny in an identity-based policy",
+                "an identity-based policy denies it",
+                not_authorized(principal, &action, &resource, true),
+                EXPLICIT_DENY_IN_IDENTITY_POLICY,
+            ),
+            (
+                "a policy on the resource denies it",
+                not_authorized_by_resource_policy(principal, &action, &resource),
+                EXPLICIT_DENY_IN_RESOURCE_POLICY,
             ),
         ];
-        for (case, explicit, reason) in rows {
-            let message = not_authorized(
-                principal,
-                &action_for("CreateRepository"),
-                &resource,
-                *explicit,
-            );
+        for (case, message, reason) in rows {
             let expected = format!(
                 "User: {principal} is not authorized to perform: ecr-public:CreateRepository \
                  on resource: {resource} {reason}"
             );
             assert_eq!(
-                message, expected,
+                *message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"
             );
         }
