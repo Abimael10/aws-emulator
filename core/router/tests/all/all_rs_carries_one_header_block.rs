@@ -29,7 +29,10 @@ use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
 ///
 /// A root with no item at all is all header, which is what the sibling guards report; this
 /// reader answers it like any other.
-fn header_of(source: &str) -> Vec<&str> {
+///
+/// Shared with the sibling that reads this rule for the OTHER declaration roots of the
+/// workspace, so the two cannot disagree about which lines are a root's header.
+pub(crate) fn header_of(source: &str) -> Vec<&str> {
     let lines: Vec<&str> = source.lines().collect();
     match first_item_line(source) {
         Some(line) => lines[..line - 1].to_vec(),
@@ -40,15 +43,24 @@ fn header_of(source: &str) -> Vec<&str> {
 /// One report per header line of `source` that repeats an earlier header line, naming the line
 /// it is on and the line it repeats.
 ///
-/// A line carrying no prose — empty, or a comment with nothing after its slashes — separates
+/// A line carrying no prose — empty, or a comment with nothing after its slashes and, in the
+/// inner-doc spelling a service crate's root uses, the `!` that follows them — separates
 /// paragraphs rather than saying anything, so it is passed over; every other line, an inner
 /// attribute included, is owed exactly one place in the block.
-fn repeated_header_lines(source: &str) -> Vec<String> {
+///
+/// Shared with the sibling that reads the same rule for the other declaration roots in the
+/// workspace rather than copied there.
+pub(crate) fn repeated_header_lines(source: &str) -> Vec<String> {
     let mut seen: Vec<(usize, &str)> = Vec::new();
     let mut reports = Vec::new();
     for (index, line) in header_of(source).into_iter().enumerate() {
         let text = line.trim_end();
-        let prose = text.trim_start().trim_start_matches('/').trim();
+        let marked = text.trim_start();
+        let prose = marked
+            .strip_prefix("//!")
+            .or_else(|| marked.strip_prefix("//"))
+            .unwrap_or(marked)
+            .trim();
         if prose.is_empty() {
             continue;
         }
@@ -100,7 +112,7 @@ fn the_reader_reports_a_header_line_written_twice() {
     let license = "// SPDX-License-Identifier: CC0-1.0\n\n";
     let paragraph = "// The target, and what belongs in it.\n// Put a new suite beside it.\n";
     let list = "#[path = \"all/boot_serve.rs\"]\nmod boot_serve;\n";
-    let cases: [(&str, String, usize); 9] = [
+    let cases: [(&str, String, usize); 10] = [
         ("a root with no header at all", list.to_string(), 0),
         ("one header block", format!("{license}{paragraph}{list}"), 0),
         (
@@ -134,6 +146,15 @@ fn the_reader_reports_a_header_line_written_twice() {
             // Two separators and two blank lines say nothing, so neither is a repeat.
             "separators and blank lines repeated",
             format!("{license}//\n{paragraph}//\n\n{list}"),
+            0,
+        ),
+        (
+            // The same, in the inner-doc spelling every service crate's root is written in:
+            // `//!` with nothing after it separates two paragraphs of that header.
+            "inner-doc separators repeated",
+            format!(
+                "{license}//! The target.\n//!\n//! Put a new suite beside it.\n//!\n{list}"
+            ),
             0,
         ),
         (

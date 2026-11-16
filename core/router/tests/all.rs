@@ -777,6 +777,8 @@ mod contributor_insights_log_events;
 mod ddb_stream_lambda_esm_provisioning;
 #[path = "all/declaration_roots_are_canonical_and_complete.rs"]
 mod declaration_roots_are_canonical_and_complete;
+#[path = "all/declaration_roots_carry_no_duplicated_comment_line.rs"]
+mod declaration_roots_carry_no_duplicated_comment_line;
 #[path = "all/declaration_roots_end_with_their_last_declaration.rs"]
 mod declaration_roots_end_with_their_last_declaration;
 #[path = "all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs"]
