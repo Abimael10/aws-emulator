@@ -71,7 +71,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One CloudWatch Logs call: its status and parsed body.
-async fn logs(
+pub(crate) async fn logs(
     router: &MultiServiceRouter,
     operation: &str,
     body: &serde_json::Value,
@@ -99,7 +99,7 @@ async fn logs(
 }
 
 /// The wire error code of an awsJson error body (`__type`, which may carry a namespace).
-fn error_code(body: &serde_json::Value) -> String {
+pub(crate) fn error_code(body: &serde_json::Value) -> String {
     let raw = body["__type"].as_str().unwrap_or_default();
     raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
 }

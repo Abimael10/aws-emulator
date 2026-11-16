@@ -611,6 +611,8 @@ mod cloudformation_updates_iam_roles;
 mod cloudformation_updates_lambda_functions;
 #[path = "all/cloudformation_wafv2_protection_stack.rs"]
 mod cloudformation_wafv2_protection_stack;
+#[path = "all/cloudfront_access_log_deliveries_carry_each_edge_request.rs"]
+mod cloudfront_access_log_deliveries_carry_each_edge_request;
 #[path = "all/cloudfront_api_call_events.rs"]
 mod cloudfront_api_call_events;
 #[path = "all/cloudfront_apigateway_origin_edge.rs"]
