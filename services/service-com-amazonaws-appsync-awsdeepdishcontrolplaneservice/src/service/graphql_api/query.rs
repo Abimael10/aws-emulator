@@ -43,7 +43,7 @@ use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::execution::{self, GraphqlRequest};
-use super::PlaneContext;
+use super::{caller, PlaneContext};
 use crate::service::event_api::{self, PresentedAuth};
 
 /// The path the GraphQL endpoint serves its API at — the path `uris`'s `GRAPHQL` entry
@@ -236,6 +236,14 @@ async fn served_request(
             );
         }
     }
+    // WHO the call speaks for, resolved once: it is both what a resolver reads as
+    // `$context.identity` and what the API's fields are authorized for ([`caller`]). A call
+    // that presents no SigV4 material names no principal, which is every call made under
+    // another of the API's authorization modes.
+    let signed = caller::presented_caller(&context.engine, &parts.headers);
+    let identity = signed
+        .as_ref()
+        .map_or(Json::Null, |caller| caller.identity.clone());
     let Ok(document) = ::serde_json::from_slice::<Json>(body) else {
         return error_response(400, BAD_REQUEST_ERROR_TYPE, BODY_IS_A_DOCUMENT);
     };
@@ -254,9 +262,100 @@ async fn served_request(
             .cloned()
             .unwrap_or_default(),
         headers: request_fields(&parts.headers),
+        identity,
+        unauthorized: Vec::new(),
     };
+    let mut request = request;
+    // What IAM says about the fields this call selects. A call NONE of whose fields it
+    // permits is refused outright; one it permits some of is served, with the rest reported
+    // as fields the caller may not access.
+    let judged = judged_fields(context, &arn, signed.as_ref(), &request);
+    if judged.refuses_the_call() {
+        ::tracing::info!(
+            api_id = %context.api_id,
+            "this caller's IAM policies permit no field this call selects"
+        );
+        return error_response(401, event_api::UNAUTHORIZED_ERROR_TYPE, PERMISSION_DENIED);
+    }
+    request.unauthorized = judged.refused;
     let answered = execution::execute(context, &request).await;
     json_response(200, &answered.document())
+}
+
+/// What IAM decided about the FIELDS one call selects.
+struct Judged {
+    /// The `(typeName, fieldName)` pairs the caller's policies do not permit.
+    refused: Vec<(String, String)>,
+    /// Whether any field the call selects IS permitted.
+    any_permitted: bool,
+}
+
+impl Judged {
+    /// Whether the whole call is refused: the caller may reach no field of it at all, which
+    /// is the request AppSync answers `401` rather than serving a result with no data in it.
+    fn refuses_the_call(&self) -> bool {
+        !self.any_permitted && !self.refused.is_empty()
+    }
+}
+
+/// Judge each field this call selects for `appsync:GraphQL`.
+///
+/// AppSync's `AWS_IAM` mode is the IAM layer in front of the API: "you can use IAM policies
+/// to restrict access to … individual fields", so each field the call selects of the
+/// operation's root type is judged on that field's own ARN ([`caller::field_resource`])
+/// BEFORE any resolver runs. A field no statement allows, and one an explicit `Deny` covers,
+/// is a field the caller may not access: it resolves to nothing and is reported as an error
+/// of its own path, and no resolver of it runs. A call that may reach NO field it selects is
+/// refused outright.
+///
+/// Judged only for a call the mode applies to: the API has to have configured `AWS_IAM` (as
+/// its `authenticationType` or as one of its additional providers), and the call has to
+/// present the SigV4 material that mode decides. Everything else permits every field, as
+/// every other authorization mode decides a call as a whole.
+fn judged_fields(
+    context: &PlaneContext,
+    arn: &str,
+    signed: Option<&caller::SignedCaller>,
+    request: &GraphqlRequest,
+) -> Judged {
+    let permitted = Judged {
+        refused: Vec::new(),
+        any_permitted: true,
+    };
+    let Some(signed) = signed else {
+        return permitted;
+    };
+    if !context
+        .state
+        .lock()
+        .graphql_apis
+        .get(&context.api_id)
+        .is_some_and(|api| super::configures(api, caller::IAM_AUTH_TYPE))
+    {
+        return permitted;
+    }
+    let selected = execution::selected_root_fields(context, request);
+    let mut judged = Judged {
+        refused: Vec::new(),
+        any_permitted: false,
+    };
+    for (type_name, field_name) in selected {
+        if caller::permits(
+            signed,
+            &caller::field_resource(arn, &type_name, &field_name),
+        ) {
+            judged.any_permitted = true;
+            continue;
+        }
+        ::tracing::info!(
+            api_id = %context.api_id,
+            %type_name,
+            %field_name,
+            "this caller's IAM policies do not let it perform appsync:GraphQL on the field"
+        );
+        judged.refused.push((type_name, field_name));
+    }
+    judged
 }
 
 /// The request's own fields as a resolver reads them (`ctx.request.headers`): one member per
@@ -456,10 +555,18 @@ fn error_response(
     error_type: &str,
     message: &str,
 ) -> ::http::Response<Full<Bytes>> {
-    json_response(
+    let mut response = json_response(
         status,
         &event_api::publish::errors_document(error_type, message),
-    )
+    );
+    // AppSync names the type of a data-plane error in a field of the answer as well as in
+    // the error itself, which is where a client that reads neither body nor status looks.
+    if let Ok(value) = ::http::HeaderValue::from_str(error_type) {
+        response
+            .headers_mut()
+            .insert(::http::HeaderName::from_static("x-amzn-errortype"), value);
+    }
+    response
 }
 
 /// The members a GraphQL request carries.
@@ -481,3 +588,8 @@ const REQUEST_TIMED_OUT: &str = "This request took longer than this endpoint all
 const SERVER_BUSY: &str = "This endpoint is serving as many requests as it can. Try again.";
 const NO_WEBSOCKETS: &str =
     "A WebSocket connection is served at the API's real-time endpoint.";
+
+/// The sentence AppSync states when the caller's IAM policies do not permit the call: the
+/// refusal of the `AWS_IAM` authorization mode, which names neither the field it refused nor
+/// the policy that refused it.
+pub const PERMISSION_DENIED: &str = "Permission denied";

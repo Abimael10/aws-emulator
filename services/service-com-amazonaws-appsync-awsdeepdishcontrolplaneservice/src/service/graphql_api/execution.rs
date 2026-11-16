@@ -37,6 +37,7 @@
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
 
+use super::mapping_template::{self, Raised};
 use super::PlaneContext;
 use crate::ops::evaluate_code::appsync_js::{self, Outcome};
 use crate::state::{DataSourceRecord, GraphqlApiRecord, ResolverRecord};
@@ -53,6 +54,14 @@ pub struct GraphqlRequest {
     pub variables: JsonMap<String, Json>,
     /// The request's own fields, which a resolver reads as `ctx.request.headers`.
     pub headers: JsonMap<String, Json>,
+    /// Who the request presented itself as, which a resolver reads as `ctx.identity` —
+    /// `Json::Null` for a request whose authorization mode names no principal
+    /// ([`super::query`] builds it).
+    pub identity: Json,
+    /// The `(typeName, fieldName)` pairs the caller may NOT access: the fields the
+    /// authorization in front of the API refused ([`super::query`]), which resolve to
+    /// nothing and are reported as errors of their own path instead of being run.
+    pub unauthorized: Vec<(String, String)>,
 }
 
 /// What executing one request came to: the data it resolved, and the errors of the fields
@@ -118,6 +127,16 @@ const MAX_SELECTED_FIELDS: usize = 64;
 /// not, and why a document past this is refused before anything is built.
 const MAX_SELECTED_NODES: usize = 1_024;
 
+/// How long ALL the mapping templates of ONE request may run, between them: the evaluations
+/// of one request share this, so a request selecting many template-defined fields cannot
+/// hold a thread for the sum of their own budgets.
+const MAX_TEMPLATE_RUNTIME: ::std::time::Duration = ::std::time::Duration::from_secs(2);
+
+/// How long the CALLER waits for one evaluation, past the budget that evaluation was given:
+/// the margin it takes a run to notice its own clock, held outside the run as the APPSYNC_JS
+/// evaluations of this service hold theirs.
+const TEMPLATE_WAIT_CEILING: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
 /// The `DataSourceType` of a data source AppSync resolves against WITHOUT leaving itself:
 /// `NONE` is "There is no data source", so the request function's own `payload` is the
 /// result the response function is handed ("local resolvers" in the AppSync developer
@@ -168,6 +187,8 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         request,
         runs: 0,
         errors: Vec::new(),
+        appended: Vec::new(),
+        template_deadline: ::std::time::Instant::now() + MAX_TEMPLATE_RUNTIME,
     };
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
@@ -176,6 +197,39 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         data: Some(data),
         errors: execution.errors,
     }
+}
+
+/// The fields one request selects of the operation's ROOT type: the `(typeName, fieldName)`
+/// pairs a call on this API addresses, which is what an IAM policy about the API's fields is
+/// judged against ([`super::query`]).
+///
+/// Empty for a request this endpoint executes nothing of — one whose document does not
+/// parse, or that names no operation of it — because such a request addresses no field; the
+/// execution reports that fault itself.
+pub fn selected_root_fields(
+    context: &PlaneContext,
+    request: &GraphqlRequest,
+) -> Vec<(String, String)> {
+    let Ok((kind, fields)) = read_operation(request) else {
+        return Vec::new();
+    };
+    let Some(root_type) = context
+        .state
+        .lock()
+        .graphql_apis
+        .get(&context.api_id)
+        .map(|api| match kind {
+            OperationKind::Query => api.query_root_type(),
+            OperationKind::Mutation => api.mutation_root_type(),
+            OperationKind::Subscription => api.subscription_root_type(),
+        })
+    else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .map(|field| (root_type.clone(), field.name.clone()))
+        .collect()
 }
 
 /// Read `request`'s document: the operation to run and the fields it selects, owned, with
@@ -212,6 +266,14 @@ struct Execution<'a> {
     runs: usize,
     /// The errors of the fields that did not resolve, in the order they were resolved.
     errors: Vec<Json>,
+    /// The errors the mapping templates of the field being resolved APPENDED
+    /// (`$util.appendError`, which "does not interrupt the evaluation"), drained onto
+    /// [`Self::errors`] under that field's own path once it is resolved.
+    appended: Vec<Raised>,
+    /// When this request's mapping templates have had all the time they get between them:
+    /// each evaluation is given what is left of it, so the PRODUCT of the fields a request
+    /// selects and the templates each one runs is bounded, not just each run.
+    template_deadline: ::std::time::Instant,
 }
 
 impl Execution<'_> {
@@ -258,6 +320,21 @@ impl Execution<'_> {
                 .push(field_error(path, &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}.")));
             return Json::Null;
         }
+        // A field the authorization in front of the API refused this caller resolves to
+        // nothing: no resolver of it runs, and the answer reports it as a field the caller
+        // may not access.
+        if self
+            .request
+            .unauthorized
+            .iter()
+            .any(|(refused_type, refused_field)| {
+                refused_type == type_name && *refused_field == field.name
+            })
+        {
+            self.errors
+                .push(unauthorized_field(path, type_name, &field.name));
+            return Json::Null;
+        }
         let plan = self.plan(type_name, &field.name);
         let value = match plan {
             // A field the API attaches no resolver to is the member of the object its
@@ -270,17 +347,28 @@ impl Execution<'_> {
                     return Json::Null;
                 }
                 self.runs = self.runs.saturating_add(1);
-                match self.run(&plan, type_name, source, field).await {
+                let outcome = self.run(&plan, type_name, source, field).await;
+                // Whatever the run came to, the errors its templates appended are reported
+                // under this field's path: that is what appending one is for.
+                for appended in ::std::mem::take(&mut self.appended) {
+                    self.errors.push(appended.document(path));
+                }
+                match outcome {
                     Ok(value) => value,
-                    Err(reason) => {
-                        self.errors.push(field_error(path, &reason));
+                    Err(failure) => {
+                        self.errors.push(failure.document(path));
                         return Json::Null;
                     }
                 }
             }
         };
         if field.selections.is_empty() {
-            return value;
+            // A field with no sub-selection resolves to a SCALAR, which the type the schema
+            // declares for it says how to write out.
+            return match self.field_type(type_name, &field.name) {
+                Some(declared) => json_coerced(&declared, value),
+                None => value,
+            };
         }
         // The field's own type is what says which resolvers its sub-selection addresses.
         let child_type = self.field_type_name(type_name, &field.name);
@@ -353,8 +441,10 @@ impl Execution<'_> {
         let resolver = api.resolver(type_name, field_name)?;
         Some(ResolverPlan {
             code: resolver.code.clone(),
-            has_templates: resolver.request_mapping_template.is_some()
-                || resolver.response_mapping_template.is_some(),
+            templates: Templates::of(
+                resolver.request_mapping_template.as_deref(),
+                resolver.response_mapping_template.as_deref(),
+            ),
             data_source: step_data_source(api, resolver.data_source_name.as_deref()),
             functions: pipeline_steps(api, resolver),
             is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
@@ -381,70 +471,103 @@ impl Execution<'_> {
             .unwrap_or_default()
     }
 
+    /// The TYPE the API's schema declares for `field_name` of `type_name`, with everything it
+    /// is wrapped in, or `None` when the schema declares none.
+    fn field_type(&self, type_name: &str, field_name: &str) -> Option<crate::state::TypeRef> {
+        let store = self.context.state.lock();
+        store
+            .graphql_apis
+            .get(&self.context.api_id)
+            .and_then(|api| api.types.get(type_name))
+            .and_then(|record| {
+                record
+                    .parsed
+                    .fields
+                    .iter()
+                    .find(|field| field.name == field_name)
+            })
+            .and_then(|field| field.value_type.clone())
+    }
+
     /// Run `plan` for one field and answer the value the field resolves to.
     ///
-    /// A UNIT resolver runs its own `request` function, resolves the result against the data
-    /// source it names, and runs its `response` function over that result. A PIPELINE
-    /// resolver runs its `request` function as the step before its functions, each function
-    /// the same way in the order the pipeline names them — each handed the previous step's
-    /// result as `ctx.prev.result` — and its `response` function as the step after them.
-    /// The stash is carried from step to step, as "an object available inside each resolver
-    /// and function handler".
+    /// A UNIT resolver runs its own request step, resolves the result against the data source
+    /// it names, and runs its response step over that result. A PIPELINE resolver runs its
+    /// request step as the step BEFORE its functions, each function the same way in the order
+    /// the pipeline names them — each handed the previous step's result as `ctx.prev.result`
+    /// — and its response step as the step AFTER them. The stash is carried from step to
+    /// step, as "a single stash object lives through a single resolver run".
+    ///
+    /// Each of those steps is the resolver's `code` where it is defined by code, and its
+    /// mapping template for that direction where it is defined by templates.
     async fn run(
         &mut self,
         plan: &ResolverPlan,
         type_name: &str,
         source: &Json,
         field: &SelectedField,
-    ) -> Result<Json, String> {
+    ) -> Result<Json, Failure> {
         let mut stash = Json::Object(JsonMap::new());
         let base = self.field_context(type_name, source, field);
-        let mut previous = if plan.is_pipeline {
-            // The pipeline's before step: what it returns is the `ctx.prev.result` the
-            // first function is handed.
-            match &plan.code {
-                Some(code) => {
-                    returned(
-                        code,
-                        REQUEST_FUNCTION,
-                        &step_context(&base, &stash, &Json::Null, None),
-                        &mut stash,
-                    )
-                    .await?
+        if !plan.is_pipeline {
+            let step = PipelineStep {
+                name: field.name.clone(),
+                code: plan.code.clone(),
+                templates: plan.templates.clone(),
+                data_source: plan.data_source.clone(),
+            };
+            return self.run_step(&step, &base, &mut stash, &Json::Null).await;
+        }
+        // The pipeline's BEFORE step: what it produces is the `ctx.prev.result` the first
+        // function is handed.
+        let mut previous = match (&plan.code, &plan.templates) {
+            (Some(code), _) => {
+                returned(
+                    code,
+                    REQUEST_FUNCTION,
+                    &step_context(&base, &stash, &Json::Null, None),
+                    &mut stash,
+                )
+                .await?
+            }
+            (None, Some(templates)) => match &templates.request {
+                Some(template) => {
+                    let context = step_context(&base, &stash, &Json::Null, None);
+                    let rendered = self.rendered(template, &context, &mut stash).await?;
+                    read_rendered(&rendered, REQUEST_TEMPLATE)?
                 }
                 None => Json::Null,
-            }
-        } else {
-            Json::Null
+            },
+            (None, None) => Json::Null,
         };
-        if plan.is_pipeline {
-            if plan.functions.is_empty() {
-                return Err(NO_PIPELINE_FUNCTIONS.to_string());
-            }
-            for step in &plan.functions {
-                previous = self
-                    .run_step(step, &base, &mut stash, &previous)
-                    .await
-                    .map_err(|reason| format!("{}: {reason}", step.name))?;
-            }
-            let Some(code) = &plan.code else {
-                return Ok(previous);
-            };
-            return returned(
+        if plan.functions.is_empty() {
+            return Err(NO_PIPELINE_FUNCTIONS.to_string().into());
+        }
+        for step in &plan.functions {
+            previous = self
+                .run_step(step, &base, &mut stash, &previous)
+                .await
+                .map_err(|failure| failure.prefixed(&step.name))?;
+        }
+        // And its AFTER step, over what the last function produced.
+        match (&plan.code, &plan.templates) {
+            (Some(code), _) => Ok(returned(
                 code,
                 RESPONSE_FUNCTION,
                 &step_context(&base, &stash, &previous, Some(&previous)),
                 &mut stash,
             )
-            .await;
+            .await?),
+            (None, Some(templates)) => match &templates.response {
+                Some(template) => {
+                    let context = step_context(&base, &stash, &previous, Some(&previous));
+                    let rendered = self.rendered(template, &context, &mut stash).await?;
+                    read_rendered(&rendered, RESPONSE_TEMPLATE)
+                }
+                None => Ok(previous),
+            },
+            (None, None) => Ok(previous),
         }
-        let step = PipelineStep {
-            name: field.name.clone(),
-            code: plan.code.clone(),
-            has_templates: plan.has_templates,
-            data_source: plan.data_source.clone(),
-        };
-        self.run_step(&step, &base, &mut stash, &previous).await
     }
 
     /// Run ONE step — a UNIT resolver, or one function of a pipeline — against its own data
@@ -455,17 +578,19 @@ impl Execution<'_> {
         base: &FieldContext,
         stash: &mut Json,
         previous: &Json,
-    ) -> Result<Json, String> {
+    ) -> Result<Json, Failure> {
         let Some(code) = &step.code else {
-            // A definition written as VTL mapping templates rather than as APPSYNC_JS
-            // code: this endpoint runs the code the APPSYNC_JS runtime runs, and nothing
-            // of this emulator evaluates a Velocity template, so the field is reported as
-            // one that did not resolve rather than answered with a value nothing computed.
-            return Err(if step.has_templates {
-                MAPPING_TEMPLATES_NOT_RUN.to_string()
-            } else {
-                NO_DEFINITION.to_string()
-            });
+            // A definition written as VTL MAPPING TEMPLATES rather than as APPSYNC_JS
+            // code, which is the other form `Resolver$requestMappingTemplate` /
+            // `$responseMappingTemplate` carry; a step that carries neither has no
+            // definition to run at all.
+            return match &step.templates {
+                Some(templates) => {
+                    self.run_templates(step, templates, base, stash, previous)
+                        .await
+                }
+                None => Err(NO_DEFINITION.to_string().into()),
+            };
         };
         let requested = returned(
             code,
@@ -475,13 +600,98 @@ impl Execution<'_> {
         )
         .await?;
         let result = self.data_source_result(step, &requested)?;
-        returned(
+        Ok(returned(
             code,
             RESPONSE_FUNCTION,
             &step_context(base, stash, &result, Some(previous)),
             stash,
         )
-        .await
+        .await?)
+    }
+
+    /// Run ONE step that is defined by MAPPING TEMPLATES: evaluate the request template to
+    /// the request its data source is handed, resolve that request against the data source,
+    /// and evaluate the response template over the result it produced.
+    ///
+    /// Both templates are evaluated over the field's own `$context` ([`step_context`]), and
+    /// the `stash` each leaves behind travels on, as "a single stash object lives through a
+    /// single resolver run". The request template renders the data source's request object,
+    /// so its text is read as the JSON document that object is
+    /// (`EvaluateMappingTemplate$evaluationResult`); the response template renders the value
+    /// the field resolves to, so its text is read as that value. A template that is missing
+    /// contributes nothing of its own: "VTL request mapping templates are optional when
+    /// using an Lambda data source", and a missing response template leaves the data
+    /// source's own result as the field's value.
+    async fn run_templates(
+        &mut self,
+        step: &PipelineStep,
+        templates: &Templates,
+        base: &FieldContext,
+        stash: &mut Json,
+        previous: &Json,
+    ) -> Result<Json, Failure> {
+        let requested = match &templates.request {
+            Some(template) => {
+                let context = step_context(base, stash, &Json::Null, Some(previous));
+                let rendered = self.rendered(template, &context, stash).await?;
+                read_rendered(&rendered, REQUEST_TEMPLATE)?
+            }
+            None => Json::Null,
+        };
+        let result = self.data_source_result(step, &requested)?;
+        match &templates.response {
+            Some(template) => {
+                let context = step_context(base, stash, &result, Some(previous));
+                let rendered = self.rendered(template, &context, stash).await?;
+                read_rendered(&rendered, RESPONSE_TEMPLATE)
+            }
+            None => Ok(result),
+        }
+    }
+
+    /// Evaluate one template over `context`, carrying onto `stash` what it left there and
+    /// onto this execution the errors it appended.
+    ///
+    /// The evaluation is SYNCHRONOUS host work with no await point of its own, so it is run
+    /// on the blocking pool rather than on the connection's own task — the same seam the
+    /// APPSYNC_JS runs of this service use ([`appsync_js`]) — and the caller waits no longer
+    /// than [`TEMPLATE_WAIT_CEILING`] for it. The budget it is given is what is LEFT of this
+    /// request's own template time ([`MAX_TEMPLATE_RUNTIME`]), so the templates of one
+    /// request cannot add up past it however many fields it selects.
+    async fn rendered(
+        &mut self,
+        template: &str,
+        context: &Json,
+        stash: &mut Json,
+    ) -> Result<String, Failure> {
+        let budget = self
+            .template_deadline
+            .saturating_duration_since(::std::time::Instant::now());
+        if budget.is_zero() {
+            return Err(format!(
+                "{TEMPLATES_TOOK_TOO_LONG} {} seconds.",
+                MAX_TEMPLATE_RUNTIME.as_secs()
+            )
+            .into());
+        }
+        let owned = template.to_string();
+        let over = context.clone();
+        let evaluated = ::tokio::time::timeout(
+            TEMPLATE_WAIT_CEILING,
+            ::tokio::task::spawn_blocking(move || mapping_template::evaluate(&owned, &over, budget)),
+        )
+        .await;
+        let evaluation = match evaluated {
+            Ok(Ok(evaluation)) => evaluation?,
+            // The run did not finish, or did not come back at all: the field is reported as
+            // one that did not resolve rather than waited on.
+            Ok(Err(_)) | Err(_) => return Err(TEMPLATE_DID_NOT_FINISH.to_string().into()),
+        };
+        if let Some(left) = evaluation.context.get(STASH_MEMBER) {
+            *stash = left.clone();
+        }
+        self.appended.extend(evaluation.appended);
+        Ok(evaluation.text)
     }
 
     /// The result the step's data source produces for the request its `request` function
@@ -491,15 +701,18 @@ impl Execution<'_> {
     /// the local resolver AppSync documents. Every other type names a resource of another
     /// service, which this endpoint does not call, so the field is reported as one that did
     /// not resolve rather than answered with a value nothing produced.
-    fn data_source_result(&self, step: &PipelineStep, requested: &Json) -> Result<Json, String> {
+    fn data_source_result(&self, step: &PipelineStep, requested: &Json) -> Result<Json, Failure> {
         let Some(data_source) = &step.data_source else {
-            return Err(crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE.to_string());
+            return Err(crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE
+                .to_string()
+                .into());
         };
         if data_source.kind != LOCAL_DATA_SOURCE {
             return Err(format!(
                 "{DATA_SOURCE_NOT_CALLED} {} data source {}.",
                 data_source.kind, data_source.name
-            ));
+            )
+            .into());
         }
         Ok(requested.get(PAYLOAD_MEMBER).cloned().unwrap_or(Json::Null))
     }
@@ -509,6 +722,7 @@ impl Execution<'_> {
         FieldContext {
             arguments: Json::Object(field.arguments.clone()),
             source: source.clone(),
+            identity: self.request.identity.clone(),
             request: json!({"headers": Json::Object(self.request.headers.clone())}),
             info: json!({
                 "fieldName": field.name,
@@ -531,9 +745,9 @@ struct ResolverPlan {
     /// The APPSYNC_JS `code` the resolver is defined by, or `None` for one defined another
     /// way.
     code: Option<String>,
-    /// Whether the resolver carries mapping templates, which is the other way a definition
-    /// is written.
-    has_templates: bool,
+    /// The mapping templates the resolver is defined by, which is the other way a
+    /// definition is written.
+    templates: Option<Templates>,
     /// The data source the resolver names, where the API still holds it.
     data_source: Option<StepDataSource>,
     /// The steps of a `PIPELINE` resolver, in the order the pipeline invokes them.
@@ -548,8 +762,84 @@ struct PipelineStep {
     /// What the step is called, which is what an error of the step names it by.
     name: String,
     code: Option<String>,
-    has_templates: bool,
+    templates: Option<Templates>,
     data_source: Option<StepDataSource>,
+}
+
+/// The mapping templates one step is defined by: one per direction, either of which a
+/// definition may leave out.
+#[derive(Debug, Clone)]
+struct Templates {
+    request: Option<String>,
+    response: Option<String>,
+}
+
+impl Templates {
+    /// The templates a stored definition carries, or `None` for one that carries neither —
+    /// which is a definition written another way.
+    fn of(request: Option<&str>, response: Option<&str>) -> Option<Self> {
+        (request.is_some() || response.is_some()).then(|| Self {
+            request: request.map(str::to_string),
+            response: response.map(str::to_string),
+        })
+    }
+}
+
+/// Why one step did not produce a value: a sentence about the step, or the error a mapping
+/// template RAISED, which carries everything `$util.error` was handed.
+#[derive(Debug, Clone)]
+enum Failure {
+    Message(String),
+    /// What a mapping template RAISED, boxed: it carries everything `$util.error` was
+    /// handed, which is far larger than the rest of this error channel.
+    Raised(Box<Raised>),
+}
+
+impl Failure {
+    /// This failure as the error of the field that did not resolve.
+    fn document(&self, path: &[Json]) -> Json {
+        match self {
+            Self::Message(message) => field_error(path, message),
+            Self::Raised(raised) => raised.document(path),
+        }
+    }
+
+    /// This failure as one a NAMED step of a pipeline produced.
+    fn prefixed(self, name: &str) -> Self {
+        match self {
+            Self::Message(message) => Self::Message(format!("{name}: {message}")),
+            Self::Raised(mut raised) => {
+                raised.message = format!("{name}: {}", raised.message);
+                Self::Raised(raised)
+            }
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<mapping_template::Fault> for Failure {
+    fn from(fault: mapping_template::Fault) -> Self {
+        match fault {
+            mapping_template::Fault::Raised(raised) => Self::Raised(raised),
+            mapping_template::Fault::Fault(reason) => Self::Message(reason),
+        }
+    }
+}
+
+/// The text a rendered template produced, as the value it stands for: a template renders
+/// the JSON of that value, and one that rendered nothing stands for nothing.
+fn read_rendered(rendered: &str, direction: &str) -> Result<Json, Failure> {
+    let text = rendered.trim();
+    if text.is_empty() {
+        return Ok(Json::Null);
+    }
+    ::serde_json::from_str(text)
+        .map_err(|error| Failure::Message(format!("{direction} {NOT_RENDERED_JSON} {error}")))
 }
 
 /// The data source one step resolves against: its type, and the name it is held under.
@@ -585,14 +875,16 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
             Some(function) => PipelineStep {
                 name: function.name.clone(),
                 code: function.code.clone(),
-                has_templates: function.request_mapping_template.is_some()
-                    || function.response_mapping_template.is_some(),
+                templates: Templates::of(
+                    function.request_mapping_template.as_deref(),
+                    function.response_mapping_template.as_deref(),
+                ),
                 data_source: step_data_source(api, Some(&function.data_source_name)),
             },
             None => PipelineStep {
                 name: function_id.clone(),
                 code: None,
-                has_templates: false,
+                templates: None,
                 data_source: None,
             },
         })
@@ -606,6 +898,7 @@ struct FieldContext {
     source: Json,
     request: Json,
     info: Json,
+    identity: Json,
 }
 
 /// The `ctx` one step is run with: what the field carries, the stash as the steps before it
@@ -624,10 +917,10 @@ fn step_context(
         "arguments": base.arguments,
         "args": base.arguments,
         "source": base.source,
-        // The material a call presents is judged by the endpoint before anything runs
-        // (`super::authorized`), and an API key names no principal, so no identity is
-        // reported to the code.
-        "identity": Json::Null,
+        // Who the request presented itself as, which the endpoint resolved before anything
+        // ran (`super::query`): the principal of the call for an authorization mode that
+        // names one, and `null` for one that names none — an API key names no principal.
+        "identity": base.identity,
         "request": base.request,
         "info": base.info,
         "stash": stash,
@@ -674,6 +967,20 @@ fn field_error(path: &[Json], message: &str) -> Json {
     json!({"path": path.to_vec(), "message": message})
 }
 
+/// The error AppSync reports for a field the caller may not access: its own path, the
+/// `Unauthorized` error type and the sentence naming the field and the type it belongs to.
+fn unauthorized_field(path: &[Json], type_name: &str, field_name: &str) -> Json {
+    json!({
+        "path": path.to_vec(),
+        "errorType": UNAUTHORIZED_FIELD_ERROR_TYPE,
+        "message": format!("{UNAUTHORIZED_FIELD} {field_name} on type {type_name}"),
+    })
+}
+
+/// The `errorType` and the fixed part of the sentence that error states.
+const UNAUTHORIZED_FIELD_ERROR_TYPE: &str = "Unauthorized";
+const UNAUTHORIZED_FIELD: &str = "Not Authorized to access";
+
 /// The named type a reference resolves to, whatever it is wrapped in: a list of non-null
 /// `Post`s is still a reference to `Post`.
 fn named_type(reference: &crate::state::TypeRef) -> String {
@@ -682,6 +989,37 @@ fn named_type(reference: &crate::state::TypeRef) -> String {
         crate::state::TypeRef::List(inner) | crate::state::TypeRef::NonNull(inner) => {
             named_type(inner)
         }
+    }
+}
+
+/// The scalar AppSync writes a value out as a JSON string: `AWSJSON` is "a JSON string",
+/// where every other scalar is written as the value itself.
+const JSON_SCALAR: &str = "AWSJSON";
+
+/// `value` as the type `reference` declares writes it out.
+///
+/// The one coercion a resolved value needs: a value of the `AWSJSON` scalar is written as the
+/// JSON TEXT of it — "a JSON string. Any valid JSON construct" — so a client reads the value
+/// back by parsing that string, whatever construct the resolver produced. A list of them
+/// coerces element by element, because each element is one such value, and `null` stays
+/// `null`: no value was produced to write out.
+fn json_coerced(reference: &crate::state::TypeRef, value: Json) -> Json {
+    match reference {
+        crate::state::TypeRef::NonNull(inner) => json_coerced(inner, value),
+        crate::state::TypeRef::List(inner) => match value {
+            Json::Array(elements) => Json::Array(
+                elements
+                    .into_iter()
+                    .map(|element| json_coerced(inner, element))
+                    .collect(),
+            ),
+            other => other,
+        },
+        crate::state::TypeRef::Named(name) if name == JSON_SCALAR => match value {
+            Json::Null => Json::Null,
+            other => Json::String(other.to_string()),
+        },
+        crate::state::TypeRef::Named(_) => value,
     }
 }
 
@@ -987,8 +1325,15 @@ const TOO_MANY_NODES: &str = "One request selects at most";
 const CYCLIC_FRAGMENT: &str = "This document spreads a fragment into itself:";
 const TOO_MANY_RUNS: &str = "One request runs at most";
 const NO_DEFINITION: &str = "This field's resolver carries no definition to run.";
-const MAPPING_TEMPLATES_NOT_RUN: &str =
-    "This field's resolver is defined by mapping templates, which this endpoint does not \
-     run; define it with APPSYNC_JS code.";
+const TEMPLATES_TOOK_TOO_LONG: &str =
+    "This request's mapping templates ran for longer than this endpoint evaluates them in:";
+const TEMPLATE_DID_NOT_FINISH: &str =
+    "This field's mapping template did not finish, so the field did not resolve.";
+const NOT_RENDERED_JSON: &str = "mapping template did not render a JSON value:";
+const REQUEST_TEMPLATE: &str = "The request";
+const RESPONSE_TEMPLATE: &str = "The response";
+
+/// The member of a resolver's `$context` the stash is carried in.
+const STASH_MEMBER: &str = "stash";
 const DATA_SOURCE_NOT_CALLED: &str = "This endpoint does not call the";
 const NO_PIPELINE_FUNCTIONS: &str = "This field's pipeline resolver invokes no function.";

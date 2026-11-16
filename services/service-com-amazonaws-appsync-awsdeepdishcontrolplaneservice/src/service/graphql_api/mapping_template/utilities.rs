@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The `$util` helpers a mapping template may call — "general utility methods … available
+//! to all templates" in the AppSync resolver mapping-template reference.
+//!
+//! One function per helper, over the same JSON value model the rest of the language works
+//! in ([`super::values`]). Three of them are not values at all and are answered as their own
+//! outcome: `$util.quiet` produces nothing, and `$util.error` and `$util.unauthorized` RAISE
+//! — "throws a custom error", which is how a template refuses the field it is resolving.
+//!
+//! A helper this does not implement is a FAULT, named in the answer, rather than an empty
+//! value: a template asking for one gets the field reported as unresolved instead of a value
+//! nothing computed.
+
+use ::serde_json::{Map as JsonMap, Value as Json};
+
+use super::values;
+
+/// What one `$util` call came to.
+#[derive(Debug, Clone)]
+pub enum Answer {
+    /// A value, written where the call was referenced.
+    Value(Json),
+    /// A call that produces no output at all: `$util.quiet` / `$util.qr`, "the same as
+    /// `$util.quiet`".
+    Nothing,
+    /// A call that RAISES: the field being resolved did not resolve, and this is the error
+    /// it reports.
+    Raised(Raised),
+    /// A call that APPENDS an error and goes on: `$util.appendError`, which "appends a
+    /// custom error … does not interrupt the evaluation of the request mapping template".
+    Appended(Raised),
+}
+
+/// The error a template raises or appends, with every member the helper takes.
+#[derive(Debug, Clone, Default)]
+pub struct Raised {
+    pub message: String,
+    pub error_type: Option<String>,
+    pub data: Option<Json>,
+    pub error_info: Option<Json>,
+}
+
+impl Raised {
+    /// The error as one entry of a GraphQL result's `errors`.
+    #[must_use]
+    pub fn document(&self, path: &[Json]) -> Json {
+        let mut entry = JsonMap::new();
+        entry.insert("path".to_string(), Json::Array(path.to_vec()));
+        entry.insert("message".to_string(), Json::String(self.message.clone()));
+        if let Some(error_type) = &self.error_type {
+            entry.insert("errorType".to_string(), Json::String(error_type.clone()));
+        }
+        if let Some(data) = &self.data {
+            entry.insert("data".to_string(), data.clone());
+        }
+        if let Some(error_info) = &self.error_info {
+            entry.insert("errorInfo".to_string(), error_info.clone());
+        }
+        Json::Object(entry)
+    }
+}
+
+/// The `errorType` AppSync gives the refusal `$util.unauthorized` raises, and the fixed
+/// part of the sentence it states, which names the field being resolved and the type it
+/// belongs to.
+const UNAUTHORIZED_ERROR_TYPE: &str = "Unauthorized";
+const UNAUTHORIZED_MESSAGE: &str = "Not Authorized to access";
+
+/// Call the `$util` helper `path` names with `args`.
+///
+/// `path` is the helper's own name, or the name of a sub-helper and the name within it
+/// (`$util.time.nowISO8601` arrives as `["time", "nowISO8601"]`). `context` is the
+/// `$context` the template is being evaluated over, which is what the one helper that
+/// refuses the FIELD being resolved names it from.
+pub fn call(path: &[String], args: &[Json], context: &Json) -> Result<Answer, String> {
+    let named: Vec<&str> = path.iter().map(String::as_str).collect();
+    let value = |produced: Json| Ok(Answer::Value(produced));
+    let argument = |index: usize| args.get(index).cloned().unwrap_or(Json::Null);
+    let text = |index: usize| match args.get(index) {
+        Some(Json::String(text)) => text.clone(),
+        Some(other) => values::rendered(other),
+        None => String::new(),
+    };
+    match named.as_slice() {
+        // "Returns a stringified JSON representation of the object".
+        ["toJson"] => value(Json::String(argument(0).to_string())),
+        // "Takes a stringified JSON and returns an object representation of the result".
+        ["parseJson"] => match ::serde_json::from_str::<Json>(&text(0)) {
+            Ok(parsed) => value(parsed),
+            Err(_) => Err(NOT_JSON.to_string()),
+        },
+        // "Returns an empty string" — the call is made for its effect, not its value.
+        ["quiet" | "qr"] => Ok(Answer::Nothing),
+        // "Throws a custom error": message, then the optional errorType, data and
+        // errorInfo, in the order the helper takes them.
+        ["error"] => Ok(Answer::Raised(raised(args))),
+        // "Appends a custom error", which does not stop the evaluation.
+        ["appendError"] => Ok(Answer::Appended(raised(args))),
+        // "Throws Unauthorized for the field being resolved."
+        ["unauthorized"] => {
+            let named = |member: &str| {
+                context
+                    .get("info")
+                    .and_then(|info| info.get(member))
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Ok(Answer::Raised(Raised {
+                message: format!(
+                    "{UNAUTHORIZED_MESSAGE} {} on type {}",
+                    named("fieldName"),
+                    named("parentTypeName")
+                ),
+                error_type: Some(UNAUTHORIZED_ERROR_TYPE.to_string()),
+                ..Raised::default()
+            }))
+        }
+        // "Returns a 128-bit randomly generated UUID."
+        ["autoId"] => value(Json::String(::uuid::Uuid::new_v4().to_string())),
+        // The null and emptiness tests.
+        ["isNull"] => value(Json::Bool(argument(0).is_null())),
+        ["isNotNull"] => value(Json::Bool(!argument(0).is_null())),
+        ["isNullOrEmpty"] => value(Json::Bool(is_empty(&argument(0)))),
+        ["isNullOrBlank"] => value(Json::Bool(match argument(0) {
+            Json::String(text) => text.trim().is_empty(),
+            other => is_empty(&other),
+        })),
+        ["defaultIfNull"] => value(match argument(0) {
+            Json::Null => argument(1),
+            present => present,
+        }),
+        ["defaultIfNullOrEmpty" | "defaultIfNullOrBlank"] => {
+            let candidate = argument(0);
+            let blank = match &candidate {
+                Json::String(text) => text.trim().is_empty(),
+                other => is_empty(other),
+            };
+            value(if blank { argument(1) } else { candidate })
+        }
+        // The type tests.
+        ["isString"] => value(Json::Bool(argument(0).is_string())),
+        ["isNumber"] => value(Json::Bool(argument(0).is_number())),
+        ["isBoolean"] => value(Json::Bool(argument(0).is_boolean())),
+        ["isList"] => value(Json::Bool(argument(0).is_array())),
+        ["isMap"] => value(Json::Bool(argument(0).is_object())),
+        // The encodings.
+        ["escapeJavaScript"] => value(Json::String(escaped(&text(0)))),
+        ["urlEncode"] => value(Json::String(
+            ::url::form_urlencoded::byte_serialize(text(0).as_bytes()).collect(),
+        )),
+        ["urlDecode"] => value(Json::String(
+            ::url::form_urlencoded::parse(format!("value={}", text(0)).as_bytes())
+                .find(|(key, _)| key == "value")
+                .map(|(_, decoded)| decoded.to_string())
+                .unwrap_or_default(),
+        )),
+        ["base64Encode"] => {
+            use ::base64::Engine as _;
+            value(Json::String(
+                ::base64::engine::general_purpose::STANDARD.encode(text(0).as_bytes()),
+            ))
+        }
+        ["base64Decode"] => {
+            use ::base64::Engine as _;
+            match ::base64::engine::general_purpose::STANDARD.decode(text(0)) {
+                Ok(decoded) => value(Json::String(
+                    String::from_utf8(decoded).map_err(|_| NOT_TEXT.to_string())?,
+                )),
+                Err(_) => Err(NOT_BASE64.to_string()),
+            }
+        }
+        // "Returns true if the specified pattern in the first argument matches the supplied
+        // data in the second argument." The pattern comes from the TEMPLATE (or from the
+        // request, through a reference), so it is compiled under an explicit program budget
+        // rather than the engine's own defaults.
+        ["matches"] => {
+            let compiled = ::regex::RegexBuilder::new(&text(0))
+                .size_limit(MAX_PATTERN_PROGRAM_BYTES)
+                .dfa_size_limit(MAX_PATTERN_DFA_BYTES)
+                .build();
+            match compiled {
+                Ok(expression) => value(Json::Bool(expression.is_match(&text(1)))),
+                Err(_) => Err(NOT_A_PATTERN.to_string()),
+            }
+        }
+        // The clock helpers, which read the one clock this process has.
+        ["time", "nowISO8601"] => value(Json::String(now_iso8601())),
+        ["time", "nowEpochSeconds"] => value(values::number(unix_millis() as f64 / 1000.0)),
+        ["time", "nowEpochMilliSeconds"] => value(values::number(unix_millis() as f64)),
+        unknown => Err(format!("{NO_SUCH_HELPER}$util.{}", unknown.join("."))),
+    }
+}
+
+/// The error the `$util.error` / `$util.appendError` arguments describe, in the order the
+/// helpers take them: the message, then the `errorType`, the `data` and the `errorInfo`.
+fn raised(args: &[Json]) -> Raised {
+    let text = |index: usize| match args.get(index) {
+        Some(Json::String(text)) => Some(text.clone()),
+        Some(Json::Null) | None => None,
+        Some(other) => Some(values::rendered(other)),
+    };
+    Raised {
+        message: text(0).unwrap_or_default(),
+        error_type: text(1),
+        data: args.get(2).cloned().filter(|data| !data.is_null()),
+        error_info: args.get(3).cloned().filter(|info| !info.is_null()),
+    }
+}
+
+/// Whether a value is null or carries nothing: an empty string, list or map.
+fn is_empty(value: &Json) -> bool {
+    match value {
+        Json::Null => true,
+        Json::String(text) => text.is_empty(),
+        Json::Array(list) => list.is_empty(),
+        Json::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// `subject` with every character a JavaScript string literal cannot carry escaped, which
+/// is what the JSON renderer of a string does — the same escapes, over the same alphabet.
+fn escaped(subject: &str) -> String {
+    let quoted = Json::String(subject.to_string()).to_string();
+    quoted
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .map_or(quoted.clone(), ToString::to_string)
+}
+
+/// Now, in the format `$util.time.nowISO8601` answers: an RFC 3339 instant in UTC.
+fn now_iso8601() -> String {
+    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// Now, in milliseconds since the epoch.
+fn unix_millis() -> u64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// How much room a pattern `$util.matches` compiles may take: an explicit budget, because
+/// the expression comes from the template rather than from this crate — a pattern past it is
+/// refused like one that does not parse. Well under the crate's own defaults.
+const MAX_PATTERN_PROGRAM_BYTES: usize = 64 * 1024;
+const MAX_PATTERN_DFA_BYTES: usize = 256 * 1024;
+
+/// The sentences a helper fault states.
+const NOT_JSON: &str = "This value is not a JSON document.";
+const NOT_TEXT: &str = "This value does not decode to text.";
+const NOT_BASE64: &str = "This value is not base64.";
+const NOT_A_PATTERN: &str = "This value is not a regular expression.";
+const NO_SUCH_HELPER: &str = "No such helper: ";

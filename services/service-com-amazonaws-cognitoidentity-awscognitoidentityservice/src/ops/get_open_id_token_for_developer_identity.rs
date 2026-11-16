@@ -664,10 +664,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             .and_then(|seconds| u64::try_from(seconds).ok())
             .map_or(DEFAULT_TOKEN_DURATION, ::std::time::Duration::from_secs);
         let expiration = now + validity;
+        // What AUTHENTICATED this identity, as the token's `amr` claim names it: each provider
+        // the call presented, and — for the developer one — the user that provider
+        // authenticated, named as `<developerProviderName>:<identityPoolId>:
+        // <developerUserIdentifier>`. A developer-authenticated identity is the user of the
+        // developer's OWN directory, so the method that stands for it has to name that user:
+        // the provider name alone says only that the directory authenticated somebody, which
+        // is why a redeemed token publishes both.
+        let mut authenticated_by = providers.clone();
+        authenticated_by.push(format!(
+            "{developer_provider}:{}:{developer_user_identifier}",
+            input.identity_pool_id
+        ));
         let token = crate::state::open_id_token(
             &input.identity_pool_id,
             &identity_id,
-            &providers,
+            &authenticated_by,
             now,
             expiration,
         );
@@ -681,7 +693,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             identity_pool_id: input.identity_pool_id.clone(),
             issued_at: now,
             expiration,
-            authenticated_by: providers.clone(),
+            authenticated_by: authenticated_by.clone(),
             principal_tags: input
                 .principal_tags
                 .map(|tags| tags.into_iter().collect()),

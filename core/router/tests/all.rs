@@ -214,6 +214,8 @@ mod appended_prose;
 mod applicationinsights_resource_group_admission;
 #[path = "all/appstream_app_block_builder_role_trust.rs"]
 mod appstream_app_block_builder_role_trust;
+#[path = "all/appsync_iam_field_authorization_and_vtl_resolvers.rs"]
+mod appsync_iam_field_authorization_and_vtl_resolvers;
 #[path = "all/assembled_router_refusal_identities.rs"]
 mod assembled_router_refusal_identities;
 #[path = "all/audited_calls_that_fail_after_acceptance.rs"]

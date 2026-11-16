@@ -259,11 +259,17 @@ async fn a_vend_is_decided_on_the_methods_the_redeemed_token_was_issued_with() {
         let (identity_id, token) =
             mint(&emulator, &pool_id, row.case, row.login, &format!("user-{index}")).await;
         let carried = token_methods(row.case, &token);
-        let expected: BTreeSet<String> = row
+        let mut expected: BTreeSet<String> = row
             .token_methods
             .iter()
             .map(|method| (*method).to_string())
             .collect();
+        // A DEVELOPER login names, beside the provider itself, the user of that provider's
+        // own directory it authenticated:
+        // `<developerProviderName>:<identityPoolId>:<developerUserIdentifier>`.
+        if matches!(row.login, Login::Developer) {
+            expected.insert(format!("{DEVELOPER_PROVIDER}:{pool_id}:user-{index}"));
+        }
         assert_eq!(
             carried, expected,
             "case {:?}: expected the token to name the methods {expected:?}, got {carried:?}",

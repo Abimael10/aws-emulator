@@ -84,14 +84,17 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # `UpdateType` carry.
 apollo-parser = "0.8"
 # Parses an `associationId` to decide whether it has the UUID form the AppSync service
-# issues its source-API association references in.
-uuid = "1"
+# issues its source-API association references in, and mints the random UUID a mapping
+# template's `$util.autoId()` answers with (`v4`).
+uuid = { version = "1", features = ["v4"] }
 # Evaluates the one modelled `@pattern` this crate checks outside the request boundary —
 # `ApiName`'s expression, which `CreateApi` and `UpdateApi` check in their handlers
 # (`src/state/api_name.rs`) — through the same linear-time engine the boundary's own
-# constraint walk uses, rather than a hand-coded character test. The expression is a
-# constant of the model and is compiled once, never per request and never from request
-# text.
+# constraint walk uses, rather than a hand-coded character test. That expression is a
+# constant of the model, compiled once. The one expression this crate compiles from
+# caller text is a mapping template's `$util.matches` pattern, which is built under an
+# explicit program budget for that reason
+# (`src/service/graphql_api/mapping_template/utilities.rs`).
 regex = "1.13"
 # The two services this one's authorization gate reads the caller and its permissions
 # through: STS resolves the access key id a request presents to the principal it speaks for

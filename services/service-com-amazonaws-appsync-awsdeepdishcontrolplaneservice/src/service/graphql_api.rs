@@ -42,7 +42,9 @@ use ::std::sync::Arc;
 use crate::ops::types::AdditionalAuthenticationProvider;
 use crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState as ServiceStore;
 
+pub mod caller;
 pub mod execution;
+pub mod mapping_template;
 pub mod metrics;
 pub mod query;
 pub mod realtime;
@@ -169,13 +171,7 @@ pub fn authorized(
     let Some(api) = store.graphql_apis.get(api_id) else {
         return false;
     };
-    let configured = |auth_type: &str| {
-        api.authentication_type == auth_type
-            || api
-                .additional_authentication_providers
-                .iter()
-                .any(|provider| provider_type(provider) == Some(auth_type))
-    };
+    let configured = |auth_type: &str| configures(api, auth_type);
     if let Some(presented) = auth.api_key.as_deref() {
         return configured(API_KEY_AUTH_TYPE)
             && store
@@ -191,6 +187,21 @@ pub fn authorized(
             .additional_authentication_providers
             .iter()
             .any(|provider| matches!(provider_type(provider), Some(named) if named != API_KEY_AUTH_TYPE))
+}
+
+/// Whether `api` SET UP the authorization type `auth_type`: either "The authentication
+/// type" every call on the API may use, or one of its `additionalAuthenticationProviders`
+/// ("a list of additional authentication providers for the GraphqlApi API").
+///
+/// The ONE reading of that question, so the material a call presents ([`authorized`]) and
+/// the decision a mode takes about the call afterwards (`query`'s IAM refusal) cannot differ
+/// about which modes the API configured.
+pub fn configures(api: &crate::state::GraphqlApiRecord, auth_type: &str) -> bool {
+    api.authentication_type == auth_type
+        || api
+            .additional_authentication_providers
+            .iter()
+            .any(|provider| provider_type(provider) == Some(auth_type))
 }
 
 /// The authentication type one additional provider sets up, or `None` for a provider that
