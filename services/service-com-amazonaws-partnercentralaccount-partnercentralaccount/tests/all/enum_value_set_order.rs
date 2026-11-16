@@ -8,9 +8,9 @@
 //! VALUES themselves (it is neither the order the model declares the type in nor the
 //! sorted one), so one enumerated type is listed the same way whichever member,
 //! operation or request reached it, and the listed set is always the modelled set
-//! re-ordered: nothing added, nothing dropped, nothing repeated. The clause states NO
-//! submitted value: the requirement is the set a value has to come from, not the one
-//! value that was not in it, so the refusal reads the same whatever a caller sent.
+//! re-ordered: nothing added, nothing dropped, nothing repeated. The clause quotes the
+//! value the request carried for the member, as every constraint class of this service
+//! does; only the ORDER of the set is this suite's subject.
 //!
 //! The rows differ along what the rule generalises over: which enumerated type the
 //! refused value belongs to (five of this model's, of two, five and eight values),
@@ -48,12 +48,13 @@ const INVITATION_STATUS_SET: &str = "EXPIRED, ACCEPTED, PENDING, CANCELED, REJEC
 /// `smithy_query(query="operation",operation="CreatePartner")`).
 const CLIENT_TOKEN_MAX: usize = 64;
 
-/// The requirement clause an enum-constraint violation states for `member_path`, with
-/// the value half the class leaves out.
-fn enum_clause(member_path: &str, value_set: &str) -> String {
+/// The clause an enum-constraint violation states for `refused`, the value the request
+/// carried at `member_path`: the value half every class of this service states, then the
+/// requirement and the set.
+fn enum_clause(refused: &str, member_path: &str, value_set: &str) -> String {
     format!(
-        "Value at '{member_path}' failed to satisfy constraint: Member must satisfy enum \
-         value set: [{value_set}]"
+        "Value '{refused}' at '{member_path}' failed to satisfy constraint: Member must \
+         satisfy enum value set: [{value_set}]"
     )
 }
 
@@ -100,7 +101,11 @@ async fn a_known_enum_set_is_stated_in_the_order_the_refusals_state_it() {
             create_partner("NOT_A_SOLUTION_TYPE", "tok-enum"),
             format!(
                 "1 validation error detected: {}",
-                enum_clause("primarySolutionType", PRIMARY_SOLUTION_TYPE_SET)
+                enum_clause(
+                    "NOT_A_SOLUTION_TYPE",
+                    "primarySolutionType",
+                    PRIMARY_SOLUTION_TYPE_SET
+                )
             ),
         ),
         (
@@ -111,7 +116,11 @@ async fn a_known_enum_set_is_stated_in_the_order_the_refusals_state_it() {
                 "2 validation errors detected: Value '{over_long_token}' at 'clientToken' failed \
                  to satisfy constraint: Member must have length less than or equal to \
                  {CLIENT_TOKEN_MAX}; {}",
-                enum_clause("primarySolutionType", PRIMARY_SOLUTION_TYPE_SET)
+                enum_clause(
+                    "NOT_A_SOLUTION_TYPE",
+                    "primarySolutionType",
+                    PRIMARY_SOLUTION_TYPE_SET
+                )
             ),
         ),
     ];
@@ -148,7 +157,7 @@ async fn a_known_enum_set_is_stated_in_the_order_the_refusals_state_it() {
         "case {case:?}: a constraint violation is HTTP 400, got {status}: {body}"
     );
     let message = string(&body, "Message", case);
-    let expected = enum_clause("status", INVITATION_STATUS_SET);
+    let expected = enum_clause("NOT_A_REAL_STATUS", "status", INVITATION_STATUS_SET);
     assert!(
         message.contains(&expected),
         "case {case:?}: expected the clause {expected:?}, got {message:?}"

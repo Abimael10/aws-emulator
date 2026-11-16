@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What an enum-constraint refusal states about the value it REFUSED: nothing.
+//! What an enum-constraint refusal states about the value it REFUSED: that value.
 //!
-//! The rule under test: a clause refusing a value outside an enumerated type's value set
-//! names the member and the set and states no value —
-//! `Value at '<member path>' failed to satisfy constraint: Member must satisfy enum value
-//! set: [ … ]` — because the requirement is the set every value of that member has to come
-//! from and not the one value that was not in it. So the refusal reads the same whatever a
-//! caller sent, and it holds for the CLASS: every enum-constrained member of every
-//! operation, whatever the type, at whatever depth. Every other constraint class keeps the
-//! value half it is refused with, so the two cannot be confused.
+//! The rule under test: a constraint-violation clause quotes the value the request carried
+//! for the member it refuses — `Value '<value>' at '<member path>' failed to satisfy
+//! constraint: <requirement>` — whatever constraint class the value broke, so the enum
+//! class reads exactly like the `@length`, `@range` and `@pattern` classes of the same
+//! message. The clause therefore FOLLOWS the request: two requests refusing the same member
+//! for two different values state two different messages, and a client that reads the quoted
+//! value out of a clause finds one for every clause of the message.
 //!
 //! The rows differ along what the rule generalises over: which enumerated type carried the
 //! refused value (six of this model's, of two, three, five and eight values), which
 //! operation and member carried it (nine members over seven operations, one of them nested
 //! inside a structure member), how the refused value was spelled (a name no value carries,
 //! an admitted value miscased, padded, the empty string, a long value, a value carrying a
-//! quote, an admitted value of another type), and whether the request breaks the enum alone
-//! or an enum together with another class. The value SET's order is not pinned here — it is
-//! `enum_value_set_order.rs`'s rule; this suite reads the set out of the message and holds
-//! it to being the modelled set re-ordered.
+//! quote, a value carrying the set's own text, an admitted value of another type), and
+//! whether the request breaks the enum alone or an enum together with another class. The
+//! value SET's order is not pinned here — it is `enum_value_set_order.rs`'s rule; this suite
+//! reads the set out of the message and holds it to being the modelled set re-ordered.
 
 use serde_json::{json, Value};
 
@@ -36,11 +35,11 @@ use crate::enum_value_set_order::create_partner;
 const CLIENT_TOKEN_MAX: usize = 64;
 
 /// Everything a clause states before the value set it lists: the envelope's count, the
-/// member path, and the value half the enum class leaves out.
-fn clause_opening(member_path: &str) -> String {
+/// value the request carried, the member path and the requirement.
+fn clause_opening(refused: &str, member_path: &str) -> String {
     format!(
-        "1 validation error detected: Value at '{member_path}' failed to satisfy constraint: \
-         Member must satisfy enum value set: ["
+        "1 validation error detected: Value '{refused}' at '{member_path}' failed to satisfy \
+         constraint: Member must satisfy enum value set: ["
     )
 }
 
@@ -65,10 +64,10 @@ fn start_profile_update_task(solution_type: &str) -> Value {
 }
 
 /// Every enum-constrained input member of this service, each refused a value outside its
-/// type: one validation error, stating the member and the set it had to come from and no
-/// value at all, and the set it lists is the modelled set re-ordered.
+/// type: one validation error, quoting the value the request carried, naming the member and
+/// the set it had to come from, and the set it lists is the modelled set re-ordered.
 #[tokio::test]
-async fn an_enum_refusal_states_no_submitted_value() {
+async fn an_enum_refusal_quotes_the_value_it_refused() {
     let emulator = Emulator::new();
     let outside = "NOT_A_MODELLED_VALUE";
 
@@ -169,7 +168,7 @@ async fn an_enum_refusal_states_no_submitted_value() {
             "case {case:?}: expected ValidationException, got {code:?}: {body}"
         );
         let message = string(&body, "Message", case);
-        let listed = listed_set(&message, member_path, case);
+        let listed = listed_set(&message, outside, member_path, case);
 
         let mut sorted_listed = listed.clone();
         sorted_listed.sort_unstable();
@@ -183,30 +182,31 @@ async fn an_enum_refusal_states_no_submitted_value() {
     }
 }
 
-/// The values a refusal lists for `member_path`, with the whole clause around them held to
-/// the wording the rule states — so a value half anywhere in the message fails here.
-fn listed_set(message: &str, member_path: &str, case: &str) -> Vec<String> {
-    let opening = clause_opening(member_path);
+/// The values a refusal lists for `member_path` after quoting `refused`, with the whole
+/// clause around them held to the wording the rule states — so a clause that drops the
+/// value half, or quotes another value, fails here.
+fn listed_set(message: &str, refused: &str, member_path: &str, case: &str) -> Vec<String> {
+    let opening = clause_opening(refused, member_path);
     let listed = message
         .strip_prefix(opening.as_str())
         .and_then(|tail| tail.strip_suffix(']'))
         .unwrap_or_else(|| {
             panic!("case {case:?}: expected {opening:?} then the set, got {message:?}")
         });
-    assert!(
-        !message.contains("Value '"),
-        "case {case:?}: an enum clause quotes no value, got {message:?}"
-    );
     listed.split(", ").map(str::to_string).collect()
 }
 
-/// The clause belongs to the member and its type, not to the request: one member refused
-/// every spelling of an inadmissible value a caller can send answers one message, byte for
-/// byte.
+/// The quoted value is the one the REQUEST sent: one member refused every spelling of an
+/// inadmissible value a caller can send quotes that spelling back, so no two of these
+/// messages are the same.
 #[tokio::test]
-async fn the_clause_does_not_follow_the_refused_value() {
+async fn the_quoted_value_follows_what_the_request_sent() {
     let emulator = Emulator::new();
 
+    // A long value, under the ceiling the framework's own walk elides a clause's echo at:
+    // past it the clause quotes a prefix and the value's byte count, which is the
+    // framework's rendering of a long value rather than this rule.
+    let long = "V".repeat(200);
     let spellings = [
         ("a name no value carries", "NOT_A_MODELLED_VALUE"),
         ("an admitted value miscased", "pending"),
@@ -215,10 +215,10 @@ async fn the_clause_does_not_follow_the_refused_value() {
         ("a value carrying a quote", "O'Brien"),
         ("a value carrying the set's own text", "EXPIRED, ACCEPTED"),
         ("an admitted value of ANOTHER type", "SUBSIDIARY"),
-        ("a long value", &"V".repeat(512)),
+        ("a long value", long.as_str()),
     ];
 
-    let mut stated: Option<(&str, String)> = None;
+    let mut seen: Vec<(&str, String)> = Vec::new();
     for (case, refused) in spellings {
         let (status, body) = emulator
             .call(
@@ -231,38 +231,42 @@ async fn the_clause_does_not_follow_the_refused_value() {
             "case {case:?}: a value outside the set is refused, got {status}: {body}"
         );
         let message = string(&body, "Message", case);
-        listed_set(&message, "status", case);
-        match &stated {
-            None => stated = Some((case, message)),
-            Some((first_case, first)) => assert_eq!(
-                &message, first,
-                "case {case:?}: expected the message {first_case:?} states, {first:?}, got \
-                 {message:?}"
-            ),
+        // The clause quotes this spelling and no other: `listed_set` holds the whole
+        // opening of the message, the quoted value included.
+        listed_set(&message, refused, "status", case);
+        for (earlier_case, earlier) in &seen {
+            assert_ne!(
+                &message, earlier,
+                "case {case:?}: a clause following the value cannot read the same as \
+                 {earlier_case:?}'s, got {message:?}"
+            );
         }
+        seen.push((case, message));
     }
 }
 
-/// The value half is dropped for the enum CLASS and not for the request: a request that
-/// breaks an enum and a `@length` maximum together states the over-long value it sent and
-/// not the inadmissible one.
+/// The value half belongs to the CLASS-independent half of a clause: a request that breaks
+/// an enum and a `@length` maximum together quotes the over-long value it sent in one clause
+/// and the inadmissible one in the other, and the message carries no clause without a value.
 #[tokio::test]
-async fn another_class_in_the_same_request_still_states_its_value() {
+async fn each_class_in_the_same_request_quotes_its_own_value() {
     let emulator = Emulator::new();
     let over_long_token = "t".repeat(CLIENT_TOKEN_MAX + 1);
+    let refused = "NOT_A_SOLUTION_TYPE";
     let case = "an over-long client token and a solution type outside its set";
 
     let (status, body) = emulator
-        .call(
-            "CreatePartner",
-            &create_partner("NOT_A_MODELLED_VALUE", &over_long_token),
-        )
+        .call("CreatePartner", &create_partner(refused, &over_long_token))
         .await;
     assert_eq!(
         status, 400,
         "case {case:?}: two constraint violations are HTTP 400, got {status}: {body}"
     );
     let message = string(&body, "Message", case);
+    assert!(
+        message.starts_with("2 validation errors detected: "),
+        "case {case:?}: the envelope counts the violations, got {message:?}"
+    );
     let token_clause = format!(
         "Value '{over_long_token}' at 'clientToken' failed to satisfy constraint: Member must \
          have length less than or equal to {CLIENT_TOKEN_MAX}"
@@ -271,15 +275,17 @@ async fn another_class_in_the_same_request_still_states_its_value() {
         message.contains(&token_clause),
         "case {case:?}: expected the length clause {token_clause:?}, got {message:?}"
     );
-    let enum_clause = "Value at 'primarySolutionType' failed to satisfy constraint: Member must \
-                       satisfy enum value set: [";
+    let enum_clause = format!(
+        "Value '{refused}' at 'primarySolutionType' failed to satisfy constraint: Member must \
+         satisfy enum value set: ["
+    );
     assert!(
-        message.contains(enum_clause),
+        message.contains(&enum_clause),
         "case {case:?}: expected the enum clause {enum_clause:?}, got {message:?}"
     );
     assert!(
-        !message.contains("Value 'NOT_A_MODELLED_VALUE'"),
-        "case {case:?}: the enum clause quotes no value, got {message:?}"
+        !message.contains("Value at '"),
+        "case {case:?}: every clause quotes the value it refused, got {message:?}"
     );
 }
 

@@ -63,9 +63,11 @@
 //! whole-value anchors the model brackets it with. Both refusal paths go through it,
 //! so they cannot disagree.
 //!
-//! What this service chooses is what an ENUM clause states: no submitted value, and
-//! the admissible values listed in the order this service lists a set in — the
-//! [`enum_value_set`] module, which owns that rule for the class.
+//! What this service chooses about an ENUM clause is one thing only: the ORDER the
+//! admissible values are listed in — the [`enum_value_set`] module, which owns that
+//! rule for the class. The value half of the clause is not a choice: every class
+//! states the value the request carried for the member it refuses, so the clause keeps
+//! the value half the framework writes for it.
 
 mod enum_value_set;
 
@@ -317,25 +319,21 @@ fn validation_exception(
 
 /// The `Message` of a constraint refusal: the AWS validation envelope
 /// (`N validation error(s) detected: `) over one clause per violation, each naming the
-/// member path in lowerCamelCase, the constraint it failed and — for every class but
-/// one — the rejected value. `None` when there is nothing to state.
+/// member path in lowerCamelCase, the constraint it failed and the rejected value.
+/// `None` when there is nothing to state.
 ///
 /// The envelope, the clauses and the `@pattern` quoting are the shared home's and the
 /// framework's, so a constraint class added upstream cannot arrive with a sentence of
-/// its own. This service chooses one thing about one class: an enum clause states no
-/// value and lists the admissible values in its own order ([`enum_value_set`]).
+/// its own — and so the value half is stated for every class alike, including the one
+/// value a `@sensitive` member's clause withholds, which the framework's own walk
+/// decides. This service chooses one thing about one class: the order an enum clause
+/// lists the admissible values in ([`enum_value_set`]).
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     // The order is applied to each violation BEFORE the envelope words it, so only the
     // values inside an enum clause move and every other violation reaches the shared
     // renderer exactly as the framework's walk reported it.
     let stated = Refusal::Invalid(violations.iter().map(enum_value_set::as_stated).collect());
-    Some(
-        service_common::validation_message::aws_validation_refusal_withholding_violations(
-            &stated,
-            enum_value_set::states_no_value,
-        )?
-        .message,
-    )
+    Some(service_common::validation_message::aws_validation_refusal(&stated)?.message)
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {

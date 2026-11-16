@@ -1,36 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a constraint refusal of a value outside an enumerated type STATES: which values
-//! that type admits, in which order, and — the half this service leaves out — no submitted
-//! value at all.
+//! that type admits, and in which order.
 //!
-//! Two things about such a clause are this service's rather than the framework's, and both
-//! belong to the enum CLASS rather than to a member or an operation:
+//! ONE thing about such a clause is this service's rather than the framework's, and it
+//! belongs to the enum CLASS rather than to a member or an operation: the values are
+//! listed in the order the front door's own TABLE of the admissible values is walked —
+//! the table's buckets in ascending order, each bucket being the low bits of the value's
+//! own string hash ([`service_common::validation_message::in_hashed_enum_order`]) — and
+//! not in the order the model declares the type's members in. That order is computed from
+//! the values themselves, so it belongs to the enumerated TYPE: every member of every
+//! operation targeting one enum is listed alike, at whatever depth and in whatever binding
+//! the value arrived, and a type the model gains needs nothing added here.
 //!
-//! * the clause names the member and the set and states NO value —
-//!   `Value at '<member path>' failed to satisfy constraint: Member must satisfy enum value
-//!   set: [ … ]` — because the requirement is the set every value of that member has to
-//!   come from and not the one value that was not in it, so the refusal reads the same
-//!   whatever a caller sent. Every other constraint class keeps the value half the
-//!   framework writes for it, which is what a `@length`, a `@range` and a `@pattern`
-//!   refusal of this service state.
-//! * the values are listed in the order the front door's own TABLE of the admissible values
-//!   is walked — the table's buckets in ascending order, each bucket being the low bits of
-//!   the value's own string hash
-//!   ([`service_common::validation_message::in_hashed_enum_order`]) — and not in the order
-//!   the model declares the type's members in. That order is computed from the values
-//!   themselves, so it belongs to the enumerated TYPE: every member of every operation
-//!   targeting one enum is listed alike, at whatever depth and in whatever binding the
-//!   value arrived, and a type the model gains needs nothing added here.
+//! The VALUE half of the clause is not this service's to choose: an enum clause quotes the
+//! value the request carried for the member it refuses — `Value '<value>' at '<member
+//! path>' failed to satisfy constraint: Member must satisfy enum value set: [ … ]` — just
+//! as a `@length`, a `@range` and a `@pattern` clause of this service do, and the one value
+//! a clause states nothing of is the one the framework's own walk withholds (a `@sensitive`
+//! member's).
 //!
 //! Nothing about the SENTENCE is this module's: the counted envelope, the clause, the
-//! member path, the requirement each constraint class states and the mechanics of dropping
-//! a clause's value half live in the shared home for boundary-refusal wording
-//! ([`service_common::validation_message`]) and in the framework behind it, so this service
-//! cannot word a constraint differently from the services that state the same sentence.
+//! member path and the requirement each constraint class states live in the shared home for
+//! boundary-refusal wording ([`service_common::validation_message`]) and in the framework
+//! behind it, so this service cannot word a constraint differently from the services that
+//! state the same sentence.
 
 use ::service_common::validation_message::in_hashed_enum_order;
-use ::smithy_server_runtime::{Violation, ViolationKind};
+use ::smithy_server_runtime::Violation;
 
 /// One violation as this service states it: an enumerated type's admissible values listed
 /// in the order the table of them is walked, and every other violation unchanged.
@@ -38,15 +35,10 @@ pub(super) fn as_stated(violation: &Violation) -> Violation {
     in_hashed_enum_order(violation)
 }
 
-/// Whether the clause `violation` states names no value: a value outside an enumerated
-/// type's value set, and nothing else.
-pub(super) fn states_no_value(violation: &Violation) -> bool {
-    matches!(violation.kind, ViolationKind::EnumValue(_))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::smithy_server_runtime::ViolationKind;
 
     /// The violation the framework hands over for `value`, outside the enumerated type
     /// whose admissible values are `declared`.
@@ -144,29 +136,65 @@ mod tests {
         }
     }
 
-    /// WHICH clauses state no value: the enum class alone, so every other class keeps the
-    /// framework's value half.
+    /// Re-ordering a set restates the set and NOTHING else: the member path, the rejected
+    /// value and whether that value is withheld reach the clause exactly as the
+    /// framework's walk reported them, whatever the constraint class.
     #[test]
-    fn only_an_enum_clause_states_no_value() {
-        let stated = enum_violation(crate::ops::types::INVITATION_STATUS_VALUES);
-        assert!(
-            states_no_value(&stated),
-            "an enum clause states no value, got {stated:?}"
-        );
-        for (case, kind) in [
-            ("a length maximum", ViolationKind::MaxLength(64)),
-            ("a length minimum", ViolationKind::MinLength(1)),
-            ("a range maximum", ViolationKind::MaxValue("100".to_string())),
+    fn only_the_listed_set_is_restated() {
+        let refused = enum_violation(crate::ops::types::INVITATION_STATUS_VALUES);
+        let rows = [
+            ("a value outside an enum", refused.clone()),
+            (
+                "a length maximum",
+                Violation {
+                    kind: ViolationKind::MaxLength(64),
+                    ..refused.clone()
+                },
+            ),
+            (
+                "a length minimum",
+                Violation {
+                    kind: ViolationKind::MinLength(1),
+                    ..refused.clone()
+                },
+            ),
+            (
+                "a range maximum",
+                Violation {
+                    kind: ViolationKind::MaxValue("100".to_string()),
+                    ..refused.clone()
+                },
+            ),
             (
                 "a pattern",
-                ViolationKind::Pattern("^[a-zA-Z0-9-]+$".to_string()),
+                Violation {
+                    kind: ViolationKind::Pattern("^[a-zA-Z0-9-]+$".to_string()),
+                    ..refused.clone()
+                },
             ),
-            ("an absent required member", ViolationKind::MissingRequiredMember),
-        ] {
-            let other = Violation { kind, ..stated.clone() };
-            assert!(
-                !states_no_value(&other),
-                "case {case:?}: every other class states the value it was sent, got {other:?}"
+            (
+                "a value the walk withholds",
+                Violation {
+                    sensitive: true,
+                    ..refused.clone()
+                },
+            ),
+            (
+                "an absent required member",
+                Violation {
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                    ..refused.clone()
+                },
+            ),
+        ];
+
+        for (case, violation) in rows {
+            let stated = as_stated(&violation);
+            assert_eq!(
+                (&stated.path, &stated.value, stated.sensitive),
+                (&violation.path, &violation.value, violation.sensitive),
+                "case {case:?}: expected the path and value half of {violation:?}, got {stated:?}"
             );
         }
     }
