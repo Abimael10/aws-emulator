@@ -4,11 +4,13 @@
 //!
 //! Creates one elastic network interface in the subnet the request names and stores it in
 //! [`crate::state`], where `DescribeNetworkInterfaces` reports it: the interface's private
-//! IPv4 addresses come out of that subnet's assignable range, its VPC and Availability
+//! IPv4 addresses come out of that subnet's assignable range, its IPv6 addresses and prefix
+//! delegation prefixes out of the IPv6 CIDR block associated with that subnet — a subnet with
+//! none has nothing to assign, which is a refusal about the request — its VPC and Availability
 //! Zone from the subnet itself, and its security groups from the account's groups in that
-//! VPC. The IPv6, prefix, connection-tracking and operator members name state this slice
-//! does not hold, so a request that carries one is answered with a 501 rather than an
-//! interface that silently lacks what was asked for.
+//! VPC. The IPv4-prefix, connection-tracking and operator members name state this slice does
+//! not hold, so a request that carries one is answered with a 501 rather than an interface
+//! that silently lacks what was asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -203,35 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state;
 
         // Members that name state this slice does not hold. Each one CONTRADICTS what the
-        // interface would otherwise report — an IPv6 address has to come out of the
-        // subnet's IPv6 range, a prefix out of its delegated prefixes, a connection
-        // tracking configuration and an operator are resources of their own — so a request
-        // that carries one is refused as unwritten rather than answered with an interface
-        // that silently lacks it.
-        if input
-            .ipv6_addresses
-            .as_ref()
-            .is_some_and(|addresses| !addresses.is_empty())
-            || input.ipv6_address_count.is_some_and(|count| count > 0)
-            || input.enable_primary_ipv6.unwrap_or(false)
-        {
-            return Err(Scaffolded::not_implemented(
-                "CreateNetworkInterface with IPv6 addresses",
-            ));
-        }
+        // interface would otherwise report — an IPv4 prefix comes out of the subnet's
+        // delegated IPv4 prefixes, a connection tracking configuration and an operator are
+        // resources of their own — so a request that carries one is refused as unwritten
+        // rather than answered with an interface that silently lacks what was asked for. The
+        // IPv6 members are NOT among them: an IPv6 address or prefix comes out of the
+        // subnet's own associated IPv6 CIDR block, which this store holds.
         if input
             .ipv4_prefixes
             .as_ref()
             .is_some_and(|prefixes| !prefixes.is_empty())
             || input.ipv4_prefix_count.is_some_and(|count| count > 0)
-            || input
-                .ipv6_prefixes
-                .as_ref()
-                .is_some_and(|prefixes| !prefixes.is_empty())
-            || input.ipv6_prefix_count.is_some_and(|count| count > 0)
         {
             return Err(Scaffolded::not_implemented(
-                "CreateNetworkInterface with assigned prefixes",
+                "CreateNetworkInterface with assigned IPv4 prefixes",
             ));
         }
         if input.connection_tracking_specification.is_some() {
@@ -289,6 +276,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.private_ip_address.as_deref(),
             specified,
             secondary_count,
+            efa_only,
+        )?;
+        // The IPv6 members' own documented combination rules and the space they ask for, read
+        // through the ONE reading of those members this crate has
+        // ([`crate::state::requested_interface_ipv6`]) — the IPv6 counterpart of the reading
+        // above, so the four IPv6 members and the primary-IPv6 flag are held to the same
+        // terms wherever an interface is asked for. Asked before any address is resolved, so
+        // the answer never depends on which member was looked at first.
+        let requested_ipv6 = state::requested_interface_ipv6(
+            input.ipv6_addresses.as_deref().unwrap_or_default(),
+            input.ipv6_address_count.unwrap_or(0),
+            input.ipv6_prefixes.as_deref().unwrap_or_default(),
+            input.ipv6_prefix_count.unwrap_or(0),
+            input.enable_primary_ipv6.unwrap_or(false),
             efa_only,
         )?;
 
@@ -399,6 +400,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .filter_map(|address| address.private_ip_address.as_deref())
                 .collect();
+            // The IPv6 space the request asked for is part of what it asked for, so a replay
+            // is compared on it too — on the ASK (how many, and which ones were named),
+            // never on the addresses the service chose, which a repeat could not have asked
+            // for.
+            let stored_ipv6: Vec<&str> = stored
+                .ipv6_addresses
+                .iter()
+                .flatten()
+                .filter_map(|address| address.ipv6_address.as_deref())
+                .collect();
+            let stored_ipv6_prefixes: Vec<&str> = stored
+                .ipv6_prefixes
+                .iter()
+                .flatten()
+                .filter_map(|prefix| prefix.ipv6_prefix.as_deref())
+                .collect();
             let same_request = stored.subnet_id.as_deref() == Some(subnet_id.as_str())
                 && stored.description.as_deref().unwrap_or_default()
                     == input.description.as_deref().unwrap_or_default()
@@ -408,7 +425,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && stored_addresses.len() == wanted
                 && explicit
                     .iter()
-                    .all(|address| stored_addresses.contains(&address.as_str()));
+                    .all(|address| stored_addresses.contains(&address.as_str()))
+                && stored_ipv6.len() == requested_ipv6.wanted_addresses
+                && stored_ipv6_prefixes.len() == requested_ipv6.wanted_prefixes
+                && requested_ipv6.named_addresses.iter().all(|address| {
+                    state::canonical_ipv6_address(address)
+                        .is_some_and(|canonical| stored_ipv6.contains(&canonical.as_str()))
+                })
+                && requested_ipv6.named_prefixes.iter().all(|prefix| {
+                    state::canonical_ipv6_cidr(prefix).is_ok_and(|canonical| {
+                        stored_ipv6_prefixes.contains(&canonical.as_str())
+                    })
+                });
             if !same_request {
                 // The crate's ONE helper for this refusal, which carries EC2's documented
                 // wording rather than echoing what the caller sent.
@@ -426,6 +454,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_token: input.client_token.clone(),
             });
         }
+
+        // The IPv6 space the interface will hold. "Amazon EC2 automatically selects the IPv6
+        // addresses from the subnet range" (`Ipv6AddressCount`), and an address the request
+        // NAMED has to be one of that same range's assignable addresses — so a subnet with no
+        // associated IPv6 CIDR block has nothing to assign at all, which is the one refusal
+        // this crate words for that ([`crate::state::subnet_has_no_ipv6_range`]). The choice
+        // itself is the store's own ([`crate::state::ComAmazonawsEc2Amazonec2State::resolve_requested_ipv6`]),
+        // the same one an assignment to an interface that already exists takes, so no two
+        // interfaces of an account can be handed the same IPv6 address. Resolved BEFORE the
+        // IPv4 addresses are taken, so a refusal here takes nothing to hand back.
+        let assigned_ipv6 = if requested_ipv6.asks_for_anything() {
+            let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
+                return Err(state::subnet_has_no_ipv6_range());
+            };
+            store.resolve_requested_ipv6(&block, &requested_ipv6)?
+        } else {
+            state::AssignedInterfaceIpv6::default()
+        };
 
         for address in explicit {
             // "The private IPv4 address" has to be one of the subnet's assignable
@@ -487,6 +533,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attachment: None,
             // Nothing but the caller manages an interface the caller created itself.
             requester: None,
+            // The IPv6 space resolved above, in the order the interface holds it.
+            ipv6_addresses: assigned_ipv6.addresses,
+            ipv6_prefixes: assigned_ipv6.prefixes,
+            primary_ipv6: requested_ipv6.primary,
             tags,
         };
         let payload_bytes = state::network_interface_spec_bytes(&spec)

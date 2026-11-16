@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpc
-//! IMPLEMENTED: creates a VPC from the request's CIDR block, stores it as the modelled
-//! [`Vpc`] shape, and answers it in `pending` with the instant the clock owes it
-//! `available` recorded beside it (see
+//! IMPLEMENTED: creates a VPC from the request's CIDR block — or from a block allocated out
+//! of the IPv4 IPAM pool it names, which the pool then reports as space the VPC holds —
+//! stores it as the modelled [`Vpc`] shape, and answers it in `pending` with the instant the
+//! clock owes it `available` recorded beside it (see
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_available_at`]).
 //!
 //! This is the ONLY file to touch for this operation.
@@ -184,52 +185,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state;
         use std::time::Instant;
 
-        // Two request shapes this emulator holds no state for at all, so a 501 ("nobody
-        // has written this yet") is the honest answer rather than a refusal that blames
-        // the caller: there is no IPAM pool store to allocate a CIDR out of (every IPAM
-        // operation is still a scaffold), and no VPC Encryption Control resource to create
-        // (`CreateVpcEncryptionControl` is still a scaffold too).
-        if input.ipv4_ipam_pool_id.is_some()
-            || input.ipv6_ipam_pool_id.is_some()
-            || input.ipv4_netmask_length.is_some()
-            || input.ipv6_netmask_length.is_some()
-        {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateVpc with an IPAM-allocated CIDR block",
-            ));
-        }
+        // One request shape this emulator holds no state for at all, so a 501 ("nobody has
+        // written this yet") is the honest answer rather than a refusal that blames the
+        // caller: there is no VPC Encryption Control resource to create
+        // (`CreateVpcEncryptionControl` is still a scaffold).
         if input.vpc_encryption_control.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "CreateVpc with a VPC encryption control configuration",
             ));
         }
+        // An IPv6 block out of an IPAM pool is the other: an IPv6 association records WHERE
+        // its space came from (`VpcIpv6CidrBlockAssociation$IpSource` and
+        // `$Ipv6AddressAttribute`), which for a pool-allocated block follows from the pool's
+        // own public-IP source — a fact this slice's pools do not carry — so an association
+        // this path stored would misreport it.
+        if input.ipv6_ipam_pool_id.is_some() || input.ipv6_netmask_length.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateVpc with an IPv6 CIDR block allocated from an IPAM pool",
+            ));
+        }
 
-        // "A VPC must have an associated IPv4 CIDR block. You can choose an IPv4 CIDR
-        // block or an IPAM-allocated IPv4 CIDR block." No IPAM pool was named, so the
-        // request has to carry the block itself. The sentence is AWS's own for this class:
-        // the two wire member names single-quoted, and "should be provided".
-        let Some(requested_cidr) = input.cidr_block.as_deref().filter(|cidr| !cidr.is_empty())
-        else {
+        // "The netmask length of the IPv4 CIDR you want to allocate to this VPC FROM an
+        // Amazon VPC IP Address Manager (IPAM) pool" (`Ipv4NetmaskLength`): the length is the
+        // size of a block taken out of a pool, so it asks for nothing without one.
+        if input.ipv4_netmask_length.is_some() && input.ipv4_ipam_pool_id.is_none() {
+            return Err(state::invalid_parameter_combination(
+                "Ipv4NetmaskLength may be specified only with Ipv4IpamPoolId",
+            ));
+        }
+        let requested_cidr = input.cidr_block.as_deref().filter(|cidr| !cidr.is_empty());
+        // The block the request NAMES and the size it asks a pool to choose are two ways of
+        // saying which block the VPC covers, so a request carrying both says it twice.
+        if requested_cidr.is_some() && input.ipv4_netmask_length.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "The request cannot contain both CIDR and Netmask Length. Exactly one of \
+                 them should be provided.",
+            ));
+        }
+        // "A VPC must have an associated IPv4 CIDR block. You can choose an IPv4 CIDR block
+        // or an IPAM-allocated IPv4 CIDR block": the block comes either from the request
+        // itself or out of the IPAM pool it names, so a request carrying neither has not said
+        // what range the VPC covers.
+        if requested_cidr.is_none() && input.ipv4_ipam_pool_id.is_none() {
             return Err(state::missing_parameter(
                 "Either 'cidrBlock' or 'ipv4IpamPoolId' should be provided.",
             ));
-        };
-        // "We modify the specified CIDR block to its canonical form" (CidrBlock), within
-        // the published VPC block size.
-        let cidr_block = match state::canonical_vpc_ipv4_cidr(requested_cidr) {
-            Ok(canonical) => canonical,
-            Err(state::CidrProblem::Malformed) => {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({requested_cidr}) for parameter cidrBlock is invalid. \
-                     This is not a valid CIDR block."
-                )))
-            }
-            Err(state::CidrProblem::PrefixLength) => {
-                // A block the VPC range rules do not admit is a RANGE violation, not an
-                // unreadable value: "The block range must be between a /16 netmask and /28
-                // netmask" (`InvalidVpc.Range`, EC2 API error codes).
-                return Err(state::invalid_vpc_range(requested_cidr))
-            }
+        }
+        // "We modify the specified CIDR block to its canonical form" (CidrBlock), within the
+        // published VPC block size. A block the pool is asked to CHOOSE is resolved below,
+        // once the store is open.
+        let named_cidr_block = match requested_cidr {
+            None => None,
+            Some(requested) => Some(match state::canonical_vpc_ipv4_cidr(requested) {
+                Ok(canonical) => canonical,
+                Err(state::CidrProblem::Malformed) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({requested}) for parameter cidrBlock is invalid. \
+                         This is not a valid CIDR block."
+                    )))
+                }
+                Err(state::CidrProblem::PrefixLength) => {
+                    // A block the VPC range rules do not admit is a RANGE violation, not an
+                    // unreadable value: "The block range must be between a /16 netmask and /28
+                    // netmask" (`InvalidVpc.Range`, EC2 API error codes).
+                    return Err(state::invalid_vpc_range(requested))
+                }
+            }),
         };
 
         // "Default: default" (InstanceTenancy), and "Important: The host value cannot be
@@ -324,7 +345,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let vpcs = state::require_service_state(&*self.engine)?;
         let region = state::request_region(ctx.parts());
         let mut store = vpcs.lock();
+        // Every move the clock already owed is applied before this request reads the store, so
+        // the IPAM pool a CIDR is taken out of below is in the state the clock owes it rather
+        // than the one its last caller saw.
+        store.materialize_due_transitions();
 
+        // The IPv4 block the VPC covers. A request that named it carries it; one that named an
+        // IPAM pool takes it OUT of that pool, which is what makes the range the VPC holds a
+        // range the pool reports as assigned.
+        let cidr_block = match input.ipv4_ipam_pool_id.as_deref() {
+            // Checked above: a request naming no pool has to carry the block itself.
+            None => named_cidr_block.clone().unwrap_or_default(),
+            Some(pool_id) => {
+                // "The ID of an IPv4 IPAM pool you want to use for allocating this VPC's
+                // CIDR" (`Ipv4IpamPoolId`): an id this account holds no pool for is
+                // `.NotFound`, and a pool on its way out is not one a range can come out of —
+                // the same two questions `AllocateIpamPoolCidr` asks of the pool it names.
+                let pool = store.ipam_pools.get(pool_id).cloned().ok_or_else(|| {
+                    state::id_not_found(
+                        state::INVALID_IPAM_POOL_ID_NOT_FOUND,
+                        state::IPAM_POOL_ID_KIND,
+                        pool_id,
+                    )
+                })?;
+                if state::ipam_pool_is_deleting(&pool) {
+                    return Err(state::incorrect_state_of(
+                        "IPAM pool",
+                        pool_id,
+                        pool.state.as_deref().unwrap_or_default(),
+                    ));
+                }
+                // "You must choose either IPv4 or IPv6 protocol for a pool"
+                // (`CreateIpamPoolRequest$AddressFamily`): a pool of the other family hands
+                // out no IPv4 block at all, so it is not a pool this member can name.
+                if pool.address_family.as_deref() != Some(state::ADDRESS_FAMILY_IPV4) {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Invalid value '{pool_id}' for ipv4IpamPoolId. It must name an \
+                         {family} IPAM pool",
+                        family = state::ADDRESS_FAMILY_IPV4,
+                    )));
+                }
+                match named_cidr_block.clone() {
+                    // A range the REQUEST named has to be one the pool actually has to hand
+                    // out, on exactly the terms `AllocateIpamPoolCidr` holds one to: its size
+                    // inside the pool's allocation rules, and the range itself inside the
+                    // pool's free space.
+                    Some(canonical) => {
+                        state::require_compliant_allocation_cidr(
+                            &pool,
+                            pool_id,
+                            "ipv4NetmaskLength",
+                            &canonical,
+                        )?;
+                        store.require_ipam_pool_space(pool_id, "cidrBlock", &canonical)?;
+                        canonical
+                    }
+                    // Otherwise the pool chooses the range, and the request has to say what
+                    // SIZE — unless the pool itself says what size "new allocations will
+                    // default to" (`IpamPool$AllocationDefaultNetmaskLength`).
+                    None => {
+                        let Some(netmask_length) = input
+                            .ipv4_netmask_length
+                            .or(pool.allocation_default_netmask_length)
+                        else {
+                            return Err(state::invalid_parameter_combination(
+                                "The request cannot contain empty CIDR and Netmask Length \
+                                 for a pool with no default allocation netmask length set. \
+                                 Exactly one of them should be provided.",
+                            ));
+                        };
+                        // A VPC's block is held to the published VPC block size whoever chose
+                        // it, so a size outside it is refused before any space is searched —
+                        // naming the length the request asked for rather than a block nothing
+                        // could have handed out.
+                        if !(i32::from(state::MIN_VPC_IPV4_PREFIX)
+                            ..=i32::from(state::MAX_VPC_IPV4_PREFIX))
+                            .contains(&netmask_length)
+                        {
+                            return Err(state::invalid_vpc_range(&format!(
+                                "/{netmask_length}"
+                            )));
+                        }
+                        state::require_compliant_allocation_length(
+                            &pool,
+                            pool_id,
+                            "ipv4NetmaskLength",
+                            netmask_length,
+                        )?;
+                        store.choose_free_ipam_pool_cidr(
+                            pool_id,
+                            "ipv4NetmaskLength",
+                            u32::try_from(netmask_length).unwrap_or(u32::MAX),
+                            &[],
+                            &[],
+                        )?
+                    }
+                }
+            }
+        };
         // A count ceiling first, then the byte budget: a record count on its own admits
         // gigabytes, because each record holds strings the caller chose the length of.
         if !store.has_vpc_capacity() {
@@ -387,6 +505,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .vpc_available_at
             .insert(vpc_id.clone(), Instant::now() + state::VPC_PROVISIONING_DELAY);
+
+        // The ALLOCATION that holds the VPC's range inside the pool it came out of: "in IPAM,
+        // an allocation is a CIDR assignment from an IPAM pool to another IPAM pool or to a
+        // RESOURCE" ([`IpamPoolAllocation`]), so the range the VPC covers is assigned space of
+        // that pool from this moment on — which is what stops a later allocation, or a later
+        // VPC, being handed the same addresses, and what `GetIpamPoolAllocations` reports. It
+        // is stored through the one writer of an allocation, which mints its id; the space
+        // goes back when the VPC is deleted
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::release_ipam_pool_allocations_of_resource`]).
+        if let Some(pool_id) = input.ipv4_ipam_pool_id.as_deref() {
+            let resource_region = store
+                .ipam_pools
+                .get(pool_id)
+                .and_then(|pool| pool.locale.clone().or_else(|| pool.ipam_region.clone()));
+            let resource_owner = store
+                .ipam_pools
+                .get(pool_id)
+                .and_then(|pool| pool.owner_id.clone());
+            if store
+                .allocate_ipam_pool_cidr(
+                    pool_id,
+                    None,
+                    IpamPoolAllocation {
+                        cidr: Some(cidr_block.clone()),
+                        // Minted by the store's one writer of an allocation.
+                        ipam_pool_allocation_id: None,
+                        description: None,
+                        resource_id: Some(vpc_id.clone()),
+                        resource_type: Some(
+                            state::IPAM_POOL_ALLOCATION_RESOURCE_TYPE_VPC.to_string(),
+                        ),
+                        resource_region,
+                        resource_owner,
+                        tags: Some(Vec::new()),
+                    },
+                )
+                .is_none()
+            {
+                // The store is at a ceiling, so the range could not be recorded as assigned.
+                // The VPC goes back with it rather than being left holding space the pool
+                // would hand out again — a success nothing carried out.
+                store.remove_vpc(&vpc_id);
+                return Err(state::resource_limit_exceeded(format!(
+                    "This emulator holds {max} IPAM pool allocations, which is as many as it \
+                     stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                )));
+            }
+        }
 
         // The IPv6 association, when the request asked for one. Its state starts at
         // `associating`: like the VPC's own, the clock owes it `associated`.

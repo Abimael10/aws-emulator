@@ -341,13 +341,16 @@ async fn a_launch_runs_from_the_template_overlaid_with_the_request() {
             value: Some(subnet_id.clone()),
         },
         Row {
-            case: "the request's subnet overrides the template interface's",
+            case: "the request's own network interface replaces the template's",
             template: vec![
                 data("ImageId", TEMPLATE_AMI),
                 data("NetworkInterface.1.DeviceIndex", "0"),
                 data("NetworkInterface.1.SubnetId", "subnet-00000000000000099"),
             ],
-            request: vec![p("SubnetId", subnet_id.clone())],
+            request: vec![
+                p("NetworkInterface.1.DeviceIndex", "0"),
+                p("NetworkInterface.1.SubnetId", subnet_id.clone()),
+            ],
             expect: Box::new(|instance| instance.subnet_id.clone()),
             value: Some(subnet_id.clone()),
         },

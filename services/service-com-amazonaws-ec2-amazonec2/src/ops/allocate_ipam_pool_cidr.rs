@@ -319,36 +319,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The space the pool holds and what is already assigned out of it, each through the
-        // ONE reader of that question, so this call, a provision to a pool within this one and
-        // the dependency `DeleteIpamPool` is refused for all read one answer.
-        let space = store.ipam_pool_provisioned_cidrs(pool_id);
-        let taken = store.ipam_pool_allocated_cidrs(pool_id);
-
+        // The space the pool holds and what is already assigned out of it are read by the
+        // store's own helpers below, each through the ONE reader of that question, so this
+        // call, a provision to a pool within this one, a VPC taking its CIDR out of this pool
+        // and the dependency `DeleteIpamPool` is refused for all read one answer.
         let cidr = match canonical_requested {
             // "The CIDR you would like to allocate from the IPAM pool" (`$Cidr`): a range
             // outside everything provisioned to the pool is space the pool does not hold, and
             // one meeting a range already assigned would hand the same addresses out twice.
             Some(canonical) => {
-                require_compliant_netmask_length(&pool, pool_id, &canonical)?;
-                if !space
-                    .iter()
-                    .any(|held| state::cidr_block_contains_block(held, &canonical))
-                {
-                    return Err(state::invalid_parameter_value(format!(
-                        "Invalid value '{canonical}' for cidr. It is not within a CIDR \
-                         provisioned to the IPAM pool '{pool_id}'"
-                    )));
-                }
-                if let Some(held) = taken
-                    .iter()
-                    .find(|held| state::cidr_blocks_overlap(held, &canonical))
-                {
-                    return Err(state::invalid_parameter_value(format!(
-                        "Invalid value '{canonical}' for cidr. It overlaps with the CIDR \
-                         '{held}' already allocated from the IPAM pool '{pool_id}'"
-                    )));
-                }
+                state::require_compliant_allocation_cidr(
+                    &pool,
+                    pool_id,
+                    "netmaskLength",
+                    &canonical,
+                )?;
+                store.require_ipam_pool_space(pool_id, "cidr", &canonical)?;
                 canonical
             }
             // "If there is no DefaultNetmaskLength allocation rule set on the pool, you must
@@ -365,35 +351,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "Either 'cidr' or 'netmaskLength' must be provided",
                         )
                     })?;
-                require_compliant_length(&pool, pool_id, netmask_length)?;
-                let netmask_length = u32::try_from(netmask_length).unwrap_or(u32::MAX);
-                let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
-                state::first_free_cidr_block(
-                    &state::FreeCidrBlockSearch {
-                        space: &space,
-                        netmask_length,
-                        taken: &taken,
-                        allowed: &allowed,
-                        disallowed: &disallowed,
-                    },
-                    &mut budget,
-                )
-                .map_err(|_| {
-                    // An INCOMPLETE search is not something to report as a result: the request
-                    // asked for more work than one call will do, and is told so rather than
-                    // given a range the search had not finished clearing.
-                    crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
-                        "Choosing a CIDR for this pool would take more than {max} \
-                         comparisons; allocate the cidr itself instead",
-                        max = state::MAX_FILTER_MATCH_STEPS,
-                    ))
-                })?
-                .ok_or_else(|| {
-                    state::invalid_parameter_value(format!(
-                        "Invalid value '{netmask_length}' for netmaskLength. The IPAM pool \
-                         '{pool_id}' has no free CIDR of that size"
-                    ))
-                })?
+                state::require_compliant_allocation_length(
+                    &pool,
+                    pool_id,
+                    "netmaskLength",
+                    netmask_length,
+                )?;
+                store.choose_free_ipam_pool_cidr(
+                    pool_id,
+                    "netmaskLength",
+                    u32::try_from(netmask_length).unwrap_or(u32::MAX),
+                    &allowed,
+                    &disallowed,
+                )?
             }
         };
 
@@ -486,52 +456,6 @@ fn canonical_rules(
         .iter()
         .map(|value| canonical_in_family(value, family, member))
         .collect()
-}
-
-/// The netmask length `cidr` itself names, held to the pool's allocation rules through
-/// [`require_compliant_length`].
-///
-/// A range the REQUEST named has a size of its own, so the rules the pool holds are asked of
-/// that size rather than of a length the request did not carry.
-fn require_compliant_netmask_length(
-    pool: &IpamPool,
-    pool_id: &str,
-    cidr: &str,
-) -> Result<(), AllocateIpamPoolCidrError> {
-    let Some(length) = crate::state::cidr_block_prefix_length(cidr)
-        .and_then(|length| i32::try_from(length).ok())
-    else {
-        return Ok(());
-    };
-    require_compliant_length(pool, pool_id, length)
-}
-
-/// `length` held to the netmask rules the pool itself carries.
-///
-/// "The MINIMUM netmask length required for CIDR allocations in this IPAM pool to be
-/// compliant" and "the MAXIMUM netmask length possible for CIDR allocations in this IPAM pool
-/// to be compliant" (`IpamPool$AllocationMinNetmaskLength`,
-/// `IpamPool$AllocationMaxNetmaskLength`) are the two bounds of the sizes a pool allocates, so
-/// a request outside them asks for a range the pool does not hand out — refused before any
-/// space is searched or taken, rather than stored as a non-compliant allocation.
-fn require_compliant_length(
-    pool: &IpamPool,
-    pool_id: &str,
-    length: i32,
-) -> Result<(), AllocateIpamPoolCidrError> {
-    if let Some(min) = pool.allocation_min_netmask_length.filter(|min| length < *min) {
-        return Err(crate::state::invalid_parameter_value(format!(
-            "Invalid value '{length}' for netmaskLength. The IPAM pool '{pool_id}' allocates \
-             CIDRs with a netmask length of at least '{min}'"
-        )));
-    }
-    if let Some(max) = pool.allocation_max_netmask_length.filter(|max| length > *max) {
-        return Err(crate::state::invalid_parameter_value(format!(
-            "Invalid value '{length}' for netmaskLength. The IPAM pool '{pool_id}' allocates \
-             CIDRs with a netmask length of at most '{max}'"
-        )));
-    }
-    Ok(())
 }
 
 /// Does `held` — the allocation a replayed `ClientToken` names — hold what THIS request asks

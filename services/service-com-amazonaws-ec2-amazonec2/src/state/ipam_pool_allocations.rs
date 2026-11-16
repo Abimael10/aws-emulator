@@ -62,6 +62,14 @@ pub const IPAM_POOL_ALLOCATION_RESOURCE_TYPE_CUSTOM: &str = "custom";
 /// sentence names.
 pub const IPAM_POOL_ALLOCATION_RESOURCE_TYPE_IPAM_POOL: &str = "ipam-pool";
 
+/// The `IpamPoolAllocationResourceType` member the allocation a VPC holds carries: `vpc`
+/// (`smithy_query(query="shape",shape="IpamPoolAllocationResourceType")`).
+///
+/// The second of the two assignments [`IpamPoolAllocation`]'s own sentence names — "to a
+/// RESOURCE" — for a VPC whose CIDR block was allocated out of the pool
+/// (`CreateVpcRequest$Ipv4IpamPoolId`).
+pub const IPAM_POOL_ALLOCATION_RESOURCE_TYPE_VPC: &str = "vpc";
+
 /// One CIDR allocated out of one IPAM pool: the modelled [`IpamPoolAllocation`] every
 /// operation that reports one answers with, and the pool the range came out of.
 ///
@@ -116,6 +124,93 @@ impl ComAmazonawsEc2Amazonec2State {
             .into_iter()
             .filter_map(|record| record.view.cidr.clone())
             .collect()
+    }
+
+    /// Hold the range `cidr` to the SPACE the pool `pool_id` has to hand out: it has to sit
+    /// inside something provisioned to the pool, and may overlap nothing already assigned out
+    /// of it.
+    ///
+    /// "The CIDR you would like to allocate from the IPAM pool"
+    /// (`AllocateIpamPoolCidrRequest$Cidr`): a range outside everything provisioned to the pool
+    /// is space the pool does not hold, and one meeting a range already assigned would hand the
+    /// same addresses out twice. `member` is the request member the range came from, so the
+    /// refusal says which one is at fault — the ONE reading of that question, so a caller
+    /// naming the range of an allocation and one naming the range of a VPC are held to the same
+    /// space.
+    pub fn require_ipam_pool_space<E>(
+        &self,
+        pool_id: &str,
+        member: &str,
+        cidr: &str,
+    ) -> Result<(), Scaffolded<E>> {
+        if !self
+            .ipam_pool_provisioned_cidrs(pool_id)
+            .iter()
+            .any(|held| cidr_block_contains_block(held, cidr))
+        {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{cidr}' for {member}. It is not within a CIDR provisioned to \
+                 the IPAM pool '{pool_id}'"
+            )));
+        }
+        if let Some(held) = self
+            .ipam_pool_allocated_cidrs(pool_id)
+            .into_iter()
+            .find(|held| cidr_blocks_overlap(held, cidr))
+        {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{cidr}' for {member}. It overlaps with the CIDR '{held}' \
+                 already allocated from the IPAM pool '{pool_id}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The first block of `netmask_length` bits the pool `pool_id` has free to hand out, inside
+    /// `allowed` and outside `disallowed` — or the refusal the request earns.
+    ///
+    /// The space and what is already assigned out of it come from the ONE reader of each
+    /// ([`Self::ipam_pool_provisioned_cidrs`] / [`Self::ipam_pool_allocated_cidrs`]), and the
+    /// choice from the ONE search ([`first_free_cidr_block`]), so no two callers can hand out
+    /// overlapping space. `member` is the request member the SIZE came from, so the refusal
+    /// says which one could not be served. Nothing is written: the caller records the
+    /// allocation that holds the range.
+    pub fn choose_free_ipam_pool_cidr<E>(
+        &self,
+        pool_id: &str,
+        member: &str,
+        netmask_length: u32,
+        allowed: &[String],
+        disallowed: &[String],
+    ) -> Result<String, Scaffolded<E>> {
+        let space = self.ipam_pool_provisioned_cidrs(pool_id);
+        let taken = self.ipam_pool_allocated_cidrs(pool_id);
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        first_free_cidr_block(
+            &FreeCidrBlockSearch {
+                space: &space,
+                netmask_length,
+                taken: &taken,
+                allowed,
+                disallowed,
+            },
+            &mut budget,
+        )
+        .map_err(|_| {
+            // An INCOMPLETE search is not something to report as a result: the request asked
+            // for more work than one call will do, and is told so rather than given a range
+            // the search had not finished clearing.
+            Scaffolded::request_limit_exceeded(format!(
+                "Choosing a CIDR for this pool would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons; allocate the cidr itself instead"
+            ))
+        })?
+        .ok_or_else(|| {
+            invalid_parameter_value(format!(
+                "Invalid value '{netmask_length}' for {member}. The IPAM pool '{pool_id}' has \
+                 no free CIDR of that size"
+            ))
+        })
     }
 
     /// Allocate `view` out of the pool `pool_id` names and answer the allocation as the store
@@ -173,6 +268,27 @@ impl ComAmazonawsEc2Amazonec2State {
             .ipam_pool_allocations
             .iter()
             .filter(|(_, record)| record.ipam_pool_id == pool_id)
+            .map(|(allocation_id, _)| allocation_id.clone())
+            .collect();
+        let released = doomed.len();
+        for allocation_id in doomed {
+            self.remove_ipam_pool_allocation(&allocation_id);
+        }
+        released
+    }
+
+    /// Release every allocation held by the RESOURCE `resource_id` — the space a resource of    /// the account holds out of an IPAM pool — and answer how many went.
+    ///
+    /// "In IPAM, an allocation is a CIDR assignment from an IPAM pool to another IPAM pool or
+    /// to a resource" ([`IpamPoolAllocation`]): an assignment to a resource lasts exactly as
+    /// long as that resource, so the resource's own removal gives the space back and the pool
+    /// may hand it out again. The counterpart of [`Self::release_ipam_pool_allocations`],
+    /// which gives back the allocations OF a pool.
+    pub fn release_ipam_pool_allocations_of_resource(&mut self, resource_id: &str) -> usize {
+        let doomed: Vec<String> = self
+            .ipam_pool_allocations
+            .iter()
+            .filter(|(_, record)| record.view.resource_id.as_deref() == Some(resource_id))
             .map(|(allocation_id, _)| allocation_id.clone())
             .collect();
         let released = doomed.len();
@@ -257,6 +373,58 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         self.release_stored_bytes(released);
     }
+}
+
+/// `length` held to the netmask rules the pool itself carries.
+///
+/// "The MINIMUM netmask length required for CIDR allocations in this IPAM pool to be
+/// compliant" and "the MAXIMUM netmask length possible for CIDR allocations in this IPAM pool
+/// to be compliant" (`IpamPool$AllocationMinNetmaskLength`,
+/// `IpamPool$AllocationMaxNetmaskLength`) are the two bounds of the sizes a pool allocates, so
+/// a request outside them asks for a range the pool does not hand out — refused before any
+/// space is searched or taken, rather than stored as a non-compliant allocation.
+///
+/// `member` is the request member the length came from, so the refusal says which one is at
+/// fault. The ONE reader of those rules, so every caller that takes space out of a pool is
+/// held to the sizes that pool allocates.
+pub fn require_compliant_allocation_length<E>(
+    pool: &IpamPool,
+    pool_id: &str,
+    member: &str,
+    length: i32,
+) -> Result<(), Scaffolded<E>> {
+    if let Some(min) = pool.allocation_min_netmask_length.filter(|min| length < *min) {
+        return Err(invalid_parameter_value(format!(
+            "Invalid value '{length}' for {member}. The IPAM pool '{pool_id}' allocates \
+             CIDRs with a netmask length of at least '{min}'"
+        )));
+    }
+    if let Some(max) = pool.allocation_max_netmask_length.filter(|max| length > *max) {
+        return Err(invalid_parameter_value(format!(
+            "Invalid value '{length}' for {member}. The IPAM pool '{pool_id}' allocates \
+             CIDRs with a netmask length of at most '{max}'"
+        )));
+    }
+    Ok(())
+}
+
+/// The netmask length `cidr` itself names, held to the pool's allocation rules through
+/// [`require_compliant_allocation_length`].
+///
+/// A range the REQUEST named has a size of its own, so the rules the pool holds are asked of
+/// that size rather than of a length the request did not carry.
+pub fn require_compliant_allocation_cidr<E>(
+    pool: &IpamPool,
+    pool_id: &str,
+    member: &str,
+    cidr: &str,
+) -> Result<(), Scaffolded<E>> {
+    let Some(length) =
+        cidr_block_prefix_length(cidr).and_then(|length| i32::try_from(length).ok())
+    else {
+        return Ok(());
+    };
+    require_compliant_allocation_length(pool, pool_id, member, length)
 }
 
 /// What a search for a free block inside a pool's space is asked for.

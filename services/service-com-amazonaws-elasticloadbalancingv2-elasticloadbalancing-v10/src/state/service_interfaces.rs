@@ -206,6 +206,9 @@ fn place_in_subnets(
             // The load balancer carries the create's tags; its interfaces are not the
             // resource the request tagged.
             tags: Vec::new(),
+            // A load balancer's interface here is reached over IPv4 alone, so it asks for
+            // no IPv6 space.
+            ..Default::default()
         };
         match store.insert_network_interface(spec) {
             Some(network_interface_id) => placed.push(network_interface_id),

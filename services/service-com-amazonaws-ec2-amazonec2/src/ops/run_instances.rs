@@ -396,26 +396,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`RunInstancesRequest$SubnetId`, `$SecurityGroupIds`, `$SecurityGroups`), and "you
         // can't specify this option if you've specified the option to designate a private IP
         // address as the primary IP address in a network interface specification"
-        // (`$PrivateIpAddress`): a request that names its interfaces names those three facts
-        // ON them, so one that names the same fact twice is refused rather than served from
-        // whichever of the two places this handler happened to read. Asked of the REQUEST's
-        // own members, before the launch template is overlaid: a template expresses the same
-        // facts through its own interface, which the overlay below reads into one launch.
-        if input
-            .network_interfaces
-            .as_ref()
-            .is_some_and(|interfaces| !interfaces.is_empty())
-        {
-            refuse_interface_and_instance_level_members(&input)?;
-        }
-        // A launch template carries the launch parameters this handler resolves, so a launch
-        // that names one is answered from the template VERSION it names, overlaid with the
-        // members the request itself carries — "any additional parameters that you specify
-        // for the new instance overwrite the corresponding parameters included in the launch
-        // template" (`RunInstancesRequest$LaunchTemplate`). The overlay happens HERE, before
-        // anything else is read, so every check, ceiling, refusal and write below sees ONE
-        // launch: a template-driven launch and the equivalent spelled-out one cannot be
-        // served differently.
+        // (`$PrivateIpAddress`): a launch that names its interfaces names those three facts ON
+        // them, so one that names the same fact twice is refused rather than served from
+        // whichever of the two places this handler happened to read. Asked of the RESOLVED
+        // launch below — after the launch template has been overlaid — because a template
+        // expresses those same facts, so the combination holds whichever side of the launch
+        // each half came from.
         let mut input = match input.launch_template.clone() {
             None => input,
             Some(specification) => {
@@ -490,6 +476,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 launch_overlaid_with_template(input, &data)?
             }
         };
+        // The combination rule above, asked of the launch as RESOLVED: the facts a launch
+        // expresses are the facts of the merged parameters, so a launch whose interfaces come
+        // from its template and whose subnet, security groups or primary private address come
+        // from the request names the same fact twice exactly as a spelled-out one does — and
+        // so does a template that carries both halves itself.
+        if input
+            .network_interfaces
+            .as_ref()
+            .is_some_and(|interfaces| !interfaces.is_empty())
+        {
+            refuse_interface_and_instance_level_members(&input)?;
+        }
         // "The network interfaces to associate with the instance"
         // (`RunInstancesRequest$NetworkInterfaces`): a launch that names them launches each
         // of its instances with exactly those interfaces — created in the subnet, with the
@@ -1414,13 +1412,6 @@ fn launch_overlaid_with_template(
     }
 
     let mut merged = request;
-    // The three facts a request names BOTH on its own members and (for a template-driven
-    // launch) on the template's primary interface, captured before the overlay rewrites
-    // either: the request's own win, which is what the overlay applies to that interface
-    // below.
-    let request_subnet_id = merged.subnet_id.clone();
-    let request_private_ip_address = merged.private_ip_address.clone();
-    let request_security_group_ids = merged.security_group_ids.clone();
     merged.image_id = merged.image_id.or_else(|| data.image_id.clone());
     merged.instance_type = merged.instance_type.or_else(|| data.instance_type.clone());
     merged.key_name = merged.key_name.or_else(|| data.key_name.clone());
@@ -1600,38 +1591,22 @@ fn launch_overlaid_with_template(
     // request names on its own `NetworkInterfaces` — so they are read into THAT member and a
     // template-driven launch takes exactly the path a spelled-out one takes. The request's own
     // interfaces win, as everywhere else in the overlay.
+    //
+    // The subnet, the security groups and the primary private address are NOT overlaid onto
+    // that interface: a launch names each of those three facts either on its own members or on
+    // its interfaces and never both ("if you specify a network interface, you must specify any
+    // subnets / security groups as part of the network interface instead of using this
+    // parameter"), so a launch that names interfaces and one of them is refused by the caller
+    // of this overlay rather than served from one of the two places.
     if merged
         .network_interfaces
         .as_ref()
         .is_none_or(Vec::is_empty)
     {
-        merged.network_interfaces = data.network_interfaces.as_ref().map(|interfaces| {
-            let mut converted: Vec<InstanceNetworkInterfaceSpecification> =
-                interfaces.iter().map(template_interface).collect();
-            // "Any additional parameters that you specify for the new instance overwrite the
-            // corresponding parameters included in the launch template": the subnet, the
-            // security groups and the primary private address a REQUEST names are the same
-            // three facts the template names ON its primary interface, so the request's own
-            // overwrite them there — which is where this launch expresses them.
-            if let Some(primary) = converted
-                .iter_mut()
-                .find(|interface| interface.device_index.unwrap_or(0) == 0)
-            {
-                if request_subnet_id.is_some() {
-                    primary.subnet_id = request_subnet_id.clone();
-                }
-                if request_private_ip_address.is_some() {
-                    primary.private_ip_address = request_private_ip_address.clone();
-                }
-                if request_security_group_ids
-                    .as_ref()
-                    .is_some_and(|groups| !groups.is_empty())
-                {
-                    primary.groups = request_security_group_ids.clone();
-                }
-            }
-            converted
-        });
+        merged.network_interfaces = data
+            .network_interfaces
+            .as_ref()
+            .map(|interfaces| interfaces.iter().map(template_interface).collect());
     }
     Ok(merged)
 }
@@ -2104,6 +2079,14 @@ fn read_interface_specifications(
     Ok(requests)
 }
 
+/// The sentence EC2 refuses a launch that names its security groups on BOTH its own members
+/// and its network interfaces with, whichever of the two instance-level members named them:
+/// `SecurityGroupIds` and `SecurityGroups` are two spellings of the one fact the interface
+/// also carries, so one refusal states it.
+const SECURITY_GROUPS_AND_INTERFACES: &str =
+    "Network interfaces and an instance-level security groups may not be specified on the \
+     same request";
+
 /// Refuse a request that names the same fact on its own members and on its interfaces.
 ///
 /// "If you specify a network interface, you must specify any subnets / security groups as
@@ -2128,8 +2111,7 @@ fn refuse_interface_and_instance_level_members(
         .is_some_and(|groups| !groups.is_empty())
     {
         return Err(Scaffolded::invalid_parameter_combination(
-            "Network interfaces and an instance-level security group ID may not be specified \
-             on the same request",
+            SECURITY_GROUPS_AND_INTERFACES,
         ));
     }
     if input
@@ -2138,8 +2120,7 @@ fn refuse_interface_and_instance_level_members(
         .is_some_and(|groups| !groups.is_empty())
     {
         return Err(Scaffolded::invalid_parameter_combination(
-            "Network interfaces and an instance-level security group may not be specified on \
-             the same request",
+            SECURITY_GROUPS_AND_INTERFACES,
         ));
     }
     if input.private_ip_address.is_some() {

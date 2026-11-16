@@ -8,6 +8,10 @@
 //! interface's own `NetworkInterface$Association`, which `DescribeNetworkInterfaces`
 //! reports. This is the ONLY file to touch for this operation.
 //!
+//! An Elastic IP address is a PUBLIC address, so the network the resource it binds to sits in
+//! has to have an internet gateway attached: a request naming a resource in a VPC with none is
+//! refused `Gateway.NotAttached`, naming that VPC, and nothing is written.
+//!
 //! An association BINDS THE ADDRESS TO AN INTERFACE whichever way the request names its
 //! target: a `NetworkInterfaceId` is resolved against the account's network interfaces —
 //! the same store `CreateNetworkInterface` writes and `DescribeNetworkInterfaces` reports:
@@ -328,6 +332,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         };
+
+        // "You're trying to associate an Elastic IP address with a VPC that has no internet
+        // gateway attached" (EC2 API "Error codes", `Gateway.NotAttached`): an Elastic IP
+        // address is a PUBLIC address, and traffic only reaches the resource it is bound to
+        // through the network's internet gateway, so the network the association binds into
+        // has to have one attached. The network comes from the STORE — the VPC of the
+        // interface the association binds to, or of the subnet the instance was launched
+        // into when it holds no interface — so a request is held to the same precondition
+        // whichever way it named the resource. Asked before the association is read or
+        // written, so a refused request changes nothing.
+        let vpc_id = spec
+            .network_interface_id
+            .as_deref()
+            .and_then(|network_interface_id| store.network_interfaces.get(network_interface_id))
+            .and_then(|interface| interface.vpc_id.clone())
+            .or_else(|| {
+                spec.instance_id
+                    .as_deref()
+                    .and_then(|instance_id| store.instances.get(instance_id))
+                    .and_then(|instance| instance.subnet_id.clone())
+                    .and_then(|subnet_id| store.subnets.get(&subnet_id)?.vpc_id.clone())
+            });
+        if let Some(vpc_id) = vpc_id.as_deref() {
+            if store.internet_gateway_of_vpc(vpc_id).is_none() {
+                return Err(crate::state::gateway_not_attached_to_vpc(vpc_id));
+            }
+        }
 
         // "This is an idempotent operation. If you perform the operation more than once,
         // Amazon EC2 doesn't return an error" (`AssociateAddress`): an association that

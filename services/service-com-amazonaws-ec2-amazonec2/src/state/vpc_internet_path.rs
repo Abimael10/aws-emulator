@@ -224,6 +224,21 @@ pub fn resource_not_attached<E>(internet_gateway_id: &str, vpc_id: &str) -> Scaf
     )
 }
 
+/// Refuse a request that needs the network `vpc_id` to be reachable from the internet while
+/// no internet gateway attaches it: HTTP 400 [`GATEWAY_NOT_ATTACHED`], the second thing EC2's
+/// error list gives that code for — "you're trying to associate an Elastic IP address with a
+/// VPC that has no internet gateway attached" (EC2 API "Error codes").
+///
+/// The network is named from the STORE — the VPC the resource the request named sits in —
+/// rather than from the request, which names the resource and not its network.
+pub fn gateway_not_attached_to_vpc<E>(vpc_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        GATEWAY_NOT_ATTACHED,
+        400,
+        format!("Network {vpc_id} is not attached to any internet gateway"),
+    )
+}
+
 /// EC2's error code for a request that named a route table association id this account holds
 /// no association for (EC2 API "Error codes": `InvalidAssociationID.NotFound`).
 pub const INVALID_ASSOCIATION_ID_NOT_FOUND: &str = "InvalidAssociationID.NotFound";

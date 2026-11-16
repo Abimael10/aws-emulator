@@ -435,11 +435,12 @@ async fn a_501_a_handler_answers_for_a_member_stays_a_501_under_the_flag() {
             ],
         ),
         (
-            "a VPC created from an IPAM pool",
+            "a VPC whose IPv6 CIDR comes from an IPAM pool",
             "CreateVpc",
             vec![
-                param("Ipv4IpamPoolId", "ipam-pool-0fedcba987654321f"),
-                param("Ipv4NetmaskLength", "16"),
+                param("CidrBlock", "10.0.0.0/16"),
+                param("Ipv6IpamPoolId", "ipam-pool-0fedcba987654321f"),
+                param("Ipv6NetmaskLength", "56"),
             ],
         ),
         (

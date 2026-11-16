@@ -1048,27 +1048,33 @@ async fn a_create_is_refused_with_the_code_the_request_earns() {
             "InvalidParameterValue",
         ),
         (
-            // Every member below names state this slice does not hold, so the honest
-            // answer is "nobody has written this yet" and not a refusal that blames the
-            // caller.
-            "an IPv6 address count",
+            // "Amazon EC2 automatically selects the IPv6 addresses from the subnet range"
+            // (`Ipv6AddressCount`), and this suite's subnet has no IPv6 range at all — so
+            // the request names space that does not exist, which is a refusal about the
+            // request and not about what this emulator has written.
+            "an IPv6 address count in a subnet with no IPv6 range",
             vec![
                 param("SubnetId", &subnet_id),
                 param("Ipv6AddressCount", "1"),
             ],
-            501,
-            "NotImplemented",
+            400,
+            "InvalidParameterValue",
         ),
         (
-            "a primary IPv6 address",
+            // The primary IPv6 address is one of the subnet's IPv6 addresses, so it is
+            // refused for the same missing range.
+            "a primary IPv6 address in a subnet with no IPv6 range",
             vec![
                 param("SubnetId", &subnet_id),
                 param("EnablePrimaryIpv6", "true"),
             ],
-            501,
-            "NotImplemented",
+            400,
+            "InvalidParameterValue",
         ),
         (
+            // Every member below names state this slice does not hold, so the honest
+            // answer is "nobody has written this yet" and not a refusal that blames the
+            // caller.
             "an IPv4 prefix count",
             vec![
                 param("SubnetId", &subnet_id),

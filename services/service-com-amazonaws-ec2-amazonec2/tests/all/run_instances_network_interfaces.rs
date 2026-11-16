@@ -1516,8 +1516,8 @@ async fn a_launch_that_asks_for_what_an_interface_cannot_be_given_is_refused() {
 }
 
 /// THE RULE, through a LAUNCH TEMPLATE: a template's `NetworkInterfaces` is the same
-/// specification, so the launch creates the interface it describes — and a member the request
-/// itself names overwrites the corresponding one on that interface.
+/// specification, so the launch creates the interface it describes — and the instance-level
+/// members that name the same facts are refused beside it.
 #[tokio::test]
 async fn a_template_interface_is_created_like_a_requests_own() {
     let network = Network::create().await;
@@ -1585,13 +1585,15 @@ async fn a_template_interface_is_created_like_a_requests_own() {
         "case {case:?}: expected the public address the template asked for, got {reported:?}"
     );
 
-    // "Any additional parameters that you specify for the new instance overwrite the
-    // corresponding parameters included in the launch template": the request's own subnet is
-    // where the instance's primary interface goes.
-    let case = "a request whose subnet overwrites the template interface's";
-    let body = ok(
-        case,
+    // A launch names its subnet either on its own `SubnetId` or on its interfaces and never
+    // both ("if you specify a network interface, you must specify any subnets as part of the
+    // network interface instead of using this parameter"), and a template's interfaces are
+    // the launch's own — so a request that adds an instance-level subnet to a template that
+    // names interfaces names that fact twice, and is refused.
+    let case = "an instance-level subnet beside the template's interface";
+    let (status, body) = call(
         &network.router,
+        REGION,
         "RunInstances",
         &[
             param("MinCount", "1"),
@@ -1601,17 +1603,13 @@ async fn a_template_interface_is_created_like_a_requests_own() {
         ],
     )
     .await;
-    let instances = launched(case, &body);
-    let instance = &instances[0];
-    let reported = &instance.interfaces[0];
     assert_eq!(
-        reported.subnet_id.as_deref(),
-        Some(network.subnet_b.as_str()),
-        "case {case:?}: expected the request's subnet, got {reported:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with body {body}"
     );
     assert_eq!(
-        instance.subnet_id.as_deref(),
-        Some(network.subnet_b.as_str()),
-        "case {case:?}: expected the instance in the request's subnet, got {instance:?}"
+        error_code(&body).as_str(),
+        "InvalidParameterCombination",
+        "case {case:?}: expected InvalidParameterCombination, got {body}"
     );
 }

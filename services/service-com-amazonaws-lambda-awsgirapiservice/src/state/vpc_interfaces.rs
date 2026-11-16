@@ -372,6 +372,9 @@ fn place_in_subnets(
             // The function carries the create's tags; its interfaces are not the resource the
             // request tagged.
             tags: Vec::new(),
+            // A function's interface is reached over IPv4 alone, so it asks for no IPv6
+            // space.
+            ..Default::default()
         };
         match store.insert_network_interface(spec) {
             Some(network_interface_id) => {

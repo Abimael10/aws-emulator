@@ -168,6 +168,9 @@ impl ComAmazonawsEc2Amazonec2State {
             // A launch tags the interfaces its own `TagSpecifications` name; nothing tags
             // this record here.
             tags: Vec::new(),
+            // A launch of this path asks for no IPv6 space (the launch's own IPv6 members
+            // are read where the launch reads them), so this interface holds none.
+            ..Default::default()
         });
         // The completion the clock owes that attachment, recorded through the one seam
         // every attachment of this store records it through.

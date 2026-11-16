@@ -2182,6 +2182,31 @@ pub fn duplicate_subnets_in_same_zone<E>(subnet_id: &str) -> Scaffolded<E> {
     )
 }
 
+/// `InvalidSubnet` (HTTP 400): the request named a subnet that cannot hold what it asked for
+/// — as opposed to `InvalidSubnetID.NotFound`, which is about an id naming no subnet at all.
+pub const INVALID_SUBNET: &str = "InvalidSubnet";
+
+/// Refuse a request naming a subnet that has no CIDR block of a family the endpoint's own
+/// `IpAddressType` is reached over: HTTP 400 [`INVALID_SUBNET`], in the wording a recorded
+/// refusal of this class pins — the sentence names the subnet the request asked for and the
+/// address type that subnet cannot serve.
+///
+/// "The IP address type for the endpoint" (`CreateVpcEndpointRequest$IpAddressType`) decides
+/// which families the endpoint network interfaces carry addresses of, and each interface takes
+/// its addresses out of its subnet's own blocks — [`subnet_serves_ip_address_type`] being the
+/// one reading of that question — so a subnet lacking one of those families is not compatible
+/// with the type.
+pub fn subnet_incompatible_with_ip_address_type<E>(
+    subnet_id: &str,
+    ip_address_type: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SUBNET,
+        400,
+        format!("Subnet {subnet_id} is not compatible with {ip_address_type} addressType."),
+    )
+}
+
 /// `InvalidParameter` (HTTP 400): a member's value cannot be honoured given the state of the
 /// resource it names — as opposed to [`INVALID_PARAMETER_VALUE`], which is about the value
 /// itself.

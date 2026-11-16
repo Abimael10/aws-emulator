@@ -483,6 +483,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The subnets the endpoint keeps, each read off the stored subnet the way the create
         // reads one: the subnet is what an endpoint network interface's Availability Zone and
         // address range come from.
+        //
+        // "The IP address type for the endpoint" (`VpcEndpoint$IpAddressType`) is the type the
+        // endpoint was created with — an endpoint that reports none is reached over IPv4, the
+        // default — and it is what every interface this call adds is reached over, so it
+        // decides which of a subnet's blocks that interface takes an address out of.
+        let endpoint_ip_address_type = endpoint
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| state::IP_ADDRESS_TYPE_IPV4.to_string());
+        let endpoint_ipv4 = endpoint_ip_address_type == state::IP_ADDRESS_TYPE_IPV4
+            || endpoint_ip_address_type == state::IP_ADDRESS_TYPE_DUALSTACK;
+        let endpoint_ipv6 = endpoint_ip_address_type == state::IP_ADDRESS_TYPE_IPV6
+            || endpoint_ip_address_type == state::IP_ADDRESS_TYPE_DUALSTACK;
         let mut placements: Vec<EndpointPlacement> = Vec::with_capacity(remaining.len());
         for subnet_id in &remaining {
             let held = store.subnets.get(subnet_id);
@@ -497,7 +510,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 availability_zone_id: held
                     .and_then(|subnet| subnet.availability_zone_id.clone())
                     .unwrap_or_default(),
+                ipv6_cidr_block: store
+                    .subnet_ipv6_cidr_block(subnet_id)
+                    .unwrap_or_default(),
                 requested_address: None,
+                requested_ipv6_address: None,
             });
         }
         // Where the subnets this call ADDS start in that list: the endpoint network interface
@@ -529,9 +546,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(state::duplicate_subnets_in_same_zone(subnet_id));
             }
+            // The endpoint's own `IpAddressType` names the address families its interfaces
+            // are reached over, and an interface takes its addresses out of its SUBNET's
+            // blocks — so a subnet with no block of one of those families cannot hold an
+            // interface of this endpoint, exactly as at create.
+            if !state::subnet_serves_ip_address_type(subnet, &endpoint_ip_address_type) {
+                return Err(state::subnet_incompatible_with_ip_address_type(
+                    subnet_id,
+                    &endpoint_ip_address_type,
+                ));
+            }
+            let ipv6_cidr_block = store
+                .subnet_ipv6_cidr_block(subnet_id)
+                .unwrap_or_default();
             placements.push(EndpointPlacement {
                 subnet_id: subnet_id.clone(),
                 cidr_block,
+                ipv6_cidr_block,
                 availability_zone,
                 availability_zone_id,
                 // "The IPv4 address to assign to the endpoint network interface in the
@@ -540,6 +571,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get(subnet_id.as_str())
                     .and_then(|configuration| configuration.ipv4.clone())
                     .filter(|address| !address.is_empty()),
+                requested_ipv6_address: None,
             });
         }
         if load_balancer && placements.len() > 1 {
@@ -894,20 +926,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let mut added_interface_ids: Vec<String> = Vec::with_capacity(placements.len() - kept);
         for placement in &placements[kept..] {
-            let address = match placement.requested_address.as_deref() {
+            // The IPv4 address, for an endpoint reached over IPv4: one reached over IPv6
+            // alone holds no IPv4 address on its interfaces, so none is taken for it.
+            let address = match (endpoint_ipv4, placement.requested_address.as_deref()) {
+                (false, _) => None,
                 // Judged against the subnet's range and against every address the account
                 // holds above, so the take itself cannot be refused for a reason the request
                 // has not already been told about.
-                Some(asked) if store.reserve_private_ip(asked) => asked.to_string(),
-                Some(asked) => {
+                (true, Some(asked)) if store.reserve_private_ip(asked) => Some(asked.to_string()),
+                (true, Some(asked)) => {
                     release_interfaces(&mut store, &added_interface_ids);
                     for done in &routed {
                         store.drop_route_table_routes_to_gateway(done, endpoint_id);
                     }
                     return Err(Scaffolded::invalid_ip_address_in_use(asked));
                 }
-                None => match store.mint_private_ip_in_cidr(&placement.cidr_block) {
-                    Some(free) => free,
+                (true, None) => match store.mint_private_ip_in_cidr(&placement.cidr_block) {
+                    Some(free) => Some(free),
                     None => {
                         release_interfaces(&mut store, &added_interface_ids);
                         for done in &routed {
@@ -916,6 +951,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(Scaffolded::insufficient_free_addresses());
                     }
                 },
+            };
+            // The IPv6 address, for an endpoint reached over IPv6: taken out of the subnet's
+            // own IPv6 range through the one resolution of an interface's IPv6 members this
+            // crate has, exactly as the create takes one.
+            let ipv6_address = if endpoint_ipv6 {
+                let requested = state::RequestedInterfaceIpv6 {
+                    wanted_addresses: 1,
+                    ..Default::default()
+                };
+                match store.resolve_requested_ipv6(&placement.ipv6_cidr_block, &requested) {
+                    Ok(assigned) => assigned.addresses,
+                    Err(refusal) => {
+                        if let Some(address) = address.as_deref() {
+                            store.release_private_ip(address);
+                        }
+                        release_interfaces(&mut store, &added_interface_ids);
+                        for done in &routed {
+                            store.drop_route_table_routes_to_gateway(done, endpoint_id);
+                        }
+                        return Err(refusal);
+                    }
+                }
+            } else {
+                Vec::new()
             };
             let spec = state::NetworkInterfaceSpec {
                 subnet_id: placement.subnet_id.clone(),
@@ -926,18 +985,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Filled in with the endpoint it serves below, as the create fills it in.
                 description: String::new(),
                 interface_type: interface_type.to_string(),
-                private_ip_addresses: vec![address.clone()],
+                private_ip_addresses: address.clone().into_iter().collect(),
                 groups: endpoint_groups.clone(),
                 // An endpoint network interface is attached to nothing a caller can see.
                 attachment: None,
                 requester: None,
                 // The endpoint carries the tags; its interfaces are not a tagged resource.
                 tags: Vec::new(),
+                // The IPv6 space this interface holds, for an endpoint reached over IPv6.
+                ipv6_addresses: ipv6_address,
+                ..Default::default()
             };
             match store.insert_network_interface(spec) {
                 Some(network_interface_id) => added_interface_ids.push(network_interface_id),
                 None => {
-                    store.release_private_ip(&address);
+                    if let Some(address) = address.as_deref() {
+                        store.release_private_ip(address);
+                    }
                     release_interfaces(&mut store, &added_interface_ids);
                     for done in &routed {
                         store.drop_route_table_routes_to_gateway(done, endpoint_id);

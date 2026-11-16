@@ -1504,6 +1504,9 @@ pub fn place_endpoint_address<Eng: Send + Sync + 'static>(
         attachment: None,
         requester: Some(SERVICE_PRINCIPAL.to_string()),
         tags: Vec::new(),
+        // A Resolver endpoint's interface is reached over IPv4 alone here, so it asks for
+        // no IPv6 space.
+        ..Default::default()
     });
     PlacedAddress {
         ip: Some(ip),

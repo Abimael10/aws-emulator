@@ -188,6 +188,9 @@ impl ComAmazonawsEc2Amazonec2State {
                         // The caller's own instance holds it; no other service manages it.
                         requester: None,
                         tags: Vec::new(),
+                        // A launch of this path asks for no IPv6 space, so this interface
+                        // holds none.
+                        ..Default::default()
                     }) else {
                         stored_all = false;
                         continue;

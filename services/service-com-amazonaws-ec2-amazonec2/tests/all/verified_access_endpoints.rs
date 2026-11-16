@@ -163,6 +163,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Fixture {
             attachment: None,
             requester: None,
             tags: Vec::new(),
+            ..Default::default()
         })
         .expect("a seeded network interface");
     let group_id = guard.insert_verified_access_group(

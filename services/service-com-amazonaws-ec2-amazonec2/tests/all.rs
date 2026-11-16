@@ -2584,6 +2584,34 @@ mod published_amd_and_graviton_catalog_rows;
 // Declared at the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/dry_run_probe_decides_on_iam.rs"]
 mod dry_run_probe_decides_on_iam;
+// The IPv6 space `CreateNetworkInterface` gives the interface it creates: the addresses and
+// prefix delegation prefixes it takes out of the subnet's own IPv6 CIDR block, the primary IPv6
+// address, and the refusal a subnet with no IPv6 range earns. Declared at the tail of this
+// file, which is where every new ec2 suite lands.
+#[path = "all/create_network_interface_ipv6.rs"]
+mod create_network_interface_ipv6;
+// That an Elastic IP address may only be associated with a resource in a network an internet
+// gateway attaches, whichever way the request names that resource. Declared at the tail of this
+// file, which is where every new ec2 suite lands.
+#[path = "all/elastic_ip_needs_an_internet_gateway.rs"]
+mod elastic_ip_needs_an_internet_gateway;
+// The address families a VPC endpoint is reached over: the `IpAddressType` each of its subnets
+// has to have a CIDR block for, and the IPv6 addresses its endpoint network interfaces then
+// hold. Declared at the tail of this file, which is where every new ec2 suite lands.
+#[path = "all/vpc_endpoint_ip_address_type.rs"]
+mod vpc_endpoint_ip_address_type;
+// A VPC whose IPv4 CIDR block is allocated out of an IPAM pool: the size the request or the
+// pool's own default decides, the space the pool then reports as assigned, and the refusals a
+// request that names neither earns. Declared at the tail of this file, which is where every new
+// ec2 suite lands.
+#[path = "all/create_vpc_from_ipam_pool.rs"]
+mod create_vpc_from_ipam_pool;
+// That a launch names its subnet, security groups and primary private address either on its own
+// members or on its network interfaces and never both — whichever side of a template-driven
+// launch each half came from. Declared at the tail of this file, which is where every new ec2
+// suite lands.
+#[path = "all/run_instances_template_parameter_conflicts.rs"]
+mod run_instances_template_parameter_conflicts;
 // HOW the flow-log surface refuses: a `LogDestination` read against the destination type the
 // request asked for, an unrecognised `DescribeFlowLogs` filter name named by its position in
 // the request, and a `FlowLogId` outside the id form refused before any lookup — each under

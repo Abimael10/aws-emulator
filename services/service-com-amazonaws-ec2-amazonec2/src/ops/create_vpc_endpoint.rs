@@ -11,10 +11,14 @@
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoint_moves`]).
 //! `DescribeVpcEndpoints` reports the record this operation stored.
 //!
-//! An endpoint of a type that points at a resource configuration or a service network, and
-//! a request member naming state this slice does not hold (an IPv6 address), is answered
-//! with a 501 rather than an endpoint that silently lacks what was asked for — the same rule
-//! the siblings of this operation follow. `ServiceName` is RESOLVED before anything is
+//! An endpoint of a type that points at a resource configuration or a service network, and a
+//! request member naming state this slice does not hold, is answered with a 501 rather than
+//! an endpoint that silently lacks what was asked for — the same rule the siblings of this
+//! operation follow. `IpAddressType` is NOT one of them: it names the address families the
+//! endpoint's own network interfaces are reached over, each of which comes out of the CIDR
+//! blocks of the subnet the interface sits in, so a subnet with no block of one of those
+//! families is refused with `InvalidSubnet` naming the subnet and the type.
+//! `ServiceName` is RESOLVED before anything is
 //! written, against the one catalogue of endpoint services `DescribeVpcEndpointServices`
 //! reports from ([`crate::state::endpoint_service_name_is_offered`]): the services Amazon
 //! Web Services publishes in the Region the name carries and the account's own
@@ -250,28 +254,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 maximum = state::MAX_RESOURCE_IDS,
             )));
         }
-        // "The IP address type for the endpoint" (`IpAddressType`): an endpoint reached over
-        // IPv6 needs IPv6 addresses on its endpoint network interfaces, and a subnet of this
-        // slice holds no IPv6 range to take one from.
+        // "The IP address type for the endpoint" (`IpAddressType`): the member targets the
+        // `IpAddressType` enum, so the boundary validator has already refused every value
+        // outside it, and each of the three names the address families the endpoint's own
+        // endpoint network interfaces are reached over — which is what each of its subnets
+        // then has to have a CIDR block for (asked of each subnet below).
         let ip_address_type = input
             .ip_address_type
             .as_deref()
             .unwrap_or(state::IP_ADDRESS_TYPE_IPV4);
-        if ip_address_type != state::IP_ADDRESS_TYPE_IPV4 {
-            return Err(Scaffolded::not_implemented(&format!(
-                "CreateVpcEndpoint with the {ip_address_type} IP address type"
-            )));
-        }
+        let endpoint_ipv4 = ip_address_type == state::IP_ADDRESS_TYPE_IPV4
+            || ip_address_type == state::IP_ADDRESS_TYPE_DUALSTACK;
+        let endpoint_ipv6 = ip_address_type == state::IP_ADDRESS_TYPE_IPV6
+            || ip_address_type == state::IP_ADDRESS_TYPE_DUALSTACK;
         let requested_dns_options = input.dns_options.clone().unwrap_or_default();
+        // "The DNS records created for the endpoint" (`DnsOptions$DnsRecordIpType`): the
+        // records resolve the endpoint's own addresses, so a records type names a family the
+        // endpoint has to be reached over — and the records an endpoint gets when the request
+        // says nothing are of the families it HAS. `service-defined` records are the
+        // Resource and ServiceNetwork endpoint types' own option, and those types are refused
+        // above, so that value is still unwritten here.
         let dns_record_ip_type = requested_dns_options
             .dns_record_ip_type
             .clone()
-            .unwrap_or_else(|| state::DNS_RECORD_IP_TYPE_IPV4.to_string());
-        if dns_record_ip_type != state::DNS_RECORD_IP_TYPE_IPV4 {
-            // "The DNS records created for the endpoint" (`DnsOptions$DnsRecordIpType`):
-            // every other value promises records for addresses this slice cannot assign.
+            .unwrap_or_else(|| ip_address_type.to_string());
+        let records_ipv4 = dns_record_ip_type == state::DNS_RECORD_IP_TYPE_IPV4
+            || dns_record_ip_type == state::IP_ADDRESS_TYPE_DUALSTACK;
+        let records_ipv6 = dns_record_ip_type == state::IP_ADDRESS_TYPE_IPV6
+            || dns_record_ip_type == state::IP_ADDRESS_TYPE_DUALSTACK;
+        if !(records_ipv4 || records_ipv6) {
             return Err(Scaffolded::not_implemented(&format!(
                 "CreateVpcEndpoint with the {dns_record_ip_type} DNS record IP type"
+            )));
+        }
+        if (records_ipv4 && !endpoint_ipv4) || (records_ipv6 && !endpoint_ipv6) {
+            return Err(state::invalid_parameter_combination(format!(
+                "DnsRecordIpType {dns_record_ip_type} cannot be specified for a \
+                 {ip_address_type} endpoint"
             )));
         }
         if requested_dns_options.private_dns_preference.is_some()
@@ -297,15 +316,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let subnet_configurations: &[SubnetConfiguration] =
             input.subnet_configurations.as_deref().unwrap_or_default();
-        if subnet_configurations
-            .iter()
-            .any(|configuration| configuration.ipv6.is_some())
+        // "The IPv4/IPv6 address to assign to the endpoint network interface in the subnet"
+        // (`SubnetConfiguration$Ipv4` / `$Ipv6`): an address of a family the endpoint is not
+        // reached over names an address no interface of this endpoint will hold, so it is
+        // refused rather than stored and reported back as though it had been honoured.
+        if !endpoint_ipv4
+            && subnet_configurations
+                .iter()
+                .any(|configuration| configuration.ipv4.is_some())
         {
-            // "The IPv6 address to assign to the endpoint network interface in the subnet"
-            // (`SubnetConfiguration$Ipv6`): the same missing IPv6 range as above.
-            return Err(Scaffolded::not_implemented(
-                "CreateVpcEndpoint with an IPv6 subnet configuration",
-            ));
+            return Err(state::invalid_parameter_combination(format!(
+                "An IPv4 address cannot be specified for a subnet of a {ip_address_type} \
+                 endpoint"
+            )));
+        }
+        if !endpoint_ipv6
+            && subnet_configurations
+                .iter()
+                .any(|configuration| configuration.ipv6.is_some())
+        {
+            return Err(state::invalid_parameter_combination(format!(
+                "An IPv6 address cannot be specified for a subnet of a {ip_address_type} \
+                 endpoint"
+            )));
         }
 
         // The members each endpoint TYPE admits, from the doc of each: a member this type
@@ -576,7 +609,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(state::invalid_subnet_id_not_found(subnet_id));
             };
+            // "The IP address type for the endpoint" (`IpAddressType`) names the address
+            // families the endpoint's network interfaces are reached over, and each interface
+            // takes its addresses out of its SUBNET's own CIDR blocks — so a subnet with no
+            // block of a family the endpoint needs cannot hold one of its interfaces at all.
+            // Read through the one reading of that question this crate has
+            // ([`crate::state::subnet_serves_ip_address_type`]).
+            if !state::subnet_serves_ip_address_type(subnet, ip_address_type) {
+                return Err(state::subnet_incompatible_with_ip_address_type(
+                    subnet_id,
+                    ip_address_type,
+                ));
+            }
             let availability_zone = subnet.availability_zone.clone().unwrap_or_default();
+            let ipv6_cidr_block = subnet
+                .ipv6_cidr_block_association_set
+                .iter()
+                .flatten()
+                .find_map(|association| association.ipv6_cidr_block.clone())
+                .unwrap_or_default();
             // The refusal names the subnet the REQUEST asked for — the one whose zone is
             // already taken by a subnet named before it.
             if placements
@@ -588,6 +639,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             placements.push(EndpointPlacement {
                 subnet_id: subnet_id.clone(),
                 cidr_block: subnet.cidr_block.clone().unwrap_or_default(),
+                ipv6_cidr_block,
                 availability_zone,
                 availability_zone_id: subnet.availability_zone_id.clone().unwrap_or_default(),
                 // "The IPv4 address to assign to the endpoint network interface in the
@@ -595,6 +647,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 requested_address: configured
                     .get(subnet_id.as_str())
                     .and_then(|configuration| configuration.ipv4.clone())
+                    .filter(|address| !address.is_empty()),
+                // "The IPv6 address to assign to the endpoint network interface in the
+                // subnet" (`SubnetConfiguration$Ipv6`), when the request chose one.
+                requested_ipv6_address: configured
+                    .get(subnet_id.as_str())
+                    .and_then(|configuration| configuration.ipv6.clone())
                     .filter(|address| !address.is_empty()),
             });
         }
@@ -832,8 +890,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut network_interface_ids: Vec<String> = Vec::with_capacity(placements.len());
         for placement in &placements {
-            let address = match placement.requested_address.as_deref() {
-                Some(asked) => {
+            // The IPv4 address, for an endpoint reached over IPv4: an endpoint reached over
+            // IPv6 alone holds no IPv4 address on its interfaces, so none is taken for one.
+            let address = match (endpoint_ipv4, placement.requested_address.as_deref()) {
+                (false, _) => None,
+                (true, Some(asked)) => {
                     if !state::is_assignable_subnet_address(&placement.cidr_block, asked) {
                         release_interfaces(&mut store, &network_interface_ids);
                         return Err(state::invalid_parameter_value(format!(
@@ -846,15 +907,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         release_interfaces(&mut store, &network_interface_ids);
                         return Err(Scaffolded::invalid_ip_address_in_use(asked));
                     }
-                    asked.to_string()
+                    Some(asked.to_string())
                 }
-                None => match store.mint_private_ip_in_cidr(&placement.cidr_block) {
-                    Some(free) => free,
+                (true, None) => match store.mint_private_ip_in_cidr(&placement.cidr_block) {
+                    Some(free) => Some(free),
                     None => {
                         release_interfaces(&mut store, &network_interface_ids);
                         return Err(Scaffolded::insufficient_free_addresses());
                     }
                 },
+            };
+            // The IPv6 address, for an endpoint reached over IPv6: taken out of the SUBNET's
+            // own IPv6 range through the one resolution of an interface's IPv6 members this
+            // crate has, so an endpoint network interface and a caller-created one are given
+            // their IPv6 addresses on the same terms — and an address this loop already gave
+            // an earlier interface is held, that interface being stored before the next
+            // placement is resolved.
+            let ipv6_address = if endpoint_ipv6 {
+                let requested = state::RequestedInterfaceIpv6 {
+                    named_addresses: placement
+                        .requested_ipv6_address
+                        .clone()
+                        .into_iter()
+                        .collect(),
+                    wanted_addresses: 1,
+                    ..Default::default()
+                };
+                match store.resolve_requested_ipv6(&placement.ipv6_cidr_block, &requested) {
+                    Ok(assigned) => assigned.addresses,
+                    Err(refusal) => {
+                        if let Some(address) = address.as_deref() {
+                            store.release_private_ip(address);
+                        }
+                        release_interfaces(&mut store, &network_interface_ids);
+                        return Err(refusal);
+                    }
+                }
+            } else {
+                Vec::new()
             };
             let spec = state::NetworkInterfaceSpec {
                 subnet_id: placement.subnet_id.clone(),
@@ -865,19 +955,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Filled in with the endpoint it serves once the endpoint has its id.
                 description: String::new(),
                 interface_type: interface_type.to_string(),
-                private_ip_addresses: vec![address.clone()],
+                private_ip_addresses: address.clone().into_iter().collect(),
                 groups: groups.clone(),
                 // An endpoint network interface is attached to nothing a caller can see.
                 attachment: None,
                 requester: None,
+                ipv6_addresses: ipv6_address,
                 // The endpoint carries the request's tags; its interfaces are not the
                 // resource the request tagged.
                 tags: Vec::new(),
+                ..Default::default()
             };
             match store.insert_network_interface(spec) {
                 Some(network_interface_id) => network_interface_ids.push(network_interface_id),
                 None => {
-                    store.release_private_ip(&address);
+                    if let Some(address) = address.as_deref() {
+                        store.release_private_ip(address);
+                    }
                     release_interfaces(&mut store, &network_interface_ids);
                     return Err(state::network_interface_limit_exceeded());
                 }
@@ -1098,8 +1192,12 @@ pub(crate) const FULL_ACCESS_POLICY: &str =
 pub(crate) struct EndpointPlacement {
     /// The subnet itself.
     pub(crate) subnet_id: String,
-    /// Its IPv4 range, which the interface's private address comes out of.
+    /// Its IPv4 range, which the interface's private address comes out of. Empty for a subnet
+    /// that has none, which only an endpoint reached over IPv6 alone can sit in.
     pub(crate) cidr_block: String,
+    /// Its IPv6 range, which the interface's IPv6 address comes out of. Empty for a subnet
+    /// that has none, which only an endpoint reached over IPv4 alone can sit in.
+    pub(crate) ipv6_cidr_block: String,
     /// "The Availability Zone of the subnet" — one subnet per zone, so this is also the zone
     /// the endpoint's zonal DNS name is built for.
     pub(crate) availability_zone: String,
@@ -1107,6 +1205,8 @@ pub(crate) struct EndpointPlacement {
     pub(crate) availability_zone_id: String,
     /// `SubnetConfiguration$Ipv4` for this subnet, when the request carried one.
     pub(crate) requested_address: Option<String>,
+    /// `SubnetConfiguration$Ipv6` for this subnet, when the request carried one.
+    pub(crate) requested_ipv6_address: Option<String>,
 }
 
 /// The DNS names an interface endpoint answers on.

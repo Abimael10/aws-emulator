@@ -501,6 +501,12 @@ impl ComAmazonawsEc2Amazonec2State {
         // already gone with those groups.
         self.security_group_vpc_associations
             .retain(|(_, associated_vpc), _| associated_vpc != vpc_id);
+        // The IPAM pool allocation this VPC's CIDR block came out of — "in IPAM, an allocation
+        // is a CIDR assignment from an IPAM pool to another IPAM pool or to a RESOURCE"
+        // ([`IpamPoolAllocation`]) — goes with the VPC too: the space stops being assigned the
+        // instant the resource holding it stops existing, so the pool can hand it out again
+        // rather than reporting it assigned to a VPC that is gone.
+        self.release_ipam_pool_allocations_of_resource(vpc_id);
         Some(vpc)
     }
 }

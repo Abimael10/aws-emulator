@@ -926,14 +926,17 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
             ec2::state::INVALID_ROUTE_TABLE_ID_NOT_FOUND,
         ),
         (
-            "an endpoint reached over IPv6",
+            // "The IP address type for the endpoint" (`IpAddressType`) names the families
+            // the endpoint's interfaces are reached over, and this suite's subnet has an
+            // IPv4 range only — so it cannot hold an interface of a dual-stack endpoint.
+            "an endpoint reached over IPv6 in a subnet with no IPv6 range",
             {
                 let mut params = interface_in(&[built.subnets[0].as_str()]);
                 params.push(param("IpAddressType", "dualstack"));
                 params
             },
-            501,
-            "NotImplemented",
+            400,
+            "InvalidSubnet",
         ),
     ];
 

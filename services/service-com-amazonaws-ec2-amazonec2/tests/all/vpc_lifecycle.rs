@@ -982,26 +982,20 @@ async fn an_ipv6_block_is_associated_as_requested_and_excluded_combinations_are_
 
 /// The rule: a request this emulator holds no state to serve is answered with the
 /// scaffold's 501 `NotImplemented` — never with a success it could not have computed.
-/// There is no IPAM pool and no address pool to allocate out of, and no VPC Encryption
-/// Control resource to create.
+/// There is no address pool to let Amazon choose an IPv6 block out of, no source for the
+/// address attributes an IPv6 block allocated from an IPAM pool would report, and no VPC
+/// Encryption Control resource to create. (An IPv4 CIDR out of an IPAM pool IS served; see
+/// `create_vpc_from_ipam_pool`.)
 #[tokio::test]
 async fn a_cidr_this_emulator_cannot_allocate_answers_not_implemented() {
     let router = emulator();
     let before = elements(&describe_ok("before", &router, &[]).await, "vpcId");
 
     // (case, the members beside CidrBlock)
-    let cases: [RequestCase; 6] = [
-        (
-            "an IPv4 IPAM pool",
-            vec![param("Ipv4IpamPoolId", "ipam-pool-0123456789abcdef0")],
-        ),
+    let cases: [RequestCase; 4] = [
         (
             "an IPv6 IPAM pool",
             vec![param("Ipv6IpamPoolId", "ipam-pool-0123456789abcdef0")],
-        ),
-        (
-            "an IPv4 netmask length",
-            vec![param("Ipv4NetmaskLength", "16")],
         ),
         (
             "an IPv6 netmask length",

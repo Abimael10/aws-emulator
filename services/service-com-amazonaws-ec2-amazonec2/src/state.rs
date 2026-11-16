@@ -1935,7 +1935,8 @@ use crate::ops::types::{
     Monitoring, NatGateway, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, NetworkInsightsAnalysis, NetworkInsightsPath,
     NetworkInterface, NetworkInterfacePermission,
-    NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
+    NetworkInterfacePermissionState, NetworkInterfaceIpv6Address, Ipv6PrefixSpecification,
+    NetworkInterfacePrivateIpAddress,
     OperatorResponse, PathFilter, PeeringAttachmentStatus,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
     PrivateDnsDetails, PrivateDnsNameConfiguration, PrivateDnsNameOptionsOnLaunch,
@@ -2256,6 +2257,13 @@ pub use launched_interfaces::*;
 /// `NetworkInterfaces`. Everything it declares is re-exported below.
 mod interface_private_ips;
 pub use interface_private_ips::*;
+
+/// The IPv6 addresses and prefixes ONE network interface specification asks for, beside the
+/// private IPv4 addresses above: the four members' documented combination rules, the primary
+/// IPv6 flag and the one resolution of that space out of a subnet's block. Everything it
+/// declares is re-exported below.
+mod interface_ipv6;
+pub use interface_ipv6::*;
 
 /// The SECONDARY private IPv4 addresses an interface that ALREADY EXISTS holds — who holds
 /// an address, and the two writers that record one on an interface and take it off again —

@@ -1261,6 +1261,19 @@ pub struct NetworkInterfaceSpec {
     /// (`NetworkInterface$RequesterManaged`). `None` for an interface the caller created for
     /// itself, which nothing but the caller manages.
     pub requester: Option<String>,
+    /// The interface's IPv6 addresses, FIRST FIRST: "when you enable an IPv6 GUA address to
+    /// be a primary IPv6, the first IPv6 GUA will be made the primary IPv6 address"
+    /// (`CreateNetworkInterfaceRequest$EnablePrimaryIpv6`), so the order is what decides
+    /// which one [`NetworkInterfaceSpec::primary_ipv6`] applies to. Empty for an interface
+    /// that asked for none, which is every interface in an IPv4-only subnet.
+    pub ipv6_addresses: Vec<String>,
+    /// The IPv6 prefixes delegated to the interface (`NetworkInterface$Ipv6Prefixes`), empty
+    /// for one that asked for none.
+    pub ipv6_prefixes: Vec<String>,
+    /// Whether the interface's first IPv6 address is its PRIMARY one
+    /// (`NetworkInterfaceIpv6Address$IsPrimaryIpv6`), which only a request that asked for it
+    /// gets.
+    pub primary_ipv6: bool,
     /// The tags the create asked for.
     pub tags: Vec<Tag>,
 }
@@ -1434,12 +1447,38 @@ impl ComAmazonawsEc2Amazonec2State {
             description: Some(spec.description),
             groups: Some(spec.groups),
             interface_type: Some(spec.interface_type),
-            // No IPv6 address or prefix is assigned until something assigns one.
-            ipv6_addresses: Some(Vec::new()),
+            // The IPv6 addresses and prefixes the create asked for, chosen out of the
+            // subnet's own IPv6 range before this writer was called — empty lists for an
+            // interface that asked for none, which is what AWS reports for one. The FIRST
+            // address is the primary one when the request asked for a primary IPv6
+            // ([`NetworkInterfaceSpec::primary_ipv6`]); every other address carries no
+            // verdict about being primary, exactly as an assignment to an existing interface
+            // leaves it.
+            ipv6_addresses: Some(
+                spec.ipv6_addresses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, address)| NetworkInterfaceIpv6Address {
+                        ipv6_address: Some(address.clone()),
+                        // "An IPv6-enabled public hostname for a network interface"
+                        // (`PublicIpv6DnsName`): reported for an interface with public DNS
+                        // names, which no operation of this crate turns on.
+                        public_ipv6_dns_name: None,
+                        is_primary_ipv6: (spec.primary_ipv6 && index == 0).then_some(true),
+                    })
+                    .collect(),
+            ),
             ipv6_address: None,
             ipv6_native: Some(false),
             ipv4_prefixes: Some(Vec::new()),
-            ipv6_prefixes: Some(Vec::new()),
+            ipv6_prefixes: Some(
+                spec.ipv6_prefixes
+                    .iter()
+                    .map(|prefix| Ipv6PrefixSpecification {
+                        ipv6_prefix: Some(prefix.clone()),
+                    })
+                    .collect(),
+            ),
             mac_address: Some(mac_address),
             network_interface_id: Some(network_interface_id.clone()),
             // An interface is on an Outpost only when it was created in an Outpost subnet.

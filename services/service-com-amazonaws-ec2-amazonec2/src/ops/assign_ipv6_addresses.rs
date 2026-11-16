@@ -183,7 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // interface is named by the request, and every address and prefix comes out of that
         // interface's own subnet. The store is reached through the engine held on `self`.
         let _ = ctx;
-        use crate::scaffolded::Scaffolded;
         use crate::state;
 
         let network_interface_id = input.network_interface_id.as_str();
@@ -275,12 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
             return Err(state::subnet_has_no_ipv6_range());
         };
-        // What the account already holds, read off the interface records that ARE the pool.
-        // Both lists are read ONCE and grown with what this call assigns, so no refusal and
-        // no choice below re-reads the store, and the work one call does is bounded by what
-        // it hands out plus what the account holds.
-        let mut taken_addresses = store.assigned_ipv6_addresses();
-        let mut taken_prefixes = store.assigned_ipv6_prefixes();
+        // What the account already holds is read by the resolution below, off the interface
+        // records that ARE the pool.
 
         // "You can assign as many IPv6 addresses to a network interface as you can assign
         // private IPv4 addresses, and the limit varies by instance type" (above), so the
@@ -309,102 +304,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The addresses this call assigns. A caller-named one is judged by the same window a
-        // service-chosen one is drawn from ([`crate::state::is_assignable_subnet_ipv6_address`]),
-        // and against the same in-use reading, so the two cannot disagree; an address named
-        // twice in one request is in use the second time, like one another interface holds.
-        // Grown as each address is resolved rather than sized from the request's own count:
-        // a capacity a caller names is memory a caller sizes.
-        let mut assigned_addresses: Vec<String> = Vec::new();
-        for address in &named_addresses {
-            let Some(canonical) = state::canonical_ipv6_address(address) else {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({address}) for parameter ipv6Addresses is invalid. \
-                     This is not a valid IPv6 address."
-                )));
-            };
-            if !state::is_assignable_subnet_ipv6_address(&block, &canonical) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({address}) for parameter ipv6Addresses is invalid. \
-                     Address does not fall within the subnet's assignable address range \
-                     {block}"
-                )));
-            }
-            if state::ipv6_address_is_taken(&canonical, &taken_addresses, &taken_prefixes) {
-                return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
-            }
-            // Held from here on, so a request naming one address twice is refused the second
-            // time the way one another interface holds is.
-            taken_addresses.push(canonical.clone());
-            assigned_addresses.push(canonical);
-        }
-        // "The specified number of IPv6 addresses are assigned in addition to the existing
-        // IPv6 addresses that are already assigned to the network interface. Amazon EC2
-        // automatically selects the IPv6 addresses from the subnet range"
-        // (`Ipv6AddressCount`).
-        let to_choose = wanted_addresses.saturating_sub(assigned_addresses.len());
-        if to_choose > 0 {
-            let Some(chosen) = state::free_subnet_ipv6_addresses(
-                &block,
-                &taken_addresses,
-                &taken_prefixes,
-                to_choose,
-            ) else {
-                return Err(state::insufficient_free_ipv6_addresses());
-            };
-            taken_addresses.extend(chosen.iter().cloned());
-            assigned_addresses.extend(chosen);
-        }
-
-        // The prefixes this call delegates, on the same terms: "One or more IPv6 prefixes
-        // assigned to the network interface" (`Ipv6Prefixes`) is a range OF the subnet's
-        // block, so it has to sit inside the assignable part of it and overlap nothing the
-        // account already holds.
-        // Grown as each prefix is resolved, for the same reason as the addresses above.
-        let mut assigned_prefixes: Vec<String> = Vec::new();
-        for prefix in &named_prefixes {
-            let Ok(canonical) = state::canonical_ipv6_cidr(prefix) else {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({prefix}) for parameter ipv6Prefixes is invalid. \
-                     This is not a valid IPv6 CIDR block."
-                )));
-            };
-            // The block is canonical, so the text before the `/` is its LOWEST address: a
-            // prefix inside the subnet's block whose lowest address is assignable holds no
-            // reserved address at all.
-            let lowest = canonical.split('/').next().unwrap_or_default().to_string();
-            if !state::ipv6_cidr_block_contains(&block, &canonical)
-                || !state::is_assignable_subnet_ipv6_address(&block, &lowest)
-            {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({prefix}) for parameter ipv6Prefixes is invalid. \
-                     Prefix does not fall within the subnet's assignable address range \
-                     {block}"
-                )));
-            }
-            if !state::ipv6_prefix_is_free(&canonical, &taken_addresses, &taken_prefixes) {
-                return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
-            }
-            // Held from here on, like an assigned address above.
-            taken_prefixes.push(canonical.clone());
-            assigned_prefixes.push(canonical);
-        }
-        // "The number of IPv6 prefixes that Amazon Web Services automatically assigns to the
-        // network interface" (`Ipv6PrefixCount`): the service picks them out of the same
-        // block, at the one size Prefix Delegation hands out
-        // ([`crate::state::IPV6_PREFIX_DELEGATION_PREFIX_LENGTH`]).
-        let to_delegate = wanted_prefixes.saturating_sub(assigned_prefixes.len());
-        if to_delegate > 0 {
-            let Some(chosen) = state::free_subnet_ipv6_prefixes(
-                &block,
-                &taken_addresses,
-                &taken_prefixes,
-                to_delegate,
-            ) else {
-                return Err(state::insufficient_free_ipv6_addresses());
-            };
-            assigned_prefixes.extend(chosen);
-        }
+        // The addresses and prefixes this call assigns, through the ONE resolution of those
+        // members this crate has
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::resolve_requested_ipv6`]): an
+        // interface a create stores and one this call adds space to are given it on the same
+        // terms — judged by the same window, against the same reading of what the account
+        // holds. Nothing is written until the interface is read back below, so every refusal
+        // leaves the interface exactly as it was.
+        let requested = state::RequestedInterfaceIpv6 {
+            named_addresses: named_addresses.iter().map(|&address| address.to_string()).collect(),
+            wanted_addresses,
+            named_prefixes: named_prefixes.iter().map(|&prefix| prefix.to_string()).collect(),
+            wanted_prefixes,
+            // This call assigns space to an interface that already exists; the primary IPv6
+            // address is `ModifyNetworkInterfaceAttribute`'s own member, not this one's.
+            primary: false,
+        };
+        let assigned = store.resolve_requested_ipv6(&block, &requested)?;
+        let assigned_addresses = assigned.addresses;
+        let assigned_prefixes = assigned.prefixes;
 
         // Nothing has been written until here, so every refusal above leaves the interface
         // exactly as it was. The interface was read under this same lock a moment ago, so a
