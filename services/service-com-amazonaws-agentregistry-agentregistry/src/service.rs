@@ -369,7 +369,7 @@ fn with_search_type(mut response: WireResponse) -> WireResponse {
 /// How this service states the framework's constraint refusal, or `None` to keep the
 /// framework's own wording for anything that is not one.
 ///
-/// Three rules, and nothing else:
+/// Four rules, and nothing else:
 ///
 /// * NO clause quotes a value. Every one names the member it was stated at and the
 ///   requirement that member's value had to satisfy, whatever the request carried —
@@ -382,6 +382,9 @@ fn with_search_type(mut response: WireResponse) -> WireResponse {
 ///   pair of whole-value anchors the model wraps it in, so a caller that re-applies
 ///   the expression it was handed back uses the same one. The CHECK still runs the
 ///   model's pattern as written; only the rendering drops the pair.
+/// * an enumerated type's value set is listed in LEXICOGRAPHIC order
+///   ([`in_lexicographic_enum_order`]), whatever order the model declares that type's
+///   members in — so one enum reads the same wherever it is carried.
 ///
 /// The envelope, its error count, the clause, the member paths, the grouping and every
 /// requirement sentence belong to the shared home for this wording and to the framework
@@ -390,12 +393,39 @@ fn with_search_type(mut response: WireResponse) -> WireResponse {
 /// failure with its own code and status and nothing about it is this service's to word.
 fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
     service_common::validation_message::aws_validation_refusal_over_elements_stating_withholding(
-        refusal,
+        &in_lexicographic_enum_order(refusal),
         service_common::validation::unanchored,
         // Every clause, whatever member or class it is about.
         |_| true,
         element_set,
     )
+}
+
+/// `refusal` with every enumerated type's value set listed in LEXICOGRAPHIC order, and
+/// any refusal that is not a constraint failure returned as it came.
+///
+/// A refusal of a value outside an enumerated type names the values that type admits, and
+/// this service states that set sorted — the model declares a type's members in an order of
+/// its own, which is a fact about the model and not about the type. The re-ordering happens
+/// BEFORE the clauses are rendered, so the envelope, the error count, the member path and
+/// every requirement sentence still come from the one place that writes them, and the set is
+/// re-ordered by the shared rule rather than by a table of enums here: it is over the
+/// declared values themselves, so every member targeting one enum — of any operation, at any
+/// depth — is stated alike and an enum the model gains needs no row anywhere.
+///
+/// Which values a member ADMITS is never decided here: that stays the enum the member
+/// targets, and only the ORDER the admissible set is listed in moves.
+fn in_lexicographic_enum_order(refusal: &Refusal) -> Refusal {
+    match refusal {
+        Refusal::Invalid(violations) => Refusal::Invalid(
+            violations
+                .iter()
+                .map(service_common::validation_message::in_sorted_enum_order)
+                .collect(),
+        ),
+        // An authentication refusal carries no violation to re-order.
+        other => other.clone(),
+    }
 }
 
 /// Every shape of this service whose own members a refused COLLECTION is looked up in:
@@ -436,7 +466,7 @@ fn element_set(collection: &str) -> Option<String> {
 }
 
 /// One requirement of an element shape as this service states it: the sentence is the
-/// framework's own, with the one rendering this service chooses applied first, so a
+/// framework's own, with the two renderings this service chooses applied first, so a
 /// requirement nested in a collection's clause reads exactly like the same requirement
 /// stated at a member the walk reported.
 fn stated_requirement(declared: ViolationKind) -> String {
@@ -445,6 +475,12 @@ fn stated_requirement(declared: ViolationKind) -> String {
         // the expression drops the whole-value anchors.
         ViolationKind::Pattern(pattern) => {
             ViolationKind::Pattern(service_common::validation::unanchored(&pattern))
+        }
+        // The same lexicographic order [`in_lexicographic_enum_order`] states a reported
+        // enum violation's set in, so a nested set and a reported one cannot differ.
+        ViolationKind::EnumValue(mut values) => {
+            values.sort_unstable();
+            ViolationKind::EnumValue(values)
         }
         other => other,
     })
