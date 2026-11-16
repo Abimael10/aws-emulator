@@ -47,6 +47,8 @@ mod describe_input_bounds;
 mod enum_value_set_order;
 #[path = "all/forward_action_config_and_mutual_authentication.rs"]
 mod forward_action_config_and_mutual_authentication;
+#[path = "all/health_check_matcher_codes.rs"]
+mod health_check_matcher_codes;
 #[path = "all/host_count_health_checks.rs"]
 mod host_count_health_checks;
 #[path = "all/identifier_arn_forms.rs"]
@@ -57,6 +59,8 @@ mod input_rejection_classes;
 mod ip_targets;
 #[path = "all/listener_lifecycle_certificates_and_rules.rs"]
 mod listener_lifecycle_certificates_and_rules;
+#[path = "all/listener_port_and_target_group_exclusivity.rs"]
+mod listener_port_and_target_group_exclusivity;
 #[path = "all/listener_rules.rs"]
 mod listener_rules;
 #[path = "all/listener_target_group_protocol_pairing.rs"]
@@ -71,6 +75,8 @@ mod load_balancer_dns_name_form;
 mod load_balancer_input_rules;
 #[path = "all/load_balancer_network_capacity_and_policy.rs"]
 mod load_balancer_network_capacity_and_policy;
+#[path = "all/load_balancer_security_groups_reported.rs"]
+mod load_balancer_security_groups_reported;
 #[path = "all/management_event_recording.rs"]
 mod management_event_recording;
 #[path = "all/provisioning_loop.rs"]
@@ -133,6 +139,8 @@ mod target_group_health_checks;
 mod target_group_in_use_refusal;
 #[path = "all/target_group_layer_7_health_check.rs"]
 mod target_group_layer_7_health_check;
+#[path = "all/target_id_forms_and_reported_ports.rs"]
+mod target_id_forms_and_reported_ports;
 #[path = "all/target_type_protocol_pairing.rs"]
 mod target_type_protocol_pairing;
 #[path = "all/target_validation_and_quotas.rs"]

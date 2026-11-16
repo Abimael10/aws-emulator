@@ -204,7 +204,6 @@ async fn a_load_balancer_presenting_a_certificate_is_recorded_as_its_consumer() 
         let case = row.case;
         // One engine per row, so each row's assertions are about its own store.
         let (router, engine) = emulator();
-        let tg_arn = create_http_target_group(&router, "consumer-tg").await;
         // The certificate under test, the one every listener of the row also holds as
         // its default when the row attaches the subject to the list instead, and a
         // certificate nothing presents at all.
@@ -222,6 +221,11 @@ async fn a_load_balancer_presenting_a_certificate_is_recorded_as_its_consumer() 
         for which in 0..row.load_balancers {
             let lb_arn =
                 create_load_balancer(&router, &format!("consumer-alb-{which}")).await;
+            // A target group per load balancer: a target group is routed to by at most
+            // one load balancer
+            // (`all/listener_port_and_target_group_exclusivity.rs`).
+            let tg_arn =
+                create_http_target_group(&router, &format!("consumer-tg-{which}")).await;
             for listener in 0..row.listeners_each {
                 let port = 443 + listener as i32;
                 match row.attached {

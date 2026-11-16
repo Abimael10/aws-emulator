@@ -401,6 +401,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And a target group ANOTHER load balancer already routes to may not be forwarded
+        // to by this listener: a target group belongs to one load balancer, and the request
+        // that would attach it to a second is the modelled `TargetGroupAssociationLimit`
+        // ([`crate::state::target_group_association`]).
+        let taken = crate::state::target_groups_routed_elsewhere(
+            &guard,
+            &candidate.load_balancer_arn,
+            &candidate.default_actions,
+        );
+        if !taken.is_empty() {
+            return Err(
+                CreateListenerErrorModeled::TargetGroupAssociationLimitException(
+                    TargetGroupAssociationLimitException {
+                        message: Some(crate::state::target_group_association_limit_message(
+                            taken.iter().map(String::as_str),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // One listener per port on a load balancer: the same settings are the
         // idempotent repeat the model documents, different ones are a duplicate.
         if let Some(existing) = listener_arns

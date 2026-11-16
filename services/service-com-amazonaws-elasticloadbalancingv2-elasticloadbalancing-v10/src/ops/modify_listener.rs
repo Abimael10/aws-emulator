@@ -327,26 +327,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One listener per port on a load balancer: moving this one onto a port another
-        // of its load balancer's listeners holds is the modelled duplicate.
-        if updated.port != stored.port {
+        // of its load balancer's listeners holds is refused, and nothing is written.
+        if let Some(port) = updated.port.filter(|_| updated.port != stored.port) {
             let clash = guard.listeners.values().any(|other| {
                 other.arn != updated.arn
                     && other.load_balancer_arn == updated.load_balancer_arn
                     && other.port == updated.port
             });
             if clash {
-                // The refusal names the load balancer whose port is already taken and
-                // nothing else — not the port, which the request carries, and not the
-                // listener that holds it: exactly as `CreateListener` words the same
-                // refusal ([`crate::state::duplicate_listener_message`]).
-                return Err(ModifyListenerErrorModeled::DuplicateListenerException(
-                    DuplicateListenerException {
-                        message: Some(crate::state::duplicate_listener_message(
-                            &updated.load_balancer_arn,
-                        )),
-                    },
-                )
-                .into());
+                // The refusal names the PORT the request asked for and nothing else — not
+                // the load balancer, and not the listener that holds the port — because a
+                // modification already names the listener it changes, so the `Port` member
+                // is the one thing the caller can correct
+                // ([`crate::state::listener_port_in_use_message`]). Recorded behaviour:
+                // this service's own `ValidationError`, not the `DuplicateListener` the
+                // CREATE of a second listener on a taken port answers.
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::listener_port_in_use_message(port),
+                ));
             }
         }
 
@@ -378,6 +376,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // And a target group ONE load balancer routes to may not be forwarded to by a
+        // listener of another: a target group belongs to one load balancer, and the
+        // request that would attach it to a second is the modelled
+        // `TargetGroupAssociationLimit` ([`crate::state::target_group_association`]).
+        let taken = crate::state::target_groups_routed_elsewhere(
+            &guard,
+            &updated.load_balancer_arn,
+            &updated.default_actions,
+        );
+        if !taken.is_empty() {
+            return Err(
+                ModifyListenerErrorModeled::TargetGroupAssociationLimitException(
+                    TargetGroupAssociationLimitException {
+                        message: Some(crate::state::target_group_association_limit_message(
+                            taken.iter().map(String::as_str),
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
 
         let load_balancer_arn = updated.load_balancer_arn.clone();

@@ -296,13 +296,17 @@ async fn the_default_rule_guards_state_what_cannot_be_changed() {
 #[tokio::test]
 async fn a_taken_listener_port_is_refused_naming_the_load_balancer() {
     let (router, _engine) = emulator();
-    let tg = create_http_target_group(&router, "duplicate-listener-tg").await;
-    // A second target group, so the repeat carries DIFFERENT settings and is the duplicate
-    // rather than the idempotent repeat the model documents.
+    // A target group the refused request forwards to, so the repeat carries DIFFERENT
+    // settings and is the duplicate rather than the idempotent repeat the model documents.
+    // Every one of those requests is refused, so this group is never routed to by anything
+    // and may be named by both load balancers below.
     let other_tg = create_http_target_group(&router, "duplicate-listener-tg-two").await;
 
     for name in ["duplicate-listener-alb-one", "duplicate-listener-alb-two"] {
         let lb = create_load_balancer(&router, name).await;
+        // A target group per load balancer: a target group is routed to by at most one
+        // load balancer (`all/listener_port_and_target_group_exclusivity.rs`).
+        let tg = create_http_target_group(&router, &format!("{name}-tg")).await;
         let expected =
             format!("A listener already exists on this port for this load balancer '{lb}'");
         for port in [80, 443, 8080] {

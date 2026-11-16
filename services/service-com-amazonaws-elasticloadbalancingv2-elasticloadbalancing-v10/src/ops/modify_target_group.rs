@@ -266,6 +266,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             http_code: matcher.http_code.clone(),
             grpc_code: matcher.grpc_code.clone(),
         });
+        // Every code a matcher the request carries names lies inside the range `Matcher`
+        // publishes for that kind of code and this target group's load balancer family —
+        // the ONE reading of those ranges in `crate::state`, which `CreateTargetGroup`
+        // applies to the check a target group STARTS with.
+        if let Some(matcher) = requested_matcher.as_ref() {
+            crate::state::check_health_check_matcher(matcher, group.family())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
         // A layer-7 health check is only a health check once it has both a destination
         // and a return code (see [`crate::state::check_layer_7_health_check`]), and a
         // MODIFY settles neither: filling their documented defaults is what the CREATE

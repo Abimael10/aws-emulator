@@ -373,25 +373,13 @@ async fn resolve_targets(
     // What a target id is WRITTEN as is decided by the group's target type, and a value of
     // none of those forms names no target of any account: that is the request to fix rather
     // than a target this group cannot carry, so it is refused with this service's
-    // `ValidationError` before anything is asked of the service that owns the target
-    // ([`crate::state::check_target_id`]). An `ip` target's form is read below, by the
-    // parse that answers the address itself.
-    for target in targets {
-        crate::state::check_target_id(target_type, &target.id)
-            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-    }
+    // `ValidationError` before anything is asked of the service that owns the target. The
+    // ONE reading of that rule ([`crate::state::check_target_forms`], shared with
+    // `DeregisterTargets`), which answers the address every `ip` target names.
+    let addresses = crate::state::check_target_forms(target_type, ip_address_type, targets)
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
     match target_type {
         "ip" => {
-            // What the ids ARE is decided by this request alone, so it is answered before
-            // anything is asked of EC2 — and for every target, so a refusal registers
-            // none of them.
-            let addresses = targets
-                .iter()
-                .map(|target| {
-                    crate::state::network::parse_ip_target(&target.id, ip_address_type)
-                        .map_err(crate::scaffolded::Scaffolded::validation_error)
-                })
-                .collect::<Result<Vec<std::net::IpAddr>, RegisterTargetsError>>()?;
             let Some(vpc_id) = vpc_id else {
                 return unresolved();
             };

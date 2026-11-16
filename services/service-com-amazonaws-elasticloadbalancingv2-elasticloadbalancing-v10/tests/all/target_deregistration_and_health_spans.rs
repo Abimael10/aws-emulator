@@ -496,16 +496,17 @@ async fn health_checking_begins_when_a_load_balancer_first_forwards_to_the_group
             );
         }
 
-        // A SECOND load balancer forwarding to the same group does not restart the span:
-        // the group was already one a load balancer sends traffic to.
-        let second = create_load_balancer(&router, &format!("attach-alb-second-{index}")).await;
-        create_listener(&router, &second, &group, 8080).await;
+        // A SECOND LISTENER forwarding to the same group does not restart the span: the
+        // group was already one a load balancer sends traffic to. It is a listener of the
+        // SAME load balancer, because a target group is routed to by at most one load
+        // balancer (`all/listener_port_and_target_group_exclusivity.rs`).
+        create_listener(&router, &lb, &group, 8080).await;
         let still = health(&router, case, &group).await;
         for (id, state, reason) in &still {
             assert_eq!(
                 (state.as_str(), reason.as_str()),
                 ("healthy", ""),
-                "case {case:?}: a second load balancer does not re-start health checking of \
+                "case {case:?}: a second listener does not re-start health checking of \
                  {id}, got {state:?}/{reason:?}"
             );
         }

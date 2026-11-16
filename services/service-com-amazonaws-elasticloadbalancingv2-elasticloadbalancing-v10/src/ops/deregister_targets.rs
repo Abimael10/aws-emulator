@@ -178,6 +178,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The FORM of every target id is judged BEFORE anything is removed, against the
+        // target type of the group it was asked of: a value that is no target of this kind
+        // of group names nothing this group could ever have held, so it is the request that
+        // has to be fixed rather than a no-op to grant — the same rule, read in the same
+        // place, that `RegisterTargets` applies to the targets it adds
+        // ([`crate::state::check_target_forms`]).
+        crate::state::check_target_forms(
+            &group.target_type,
+            group.ip_address_type.as_deref(),
+            &input.targets,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // What an earlier deregistration already owes this group, before this one is
         // applied: a registration whose drain is over has left the group, so a
         // deregistration of it names nothing rather than restarting a drain.

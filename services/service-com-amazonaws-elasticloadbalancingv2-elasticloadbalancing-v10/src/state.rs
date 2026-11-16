@@ -134,6 +134,27 @@ pub mod health_check_schedule;
 
 pub use health_check_schedule::{check_health_check_schedule, HEALTH_CHECK_SCHEDULE_MESSAGE};
 
+/// The RETURN CODES a target group's health check counts as success, and the range each
+/// kind of code may name.
+pub mod health_check_matcher;
+
+pub use health_check_matcher::{
+    check_health_check_matcher, health_check_grpc_codes, health_check_http_codes,
+    matcher_code_message,
+};
+
+/// How many load balancers one target group may be forwarded to by.
+pub mod target_group_association;
+
+pub use target_group_association::{
+    target_group_association_limit_message, target_groups_routed_elsewhere,
+};
+
+/// The Route 53 hosted zone published for each Region and load balancer family.
+mod hosted_zones;
+
+pub use hosted_zones::*;
+
 /// Which target-group protocols each target TYPE can be routed to over, read once for
 /// every operation that settles the pair.
 pub mod target_type_protocol;
@@ -155,8 +176,8 @@ pub use load_balancer_endpoint::{
 pub mod identifier_syntax;
 
 pub use identifier_syntax::{
-    arn_format_message, check_arn_format, check_resource_arn, check_target_group_name,
-    check_target_group_name_as, check_target_id, invalid_arn_message,
+    arn_format_message, check_arn_format, check_resource_arn, check_target_forms,
+    check_target_group_name, check_target_group_name_as, check_target_id, invalid_arn_message,
     invalid_instance_id_message, invalid_instance_targets_message, is_resource_arn, ArnKind,
     SELECTED_TARGET_GROUP_NAME_SUBJECT, TARGET_GROUP_NAME_SUBJECT,
 };
@@ -476,7 +497,12 @@ impl LoadBalancerRecord {
                     .map(AvailabilityZoneRecord::to_shape)
                     .collect(),
             ),
-            security_groups: Some(self.security_groups.clone()),
+            // "The IDs of the security groups for the load balancer" — an OPTIONAL list,
+            // so a load balancer carrying none reports no such member rather than an empty
+            // one: an absent list and an empty list are different answers to whether this
+            // load balancer has security groups, and a Network Load Balancer created
+            // without them has none to report.
+            security_groups: reported_list(self.security_groups.clone()),
             ip_address_type: Some(self.ip_address_type.clone()),
             customer_owned_ipv4_pool: self.customer_owned_ipv4_pool.clone(),
             enforce_security_group_inbound_rules_on_private_link_traffic: self
@@ -833,13 +859,27 @@ pub const DEFAULT_RULE_PRIORITY_MESSAGE: &str =
 /// The message a `DuplicateListener` states: the load balancer whose port the request
 /// asked for is already taken on.
 ///
-/// One message for `CreateListener` and for a `ModifyListener` that moves a listener onto
-/// a taken port, because "one listener per port of a load balancer" is ONE rule of the
-/// service. The PORT is not named — the request carries it — and neither is the listener
-/// that holds it: the identifier of the resource that happens to hold the port is not
-/// part of the refusal.
+/// `CreateListener`'s refusal for a port of the load balancer another of its listeners
+/// already holds. The PORT is not named — the request carries it — and neither is the
+/// listener that holds it: the identifier of the resource that happens to hold the port is
+/// not part of the refusal. The MODIFICATION that moves a listener onto a taken port is
+/// refused differently ([`listener_port_in_use_message`]), which is why the two wordings
+/// live beside one another.
 pub fn duplicate_listener_message(load_balancer_arn: &str) -> String {
     format!("A listener already exists on this port for this load balancer '{load_balancer_arn}'")
+}
+
+/// The message a request that MOVES a listener onto a port of its load balancer another
+/// listener already holds is refused with: the port the request asked for, and nothing
+/// else.
+///
+/// Recorded behaviour of `ModifyListener`, and this service's own `ValidationError` rather
+/// than the `DuplicateListener` the create answers: a modification names the listener it
+/// changes, so what the caller has to correct is the `Port` member it carried, which is the
+/// one variable part of the sentence. Neither the load balancer nor the listener holding
+/// the port is named.
+pub fn listener_port_in_use_message(port: i32) -> String {
+    format!("Listener port '{port}' is already in use")
 }
 
 /// The published maximum length of a load balancer name, from `CreateLoadBalancer`'s
@@ -1474,157 +1514,6 @@ pub fn load_balancer_family(lb_type: &str) -> LoadBalancerFamily {
         "gateway" => LoadBalancerFamily::Gateway,
         // `application` is the modelled default for `Type`.
         _ => LoadBalancerFamily::Application,
-    }
-}
-
-/// One Region's published Route 53 hosted zones: the Region, the zone an Application Load
-/// Balancer of it is aliased through, and the zone a Network Load Balancer of it is
-/// aliased through.
-struct HostedZoneEntry {
-    region: &'static str,
-    application: &'static str,
-    network: &'static str,
-}
-
-/// The Route 53 hosted zone ids Elastic Load Balancing publishes per Region and load
-/// balancer family, which `LoadBalancer$CanonicalHostedZoneId` reports ("the ID of the
-/// Amazon Route 53 hosted zone associated with the load balancer").
-///
-/// These are the service's own published identifiers — the "Elastic Load Balancing
-/// endpoints and quotas" table of hosted zone ids, which a client needs to alias a record
-/// at the load balancer — not anything derived from a request or minted per run: the same
-/// Region and family always answer the same id, for every account and every load balancer.
-/// Application Load Balancers share their Region's zone with Classic load balancers, and
-/// Network Load Balancers have their own.
-///
-/// A Region this table does not carry reports no hosted zone rather than a made-up one: an
-/// id of the right shape that resolves to nothing would be worse than an absent member.
-///
-/// The `application` column is the SAME published column as the Classic endpoint's, which
-/// `services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7`'s
-/// `CLASSIC_ELB_HOSTED_ZONE_IDS` carries for its own model: the two tables must agree on
-/// every Region both cover, and they do. They cannot be ONE table in a shared crate
-/// without a dependency cycle — that crate already depends on this one, for the shared
-/// endpoint's API-version dispatch — so this is the cross-reference that keeps them in
-/// step, and a Region added to either belongs in both.
-const HOSTED_ZONES: &[HostedZoneEntry] = &[
-    HostedZoneEntry {
-        region: "af-south-1",
-        application: "Z268VQBMOI5EKX",
-        network: "Z203XCE67M25HM",
-    },
-    HostedZoneEntry {
-        region: "ap-east-1",
-        application: "Z3DQVH9N71FHZ0",
-        network: "Z12Y7K3UBGUAD1",
-    },
-    HostedZoneEntry {
-        region: "me-south-1",
-        application: "ZS929ML54UICD",
-        network: "Z3QSRYVP46NYYV",
-    },
-    HostedZoneEntry {
-        region: "us-east-1",
-        application: "Z35SXDOTRQ7X7K",
-        network: "Z26RNL4JYFTOTI",
-    },
-    HostedZoneEntry {
-        region: "us-east-2",
-        application: "Z3AADJGX6KTTL2",
-        network: "ZLMOA37VPKANP",
-    },
-    HostedZoneEntry {
-        region: "us-west-1",
-        application: "Z368ELLRRE2KJ0",
-        network: "Z24FKFUX50B4VV",
-    },
-    HostedZoneEntry {
-        region: "us-west-2",
-        application: "Z1H1FL5HABSF5",
-        network: "Z18D5FSROUN65G",
-    },
-    HostedZoneEntry {
-        region: "ca-central-1",
-        application: "ZQSVJUPU6J1EY",
-        network: "Z2EPGBW3API2WT",
-    },
-    HostedZoneEntry {
-        region: "eu-west-1",
-        application: "Z32O12XQLNTSW2",
-        network: "Z2IFOLAFXWLO4F",
-    },
-    HostedZoneEntry {
-        region: "eu-west-2",
-        application: "ZHURV8PSTC4K8",
-        network: "ZD4D7Y8KGAS4G",
-    },
-    HostedZoneEntry {
-        region: "eu-west-3",
-        application: "Z3Q77PNBQS71R4",
-        network: "Z1CMS0P5QUZ6D5",
-    },
-    HostedZoneEntry {
-        region: "eu-central-1",
-        application: "Z215JYRZR1TBD5",
-        network: "Z3F0SRJ5LGBH90",
-    },
-    HostedZoneEntry {
-        region: "eu-north-1",
-        application: "Z23TAZ6LKFMNIO",
-        network: "Z1UDT6IFJ4EJM",
-    },
-    HostedZoneEntry {
-        region: "eu-south-1",
-        application: "Z3ULH7SSC9OV64",
-        network: "Z23146JA1KNAFP",
-    },
-    HostedZoneEntry {
-        region: "ap-south-1",
-        application: "ZP97RAFLXTNZK",
-        network: "ZVDDRBQ08TROA",
-    },
-    HostedZoneEntry {
-        region: "ap-northeast-1",
-        application: "Z14GRHDCWA56QT",
-        network: "Z31USIVHYNEOWT",
-    },
-    HostedZoneEntry {
-        region: "ap-northeast-2",
-        application: "ZWKZPGTI48KDX",
-        network: "ZIBE1TIR4HY56",
-    },
-    HostedZoneEntry {
-        region: "ap-northeast-3",
-        application: "Z5LXEXXYQ4HTP",
-        network: "Z1GWIQ4HH19I5X",
-    },
-    HostedZoneEntry {
-        region: "ap-southeast-1",
-        application: "Z1LMS91P8CMLE5",
-        network: "ZKVM4W9LS7TM",
-    },
-    HostedZoneEntry {
-        region: "ap-southeast-2",
-        application: "Z1GM3OXH4ZPM65",
-        network: "ZCT6FZBF4DROD",
-    },
-    HostedZoneEntry {
-        region: "sa-east-1",
-        application: "Z2P70J7HTTTPLU",
-        network: "ZTK26PT1VY4CU",
-    },
-];
-
-/// The published hosted zone of a load balancer of `family` in `region`, or `None` when
-/// the service publishes none for it — a Region [`HOSTED_ZONES`] does not carry, or a
-/// Gateway Load Balancer, which is reached through its own VPC endpoints rather than
-/// through a DNS name a hosted zone resolves.
-pub fn canonical_hosted_zone_id(region: &str, family: LoadBalancerFamily) -> Option<&'static str> {
-    let entry = HOSTED_ZONES.iter().find(|entry| entry.region == region)?;
-    match family {
-        LoadBalancerFamily::Application => Some(entry.application),
-        LoadBalancerFamily::Network => Some(entry.network),
-        LoadBalancerFamily::Gateway => None,
     }
 }
 
@@ -4384,6 +4273,18 @@ fn sorted(values: &[String]) -> Vec<String> {
     let mut sorted = values.to_vec();
     sorted.sort();
     sorted
+}
+
+/// How an OPTIONAL list member of a reported shape carries what a record holds: the
+/// entries when it holds any, and nothing at all when it holds none.
+///
+/// A list the model makes optional has two distinct answers — absent and empty — and a
+/// resource that carries no entry of it is the absent one: a caller tests whether the
+/// member is there to learn whether the resource has that kind of thing at all, so
+/// reporting an empty list would answer "it has none of them" where the service answers
+/// "it has no such list".
+fn reported_list(values: Vec<String>) -> Option<Vec<String>> {
+    Some(values).filter(|values| !values.is_empty())
 }
 
 /// Per-service state for com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10. A handler reaches it through [`service_state`].

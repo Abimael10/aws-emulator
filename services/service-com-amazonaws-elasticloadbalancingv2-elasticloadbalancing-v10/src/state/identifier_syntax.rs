@@ -96,6 +96,38 @@ pub fn check_target_id(target_type: &str, id: &str) -> Result<(), String> {
     }
 }
 
+/// The `TargetType` whose targets are named by an ADDRESS rather than by the id or ARN of
+/// a resource, which is the one form this module reads through the parse that answers the
+/// address itself ([`network::parse_ip_target`]).
+const IP_TARGET_TYPE: &str = "ip";
+
+/// Whether every target of a request is written the way a target of a `target_type` target
+/// group is written, answering the ADDRESS each `ip` target names.
+///
+/// One reading of that rule for every operation that takes a `Targets` list: the
+/// registration that adds them and the deregistration that removes them are judged alike,
+/// because the form of an id does not depend on what is being asked of it — a value that is
+/// no target of this kind of group names nothing to remove any more than it names something
+/// to add, so it is refused rather than treated as the no-op a well-formed target that was
+/// never registered earns.
+///
+/// The whole list is judged before anything is done with any of it, so a refusal leaves the
+/// target group exactly as it was.
+pub fn check_target_forms(
+    target_type: &str,
+    ip_address_type: Option<&str>,
+    targets: &[crate::ops::types::TargetDescription],
+) -> Result<Vec<std::net::IpAddr>, String> {
+    let mut addresses = Vec::with_capacity(targets.len());
+    for target in targets {
+        check_target_id(target_type, &target.id)?;
+        if target_type == IP_TARGET_TYPE {
+            addresses.push(network::parse_ip_target(&target.id, ip_address_type)?);
+        }
+    }
+    Ok(addresses)
+}
+
 /// The message a registration naming a value that is no INSTANCE ID is refused with: a
 /// verdict on the instance id the request carried, which is the one thing the caller can
 /// act on.

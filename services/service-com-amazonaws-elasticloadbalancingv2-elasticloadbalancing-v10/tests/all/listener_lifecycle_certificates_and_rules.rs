@@ -60,9 +60,6 @@ const INVALID_CONFIGURATION: &str = "InvalidConfigurationRequest";
 /// `RemoveListenerCertificates` models.
 const OPERATION_NOT_PERMITTED: &str = "OperationNotPermitted";
 
-/// The awsQuery code of `DuplicateListenerException`.
-const DUPLICATE_LISTENER: &str = "DuplicateListener";
-
 /// The awsQuery code of `TooManyCertificatesException`, which `CreateListener` and
 /// `ModifyListener` model for a request carrying more certificate ARNs than one call may.
 const TOO_MANY_CERTIFICATES: &str = "TooManyCertificates";
@@ -768,9 +765,12 @@ async fn modify_listener_refuses_a_configuration_the_model_rules_out() {
             VALIDATION_ERROR,
         ),
         (
+            // Recorded behaviour: a MODIFICATION onto a taken port is this service's own
+            // `ValidationError` naming the port, not the `DuplicateListener` the CREATE of
+            // a second listener on a taken port answers.
             "a port the load balancer already listens on",
             vec![p("Port", "8080")],
-            DUPLICATE_LISTENER,
+            VALIDATION_ERROR,
         ),
         (
             "a default action forwarding to a target group that does not exist",

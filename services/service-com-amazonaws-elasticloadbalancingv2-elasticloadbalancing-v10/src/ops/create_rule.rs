@@ -320,6 +320,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And a target group ANOTHER load balancer already routes to may not be forwarded
+        // to by a rule of this one, exactly as a listener's default actions may not
+        // ([`crate::state::target_group_association`]).
+        let taken = crate::state::target_groups_routed_elsewhere(
+            &guard,
+            &load_balancer_arn,
+            &input.actions,
+        );
+        if !taken.is_empty() {
+            return Err(
+                CreateRuleErrorModeled::TargetGroupAssociationLimitException(
+                    TargetGroupAssociationLimitException {
+                        message: Some(crate::state::target_group_association_limit_message(
+                            taken.iter().map(String::as_str),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The bound on what one load balancer's rules grow to, enforced before the
         // insert: past it the emulator answers the modelled quota error instead of
         // growing without end.

@@ -336,6 +336,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             health_check.timeout_seconds,
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // And its SUCCESS CRITERION has to be one the load balancer can observe: every
+        // code the matcher names lies inside the range `Matcher` publishes for that kind
+        // of code and this load balancer family (see
+        // [`crate::state::check_health_check_matcher`]). Judged on the EFFECTIVE matcher
+        // the record above settled — what the request carried, else the documented default
+        // — and before the insert, so a refused create persists nothing.
+        if let Some(matcher) = health_check.matcher.as_ref() {
+            crate::state::check_health_check_matcher(
+                matcher,
+                crate::state::protocol_family(protocol.as_deref()),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
         let mut candidate = TargetGroupRecord {
             arn: String::new(),
             name: input.name.clone(),

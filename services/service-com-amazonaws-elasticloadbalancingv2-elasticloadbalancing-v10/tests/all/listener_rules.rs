@@ -1060,15 +1060,18 @@ async fn the_rules_of_one_load_balancer_are_bounded_across_its_listeners() {
         );
     }
 
-    // The bound is this load balancer's: another one starts from nothing.
+    // The bound is this load balancer's: another one starts from nothing. It forwards to
+    // a target group of its own, because a target group is routed to by at most one load
+    // balancer (`all/listener_port_and_target_group_exclusivity.rs`).
     let other_lb = create_load_balancer(&router, "rule-quota-alb-2").await;
-    let other_listener = create_listener(&router, &other_lb, &group, 80).await;
+    let other_group = create_http_target_group(&router, "rule-quota-tg-2").await;
+    let other_listener = create_listener(&router, &other_lb, &other_group, 80).await;
     add_rule(
         &router,
         "the first rule of another load balancer",
         &other_listener,
         1,
-        &[host_header("fresh.example.com"), forward_to(&group)].concat(),
+        &[host_header("fresh.example.com"), forward_to(&other_group)].concat(),
     )
     .await;
 }

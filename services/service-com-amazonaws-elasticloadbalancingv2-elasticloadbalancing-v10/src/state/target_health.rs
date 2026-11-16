@@ -474,12 +474,21 @@ impl TargetGroupRecord {
     /// (`TargetGroupRecord::health_check_port_for`): the port is the group's health-check
     /// configuration read against the target the request named, which an unregistered
     /// target has as much as a registered one.
+    ///
+    /// And the same `Target$Port`: the port the request named, else the target group's own
+    /// ("the port on which the targets receive traffic … you can override the port for a
+    /// target when you register it"), which is the port the registration this target would
+    /// be is keyed by. So a read answers the port the traffic to that target would go to,
+    /// whether or not anything is registered on it.
     pub fn unregistered_health_description(
         &self,
         target: &TargetDescription,
     ) -> TargetHealthDescription {
         TargetHealthDescription {
-            target: Some(target.clone()),
+            target: Some(TargetDescription {
+                port: target.port.or(self.port),
+                ..target.clone()
+            }),
             health_check_port: self.health_check_port_for(target.port),
             target_health: Some(reported(UNUSED_NOT_REGISTERED)),
             anomaly_detection: None,

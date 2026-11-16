@@ -321,6 +321,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And a target group ANOTHER load balancer already routes to may not be forwarded
+        // to by a rule of this one, exactly as the actions a rule is created with may not
+        // ([`crate::state::target_group_association`]).
+        let taken = crate::state::target_groups_routed_elsewhere(
+            &guard,
+            &listener.load_balancer_arn,
+            &updated.actions,
+        );
+        if !taken.is_empty() {
+            return Err(
+                ModifyRuleErrorModeled::TargetGroupAssociationLimitException(
+                    TargetGroupAssociationLimitException {
+                        message: Some(crate::state::target_group_association_limit_message(
+                            taken.iter().map(String::as_str),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let Some(record) = guard.rule_record_mut(&input.rule_arn) else {
             // Resolved above under this same lock, so nothing can have released it.
             return Err(rule_not_found(&input.rule_arn));

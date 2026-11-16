@@ -6,7 +6,9 @@
 //! governed by a security group carries one from the moment it exists, so a create that
 //! names no `SecurityGroups` is placed in the DEFAULT security group of the VPC its
 //! subnets are in — the group EC2 created with that VPC — while a create that names groups
-//! carries exactly those, and a family that may carry none carries none.
+//! carries exactly those, and a family that may carry none reports no `SecurityGroups`
+//! member at all (the member is an optional list, so an absent one and an empty one are
+//! different answers to whether this load balancer has security groups).
 //!
 //! Which group is a VPC's default one is EC2's to say, so every row here runs against VPCs
 //! created through EC2 itself and compares what `DescribeLoadBalancers` reports against
@@ -110,13 +112,14 @@ fn seed_vpc(
 }
 
 /// The `SecurityGroups` a load balancer reports, in the order it reports them, read back
-/// through `DescribeLoadBalancers` rather than off the create's own answer.
+/// through `DescribeLoadBalancers` rather than off the create's own answer — `None` when it
+/// reports no such member at all, which is the answer for a load balancer that has none.
 fn reported_groups(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     case: &str,
     arn: &str,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let read = elbv2(
         router,
         runtime,
@@ -127,13 +130,8 @@ fn reported_groups(
         read.status, 200,
         "case {case:?}: expected 200 from the read, got {read:?}"
     );
-    let block = block_of(&read.text, "SecurityGroups").unwrap_or_else(|| {
-        panic!("case {case:?}: no SecurityGroups member in {}", read.text)
-    });
-    members_of(block)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    block_of(&read.text, "SecurityGroups")
+        .map(|block| members_of(block).into_iter().map(str::to_string).collect())
 }
 
 /// Which groups a row expects, resolved once both VPCs exist.
@@ -142,7 +140,8 @@ enum Expected {
     VpcDefault,
     /// The groups the request named, in that order.
     AsNamed,
-    /// No group at all.
+    /// No `SecurityGroups` member at all, which is what a load balancer with no security
+    /// group reports.
     None,
 }
 
@@ -253,10 +252,10 @@ fn a_load_balancer_carries_the_groups_it_was_created_with_or_its_vpcs_default() 
                     );
                     let arn = element(&created.text, "LoadBalancerArn");
 
-                    let wanted: Vec<String> = match row.expected {
-                        Expected::VpcDefault => vec![vpc.default_group.clone()],
-                        Expected::AsNamed => vec![vpc.named_group.clone()],
-                        Expected::None => Vec::new(),
+                    let wanted: Option<Vec<String>> = match row.expected {
+                        Expected::VpcDefault => Some(vec![vpc.default_group.clone()]),
+                        Expected::AsNamed => Some(vec![vpc.named_group.clone()]),
+                        Expected::None => None,
                     };
                     let case = format!("{} in VPC {index}", row.case);
                     assert_eq!(
@@ -265,10 +264,10 @@ fn a_load_balancer_carries_the_groups_it_was_created_with_or_its_vpcs_default() 
                         "case {case:?}: expected the load balancer to report {wanted:?}"
                     );
                     // The create answered what the read reports: one load balancer, one
-                    // group list.
-                    let answered: Vec<String> = block_of(&created.text, "SecurityGroups")
-                        .map(|block| members_of(block).into_iter().map(str::to_string).collect())
-                        .unwrap_or_default();
+                    // group list — or no such member on either, for a load balancer with
+                    // no security group.
+                    let answered: Option<Vec<String>> = block_of(&created.text, "SecurityGroups")
+                        .map(|block| members_of(block).into_iter().map(str::to_string).collect());
                     assert_eq!(
                         answered, wanted,
                         "case {case:?}: the create must answer the groups a later read \
@@ -298,7 +297,7 @@ fn a_load_balancer_carries_the_groups_it_was_created_with_or_its_vpcs_default() 
             let arn = element(&created.text, "LoadBalancerArn");
             assert_eq!(
                 reported_groups(&router, &runtime, "before the replacement", &arn),
-                vec![first.default_group.clone()],
+                Some(vec![first.default_group.clone()]),
                 "case \"before the replacement\": it took its VPC's default group"
             );
             let replaced = elbv2(
@@ -316,7 +315,7 @@ fn a_load_balancer_carries_the_groups_it_was_created_with_or_its_vpcs_default() 
             );
             assert_eq!(
                 reported_groups(&router, &runtime, "after the replacement", &arn),
-                vec![first.named_group.clone()],
+                Some(vec![first.named_group.clone()]),
                 "case \"after the replacement\": a read reports the groups the caller set"
             );
         })
