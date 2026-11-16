@@ -170,9 +170,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // declared in `types/shared_types.rs`), and this operation's own `errors` list omits it. So
 // a reference that resolves to nothing is reported MISSING rather than dressed up as an
 // invalid request, which is a different claim a client branches on.
+//
+// `InvalidParameterValueException` is widened in for the same kind of reason: `schedule`'s
+// `scheduleExpression` is an EXPRESSION whose grammar the model cannot state, this SERVICE
+// models that shape for a value a parameter does not admit
+// (`com.amazonaws.imagebuilder#InvalidParameterValueException`, HTTP 400, declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it — so the same
+// member is refused the same way here as on the create.
 #[smithy_macros::operation_error(
     "com.amazonaws.imagebuilder#UpdateImagePipeline",
-    extra_errors = ["ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException", "InvalidParameterValueException"]
 )]
 #[derive(Debug)]
 pub enum UpdateImagePipelineErrorModeled {
@@ -180,6 +187,7 @@ pub enum UpdateImagePipelineErrorModeled {
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -274,6 +282,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refused(
                 crate::state::workflows_without_execution_role_message(),
             ));
+        }
+
+        // The schedule expression is read the same way the create reads it, and before the
+        // store is reached: a refused update replaces nothing, so the pipeline keeps the
+        // configuration it had.
+        if let Some(message) =
+            crate::state::unreadable_schedule_expression(input.schedule.as_ref())
+        {
+            return Err(
+                UpdateImagePipelineErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
 
         let fingerprint = crate::state::image_pipeline_update_fingerprint(&input);
@@ -422,8 +446,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 },
                 // "Because the update replaces the entire configuration, omitting this
-                // property removes any existing schedule" (`schedule`).
-                schedule: input.schedule,
+                // property removes any existing schedule" (`schedule`) — and a schedule the
+                // request DID carry is stored the way the create stores one, with the start
+                // condition Image Builder fills in where the request named none.
+                schedule: crate::state::stored_schedule(input.schedule),
                 // "Defaults to ENABLED when omitted. To keep a pipeline disabled, include
                 // this property set to DISABLED in your update request" (`status`).
                 status: input

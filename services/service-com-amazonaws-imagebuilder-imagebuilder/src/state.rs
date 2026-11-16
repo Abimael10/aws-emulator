@@ -192,6 +192,11 @@ pub use output_ami::*;
 mod output_ami_production;
 pub use output_ami_production::*;
 
+/// What the schedule an image pipeline fires on has to be, and how one this service cannot
+/// read is refused.
+mod schedule_expression;
+pub use schedule_expression::*;
+
 use crate::ops::types::{
     AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
     ComponentConfiguration, ComponentParameterDetail,
@@ -916,6 +921,9 @@ impl ComponentRecord {
             // Services Marketplace components" — this one came from a caller, not from
             // Marketplace.
             product_codes: None,
+            // Which is also why it is not billable ([`Self::billable`]), the flag a read of
+            // a component reports beside those codes.
+            billable: Some(self.billable()),
         }
     }
 
@@ -1374,9 +1382,12 @@ pub struct ImagePipelineRecord {
     pub logging_configuration: Option<PipelineLoggingConfiguration>,
     /// When the create stored it.
     pub date_created: String,
-    /// When an update last replaced it, and so `None` until one has — for the same reason
-    /// an infrastructure configuration's is
-    /// ([`InfrastructureConfigurationRecord::date_updated`]).
+    /// When the record was last WRITTEN: the instant of the create until an update replaces
+    /// it, and that update's instant afterwards — so a read of a pipeline always reports
+    /// one, which is how a recorded read of a freshly created pipeline reports it. (An
+    /// infrastructure configuration's is the instant of its last UPDATE and absent until one
+    /// has run, [`InfrastructureConfigurationRecord::date_updated`]: that resource's own
+    /// recorded read reports it that way.)
     pub date_updated: Option<String>,
 }
 

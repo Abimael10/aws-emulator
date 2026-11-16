@@ -4014,21 +4014,16 @@ pub enum Schedule {
 /// "For rate expressions, value is a positive integer and unit is minute | minutes | hour
 /// | hours | day | days."
 ///
-/// The one place the unit set lives — [`parse_schedule`] reads membership and the
-/// multiplier from it, and the suites pin the set through it.
-pub const RATE_UNITS: &[(&str, u64)] = &[
-    ("minute", 60),
-    ("minutes", 60),
-    ("hour", 3_600),
-    ("hours", 3_600),
-    ("day", 86_400),
-    ("days", 86_400),
-];
+/// The one place the unit set lives is the shared reading of a schedule expression
+/// ([`::service_common::schedule_expression`]), which every service taking one of these
+/// expressions reads it with; [`parse_schedule`] reads membership and the multiplier from it,
+/// and the suites pin the set through it.
+pub use ::service_common::schedule_expression::RATE_UNITS;
 
 /// How many whitespace-separated fields a `cron(…)` schedule carries: "The cron format
 /// consists of six fields separated by white spaces: [Minutes] [Hours] [Day_of_Month]
 /// [Month] [Day_of_Week] [Year]."
-pub const CRON_FIELDS: usize = 6;
+pub use ::service_common::schedule_expression::CRON_FIELDS;
 
 /// The largest instant this service computes with: 9999-12-31T23:59:59Z, the end of the
 /// range a modelled timestamp can be rendered in.
@@ -4057,86 +4052,60 @@ pub const START_TIME_BEFORE_END_TIME: &str = "StartTime must be before EndTime";
 /// The three forms are the model's own ("At expressions - at(yyyy-mm-ddThh:mm:ss), Rate
 /// expressions - rate(value unit), Cron expressions - cron(fields)"), and the service states
 /// them back as the syntax a schedule expression has to have: a caller whose expression is
-/// not a schedule at all is told the grammar, not which member failed which constraint. A
-/// detail is a sentence of its own, so it carries its own full stop ([`refuse_schedule`]).
-pub const SCHEDULE_SYNTAX_DETAIL: &str = "Schedule expressions must have the following syntax: \
-     rate(<number>\\s?(minutes?|hours?|days?)), cron(<cron_expression>) or \
-     at(yyyy-MM-dd'T'HH:mm:ss).";
+/// not a schedule at all is told the grammar, not which member failed which constraint. The
+/// statement is the shared one every service taking one of these expressions refuses with.
+pub use ::service_common::schedule_expression::SCHEDULE_SYNTAX_DETAIL;
 
-/// The six cron fields, in the order the service documents them, as one phrase \u2014 what a
+/// The six cron fields, in the order the service documents them, as one phrase — what a
 /// refusal names when the expression does not carry that many.
-pub const CRON_FIELD_LAYOUT: &str = "[Minutes] [Hours] [Day_of_Month] [Month] [Day_of_Week] [Year]";
+pub use ::service_common::schedule_expression::CRON_FIELD_LAYOUT;
 
 /// The name of each cron field, in order: "The cron format consists of six fields separated
 /// by white spaces: [Minutes] [Hours] [Day_of_Month] [Month] [Day_of_Week] [Year]."
-pub const CRON_FIELD_NAMES: [&str; CRON_FIELDS] = [
-    "Minutes",
-    "Hours",
-    "Day_of_Month",
-    "Month",
-    "Day_of_Week",
-    "Year",
-];
+pub use ::service_common::schedule_expression::CRON_FIELD_NAMES;
 
 /// Wrap one parse detail as the `ValidationException` message a schedule expression is
-/// refused with: the service's own sentence for "this is not a schedule", with the detail of
-/// what stopped the parse.
+/// refused with: the sentence for "this is not a schedule", with the detail of what stopped
+/// the parse.
 ///
-/// The detail is a statement in its own right and carries its own punctuation, so the
-/// envelope adds none: a cron body the parser refused is stated as the parser states it
-/// ([`cron_parse_failure`]), down to the quoted token it ends on.
+/// Both halves are the shared statements of them
+/// ([`::service_common::schedule_expression::invalid_schedule_expression`]), so a caller that
+/// surfaces or parses the detail reads the same two parts here as at every other service that
+/// takes one of these expressions.
 fn refuse_schedule(detail: &str) -> String {
-    format!("Invalid schedule expression. Details: {detail}")
+    ::service_common::schedule_expression::invalid_schedule_expression(detail)
 }
 
 /// Parse a `Schedule`, or the `ValidationException` message for one that is not a schedule.
+///
+/// The GRAMMAR is the shared reading of a schedule expression
+/// ([`::service_common::schedule_expression::parse`]); what is this service's own is the
+/// interval a `rate` expression is allowed to name ([`MAX_RATE_SECS`]) and the span it
+/// becomes, which is what its occurrences are computed from.
 pub fn parse_schedule(schedule: &str) -> Result<Schedule, String> {
-    let body = |keyword: &str| {
-        schedule
-            .strip_prefix(keyword)
-            .and_then(|rest| rest.strip_prefix('('))
-            .and_then(|rest| rest.strip_suffix(')'))
-    };
+    use ::service_common::schedule_expression::ScheduleExpression;
 
-    if let Some(instant) = body("at") {
-        let parsed = ::chrono::NaiveDateTime::parse_from_str(instant.trim(), "%Y-%m-%dT%H:%M:%S")
-            .map_err(|_| refuse_schedule(SCHEDULE_SYNTAX_DETAIL))?;
-        return Ok(Schedule::At(parsed));
+    match ::service_common::schedule_expression::parse(schedule)? {
+        ScheduleExpression::At(instant) => Ok(Schedule::At(instant)),
+        ScheduleExpression::Rate {
+            value,
+            unit_seconds,
+        } => {
+            // The magnitude is refused here, where the caller is told why, rather than
+            // carried into instant arithmetic that cannot represent it. The EMULATOR's own
+            // bound, so the detail says what the bound is.
+            let total = value
+                .checked_mul(unit_seconds)
+                .filter(|total| *total <= MAX_RATE_SECS)
+                .ok_or_else(|| {
+                    refuse_schedule(&format!(
+                        "the schedule interval must not exceed {MAX_RATE_SECS} seconds."
+                    ))
+                })?;
+            Ok(Schedule::Rate(::std::time::Duration::from_secs(total)))
+        }
+        ScheduleExpression::Cron(cron) => Ok(Schedule::Cron(cron)),
     }
-    if let Some(rate) = body("rate") {
-        let mut parts = rate.split_whitespace();
-        let (Some(value), Some(unit), None) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(refuse_schedule(SCHEDULE_SYNTAX_DETAIL));
-        };
-        let value: u64 = value
-            .parse()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| refuse_schedule(SCHEDULE_SYNTAX_DETAIL))?;
-        let seconds = RATE_UNITS
-            .iter()
-            .find(|(name, _)| *name == unit)
-            .map(|(_, seconds)| *seconds)
-            .ok_or_else(|| refuse_schedule(SCHEDULE_SYNTAX_DETAIL))?;
-        // The magnitude is refused here, where the caller is told why, rather than carried
-        // into instant arithmetic that cannot represent it. The EMULATOR's own bound, so the
-        // detail says what the bound is.
-        let total = value
-            .checked_mul(seconds)
-            .filter(|total| *total <= MAX_RATE_SECS)
-            .ok_or_else(|| {
-                refuse_schedule(&format!(
-                    "the schedule interval must not exceed {MAX_RATE_SECS} seconds."
-                ))
-            })?;
-        return Ok(Schedule::Rate(::std::time::Duration::from_secs(total)));
-    }
-    if let Some(fields) = body("cron") {
-        return Ok(Schedule::Cron(Box::new(
-            parse_cron(fields).map_err(|detail| refuse_schedule(&detail))?,
-        )));
-    }
-    Err(refuse_schedule(SCHEDULE_SYNTAX_DETAIL))
 }
 
 /// The time zone an `at` or `cron` expression is read in: "specifies the time zone used when
@@ -4153,136 +4122,6 @@ pub fn schedule_timezone(timezone: Option<&str>) -> Result<::chrono_tz::Tz, Stri
         // The service's own sentence, built from the request: the fixed phrase plus the
         // name it could not resolve, which is the whole of what the caller got wrong.
         .map_err(|_| format!("Invalid schedule timezone: {timezone}"))
-}
-
-/// Parse the six-field cron expression the service documents into a [`cron::Schedule`].
-///
-/// "The cron format consists of six fields separated by white spaces: [Minutes] [Hours]
-/// [Day_of_Month] [Month] [Day_of_Week] [Year]" — a minute-resolution expression, which the
-/// `cron` crate reads in its seven-field form (seconds first), so a literal `0` seconds field
-/// is prepended. A `?` ("no specific value") in the day-of-month or day-of-week field is the
-/// same statement as `*` in the grammar the crate parses; `?` in any OTHER field states
-/// nothing, so it is a token that stops the parse.
-///
-/// Every refusal is the parser's own statement inside the envelope a refused cron body is
-/// reported in ([`cron_parse_failure`]), and every POSITION it names is an offset into the
-/// `cron(…)` body. Which token stopped the parse is decided field by field: each field is
-/// parsed in its own place (the other five held at `*`, which every field accepts), so the
-/// field that cannot be read is the one reported rather than the whole expression.
-fn parse_cron(body: &str) -> Result<::cron::Schedule, String> {
-    let fields = whitespace_fields(body);
-    for (index, (at, field)) in fields.iter().enumerate().take(CRON_FIELDS) {
-        if !cron_field_parses(index, field) {
-            return Err(cron_parse_failure(*at, &illegal_characters(field)));
-        }
-    }
-    if let Some((at, field)) = fields.get(CRON_FIELDS) {
-        return Err(cron_parse_failure(
-            *at,
-            &format!(
-                "Unexpected token '{}' after the {} field, the CRON format consists of \
-                 {CRON_FIELDS} fields ({CRON_FIELD_LAYOUT}).",
-                field.to_uppercase(),
-                CRON_FIELD_NAMES[CRON_FIELDS - 1]
-            ),
-        ));
-    }
-    if fields.len() < CRON_FIELDS {
-        return Err(cron_parse_failure(
-            body.chars().count(),
-            &format!(
-                "Unexpected end of expression, the {} field is missing, the CRON format \
-                 consists of {CRON_FIELDS} fields ({CRON_FIELD_LAYOUT}).",
-                CRON_FIELD_NAMES[fields.len()]
-            ),
-        ));
-    }
-    let normalised: Vec<String> = ::std::iter::once("0".to_string())
-        .chain(
-            fields
-                .iter()
-                .enumerate()
-                .map(|(index, (_, field))| normalised_cron_field(index, field).to_string()),
-        )
-        .collect();
-    // Every field parses in its own place, so what is left is a combination of fields the
-    // grammar does not allow, which belongs to no single token: the parse stops where the
-    // expression begins.
-    normalised
-        .join(" ")
-        .parse::<::cron::Schedule>()
-        .map_err(|_| cron_parse_failure(0, UNSUPPORTED_CRON_COMBINATION))
-}
-
-/// How the parser states where a refused `cron(…)` body stopped it: the offset into that
-/// BODY, counted from zero, and its own statement of what stopped it.
-///
-/// One envelope for every cron refusal, so a caller that surfaces or parses the detail reads
-/// the same two parts whichever field was at fault.
-fn cron_parse_failure(position: usize, detail: &str) -> String {
-    format!("Invalid CRON expression: error at position {position}, details: {detail}")
-}
-
-/// The parser's statement about a token it cannot read where that token stands.
-///
-/// The expression is read in UPPER CASE — a named month or day of week is one of a fixed set
-/// of names, matched whatever case it was written in — so the token is quoted as the parser
-/// saw it rather than as the caller typed it.
-fn illegal_characters(token: &str) -> String {
-    format!(
-        "Illegal characters for this position: '{}'",
-        token.to_uppercase()
-    )
-}
-
-/// The parser's statement about six fields that each parse where they stand but do not
-/// combine into one expression, which belongs to no single token of the body.
-const UNSUPPORTED_CRON_COMBINATION: &str = "Unsupported combination of CRON fields.";
-
-/// The whitespace-separated fields of `text`, each with the CHARACTER position it starts at \u2014
-/// the position a parse refusal reports, which `split_whitespace` alone does not carry.
-fn whitespace_fields(text: &str) -> Vec<(usize, &str)> {
-    let mut fields = Vec::new();
-    let mut start: Option<(usize, usize)> = None;
-    for (position, (at, character)) in text.char_indices().enumerate() {
-        match (character.is_whitespace(), start) {
-            (false, None) => start = Some((position, at)),
-            (true, Some((position, from))) => {
-                fields.push((position, &text[from..at]));
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some((position, from)) = start {
-        fields.push((position, &text[from..]));
-    }
-    fields
-}
-
-/// What the `cron` crate's grammar reads a field as: `?` ("no specific value") is `*` in the
-/// day-of-month and day-of-week fields, and means nothing anywhere else.
-fn normalised_cron_field(index: usize, field: &str) -> &str {
-    /// The indexes of the day-of-month and day-of-week fields in [`CRON_FIELD_NAMES`].
-    const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [2, 4];
-
-    if field == "?" && NO_SPECIFIC_VALUE_FIELDS.contains(&index) {
-        "*"
-    } else {
-        field
-    }
-}
-
-/// Whether `field` is a legal cron field in the place `index` names, judged by parsing it
-/// THERE with every other field held at `*`.
-fn cron_field_parses(index: usize, field: &str) -> bool {
-    // The crate's seven-field form: seconds, then the six the service documents.
-    let mut expression = ["0", "*", "*", "*", "*", "*", "*"];
-    expression[index + 1] = normalised_cron_field(index, field);
-    expression
-        .join(" ")
-        .parse::<::cron::Schedule>()
-        .is_ok()
 }
 
 /// Apply every scheduled action whose occurrence the clock has already made due.

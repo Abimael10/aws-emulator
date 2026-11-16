@@ -174,9 +174,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // `types/shared_types.rs`), and this operation's own `errors` list omits it. So a
 // reference that resolves to nothing is reported MISSING rather than dressed up as an
 // invalid request, which is a different claim a client branches on.
+//
+// `InvalidParameterValueException` is widened in for the same kind of reason: `schedule`'s
+// `scheduleExpression` is an EXPRESSION whose grammar the model cannot state (its target
+// carries a length bound and no pattern), this SERVICE models that shape for a value a
+// parameter does not admit (`com.amazonaws.imagebuilder#InvalidParameterValueException`,
+// HTTP 400, "The value that you provided for the specified parameter is invalid", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So an expression
+// that is not a schedule is refused as that parameter's value, in the one sentence this
+// service states every parameter refusal in.
 #[smithy_macros::operation_error(
     "com.amazonaws.imagebuilder#CreateImagePipeline",
-    extra_errors = ["ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException", "InvalidParameterValueException"]
 )]
 #[derive(Debug)]
 pub enum CreateImagePipelineErrorModeled {
@@ -185,6 +194,7 @@ pub enum CreateImagePipelineErrorModeled {
     DryRunOperationException(DryRunOperationException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceInUseException(ResourceInUseException),
@@ -290,6 +300,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // "You can specify a cron expression, or a rate expression such as rate(1 day)"
+        // (`Schedule`'s `scheduleExpression`): the value is an expression in a grammar, and
+        // its target carries a length bound and no pattern, so the SERVICE reads the syntax.
+        // Read here, before the store is reached at all, so a refused create writes nothing
+        // and the pipeline name it asked for stays free for the retry that corrects the
+        // expression.
+        if let Some(message) =
+            crate::state::unreadable_schedule_expression(input.schedule.as_ref())
+        {
+            return Err(
+                CreateImagePipelineErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
 
         let fingerprint = crate::state::image_pipeline_request_fingerprint(&input);
@@ -460,7 +489,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES),
                     ),
                 },
-                schedule: input.schedule,
+                // The schedule as submitted, with the start condition Image Builder fills in
+                // where the request named none, for the same reason the test settings above
+                // are stored with their defaults filled in: what is stored is what the
+                // pipeline will run under, which is what a read reports.
+                schedule: crate::state::stored_schedule(input.schedule),
                 status: input
                     .status
                     .unwrap_or_else(|| crate::state::PIPELINE_STATUS_ENABLED.to_string()),
@@ -470,10 +503,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution_role: input.execution_role,
                 workflows: input.workflows,
                 logging_configuration: input.logging_configuration,
-                date_created: stored_at,
-                // An update is what records a last-updated instant, and no update has
-                // run, so the record carries none.
-                date_updated: None,
+                date_created: stored_at.clone(),
+                // A pipeline reports when it was last written, and THIS create is that
+                // write: `dateUpdated` carries the instant the record was stored, as the
+                // recorded read of a freshly created pipeline reports it, until an update
+                // replaces the record and records its own instant.
+                date_updated: Some(stored_at),
             },
             &client_token,
             fingerprint,

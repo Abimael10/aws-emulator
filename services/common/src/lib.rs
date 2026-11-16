@@ -637,6 +637,10 @@ pub mod ses_configuration_sets;
 /// records, replaces or deletes one and read by both — and the continuation token of the
 /// one template listing those two APIs page.
 pub mod ses_templates;
+/// The ONE reading of the SCHEDULE EXPRESSION a caller hands a service that fires work on a
+/// schedule — `rate(value unit)`, `cron(fields)`, `at(instant)` — and the ONE wording of a
+/// refusal of one that cannot be read.
+pub mod schedule_expression;
 /// Which member paths a boundary refusal states no value for, read from a service's own
 /// Smithy model: the members it marks `@sensitive`.
 pub mod sensitive_members;

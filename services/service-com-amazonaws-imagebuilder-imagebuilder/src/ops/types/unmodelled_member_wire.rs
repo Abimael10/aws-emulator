@@ -22,8 +22,9 @@
 //! WHAT IS DELIBERATELY ABSENT, for the same reason the derive's own output would be inert
 //! here: the constraint traits (the validating walk runs on operation INPUTS only, and every
 //! structure built with these macros is output-only), the `@http` chain (baked on only for an
-//! operation's input) and `@jsonName` (no member below declares one: each one's wire name IS
-//! its Smithy member name).
+//! operation's input), `@jsonName` (no member below declares one: each one's wire name IS
+//! its Smithy member name) and a map's key/value sub-member schemas (the codec falls back to
+//! the Smithy defaults, and no map written through these macros renames either).
 //!
 //! The structures that need them live in this service's per-operation `types/` modules, where
 //! each shape is declared exactly once, so `types/mod.rs` pulls this module in with
@@ -40,6 +41,12 @@ macro_rules! ib_shape_type {
     };
     (boolean) => {
         ::aws_smithy_schema::ShapeType::Boolean
+    };
+    (map_of_string) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
+    (struct_of) => {
+        ::aws_smithy_schema::ShapeType::Structure
     };
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
@@ -100,6 +107,20 @@ macro_rules! ib_write_member {
     ($s:ident, $m:expr, $v:expr, boolean) => {
         $s.write_boolean($m, *$v)?;
     };
+    // A map writes each key and then its value against the MAP member's own schema, which is
+    // where the codec reads the entry layout from.
+    ($s:ident, $m:expr, $v:expr, map_of_string) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __mv) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_string($m, __mv.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => {
+        $s.write_struct($m, $v)?;
+    };
     ($s:ident, $m:expr, $v:expr, list_of_string) => {
         $s.write_list($m, &|__sl| {
             for __it in $v.iter() {
@@ -131,6 +152,18 @@ macro_rules! ib_read_member {
     };
     ($d:ident, $m:expr, boolean) => {
         $d.read_boolean($m)?
+    };
+    ($d:ident, $m:expr, map_of_string) => {{
+        let mut __out: ::std::collections::HashMap<::std::string::String, ::std::string::String> =
+            ::std::collections::HashMap::new();
+        $d.read_map($m, &mut |__k, __dm| {
+            __out.insert(__k, __dm.read_string($m)?);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, struct_of($inner:ty)) => {
+        <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
     };
     ($d:ident, $m:expr, list_of_string) => {{
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();

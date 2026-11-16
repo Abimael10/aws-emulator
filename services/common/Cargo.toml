@@ -218,6 +218,10 @@ rustls-pemfile = "2"
 mp4 = "0.14"
 # ... and the buffer type that writer takes one sample's bytes as.
 bytes = { workspace = true }
+# `schedule_expression`: the cron grammar a caller-supplied `cron(…)` schedule is read with,
+# from the maintained parser this workspace already reads cron expressions with rather than a
+# grammar written here.
+cron = "0.15"
 
 [dev-dependencies]
 # `acm_certificate_termination`'s own cases load REAL certificate material, minted by the

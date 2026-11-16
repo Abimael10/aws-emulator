@@ -18,7 +18,8 @@
 //!   configuration Image Builder "stores a default configuration" for);
 //! * the three members an update request cannot carry are what the pipeline keeps: the name
 //!   its ARN was derived from, the resource's own tags, and the instant it was created —
-//!   while `dateUpdated` reports the instant of the last update;
+//!   while `dateUpdated` reports the instant of the last WRITE, which is the create's own
+//!   until an update replaces the record;
 //! * "You must specify exactly one recipe for your image, using either a containerRecipeArn
 //!   or an imageRecipeArn. The recipe must be the same type, image or container, as the
 //!   pipeline's current recipe", and the platform the pipeline reports is "inherited from
@@ -855,9 +856,11 @@ async fn a_replacement_names_one_recipe_of_the_pipelines_own_kind() {
         Some(&json!(fixture.image_recipe)),
         "case \"after the refused kind change\": expected the create's recipe, got {pipeline}"
     );
-    assert!(
-        pipeline.get("dateUpdated").is_none(),
-        "case \"after the refused kind change\": expected no dateUpdated, got {pipeline}"
+    assert_eq!(
+        pipeline.get("dateUpdated"),
+        pipeline.get("dateCreated"),
+        "case \"after the refused kind change\": expected the pipeline to still report the \
+         create's own instant as dateUpdated, got {pipeline}"
     );
 
     // Another IMAGE recipe is admitted, and the platform the pipeline reports is the one
@@ -1097,9 +1100,11 @@ async fn a_reference_that_names_nothing_is_reported_missing() {
         Some(&json!("the pipeline as created")),
         "case \"the stored pipeline afterwards\": expected the create's settings, got {pipeline}"
     );
-    assert!(
-        pipeline.get("dateUpdated").is_none(),
-        "case \"the stored pipeline afterwards\": expected no dateUpdated, got {pipeline}"
+    assert_eq!(
+        pipeline.get("dateUpdated"),
+        pipeline.get("dateCreated"),
+        "case \"the stored pipeline afterwards\": expected the pipeline to still report the \
+         create's own instant as dateUpdated, got {pipeline}"
     );
 }
 
@@ -1171,9 +1176,11 @@ async fn a_refused_update_leaves_the_pipeline_as_it_was() {
             Some(&json!(DISABLED)),
             "case {case:?}: expected the create's status, got {pipeline}"
         );
-        assert!(
-            pipeline.get("dateUpdated").is_none(),
-            "case {case:?}: expected no dateUpdated after a refused update, got {pipeline}"
+        assert_eq!(
+            pipeline.get("dateUpdated"),
+            pipeline.get("dateCreated"),
+            "case {case:?}: expected the create's own instant to still be the dateUpdated \
+             after a refused update, got {pipeline}"
         );
     }
 }

@@ -27,6 +27,8 @@ mod component_listing_wire_members;
 mod component_policy;
 #[path = "all/component_policy_lifecycle.rs"]
 mod component_policy_lifecycle;
+#[path = "all/component_read_wire_members.rs"]
+mod component_read_wire_members;
 #[path = "all/container_recipe.rs"]
 mod container_recipe;
 #[path = "all/dependency_refusal_wording.rs"]
@@ -49,6 +51,8 @@ mod image_packages;
 mod image_pipeline_execution;
 #[path = "all/image_pipeline_listing.rs"]
 mod image_pipeline_listing;
+#[path = "all/image_pipeline_schedule.rs"]
+mod image_pipeline_schedule;
 #[path = "all/image_pipeline_update.rs"]
 mod image_pipeline_update;
 #[path = "all/image_read.rs"]

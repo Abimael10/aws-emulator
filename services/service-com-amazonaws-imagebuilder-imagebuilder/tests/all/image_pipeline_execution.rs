@@ -919,13 +919,32 @@ async fn a_created_pipeline_reads_back_with_its_defaults() {
             Some(&expected_tags),
             "case {case:?}: expected tags {expected_tags} in {stored}"
         );
-        for member in ["description", "imageTags", "schedule"] {
+        for member in ["description", "imageTags"] {
             assert_eq!(
                 stored.get(member),
                 extra.get(member),
                 "case {case:?}: expected {member} reported exactly as the create named it"
             );
         }
+        // The schedule is reported as named, with the start condition Image Builder fills in
+        // where the create named none ("If no value is set Image Builder defaults to
+        // EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE"), the way the test settings
+        // above are reported with their own defaults filled in.
+        let expected_schedule = extra.get("schedule").map(|schedule| {
+            let mut schedule = schedule.clone();
+            if let Some(members) = schedule.as_object_mut() {
+                members
+                    .entry("pipelineExecutionStartCondition")
+                    .or_insert_with(|| json!("EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE"));
+            }
+            schedule
+        });
+        assert_eq!(
+            stored.get("schedule"),
+            expected_schedule.as_ref(),
+            "case {case:?}: expected the schedule the create named, carrying the start \
+             condition it runs under, in {stored}"
+        );
         assert_eq!(
             stored.get("consecutiveFailures"),
             Some(&json!(0)),
@@ -935,10 +954,13 @@ async fn a_created_pipeline_reads_back_with_its_defaults() {
             stored.get("dateNextRun").is_none(),
             "case {case:?}: expected no scheduled next run in {stored}"
         );
-        assert!(
-            stored.get("dateUpdated").is_none(),
-            "case {case:?}: expected a pipeline nothing updated to report no dateUpdated in \
-             {stored}"
+        // The create IS the pipeline's last write, so the instant it stored the record at is
+        // what `dateUpdated` reports until an update replaces it.
+        assert_eq!(
+            stored.get("dateUpdated"),
+            stored.get("dateCreated"),
+            "case {case:?}: expected a pipeline nothing updated to report the create's own \
+             instant as dateUpdated in {stored}"
         );
     }
 }

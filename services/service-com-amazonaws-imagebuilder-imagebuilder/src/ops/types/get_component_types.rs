@@ -25,7 +25,15 @@ pub struct GetComponentOutput {
     pub latest_version_references: Option<LatestVersionReferences>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.imagebuilder#Component")]
+/// The detailed view of one component a read reports: the members `Component` declares, in
+/// the model's own member order, and `billable` appended last.
+///
+/// Member set and order from `smithy_query(query="shape", shape="Component")`, plus
+/// `billable` — a member the real service reports on a component read and the on-disk model
+/// omits, which is why the schema and the codec come from `types/unmodelled_member_wire.rs`
+/// rather than from the derive (see that module's note). Whether a component is billable is
+/// read off the stored component (`crate::state::ComponentRecord::billable`), never fixed
+/// here.
 #[derive(Debug, Clone, Default)]
 pub struct Component {
     pub arn: Option<String>,
@@ -47,7 +55,71 @@ pub struct Component {
     pub publisher: Option<String>,
     pub obfuscate: bool,
     pub product_codes: Option<Vec<ProductCodeListItem>>,
+    pub billable: Option<bool>,
 }
+
+ib_schema_and_codec!(
+    Component,
+    COMPONENT_SCHEMA,
+    "com.amazonaws.imagebuilder#Component",
+    "com.amazonaws.imagebuilder",
+    "Component",
+    (M_ARN, arn, "arn", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (M_VERSION, version, "version", 2, opt, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_CHANGE_DESCRIPTION,
+        change_description,
+        "changeDescription",
+        4,
+        opt,
+        string
+    ),
+    (M_TYPE, r#type, "type", 5, opt, string),
+    (M_PLATFORM, platform, "platform", 6, opt, string),
+    (
+        M_SUPPORTED_OS_VERSIONS,
+        supported_os_versions,
+        "supportedOsVersions",
+        7,
+        opt,
+        list_of_string
+    ),
+    (M_STATE, state, "state", 8, opt, struct_of(ComponentState)),
+    (
+        M_PARAMETERS,
+        parameters,
+        "parameters",
+        9,
+        opt,
+        list_of_struct(ComponentParameterDetail)
+    ),
+    (M_OWNER, owner, "owner", 10, opt, string),
+    (M_DATA, data, "data", 11, opt, string),
+    (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 12, opt, string),
+    (M_ENCRYPTED, encrypted, "encrypted", 13, opt, boolean),
+    (M_DATE_CREATED, date_created, "dateCreated", 14, opt, string),
+    (M_TAGS, tags, "tags", 15, opt, map_of_string),
+    (M_PUBLISHER, publisher, "publisher", 16, opt, string),
+    (M_OBFUSCATE, obfuscate, "obfuscate", 17, req, boolean),
+    (
+        M_PRODUCT_CODES,
+        product_codes,
+        "productCodes",
+        18,
+        opt,
+        list_of_struct(ProductCodeListItem)
+    ),
+    (
+        M_BILLABLE,
+        billable,
+        "billable",
+        19,
+        opt,
+        recorded("com.amazonaws.imagebuilder.recorded", boolean)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.imagebuilder#ComponentParameterDetail")]
 #[derive(Debug, Clone, Default)]
