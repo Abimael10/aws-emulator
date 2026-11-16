@@ -23,6 +23,15 @@ use super::*;
 /// per-account comparison that could never be the one to refuse.
 pub const REPLICATION_CONFIGURATION_TEMPLATE_QUOTA: usize = 1_000;
 
+/// The `replicationConfigurationTemplateID` prefix the model's `^rct-[0-9a-zA-Z]{17}$`
+/// pattern requires.
+const REPLICATION_CONFIGURATION_TEMPLATE_ID_PREFIX: &str = "rct-";
+
+/// How many `[0-9a-zA-Z]` characters follow the prefix of a
+/// `ReplicationConfigurationTemplateID` (model pattern `^rct-[0-9a-zA-Z]{17}$`, length
+/// 21..21).
+const REPLICATION_CONFIGURATION_TEMPLATE_ID_BODY_LEN: usize = 17;
+
 /// One stored replication configuration template: everything the model's
 /// `ReplicationConfigurationTemplate` structure reports.
 #[derive(Debug, Clone, Default)]
@@ -104,6 +113,33 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
             .collect()
     }
 
+    /// A fresh `replicationConfigurationTemplateID` no stored template holds.
+    pub fn mint_replication_configuration_template_id(&self) -> String {
+        loop {
+            let candidate = mint_id(
+                REPLICATION_CONFIGURATION_TEMPLATE_ID_PREFIX,
+                REPLICATION_CONFIGURATION_TEMPLATE_ID_BODY_LEN,
+            );
+            if !self
+                .replication_configuration_templates
+                .contains_key(&candidate)
+            {
+                return candidate;
+            }
+        }
+    }
+
+    /// Whether the template store is full: it already holds
+    /// [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] templates, over every account.
+    ///
+    /// The one bound the insert below enforces, read ahead of minting an id so a write
+    /// refuses before it mints anything. One bound on the whole store bounds every
+    /// account's count with it, as the quota's own doc records, so there is no second,
+    /// per-account comparison here that could never be the one to refuse.
+    pub fn replication_configuration_template_store_is_full(&self) -> bool {
+        self.replication_configuration_templates.len() >= REPLICATION_CONFIGURATION_TEMPLATE_QUOTA
+    }
+
     /// Store a replication configuration template, remembering its place in creation
     /// order.
     ///
@@ -149,4 +185,31 @@ pub fn replication_configuration_template_arn(region: &str, template_id: &str) -
         region,
         &format!("replication-configuration-template/{template_id}"),
     )
+}
+
+/// The modelled server fault for a template the store would not take, though the bound was
+/// read and the id minted unheld under the same lock: the write is reported as the fault it
+/// is rather than as a success for a record the store does not hold.
+pub fn replication_configuration_template_not_stored() -> InternalServerException {
+    InternalServerException {
+        message: "the replication configuration template could not be stored".to_string(),
+        retry_after_seconds: 0,
+    }
+}
+
+/// The modelled refusal when the emulator's own
+/// [`REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`] is reached:
+/// `CreateReplicationConfigurationTemplate` models no `ServiceQuotaExceededException`,
+/// so the request is refused with the one client error it does model for a request it
+/// cannot serve.
+pub fn replication_configuration_template_quota_exceeded(account_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Account {account_id} already holds the maximum of \
+             {REPLICATION_CONFIGURATION_TEMPLATE_QUOTA} replication configuration templates."
+        )),
+        code: None,
+        reason: None,
+        field_list: None,
+    }
 }

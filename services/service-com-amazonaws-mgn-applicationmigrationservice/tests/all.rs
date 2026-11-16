@@ -31,6 +31,8 @@ mod network_migration_definition_update;
 mod network_migration_execution_listing;
 #[path = "all/network_migration_mapping_start.rs"]
 mod network_migration_mapping_start;
+#[path = "all/replication_configuration_template_create.rs"]
+mod replication_configuration_template_create;
 #[path = "all/replication_configuration_template_describe.rs"]
 mod replication_configuration_template_describe;
 #[path = "all/request_body_validation.rs"]

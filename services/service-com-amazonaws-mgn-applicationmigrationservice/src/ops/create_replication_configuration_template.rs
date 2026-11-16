@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a `replicationConfigurationTemplateID` and an ARN, stores the replication
+//! settings the request supplied in this service's state and returns the stored record —
+//! the same record `DescribeReplicationConfigurationTemplates` reports afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicationConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Application Migration Service is account-scoped: the one-time `InitializeService`
+//! call initializes the account a request acts on, and this operation — which models
+//! `UninitializedAccountException` — refuses with it while the account is uninitialized.
+//! The gate is evaluated AFTER the modelled field constraints (which the framework
+//! refuses at the boundary, ahead of this handler) and ahead of every other check.
+//!
+//! The operation is not `@idempotent` and models no idempotency token, so every call
+//! mints a template of its own: two identical requests answer two different ids.
+//!
+//! The store is bounded by `crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA` and
+//! refuses past it with the modelled `ValidationException` (400) — this operation models
+//! no quota error — so a caller cannot grow the emulator's heap without end.
 //!
 //! ## Shape of an operation
 //!
@@ -154,12 +161,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `CreateReplicationConfigurationTemplateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#CreateReplicationConfigurationTemplate")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#CreateReplicationConfigurationTemplate",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateReplicationConfigurationTemplateErrorModeled {
     AccessDeniedException(AccessDeniedException),
     UninitializedAccountException(UninitializedAccountException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -213,18 +227,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationConfigurationTemplate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateReplicationConfigurationTemplateErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // This operation carries no `accountID` member, so a template lives in the
+        // account the request was signed for — the emulator's own canonical account.
+        let account = crate::state::account_key(None);
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The account gate is evaluated ahead of every other check: the modelled field
+        // constraints were already refused at the boundary, so a well-formed request on
+        // an uninitialized account is refused here and nowhere else.
+        if !store.is_initialized(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                "",
+                "refused: UninitializedAccountException",
+            );
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
+                    crate::state::uninitialized_account(),
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded over every account, which bounds each account's count with
+        // it: see `crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA`.
+        if store.replication_configuration_template_store_is_full() {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                "",
+                "refused: ValidationException",
+            );
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::ValidationException(
+                    crate::state::replication_configuration_template_quota_exceeded(&account),
+                )
+                .into(),
+            );
+        }
+
+        let template_id = store.mint_replication_configuration_template_id();
+        // Every setting the request supplied is stored as supplied — a read reports the
+        // record and computes nothing per read. Both tag maps are stored sorted, so the
+        // entries a read reports are in one stable order.
+        let template = crate::state::ReplicationConfigurationTemplate {
+            arn: crate::state::replication_configuration_template_arn(&region, &template_id),
+            replication_configuration_template_id: template_id,
+            account_id: account.clone(),
+            staging_area_subnet_id: Some(input.staging_area_subnet_id.clone()),
+            associate_default_security_group: Some(input.associate_default_security_group),
+            replication_servers_security_groups_ids: input
+                .replication_servers_security_groups_i_ds
+                .clone(),
+            replication_server_instance_type: Some(input.replication_server_instance_type.clone()),
+            use_dedicated_replication_server: Some(input.use_dedicated_replication_server),
+            default_large_staging_disk_type: Some(input.default_large_staging_disk_type.clone()),
+            ebs_encryption: Some(input.ebs_encryption.clone()),
+            ebs_encryption_key_arn: input.ebs_encryption_key_arn.clone(),
+            bandwidth_throttling: input.bandwidth_throttling,
+            data_plane_routing: Some(input.data_plane_routing.clone()),
+            create_public_ip: Some(input.create_public_ip),
+            staging_area_tags: input.staging_area_tags.clone().into_iter().collect(),
+            use_fips_endpoint: input.use_fips_endpoint,
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            internet_protocol: input.internet_protocol.clone(),
+            store_snapshot_on_local_zone: input.store_snapshot_on_local_zone,
+            storage_configuration: input.storage_configuration.clone(),
+        };
+
+        let created = template.to_shape();
+        // The store answers whether it took the record, and a success is reported only for
+        // a record it holds: the bound was read above under this same lock and the id was
+        // minted unheld, so a refusal here is the store disagreeing with both rather than
+        // anything the request did.
+        if !store.insert_replication_configuration_template(template) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &created.replication_configuration_template_id,
+                "refused: InternalServerException",
+            );
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::InternalServerException(
+                    crate::state::replication_configuration_template_not_stored(),
+                )
+                .into(),
+            );
+        }
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account,
+            &created.replication_configuration_template_id,
+            "created",
+        );
+        Ok(created)
     }
 }

@@ -17,9 +17,11 @@
 //!   `UninitializedAccountException`; another account's templates are never this
 //!   account's to read.
 //!
-//! Nothing writes this store yet — `CreateReplicationConfigurationTemplate` is still a
-//! scaffolded stub — so the records are seeded through the service's own state, the way
-//! `wave_and_connector_lifecycle.rs` seeds launch configuration templates.
+//! `CreateReplicationConfigurationTemplate` is what writes this store, and
+//! `replication_configuration_template_create.rs` drives it; the records here are seeded
+//! through the service's own state instead, the way `wave_and_connector_lifecycle.rs` seeds
+//! launch configuration templates, so a reporting rule is read on a record whatever operation
+//! stored it — another account's included, which no sequence of calls can reach.
 //!
 //! The harness (`Mgn`, `error_code`, the region and account constants) is the one
 //! `application_lifecycle.rs` defines.
