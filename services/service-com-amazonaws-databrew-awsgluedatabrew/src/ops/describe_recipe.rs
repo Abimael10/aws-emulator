@@ -188,10 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resolved = store.recipes.get(&input.name).and_then(|recipe| {
             Some((
                 recipe,
-                recipe.resolve_version(input.recipe_version.as_deref())?,
+                recipe.resolve_version_view(input.recipe_version.as_deref())?,
             ))
         });
-        let Some((recipe, version)) = resolved else {
+        let Some((recipe, view)) = resolved else {
             return Err(DescribeRecipeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::recipe_version_not_found_message(
@@ -202,6 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The version the identifier resolved to, whose definition and audit this
+        // answer reports.
+        let version = view.held;
 
         Ok(DescribeRecipeOutput {
             created_by: Some(version.audit.created_by.clone()),
@@ -215,12 +218,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Absent on a version no publish has frozen.
             published_by: version.published_by.clone(),
             published_date: version.published_date.map(crate::state::wire_date),
-            description: version.description.clone(),
+            // The description this VIEW of the version reports: what the publish said
+            // about the recipe it published when the latest-published view is the one
+            // addressed, and the version definition's own otherwise.
+            description: view.description.map(str::to_string),
             name: recipe.name.clone(),
             // The steps of the resolved VERSION, which is the definition this
             // operation returns.
             steps: Some(version.steps.clone()),
-            tags: crate::state::wire_tags(&recipe.tags),
+            // The recipe's whole tag set: the member is answered on every read,
+            // holding no entry when the recipe carries no tag.
+            tags: Some(crate::state::wire_recipe_tags(&recipe.tags)),
             resource_arn: Some(recipe.resource_arn.clone()),
             // The version that was resolved, never the alias the request asked with.
             recipe_version: Some(version.version.clone()),

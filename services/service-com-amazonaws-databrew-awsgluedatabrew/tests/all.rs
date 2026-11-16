@@ -39,6 +39,8 @@ mod recipe_job_schema_evaluation;
 mod recipe_lifecycle;
 #[path = "all/recipe_publishing.rs"]
 mod recipe_publishing;
+#[path = "all/recipe_read_views.rs"]
+mod recipe_read_views;
 #[path = "all/recipe_version_batch_delete.rs"]
 mod recipe_version_batch_delete;
 #[path = "all/recipe_version_held_message.rs"]

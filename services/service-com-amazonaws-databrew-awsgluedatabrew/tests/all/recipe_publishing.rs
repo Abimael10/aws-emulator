@@ -10,6 +10,11 @@
 //! publish instant, and reachable as `LATEST_PUBLISHED`; the working version carries on
 //! unchanged as the draft, and a version an earlier publish froze is never rewritten.
 //!
+//! The `Description` a publish carries describes the recipe AS PUBLISHED rather than the
+//! definition that was frozen, so it is the recipe's latest-published view that reports
+//! it (and the versionless read that asks for that view), while the frozen version
+//! addressed by its own number reports the description of the definition it took.
+//!
 //! The tables span what the rule generalises over: how many publishes a recipe has had,
 //! every shape a `RecipeStepList` takes, and whether the publish carries a description
 //! of its own, none at all, or an empty one.
@@ -187,13 +192,19 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
                 // The next whole major number at minor 0: the first publish of a recipe
                 // created at major 0 is `1.0`.
                 let expected_version = format!("{}.0", publish_index + 1);
-                // The description the frozen version carries: the publish's own when it
-                // carried one, and otherwise the definition's.
-                let expected_description = carried.or(created_with);
 
-                for (addressed, identifier) in [
-                    ("by its own number", expected_version.as_str()),
-                    ("by the published alias", LATEST_PUBLISHED),
+                for (addressed, identifier, expected_description) in [
+                    // A version addressed by its own number reports the DEFINITION it
+                    // froze, description included.
+                    ("by its own number", expected_version.as_str(), created_with),
+                    // The latest-published view reports what the publish said about the
+                    // recipe it published, falling back to the frozen definition's own
+                    // description when the publish carried none.
+                    (
+                        "by the published alias",
+                        LATEST_PUBLISHED,
+                        carried.or(created_with),
+                    ),
                 ] {
                     let frozen = describe_recipe(&emulator, &name, Some(identifier)).await;
                     assert_eq!(
@@ -219,14 +230,14 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
                         Some(description) => assert_eq!(
                             frozen.text("Description"),
                             description,
-                            "case {case:?}: expected version {expected_version} to carry \
-                             {description:?}, got {:?}",
+                            "case {case:?}: expected version {expected_version} {addressed} to \
+                             carry {description:?}, got {:?}",
                             frozen.body["Description"]
                         ),
                         None => assert!(
                             frozen.is_absent("Description"),
-                            "case {case:?}: version {expected_version} has no description to \
-                             report, got {:?}",
+                            "case {case:?}: version {expected_version} {addressed} has no \
+                             description to report, got {:?}",
                             frozen.body["Description"]
                         ),
                     }
@@ -254,7 +265,8 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
 
                 // A versionless describe asks for the latest published version (model:
                 // `DescribeRecipeRequest$RecipeVersion`), so it answers the version this
-                // publish just froze.
+                // publish just froze, through the same latest-published view the alias
+                // addresses.
                 let versionless = describe_recipe(&emulator, &name, None).await;
                 assert_eq!(
                     versionless.text("RecipeVersion"),
@@ -264,6 +276,21 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
                     versionless.status,
                     versionless.body
                 );
+                match carried.or(created_with) {
+                    Some(description) => assert_eq!(
+                        versionless.text("Description"),
+                        description,
+                        "case {case:?}: a versionless describe must report the same description \
+                         as the alias, got {:?}",
+                        versionless.body["Description"]
+                    ),
+                    None => assert!(
+                        versionless.is_absent("Description"),
+                        "case {case:?}: nothing describes this publish, so the versionless \
+                         describe reports no description, got {:?}",
+                        versionless.body["Description"]
+                    ),
+                }
 
                 // The draft keeps its definition and its body across the publish, and
                 // still has no publish of its own to report; its NUMBER follows the
@@ -328,7 +355,8 @@ async fn a_publish_freezes_the_working_definition_at_the_next_whole_version() {
 }
 
 /// A version an earlier publish froze keeps the definition it was frozen with after the
-/// draft moves on: the frozen copy is independent of the working version.
+/// draft moves on: the frozen copy is independent of the working version. A version
+/// addressed by its own number reports that frozen definition, description included.
 ///
 /// The draft is moved on with `UpdateRecipe`, the operation that modifies the working
 /// version, so every call below is made over the wire.
@@ -385,7 +413,7 @@ async fn an_earlier_version_keeps_the_definition_it_was_frozen_with() {
             "the version frozen from the first draft",
             "1.0",
             &first_steps,
-            "frozen from the first draft",
+            "the first draft",
         ),
         (
             "the version frozen from the second draft",

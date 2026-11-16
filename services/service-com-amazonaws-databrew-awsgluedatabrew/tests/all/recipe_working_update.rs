@@ -429,7 +429,7 @@ async fn an_update_leaves_every_published_version_alone() {
         );
         assert_eq!(
             frozen.text("Description"),
-            "frozen from the first draft",
+            "the first draft",
             "case {case:?}: version 1.0 keeps the body it froze, got {:?}",
             frozen.body["Description"]
         );

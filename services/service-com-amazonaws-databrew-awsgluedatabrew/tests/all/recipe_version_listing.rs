@@ -265,7 +265,10 @@ async fn the_listing_reports_every_published_version_and_never_the_draft() {
                         "case {case:?}: item {version} must hold the definition it froze, \
                          got {item:?}"
                     );
-                    match publishes[index].or(created_with) {
+                    // A listed version reports the description of the DEFINITION it
+                    // froze — the draft's — because the text a publish carries describes
+                    // the recipe as published rather than the definition.
+                    match created_with {
                         Some(description) => assert_eq!(
                             item.get("Description").and_then(Value::as_str),
                             Some(description),

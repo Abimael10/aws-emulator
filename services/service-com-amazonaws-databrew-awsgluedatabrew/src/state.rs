@@ -532,14 +532,42 @@ pub struct ScheduleRecord {
 #[derive(Debug, Clone)]
 pub struct RecipeVersionRecord {
     pub version: String,
+    /// The description this version's DEFINITION holds: the one it was created with,
+    /// or — on a version a publish froze — the one the draft held when it was frozen.
+    /// It is the description a read of this version BY ITS NUMBER answers with, and the
+    /// one a listing reports for it.
     pub description: Option<String>,
     pub steps: Vec<RecipeStep>,
+    /// The description the PUBLISH that froze this version carried, which describes the
+    /// recipe's published state rather than the definition that was frozen: it is what
+    /// the latest-published VIEW of the recipe reports
+    /// ([`RecipeRecord::resolve_version_view`]), while this version's own
+    /// [`RecipeVersionRecord::description`] stays the definition's.
+    ///
+    /// `None` on a working version — no publish carried anything for it — and on a
+    /// frozen version whose publish carried no description.
+    pub publish_description: Option<String>,
     /// Set only on a version a publish froze; `None` on a working version, whose
     /// modelled `PublishedBy`/`PublishedDate` report a publish that has not happened
     /// ([`RecipeRecord::publish`] is what sets them).
     pub published_by: Option<String>,
     pub published_date: Option<SystemTime>,
     pub audit: Audit,
+}
+
+/// One version of a recipe as a READ of it answers: the version an identifier resolved
+/// to, and the description that view of the version reports.
+///
+/// The pair is held together because the two halves come from different places: the
+/// definition is the version's own, while the description depends on HOW the version was
+/// addressed — the recipe's latest-published view reports what its publish said about the
+/// recipe, a version addressed by its number reports the definition's own description.
+#[derive(Debug, Clone, Copy)]
+pub struct RecipeVersionView<'a> {
+    /// The version the identifier resolved to.
+    pub held: &'a RecipeVersionRecord,
+    /// The description this view of that version reports.
+    pub description: Option<&'a str>,
 }
 
 /// A stored DataBrew recipe: the versions it holds, plus the members that belong to
@@ -908,6 +936,7 @@ impl RecipeRecord {
                 version: INITIAL_RECIPE_VERSION.to_string(),
                 description,
                 steps,
+                publish_description: None,
                 published_by: None,
                 published_date: None,
                 audit: Audit::created(at, principal),
@@ -959,6 +988,31 @@ impl RecipeRecord {
             version if version == self.working.version => Some(&self.working),
             version => self.published.iter().find(|held| held.version == version),
         }
+    }
+
+    /// The version a request's `RecipeVersion` names, as a READ of it answers
+    /// ([`RecipeVersionView`]): the version [`RecipeRecord::resolve_version`] resolves,
+    /// plus the description that view of it reports.
+    ///
+    /// The recipe's LATEST_PUBLISHED view — which an omitted identifier asks for too —
+    /// is the recipe AS PUBLISHED, so the description it reports is the one the publish
+    /// carried for it (model: `PublishRecipeRequest$Description` — "A description of the
+    /// recipe to be published, for this version of the recipe"), falling back to the
+    /// frozen definition's own when that publish carried none. Every other identifier
+    /// addresses a version's DEFINITION — the working draft, or a frozen version by its
+    /// number — and reports the description that definition holds, which is the same
+    /// description a listing reports for it
+    /// ([`RecipeRecord::version_to_wire`]).
+    pub fn resolve_version_view(&self, requested: Option<&str>) -> Option<RecipeVersionView<'_>> {
+        let held = self.resolve_version(requested)?;
+        let description = if requested_recipe_version(requested) == LATEST_PUBLISHED {
+            held.publish_description
+                .as_deref()
+                .or(held.description.as_deref())
+        } else {
+            held.description.as_deref()
+        };
+        Some(RecipeVersionView { held, description })
     }
 
     /// Whether this recipe holds a version BESIDE its working one, which is what keeps
@@ -1025,9 +1079,12 @@ impl RecipeRecord {
     /// [`RecipeRecord::next_published_version`] and appended to
     /// [`RecipeRecord::published`] (oldest first, so it becomes `LATEST_PUBLISHED`),
     /// while the working version carries on with the same definition as the draft
-    /// development continues on. `description` is the description the publish carried
-    /// for this version; a publish that carried none freezes the definition's own
-    /// description with it.
+    /// development continues on. The FROZEN DEFINITION is the draft's, description
+    /// included: what is frozen is the recipe as it stands, so reading that version
+    /// back by its number (or listing it) answers with the definition the publish
+    /// took. `description` is what the publish said about the recipe it published, kept
+    /// beside the definition ([`RecipeVersionRecord::publish_description`]) because the
+    /// recipe's latest-published view is what reports it.
     ///
     /// The draft is RENUMBERED onto the major just frozen
     /// ([`RecipeRecord::renumber_working`]): the draft revises the latest published
@@ -1041,8 +1098,9 @@ impl RecipeRecord {
     ) -> String {
         let frozen = RecipeVersionRecord {
             version: self.next_published_version(),
-            description: description.or_else(|| self.working.description.clone()),
+            description: self.working.description.clone(),
             steps: self.working.steps.clone(),
+            publish_description: description,
             published_by: Some(principal.clone()),
             published_date: Some(at),
             // The frozen version is minted by this publish, so its create audit is
@@ -1256,12 +1314,25 @@ pub fn wire_date(at: SystemTime) -> ::aws_smithy_types::DateTime {
 
 /// A stored tag map as the modelled `TagMap`: absent rather than empty, because
 /// `TagMap` is `len 1..200` and an untagged resource carries no map at all.
+///
+/// The conversion itself is [`wire_recipe_tags`]; what this adds is the rule that an
+/// empty map is left out, which is how a tag map NESTED in a reported structure is
+/// answered.
 pub fn wire_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
-    if tags.is_empty() {
-        None
-    } else {
-        Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-    }
+    Some(wire_recipe_tags(tags)).filter(|tags| !tags.is_empty())
+}
+
+/// A stored tag map as the whole `Tags` member a RECIPE READ answers with: the map
+/// itself, holding no entry when the recipe carries no tag.
+///
+/// Where [`wire_tags`] omits an empty map, this map is answered as it stands, which is
+/// why it is NOT an `Option`: the recipe read reports the recipe's whole tag set, and "no
+/// tags" is the empty set rather than a member a client has to test for presence before
+/// it can enumerate or diff them. The two differ because the member of a response and the
+/// member of a nested `Recipe` a listing carries are reported differently: the listing's
+/// item leaves the empty map out ([`RecipeRecord::version_to_wire`]).
+pub fn wire_recipe_tags(tags: &BTreeMap<String, String>) -> HashMap<String, String> {
+    tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// A stored list as a modelled `len 1..` list member: absent rather than empty.

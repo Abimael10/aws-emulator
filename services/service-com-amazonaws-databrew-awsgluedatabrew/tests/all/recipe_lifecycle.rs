@@ -162,20 +162,14 @@ async fn a_recipe_round_trips_every_shape_of_steps() {
                 described.body["Description"]
             ),
         }
-        match &tags {
-            Some(tags) => assert_eq!(
-                described.member("Tags"),
-                *tags,
-                "case {case:?}: expected the stored Tags back, got {:?}",
-                described.body["Tags"]
-            ),
-            // `TagMap` is `len 1..200`, so an untagged recipe carries no map at all.
-            None => assert!(
-                described.is_absent("Tags"),
-                "case {case:?}: an untagged recipe must report no Tags, got {:?}",
-                described.body["Tags"]
-            ),
-        }
+        // The read answers with the recipe's whole tag set, so an untagged recipe
+        // reports the empty map rather than nothing at all.
+        assert_eq!(
+            described.member("Tags"),
+            tags.clone().unwrap_or_else(|| json!({})),
+            "case {case:?}: expected the stored Tags back, got {:?}",
+            described.body["Tags"]
+        );
         assert_eq!(
             described.text("Name"),
             name,
