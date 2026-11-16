@@ -34,6 +34,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
+// The one percent-encoder of this test crate: IAM's `awsQuery` parameters travel in a form
+// body, and `query_wire` is where that encoding lives.
+use crate::query_wire::form_encode;
+
 /// Keep this at or above the size `boot_serve.rs` uses.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
@@ -88,6 +92,59 @@ async fn call(router: &MultiServiceRouter, target: &str, body: Value) -> Answer 
     }
 }
 
+/// The service execution role the 2018-05-23 create names, and the service principal it has
+/// to let assume it. An application runs AS its `ServiceExecutionRole`, so that version
+/// resolves the role in IAM before it persists anything — and IAM is mounted in the ASSEMBLED
+/// emulator, so the role is provisioned through IAM's own `CreateRole` rather than merely
+/// named.
+const V2_ROLE: &str = "kda-service-role";
+
+/// See [`V2_ROLE`].
+const KDA_PRINCIPAL: &str = "kinesisanalytics.amazonaws.com";
+
+/// The ARN of [`V2_ROLE`] in this emulator's account.
+fn v2_role_arn() -> String {
+    format!("arn:aws:iam::{}:role/{V2_ROLE}", engine::emulator_account_id())
+}
+
+/// Provision [`V2_ROLE`] in IAM, with a trust policy admitting Kinesis Analytics.
+async fn given_the_service_execution_role(router: &MultiServiceRouter) {
+    let trust = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": KDA_PRINCIPAL},
+            "Action": "sts:AssumeRole",
+        }],
+    });
+    let body = format!(
+        "Action=CreateRole&Version=2010-05-08&RoleName={}&AssumeRolePolicyDocument={}",
+        form_encode(V2_ROLE),
+        form_encode(&trust.to_string()),
+    );
+    let host = "iam.us-east-1.amazonaws.com";
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{host}/"))
+        .header("host", host)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLE/20260101/us-east-1/iam/aws4_request, \
+             SignedHeaders=host, Signature=0123456789abcdef",
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let xml = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "setup: the service execution role must be created in IAM first, got {status} {xml}"
+    );
+}
+
 /// Run one async check on a thread sized like `boot_serve.rs`'s.
 fn on_a_sized_thread(
     name: &str,
@@ -129,6 +186,7 @@ fn each_kinesis_analytics_api_version_answers_its_own_targets() {
         Box::pin(async {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
             let router = build_router(engine);
+            given_the_service_execution_role(&router).await;
 
             // An operation BOTH versions model, whose outputs differ: each version's
             // answer names the version that served it.
@@ -138,7 +196,7 @@ fn each_kinesis_analytics_api_version_answers_its_own_targets() {
                 json!({
                     "ApplicationName": "shared-endpoint-app",
                     "RuntimeEnvironment": "FLINK-1_20",
-                    "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
+                    "ServiceExecutionRole": v2_role_arn(),
                 }),
             )
             .await;

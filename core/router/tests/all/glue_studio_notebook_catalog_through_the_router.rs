@@ -37,6 +37,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
+// The one percent-encoder of this test crate: IAM's `awsQuery` parameters travel in a form
+// body, and `query_wire` is where that encoding lives.
+use crate::query_wire::form_encode;
+
 /// Keep this at or above the size `boot_serve.rs` uses.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
@@ -189,7 +193,7 @@ fn notebook_body(name: &str, arn: &str) -> Value {
         "ApplicationName": name,
         "RuntimeEnvironment": NOTEBOOK_RUNTIME,
         "ApplicationMode": "INTERACTIVE",
-        "ServiceExecutionRole": format!("arn:aws:iam::{ACCOUNT}:role/kda-service-role"),
+        "ServiceExecutionRole": notebook_role_arn(),
         "ApplicationConfiguration": {
             "ZeppelinApplicationConfiguration": {
                 "CatalogConfiguration": {
@@ -198,6 +202,63 @@ fn notebook_body(name: &str, arn: &str) -> Value {
             }
         }
     })
+}
+
+/// The service execution role every notebook here runs as, and the service principal it has
+/// to let assume it. An application runs AS its `ServiceExecutionRole`, so Kinesis Analytics
+/// resolves that role in IAM before it persists anything — and in the ASSEMBLED emulator IAM
+/// is mounted, so the role is provisioned through IAM's own `CreateRole` before the first
+/// create rather than merely named.
+const NOTEBOOK_ROLE: &str = "kda-service-role";
+
+/// See [`NOTEBOOK_ROLE`].
+const KDA_PRINCIPAL: &str = "kinesisanalytics.amazonaws.com";
+
+/// The ARN of [`NOTEBOOK_ROLE`] in this account.
+fn notebook_role_arn() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:role/{NOTEBOOK_ROLE}")
+}
+
+/// Provision [`NOTEBOOK_ROLE`] in IAM, with a trust policy admitting this service, asserting
+/// the create succeeded.
+async fn given_the_notebook_role(router: &MultiServiceRouter, case: &str) {
+    let trust = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": KDA_PRINCIPAL},
+            "Action": "sts:AssumeRole",
+        }],
+    });
+    let body = format!(
+        "Action=CreateRole&Version=2010-05-08&RoleName={}&AssumeRolePolicyDocument={}",
+        form_encode(NOTEBOOK_ROLE),
+        form_encode(&trust.to_string()),
+    );
+    let host = format!("iam.{REGION}.amazonaws.com");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{host}/"))
+        .header("host", host)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{REGION}/iam/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let xml = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the notebook's service execution role must be created in IAM first, \
+         got {status} {xml}"
+    );
 }
 
 /// The configuration-only update both phases of a row send, byte for byte identical.
@@ -289,6 +350,7 @@ fn a_studio_notebook_tracks_the_glue_database_it_names() {
         Box::pin(async {
             let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
             let router = build_router(engine);
+            given_the_notebook_role(&router, "the notebook's role").await;
 
             let rows = [
                 CatalogRow {
@@ -542,6 +604,7 @@ fn glue_and_both_kinesis_analytics_versions_each_answer_their_own_targets() {
             let router = build_router(engine);
 
             let case = "one signing name, two API versions, one workflow";
+            given_the_notebook_role(&router, case).await;
             let database = "shared_target_db";
             let created = glue(
                 &router,

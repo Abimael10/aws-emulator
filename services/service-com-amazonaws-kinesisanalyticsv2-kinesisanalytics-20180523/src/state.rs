@@ -27,13 +27,18 @@
 //! application runs in when its create named none ([`default_application_mode`]), the
 //! maintenance window every application carries
 //! ([`Application::maintenance_configuration`]), the resolution of a Studio notebook's
-//! catalog against the Glue Data Catalog ([`catalog_database_refusal`]) and the
+//! catalog against the Glue Data Catalog ([`catalog_database_refusal`]), the resolution of
+//! the service execution role an application runs as
+//! ([`service_execution_role_is_unassumable`]) and the
 //! clock-owed status settlement
 //! ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::settle`]),
 //! so an operation handler never re-derives them.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod service_execution_role;
+pub use service_execution_role::*;
 
 use ::aws_smithy_types::DateTime;
 
@@ -527,10 +532,13 @@ impl Application {
         }
 
         if let Some(snapshots) = update.application_snapshot_configuration_update.as_ref() {
-            cfg.application_snapshot_configuration_description =
-                Some(ApplicationSnapshotConfigurationDescription {
-                    snapshots_enabled: snapshots.snapshots_enabled_update,
-                });
+            // `ApplicationSnapshotConfigurationUpdate` names only whether snapshots are
+            // taken, so the described snapshot MODE is carried over rather than dropped:
+            // the update replaces the one value it names and leaves the rest of the
+            // description as it stands.
+            cfg.application_snapshot_configuration_description
+                .get_or_insert_with(Default::default)
+                .snapshots_enabled = snapshots.snapshots_enabled_update;
         }
 
         if let Some(rollback) = update
@@ -1388,6 +1396,10 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
                 .as_ref()
                 .map(|s| ApplicationSnapshotConfigurationDescription {
                     snapshots_enabled: s.snapshots_enabled,
+                    // `ApplicationSnapshotConfiguration` carries no mode, so the one in
+                    // force is filled in with the rest of the service's own values
+                    // ([`complete_with_service_defaults`]).
+                    snapshot_mode: None,
                 }),
             application_system_rollback_configuration_description: cfg
                 .application_system_rollback_configuration
@@ -1615,6 +1627,15 @@ const DEFAULT_AUTO_SCALING_ENABLED: bool = true;
 /// it: the default for `ApplicationSystemRollbackConfiguration$RollbackEnabled`.
 const DEFAULT_ROLLBACK_ENABLED: bool = false;
 
+/// The snapshot mode an application whose mode was never selected runs under: the legacy
+/// marker, which is what the service reports for every application this API revision can
+/// create, since it models no member for choosing another mode.
+///
+/// It is the mode stored ON the application's configuration description
+/// ([`complete_with_service_defaults`]) rather than a value the serializer writes, so a
+/// description that was stored with a mode keeps reporting that one.
+pub const DEFAULT_SNAPSHOT_MODE: &str = "APPLICATION_SNAPSHOTS_LEGACY";
+
 /// An application whose creator named no KMS key is encrypted at rest under the key AWS
 /// owns, which is the `KeyType` value the model declares for it
 /// (`smithy_query(query="shape",shape="KeyType")`). No key id is reported with it,
@@ -1673,14 +1694,20 @@ fn complete_with_service_defaults(
         );
     }
 
-    if description
+    let snapshots = description
         .application_snapshot_configuration_description
-        .is_none()
-    {
-        description.application_snapshot_configuration_description =
-            Some(ApplicationSnapshotConfigurationDescription {
-                snapshots_enabled: defaults.snapshots_enabled,
-            });
+        .get_or_insert(ApplicationSnapshotConfigurationDescription {
+            snapshots_enabled: defaults.snapshots_enabled,
+            snapshot_mode: None,
+        });
+    // Every application's snapshots are taken under one snapshot mode, and the API this
+    // revision models has no member for selecting one, so a description that carries no
+    // mode reports the one an application that never selected a mode runs under
+    // ([`DEFAULT_SNAPSHOT_MODE`]). Stored on the description, so a later read — of the
+    // version in force or of a version this application has left — reports the mode that
+    // configuration was described with rather than recomputing it.
+    if snapshots.snapshot_mode.is_none() {
+        snapshots.snapshot_mode = Some(DEFAULT_SNAPSHOT_MODE.to_string());
     }
     if description
         .application_system_rollback_configuration_description
@@ -2137,6 +2164,13 @@ pub fn missing_catalog_database_message(database: &str) -> String {
     format!("Cannot find database with name '{database}' in Glue Data Catalog")
 }
 
+/// How the service words a `DatabaseARN` naming a database of ANOTHER Region: the Region the
+/// request was made in, which is the only one this application can read a catalog in, and
+/// the Region the value carried.
+pub fn cross_region_catalog_database_message(expected: &str, found: &str) -> String {
+    format!("Incorrect region in DatabaseArn, expecting '{expected}' but found '{found}'.")
+}
+
 /// How the service words a `DatabaseARN` that is not the ARN of a Glue Data Catalog
 /// database at all — a value that names no database for the notebook to read, as opposed
 /// to one naming a database the catalog does not hold
@@ -2152,15 +2186,17 @@ pub fn invalid_catalog_database_arn_message(database_arn: &str) -> String {
 const GLUE_ARN_NAMESPACE: &str = "glue";
 const GLUE_DATABASE_RESOURCE_TYPE: &str = "database";
 
-/// The Data Catalog and the database name a `GlueDataCatalogConfiguration$DatabaseARN`
-/// points at, or `None` when the value is not the ARN of a Glue database.
+/// The Data Catalog, the Region and the database name a
+/// `GlueDataCatalogConfiguration$DatabaseARN` points at, or `None` when the value is not the
+/// ARN of a Glue database.
 ///
 /// A Glue database ARN carries the catalog it lives in as its ACCOUNT field (Glue keys a
 /// Data Catalog by the account id, which is what its own operations default `CatalogId`
-/// to) and the database as the ID of a `database` resource. Read through the shared ARN
-/// parse, so this service reads a caller-supplied ARN exactly as every other one does
-/// rather than splitting the value again.
-fn glue_database_reference(database_arn: &str) -> Option<(String, String)> {
+/// to), the Region that catalog is in as its REGION field, and the database as the ID of a
+/// `database` resource. Read through the shared ARN parse ONCE, so this service reads a
+/// caller-supplied ARN exactly as every other one does rather than splitting the value again
+/// — and so every reader of one value agrees on what it names.
+fn glue_database_reference(database_arn: &str) -> Option<(String, String, String)> {
     let arn = ::service_common::arn::parse(database_arn)?;
     if arn.vendor != GLUE_ARN_NAMESPACE {
         return None;
@@ -2175,12 +2211,21 @@ fn glue_database_reference(database_arn: &str) -> Option<(String, String)> {
     } else {
         arn.account
     };
-    Some((catalog_id.to_string(), database.to_string()))
+    Some((
+        catalog_id.to_string(),
+        arn.region.to_string(),
+        database.to_string(),
+    ))
 }
 
 /// The refusal a Studio notebook's catalog configuration earns when the `DatabaseARN` it
-/// names is not a Glue database ARN, or the Glue Data Catalog holds no database under the
-/// name it points at — `None` when that database resolves.
+/// names is not a Glue database ARN, names a database of another Region, or points at a name
+/// the Glue Data Catalog holds no database under — `None` when that database resolves.
+///
+/// `region` is the Region the request was made in, which is the Region whose Data Catalog
+/// the application reads: a Data Catalog is Regional, so a value naming another Region is
+/// refused on the ARN alone ([`cross_region_catalog_database_message`]) before any catalog is
+/// asked.
 ///
 /// Read from the Glue service's OWN store through the one shared engine, so the answer is
 /// LIVE: the same ARN resolves once `CreateDatabase` has written the database and stops
@@ -2194,11 +2239,20 @@ fn glue_database_reference(database_arn: &str) -> Option<(String, String)> {
 /// would refuse every notebook. A value that is no database ARN needs nothing asked.
 pub fn catalog_database_refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    region: &str,
     database_arn: &str,
 ) -> Option<String> {
-    let Some((catalog_id, database)) = glue_database_reference(database_arn) else {
+    let Some((catalog_id, named_region, database)) = glue_database_reference(database_arn) else {
         return Some(invalid_catalog_database_arn_message(database_arn));
     };
+    // A Data Catalog is Regional, and an application reads the one of the Region it runs in,
+    // so a `DatabaseARN` whose Region field is another one names a database this application
+    // could never read — refused on the ARN alone, before any catalog is asked, naming the
+    // Region expected and the Region found. A value carrying no Region at all states no
+    // other Region, so it is left to the lookup below.
+    if !named_region.is_empty() && named_region != region {
+        return Some(cross_region_catalog_database_message(region, &named_region));
+    }
     let state = ::service_com_amazonaws_glue_awsglue::state::service_state(engine)?;
     let held = state.lock().database(&catalog_id, &database).is_some();
     (!held).then(|| missing_catalog_database_message(&database))

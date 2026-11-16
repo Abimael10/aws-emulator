@@ -37,6 +37,12 @@ hex = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# IAM, for the SUITE that pins the service-execution-role gate: the gate asks IAM
+# in-process for the role a create or an update names, so IAM has to be mounted beside
+# this service for there to be anything to ask. Test-only.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The percent-encoding of the `awsQuery` form body that suite's IAM `CreateRole` travels in.
+percent-encoding = "2"
 
 [lints]
 workspace = true

@@ -99,22 +99,9 @@
 // (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is what
 // points it into `tests/all/`.
 // comment, like an inner attribute, is legal only before the first item, so one left past the
-// declarations compiles no suite of this target at all, and with none anywhere in the file no
+// declarations compiles no suite of this target at all — which is what the re-typed copies of
+// this header that kept arriving in its tail had done. With none anywhere below this block, no
 // merge of two landings can leave one there.
-// this file, which the layout check refuses: the `#[path]` above each `mod` is what points
-// the declaration into `tests/all/`. A suite file no `mod` here names is compiled nowhere and
-// its tests never run, a suite left at the top level of `tests/` fails the build, and a
-// second `mod` for one name is `E0428`. Some of the files below are shared harnesses or
-// probes rather than suites; every one of them is declared, for that reason.
-// `all/all_rs_is_a_canonical_declaration_list.rs`,
-// `all/declaration_roots_are_canonical_and_complete.rs`,
-// `all/declaration_roots_end_with_their_last_declaration.rs`,
-// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
-// `all/every_suite_file_is_declared.rs` pin every rule above, for this file and for every
-// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
-// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
-// whole target. An inner attribute, like an inner doc comment, is legal only before the first
-// item, so it stands here rather than in the list below.
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file
@@ -122,6 +109,7 @@
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before
 // the first item, so it stands here rather than in the list below.
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // suite.
 // comment is legal only before the first item, so one left past the declarations is `E0753`
 // and compiles no suite of this target. With none anywhere in the file, no merge of two

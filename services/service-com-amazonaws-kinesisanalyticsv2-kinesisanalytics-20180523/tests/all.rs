@@ -37,16 +37,22 @@ mod list_tags_for_resource_reads;
 mod modeled_client_errors;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/pattern_clause_expression.rs"]
+mod pattern_clause_expression;
 #[path = "all/presigned_extension_url.rs"]
 mod presigned_extension_url;
 #[path = "all/runtime_configuration_defaults.rs"]
 mod runtime_configuration_defaults;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/service_execution_role_gate.rs"]
+mod service_execution_role_gate;
 #[path = "all/snapshot_delete_application_status.rs"]
 mod snapshot_delete_application_status;
 #[path = "all/snapshot_deletion.rs"]
 mod snapshot_deletion;
+#[path = "all/snapshot_mode_reporting.rs"]
+mod snapshot_mode_reporting;
 #[path = "all/sql_input_and_configuration_defaults.rs"]
 mod sql_input_and_configuration_defaults;
 #[path = "all/state_roundtrip.rs"]

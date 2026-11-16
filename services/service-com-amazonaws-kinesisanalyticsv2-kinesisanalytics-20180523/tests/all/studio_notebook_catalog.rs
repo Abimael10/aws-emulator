@@ -349,6 +349,177 @@ async fn a_notebook_catalog_is_resolved_against_the_glue_data_catalog() {
     }
 }
 
+/// The whole `Message` a `DatabaseARN` naming another Region's database is refused with,
+/// pinned here the same way: the Region the request was made in, then the Region the value
+/// carried.
+fn cross_region_message(expected: &str, found: &str) -> String {
+    format!("Incorrect region in DatabaseArn, expecting '{expected}' but found '{found}'.")
+}
+
+/// A Data Catalog is REGIONAL, so the database a notebook reads its tables through is one of
+/// the Region the request was made in: a `DatabaseARN` carrying another Region names a
+/// database this notebook could never read and is refused on the ARN alone, before any
+/// catalog is asked — which is why a row naming another Region is refused even when the
+/// catalog holds a database of that name.
+///
+/// The rows differ in the Region the value carries (the request's own, two others, and none
+/// at all) and in whether the catalog holds the database the name points at.
+#[tokio::test]
+async fn a_catalog_database_of_another_region_is_refused_on_the_arn_alone() {
+    let router = emulator_with_glue();
+    let case = "the Region a DatabaseARN carries";
+    create_database(&router, case, "regional_db").await;
+
+    // (case, the DatabaseARN the notebook names, the Region the refusal must report, or
+    // `None` for a value that is accepted)
+    let rows: [(&str, String, Option<&str>); 5] = [
+        (
+            "the Region the request was made in",
+            database_arn("regional_db"),
+            None,
+        ),
+        (
+            // No Region at all states no OTHER Region, so the lookup decides it.
+            "an ARN carrying no Region",
+            format!("arn:aws:glue::{ACCOUNT}:database/regional_db"),
+            None,
+        ),
+        (
+            "another Region, holding a database of that name here",
+            format!("arn:aws:glue:us-west-2:{ACCOUNT}:database/regional_db"),
+            Some("us-west-2"),
+        ),
+        (
+            // The Region decides BEFORE the catalog is asked, so a name nothing holds is
+            // still refused for its Region rather than as a missing database.
+            "another Region, naming a database nothing holds",
+            format!("arn:aws:glue:us-west-2:{ACCOUNT}:database/absent_regional_db"),
+            Some("us-west-2"),
+        ),
+        (
+            "a third Region",
+            format!("arn:aws:glue:eu-central-1:{ACCOUNT}:database/regional_db"),
+            Some("eu-central-1"),
+        ),
+    ];
+
+    for (index, (row, database_arn, refused_region)) in rows.into_iter().enumerate() {
+        let name = format!("regional-notebook-{index}");
+        let (status, body) = call(
+            &router,
+            "CreateApplication",
+            &notebook_body(&name, &database_arn, "INFO"),
+        )
+        .await;
+
+        let Some(found) = refused_region else {
+            assert_eq!(
+                status, 200,
+                "case {row:?}: expected the create to be accepted, got {status} with {body}"
+            );
+            let detail = describe(&router, &name).await;
+            assert_eq!(
+                described_database_arn(&detail),
+                Some(database_arn.as_str()),
+                "case {row:?}: expected the stored DatabaseARN, got {detail}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {row:?}: expected 400 InvalidArgumentException, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            cross_region_message(REGION, found),
+            "case {row:?}: expected the cross-Region refusal's wording, got {body}"
+        );
+        let (status, read) = call(
+            &router,
+            "DescribeApplication",
+            &json!({"ApplicationName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&read).as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {row:?}: a refused create must store no application, got {status} with {read}"
+        );
+    }
+}
+
+/// The same Region rule on the UPDATE path: an update that would move a notebook onto a
+/// database of another Region is refused with the same sentence, and changes nothing — the
+/// resolution is the one both writes make, so neither can regress on its own.
+#[tokio::test]
+async fn an_update_onto_another_regions_catalog_database_is_refused() {
+    let router = emulator_with_glue();
+    let case = "an update onto another Region's database";
+    let database = "regional_update_db";
+    let name = "regional-update-notebook";
+    create_database(&router, case, database).await;
+
+    let (status, body) = call(
+        &router,
+        "CreateApplication",
+        &notebook_body(name, &database_arn(database), "INFO"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the create must be accepted, got {status} with {body}"
+    );
+
+    // Each row names the same database in a Region that is not the one the request is made
+    // in, so what is refused is the Region and never the name.
+    for found in ["us-west-2", "eu-central-1"] {
+        let (status, refused) = call(
+            &router,
+            "UpdateApplication",
+            &json!({
+                "ApplicationName": name,
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "ZeppelinApplicationConfigurationUpdate": {
+                        "CatalogConfigurationUpdate": {
+                            "GlueDataCatalogConfigurationUpdate": {
+                                "DatabaseARNUpdate":
+                                    format!("arn:aws:glue:{found}:{ACCOUNT}:database/{database}")
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?} ({found}): expected 400 InvalidArgumentException, got {status} with \
+             {refused}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            cross_region_message(REGION, found),
+            "case {case:?} ({found}): expected the cross-Region refusal's wording, got {refused}"
+        );
+
+        // The refusal is side-effect free: neither the stored catalog nor the version moved.
+        let detail = describe(&router, name).await;
+        assert_eq!(
+            (
+                described_database_arn(&detail),
+                detail["ApplicationVersionId"].as_i64()
+            ),
+            (Some(database_arn(database).as_str()), Some(1)),
+            "case {case:?} ({found}): a refused update must change neither the catalog nor the \
+             version, got {detail}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn dropping_the_catalog_database_strands_the_notebook_until_it_is_recreated() {
     let router = emulator_with_glue();

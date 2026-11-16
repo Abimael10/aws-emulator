@@ -234,7 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A Studio notebook's `CatalogConfiguration` names "the configuration parameters
         // for the default Amazon Glue database" the notebook reads its tables through
         // (`GlueDataCatalogConfiguration`), so the create RESOLVES that database in the
-        // Glue Data Catalog and is refused when the catalog holds none under the name the
+        // Glue Data Catalog of the Region the request was made in and is refused when the
+        // value names another Region or the catalog holds no database under the name the
         // `DatabaseARN` points at. Resolved BEFORE the store's guard is taken, so nothing
         // is written for a notebook whose catalog does not exist and this handler never
         // holds two services' store locks at once.
@@ -244,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(crate::state::configured_catalog_database_arn)
         {
             if let Some(message) =
-                crate::state::catalog_database_refusal(&*self.engine, database_arn)
+                crate::state::catalog_database_refusal(&*self.engine, &region, database_arn)
             {
                 return Err(CreateApplicationErrorModeled::InvalidArgumentException(
                     InvalidArgumentException {
@@ -253,6 +254,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // The IAM half of the create, judged before anything is written and with no store
+        // guard held: an application runs AS its `ServiceExecutionRole`, so a role this
+        // service cannot assume is one the application could never read a record or write
+        // one under ([`crate::state::service_execution_role_is_unassumable`], which refuses
+        // only what IAM ANSWERED). The question goes to the IAM service mounted in THIS
+        // process, over the emulator's own transport through the operation callback — the
+        // same in-process seam the catalog read above uses — so nothing here opens a
+        // connection, resolves a host, or builds an endpoint out of the request: `region` is
+        // only the credential scope that in-process call is signed under.
+        if crate::state::service_execution_role_is_unassumable(
+            ctx,
+            &region,
+            &input.service_execution_role,
+        )
+        .await
+        {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        crate::state::unassumable_service_execution_role_message(
+                            &input.service_execution_role,
+                        ),
+                    ),
+                },
+            )
+            .into());
         }
 
         let mut store = state.lock();

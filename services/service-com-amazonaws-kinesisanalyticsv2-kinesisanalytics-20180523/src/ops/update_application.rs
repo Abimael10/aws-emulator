@@ -185,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pattern, `CurrentApplicationVersionId`'s 1..999999999 range,
         // `ConditionalToken`'s pattern, the enum value sets of every `…Update` member —
         // is refused at the boundary with HTTP 400 before this handler runs.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateApplicationErrorModeled::InvalidRequestException(
                 InvalidRequestException {
@@ -201,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.application_name.clone();
         let now = crate::state::now_timestamp();
+        let region = crate::state::region_from_headers(&ctx.parts().headers);
 
         // What this update has to decide against, read under the store's guard and the
         // guard RELEASED before the Glue Data Catalog is asked anything: no two services'
@@ -277,11 +277,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or(stored_catalog_arn);
         if let Some(database_arn) = catalog_database_arn.as_deref() {
             if let Some(message) =
-                crate::state::catalog_database_refusal(&*self.engine, database_arn)
+                crate::state::catalog_database_refusal(&*self.engine, &region, database_arn)
             {
                 return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
                     InvalidArgumentException {
                         message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The role the application will RUN AS once this update lands is resolved the same
+        // way a create resolves it — an application cannot be moved onto a role this service
+        // cannot assume, since it could never read a record or write one under it — and
+        // resolved before anything is written, with no store guard held
+        // ([`crate::state::service_execution_role_is_unassumable`], which refuses only what
+        // IAM ANSWERED and asks it over the emulator's own in-process transport, opening no
+        // connection and resolving no host). Only an update that NAMES a role is judged: one
+        // that names none leaves the application on the role it already runs as.
+        if let Some(role) = input.service_execution_role_update.as_deref() {
+            if crate::state::service_execution_role_is_unassumable(ctx, &region, role).await {
+                return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(
+                            crate::state::unassumable_service_execution_role_message(role),
+                        ),
                     },
                 )
                 .into());

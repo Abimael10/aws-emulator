@@ -258,8 +258,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // …` envelope — the envelope, the member paths and the requirement sentences the
         // framework already renders, which is why this delegates to the ONE shared
         // statement of them (`service_common::validation_message`) instead of writing a
-        // second one here. The `@pattern` rendering passed to it is the identity, so a
-        // pattern is quoted back as this model writes it, anchors included.
+        // second one here.
+        //
+        // The `@pattern` rendering passed to it is the expression the WHOLE value has to
+        // satisfy (`service_common::validation::whole_value_expression`), which is the
+        // expression this service PUBLISHES for a member's shape and is what its clause
+        // quotes: a Smithy `@pattern` is a FIND, so an end the model anchors carries its
+        // `^`/`$` away with it and an end the model leaves open is spelled with the
+        // unconstrained run that end admits. So an ARN member declared `^arn:` is quoted
+        // `arn:.*` and a name declared `^[a-zA-Z0-9_.-]+$` is quoted `[a-zA-Z0-9_.-]+`.
+        // The CHECK is always the model's pattern as written; only the quoting is this.
         //
         // What this service chooses is the enumerated value SET that is stated and the ORDER
         // it is stated in ([`as_stated_refusal`]): the set the service names for that shape
@@ -267,7 +275,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // sorted rather than left in the model's declaration order.
         service_common::validation_message::aws_validation_refusal_with(
             &as_stated_refusal(refusal),
-            |pattern| pattern.to_string(),
+            service_common::validation::whole_value_expression,
         )
     }
 

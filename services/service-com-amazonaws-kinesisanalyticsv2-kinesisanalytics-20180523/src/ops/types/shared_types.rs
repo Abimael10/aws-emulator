@@ -486,6 +486,15 @@ pub struct EnvironmentPropertyDescriptions {
 #[derive(Debug, Clone, Default)]
 pub struct ApplicationSnapshotConfigurationDescription {
     pub snapshots_enabled: bool,
+    /// The snapshot mode the application's snapshots are taken under
+    /// ([`crate::state::DEFAULT_SNAPSHOT_MODE`] for one whose mode was never moved off the
+    /// one this API started with). A schema-driven serializer can only write a member the
+    /// model declares, so `SnapshotMode` was ADDED to
+    /// `smithy-model/com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523.json`
+    /// (target a string shape of the same name): the recorded service reports it beside
+    /// `SnapshotsEnabled` on every description of an application's snapshot configuration,
+    /// while this model revision declares only the boolean.
+    pub snapshot_mode: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kinesisanalyticsv2#ApplicationSystemRollbackConfigurationDescription")]
