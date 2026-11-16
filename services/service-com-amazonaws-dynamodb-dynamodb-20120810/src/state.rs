@@ -4119,6 +4119,26 @@ pub fn resolve_resource_arn(
     })
 }
 
+/// What a refused tagging write would have done to the resource, as
+/// [`being_deleted_message`] names it: the wording a tag WRITE states.
+pub const TAG_WRITE_ACTION: &str = "tagged";
+
+/// The same for a tag REMOVAL.
+pub const TAG_REMOVAL_ACTION: &str = "untagged";
+
+/// The `ResourceInUseException` message for a tagging write addressed at a table whose
+/// deletion is already under way.
+///
+/// "The operation conflicts with the resource's availability" (that error's own doc): a
+/// table on its way out takes no configuration change, so the write is refused rather
+/// than applied to a resource that is going. Two variable parts — the ARN as the caller
+/// sent it, and what the refused write would have done to it ([`TAG_WRITE_ACTION`] or
+/// [`TAG_REMOVAL_ACTION`]) — so the two tagging writes are refused in one wording,
+/// whichever surface addressed the table.
+pub fn being_deleted_message(resource_arn: &str, action: &str) -> String {
+    format!("Resource {resource_arn} is being deleted and cannot be {action}")
+}
+
 /// Fold a request's `TagList` into the stored [`TagSet`], refusing a list AWS does not
 /// accept.
 ///

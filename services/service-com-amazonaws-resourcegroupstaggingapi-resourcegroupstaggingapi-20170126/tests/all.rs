@@ -66,3 +66,6 @@ mod tag_batch_partial_failure;
 
 #[path = "all/namespace_filter_discovery.rs"]
 mod namespace_filter_discovery;
+
+#[path = "all/dynamodb_tagged_resource_index.rs"]
+mod dynamodb_tagged_resource_index;

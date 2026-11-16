@@ -225,9 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if table.status(now) == crate::state::TableStatus::Deleting {
             return Err(TagResourceErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Resource {} is being deleted and cannot be tagged",
-                        resource.arn
+                    message: Some(crate::state::being_deleted_message(
+                        &resource.arn,
+                        crate::state::TAG_WRITE_ACTION,
                     )),
                 },
             )

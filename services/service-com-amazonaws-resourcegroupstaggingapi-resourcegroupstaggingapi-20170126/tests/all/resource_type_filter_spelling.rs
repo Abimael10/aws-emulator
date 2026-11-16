@@ -210,7 +210,7 @@ type AcceptedRow = (&'static [&'static str], &'static [usize]);
 /// and the bare id whose type `crate::state::implicit_resource_type` names).
 const TAGGED: &[&str] = &[
     "arn:aws:auditmanager:us-east-1:ACCOUNT:assessment/spelling-assessment",
-    "arn:aws:dynamodb:us-east-1:ACCOUNT:table/spelling-table",
+    "arn:aws:qldb:us-east-1:ACCOUNT:ledger/spelling-ledger",
     "arn:aws:rds:us-east-1:ACCOUNT:db:spelling-db",
     "arn:aws:s3:::spelling-bucket",
 ];
@@ -224,7 +224,7 @@ const ACCEPTED: &[AcceptedRow] = &[
     // An ARN whose resource field carries `type:id`.
     (&["rds:db"], &[2]),
     // An ARN whose resource field carries `type/id`.
-    (&["dynamodb:table"], &[1]),
+    (&["qldb:ledger"], &[1]),
     // The worked example from the member's own documentation.
     (&["auditmanager"], &[0]),
     (&["auditmanager:assessment"], &[0]),

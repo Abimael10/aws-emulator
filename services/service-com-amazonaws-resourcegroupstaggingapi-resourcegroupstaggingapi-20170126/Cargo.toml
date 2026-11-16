@@ -39,6 +39,11 @@ service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 service-com-amazonaws-connecthealth-connecthealth = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+# A DynamoDB table carries the tag set this API reads and writes for the `dynamodb`
+# namespace: `TagResource`/`UntagResource` there and `TagResources`/`UntagResources` here
+# edit ONE set, which is why a table tagged through DynamoDB's own API is discoverable
+# through `GetResources`.
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-glue-awsglue = { workspace = true }

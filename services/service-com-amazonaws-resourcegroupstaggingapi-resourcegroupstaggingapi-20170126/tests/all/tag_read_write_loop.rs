@@ -171,9 +171,9 @@ const ARN_FORMS: &[(&str, &str, Option<&str>)] = &[
     ),
     // `resource-type/resource-id` with a multi-segment id.
     (
-        "arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2026",
-        "dynamodb",
-        Some("dynamodb:table"),
+        "arn:aws:ssm:us-east-1:123456789012:parameter/orders/dev/token",
+        "ssm",
+        Some("ssm:parameter"),
     ),
     // `resource-type:resource-id`.
     (

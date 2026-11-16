@@ -343,7 +343,7 @@ async fn an_arn_this_endpoint_serves_is_still_tagged_and_a_refusal_writes_nothin
         ("a global resource", UNOWNED),
         (
             "a resource of the endpoint's own Region",
-            "arn:aws:dynamodb:us-east-1:000000000000:table/wording-near-table",
+            "arn:aws:qldb:us-east-1:000000000000:ledger/wording-near-ledger",
         ),
     ];
     for (case, arn) in served {

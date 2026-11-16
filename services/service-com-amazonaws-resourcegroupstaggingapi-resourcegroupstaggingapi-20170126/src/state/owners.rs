@@ -44,6 +44,7 @@ use std::time::SystemTime;
 // workspace resolves them at stays in one place.
 use service_com_amazonaws_apigateway_backplanecontrolservice as owner_apigateway;
 use service_com_amazonaws_connecthealth_connecthealth as owner_connecthealth;
+use service_com_amazonaws_dynamodb_dynamodb_20120810 as owner_dynamodb;
 use service_com_amazonaws_ecs_amazonec2containerservicev20141113 as owner_ecs;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as owner_elb;
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
@@ -236,6 +237,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
         "apigateway" => apigateway(engine, arn, change),
         "health-agent" => health_agent(engine, arn, change),
         "sqs" => sqs(engine, arn, change),
+        "dynamodb" => dynamodb(engine, arn, change),
         "ecs" => ecs(engine, arn, change),
         "elasticloadbalancing" => elasticloadbalancing(engine, arn, change),
         "events" => events(engine, arn, change),
@@ -325,6 +327,25 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
         for instance in state.container_instances.values() {
             record(instance.arn.clone(), option_tag_pairs!(instance.tags));
+        }
+    }
+    if let Some(state) = owner_dynamodb::state::service_state(engine) {
+        let mut state = state.lock();
+        // Like the secrets and state machines below, what the CLOCK already owes is
+        // materialised before this projection is read: a table whose `DeleteTable` span
+        // has elapsed is gone, and a tag write whose propagation span has elapsed is
+        // visible to that service's tag readers. Both were owed at this instant whether
+        // or not anybody called.
+        state.apply_due_transitions(SystemTime::now());
+        // A table is a REGIONAL resource of that service — a table name resolves only
+        // within one Region, which is the Region its ARN carries — so the tables this
+        // projection reports are the ones of the serving Region, each under the ARN that
+        // service minted for it. The set reported is the one its own eventually
+        // consistent tag reader reports, because there is ONE tag set per table.
+        if let Some(tables) = state.tables_in(region) {
+            for table in tables.values() {
+                record(table.arn.clone(), table.tags.visible().clone());
+            }
         }
     }
     if let Some(state) = owner_elb::state::service_state(engine) {
@@ -639,6 +660,95 @@ fn sns<Eng: Send + Sync + 'static>(
         // map the change left is the map that service now holds — no per-record
         // field to preserve, which is what `option_tag_list!` edits in place for.
         topic.tags = held.clone().into_iter().collect();
+    }
+    Resolution::Present { tags: Some(held) }
+}
+
+/// Amazon DynamoDB: a table, whose tags are the table's own — the resource that
+/// service's tagging surface addresses ("Identifies the Amazon DynamoDB resource to
+/// which tags should be added", `TagResource$ResourceArn`) — so the set this API reads
+/// and writes IS the set its own `ListTagsOfResource` reports, and a table created with
+/// `Tags` or deleted through DynamoDB appears in and disappears from this API's answers
+/// with nothing to keep in step.
+///
+/// The ARN is read by that service's OWN rule for a tagging `ResourceArn`
+/// ([`owner_dynamodb::state::resolve_resource_arn`]), so the values this API can tag are
+/// exactly the ones that service can, with no second copy of the resolution here to
+/// drift from it: a value in this namespace that names something other than a table of
+/// this endpoint — a sub-resource ARN such as an index or a stream — is a bad request TO
+/// IT, and it is reported with ITS refusal.
+///
+/// The Region comes off the ARN, which is the Region the request is addressed to since
+/// [`super::addressable_arn`] has already refused an ARN of any other.
+fn dynamodb<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_dynamodb::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    let resource = match owner_dynamodb::state::resolve_resource_arn(&arn.arn, &arn.region) {
+        Ok(resource) => resource,
+        // That service's 400 `ValidationException` — the channel its own tagging writes
+        // refuse an unaddressable `ResourceArn` through — carrying the sentence it words
+        // for the value.
+        Err(error) => return absent("ValidationException", error.message().to_string()),
+    };
+    let now = SystemTime::now();
+    let mut state = state.lock();
+    // A resolution must see the store a report of it sees: materialising the deletion the
+    // clock already owes is what keeps a table whose `DeleteTable` span has elapsed from
+    // being tagged after it is gone.
+    state.apply_due_transitions(now);
+    let table = match state.table_by_arn_mut(&resource) {
+        Ok(table) => table,
+        // That service's own `ResourceNotFoundException`, modelled at HTTP 400
+        // (`smithy_query(query="operation", operation="TagResource")` on the DynamoDB
+        // model), with the sentence it words for an ARN it holds no table for.
+        Err(error) => return absent("ResourceNotFoundException", error.message().to_string()),
+    };
+    let Some(change) = change else {
+        // A READ reports what that service's own EVENTUALLY CONSISTENT tag reader
+        // reports, which is the projection of the stored set whose propagation span has
+        // elapsed.
+        return Resolution::Present {
+            tags: Some(table.tags.visible().clone()),
+        };
+    };
+    // "The operation conflicts with the resource's availability" — a table being deleted
+    // takes no configuration change, so a write is refused exactly as that service's own
+    // tagging writes refuse it, in its own wording for the action asked for.
+    if table.status(now) == owner_dynamodb::state::TableStatus::Deleting {
+        return absent(
+            "ResourceInUseException",
+            owner_dynamodb::state::being_deleted_message(
+                &resource.arn,
+                match change {
+                    Change::Upsert { .. } => owner_dynamodb::state::TAG_WRITE_ACTION,
+                    Change::Remove(_) => owner_dynamodb::state::TAG_REMOVAL_ACTION,
+                },
+            ),
+        );
+    }
+    // A WRITE reads the set the writes have left on the table, never the eventually
+    // consistent projection of it, so two writes inside one propagation span compose —
+    // the rule that service's own writes follow.
+    let mut held: Tags = table.tags.stored().clone();
+    if let Err(would_hold) = change.apply(&mut held) {
+        return Resolution::TooManyTags(would_hold);
+    }
+    // That service's own cap on a table's tag set, which a write through this API is held
+    // to exactly as a write through its own `TagResource` is.
+    if held.len() > owner_dynamodb::state::MAX_TAGS_PER_TABLE {
+        return Resolution::TooManyTags(held.len());
+    }
+    // Applied through that service's OWN editors, so the write starts the propagation its
+    // own writes start: the set lands on the table now and every tag reader of it — this
+    // API's projection included — reports it one span later.
+    match change {
+        Change::Upsert { tags: upserts, .. } => table.tags.merge((*upserts).clone(), now),
+        Change::Remove(keys) => table.tags.remove(keys.iter().map(String::as_str), now),
     }
     Resolution::Present { tags: Some(held) }
 }

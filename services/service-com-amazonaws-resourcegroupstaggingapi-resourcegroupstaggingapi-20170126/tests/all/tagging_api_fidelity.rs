@@ -1625,7 +1625,7 @@ async fn the_reads_report_only_the_region_the_request_is_signed_for() {
     // Both are in namespaces no owner crate resolves, so neither needs a live
     // resource behind it; they differ exactly along what the rule generalises
     // over — one carries a Region segment, one does not.
-    let regional = "arn:aws:dynamodb:us-east-1:000000000000:table/in-region";
+    let regional = "arn:aws:qldb:us-east-1:000000000000:ledger/in-region";
     let global = "arn:aws:s3:::fidelity-global";
     for (arn, scope) in [(regional, "regional"), (global, "global")] {
         let (status, body) = tagging(
