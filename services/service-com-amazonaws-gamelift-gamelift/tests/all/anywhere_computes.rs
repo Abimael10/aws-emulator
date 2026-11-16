@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_gamelift_gamelift::state::MAX_COMPUTES_PER_FLEET;
 
 use crate::hosting_loop::{
-    anywhere_fleet, create_fleet, ec2_fleet, error_code, error_message, gamelift_arn,
-    wait_for_due_transitions, GameLift, REGION,
+    anywhere_fleet, compute_plane_endpoint, create_fleet, ec2_fleet, error_code, error_message,
+    gamelift_arn, wait_for_due_transitions, GameLift, EMULATOR_BASE, REGION,
 };
 
 /// The longest `ComputeName` a register may carry: `ComputeName` (`smithy_query
@@ -37,11 +37,12 @@ const RACK_ONE: &str = "custom-rack-1";
 /// See [`RACK_ONE`].
 const RACK_TWO: &str = "custom-rack-2";
 
-/// The Amazon GameLift Servers SDK endpoint a compute registered in [`REGION`] reports:
-/// the service's own WebSocket endpoint in the Region the compute was registered in, which
-/// a game server process passes to the server SDK's `InitSDK()`.
+/// The Amazon GameLift Servers SDK endpoint a compute registered against this emulator
+/// reports: the WebSocket address on this emulator's own endpoint that a game server
+/// process passes to the server SDK's `InitSDK()`. `compute_status_rendering.rs` asserts it
+/// over several emulator bases.
 fn sdk_endpoint() -> String {
-    format!("wss://{REGION}.api.amazongamelift.com")
+    compute_plane_endpoint(EMULATOR_BASE, "gamelift-server-sdk")
 }
 
 /// The ARN assigned to a compute named `name`. `Compute$ComputeArn`'s modelled pattern is
@@ -209,8 +210,10 @@ async fn a_registered_compute_is_reported_as_stored_and_reads_back_by_name_and_b
             "Location": case.location,
             // `Compute$ComputeStatus`: "A compute must have an ACTIVE status to host game
             // sessions", and a registered compute is hardware already running at the
-            // address the request gave.
-            "ComputeStatus": "ACTIVE",
+            // address the request gave. A compute of a fleet that is not container-based
+            // reports its status in the non-enumerated form that member's doc names, which
+            // `compute_status_rendering.rs` asserts over the whole status catalog.
+            "ComputeStatus": "Active",
             "GameLiftServiceSdkEndpoint": sdk_endpoint(),
         });
         assert_eq!(
@@ -231,8 +234,10 @@ async fn a_registered_compute_is_reported_as_stored_and_reads_back_by_name_and_b
             );
         }
         // A registered compute in an Anywhere fleet is not a managed instance, so it
-        // carries none of the members that describe one.
-        for member in ["Type", "InstanceId", "GameLiftAgentEndpoint", "ContainerAttributes"] {
+        // carries none of the members that describe one. The endpoints it DOES report —
+        // the SDK endpoint above and the Agent endpoint — are asserted in
+        // `compute_status_rendering.rs`.
+        for member in ["Type", "InstanceId", "ContainerAttributes"] {
             assert_eq!(
                 compute[member],
                 Value::Null,

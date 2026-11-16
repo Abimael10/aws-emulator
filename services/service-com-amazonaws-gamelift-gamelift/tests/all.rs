@@ -27,6 +27,8 @@ mod anywhere_computes;
 mod builds;
 #[path = "all/compute_auth_tokens.rs"]
 mod compute_auth_tokens;
+#[path = "all/compute_status_rendering.rs"]
+mod compute_status_rendering;
 #[path = "all/custom_location_deletion.rs"]
 mod custom_location_deletion;
 #[path = "all/error_message_templates.rs"]

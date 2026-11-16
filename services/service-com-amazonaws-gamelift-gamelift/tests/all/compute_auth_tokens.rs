@@ -291,7 +291,7 @@ async fn an_issued_token_is_reported_as_stored_for_every_identifier_form() {
             .await;
         assert_eq!(
             described["Compute"]["ComputeStatus"],
-            json!("ACTIVE"),
+            json!("Active"),
             "case {:?}: the compute must still be reported as registered, got {described}",
             case.label
         );

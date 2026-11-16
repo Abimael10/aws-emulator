@@ -321,7 +321,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: COMPUTE_STATUS_ACTIVE.to_string(),
             location,
             creation_time: now,
-            service_sdk_endpoint: crate::state::service_sdk_endpoint(&region),
+            service_sdk_endpoint: crate::state::service_sdk_endpoint(ctx.endpoint().as_str()),
+            // "If successful, this operation returns compute details, including an Amazon
+            // GameLift Servers SDK endpoint or Agent endpoint": both are addresses a
+            // process on the compute dials later, so both are resolved once, here, and
+            // stored on the record every later read is served from.
+            agent_endpoint: crate::state::agent_endpoint(ctx.endpoint().as_str()),
             // A compute holds no authentication token until one is requested for it:
             // `GetComputeAuthToken` is the operation that issues one.
             auth_token: None,

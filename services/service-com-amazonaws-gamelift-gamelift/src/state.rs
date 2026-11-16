@@ -1006,17 +1006,106 @@ pub fn compute_not_found_message(name_or_arn: &str) -> String {
     format!("Host ({name_or_arn}) not found.")
 }
 
+/// The WebSocket plane a compute's game server processes reach the service's server SDK
+/// at, as the path segment that names it on this emulator's own endpoint (see
+/// [`compute_endpoint`]).
+const SERVER_SDK_PLANE: &str = "gamelift-server-sdk";
+
+/// The WebSocket plane the Amazon GameLift Servers Agent on a compute connects to, as the
+/// path segment that names it (see [`compute_endpoint`]).
+const AGENT_PLANE: &str = "gamelift-agent";
+
+/// A WebSocket endpoint this service reports for a compute to DIAL, on `plane`.
+///
+/// Both endpoints a registered compute carries are addresses a process on that compute
+/// connects to later, so each has to be an address this emulator is reached at: a host in
+/// Amazon GameLift Servers' own zone resolves to nothing on the machine this emulator runs
+/// on, and a game server handed one either fails to connect or leaves the emulator for
+/// public AWS. The requirement is RELATIONAL — whatever address this emulator answers on
+/// is the address it publishes — so the authority comes from
+/// [`::smithy_server_runtime::OperationContext::endpoint`], "the base URL a later request
+/// addresses", read through the tree's shared reading of a published address
+/// (`service_common::data_plane_addressing`) rather than a second rule written here.
+///
+/// The scheme stays the `wss://` the service's endpoints are modelled and documented as.
+/// Amazon GameLift Servers tells the two planes apart by the host they answer on
+/// (`<region>.api` and `<region>.process-manager-api`), which one endpoint cannot do, so
+/// the plane is named in the PATH instead, under the segment this tree reserves for a data
+/// plane served at the emulator's own front door
+/// ([`::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`]).
+///
+/// What the two members carry is an ADDRESSING claim and nothing more: the protocol a game
+/// server process or the Agent speaks over such a socket is the server SDK's own, which
+/// this emulator does not serve, so no route of this crate answers either path. The value
+/// is still the address of this emulator rather than one off the machine, which is what the
+/// members are for — a caller reading one is told where this deployment is, not where the
+/// real service is.
+///
+/// The endpoint is taken as a string rather than as the context, so one resolved when a
+/// compute was registered can be re-read off the stored record; a caller holding the
+/// context reads the same base through
+/// [`::service_common::data_plane_addressing::emulator_endpoint_authority`].
+fn compute_endpoint(emulator_endpoint: &str, plane: &str) -> String {
+    let authority = ::service_common::data_plane_addressing::url_authority(emulator_endpoint)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    format!(
+        "wss://{authority}/{}/{plane}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
 /// The Amazon GameLift Servers SDK endpoint a game server process on a registered compute
-/// connects to.
+/// connects to, on the endpoint this emulator is served at ([`compute_endpoint`]).
 ///
 /// `Compute$GameLiftServiceSdkEndpoint` is "the Amazon GameLift Servers SDK endpoint
 /// connection for a registered compute resource in an Anywhere fleet. The game servers on
 /// the compute use this endpoint to connect to the Amazon GameLift Servers service", and
 /// `RegisterCompute`'s own doc has each server process pass it to "the Amazon GameLift
-/// Servers server SDK action `InitSDK()`" — a WebSocket connection to the service in the
-/// Region the compute is registered in, which is the one variable part of the endpoint.
-pub fn service_sdk_endpoint(region: &str) -> String {
-    format!("wss://{region}.api.amazongamelift.com")
+/// Servers server SDK action `InitSDK()`" — so it is an address a process DIALS.
+pub fn service_sdk_endpoint(emulator_endpoint: &str) -> String {
+    compute_endpoint(emulator_endpoint, SERVER_SDK_PLANE)
+}
+
+/// The Amazon GameLift Servers Agent endpoint reported for a registered compute, on the
+/// endpoint this emulator is served at ([`compute_endpoint`]).
+///
+/// `Compute$GameLiftAgentEndpoint` is "the endpoint of the Amazon GameLift Servers Agent",
+/// and `RegisterCompute`'s own doc has the operation report it: "this operation returns
+/// compute details, including an Amazon GameLift Servers SDK endpoint or Agent endpoint" —
+/// the endpoint the Agent running on the compute connects to, so it too is an address a
+/// process DIALS.
+pub fn agent_endpoint(emulator_endpoint: &str) -> String {
+    compute_endpoint(emulator_endpoint, AGENT_PLANE)
+}
+
+/// `Compute$ComputeStatus` as a compute whose fleet is NOT container-based reports it.
+///
+/// That member's own doc (`smithy_query query=doc shape=Compute member=ComputeStatus`):
+/// "Valid values include `PENDING`, `ACTIVE`, `TERMINATING`, and `IMPAIRED`. ... While the
+/// ComputeStatus enum type is valid for Container based servers, the result may also
+/// include other non-enumerated string values such as 'Active' for fleets which are not
+/// Container-based." So the enum form is what a compute of a CONTAINER fleet reports, and
+/// every other compute reports the status as a word: its first character upper case and the
+/// rest lower. That holds for each status the enum declares, not only for the one a compute
+/// a caller just registered carries.
+///
+/// A compute's status is STORED in the enum form the model declares, because that is the
+/// form the request members that select on it carry (`ListCompute$ComputeStatus` targets
+/// `ListComputeInputStatus`: `ACTIVE` | `IMPAIRED`); only the REPORTED value is written
+/// this way. A container fleet is a resource of its own (`CreateContainerFleet`), so the
+/// computes this store holds — registered into Anywhere fleets, which are not
+/// container-based — all report the non-enumerated form.
+pub fn non_container_compute_status(status: &str) -> String {
+    let mut characters = status.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+    first
+        .to_uppercase()
+        .chain(characters.flat_map(char::to_lowercase))
+        .collect()
 }
 
 /// A fresh authentication token for the game server processes running on one compute, for
@@ -1120,6 +1209,9 @@ pub struct ComputeRecord {
     /// The endpoint this compute's game server processes connect to the service through
     /// (see [`service_sdk_endpoint`]).
     pub service_sdk_endpoint: String,
+    /// The endpoint the Amazon GameLift Servers Agent on this compute connects to (see
+    /// [`agent_endpoint`]).
+    pub agent_endpoint: String,
     /// The authentication token this compute's game server processes present to the
     /// service, while it is still valid: "all game servers that are running on [a] compute
     /// have access to a valid auth token", so a compute holds the ONE token
@@ -1130,15 +1222,19 @@ pub struct ComputeRecord {
 impl ComputeRecord {
     /// This compute as the modelled `Compute`.
     ///
+    /// The status is reported in the form the compute's fleet kind calls for (see
+    /// [`non_container_compute_status`]), and both endpoints a register reports — the SDK
+    /// endpoint a game server process connects through and the Agent endpoint
+    /// (`RegisterCompute`: "this operation returns compute details, including an Amazon
+    /// GameLift Servers SDK endpoint or Agent endpoint") — come from the stored record.
+    ///
     /// The members a registered Anywhere compute does not have are absent rather than
     /// invented: `Type` is the fleet's EC2 instance type and "for registered computes in an
     /// Amazon GameLift Servers Anywhere fleet, this property is empty"; `InstanceId` names
     /// "the EC2 instance that is hosting the compute" and an Anywhere compute is hardware
     /// the service does not own; `OperatingSystem` is read off a managed instance's build;
-    /// `GameLiftAgentEndpoint` belongs to a fleet running the Amazon GameLift Servers
-    /// Agent, which "handles all compute registry tasks for you" instead of this
-    /// operation; and `ContainerAttributes` and `GameServerContainerGroupDefinitionArn`
-    /// belong to a compute in a container fleet.
+    /// and `ContainerAttributes` and `GameServerContainerGroupDefinitionArn` belong to a
+    /// compute in a container fleet.
     pub fn to_modelled(&self) -> Compute {
         Compute {
             fleet_id: Some(self.fleet_id.clone()),
@@ -1147,13 +1243,13 @@ impl ComputeRecord {
             compute_arn: Some(self.compute_arn.clone()),
             ip_address: self.ip_address.clone(),
             dns_name: self.dns_name.clone(),
-            compute_status: Some(self.status.clone()),
+            compute_status: Some(non_container_compute_status(&self.status)),
             location: Some(self.location.clone()),
             creation_time: Some(to_date_time(self.creation_time)),
             operating_system: None,
             r#type: None,
             game_lift_service_sdk_endpoint: Some(self.service_sdk_endpoint.clone()),
-            game_lift_agent_endpoint: None,
+            game_lift_agent_endpoint: Some(self.agent_endpoint.clone()),
             instance_id: None,
             container_attributes: None,
             game_server_container_group_definition_arn: None,

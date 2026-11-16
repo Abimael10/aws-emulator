@@ -71,6 +71,20 @@ impl GameLift {
         Self { router, engine }
     }
 
+    /// The same emulator, SERVED at `base` rather than at the unserved default
+    /// ([`EMULATOR_BASE`]): `base` is what `ctx.endpoint()` answers, and so what an
+    /// address a handler PUBLISHES for a client to dial is built from. A suite drives
+    /// several bases through one request path, because an address that named a fixed host
+    /// rather than the emulator's own would pass against only one of them.
+    pub(crate) fn served_at(base: &str) -> Self {
+        let mut emulator = Self::new();
+        emulator.router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("{base:?} is a usable emulator base URL")),
+        );
+        emulator
+    }
+
     /// This service's store in that engine, exactly as a handler reaches it
     /// (`crate::state::service_state(&*self.engine)`).
     pub(crate) fn state(
@@ -224,6 +238,26 @@ pub(crate) fn error_message(body: &Value) -> String {
         }
     }
     format!("<no Message in {body}>")
+}
+
+/// The base URL the in-process emulator of [`GameLift::new`] is reached at: it is served
+/// on no port, so `ctx.endpoint()` answers the unserved base
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]).
+pub(crate) const EMULATOR_BASE: &str = smithy_server_runtime::UNSERVED_URL_BASE;
+
+/// The endpoint this emulator publishes for one of a compute's WebSocket planes when it is
+/// served at `base`: that base's own authority under the `wss://` scheme Amazon GameLift
+/// Servers' endpoints carry, with the plane named in the path — because an address a
+/// process on the compute DIALS has to lead back to this emulator, which is the only
+/// address a client on this machine can reach.
+pub(crate) fn compute_plane_endpoint(base: &str, plane: &str) -> String {
+    let authority = base
+        .split_once("://")
+        .map_or(base, |(_scheme, authority)| authority)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    format!("wss://{authority}/_aws/{plane}")
 }
 
 /// The wire error code of an awsJson error body (`__type`), without its namespace.

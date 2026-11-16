@@ -28,6 +28,10 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# The one reading of how a client ADDRESSES an emulated plane: the authority this emulator
+# is served at, which the endpoints a registered compute reports are built on
+# (`state::compute_endpoint`).
+service-common = { path = "../common" }
 tracing = { workspace = true }
 # Mints the opaque UUID-shaped ids the GameLift resources carry (`fleet-<uuid>`,
 # `psess-<uuid>`, a game session's id string), as `state::mint_uuid` does it.
