@@ -968,15 +968,16 @@ pub fn available_processor_features(
 
 /// The Availability Zones of `region` an option is offered in.
 ///
-/// Every AWS Region has at least three zones, named `<region><letter>`, and
-/// `CreateDBInstance` in this emulator places an instance that names no zone in the
-/// region's FIRST zone, so the zones reported here are the ones an instance can land in.
+/// They are the zones AWS publishes for the Region
+/// ([`::service_common::aws_availability_zones`]): a Region exposes at least three and
+/// several expose more, so a report that named three letters refused a zone that is in fact
+/// orderable in the Region. `CreateDBInstance` in this emulator places an instance that
+/// names no zone in the region's FIRST zone, so the zones reported here are the ones an
+/// instance can land in.
 fn availability_zones(region: &str) -> Vec<AvailabilityZone> {
-    ["a", "b", "c"]
+    ::service_common::aws_availability_zones::availability_zones(region)
         .into_iter()
-        .map(|letter| AvailabilityZone {
-            name: Some(format!("{region}{letter}")),
-        })
+        .map(|name| AvailabilityZone { name: Some(name) })
         .collect()
 }
 
@@ -995,6 +996,14 @@ fn to_wire(
         .size_range
         .map(|(min, max)| (min, max.min(max_allocated_storage(engine))));
     let processor_features = available_processor_features(engine, class);
+    // The capability answers of an engine of ANOTHER control plane are that control plane's,
+    // held once for both views of this front door that answer for it: the document engine's
+    // are `::service_common::docdb_engine_catalog::OPTION_CAPABILITIES`, and an option of it
+    // reports every member of that set rather than leaving the ones this door models for its
+    // own engines absent. An engine of this door's own control plane answers from the tables
+    // below as before.
+    let docdb = (engine == ::service_common::docdb_engine_catalog::ENGINE)
+        .then_some(::service_common::docdb_engine_catalog::OPTION_CAPABILITIES);
     OrderableDBInstanceOption {
         engine: Some(engine.to_string()),
         engine_version: Some(version.engine_version.to_string()),
@@ -1035,7 +1044,10 @@ fn to_wire(
             .as_ref()
             .map(|throughput| throughput.max_per_iops),
         // Storage autoscaling raises `AllocatedStorage`, so it applies exactly where
-        // storage is ordered per instance rather than managed by a cluster.
+        // storage is ordered per instance rather than managed by a cluster. It is reported
+        // for every option, including an engine whose cluster manages the storage, because
+        // `DescribeValidDBInstanceModifications` answers the same fact for a STORED instance
+        // of that engine and the two reports must agree about it.
         supports_storage_autoscaling: Some(storage.size_range.is_some()),
         min_storage_size: storage_size.map(|(min, _)| min),
         max_storage_size: storage_size.map(|(_, max)| max),
@@ -1057,7 +1069,10 @@ fn to_wire(
                 .map(|mode| (*mode).to_string())
                 .collect(),
         ),
-        supports_global_databases: Some(version.profile.supports_global_databases),
+        supports_global_databases: Some(docdb.map_or(
+            version.profile.supports_global_databases,
+            |capabilities| capabilities.global_databases,
+        )),
         // "Whether DB instances can be configured as a Multi-AZ DB cluster": the Multi-AZ
         // DB cluster deployment is offered on the MySQL and PostgreSQL engines and never on
         // a burstable class. An engine of ANOTHER control plane served by this door reports
@@ -1072,17 +1087,42 @@ fn to_wire(
         // ordered with the instance; a cluster engine's storage is cluster-managed.
         supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),
         supported_activity_stream_modes: Some(activity_stream_modes(engine)),
-        // Absent rather than empty when the class has no configurable feature.
-        available_processor_features: (!processor_features.is_empty()).then_some(processor_features),
-        // This emulator's subnets are IPv4, so an option is offered for IPv4 only rather
-        // than reporting a dual-stack network it does not provide.
-        supported_network_types: Some(vec!["IPV4".to_string()]),
+        // Present and EMPTY for an engine whose classes expose no configurable processor
+        // feature at all, absent for a class of this door's own engines that has none.
+        available_processor_features: (!processor_features.is_empty() || docdb.is_some())
+            .then_some(processor_features),
+        // This emulator's subnets are IPv4, so an option of this door's own engines is
+        // offered for IPv4 only rather than reporting a dual-stack network it does not
+        // provide; an engine of another control plane publishes its own network types
+        // (the document engine's `DBCluster$NetworkType`: "Valid Values: IPV4 | DUAL").
+        supported_network_types: Some(match docdb {
+            Some(_) => ::service_common::docdb_engine_catalog::NETWORK_TYPES
+                .iter()
+                .map(|network_type| (*network_type).to_string())
+                .collect(),
+            None => vec!["IPV4".to_string()],
+        }),
         // `AvailabilityZoneGroup` names a Local Zone group and `OutpostCapable` an AWS
-        // Outpost; this service offers neither, so no option claims one.
-        outpost_capable: Some(false),
-        // The members that describe capacity this emulator does not model — Kerberos
-        // authentication, additional storage volumes, the Data API HTTP endpoint — are
-        // left absent rather than invented.
+        // Outpost; this service offers neither, which is also what the document engine's
+        // own capability set publishes, so no option claims one.
+        outpost_capable: Some(docdb.is_some_and(|capabilities| capabilities.outpost_capable)),
+        // Kerberos authentication, additional storage volumes, the Data API HTTP endpoint,
+        // optimized reads and writes, and whether a class requires its processor features
+        // to be named: members this door models for none of its own engines, so they are
+        // left absent there rather than invented — and reported for an engine whose own
+        // control plane publishes the answer.
+        supports_kerberos_authentication: docdb.map(|capabilities| {
+            capabilities.kerberos_authentication
+        }),
+        supports_additional_storage_volumes: docdb.map(|capabilities| {
+            capabilities.additional_storage_volumes
+        }),
+        supports_http_endpoint: docdb.map(|capabilities| capabilities.http_endpoint),
+        supports_optimized_reads: docdb.map(|capabilities| capabilities.optimized_reads),
+        supports_optimized_writes: docdb.map(|capabilities| capabilities.optimized_writes),
+        requires_custom_processor_features: docdb.map(|capabilities| {
+            capabilities.requires_custom_processor_features
+        }),
         ..Default::default()
     }
 }

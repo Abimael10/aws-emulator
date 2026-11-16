@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // option rather than refusing the call.
         let classes = docdb::instance_classes();
         let mut options: Vec<OrderableDBInstanceOption> = Vec::new();
-        for version in docdb::DOCDB_ENGINE_VERSIONS {
+        for version in docdb::engine_versions() {
             if input
                 .engine_version
                 .as_ref()

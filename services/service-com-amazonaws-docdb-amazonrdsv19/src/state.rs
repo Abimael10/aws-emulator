@@ -35,9 +35,11 @@ pub const ARN_NAMESPACE: &str = "rds";
 pub const DOCDB_ENGINE: &str = "docdb";
 
 /// `CreateDBClusterMessage$EngineVersion`: "The --engine-version will default to the
-/// latest major engine version." Derived from the catalogue rather than restated, so a
-/// version added to [`DOCDB_ENGINE_VERSIONS`] moves the default with it.
-pub const DEFAULT_ENGINE_VERSION: &str = DOCDB_ENGINE_VERSIONS[DOCDB_ENGINE_VERSIONS.len() - 1];
+/// latest major engine version." Read from the shared engine catalog of the front door this
+/// service is a view of ([`::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION`]),
+/// so a cluster created without a version runs the version that door publishes as the
+/// engine's default — whichever view the create arrived at.
+pub const DEFAULT_ENGINE_VERSION: &str = ::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION;
 
 /// The port DocumentDB listens on when `Port` is absent (the engine's default port, and
 /// the one `aws docdb create-db-cluster` reports back for a cluster created without it).
@@ -191,12 +193,18 @@ pub const MAX_SNAPSHOT_SHARED_ACCOUNTS: usize = 20;
 /// The region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The engine versions the `docdb` engine offers, oldest first. These are the versions
-/// Amazon DocumentDB publishes for the engine ("Amazon DocumentDB release notes"; they are
-/// also what `DescribeDBEngineVersions` reports), and they are the catalogue
-/// [`resolve_engine_version`] answers from: a request naming a version that is not in it
-/// names a version the engine cannot run.
-pub const DOCDB_ENGINE_VERSIONS: [&str; 3] = ["3.6.0", "4.0.0", "5.0.0"];
+/// The engine versions the `docdb` engine offers, oldest first.
+///
+/// They are the rows of the shared engine catalog of the one front door this service is a
+/// view of ([`::service_common::docdb_engine_catalog::ENGINE_VERSIONS`]) rather than a list
+/// of this view's own: the Amazon RDS view of that door reports the same versions for this
+/// engine, and this is the catalogue [`resolve_engine_version`] answers from — a request
+/// naming a version that is not in it names a version the engine cannot run.
+pub fn engine_versions() -> Vec<&'static str> {
+    ::service_common::docdb_engine_catalog::engine_versions()
+        .map(|published| published.version)
+        .collect()
+}
 
 /// `CreateDBSubnetGroupMessage$DBSubnetGroupName`: "Must contain no more than 255 letters,
 /// numbers, periods, underscores, spaces, or hyphens."
@@ -1045,13 +1053,20 @@ pub fn resource_token(ordinal: u64) -> String {
     digits.iter().map(|byte| char::from(*byte)).collect()
 }
 
-/// The Availability Zones a cluster lands in when `AvailabilityZones` is absent:
-/// DocumentDB spreads a cluster's storage over three zones of the request's region.
+/// How many Availability Zones of its Region a DocumentDB cluster spreads its storage
+/// over: three copies in three zones, whatever the Region's own zone count is ("Amazon
+/// DocumentDB stores six copies of your data across three Availability Zones").
+pub const CLUSTER_AVAILABILITY_ZONES: usize = 3;
+
+/// The Availability Zones a cluster lands in when `AvailabilityZones` is absent: the first
+/// [`CLUSTER_AVAILABILITY_ZONES`] zones of the request's Region
+/// ([`::service_common::aws_availability_zones`]). A cluster spans three zones even in a
+/// Region that exposes more, which is why this is a prefix of the Region's zones and not the
+/// whole list an orderable instance option reports.
 pub fn default_availability_zones(region: &str) -> Vec<String> {
-    ["a", "b", "c"]
-        .iter()
-        .map(|suffix| format!("{region}{suffix}"))
-        .collect()
+    let mut zones = ::service_common::aws_availability_zones::availability_zones(region);
+    zones.truncate(CLUSTER_AVAILABILITY_ZONES);
+    zones
 }
 
 /// The `PreferredBackupWindow` a cluster gets when the caller names none.
@@ -1202,7 +1217,7 @@ pub fn validate_subnet_group_name(member: &str, value: &str) -> Result<(), Strin
 /// is what "The --engine-version will default to the latest major engine version" describes
 /// for the absent case. Anything else names a version the engine cannot run.
 pub fn resolve_engine_version(requested: &str) -> Option<&'static str> {
-    DOCDB_ENGINE_VERSIONS
+    engine_versions()
         .iter()
         .rev()
         .find(|published| {
@@ -1241,7 +1256,7 @@ pub fn default_parameter_group_name(family: &str) -> String {
 /// caller-created group (`CreateDBClusterParameterGroup`, still scaffolded) will be a
 /// stored record read alongside these.
 pub fn default_parameter_groups(region: &str) -> Vec<DBClusterParameterGroup> {
-    let mut families: Vec<String> = DOCDB_ENGINE_VERSIONS
+    let mut families: Vec<String> = engine_versions()
         .iter()
         .map(|version| parameter_group_family(version))
         .collect();
@@ -1303,7 +1318,7 @@ pub fn resolve_parameter_group_in(
 /// (`aurora-mysql8.0`) is not this model's to answer — see [`serves_parameter_group_name`],
 /// which the shared `rds` front door reads for the same decision.
 pub fn serves_parameter_group_family(family: &str) -> bool {
-    DOCDB_ENGINE_VERSIONS
+    engine_versions()
         .iter()
         .any(|version| parameter_group_family(version).eq_ignore_ascii_case(family))
 }
@@ -2035,79 +2050,110 @@ pub const DOCDB_ENGINE_DESCRIPTION: &str = "Amazon DocumentDB (with MongoDB comp
 pub const DOCDB_PRODUCT: &str = "Amazon DocumentDB";
 
 /// The CloudWatch log types a cluster can export, each with the cluster parameter that
-/// enables it.
-///
-/// `CreateDBClusterMessage$EnableCloudwatchLogsExports`: "A list of log types that need to
-/// be enabled for exporting to Amazon CloudWatch Logs. You can enable audit logs or
-/// profiler logs" — the audit log is what the `audit_logs` parameter turns on and the
-/// profiler log what the `profiler` parameter does ([`DOCDB_CLUSTER_PARAMETERS`]), so a
-/// version exports a log type exactly when the parameter that enables it applies at that
-/// version. One table rather than a per-version list, so a log type cannot be reported
-/// exportable by a version whose parameter catalogue cannot switch it on.
-pub const EXPORTABLE_LOG_TYPES: [(&str, &str); 2] = [("audit", "audit_logs"), ("profiler", "profiler")];
+/// enables it, and the log types of one version: both are the shared catalog's
+/// ([`::service_common::docdb_engine_catalog::EXPORTABLE_LOG_TYPES`],
+/// [`::service_common::docdb_engine_catalog::exportable_log_types`]), so this view and the
+/// Amazon RDS view of the same front door cannot report different log exports for one
+/// version.
+pub use ::service_common::docdb_engine_catalog::EXPORTABLE_LOG_TYPES;
 
-/// `DBEngineVersion$ExportableLogTypes` for `version`: the log types of
-/// [`EXPORTABLE_LOG_TYPES`] whose enabling parameter the version's family publishes and
-/// whose own earliest engine version the version is not older than.
+/// `DBEngineVersion$ExportableLogTypes` for `version`; see [`EXPORTABLE_LOG_TYPES`].
 pub fn exportable_log_types(version: &str) -> Vec<String> {
-    let family = parameter_group_family(version);
-    EXPORTABLE_LOG_TYPES
-        .iter()
-        .filter(|(_, parameter)| {
-            published_parameter(&family, parameter).is_some_and(|spec| {
-                !engine_version_precedes(version, spec.minimum_engine_version)
-            })
-        })
-        .map(|(log_type, _)| (*log_type).to_string())
+    ::service_common::docdb_engine_catalog::exportable_log_types(version)
+        .into_iter()
+        .map(|log_type| log_type.to_string())
         .collect()
 }
 
-/// The versions `version` can be upgraded to: the LATER versions this engine publishes,
-/// which is what `DBEngineVersion$ValidUpgradeTarget` reports ("A list of engine versions
-/// that this database engine version can be upgraded to").
+/// The versions `version` can be upgraded to, as `DBEngineVersion$ValidUpgradeTarget`
+/// reports them ("A list of engine versions that this database engine version can be
+/// upgraded to").
 ///
-/// Every published DocumentDB version opens a new major line ([`DOCDB_ENGINE_VERSIONS`]),
-/// so every target is a MAJOR version upgrade — which is also why none of them is taken
-/// automatically: `UpgradeTarget$AutoUpgrade` is whether the target is applied to a
-/// resource with `AutoMinorVersionUpgrade` set, and a major upgrade never is.
+/// Which versions those are is the shared front door's rule, read from the ONE catalog both
+/// of its views answer this report from
+/// ([`::service_common::docdb_engine_catalog::upgrade_targets`]): a later minor release of
+/// the line the version runs, and a release of a later major line this engine offers an
+/// in-place major version upgrade to.
+///
+/// Every member of a target is the TARGET's own, because a caller decides whether to take an
+/// upgrade by what it would be running afterwards. `AutoUpgrade` is whether the target is
+/// applied to a resource with `AutoMinorVersionUpgrade` set, so it is reported for a MINOR
+/// move within one major line and never for a major one; `SupportsSnapshotUpgrade` is
+/// whether a snapshot can be upgraded straight to the target, which is what "Upgrading a DB
+/// snapshot engine version" documents for a MAJOR version upgrade.
 pub fn valid_upgrade_targets(version: &str) -> Vec<UpgradeTarget> {
-    DOCDB_ENGINE_VERSIONS
-        .iter()
-        .filter(|published| engine_version_precedes(version, published))
-        .map(|published| {
-            let major_upgrade = engine_major_version(published) != engine_major_version(version);
+    let from_major = ::service_common::docdb_engine_catalog::engine_version(version)
+        .map(|row| row.major)
+        .unwrap_or_default();
+    ::service_common::docdb_engine_catalog::upgrade_targets(version)
+        .into_iter()
+        .map(|target| {
+            let major_upgrade = target.major != from_major;
             UpgradeTarget {
                 engine: Some(DOCDB_ENGINE.to_string()),
-                engine_version: Some((*published).to_string()),
-                description: Some(engine_version_description(published)),
-                auto_upgrade: Some(false),
+                engine_version: Some(target.version.to_string()),
+                major_engine_version: Some(target.major.to_string()),
+                minor_engine_version: Some(target.minor.to_string()),
+                description: Some(engine_version_description(target.version)),
+                // `AutoUpgrade` is whether the target is applied to a resource with
+                // `AutoMinorVersionUpgrade` set, which moves a cluster onto the DEFAULT
+                // release of the line it already runs — so it is reported for a target
+                // inside the version's own line that is that line's default, and for no
+                // major-version target, which is never taken automatically.
+                auto_upgrade: Some(
+                    !major_upgrade
+                        && ::service_common::docdb_engine_catalog::is_line_default(
+                            target.version,
+                        ),
+                ),
                 is_major_version_upgrade: Some(major_upgrade),
+                supports_snapshot_upgrade: Some(major_upgrade),
+                supports_data_groups: Some(
+                    ::service_common::docdb_engine_catalog::VERSION_CAPABILITIES.data_groups,
+                ),
             }
         })
         .collect()
 }
 
 /// `DBEngineVersion$DBEngineVersionDescription` for `version`.
+///
+/// The DocumentDB control plane publishes no per-version description of its own: every
+/// version of this engine, and every upgrade target onto one, is described by the product's
+/// own full name, which is the description the shared front door reports for this engine
+/// ([`::service_common::docdb_engine_catalog::ENGINE_DESCRIPTION`]).
 pub fn engine_version_description(version: &str) -> String {
-    format!("{DOCDB_PRODUCT} {version}")
+    let _ = version;
+    ::service_common::docdb_engine_catalog::ENGINE_DESCRIPTION.to_string()
 }
 
 /// One published engine version as the modelled `DBEngineVersion`.
 ///
-/// Every member is DERIVED: the parameter-group family from the version
-/// ([`parameter_group_family`]), the exportable log types from the parameter catalogue
-/// ([`exportable_log_types`]), the supported authorities from the certificate catalogue
-/// ([`supported_ca_certificate_identifiers`]) and the upgrade targets from the published
-/// version list ([`valid_upgrade_targets`]).
+/// Every member is DERIVED: the version split and the parameter-group family from the shared
+/// engine catalog of the front door this service is a view of
+/// ([`::service_common::docdb_engine_catalog`]), the exportable log types from the parameter
+/// catalogue ([`exportable_log_types`]), the supported authorities from the certificate
+/// catalogue ([`supported_ca_certificate_identifiers`]) and the upgrade targets from the
+/// published version list ([`valid_upgrade_targets`]).
+///
+/// The capability members are the ones that front door reports on EVERY engine version,
+/// whichever of its views answers — this engine publishes none of them but the certificate
+/// rotation ([`::service_common::docdb_engine_catalog::VERSION_CAPABILITIES`]) — so a client
+/// that gates on one reads the same answer from this view as from the Amazon RDS view of the
+/// same door, rather than reading it as absent.
 ///
 /// `ServerlessV2FeaturesSupport` reports "any Amazon DocumentDB Serverless properties or
 /// limits that differ between Amazon DocumentDB engine versions"; this emulator publishes
 /// no serverless capacity limits, so the member is left absent rather than invented.
 pub fn engine_version_to_shape(version: &str) -> DBEngineVersion {
     let exportable = exportable_log_types(version);
+    let capabilities = ::service_common::docdb_engine_catalog::VERSION_CAPABILITIES;
+    let published = ::service_common::docdb_engine_catalog::engine_version(version);
     DBEngineVersion {
         engine: Some(DOCDB_ENGINE.to_string()),
         engine_version: Some(version.to_string()),
+        major_engine_version: published.map(|row| row.major.to_string()),
+        minor_engine_version: published.map(|row| row.minor.to_string()),
         db_parameter_group_family: Some(parameter_group_family(version)),
         db_engine_description: Some(DOCDB_ENGINE_DESCRIPTION.to_string()),
         db_engine_version_description: Some(engine_version_description(version)),
@@ -2115,11 +2161,17 @@ pub fn engine_version_to_shape(version: &str) -> DBEngineVersion {
         supports_log_exports_to_cloudwatch_logs: Some(!exportable.is_empty()),
         exportable_log_types: Some(exportable),
         supported_ca_certificate_identifiers: Some(supported_ca_certificate_identifiers()),
-        // "Indicates whether the engine version supports rotating the server certificate
-        // without rebooting the DB instance": Amazon DocumentDB rotates a cluster's server
-        // certificate without a restart of its instances for every version it publishes
-        // ("Updating your Amazon DocumentDB TLS certificates").
-        supports_certificate_rotation_without_restart: Some(true),
+        supports_certificate_rotation_without_restart: Some(
+            capabilities.certificate_rotation_without_restart,
+        ),
+        supports_read_replica: Some(capabilities.read_replica),
+        supports_cluster: Some(capabilities.cluster),
+        supports_global_databases: Some(capabilities.global_databases),
+        supports_rds_proxy: Some(capabilities.rds_proxy),
+        supports_parallel_query: Some(capabilities.parallel_query),
+        supports_babelfish: Some(capabilities.babelfish),
+        supports_limitless_database: Some(capabilities.limitless_database),
+        supports_data_groups: Some(capabilities.data_groups),
         serverless_v2_features_support: None,
     }
 }
@@ -2127,76 +2179,18 @@ pub fn engine_version_to_shape(version: &str) -> DBEngineVersion {
 /// The event source types this service publishes a category map for, each with the event
 /// categories of that source type.
 ///
-/// It is NARROWER than the set of source types the shared front door accepts, which
+/// It is the SHARED catalog of the one `rds` front door this service is a view of
+/// ([`::service_common::rds_event_categories::EVENT_CATEGORIES`]), re-exported here rather
+/// than restated: Amazon DocumentDB, Amazon RDS and Amazon Neptune are three views of that
+/// one door, `DescribeEventCategories` answers all three from the one published catalog,
+/// and a view that held its own copy published rows — and an order — the front door does
+/// not. The rows are published in the catalog's own order and each row's categories in
+/// theirs, neither of them sorted.
+///
+/// It is NARROWER than the set of source types that front door ACCEPTS, which
 /// [`invalid_event_source_type_message`] names: a map is published only for a source type
-/// whose categories this emulator can cite. Every name here is a value the model's
-/// `SourceType` declares (`smithy_query(query="shape",shape="SourceType")`), in the order
-/// that front door names them.
-///
-/// The categories of each are the ones published for this front door's event source types
-/// ("Amazon RDS event categories and event messages", whose tables cover the cluster,
-/// instance, parameter-group, security-group and snapshot source types this one endpoint
-/// serves), in the order that table lists them, which is alphabetical: the wire order of
-/// `EventCategories` is documented neither in the model nor in the API reference, so the
-/// ONE order this catalogue can state a source for is the published table's.
-///
-/// `db-cluster` carries the two categories only a CLUSTER has — it is migrated onto the
-/// service (`migration`) and it runs serverless capacity (`serverless`) — beside the
-/// categories a cluster shares with the other source types: both are rows of the published
-/// cluster event table, and a client builds a `CreateEventSubscription` `EventCategories`
-/// argument out of this map, so a category the service accepts has to be in it.
-pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
-    (
-        "db-instance",
-        &[
-            "availability",
-            "backup",
-            "configuration change",
-            "creation",
-            "deletion",
-            "failover",
-            "failure",
-            "low storage",
-            "maintenance",
-            "notification",
-            "read replica",
-            "recovery",
-            "restoration",
-            "security patching",
-        ],
-    ),
-    ("db-security-group", &["configuration change", "failure"]),
-    ("db-parameter-group", &["configuration change"]),
-    (
-        "db-snapshot",
-        &["creation", "deletion", "notification", "restoration"],
-    ),
-    (
-        "db-cluster",
-        &[
-            "configuration change",
-            "creation",
-            "deletion",
-            "failover",
-            "failure",
-            "global-failover",
-            "maintenance",
-            "migration",
-            "notification",
-            "serverless",
-        ],
-    ),
-    ("db-cluster-snapshot", &["backup", "notification"]),
-];
-
-/// The event categories of `source_type`, or `None` when it names no published source
-/// type. Matching is exact: the documented source types are all lowercase.
-pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]> {
-    EVENT_CATEGORIES
-        .iter()
-        .find(|(published, _)| *published == source_type)
-        .map(|(_, categories)| *categories)
-}
+/// whose categories this emulator can cite.
+pub use ::service_common::rds_event_categories::{event_categories_of, EVENT_CATEGORIES};
 
 /// One source type's categories as the modelled `EventCategoriesMap`.
 pub fn event_categories_to_shape(source_type: &str, categories: &[&str]) -> EventCategoriesMap {
@@ -2290,29 +2284,73 @@ pub const DOCDB_LICENSE_MODEL: &str = "na";
 
 /// One (engine version, instance class) pair as the modelled `OrderableDBInstanceOption`.
 ///
-/// The zones are the ones of the request's Region this service places a resource in
-/// ([`default_availability_zones`]), so a caller that picks a zone out of an option can
-/// create a cluster in it; `Vpc` is true because every endpoint this emulator serves is
-/// reached inside a VPC; and the storage type is the one a cluster member reports
-/// ([`DEFAULT_STORAGE_TYPE`]), since a DocumentDB cluster — not its instance — owns the
-/// storage.
+/// The zones are the ones the REGION exposes
+/// ([`::service_common::aws_availability_zones`]) — an option is offered in every zone of
+/// the Region, which is a longer list than the three a single cluster spreads itself over
+/// ([`default_availability_zones`]) — so a caller that places an instance in a zone this
+/// report names is not refused a zone the Region in fact offers. `Vpc` is true because every
+/// endpoint this emulator serves is reached inside a VPC; and the storage type is the one a
+/// cluster member reports ([`DEFAULT_STORAGE_TYPE`]), since a DocumentDB cluster — not its
+/// instance — owns the storage.
+///
+/// The capability members are the ones the shared front door reports on EVERY orderable
+/// option, answered for this engine from the one catalog both of its views read
+/// ([`::service_common::docdb_engine_catalog::OPTION_CAPABILITIES`]): this is the call a
+/// client makes before a create to decide what it may order, so a capability its cluster
+/// member does not have is reported false rather than left absent, and one it does have is
+/// reported rather than hidden.
 pub fn orderable_option_to_shape(
     version: &str,
     instance_class: &str,
     region: &str,
 ) -> OrderableDBInstanceOption {
+    let capabilities = ::service_common::docdb_engine_catalog::OPTION_CAPABILITIES;
     OrderableDBInstanceOption {
         engine: Some(DOCDB_ENGINE.to_string()),
         engine_version: Some(version.to_string()),
         db_instance_class: Some(instance_class.to_string()),
         license_model: Some(DOCDB_LICENSE_MODEL.to_string()),
         availability_zones: Some(
-            default_availability_zones(region)
+            ::service_common::aws_availability_zones::availability_zones(region)
                 .into_iter()
                 .map(|zone| AvailabilityZone { name: Some(zone) })
                 .collect(),
         ),
         vpc: Some(true),
         storage_type: Some(DEFAULT_STORAGE_TYPE.to_string()),
+        multi_az_capable: Some(capabilities.multi_az_capable),
+        read_replica_capable: Some(capabilities.read_replica_capable),
+        supports_storage_encryption: Some(capabilities.storage_encryption),
+        supports_iops: Some(capabilities.iops),
+        supports_storage_throughput: Some(capabilities.storage_throughput),
+        supports_enhanced_monitoring: Some(capabilities.enhanced_monitoring),
+        supports_iam_database_authentication: Some(capabilities.iam_database_authentication),
+        supports_performance_insights: Some(capabilities.performance_insights),
+        outpost_capable: Some(capabilities.outpost_capable),
+        supports_clusters: Some(capabilities.clusters),
+        supports_global_databases: Some(capabilities.global_databases),
+        supports_http_endpoint: Some(capabilities.http_endpoint),
+        supports_optimized_reads: Some(capabilities.optimized_reads),
+        supports_optimized_writes: Some(capabilities.optimized_writes),
+        supports_kerberos_authentication: Some(capabilities.kerberos_authentication),
+        supports_dedicated_log_volume: Some(capabilities.dedicated_log_volume),
+        supports_additional_storage_volumes: Some(capabilities.additional_storage_volumes),
+        requires_custom_processor_features: Some(
+            capabilities.requires_custom_processor_features,
+        ),
+        supported_engine_modes: Some(strings(
+            ::service_common::docdb_engine_catalog::ENGINE_MODES,
+        )),
+        supported_activity_stream_modes: Some(strings(
+            ::service_common::docdb_engine_catalog::ACTIVITY_STREAM_MODES,
+        )),
+        supported_network_types: Some(strings(
+            ::service_common::docdb_engine_catalog::NETWORK_TYPES,
+        )),
     }
+}
+
+/// A published list of literals as the owned strings a wire shape's list member takes.
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
 }

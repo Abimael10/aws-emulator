@@ -354,8 +354,20 @@ async fn an_entrys_upgrade_targets_are_the_engines_later_builds_each_classified(
                 .iter()
                 .map(|target| text(target, "EngineVersion"))
                 .collect();
+            // A later build of the same engine is an upgrade target unless that engine
+            // publishes a floor on the major line an in-place major version upgrade can land
+            // on: the document engine does, and the shared catalog of that engine holds the
+            // rule its own control plane publishes.
             let later: Vec<String> = order[index + 1..]
                 .iter()
+                .filter(|later_version| {
+                    engine != ::service_common::docdb_engine_catalog::ENGINE
+                        || ::service_common::docdb_engine_catalog::upgrade_targets(
+                            &version.engine_version,
+                        )
+                        .iter()
+                        .any(|reachable| reachable.version == **later_version)
+                })
                 .map(|version| (*version).to_string())
                 .collect();
             assert_eq!(

@@ -108,7 +108,10 @@ const CAPABILITIES: &[Capabilities] = &[
         engine: "docdb",
         class: "db.r5.2xlarge",
         multi_az_capable: false,
-        read_replica_capable: true,
+        // A reader of this engine's cluster is another MEMBER of that cluster rather than an
+        // RDS read replica, which is what the shared capability set of the document engine
+        // publishes (`::service_common::docdb_engine_catalog::OPTION_CAPABILITIES`).
+        read_replica_capable: false,
         supports_enhanced_monitoring: false,
         supports_performance_insights: true,
         supports_iam_database_authentication: false,

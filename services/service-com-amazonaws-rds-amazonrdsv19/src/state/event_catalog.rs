@@ -5,107 +5,12 @@ use super::*;
 /// The event source types and their categories, as `DescribeEventCategories` reports
 /// them.
 ///
-/// The ORDER of this catalog is the order the report publishes, entry for entry and
-/// category for category: neither the model nor the API reference states a sort rule for
-/// either list, so the sequence is the front door's own published one and the handler emits
-/// it unchanged — a client that indexes this report positionally, or renders it as the
-/// ordered list it is, reads the source type the service names at that position. The
-/// source-type sequence below, and the category sequence of the entries the front door's
-/// own report is evidenced for (`db-snapshot`, `db-instance`, `db-cluster`, `db-proxy`), are
-/// that published sequence; the remaining entries carry their categories in the order the
-/// published event table lists them. It is NOT the order
-/// `DescribeEventCategoriesMessage$SourceType`'s prose happens to name the types in, and
-/// not an alphabetical sort of either list — no entry here is sorted, and an entry that
-/// were would report a sequence the service never publishes.
-///
-/// The SETS are the ones published in "Amazon RDS event categories and event messages"
-/// (Amazon RDS User Guide), one entry per source type this front door publishes a map for.
-///
-/// `db-instance` carries the two categories that table lists beyond the ones a DB
-/// instance shares with the other source types — `backtrack` (an Aurora MySQL backtrack
-/// event) and `security` — because a client builds a `CreateEventSubscription`
-/// `EventCategories` argument out of this map and AWS accepts both for that source type;
-/// `db-cluster-snapshot` carries `notification` beside `backup` for the same reason.
-///
-/// A source type the model's `SourceType` enum
-/// (`smithy_query(query="shape",shape="SourceType")`) carries but this member's prose does
-/// not list is published too, at the position the published report names it in, when this
-/// emulator can cite the categories that source type publishes: `custom-engine-version` is
-/// one — the published custom-engine-version event table carries a single `failure` event —
-/// and a client that subscribes to a source type has to be able to read its categories from
-/// this one map. The three remaining enum values — `blue-green-deployment`,
-/// `db-shard-group` and `zero-etl` — have no published category table this emulator can
-/// cite, so it publishes no map for them rather than an invented one, and a request naming
-/// one is refused with the code a value this parameter does not accept gets, naming the
-/// set it is not in.
-pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
-    (
-        "db-snapshot",
-        &["notification", "creation", "deletion", "restoration"],
-    ),
-    ("db-parameter-group", &["configuration change"]),
-    (
-        // The DB instance entry's own published sequence, which is NOT an alphabetical sort
-        // of its categories: the report publishes each source type's categories in the order
-        // that source type's own entry declares them, and this one declares them as the
-        // published report names them.
-        "db-instance",
-        &[
-            "backup",
-            "deletion",
-            "availability",
-            "creation",
-            "low storage",
-            "restoration",
-            "configuration change",
-            "failover",
-            "maintenance",
-            "failure",
-            "notification",
-            "read replica",
-            "recovery",
-            "security",
-            "backtrack",
-            "security patching",
-        ],
-    ),
-    ("db-security-group", &["configuration change", "failure"]),
-    ("db-cluster-snapshot", &["backup", "notification"]),
-    (
-        "db-cluster",
-        &[
-            "failover",
-            // The two categories only a CLUSTER publishes: it is migrated onto the
-            // service (`migration`), and it runs serverless capacity (`serverless`).
-            // Both are rows of the published DB cluster event table and both are
-            // categories a cluster subscription may name.
-            "migration",
-            "failure",
-            "notification",
-            "serverless",
-            "creation",
-            "deletion",
-            "maintenance",
-            "configuration change",
-            "global-failover",
-        ],
-    ),
-    // The published custom-engine-version event table has one row, a failed CEV creation.
-    ("custom-engine-version", &["failure"]),
-    (
-        "db-proxy",
-        &["creation", "configuration change", "deletion", "failure"],
-    ),
-];
-
-/// The event categories of `source_type`, or `None` when it names no published source
-/// type. Matching is exact: the documented values are all lowercase.
-pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]> {
-    EVENT_CATEGORIES
-        .iter()
-        .find(|(published, _)| *published == source_type)
-        .map(|(_, categories)| *categories)
-}
+/// It is the SHARED catalog of the one front door
+/// ([`::service_common::rds_event_categories::EVENT_CATEGORIES`]), re-exported here rather
+/// than restated: Amazon RDS, Amazon DocumentDB and Amazon Neptune are three views of that
+/// one door and the report answers all three from one table, so no view can publish rows,
+/// or an order, the others do not.
+pub use ::service_common::rds_event_categories::{event_categories_of, EVENT_CATEGORIES};
 
 /// The message the refusal of a `SourceType` that names no published event source type
 /// carries.

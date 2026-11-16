@@ -234,9 +234,10 @@ async fn describe_db_engine_versions_derives_every_member_from_the_catalogues() 
     let listed = docdb
         .ok("every version", "DescribeDBEngineVersions", &[])
         .await;
+    let published_versions = state::engine_versions();
     assert_eq!(
         count(&listed, "DBEngineVersion"),
-        state::DOCDB_ENGINE_VERSIONS.len(),
+        published_versions.len(),
         "case \"every version\": expected one record per published engine version, got {listed}"
     );
 
@@ -244,7 +245,7 @@ async fn describe_db_engine_versions_derives_every_member_from_the_catalogues() 
     // authorities, the exportable log types and the upgrade targets are each DERIVED, so
     // each is asserted against the catalogue it is derived from rather than against a
     // literal.
-    for (index, version) in state::DOCDB_ENGINE_VERSIONS.iter().enumerate() {
+    for version in published_versions.iter() {
         let one = docdb
             .ok(
                 version,
@@ -252,9 +253,21 @@ async fn describe_db_engine_versions_derives_every_member_from_the_catalogues() 
                 &[("EngineVersion", version)],
             )
             .await;
-        let expected_targets: Vec<String> = state::DOCDB_ENGINE_VERSIONS[index + 1..]
+        // The upgrade targets are the shared catalog's own rule: a later minor release of
+        // the line the version runs, and a release of a later major line the engine upgrades
+        // in place to.
+        let targets = ::service_common::docdb_engine_catalog::upgrade_targets(version);
+        let expected_targets: Vec<String> = targets
             .iter()
-            .map(|target| (*target).to_string())
+            .map(|target| target.version.to_string())
+            .collect();
+        let major_upgrades: Vec<String> = targets
+            .iter()
+            .map(|target| {
+                (::service_common::docdb_engine_catalog::engine_version(version)
+                    .is_some_and(|from| from.major != target.major))
+                .to_string()
+            })
             .collect();
         let reported_targets: Vec<String> = texts(&one, "EngineVersion")
             .into_iter()
@@ -284,19 +297,25 @@ async fn describe_db_engine_versions_derives_every_member_from_the_catalogues() 
             "case {version:?}: expected the record derived from the published catalogues, got \
              {one}"
         );
-        // Every upgrade target of a published version opens a new major line, so each is a
-        // major-version upgrade and none is taken automatically.
+        // A target of a later major line is a major-version upgrade and one inside the
+        // version's own line is not; a target is taken automatically exactly when it is the
+        // DEFAULT release of the line the version already runs.
+        let automatic: Vec<String> = targets
+            .iter()
+            .map(|target| {
+                (::service_common::docdb_engine_catalog::engine_version(version)
+                    .is_some_and(|from| from.major == target.major)
+                    && ::service_common::docdb_engine_catalog::is_line_default(target.version))
+                .to_string()
+            })
+            .collect();
         assert_eq!(
             (
                 texts(&one, "IsMajorVersionUpgrade"),
                 texts(&one, "AutoUpgrade"),
             ),
-            (
-                vec!["true".to_string(); expected_targets.len()],
-                vec!["false".to_string(); expected_targets.len()],
-            ),
-            "case {version:?}: every published upgrade target is a major-version upgrade that \
-             is not taken automatically, got {one}"
+            (major_upgrades.clone(), automatic.clone()),
+            "case {version:?}: expected the upgrade kinds of the published targets, got {one}"
         );
         // The authorities are the ones the certificate catalogue offers this engine, and
         // the log types the ones the family's parameter catalogue can switch on. Both lists
@@ -320,16 +339,26 @@ async fn describe_db_engine_versions_derives_every_member_from_the_catalogues() 
         );
     }
 
-    // Each documented filter, including the values that select nothing.
-    let newest = state::DOCDB_ENGINE_VERSIONS[state::DOCDB_ENGINE_VERSIONS.len() - 1];
+    // Each documented filter, including the values that select nothing. A line the catalogue
+    // publishes several releases of selects all of them, which is what makes the line filter
+    // a filter rather than a lookup.
+    let newest = published_versions[published_versions.len() - 1];
     let newest_family = state::parameter_group_family(newest);
+    let newest_line = published_versions
+        .iter()
+        .filter(|version| state::parameter_group_family(version) == newest_family)
+        .count();
     let rows: [FilterRow<'_>; 7] = [
-        ("this engine", vec![("Engine", "docdb")], state::DOCDB_ENGINE_VERSIONS.len()),
-        ("this engine, mixed case", vec![("Engine", "DocDB")], state::DOCDB_ENGINE_VERSIONS.len()),
+        ("this engine", vec![("Engine", "docdb")], published_versions.len()),
+        ("this engine, mixed case", vec![("Engine", "DocDB")], published_versions.len()),
         ("another engine", vec![("Engine", "mysql")], 0),
-        ("a major line", vec![("EngineVersion", state::engine_major_version(newest))], 1),
+        (
+            "a major line",
+            vec![("EngineVersion", state::engine_major_version(newest))],
+            newest_line,
+        ),
         ("a version the engine does not publish", vec![("EngineVersion", "1.2.3")], 0),
-        ("a family", vec![("DBParameterGroupFamily", &newest_family)], 1),
+        ("a family", vec![("DBParameterGroupFamily", &newest_family)], newest_line),
         ("the default only", vec![("DefaultOnly", "true")], 1),
     ];
     for (case, params, expected) in rows {
@@ -341,8 +370,8 @@ async fn describe_db_engine_versions_derives_every_member_from_the_catalogues() 
         );
     }
 
-    // `DefaultOnly` reports the latest version, which is the one a create without an
-    // `EngineVersion` gets.
+    // `DefaultOnly` reports the engine's default version, which is the one a create without
+    // an `EngineVersion` gets.
     let default_only = docdb
         .ok(
             "the default only",
@@ -442,7 +471,7 @@ async fn describe_event_categories_publishes_every_declared_source_type() {
     // sentence names the types that ARE valid, built from the same catalogue the report is
     // built from.
     let expected_message = state::invalid_event_source_type_message();
-    for case in ["db-proxy", "not-a-source-type", "DB-CLUSTER"] {
+    for case in ["blue-green-deployment", "not-a-source-type", "DB-CLUSTER"] {
         let refused = docdb
             .call("DescribeEventCategories", &[("SourceType", case)])
             .await;
@@ -474,12 +503,17 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
     let docdb = Docdb::new();
 
     let classes = state::instance_classes();
-    let versions = state::DOCDB_ENGINE_VERSIONS.len();
+    let published_versions = state::engine_versions();
+    let versions = published_versions.len();
     let expected_total = versions * classes.len();
-    let zones = state::default_availability_zones(REGION);
+    // An option is offered in every zone of the Region, which is a longer list than the
+    // three zones one cluster spreads itself over.
+    let zones = ::service_common::aws_availability_zones::availability_zones(REGION);
+    let page_size = state::MAX_MAX_RECORDS as usize;
 
-    // The whole matrix, in one page: every published version crossed with every class a
-    // cluster member can be ordered in.
+    // The whole matrix is every published version crossed with every class a cluster member
+    // can be ordered in, and it is longer than one page: the first page carries the records
+    // the caller may ask for and hands back the marker the rest are read beyond.
     let listed = docdb
         .ok(
             "every option",
@@ -489,10 +523,16 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
         .await;
     assert_eq!(
         count(&listed, "OrderableDBInstanceOption"),
-        expected_total,
-        "case \"every option\": expected {versions} version(s) crossed with {} class(es), got \
-         {listed}",
+        expected_total.min(page_size),
+        "case \"every option\": expected {versions} version(s) crossed with {} class(es), one \
+         page at a time, got {listed}",
         classes.len()
+    );
+    assert_eq!(
+        text(&listed, "Marker").is_empty(),
+        expected_total <= page_size,
+        "case \"every option\": a catalogue longer than one page hands back a marker, got \
+         {listed}"
     );
     assert_eq!(
         (
@@ -523,8 +563,8 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
          VPC, on the storage a cluster manages, got {listed}"
     );
 
-    // Each option is offered in the zones of the request's Region — the same zones a
-    // cluster is placed in, so a caller can create in a zone it read here.
+    // Each option is offered in the zones of the request's Region, so a caller can place an
+    // instance in any zone it read here.
     let one = docdb
         .ok(
             "one option",
@@ -561,7 +601,7 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
                 ("LicenseModel", state::DOCDB_LICENSE_MODEL),
                 ("MaxRecords", "100"),
             ],
-            expected_total,
+            expected_total.min(page_size),
         ),
         (
             "another licence",

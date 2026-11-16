@@ -774,14 +774,19 @@ const DB2_WITH_REPLICA: VersionProfile = VersionProfile::provisioned()
 const DB2: VersionProfile = VersionProfile::provisioned().features(DB2_FEATURE_NAMES);
 
 /// Amazon DocumentDB: a cluster engine, provisioned like Aurora, whose instances are
-/// cluster members (so `SupportsReadReplica` is reported, as that control plane's own
-/// read report does) and whose clusters join a global cluster
-/// (`CreateGlobalCluster` in the DocumentDB model). It publishes no serverless mode of
-/// its own and none of the Aurora-specific capabilities.
-const DOCDB: VersionProfile = VersionProfile::provisioned()
-    .read_replica()
-    .global_databases()
-    .certificate_rotation_without_restart();
+/// cluster members and whose storage, readers and Regions the CLUSTER owns.
+///
+/// It publishes none of the capability flags this report carries beside rotating the server
+/// certificate without a restart: the capability answers for this engine are the ones the
+/// shared catalog of the DocumentDB engine holds
+/// ([`::service_common::docdb_engine_catalog::VERSION_CAPABILITIES`], which the suite in
+/// `tests/all/db_engine_versions.rs` holds these rows to), so the two views of this one
+/// front door that answer for the engine cannot report different capabilities for one
+/// version — a reader of this engine's cluster is another MEMBER of that cluster rather than
+/// an RDS read replica, and a DocumentDB global cluster is a resource of its own control
+/// plane rather than a capability this report publishes on the version.
+const DOCDB: VersionProfile =
+    VersionProfile::provisioned().certificate_rotation_without_restart();
 
 /// Amazon Neptune, the same kind of cluster engine with its own global database, from the
 /// release that offers Neptune Serverless on.
@@ -1381,6 +1386,33 @@ const fn row(
     }
 }
 
+/// The catalogue row of the Amazon DocumentDB engine version `version`, read from the
+/// SHARED catalog of that engine
+/// ([`::service_common::docdb_engine_catalog::published_row`]).
+///
+/// The version string, its major line and that line's parameter-group family come from
+/// there, so this view and the DocumentDB view of the same front door publish one version
+/// list rather than two; what stays here is what this report adds — whether AWS still offers
+/// the version for a new cluster, and whether it is a default. The row is keyed by the
+/// VERSION rather than by a position in that catalog, so a version added there cannot
+/// silently re-assign another version's status or default level.
+const fn docdb_row(
+    version: &'static str,
+    status: &'static str,
+    default_level: DefaultLevel,
+) -> CatalogVersion {
+    let published = ::service_common::docdb_engine_catalog::published_row(version);
+    row(
+        ::service_common::docdb_engine_catalog::ENGINE,
+        published.version,
+        published.major,
+        published.family,
+        status,
+        default_level,
+        &DOCDB,
+    )
+}
+
 /// The DB engine versions this service reports.
 ///
 /// Reference data, like the engine facts above: AWS publishes an engine-version list per
@@ -1842,56 +1874,35 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         &DB2_WITH_REPLICA,
     ),
     // --- Amazon DocumentDB ------------------------------------------------
-    // The Amazon DocumentDB engine versions this front door publishes: 3.6, 4.0, 5.0 and
-    // 8.0 are DocumentDB's major versions — the recorded report of the 3.6 entry names
-    // both 5.0 and 8.0 among its major-version upgrade targets (trace
-    // `rds-catalog-describe-db-engine-versions-custom-sqlserver-web-oracle-ee`, the
-    // `docdb` step), which is the only source for the `docdb8.0` family name.
-    // `CreateDBClusterMessage$EngineVersion` in that model states that "the
-    // --engine-version will default to the latest major engine version"; the engine
-    // default below is 5.0, the latest major version this catalogue publishes on more
-    // than an upgrade-target list.
-    row(
-        "docdb",
-        "3.6.0",
-        "3.6",
-        "docdb3.6",
-        STATUS_DEPRECATED,
-        DefaultLevel::Major,
-        &DOCDB,
-    ),
-    row(
-        "docdb",
-        "4.0.0",
-        "4.0",
-        "docdb4.0",
-        STATUS_AVAILABLE,
-        DefaultLevel::Major,
-        &DOCDB,
-    ),
-    row(
-        "docdb",
-        "5.0.0",
-        "5.0",
-        "docdb5.0",
-        STATUS_AVAILABLE,
-        DefaultLevel::Engine,
-        &DOCDB,
-    ),
-    // The 8.0 family is published because the recorded 3.6 entry names 8.0.x among its
+    // The Amazon DocumentDB engine versions this front door publishes, read ROW FOR ROW
+    // from the shared catalog of that engine
+    // (`::service_common::docdb_engine_catalog::ENGINE_VERSIONS`): the DocumentDB view of
+    // this one door reports the same versions for it, so the version list, each version's
+    // major line and each line's parameter-group family are held once and projected twice
+    // rather than written out here and there. `tests/all/db_engine_versions.rs` holds these
+    // rows to that catalog.
+    //
+    // `CreateDBClusterMessage$EngineVersion` in that model states that "the --engine-version
+    // will default to the latest major engine version"; the engine default below is the
+    // version the shared catalog publishes as the engine's own
+    // (`docdb_engine_catalog::DEFAULT_ENGINE_VERSION`), the newest release of the latest major
+    // line this catalogue publishes an engine-version listing for. The 8.0 family is
+    // published because the recorded report of the 3.6 entry names 8.0.x among its
     // major-version upgrade targets, which is evidence the family is SERVED; it is not
-    // evidence of which version a cluster created without an `EngineVersion` gets, so
-    // the engine's default stays on 5.0 until an engine-version listing of 8.0 says
-    // otherwise.
-    row(
-        "docdb",
-        "8.0.0",
-        "8.0",
-        "docdb8.0",
-        STATUS_AVAILABLE,
-        DefaultLevel::Major,
-        &DOCDB,
-    ),
+    // evidence of which version a cluster created without an `EngineVersion` gets.
+    //
+    // The default of a LINE is its newest release, which is what an automatic minor version
+    // upgrade moves onto and what a request naming the line resolves to; the engine's own
+    // default is the line default of the latest line this catalogue lists engine versions
+    // for (`docdb_engine_catalog::DEFAULT_ENGINE_VERSION`), so exactly one row of each line
+    // is its default and the engine default is one of them.
+    docdb_row("3.6.0", STATUS_DEPRECATED, DefaultLevel::Major),
+    docdb_row("4.0.0", STATUS_AVAILABLE, DefaultLevel::Major),
+    docdb_row("5.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
+    docdb_row("5.0.1", STATUS_AVAILABLE, DefaultLevel::Neither),
+    docdb_row("5.0.2", STATUS_AVAILABLE, DefaultLevel::Engine),
+    docdb_row("8.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
+    docdb_row("8.0.1", STATUS_AVAILABLE, DefaultLevel::Major),
     // --- MariaDB ----------------------------------------------------------
     row(
         "mariadb",
@@ -3126,6 +3137,7 @@ fn valid_upgrade_targets(
         .iter()
         .skip(index.saturating_add(1))
         .filter(|target| target.engine == entry.engine)
+        .filter(|target| upgrades_in_place(entry, target))
         .map(|target| {
             let within_one_major = target.major_engine_version == entry.major_engine_version;
             UpgradeTarget {
@@ -3161,9 +3173,30 @@ fn valid_upgrade_targets(
                     target.profile.supports_local_write_forwarding,
                 ),
                 supports_integrations: Some(target.profile.supports_integrations),
+                // Reported beside the engine version's own `SupportsDataGroups`, for the
+                // same reason every other capability of a target is: a caller decides
+                // whether to take an upgrade by what it would be running afterwards.
+                supports_data_groups: Some(target.profile.supports_data_groups),
             }
         })
         .collect()
+}
+
+/// Whether `entry` can be upgraded IN PLACE to `target`, both rows of one engine.
+///
+/// A later version of the same engine is reachable unless that engine publishes a floor on
+/// the major line an in-place major version upgrade can land on. Amazon DocumentDB does:
+/// the shared catalog of that engine holds the rule its own control plane publishes
+/// ([`::service_common::docdb_engine_catalog::upgrade_targets`]), so this report's upgrade
+/// path for a DocumentDB version is the one the DocumentDB view of the same front door
+/// reports, rather than every later row of the table.
+fn upgrades_in_place(entry: &CatalogVersion, target: &CatalogVersion) -> bool {
+    if entry.engine != ::service_common::docdb_engine_catalog::ENGINE {
+        return true;
+    }
+    ::service_common::docdb_engine_catalog::upgrade_targets(entry.engine_version)
+        .iter()
+        .any(|reachable| reachable.version == target.engine_version)
 }
 
 /// `MinorEngineVersion` — the part of `engine_version` that follows its
@@ -3216,6 +3249,13 @@ fn reports_replication_log_capabilities(engine: &str) -> bool {
 /// that version — except Microsoft SQL Server, whose product is named by its RELEASE YEAR
 /// ([`sqlserver_product_year`]).
 fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
+    if facts.engine == ::service_common::docdb_engine_catalog::ENGINE {
+        // The document engine's control plane publishes no per-version description: every
+        // version of it, and every upgrade target onto one, is described by the product's
+        // own full name, which is the description the shared catalog of that engine holds
+        // for both views of this front door.
+        return ::service_common::docdb_engine_catalog::ENGINE_DESCRIPTION.to_string();
+    }
     if facts.engine == "aurora-postgresql" {
         return format!(
             "{} (Compatible with PostgreSQL {engine_version})",
@@ -3361,6 +3401,19 @@ fn to_wire(
 ) -> CreateCustomDBEngineVersionOutput {
     let profile = entry.profile;
     let character_sets = character_set_members(facts, input);
+    // The log types a version can export are the VERSION's where the engine's own control
+    // plane publishes them per version — the document engine's are read from its shared
+    // catalog, so an early version does not claim a log export its cluster has no parameter
+    // to switch on — and the engine's otherwise.
+    let exportable: Vec<String> =
+        if entry.engine == ::service_common::docdb_engine_catalog::ENGINE {
+            ::service_common::docdb_engine_catalog::exportable_log_types(entry.engine_version)
+                .into_iter()
+                .map(|log_type| log_type.to_string())
+                .collect()
+        } else {
+            strings(facts.exportable_log_types)
+        };
     CreateCustomDBEngineVersionOutput {
         engine: Some(entry.engine.to_string()),
         engine_version: Some(entry.engine_version.to_string()),
@@ -3402,8 +3455,8 @@ fn to_wire(
             entry.engine,
             certificates,
         )),
-        exportable_log_types: Some(strings(facts.exportable_log_types)),
-        supports_log_exports_to_cloudwatch_logs: Some(!facts.exportable_log_types.is_empty()),
+        exportable_log_types: Some(exportable.clone()),
+        supports_log_exports_to_cloudwatch_logs: Some(!exportable.is_empty()),
         supports_read_replica: Some(profile.supports_read_replica),
         supports_global_databases: Some(profile.supports_global_databases),
         supports_parallel_query: Some(profile.supports_parallel_query),

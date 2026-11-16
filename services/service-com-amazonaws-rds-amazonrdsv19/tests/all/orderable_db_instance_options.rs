@@ -187,13 +187,9 @@ async fn an_engines_options_are_its_available_versions_crossed_with_its_classes(
             );
             assert_eq!(
                 texts(&zones[0], "Name"),
-                vec![
-                    format!("{REGION}a"),
-                    format!("{REGION}b"),
-                    format!("{REGION}c")
-                ],
-                "case {engine:?}: an option's zones are the zones of the region the \
-                 request was signed for, got {}",
+                ::service_common::aws_availability_zones::availability_zones(REGION),
+                "case {engine:?}: an option's zones are the zones the region the \
+                 request was signed for publishes, got {}",
                 option.xml
             );
             // Aurora storage is cluster-managed, so an Aurora option reports no storage
@@ -250,8 +246,10 @@ async fn an_engines_options_are_its_available_versions_crossed_with_its_classes(
 async fn an_options_zones_follow_the_region_the_request_is_signed_for() {
     let router = emulator();
 
-    // RDS is regional, so the zones an option is offered in are the signed region's.
-    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+    // RDS is regional, so the zones an option is offered in are the signed region's own
+    // published zones: a Region exposes at least three and several expose more, so the rows
+    // below span a Region of each kind.
+    for region in ["us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1", "ap-southeast-2"] {
         let case = format!("options in {region}");
         let body = expect_ok(
             &case,
@@ -275,11 +273,7 @@ async fn an_options_zones_follow_the_region_the_request_is_signed_for() {
             let zones = subtrees(&option.xml, "AvailabilityZones");
             assert_eq!(
                 texts(&zones[0], "Name"),
-                vec![
-                    format!("{region}a"),
-                    format!("{region}b"),
-                    format!("{region}c")
-                ],
+                ::service_common::aws_availability_zones::availability_zones(region),
                 "case {case:?}: got {}",
                 option.xml
             );

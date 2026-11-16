@@ -681,6 +681,7 @@ pub struct UpgradeTarget {
     pub supports_limitless_database: Option<bool>,
     pub supports_local_write_forwarding: Option<bool>,
     pub supports_integrations: Option<bool>,
+    pub supports_data_groups: Option<bool>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.rds#Timezone")]

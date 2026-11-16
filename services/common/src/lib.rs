@@ -265,6 +265,18 @@
 //! epoch-seconds number.
 
 pub mod rds_cluster_parameters;
+/// The Amazon DocumentDB engine catalog the one `rds` front door publishes — its engine
+/// versions, their upgrade targets and the capabilities a version and an orderable option of
+/// it report — shared by the two views of that door which answer for this engine.
+pub mod docdb_engine_catalog;
+/// The Availability Zone names a Region exposes, for the reports that offer a resource in
+/// the zones of a Region.
+pub mod aws_availability_zones;
+/// The event source types the one `rds` front door publishes a category map for, and the
+/// categories of each — one catalog for the three service views it serves, so
+/// `DescribeEventCategories` answers every view with the rows, and the order, that front
+/// door publishes.
+pub mod rds_event_categories;
 /// The event source types the one `rds` front door accepts, and the sentence it refuses a
 /// `SourceType` outside them with — one set for the three service views it serves.
 pub mod rds_event_source_types;

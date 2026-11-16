@@ -200,10 +200,13 @@ impl ClusterParameterSpec {
 /// catalog covers the family a group was created with.
 pub const DOCDB_PARAMETER_GROUP_FAMILY_PREFIX: &str = "docdb";
 
-/// The cluster parameter group families Amazon DocumentDB publishes, as the Amazon
-/// DocumentDB Developer Guide lists them (one per engine major version: 3.6, 4.0 and 5.0).
-/// A `docdb`-prefixed family outside this set names no DocumentDB engine version.
-pub const DOCDB_PARAMETER_GROUP_FAMILIES: [&str; 3] = ["docdb3.6", "docdb4.0", "docdb5.0"];
+/// The cluster parameter group families Amazon DocumentDB publishes, one per engine major
+/// version, as the engine catalog of the one `rds` front door publishes those versions
+/// ([`crate::docdb_engine_catalog::parameter_group_families`], which the test below holds
+/// this list to): a family exists exactly for a major line that door serves. A
+/// `docdb`-prefixed family outside this set names no DocumentDB engine version.
+pub const DOCDB_PARAMETER_GROUP_FAMILIES: [&str; 4] =
+    ["docdb3.6", "docdb4.0", "docdb5.0", "docdb8.0"];
 
 /// The cluster parameters the Amazon DocumentDB families publish.
 ///
@@ -938,6 +941,33 @@ mod tests {
         );
     }
 
+    /// The families this catalog publishes are the ones the shared engine catalog's major
+    /// lines name: a family of a line that door does not serve would publish parameters for
+    /// an engine version nothing can run, and a line with no family would refuse the default
+    /// group of a version the door does serve.
+    #[test]
+    fn the_published_families_are_the_engine_catalogs_major_lines() {
+        let from_engine_catalog = crate::docdb_engine_catalog::parameter_group_families();
+        assert_eq!(
+            DOCDB_PARAMETER_GROUP_FAMILIES.to_vec(),
+            from_engine_catalog,
+            "the published families must be the engine catalog's own, got {:?} against {:?}",
+            DOCDB_PARAMETER_GROUP_FAMILIES,
+            from_engine_catalog
+        );
+        for family in DOCDB_PARAMETER_GROUP_FAMILIES {
+            let earliest = family_earliest_engine_version(family);
+            assert!(
+                earliest.is_some_and(|version| crate::docdb_engine_catalog::engine_version(
+                    &version
+                )
+                .is_some()),
+                "case {family}: its earliest engine version must be one the engine catalog \
+                 publishes"
+            );
+        }
+    }
+
     /// A family the catalog covers validates values; one it does not covers nothing, so it
     /// admits any parameter and any value. The two predicates agree about which families
     /// exist: a `docdb` family the engine does not have is refused at create time AND
@@ -945,10 +975,11 @@ mod tests {
     #[test]
     fn only_a_published_family_validates_a_value() {
         // (case, family, publishes a catalog)
-        let rows: [(&str, &str, bool); 6] = [
+        let rows: [(&str, &str, bool); 7] = [
             ("the 3.6 family", "docdb3.6", true),
             ("the 4.0 family", "docdb4.0", true),
             ("the 5.0 family", "docdb5.0", true),
+            ("the 8.0 family", "docdb8.0", true),
             ("a family the engine does not have", "docdb9.9", false),
             ("another engine's family", "aurora-mysql8.0", false),
             ("a neptune family", "neptune1.3", false),

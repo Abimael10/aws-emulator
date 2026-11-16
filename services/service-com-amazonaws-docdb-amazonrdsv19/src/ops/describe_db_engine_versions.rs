@@ -3,7 +3,7 @@
 //! @op DescribeDBEngineVersions
 //!
 //! Serves this service's published engine-version catalogue: one record per engine version
-//! Amazon DocumentDB publishes (`crate::state::DOCDB_ENGINE_VERSIONS`), projected by
+//! Amazon DocumentDB publishes (`crate::state::engine_versions`), projected by
 //! `crate::state::engine_version_to_shape`, which derives every member of it — the
 //! parameter-group family, the exportable log types, the supported certificate authorities
 //! and the upgrade targets — from the catalogues the other reports read, so no two reports
@@ -181,9 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="shape",shape="DBEngineVersion")`), and a document database
         // takes neither a `CharacterSetName` nor a `TimeZone` on a create, so neither flag
         // adds anything to report.
-        let selected: Vec<&'static str> = docdb::DOCDB_ENGINE_VERSIONS
-            .iter()
-            .copied()
+        let selected: Vec<&'static str> = docdb::engine_versions()
+            .into_iter()
             .filter(|version| {
                 input
                     .engine
@@ -200,13 +199,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // "Indicates that only the default version of the specified engine or engine and
-        // major version combination is returned." The default is the latest version of
-        // what the filters selected, which is the rule
-        // `CreateDBClusterMessage$EngineVersion` states for a create that names none ("the
-        // --engine-version will default to the latest major engine version"), and the
-        // catalogue is held oldest first.
+        // major version combination is returned." The DEFAULT of a selection is the engine's
+        // own default version when the filters still carry it
+        // (`::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION`, the version
+        // `CreateDBClusterMessage$EngineVersion` says a create without one gets), and
+        // otherwise the default release of the line the filters narrowed to, which is that
+        // line's newest. The catalogue is held oldest first, so that is the last row left.
         let selected = match input.default_only {
-            Some(true) => selected.last().copied().into_iter().collect(),
+            Some(true) => selected
+                .iter()
+                .find(|version| {
+                    **version == ::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION
+                })
+                .or(selected.last())
+                .copied()
+                .into_iter()
+                .collect(),
             _ => selected,
         };
 

@@ -1499,14 +1499,14 @@ async fn renaming_a_cluster_rekeys_it_and_moves_its_arn_and_endpoints() {
     // different major with it.
     //
     // Every version named here is one the engine PUBLISHES
-    // (`state::DOCDB_ENGINE_VERSIONS`): a version outside that catalogue is refused by its
+    // (`state::engine_versions`): a version outside that catalogue is refused by its
     // own rule, which `tests/all/subnet_and_parameter_groups.rs` covers.
     let current = state::DEFAULT_ENGINE_VERSION;
     let same_major = current
         .rsplit_once('.')
         .map(|(line, _)| line.to_string())
         .expect("the default engine version carries a major.minor line");
-    let other_major = state::DOCDB_ENGINE_VERSIONS
+    let other_major = state::engine_versions()
         .iter()
         .rev()
         .find(|published| {
