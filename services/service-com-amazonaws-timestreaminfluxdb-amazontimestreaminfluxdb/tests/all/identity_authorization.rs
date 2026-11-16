@@ -418,18 +418,18 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "an operation whose handler is still a scaffold, with no policy at all",
-            operation: "GetDbBackup",
-            body: || json!({ "identifier": "bkp123" }),
-            resource: || family_arn("db-backup", "bkp123"),
+            operation: "ListDbBackups",
+            body: || json!({}),
+            resource: || family_arn("db-backup", "*"),
             document: None,
             refused_because: Some(""),
             served_status: NOT_IMPLEMENTED_STATUS,
         },
         Row {
             case: "an operation whose handler is still a scaffold, allowed",
-            operation: "GetDbBackup",
-            body: || json!({ "identifier": "bkp123" }),
-            resource: || family_arn("db-backup", "bkp123"),
+            operation: "ListDbBackups",
+            body: || json!({}),
+            resource: || family_arn("db-backup", "*"),
             document: Some(|| allow(&format!("{ACTION_PREFIX}:*"), "*")),
             // The authorized caller reaches the scaffold, which answers its own 501: the
             // gate decides access, not whether the operation exists.

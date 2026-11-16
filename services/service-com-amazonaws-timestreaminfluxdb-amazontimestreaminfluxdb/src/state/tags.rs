@@ -158,11 +158,13 @@ impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
                 .get(id)
                 .filter(|record| record.arn == resource_arn)
                 .map(|record| &record.tags),
-            // A DB backup is a resource of this service's model that no operation here
-            // creates yet (the backup operations are still scaffolds), so the store holds
-            // none and no backup ARN resolves to one. Nothing stands in for a backup that
-            // does not exist: a tagging call on one is refused as not found.
-            TaggableResourceKind::DbBackup => None,
+            // A DB backup carries the tags its create attached, in its own record like
+            // every other family here, so a backup ARN resolves to that record's tag set.
+            TaggableResourceKind::DbBackup => self
+                .db_backups
+                .get(id)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
         }
     }
 
@@ -190,7 +192,11 @@ impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
                 .get_mut(id)
                 .filter(|record| record.arn == resource_arn)
                 .map(|record| &mut record.tags),
-            TaggableResourceKind::DbBackup => None,
+            TaggableResourceKind::DbBackup => self
+                .db_backups
+                .get_mut(id)
+                .filter(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
         }
     }
 }

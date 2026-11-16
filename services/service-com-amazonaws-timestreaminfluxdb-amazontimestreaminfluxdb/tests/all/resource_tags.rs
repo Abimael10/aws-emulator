@@ -21,7 +21,7 @@
 //! The rows vary the resource kind the ARN addresses, the number of tags, the key and
 //! value lengths at their modelled bounds, which keys overlap an existing set, and why
 //! an ARN resolves to nothing (nothing minted it, the wrong resource kind, the wrong
-//! Region, the wrong account, a deleted resource, a resource kind no operation creates).
+//! Region, the wrong account, a deleted resource).
 
 use std::collections::BTreeMap;
 
@@ -429,7 +429,7 @@ async fn an_arn_that_names_no_resource_is_refused_not_found_and_changes_nothing(
             "DB_PARAMETER_GROUP",
         ),
         (
-            "a db-backup ARN, a resource kind no operation creates yet",
+            "a db-backup ARN nothing minted",
             arn_for(REGION, ACCOUNT, "db-backup", &unminted),
             "DB_BACKUP",
         ),

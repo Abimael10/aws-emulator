@@ -18,6 +18,11 @@ use crate::ops::types::{
     ValidationException,
 };
 
+/// The DB-backup records and the helpers the backup operations share. A backup is a
+/// snapshot of one of the records above, so its slice of the state lives beside them and
+/// reads them where a backup is taken.
+mod backups;
+
 /// The DB-cluster records and the helpers the cluster operations share. A cluster
 /// provisions the DB instances its nodes are, so its slice of the state lives beside
 /// this one and reaches the same [`DbInstance`] records.
@@ -31,6 +36,7 @@ mod marketplace;
 /// carries — the slice the three tagging operations share.
 mod tags;
 
+pub use backups::*;
 pub use clusters::*;
 pub use marketplace::*;
 pub use tags::*;
@@ -313,9 +319,9 @@ impl DbInstance {
 
     /// The backup configurations as the output list shape.
     ///
-    /// `nextAutomatedBackupTime` stays absent: scheduling automated backups belongs to
-    /// the backup operations, which are not implemented, so this emulator reports no
-    /// time for a backup nothing has scheduled.
+    /// `nextAutomatedBackupTime` stays absent: nothing in this emulator runs a backup on
+    /// a configuration's schedule (`CreateDbBackup` takes an on-demand backup, the only
+    /// kind this API asks for), so no time is reported for a backup nothing has scheduled.
     fn backup_configurations_output(&self) -> Option<Vec<DbBackupConfigurationOutput>> {
         backup_configurations_output(&self.db_backup_configurations)
     }
@@ -323,9 +329,9 @@ impl DbInstance {
 
 /// The stored backup configurations of a resource as the output list shape.
 ///
-/// `nextAutomatedBackupTime` stays absent: scheduling automated backups belongs to the
-/// backup operations, which are not implemented, so this emulator reports no time for a
-/// backup nothing has scheduled.
+/// `nextAutomatedBackupTime` stays absent: nothing in this emulator runs a backup on a
+/// configuration's schedule (`CreateDbBackup` takes an on-demand backup, the only kind
+/// this API asks for), so no time is reported for a backup nothing has scheduled.
 pub fn backup_configurations_output(
     configurations: &Option<Vec<DbBackupConfiguration>>,
 ) -> Option<Vec<DbBackupConfigurationOutput>> {
@@ -701,6 +707,16 @@ pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     pub db_cluster_names: BTreeMap<(String, String), String>,
     /// Monotonic sequence mixed into every minted cluster `id`.
     pub db_cluster_seq: u64,
+    /// Live DB backups by their service-generated `id`. Ordered, so `ListDbBackups`
+    /// pages deterministically.
+    pub db_backups: BTreeMap<String, DbBackup>,
+    /// `(region, name)` -> `id`: the uniqueness index behind `ConflictException` on a
+    /// duplicate backup name. The key carries the Region because the rule the model
+    /// documents is "Must be unique within the account and region", so the same name in
+    /// two Regions is two backups.
+    pub db_backup_names: BTreeMap<(String, String), String>,
+    /// Monotonic sequence mixed into every minted backup `id`.
+    pub db_backup_seq: u64,
     /// The AWS Marketplace offerings this account holds an ACTIVE subscription to, by
     /// [`MarketplaceOffering::key`]. EMPTY by default, because nothing in this API
     /// subscribes an account: a buyer subscribes in AWS Marketplace, out of band of

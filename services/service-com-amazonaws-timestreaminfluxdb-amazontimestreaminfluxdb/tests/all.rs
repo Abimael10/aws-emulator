@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/already_exists_conflicts.rs"]
 mod already_exists_conflicts;
+#[path = "all/db_backup_snapshot.rs"]
+mod db_backup_snapshot;
 #[path = "all/db_cluster_lifecycle.rs"]
 mod db_cluster_lifecycle;
 #[path = "all/db_cluster_marketplace_subscription.rs"]

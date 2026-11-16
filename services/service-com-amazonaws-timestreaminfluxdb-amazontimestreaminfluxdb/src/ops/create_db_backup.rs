@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDbBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDbBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDbBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +201,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDbBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDbBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDbBackup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateDbBackupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+
+        // The store is bounded: past the emulator's own cardinality bound a create is
+        // refused with the modelled quota error instead of growing the state without end.
+        if state.db_backups.len() >= st::DB_BACKUP_QUOTA {
+            return Err(CreateDbBackupErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the maximum of {} DB backups this emulator stores has been \
+                         reached",
+                        st::DB_BACKUP_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A backup's name is unique within the account and REGION (see `name` in the
+        // modeled contract above), so a second create under a name a stored backup holds
+        // conflicts, while the same name in another Region is a new backup.
+        if let Some(existing_id) = state.db_backup_id_for_name(&region, &input.name) {
+            let existing_id = existing_id.clone();
+            return Err(CreateDbBackupErrorModeled::ConflictException(
+                st::name_already_exists(st::NAMED_DB_BACKUP, &existing_id, &input.name),
+            )
+            .into());
+        }
+
+        // `dbResourceId` is the id of the DB instance or DB cluster to back up, so both
+        // families are resolved and the snapshot is taken off whichever record answers.
+        // A request naming neither has nothing to back up, and nothing stands in for the
+        // resource it named: it is refused rather than backed up from nowhere.
+        let Some(snapshot) = state.db_resource_snapshot(&input.db_resource_id) else {
+            return Err(CreateDbBackupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("DB resource {} not found", input.db_resource_id),
+                    resource_id: input.db_resource_id.clone(),
+                    resource_type: st::RESOURCE_TYPE_DB_RESOURCE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let record = state.insert_db_backup(
+            &region,
+            &input.name,
+            &input.db_resource_id,
+            snapshot,
+            input.retention_days,
+            input.tags.unwrap_or_default().into_iter().collect(),
+            now,
+        );
+        Ok(record.to_create_output())
     }
 }
