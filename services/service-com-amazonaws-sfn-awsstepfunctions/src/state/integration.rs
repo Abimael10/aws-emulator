@@ -406,6 +406,16 @@ pub struct Api {
     /// failure as a Forbidden, and [`TARGET_CLIENT_ERROR_STATUS`] for one whose front
     /// door answers it as a client error.
     pub access_denied_status: u16,
+    /// The code its answer to such a call names the class by: the AWS-common
+    /// [`COMMON_ACCESS_DENIED_CODE`] for most services, and its own code for one whose
+    /// front door words it differently (Amazon SQS answers `AccessDenied`). A fact of the
+    /// SERVICE for the same reason the status above is, so it is stated per entry.
+    pub access_denied_code: &'static str,
+    /// Whether its authorization layer spells the action it refused LOWER-CASED in that
+    /// sentence, as Amazon SQS reports it (`sqs:sendmessage`). Only the SENTENCE is
+    /// affected: IAM compares action names without regard to case, so the decision is the
+    /// same either way.
+    pub lowercases_refused_action: bool,
     /// How its model spells the members of an operation's input
     /// ([`MemberCase`]), which is what decides the spelling the document a `Task`
     /// state built goes on the wire under.
@@ -418,7 +428,30 @@ pub struct Api {
     pub query_compatible: bool,
 }
 
+/// The code the AWS-common authorization refusal names its class by — "Common Errors":
+/// the code a service answers an unauthorized call with where the invoked operation
+/// models no access error of its own.
+pub const COMMON_ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+
 impl Api {
+    /// The code THIS service's front door names an authorization refusal by, where the
+    /// invoked operation models no access-denied error of its own
+    /// ([`Api::access_denied_code`]).
+    #[must_use]
+    pub fn access_denied_code(&self) -> &'static str {
+        self.access_denied_code
+    }
+
+    /// `action` as THIS service's own refusal SPELLS it
+    /// ([`Api::lowercases_refused_action`]).
+    #[must_use]
+    pub fn refused_action(&self, action: &str) -> String {
+        match self.lowercases_refused_action {
+            true => action.to_lowercase(),
+            false => action.to_string(),
+        }
+    }
+
     /// The host one of this service's regional endpoints answers on.
     fn host(&self, region: &str) -> String {
         format!("{}.{region}.amazonaws.com", self.endpoint_prefix)
@@ -1035,6 +1068,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonAthena",
         sdk_exception: "AmazonAthenaException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `StartQueryExecution`'s input: `QueryString`, `WorkGroup`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1060,6 +1095,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AWSBackup",
         sdk_exception: "AWSBackupException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `StartBackupJob`'s input: `BackupVaultName`, `ResourceArn`, `IamRoleArn`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1089,6 +1126,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonDynamoDBv2",
         sdk_exception: "AmazonDynamoDBException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `PutItem`'s input: `TableName`, `Item`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1097,7 +1136,7 @@ pub const APIS: &[Api] = &[
     // com-amazonaws-sqs-amazonsqs.json`: awsJson1_0, sigv4Name `sqs`,
     // endpointPrefix `sqs`, sdkId `SQS`, service shape `AmazonSQS`.
     Api {
-        namespace: "sqs",
+        namespace: SQS_NAMESPACE,
         action_prefix: None,
         signing_name: "sqs",
         endpoint_prefix: "sqs",
@@ -1114,6 +1153,12 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonSQS",
         sdk_exception: "AmazonSQSException",
         access_denied_status: TARGET_FORBIDDEN_STATUS,
+        // Amazon SQS's front door answers an unauthorized call `AccessDenied` rather than
+        // the AWS-common code, and names the action it refused in the lower case its own
+        // authorization layer reports (`sqs:sendmessage`), which is what a client parsing
+        // the relayed cause reads.
+        access_denied_code: "AccessDenied",
+        lowercases_refused_action: true,
         // `SendMessage`'s input: `QueueUrl`, `MessageBody`.
         member_case: MemberCase::Pascal,
         // Amazon SQS is the one service here whose model carries
@@ -1151,6 +1196,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonSNS",
         sdk_exception: "AmazonSNSException",
         access_denied_status: TARGET_FORBIDDEN_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `Publish`'s input: `TopicArn`, `Message`, `MessageAttributes`.
         member_case: MemberCase::Pascal,
         // Its model declares the `awsQuery` protocol itself rather than the
@@ -1181,6 +1228,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonCloudWatchEvents",
         sdk_exception: "AmazonCloudWatchEventsException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `PutEvents`' input: `Entries`, `EndpointId`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1211,6 +1260,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AWSStepFunctions",
         sdk_exception: "AWSStepFunctionsException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `StartExecution`'s input: `stateMachineArn`, `name`, `input`.
         member_case: MemberCase::LowerCamel,
         query_compatible: false,
@@ -1238,6 +1289,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonKinesis",
         sdk_exception: "AmazonKinesisException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `PutRecord`'s input: `StreamName`, `Data`, `PartitionKey`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1263,6 +1316,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonSSM",
         sdk_exception: "AmazonSSMException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `GetParameter`'s input: `Name`, `WithDecryption`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1290,6 +1345,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonECS",
         sdk_exception: "AmazonECSException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `RunTask`'s input: `cluster`, `taskDefinition`, `overrides`.
         member_case: MemberCase::LowerCamel,
         query_compatible: false,
@@ -1315,6 +1372,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AWSGlue",
         sdk_exception: "AWSGlueException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `StartJobRun`'s input: `JobName`, `Arguments`, `Timeout`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1338,6 +1397,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AWSLambda",
         sdk_exception: "AWSLambdaException",
         access_denied_status: TARGET_FORBIDDEN_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `Invoke`'s input: `FunctionName`, `Payload`, `InvocationType`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
@@ -1371,6 +1432,8 @@ pub const APIS: &[Api] = &[
         sdk_client: "AWSSecurityTokenService",
         sdk_exception: "AWSSecurityTokenServiceException",
         access_denied_status: TARGET_FORBIDDEN_STATUS,
+        access_denied_code: COMMON_ACCESS_DENIED_CODE,
+        lowercases_refused_action: false,
         // `AssumeRole`'s input: `RoleArn`, `RoleSessionName`, `DurationSeconds`.
         member_case: MemberCase::Pascal,
         // Its model declares the `awsQuery` protocol itself rather than the
@@ -2201,6 +2264,13 @@ pub fn access_request(call: &Call, request: &Value, region: &str) -> Option<(Str
     // call is the same one on the same function either way, so it is judged on the
     // request that is actually made ([`Call::operation_input`]).
     let resource = targets.resource_of(&call.operation_input(request), region)?;
+    // A state machine is named by an unqualified ARN, a version ARN or an alias ARN
+    // alike — three ways of naming ONE state machine to run — so the resource such a
+    // call is taken on is the state machine itself, read the way this service's own front
+    // door reads it (`crate::service::request_conditions::unqualified_arn`): a grant of
+    // the action on a state machine therefore covers starting it by a version or an alias
+    // ARN. Nothing else is affected, since no other ARN carries that qualifier.
+    let resource = crate::service::request_conditions::unqualified_arn(&resource).to_string();
     // The action is the one the invoked service publishes for the operation
     // ([`Call::action`]), unless the entry states the permission that operation
     // PUBLISHES instead.

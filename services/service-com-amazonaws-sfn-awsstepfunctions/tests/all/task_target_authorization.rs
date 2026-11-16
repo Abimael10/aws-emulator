@@ -34,6 +34,10 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_FAILED;
 use crate::state_machine_lifecycle::{string, REGION};
 use crate::task_execution_role::{Chain, REFUSAL_CODE};
 
+/// The code Amazon SQS's OWN front door names an authorization refusal by, which is not
+/// the AWS-common one every other service here answers ([`REFUSAL_CODE`]).
+const SQS_REFUSAL_CODE: &str = "AccessDenied";
+
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
 
@@ -107,13 +111,15 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
 
     let rows = [
         Row {
+            // Amazon SQS words its own refusal: `AccessDenied` rather than the AWS-common
+            // code, and the action it refused in lower case.
             case: "a send to a queue, addressed by its url",
             resource: "arn:aws:states:::sqs:sendMessage",
             parameters: json!({ "QueueUrl": queue_url.clone(), "MessageBody": "hello" }),
-            action: "sqs:SendMessage",
+            action: "sqs:sendmessage",
             resource_arn: queue_arn.clone(),
             refusal_error: "SQS.AmazonSQSException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: SQS_REFUSAL_CODE,
         },
         Row {
             // The other family makes the same call on the same queue, so the refusal
@@ -121,11 +127,11 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             case: "the same send through the AWS SDK integration",
             resource: "arn:aws:states:::aws-sdk:sqs:sendMessage",
             parameters: json!({ "queueUrl": queue_url.clone(), "messageBody": "hello" }),
-            action: "sqs:SendMessage",
+            action: "sqs:sendmessage",
             resource_arn: queue_arn,
             // That family names the service as the AWS SDK does.
             refusal_error: "Sqs.AmazonSQSException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: SQS_REFUSAL_CODE,
         },
         // `Publish` MODELS the refusal of an unauthorized call
         // (`AuthorizationErrorException`, HTTP 403 under the query code

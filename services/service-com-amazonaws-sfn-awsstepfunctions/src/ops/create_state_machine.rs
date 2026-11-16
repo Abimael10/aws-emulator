@@ -384,6 +384,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::observability::LOG_DESTINATION_ACCESS_DENIED,
                 ));
             }
+            // Delivering AS that role means ASSUMING it for THIS state machine, and a
+            // trust policy may be narrowed to the resource the service may take the role
+            // on for — `aws:SourceArn`, `aws:SourceAccount` — which is the
+            // confused-deputy protection AWS guidance tells an operator to write. A role
+            // whose trust does not cover an assume for the state machine being created
+            // could never deliver one event of it, so the configuration is refused here
+            // rather than creating a state machine whose logging can never work. The
+            // assume is the same one the data plane makes
+            // (`crate::state::task_authorization`), under either spelling of this
+            // service's principal, and it refuses only what a trust document this
+            // account HOLDS withholds for that state machine: a role provisioned out of
+            // band is evidence of nothing and is served.
+            if crate::state::observability::log_role_unassumable_for(
+                ctx,
+                &region,
+                &input.role_arn,
+                &arn,
+            )
+            .await
+            {
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::observability::log_role_not_assumable(),
+                ));
+            }
         }
 
         let tags = input.tags.clone().unwrap_or_default();

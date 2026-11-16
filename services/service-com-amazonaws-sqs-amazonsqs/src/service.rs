@@ -501,6 +501,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for QueryCompatibleErrors<Eng> 
                 None => svc.definition().routing_error_response(req),
             };
             let answered = completing_the_envelope(req, response);
+            // Every response an AWS service sends NAMES the request it answered, in the
+            // header this protocol reports that id in (`x-amzn-RequestId`) — on a success
+            // exactly as on a failure, which is where an SDK reads the response's own
+            // request id from. It is a property of the RESPONSE and of no modelled shape,
+            // so no handler can set it; this wrapper is the one place every response of
+            // this service passes through, and the rule itself lives in
+            // `service_common::query_error_envelope`.
+            let answered = service_common::query_error_envelope::with_request_id_header(answered);
             // The request has been answered; what it left the queues holding, and what it
             // contributed to their counters, is published now, with no store lock held, and
             // the clock that keeps sampling them is (re)started.

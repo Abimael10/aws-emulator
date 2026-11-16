@@ -193,6 +193,9 @@ struct Row {
     resource_arn: String,
     /// The clause the sentence ends with: why the documents withheld the call.
     because: &'static str,
+    /// The code the INVOKED service's own answer to an unauthorized call names the class
+    /// by, which the relayed metadata reports.
+    code: &'static str,
 }
 
 /// RULE: a refused `Task` state's cause names the assumed-role SESSION of the state
@@ -219,6 +222,7 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             because: "because no identity-based policy allows the lambda:InvokeFunction action",
+            code: REFUSAL_CODE,
         },
         Row {
             // The same call, refused by an explicit `Deny`, under a role IAM holds beneath
@@ -233,10 +237,13 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             because: "with an explicit deny in an identity-based policy",
+            code: REFUSAL_CODE,
         },
         Row {
             // Another service's call, addressed by a queue url, for another state machine:
-            // the session is named after THAT machine.
+            // the session is named after THAT machine. Amazon SQS spells the action it
+            // refused in lower case, which the relayed sentence reports as that service
+            // worded it.
             case: "a send to a queue no statement is about",
             role_name: "SessionQueueRole",
             role_path: "/",
@@ -244,9 +251,11 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             machine_name: "session-principal-send",
             resource: "arn:aws:states:::sqs:sendMessage",
             parameters: json!({ "QueueUrl": queue_url.clone(), "MessageBody": "hello" }),
-            action: "sqs:SendMessage",
+            action: "sqs:sendmessage",
             resource_arn: queue_arn.clone(),
-            because: "because no identity-based policy allows the sqs:SendMessage action",
+            because: "because no identity-based policy allows the sqs:sendmessage action",
+            // Amazon SQS's own front door names it `AccessDenied`.
+            code: "AccessDenied",
         },
         Row {
             // And a call of THIS service, made through the AWS SDK integration family.
@@ -260,6 +269,7 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             action: "states:StartExecution",
             resource_arn: child_arn.clone(),
             because: "because no identity-based policy allows the states:StartExecution action",
+            code: REFUSAL_CODE,
         },
     ];
 
@@ -336,8 +346,9 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
         }
         // The refusal is still the invoked service's own answer to an unauthorized call.
         assert!(
-            cause.contains(REFUSAL_CODE),
-            "case {case:?}: expected the cause to carry {REFUSAL_CODE:?}, got {cause:?}"
+            cause.contains(row.code),
+            "case {case:?}: expected the cause to carry {:?}, got {cause:?}",
+            row.code
         );
     }
 }

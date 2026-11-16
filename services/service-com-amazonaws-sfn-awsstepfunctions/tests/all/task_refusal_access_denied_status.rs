@@ -137,15 +137,19 @@ async fn a_refused_task_reports_the_invoked_services_own_status() {
             failure_event: EVENT_LAMBDA_FUNCTION_FAILED,
         },
         Row {
+            // Amazon SQS's own front door answers an unauthorized call as a Forbidden
+            // carrying `AccessDenied` — not the AWS-common `AccessDeniedException` — and
+            // names the action it refused in the lower case its authorization layer
+            // reports, so the relayed cause reads exactly as Amazon SQS worded it.
             case: "a send to a queue",
             resource: "arn:aws:states:::sqs:sendMessage".to_string(),
             parameters: json!({ "QueueUrl": queue_url, "MessageBody": "hello" }),
-            action: "sqs:SendMessage",
+            action: "sqs:sendmessage",
             target: queue_arn,
-            because: unstated("sqs:SendMessage"),
+            because: unstated("sqs:sendmessage"),
             refusal_error: "SQS.AmazonSQSException",
             sdk_client: "AmazonSQS",
-            code: ACCESS_DENIED_CODE,
+            code: "AccessDenied",
             status: FORBIDDEN,
             failure_event: EVENT_TASK_FAILED,
         },

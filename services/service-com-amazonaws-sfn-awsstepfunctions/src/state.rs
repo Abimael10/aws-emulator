@@ -237,6 +237,11 @@ pub const MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS: i32 = 60;
 /// `KmsDataKeyReusePeriodSeconds` accepts (range 60..900).
 pub const MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS: i32 = 900;
 
+/// The `kmsDataKeyReusePeriodSeconds` in force on a configuration that states none: the
+/// default the API reference documents for the member ("default is 300 seconds"), which
+/// is how long a data key serves before the next one is minted.
+pub const DEFAULT_KMS_DATA_KEY_REUSE_PERIOD_SECONDS: i32 = 300;
+
 /// An execution that has not reached a terminal status yet.
 pub const EXECUTION_STATUS_RUNNING: &str = "RUNNING";
 
@@ -3464,6 +3469,25 @@ pub fn every_resource_arn(region: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{ARN_WILDCARD}:{ARN_WILDCARD}"),
+    )
+}
+
+/// The ARN naming EVERY resource of the type `resource_type` in `region`: this
+/// service's own ARN form with the part that names ONE resource of that type — its
+/// name — left as IAM's wildcard.
+///
+/// It is what AWS reports a call that fixes no resource of its own was refused on:
+/// such a call is about one KIND of resource of this service (the state machines of
+/// the account, the activities of it), so the ARN it is judged against fixes the
+/// resource TYPE and wildcards the name, exactly as a statement scoped to that kind
+/// of resource writes it. Built from the same total function of the region the ARN
+/// of one resource is ([`state_machine_arn`], [`activity_arn`]), so the account and
+/// the partition it carries are the ones every ARN of this service carries.
+pub fn every_resource_of_type_arn(region: &str, resource_type: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{resource_type}:{ARN_WILDCARD}"),
     )
 }
 

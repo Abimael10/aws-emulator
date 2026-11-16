@@ -434,12 +434,17 @@ pub(crate) fn message(body: &Value) -> String {
         .to_string()
 }
 
-/// The ARN naming every resource of this service in the Region every call below is signed
-/// for: what a request that names no resource of this service in a member of its own is
-/// judged against, and what a refusal of such a call names.
-pub(crate) fn every_resource() -> String {
-    format!("arn:aws:states:{REGION}:{ACCOUNT}:*:*")
+/// The ARN naming every resource of the TYPE `resource_type` in the Region every call below
+/// is signed for: what a request that names no resource of its own is judged against, and
+/// what a refusal of such a call names — the API's own resource type with the resource name
+/// wildcarded.
+pub(crate) fn every_resource(resource_type: &str) -> String {
+    format!("arn:aws:states:{REGION}:{ACCOUNT}:{resource_type}:*")
 }
+
+/// The resource type the state machine APIs of this service are about, which is the kind of
+/// resource a call of one that names no resource of its own is judged against.
+pub(crate) const STATE_MACHINE_TYPE: &str = "stateMachine";
 
 /// The ARN of the activity `name` in the Region every call below is signed for.
 fn activity_arn(name: &str) -> String {
@@ -496,8 +501,8 @@ fn rows(index: usize, machine: &str, execution: &str) -> Vec<Row> {
             operation: "ListStateMachines",
             body: json!({}),
             // A call that names no resource of this service is judged against every
-            // resource of it in the Region, written as this service's own wildcard ARN.
-            resource: every_resource(),
+            // resource of the kind its API is about, written as that type's wildcard ARN.
+            resource: every_resource(STATE_MACHINE_TYPE),
         },
         Row {
             case: "a read of a resource's tags",
@@ -1005,6 +1010,94 @@ fn the_catalog_of_addressed_members_is_the_model_s_own() {
          operation(s)",
         identity_authorization::ADDRESSED_BY.len()
     );
+}
+
+/// The catalog the gate reads the RESOURCE TYPE of an API through
+/// (`service::identity_authorization::API_RESOURCE_TYPE`) is a transcription of the same
+/// model: every operation the model binds carries a row, and the type each row names is one
+/// of this service's own ARN resource types — or the empty one, for an API about no single
+/// type.
+///
+/// So an operation added to the model with no row fails here rather than silently leaving
+/// that call judged against the both-wildcards ARN, and the catalog of the ownership check
+/// (`service::identity_authorization::OWNERSHIP_CHECKED`) is read back beside it: every
+/// operation it names is one the model binds, and each is about a state machine's aliases
+/// or versions.
+#[test]
+fn the_catalog_of_api_resource_types_is_the_model_s_own() {
+    let source = std::fs::read_to_string(MODEL_PATH).unwrap_or_else(|error| {
+        panic!("the Smithy model at {MODEL_PATH} must be readable: {error}")
+    });
+    let model: Value = serde_json::from_str(&source).expect("the Smithy model parses as JSON");
+    let shapes = model
+        .get("shapes")
+        .and_then(Value::as_object)
+        .expect("the Smithy model carries a shapes map");
+
+    // The resource types this service's own ARNs carry, which is what a row may name.
+    let types = ["stateMachine", "activity", "execution", "mapRun"];
+    let mut bound: Vec<String> = Vec::new();
+    for (shape_id, shape) in shapes {
+        if shape.get("type").and_then(Value::as_str) != Some("operation") {
+            continue;
+        }
+        let operation = shape_id.rsplit('#').next().unwrap_or(shape_id).to_string();
+        let row = identity_authorization::API_RESOURCE_TYPE
+            .iter()
+            .find(|(named, _)| *named == operation.as_str());
+        let (_, resource_type) = row.unwrap_or_else(|| {
+            panic!(
+                "case {operation:?}: the model binds this operation, which the resource-type \
+                 catalog does not carry a row for"
+            )
+        });
+        assert!(
+            resource_type.is_empty() || types.contains(resource_type),
+            "case {operation:?}: the row names the resource type {resource_type:?}, which is \
+             none of this service's own {types:?}"
+        );
+        // What the gate answers for the row, which is the ARN a refusal of such a call
+        // names: a wildcard of that type, and every resource where the row names none.
+        let judged = identity_authorization::any_resource(&operation, REGION);
+        let expected = if resource_type.is_empty() {
+            every_resource("*")
+        } else {
+            every_resource(resource_type)
+        };
+        assert_eq!(
+            judged, expected,
+            "case {operation:?}: expected a call naming no resource of its own to be judged \
+             against {expected:?}, got {judged:?}"
+        );
+        bound.push(operation);
+    }
+    assert_eq!(
+        bound.len(),
+        identity_authorization::API_RESOURCE_TYPE.len(),
+        "expected one catalog row per operation the model binds, got {} row(s) for {} \
+         operation(s)",
+        identity_authorization::API_RESOURCE_TYPE.len(),
+        bound.len()
+    );
+    // Every ownership-checked operation is one the model binds, and each is about a state
+    // machine's aliases or versions — which is what makes the account part of the reference
+    // it names.
+    for operation in identity_authorization::OWNERSHIP_CHECKED {
+        assert!(
+            bound.iter().any(|named| named == operation),
+            "case {operation:?}: the ownership check names an operation this model does not \
+             bind"
+        );
+        assert!(
+            operation.contains("Alias") || operation.contains("Version"),
+            "case {operation:?}: the ownership check is about a state machine's aliases and \
+             versions, which this operation's name does not name"
+        );
+        assert!(
+            identity_authorization::ownership_checked(operation, "not-an-arn"),
+            "case {operation:?}: expected the catalog's own operation to be ownership-checked"
+        );
+    }
 }
 
 /// How long a poll below waits for a condition this service owes — a task queued on an

@@ -56,8 +56,13 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// The fragment the cause of an access-denied refusal carries: the code the answer came
-/// back under.
+/// back under, which is the invoked service's own — the AWS-common one for all but the
+/// services whose front door words it differently.
 const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+
+/// Amazon SQS's own: its front door answers an unauthorized call `AccessDenied`, and names
+/// the action it refused in the lower case its authorization layer reports.
+const SQS_REFUSAL_CODE: &str = "Error Code: AccessDenied";
 
 /// The ARN of the SESSION a refusal of one of an execution's calls blames, read back out of
 /// the refusal `cause`: Step Functions
@@ -423,12 +428,14 @@ pub(crate) fn logs_only() -> Value {
 }
 
 /// One row: the case, the `Resource` the `Task` names, its parameters, the IAM action the
-/// refusal must name, and the error name a `Task` state reports for it.
+/// refusal must name — as the INVOKED service spells it — the code its answer named the
+/// class by, and the error name a `Task` state reports for it.
 struct Row {
     case: &'static str,
     resource: &'static str,
     parameters: Value,
     action: &'static str,
+    code: &'static str,
     refusal_error: &'static str,
 }
 
@@ -455,7 +462,8 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             case: "a send to a queue, addressed by its url",
             resource: "arn:aws:states:::sqs:sendMessage",
             parameters: json!({ "QueueUrl": queue_url.clone(), "MessageBody": "hello" }),
-            action: "sqs:SendMessage",
+            action: "sqs:sendmessage",
+            code: SQS_REFUSAL_CODE,
             refusal_error: "SQS.AmazonSQSException",
         },
         Row {
@@ -464,7 +472,8 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             case: "the same send through the AWS SDK integration",
             resource: "arn:aws:states:::aws-sdk:sqs:sendMessage",
             parameters: json!({ "QueueUrl": queue_url.clone(), "MessageBody": "hello" }),
-            action: "sqs:SendMessage",
+            action: "sqs:sendmessage",
+            code: SQS_REFUSAL_CODE,
             // That family names the service as the AWS SDK does.
             refusal_error: "Sqs.AmazonSQSException",
         },
@@ -473,6 +482,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             resource: "arn:aws:states:::lambda:invoke",
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
             action: "lambda:InvokeFunction",
+            code: REFUSAL_CODE,
             refusal_error: "Lambda.AWSLambdaException",
         },
         Row {
@@ -480,6 +490,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             resource: "arn:aws:states:::aws-sdk:lambda:invoke",
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
             action: "lambda:InvokeFunction",
+            code: REFUSAL_CODE,
             refusal_error: "Lambda.AWSLambdaException",
         },
         Row {
@@ -489,6 +500,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             resource: "arn:aws:states:::lambda:invoke",
             parameters: json!({ "FunctionName": "absent-handler" }),
             action: "lambda:InvokeFunction",
+            code: REFUSAL_CODE,
             refusal_error: "Lambda.AWSLambdaException",
         },
     ];
@@ -519,8 +531,9 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
         let details = task_failure(&router, &execution_arn, case).await;
         let cause = string(&details, "cause");
         assert!(
-            cause.contains(REFUSAL_CODE),
-            "case {case:?}: expected the cause to carry {REFUSAL_CODE:?}, got {cause:?}"
+            cause.contains(row.code),
+            "case {case:?}: expected the cause to carry {:?}, got {cause:?}",
+            row.code
         );
         assert!(
             cause.contains(row.action),
@@ -530,7 +543,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
         // The resource it was refused ON is the ARN of what the request addressed,
         // whichever form the request named it in.
         let resource = match row.action {
-            "sqs:SendMessage" => queue_arn.clone(),
+            "sqs:sendmessage" => queue_arn.clone(),
             _ => function_arn.clone(),
         };
         // The whole sentence, principal first: the SESSION of the role the call was made

@@ -20,10 +20,11 @@
 //!
 //! The rows span the writers the rule covers (both activity-task replies and the stop
 //! of an execution), the fields each one seals — error alone, cause alone, both,
-//! neither, and a reply's output — and the two KMS operations sealing a payload makes
-//! on the key: the `GenerateDataKey` the `kmsDataKeyReusePeriodSeconds` member names
-//! ("when the period expires, Step Functions will call `GenerateDataKey`") and the
-//! decrypt of a data key still inside that period.
+//! neither, and a reply's output — and the KMS operation sealing a payload makes on the
+//! key at the instant of the write: the data key an execution's payloads go under is
+//! RE-USED while `kmsDataKeyReusePeriodSeconds` lasts, which opens it (`kms:Decrypt`),
+//! and the next one is minted only once that period has expired ("when the period
+//! expires, Step Functions will call `GenerateDataKey`").
 //!
 //! The harness (`Chain`, the key policies, `customer_managed`) is the one
 //! `execution_data_encryption` builds for the READ side of the same key; `tests/all.rs`
@@ -288,17 +289,18 @@ async fn a_write_of_sealed_data_follows_the_keys_own_policy() {
     }
 }
 
-/// Sealing data under the key asks TWO operations of it — the mint of a data key, and
-/// the decrypt of one still inside the reuse period — so a policy granting one of them
-/// and withholding the other does not let the write through, and the refusal names the
-/// operation that was withheld.
+/// A write into an execution RE-USES the data key its payloads already go under while the
+/// period `kmsDataKeyReusePeriodSeconds` names lasts — "when the period expires, Step
+/// Functions will call `GenerateDataKey`" — so the write a fresh execution takes asks the
+/// key for the DECRYPT of that data key and for nothing else: a policy withholding the
+/// decrypt refuses it, and one withholding only the mint of the NEXT data key does not.
 #[tokio::test]
-async fn a_write_needs_both_the_mint_and_the_reuse_of_a_data_key() {
+async fn a_write_inside_the_reuse_period_asks_the_decrypt_of_the_data_key() {
     let chain = Chain::new();
     let key = chain.create_key(&granting_policy()).await;
 
     // Each row: the crypto actions the key policy delegates to the account, and the
-    // action the write is refused for — `None` when the policy covers the whole write.
+    // action the write is refused for — `None` when the policy covers the write.
     let rows: Vec<(&str, Vec<&str>, Option<&str>)> = vec![
         (
             "only the mint of a data key is granted",
@@ -308,12 +310,17 @@ async fn a_write_needs_both_the_mint_and_the_reuse_of_a_data_key() {
         (
             "only the decrypt of a data key is granted",
             vec!["kms:Decrypt"],
-            Some("kms:GenerateDataKey"),
+            None,
         ),
         (
             "both are granted",
             vec!["kms:GenerateDataKey", "kms:Decrypt"],
             None,
+        ),
+        (
+            "neither is granted",
+            vec!["kms:DescribeKey"],
+            Some("kms:Decrypt"),
         ),
     ];
 
@@ -321,7 +328,7 @@ async fn a_write_needs_both_the_mint_and_the_reuse_of_a_data_key() {
         chain.put_policy(&key, &granting_policy()).await;
         let (_execution, token) = outstanding_task(
             &chain,
-            &format!("two-actions-{index}"),
+            &format!("reuse-period-{index}"),
             Some(customer_managed(&key)),
         )
         .await;
@@ -341,7 +348,7 @@ async fn a_write_needs_both_the_mint_and_the_reuse_of_a_data_key() {
         let Some(withheld) = withheld else {
             assert_eq!(
                 status, 200,
-                "case {case:?}: a policy covering the whole write serves it, got {status} with \
+                "case {case:?}: a policy covering the decrypt serves the write, got {status} with \
                  {answer:?}"
             );
             continue;
@@ -349,7 +356,7 @@ async fn a_write_needs_both_the_mint_and_the_reuse_of_a_data_key() {
         assert_eq!(
             (status, error_code(&answer).as_str()),
             (KMS_ACCESS_DENIED_STATUS, KMS_ACCESS_DENIED),
-            "case {case:?}: a write missing one of the two operations is refused, got {status} \
+            "case {case:?}: a write whose decrypt the policy withholds is refused, got {status} \
              with {answer:?}"
         );
         assert!(

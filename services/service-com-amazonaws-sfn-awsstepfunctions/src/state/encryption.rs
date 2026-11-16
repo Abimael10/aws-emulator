@@ -47,9 +47,11 @@
 //! nothing and so asks nothing of the key.
 //!
 //! Two approximations are deliberate here, so a later reader does not take them for
-//! the service's exact rule. Which of the two calls a given write makes depends on
-//! how long ago a data key was minted, which no caller chooses, so a write asks for
-//! both rather than for whichever one this instant would have made. And a read or a
+//! the service's exact rule. Which of the two calls a given write makes is read from the
+//! clock — the data key an execution's payloads go under is minted when it starts, so a
+//! write inside the reuse period opens that data key and one past the period mints the
+//! next ([`write_of_sealed_data`]) — while the data key itself is never held, so every
+//! call that needs the key consults it. And a read or a
 //! write of an execution's own data is decided against the identity that signed the
 //! REQUEST, which stands in for the caller the service makes that call as.
 //!
@@ -116,7 +118,7 @@ const READ_OF_SEALED_DATA: &[&str] = &[DECRYPT_OPERATION];
 /// Reading the key is not part of it: a key is READ where a resource is COMMITTED to it
 /// ([`CONFIGURED_KEY_USE`]), which has already happened by the time anything is sealed,
 /// so a call that only seals asks nothing of the key it does not make — exactly as a
-/// write into an existing execution does ([`WRITE_OF_SEALED_DATA`]).
+/// write into an existing execution does ([`write_of_sealed_data`]).
 const SEAL_OF_CALLER_DATA: &[&str] = &[GENERATE_DATA_KEY_OPERATION];
 
 /// What a call that neither seals nor unseals anything asks of the key: nothing. The
@@ -124,16 +126,6 @@ const SEAL_OF_CALLER_DATA: &[&str] = &[GENERATE_DATA_KEY_OPERATION];
 /// the KEY rather than of an identity, and nothing of the resource's data can be written
 /// or read while it lasts.
 const NOTHING_OF_THE_KEY: &[&str] = &[];
-
-/// What sealing caller-supplied data INTO AN EXISTING execution asks of its key: the
-/// data key that execution's payloads already go under is RE-USED, which decrypts it —
-/// "when the period expires, Step Functions will call `GenerateDataKey`"
-/// (`kmsDataKeyReusePeriodSeconds`), so a reply inside that period opens the data key
-/// already minted and a reply past it mints the next one. A caller is allowed to have
-/// its data sealed only when it is allowed both, since which of the two a given call
-/// makes is not the caller's to choose; the reuse is asked FIRST, because that is what a
-/// reply to a task an execution is already holding does.
-const WRITE_OF_SEALED_DATA: &[&str] = &[DECRYPT_OPERATION, GENERATE_DATA_KEY_OPERATION];
 
 /// What APPLYING an encryption configuration asks of the key the configuration names:
 /// the key is READ first — a configuration commits the resource to a key of the kind it
@@ -364,10 +356,63 @@ pub fn execution_write_denied<Eng: Send + Sync + 'static>(
     region: &str,
     execution_arn: &str,
 ) -> Option<KeyRefusal> {
-    execution_key_denied(engine, ctx, region, execution_arn, WRITE_OF_SEALED_DATA)
+    let state = super::service_state(engine)?;
+    // The lock is released before KMS is consulted: nothing of this service's state is
+    // read or written while the decision is being made.
+    let (key, operations) = {
+        let store = state.lock();
+        let execution = store.executions.get(execution_arn)?;
+        let machine_arn = execution.state_machine_arn.clone();
+        let operations = write_of_sealed_data(
+            execution.start_date,
+            data_key_reuse_period(&store, &machine_arn),
+            super::now(),
+        );
+        (state_machine_key(&store, &machine_arn)?, operations)
+    };
+    key_denied(engine, ctx, region, &key, operations)
 }
 
-/// The one resolution behind both of the above: the key the execution's data lives
+/// What sealing caller-supplied data into an execution that STARTED at `started` asks of
+/// its key at `now`, under the reuse period `period_seconds` the resource's configuration
+/// states.
+///
+/// The data key an execution's payloads go under is minted when the execution starts, and
+/// `kmsDataKeyReusePeriodSeconds` is the "maximum duration that Step Functions will reuse
+/// data keys. When the period expires, Step Functions will call `GenerateDataKey`" — so a
+/// write INSIDE that period re-uses the data key already minted, which OPENS it
+/// ([`READ_OF_SEALED_DATA`]), and a write past it mints the next one
+/// ([`SEAL_OF_CALLER_DATA`]). Which of the two a given write makes is therefore a fact of
+/// the clock rather than of the caller, and it is the call this instant really makes: a
+/// write is never judged for a call it did not make.
+fn write_of_sealed_data(
+    started: ::std::time::SystemTime,
+    period_seconds: i32,
+    now: ::std::time::SystemTime,
+) -> &'static [&'static str] {
+    let period = ::std::time::Duration::from_secs(u64::try_from(period_seconds).unwrap_or_default());
+    match now.duration_since(started).unwrap_or_default() < period {
+        true => READ_OF_SEALED_DATA,
+        false => SEAL_OF_CALLER_DATA,
+    }
+}
+
+/// The reuse period in force on the data keys of the state machine `arn` names: the one
+/// its `encryptionConfiguration` states, and the service's own default for a
+/// configuration that states none.
+fn data_key_reuse_period(
+    store: &super::ComAmazonawsSfnAwsstepfunctionsState,
+    arn: &str,
+) -> i32 {
+    store
+        .state_machines
+        .get(arn)
+        .and_then(|machine| machine.encryption_configuration.as_ref())
+        .and_then(|configuration| configuration.kms_data_key_reuse_period_seconds)
+        .unwrap_or(super::DEFAULT_KMS_DATA_KEY_REUSE_PERIOD_SECONDS)
+}
+
+/// The one resolution behind the READ above: the key the execution's data lives
 /// under, judged for the `operations` this call makes on it.
 fn execution_key_denied<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -408,7 +453,7 @@ pub fn task_reply_write_denied<Eng: Send + Sync + 'static>(
     // ONE acquisition resolves the whole chain — the task, the activity it was queued
     // under, its execution and that execution's state machine — so the reads cannot
     // disagree, and the guard is released before KMS is consulted.
-    let (execution_arn, role_arn, uses) = {
+    let (execution_arn, role_arn, uses, operations) = {
         let store = state.lock();
         let task = store.activity_tasks.get(token)?;
         let execution_arn = task.execution_arn.clone();
@@ -420,24 +465,35 @@ pub fn task_reply_write_denied<Eng: Send + Sync + 'static>(
         }
         let execution = store.executions.get(&execution_arn);
         let role_arn = execution.map(|execution| execution.ran.role_arn.clone());
+        // What the reply asks of the key is what the clock makes of it: the data key the
+        // execution's payloads go under is re-used while its period lasts and the next one
+        // is minted once it has expired ([`write_of_sealed_data`]).
+        let mut operations = SEAL_OF_CALLER_DATA;
         if let Some(machine_arn) = execution.map(|execution| execution.state_machine_arn.clone()) {
+            if let Some(started) = execution.map(|execution| execution.start_date) {
+                operations = write_of_sealed_data(
+                    started,
+                    data_key_reuse_period(&store, &machine_arn),
+                    super::now(),
+                );
+            }
             uses.extend(state_machine_key(&store, &machine_arn));
         }
-        (execution_arn, role_arn, uses)
+        (execution_arn, role_arn, uses, operations)
     };
     let region = super::arn_region(&execution_arn);
     uses.iter().find_map(|used| {
         // The reply's data is recorded INTO the execution, which Step Functions does as
         // the state machine's EXECUTION ROLE — the identity it assumes for that
-        // execution's work — so that role has to be allowed the key as well as the
-        // caller: a least-privilege role the key does not permit cannot have the reply
-        // sealed, whoever sent it. A token whose execution the store no longer holds
-        // names no role, and no use of a key is decided for an identity that is not
-        // there.
-        key_denied(engine, ctx, &region, used, WRITE_OF_SEALED_DATA).or_else(|| {
-            let role_arn = role_arn.as_deref()?;
-            role_key_denied(engine, &region, used, role_arn, WRITE_OF_SEALED_DATA)
-        })
+        // execution's work — so THAT is the use the key is asked for, and a role the key
+        // does not permit cannot have the reply sealed, whoever sent it: a least-privilege
+        // role is refused before the caller's own use of the key is weighed. A token whose
+        // execution the store no longer holds names no role, and no use of a key is
+        // decided for an identity that is not there.
+        role_arn
+            .as_deref()
+            .and_then(|role_arn| role_key_denied(engine, &region, used, role_arn, operations))
+            .or_else(|| key_denied(engine, ctx, &region, used, operations))
     })
 }
 

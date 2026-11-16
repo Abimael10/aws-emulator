@@ -138,7 +138,13 @@ pub fn pass_role_denial<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let caller = caller(engine, ctx);
     let context = pass_context();
-    denial(&caller, PASS_ROLE_ACTION, role_arn, &context)
+    denial(
+        &caller,
+        PASS_ROLE_ACTION,
+        role_arn,
+        &context,
+        &[PASSED_TO_SERVICE_CONDITION_KEY],
+    )
 }
 
 /// Why this caller may not perform `action` on `resource`, or `None` when it may —
@@ -150,6 +156,11 @@ pub fn pass_role_denial<Eng: Send + Sync + 'static>(
 /// what the call is about, which is also what keeps a refused call from telling an
 /// unauthorized caller whether a resource is there.
 ///
+/// `conditions` are the condition keys this request FIXES
+/// ([`super::request_conditions`]), so a statement narrowed with a `Condition` over one of
+/// them is decided on its own terms rather than left undecided — which is what makes a
+/// qualifier-scoped or tag-scoped grant of this service usable at all.
+///
 /// Call it BEFORE this service's store is read or written: a refused call must leave
 /// nothing behind. Nothing is cached, so a policy `iam:PutRolePolicy` wrote takes effect
 /// on the next request and one it replaced stops granting on the next request.
@@ -158,24 +169,66 @@ pub fn caller_action_denial<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     resource: &str,
+    conditions: &super::request_conditions::RequestConditions,
 ) -> Option<String> {
     let caller = caller(engine, ctx);
-    // No condition context: a call of this service carries no key a statement of its
-    // own could be scoped by here, and a clause over a key the request does not carry
-    // is left undecided by the shared evaluator rather than guessed at.
-    denial(&caller, action, resource, &[])
+    denial(
+        &caller,
+        action,
+        resource,
+        &conditions.context,
+        &conditions.published,
+    )
+}
+
+/// Why this caller may not reach the resource `resource` AT ALL: it belongs to another
+/// account, which no document of this account can grant over — or `None` for a resource
+/// of the account this endpoint serves and for a value that names no resource of this
+/// service.
+///
+/// A policy of an account grants over that account's own resources, so a request naming a
+/// resource field of ANOTHER account is one no evaluation here can allow: AWS refuses it
+/// with the sentence that names the principal ALONE
+/// ([`::service_common::iam_authorization::not_authorized_to_access_resource`]) — neither
+/// the action nor the ARN — so a caller cannot learn from the refusal what exists in an
+/// account that is not its own, and it is answered before anything is looked up, which is
+/// what keeps a cross-account mistake from being reported as a resource that is missing.
+///
+/// Call it BEFORE the store is read, with the ARN the request CARRIED.
+pub fn foreign_account_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    resource: &str,
+) -> Option<String> {
+    let parsed = ::service_common::arn::parse(resource)?;
+    if parsed.vendor != crate::state::ARN_SERVICE
+        || parsed.account.is_empty()
+        || parsed.account == ::engine::emulator_account_id()
+    {
+        return None;
+    }
+    let caller = caller(engine, ctx);
+    Some(iam::not_authorized_to_access_resource(&caller.arn))
 }
 
 /// Why `caller` may not perform `action` on `resource` under the documents in force on
 /// it, or `None` when it may — IAM's own order, read once for every question this
 /// module asks, so the two gates cannot decide one principal differently.
+///
+/// `published` are the condition keys the request MODELS, whether or not `context` carries
+/// a value for each: the shared evaluator reads a published key's absence as "the request
+/// carries none" and an unpublished key's absence as "this emulator does not model it",
+/// which decides nothing — the fail-closed reading of a clause this emulator cannot answer.
 fn denial(
     caller: &Caller,
     action: &str,
     resource: &str,
     context: &[(String, String)],
+    published: &[&str],
 ) -> Option<String> {
-    let request = iam::Request::new(action, resource, &caller.principals).with_context(context);
+    let request = iam::Request::new(action, resource, &caller.principals)
+        .with_context(context)
+        .with_published_keys(published);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be
     // read refuses the call whatever else the principal carries — including a grant

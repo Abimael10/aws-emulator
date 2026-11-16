@@ -405,6 +405,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::observability::LOG_DESTINATION_ACCESS_DENIED,
                     ));
                 }
+                // And the other half of that gate: delivering AS that role means ASSUMING
+                // it for THIS state machine, so a trust this account holds that withholds
+                // that assume is a configuration this service cannot apply — the same
+                // reading `CreateStateMachine` takes of the same document
+                // (`crate::state::observability::log_role_unassumable_for`), over the
+                // state machine this update configures.
+                if crate::state::observability::log_role_unassumable_for(
+                    ctx,
+                    &endpoint_region,
+                    &role_arn,
+                    &input.state_machine_arn,
+                )
+                .await
+                {
+                    return Err(crate::scaffolded::Scaffolded::access_denied(
+                        crate::state::observability::log_role_not_assumable(),
+                    ));
+                }
             }
         }
 

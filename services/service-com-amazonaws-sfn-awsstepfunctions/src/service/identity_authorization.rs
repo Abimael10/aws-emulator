@@ -60,18 +60,20 @@
 //! OPERATION names its resource by ([`ADDRESSED_BY`], keyed by operation so a member
 //! another operation names its resource by cannot decide this one), the resource the TASK
 //! TOKEN it carries belongs to for an operation addressed that way
-//! ([`ADDRESSED_BY_TASK_TOKEN`]), the ARN a create would MINT for the name it carries
-//! ([`minted_resource`]), and otherwise [`any_resource`] — a
-//! call that names no resource of this service in a member of its own, which is judged
-//! against EVERY resource of this service in the account and Region the request was made
-//! for, written in this service's own ARN form with the parts that name one resource
-//! wildcarded (`crate::state::every_resource_arn`) rather than as a bare `*`: that ARN is
-//! what AWS reports such a call was refused on, and it is what a statement has to cover to
-//! grant it. A request that names one only INSIDE another structure
-//! (`CreateStateMachineAlias`, whose routing configuration carries the version ARNs the
-//! alias is to point at) is in that last group: the ARN it would be judged against is not a
-//! member of the request, so such a call is decided against every resource rather than
-//! against an ARN read out of a nested shape.
+//! ([`ADDRESSED_BY_TASK_TOKEN`]), the ARN a create would MINT — for the name it carries
+//! ([`minted_resource`]), or, for an alias, inside the state machine its routing
+//! configuration points at ([`super::request_conditions::minted_alias_arn`]) — and
+//! otherwise [`any_resource`]: a call that names no resource of this service at all, which
+//! is judged against every resource of the KIND its API is about in the account and Region
+//! the request was made for, written in this service's own ARN form with the resource name
+//! wildcarded rather than as a bare `*`. That ARN is what AWS reports such a call was
+//! refused on, and it is what a statement has to cover to grant it.
+//!
+//! The ARN a request carries may be a QUALIFIED one, and a qualifier is not always part of
+//! the resource: an operation that reaches a state machine THROUGH an alias or a version
+//! is taken on the state machine itself, with the qualifier carried as a condition key
+//! instead ([`super::request_conditions`]), so a grant of the action on a state machine
+//! covers every way of naming it.
 //!
 //! A `SendTask*` call carries no ARN at all — the task it settles is named by the
 //! `taskToken` the service itself minted for that task — and a task token of this service
@@ -97,14 +99,126 @@ pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
 /// The resource a request that names no resource of this service in a member of its own is
 /// judged against, as AWS writes it for such a request — a listing, a state tested without a
-/// state machine, a definition validated without one, a create whose resource is named only
-/// inside a nested shape, and a call carrying a task token this service never minted (see the
-/// module docs): every resource of this service in the Region the request was made for and
-/// the account this emulator serves, spelled by the one place this crate writes that ARN
-/// ([`crate::state::every_resource_arn`]).
+/// state machine, a definition validated without one, and a call carrying a task token this
+/// service never minted (see the module docs): every resource of the KIND that request's
+/// API is about, in the Region the request was made for and the account this emulator
+/// serves, written in this service's own ARN form with the resource NAME wildcarded
+/// (`crate::state::every_resource_of_type_arn`) rather than as a bare `*`.
+///
+/// That ARN is what AWS reports such a call was refused on, and it is what a statement has
+/// to cover to grant it: an API about state machines is judged against the state machines of
+/// the Region (`arn:<partition>:states:<region>:<account>:stateMachine:*`), one about
+/// activities against its activities, and so on down [`API_RESOURCE_TYPE`]. An API that is
+/// about no one resource type is judged against every resource of this service
+/// ([`crate::state::every_resource_arn`]), the ARN with both the type and the name
+/// wildcarded.
 #[must_use]
-pub fn any_resource(region: &str) -> String {
-    crate::state::every_resource_arn(region)
+pub fn any_resource(operation: &str, region: &str) -> String {
+    match api_resource_type(operation) {
+        Some(resource_type) => crate::state::every_resource_of_type_arn(region, resource_type),
+        None => crate::state::every_resource_arn(region),
+    }
+}
+
+/// The resource TYPE each operation's API is ABOUT, keyed by the operation's shape name:
+/// the type of resource the call acts on, whether or not its request names one.
+///
+/// AWS reports a call that fixed no resource of its own as refused on the resource pattern
+/// of the API's own category rather than on a bare wildcard, so the category is a fact of
+/// each operation — read from what the operation DOES: a state machine API (every create,
+/// read, write and listing of state machines, their versions and their aliases, and every
+/// start of one), an activity API (every create, read, listing and poll of activities, and
+/// the three `SendTask*` calls a worker settles a task with), an execution API (every read,
+/// stop and redrive of one execution, and the Map Runs of one), or a Map Run API. An empty
+/// row is an API about no one type: the tagging calls take "the ARN for the Step Functions
+/// state machine or activity", so they are about both.
+///
+/// Source: every operation `smithy_query(query="digest",model_path="services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/com-amazonaws-sfn-awsstepfunctions.json")`
+/// binds, with the resource each one's own documentation says it acts on. Public, so the
+/// catalog is re-derived from the model by this crate's own tests
+/// (`tests/all/identity_policy_authorization.rs`) rather than only transcribed here.
+pub const API_RESOURCE_TYPE: &[(&str, &str)] = &[
+    ("CreateActivity", crate::state::ACTIVITY_RESOURCE),
+    ("CreateStateMachine", crate::state::STATE_MACHINE_RESOURCE),
+    (
+        "CreateStateMachineAlias",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    ("DeleteActivity", crate::state::ACTIVITY_RESOURCE),
+    ("DeleteStateMachine", crate::state::STATE_MACHINE_RESOURCE),
+    (
+        "DeleteStateMachineAlias",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    (
+        "DeleteStateMachineVersion",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    ("DescribeActivity", crate::state::ACTIVITY_RESOURCE),
+    ("DescribeExecution", crate::state::EXECUTION_RESOURCE),
+    ("DescribeMapRun", crate::state::MAP_RUN_RESOURCE),
+    ("DescribeStateMachine", crate::state::STATE_MACHINE_RESOURCE),
+    (
+        "DescribeStateMachineAlias",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    (
+        "DescribeStateMachineForExecution",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    ("GetActivityTask", crate::state::ACTIVITY_RESOURCE),
+    ("GetExecutionHistory", crate::state::EXECUTION_RESOURCE),
+    ("ListActivities", crate::state::ACTIVITY_RESOURCE),
+    ("ListExecutions", crate::state::STATE_MACHINE_RESOURCE),
+    ("ListMapRuns", crate::state::EXECUTION_RESOURCE),
+    (
+        "ListStateMachineAliases",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    (
+        "ListStateMachineVersions",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    ("ListStateMachines", crate::state::STATE_MACHINE_RESOURCE),
+    // "The Amazon Resource Name (ARN) for the Step Functions state machine or activity":
+    // a tagging call is about both taggable types, so it is about no one type.
+    ("ListTagsForResource", ""),
+    (
+        "PublishStateMachineVersion",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    ("RedriveExecution", crate::state::EXECUTION_RESOURCE),
+    ("SendTaskFailure", crate::state::ACTIVITY_RESOURCE),
+    ("SendTaskHeartbeat", crate::state::ACTIVITY_RESOURCE),
+    ("SendTaskSuccess", crate::state::ACTIVITY_RESOURCE),
+    ("StartExecution", crate::state::STATE_MACHINE_RESOURCE),
+    ("StartSyncExecution", crate::state::STATE_MACHINE_RESOURCE),
+    ("StopExecution", crate::state::EXECUTION_RESOURCE),
+    ("TagResource", ""),
+    ("TestState", crate::state::STATE_MACHINE_RESOURCE),
+    ("UntagResource", ""),
+    ("UpdateMapRun", crate::state::MAP_RUN_RESOURCE),
+    ("UpdateStateMachine", crate::state::STATE_MACHINE_RESOURCE),
+    (
+        "UpdateStateMachineAlias",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+    (
+        "ValidateStateMachineDefinition",
+        crate::state::STATE_MACHINE_RESOURCE,
+    ),
+];
+
+/// The resource type `operation`'s API is about, and `None` for an API about no one type —
+/// including an operation this catalog does not carry, which is judged against every
+/// resource of this service rather than against a type guessed from its name.
+#[must_use]
+pub fn api_resource_type(operation: &str) -> Option<&'static str> {
+    API_RESOURCE_TYPE
+        .iter()
+        .find(|(named, _)| *named == operation)
+        .map(|(_, resource_type)| *resource_type)
+        .filter(|resource_type| !resource_type.is_empty())
 }
 
 /// The member of each operation's INPUT that names the ARN of the resource that request
@@ -271,7 +385,8 @@ pub fn capabilities(operation: &str) -> Vec<(&'static str, &'static str)> {
 
 /// Every IAM action this submitted input asks for, in the order they are decided: the
 /// operation's OWN action first, then the action of each capability a member of the request
-/// switches on.
+/// switches on, then the action of each further permission a member of it IMPLIES
+/// ([`IMPLIED_ACTIONS`]).
 ///
 /// A capability member that is absent, is `false` or carries anything but a boolean asks for
 /// nothing — the modelled default of such a member is `false`, so a request that does not
@@ -287,7 +402,74 @@ fn requested_actions(submitted: Option<&::serde_json::Value>, operation: &str) -
             asked.push(service_action(action));
         }
     }
+    for (member, asked_for, action) in IMPLIED_ACTIONS {
+        if member.0 != operation {
+            continue;
+        }
+        if asked_for(submitted.and_then(|body| body.get(member.1))) {
+            asked.push(service_action(action));
+        }
+    }
     asked
+}
+
+/// Whether the value a member carries ASKS FOR the permission its row names.
+type AsksFor = fn(Option<&::serde_json::Value>) -> bool;
+
+/// One implied permission: the `(operation, member)` whose value asks for it, whether that
+/// value asks for it, and the name of the action AWS grants it by.
+type ImpliedAction = ((&'static str, &'static str), AsksFor, &'static str);
+
+/// A permission a request asks for because of WHAT IT DOES rather than because of the
+/// operation it names: the `(operation, member)` whose value asks for it, whether that
+/// value asks for it, and the action AWS grants it by.
+///
+/// AWS gates a capability like this on its own action even where the operation's own
+/// documentation does not say so, and refuses the whole call — creating nothing — when the
+/// caller holds the operation but not the implied action:
+///
+/// * passing `tags` on a create TAGS the resource being created, which is
+///   `states:TagResource`: "to create a resource with tags you must have permissions to
+///   use the action that creates the resource and the `TagResource` action" is AWS's own
+///   rule for tag-on-create, and it is why a caller denied the tagging action cannot
+///   escape a tag-based permission boundary by writing its tags through the create;
+/// * asking a create or an update to `publish` mints a VERSION of the state machine, which
+///   is the work `states:PublishStateMachineVersion` grants — the same action the
+///   standalone `PublishStateMachineVersion` operation is taken under — so a caller denied
+///   it gets no version and no state machine from a create that asked for one.
+///
+/// A member that is absent, or carries a value that asks for nothing (no tags at all, a
+/// `publish` left at its `false` default), implies nothing: such a request is decided
+/// exactly as one that does not carry the member.
+const IMPLIED_ACTIONS: &[ImpliedAction] = &[
+    (("CreateActivity", "tags"), writes_tags, "TagResource"),
+    (("CreateStateMachine", "tags"), writes_tags, "TagResource"),
+    (
+        ("CreateStateMachine", "publish"),
+        switched_on,
+        "PublishStateMachineVersion",
+    ),
+    (
+        ("UpdateStateMachine", "publish"),
+        switched_on,
+        "PublishStateMachineVersion",
+    ),
+];
+
+/// Whether the member carries tags to write: a non-empty list, since a request carrying an
+/// empty one writes none.
+fn writes_tags(member: Option<&::serde_json::Value>) -> bool {
+    member
+        .and_then(::serde_json::Value::as_array)
+        .is_some_and(|tags| !tags.is_empty())
+}
+
+/// Whether the member switches its capability ON: the boolean `true`, since the modelled
+/// default of such a member is `false`.
+fn switched_on(member: Option<&::serde_json::Value>) -> bool {
+    member
+        .and_then(::serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The member a request that MINTS a resource names it by.
@@ -297,8 +479,12 @@ const NAME_MEMBER: &str = "name";
 /// `None` for an operation that mints none.
 ///
 /// Source: the two operations of this model whose input carries the `name` of the resource
-/// it creates and no ARN of an existing one (`CreateStateMachineInput$name`,
-/// `CreateActivityInput$name`). Such a request addresses the resource it is about to mint,
+/// it creates and no ARN of an existing one, and whose resource's ARN is a function of that
+/// name alone (`CreateStateMachineInput$name`, `CreateActivityInput$name`) — an alias is
+/// named inside the state machine its routing configuration points at, so the ARN a
+/// `CreateStateMachineAlias` mints is read by
+/// [`super::request_conditions::minted_alias_arn`] instead. Such a request addresses the
+/// resource it is about to mint,
 /// so it is judged against that ARN — built by the one place this service spells each form
 /// ([`crate::state::state_machine_arn`], [`crate::state::activity_arn`]) and from the
 /// request alone, so nothing is looked up and nothing is created to decide it.
@@ -348,20 +534,64 @@ fn addressed_in(submitted: Option<&::serde_json::Value>, operation: &str, region
             return named;
         }
     }
-    member(NAME_MEMBER)
+    if let Some(minted) = member(NAME_MEMBER)
         .and_then(|name| minted_resource(operation, region, &name))
-        .unwrap_or_else(|| any_resource(region))
+        .or_else(|| super::request_conditions::minted_alias_arn(submitted, operation))
+    {
+        return minted;
+    }
+    any_resource(operation, region)
+}
+
+/// The operations whose request is refused outright when the ARN it names belongs to
+/// ANOTHER account ([`super::authorization::foreign_account_denial`]): the calls about a
+/// state machine's VERSIONS and ALIASES, and the listings of them.
+///
+/// A version and an alias are reached only through the state machine that holds them, and
+/// the account is part of that reference: such a call is about a resource of one account,
+/// so an ARN of another account names nothing this endpoint can answer for — AWS refuses
+/// it as a resource the caller may not access rather than as a resource that is absent,
+/// which is what keeps a cross-account mistake from being reported as a missing resource
+/// and keeps the refusal from disclosing whether the other account holds it.
+///
+/// Source: every operation of this model whose input names a state machine alias or
+/// version ARN, or lists the aliases or versions of a state machine
+/// (`smithy_query(query="digest",model_path="services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/com-amazonaws-sfn-awsstepfunctions.json")`).
+/// Public, so the catalog is read back by this crate's own tests.
+pub const OWNERSHIP_CHECKED: &[&str] = &[
+    "CreateStateMachineAlias",
+    "DeleteStateMachineAlias",
+    "DeleteStateMachineVersion",
+    "DescribeStateMachineAlias",
+    "ListStateMachineAliases",
+    "ListStateMachineVersions",
+    "UpdateStateMachineAlias",
+];
+
+/// Whether `operation` refuses an ARN of another account outright, for the ARN
+/// `addressed` it named ([`OWNERSHIP_CHECKED`]).
+///
+/// A QUALIFIED state machine ARN names a VERSION or an ALIAS whichever operation carries
+/// it, so a call about one is ownership-checked too: an unqualified ARN of another account
+/// names a state machine that is simply not here, which the operation's own
+/// does-not-exist error reports.
+#[must_use]
+pub fn ownership_checked(operation: &str, addressed: &str) -> bool {
+    OWNERSHIP_CHECKED.contains(&operation)
+        || super::request_conditions::state_machine_qualifier(addressed).is_some()
 }
 
 /// Why the policies in force do not let this caller perform what this request asks for —
-/// `operation` itself and every capability a member of it switches on ([`requested_actions`])
-/// — or `None` when they let it, including every caller the gate does not bound (see the
-/// module docs).
+/// `operation` itself, every capability a member of it switches on and every permission a
+/// member of it implies ([`requested_actions`]) — or `None` when they let it, including
+/// every caller the gate does not bound (see the module docs).
 ///
 /// Call it BEFORE the operation runs: a refused request must read and write nothing. The
 /// decision itself is [`super::authorization::caller_action_denial`], the one place this
 /// service asks what the documents in force on a caller say about an `(action, resource)`
-/// pair; this reads the pairs off the request.
+/// pair; this reads the pairs off the request, together with the condition keys that
+/// request fixes ([`super::request_conditions`]), so a statement scoped to one of them is
+/// decided on its own terms.
 fn denial<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
@@ -370,13 +600,31 @@ fn denial<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let submitted = submitted_input(req);
     let region = crate::state::request_region(ctx.parts());
-    let resource = addressed_in(submitted.as_ref(), operation, &region);
-    // Every action the request asks for has to be allowed, so the FIRST one the documents
-    // in force do not cover refuses the call — and the refusal names that action, which is
-    // what tells the caller which grant it is missing.
+    let addressed = addressed_in(submitted.as_ref(), operation, &region);
+    // A VERSION or an ALIAS of a state machine is reached only through the account that
+    // holds it: such a call names its resource by an ARN whose account field is part of
+    // the reference, and an ARN of another account names a resource no document of this
+    // account can grant over — so it is refused before anything is looked up
+    // ([`OWNERSHIP_CHECKED`]).
+    if ownership_checked(operation, &addressed) {
+        if let Some(refusal) = super::authorization::foreign_account_denial(engine, ctx, &addressed)
+        {
+            return Some(refusal);
+        }
+    }
+    // Every action the request asks for has to be allowed, on every resource the request
+    // is ABOUT ([`super::request_conditions::asked_for`]), so the FIRST decision the
+    // documents in force do not cover refuses the call — and the refusal names that
+    // action and that resource, which is what tells the caller which grant it is missing.
+    let asked =
+        super::request_conditions::asked_for(engine, submitted.as_ref(), operation, &addressed);
     requested_actions(submitted.as_ref(), operation)
         .iter()
-        .find_map(|action| caller_action_denial(engine, ctx, action, &resource))
+        .find_map(|action| {
+            asked.iter().find_map(|about| {
+                caller_action_denial(engine, ctx, action, &about.resource, &about.conditions)
+            })
+        })
 }
 
 /// Every modelled operation of this service, served only to a caller IAM allows to perform
@@ -513,10 +761,10 @@ mod tests {
     /// a version-4 UUID in, so a token built from it is one this service would have minted.
     const MINTED_ID: &str = "0f1e2d3c-4b5a-4968-8776-65544332211a";
 
-    /// Every resource of this service in that Region: what a request naming none of them
-    /// is judged against.
-    fn any_resource_of_the_region() -> String {
-        any_resource(REGION)
+    /// Every resource of the kind `operation`'s API is about, in that Region: what a request
+    /// naming no resource of its own is judged against.
+    fn any_resource_of_the_region(operation: &str) -> String {
+        any_resource(operation, REGION)
     }
 
     /// RULE: a request is judged against the ARN it NAMES, in the member ITS OWN
@@ -601,16 +849,28 @@ mod tests {
                 crate::state::activity_arn(REGION, "minted"),
             ),
             (
-                "an alias create, whose resource is named only inside its routing shape",
+                "an alias create naming no version for it to route to",
                 "CreateStateMachineAlias",
                 json!({ "name": "PROD", "routingConfiguration": [] }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("CreateStateMachineAlias"),
+            ),
+            (
+                "an alias create, judged against the ARN it would mint",
+                "CreateStateMachineAlias",
+                json!({
+                    "name": "PROD",
+                    "routingConfiguration": [{
+                        "stateMachineVersionArn": version,
+                        "weight": 100,
+                    }],
+                }),
+                alias.clone(),
             ),
             (
                 "a listing that names no resource",
                 "ListStateMachines",
                 json!({}),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("ListStateMachines"),
             ),
             (
                 "a settlement addressed by a callback task's token",
@@ -637,31 +897,31 @@ mod tests {
                 "a task token this service never minted",
                 "SendTaskSuccess",
                 json!({ "taskToken": "token", "output": "{}" }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("SendTaskSuccess"),
             ),
             (
                 "a state tested with no state machine around it",
                 "TestState",
                 json!({ "definition": r#"{"Type":"Pass","End":true}"# }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("TestState"),
             ),
             (
                 "a task token carried on an operation that names none",
                 "DescribeExecution",
                 json!({ "taskToken": crate::state::task_token(MINTED_ID, &execution) }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("DescribeExecution"),
             ),
             (
                 "a member carrying no text at all",
                 "DescribeExecution",
                 json!({ "executionArn": "" }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("DescribeExecution"),
             ),
             (
                 "a member carrying a value of another type",
                 "DescribeExecution",
                 json!({ "executionArn": 7 }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("DescribeExecution"),
             ),
             (
                 "a member the operation does not model, carried beside the one it does",
@@ -673,7 +933,7 @@ mod tests {
                 "a member the operation does not model, carried alone",
                 "ListStateMachines",
                 json!({ "stateMachineArn": machine }),
-                any_resource_of_the_region(),
+                any_resource_of_the_region("ListStateMachines"),
             ),
         ];
         for (case, operation, body, expected) in rows {
@@ -685,7 +945,7 @@ mod tests {
         }
         // A body that is no JSON document at all names nothing either.
         let unreadable = addressed_in(None, "DescribeExecution", REGION);
-        let every_resource = any_resource_of_the_region();
+        let every_resource = any_resource_of_the_region("DescribeExecution");
         assert_eq!(
             unreadable, every_resource,
             "case \"a body that is not a JSON document\": expected {every_resource:?}, got \
@@ -694,12 +954,15 @@ mod tests {
     }
 
     /// RULE: a request asks for the action of its own operation, plus the action of every
-    /// capability a member of it switches ON — so a capability member left at its `false`
-    /// default asks for nothing more than the operation.
+    /// capability a member of it switches ON and of every permission a member of it
+    /// IMPLIES — so a capability member left at its `false` default, and a member that
+    /// writes nothing, ask for nothing more than the operation.
     ///
     /// The rows span the capability switched on and off, left out, carrying a value of
-    /// another type, an operation that models no capability at all, and the capability
-    /// member carried on an operation that does not model it.
+    /// another type, an operation that models no capability at all, the capability
+    /// member carried on an operation that does not model it, and each implied permission:
+    /// tagging on both creates, publishing on the create and on the update, both together,
+    /// and an empty tag list, which writes no tag.
     #[test]
     fn a_request_asks_for_the_action_of_every_capability_it_switches_on() {
         let pass = r#"{"Type":"Pass","End":true}"#;
@@ -740,6 +1003,80 @@ mod tests {
                 "ListStateMachines",
                 json!({ "revealSecrets": true }),
                 vec!["states:ListStateMachines"],
+            ),
+            (
+                "a create that tags what it creates",
+                "CreateStateMachine",
+                json!({
+                    "name": "runner",
+                    "definition": pass,
+                    "roleArn": "role",
+                    "tags": [{ "key": "team", "value": "payments" }],
+                }),
+                vec!["states:CreateStateMachine", "states:TagResource"],
+            ),
+            (
+                "a create carrying an empty tag list, which tags nothing",
+                "CreateStateMachine",
+                json!({ "name": "runner", "definition": pass, "roleArn": "role", "tags": [] }),
+                vec!["states:CreateStateMachine"],
+            ),
+            (
+                "an activity create that tags what it creates",
+                "CreateActivity",
+                json!({ "name": "worker", "tags": [{ "key": "team", "value": "payments" }] }),
+                vec!["states:CreateActivity", "states:TagResource"],
+            ),
+            (
+                "a create that publishes a version",
+                "CreateStateMachine",
+                json!({
+                    "name": "runner",
+                    "definition": pass,
+                    "roleArn": "role",
+                    "publish": true,
+                }),
+                vec![
+                    "states:CreateStateMachine",
+                    "states:PublishStateMachineVersion",
+                ],
+            ),
+            (
+                "a create that tags and publishes",
+                "CreateStateMachine",
+                json!({
+                    "name": "runner",
+                    "definition": pass,
+                    "roleArn": "role",
+                    "publish": true,
+                    "tags": [{ "key": "team", "value": "payments" }],
+                }),
+                vec![
+                    "states:CreateStateMachine",
+                    "states:TagResource",
+                    "states:PublishStateMachineVersion",
+                ],
+            ),
+            (
+                "an update that publishes a version",
+                "UpdateStateMachine",
+                json!({ "stateMachineArn": "arn", "publish": true }),
+                vec![
+                    "states:UpdateStateMachine",
+                    "states:PublishStateMachineVersion",
+                ],
+            ),
+            (
+                "an update that publishes nothing",
+                "UpdateStateMachine",
+                json!({ "stateMachineArn": "arn", "publish": false }),
+                vec!["states:UpdateStateMachine"],
+            ),
+            (
+                "a tagging call, whose own action is the tagging one",
+                "TagResource",
+                json!({ "resourceArn": "arn", "tags": [{ "key": "team", "value": "x" }] }),
+                vec!["states:TagResource"],
             ),
         ];
         for (case, operation, body, expected) in rows {

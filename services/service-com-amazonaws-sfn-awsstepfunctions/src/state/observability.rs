@@ -551,6 +551,69 @@ pub fn log_destination_denied<Eng: Send + Sync + 'static>(
     })
 }
 
+/// What a control-plane call answers when the role it names cannot be ASSUMED by this
+/// service to deliver the logs of the state machine being configured
+/// ([`log_role_unassumable_for`]).
+///
+/// Fixed service text, as AWS words it: the sentence names the two spellings of this
+/// service's principal a trust policy can be written for — the global one, read from the
+/// one place this crate spells it ([`super::task_authorization::SERVICE_PRINCIPAL`]), and
+/// the Region's own, which it names rather than spells — and carries no value of the
+/// request, so neither the role nor the state machine is quoted back.
+#[must_use]
+pub fn log_role_not_assumable() -> String {
+    format!(
+        "Neither the global service principal {}, nor the regional one is authorized to assume \
+         the provided role.",
+        super::task_authorization::SERVICE_PRINCIPAL
+    )
+}
+
+/// Whether the role `role_arn` cannot be ASSUMED by this service to deliver the logs of
+/// the state machine `state_machine_arn`, so a control-plane call that named them both is
+/// refused ([`LOG_DESTINATION_ACCESS_DENIED`]).
+///
+/// Step Functions does not write a vended log as the caller: it takes the state machine's
+/// role on and sets the delivery up as that role, and taking a role on is one PARTICULAR
+/// assume — the one made for this state machine, which this service presents under the two
+/// confused-deputy keys a service trust policy is written against
+/// ([`super::task_authorization::assume_context`]). A role whose trust is narrowed to
+/// another state machine, or to another account, is therefore one this service may not act
+/// as for the state machine being configured, and a configuration naming it could never
+/// deliver an event.
+///
+/// Either spelling of this service's principal getting the role is enough, so the Region's
+/// own is asked about only where the global one is withheld — the same pair, in the same
+/// order, the data plane asks about for the same document
+/// ([`super::task_authorization::assume_principals`],
+/// [`super::task_authorization::unassumable_role`]). It refuses only what a trust document
+/// this account HOLDS withholds
+/// ([`::service_common::iam_role::held_role_assume_is_unauthorized`]): a role the account
+/// does not hold, an answer this emulator cannot read and an emulator with no IAM to ask
+/// show nothing about the role, which is the deploy-time/run-time split this service
+/// exposes.
+pub async fn log_role_unassumable_for(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    state_machine_arn: &str,
+) -> bool {
+    if role_arn.is_empty() {
+        return false;
+    }
+    let context = super::task_authorization::assume_context(state_machine_arn);
+    for principal in super::task_authorization::assume_principals(region) {
+        let withheld = ::service_common::iam_role::held_role_assume_is_unauthorized(
+            ctx, region, role_arn, &principal, &context,
+        )
+        .await;
+        if !withheld {
+            return false;
+        }
+    }
+    true
+}
+
 /// The stream one execution's events are delivered to.
 ///
 /// Step Functions writes a stream per execution under the `states/` prefix every

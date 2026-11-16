@@ -171,6 +171,8 @@ mod lambda_task_control_flow;
 mod lambda_task_function_metrics;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
+#[path = "all/logging_role_trust.rs"]
+mod logging_role_trust;
 #[path = "all/management_event_recording.rs"]
 mod management_event_recording;
 #[path = "all/map_item_batcher.rs"]
@@ -261,6 +263,8 @@ mod state_machine_version_publish;
 mod state_machine_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/states_authorization_scopes.rs"]
+mod states_authorization_scopes;
 #[path = "all/states_metric_families.rs"]
 mod states_metric_families;
 #[path = "all/stop_execution_on_a_terminal_execution.rs"]
@@ -290,6 +294,8 @@ mod task_lifecycle_under_execution_role;
 mod task_refusal_access_denied_status;
 #[path = "all/task_refusal_session_principal.rs"]
 mod task_refusal_session_principal;
+#[path = "all/task_reply_key_use.rs"]
+mod task_reply_key_use;
 #[path = "all/task_role_over_dynamodb.rs"]
 mod task_role_over_dynamodb;
 #[path = "all/task_role_session_principal.rs"]

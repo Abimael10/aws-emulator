@@ -147,6 +147,22 @@ pub fn assume_context(state_machine_arn: &str) -> Vec<(String, String)> {
     context
 }
 
+/// The two spellings of this service's principal a trust policy can be written for, in
+/// the order an assume asks about them: the GLOBAL one ([`SERVICE_PRINCIPAL`]) and the
+/// Region's own ([`regional_service_principal`]).
+///
+/// Either of them getting the role is enough — each names this same service — so a caller
+/// asks about them in turn and stops at the first that is granted. The pair is spelled
+/// here once, so every reading of a role this service has to act as asks about the same
+/// two principals.
+#[must_use]
+pub fn assume_principals(region: &str) -> [String; 2] {
+    [
+        SERVICE_PRINCIPAL.to_string(),
+        regional_service_principal(region),
+    ]
+}
+
 /// What a `Task` state fails with when the execution role `role_arn` cannot be
 /// assumed, or `None` when nothing of the kind can be shown (see the module docs).
 ///
@@ -173,15 +189,14 @@ pub async fn unassumable_role(
         return None;
     }
     // Either principal getting the role is enough, so the Region's own is asked about
-    // only where the global one was refused.
-    let regional = regional_service_principal(region);
+    // only where the global one was refused ([`assume_principals`]).
     let context = assume_context(state_machine_arn);
-    for principal in [SERVICE_PRINCIPAL, regional.as_str()] {
+    for principal in assume_principals(region) {
         let unassumable = ::service_common::iam_role::role_assume_is_unauthorized_through(
             callback,
             region,
             role_arn,
-            principal,
+            &principal,
             &context,
         )
         .await;
@@ -275,23 +290,19 @@ fn unassumable_role_cause(role_arn: &str) -> String {
 pub type IamState =
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
 
-/// The error code an AWS service refuses an unauthorized call with, which the cause
-/// of a failed task names as the code the call came back under, for an operation that
-/// models no access-denied error of its OWN.
-const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
-
 /// The error an operation that MODELS the refusal of an unauthorized call answers it
-/// with ([`Denied`]), or the unmodelled refusal above for an operation that models
-/// none: the code the answer names the class by, and the status it carries.
+/// with ([`Denied`]), or the UNMODELLED refusal for an operation that models none: the
+/// code the answer names the class by, and the status it carries.
 ///
-/// The status of an UNMODELLED refusal is the invoked service's own
-/// ([`super::integration::Api::access_denied_status`]): the decision is taken before
+/// Both halves of an UNMODELLED refusal are the invoked service's own
+/// ([`super::integration::Api::access_denied_code`],
+/// [`super::integration::Api::access_denied_status`]): the decision is taken before
 /// the operation is reached, so what answers it is that service's front door, and the
-/// services differ in whether they answer an authorization failure as a Forbidden or as
-/// a client error.
+/// services differ both in whether they answer an authorization failure as a Forbidden
+/// or as a client error and in the code they name it by.
 fn denied_answer(api: &Api, denied: Option<Denied>) -> (&'static str, u16) {
     denied.map_or(
-        (ACCESS_DENIED_CODE, api.access_denied_status),
+        (api.access_denied_code(), api.access_denied_status),
         |denied| (denied.code, denied.status),
     )
 }
@@ -344,6 +355,10 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
         let targets = call.targets?;
         let iam = iam_state(&*engine)?;
         let (action, resource) = access_request(call, request, &region)?;
+        // The sentence reports the action as the INVOKED service's own refusal spells it;
+        // IAM compares action names without regard to case, so the decision is the same
+        // either way ([`super::integration::Api::refused_action`]).
+        let action = call.api.refused_action(&action);
         let (code, status) = denied_answer(call.api, targets.denied);
         if let Some(refused) = refusal(
             &iam.lock(),
@@ -497,7 +512,7 @@ pub fn job_report_denial<Eng: Send + Sync + 'static>(
             role_arn,
             session_name: &new_session_name(),
         },
-        &call.action(),
+        &call.api.refused_action(&call.action()),
         resource,
         call.api.sdk_client,
         code,

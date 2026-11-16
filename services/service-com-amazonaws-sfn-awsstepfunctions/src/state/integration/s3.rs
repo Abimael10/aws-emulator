@@ -41,6 +41,8 @@ pub(super) static S3_API: Api = Api {
     sdk_client: "AmazonS3",
     sdk_exception: "AmazonS3Exception",
     access_denied_status: TARGET_FORBIDDEN_STATUS,
+    access_denied_code: super::COMMON_ACCESS_DENIED_CODE,
+    lowercases_refused_action: false,
     // `GetObject`'s input: `Bucket`, `Key`; `ListObjectsV2`'s: `Bucket`, `Prefix`.
     member_case: MemberCase::Pascal,
     query_compatible: false,

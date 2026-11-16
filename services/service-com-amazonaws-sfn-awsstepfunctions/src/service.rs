@@ -126,6 +126,13 @@ pub mod data_events;
 /// against the Smithy model by this crate's tests.
 pub mod identity_authorization;
 
+/// What a request FIXES beside its action and its resource: the condition keys a statement
+/// about it can be scoped by, read off the request itself.
+///
+/// Public: its readings of a request's qualifiers and tags are checked by this crate's
+/// tests.
+pub mod request_conditions;
+
 /// How this service words the input-constraint refusals the framework hands
 /// back — the one formatter every operation's boundary validation reaches.
 /// How this service words a boundary refusal, and which members it states no value
