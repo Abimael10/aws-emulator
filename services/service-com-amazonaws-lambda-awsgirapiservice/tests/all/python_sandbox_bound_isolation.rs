@@ -130,6 +130,8 @@ fn ran(source: &str, budget: Budget, clock: &Clock, case: &str) -> Finished {
                     // The run's own containment and bounds are what these rows are about,
                     // and no emulator stands behind them: there is no SDK seam either.
                     aws: None,
+                    // Nor a durable execution: nothing here is the run of one.
+                    durable: None,
                 },
                 &clock,
             );

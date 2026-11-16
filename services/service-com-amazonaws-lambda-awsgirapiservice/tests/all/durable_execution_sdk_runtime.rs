@@ -15,8 +15,9 @@
 //! move publishes) could ever report one.
 //!
 //! The rows differ along what the rule generalises over: WHICH of the model's operations the
-//! handler uses (a wait named in seconds, a wait named in milliseconds, a step that computes
-//! the result, a step-marked callable called directly, a handler using none of them) and
+//! handler uses (a wait named in seconds, a wait named in milliseconds, a step run from the
+//! callable itself, a step named by calling its step-marked callable, a handler using none of
+//! them) and
 //! WHAT the handler reads off the context it is handed (the invocation's own members, which
 //! the durable context carries through). Every row asserts both halves: what the invocation
 //! answered, and what a read of the execution reports.
@@ -150,13 +151,14 @@ def lambda_handler(event, context):
 "#;
 
 /// A handler whose result is computed by a STEP: the unit of work really runs, and what it
-/// returned is the execution's result.
+/// returned is the execution's result. The work takes the durable context the model calls a
+/// step's work with, then the arguments the step was given.
 const STEP_HANDLER: &str = r#"
 from aws_durable_execution_sdk_python import durable_execution, durable_step
 
 
 @durable_step
-def total(values):
+def total(context, values):
     return sum(values)
 
 
@@ -165,19 +167,20 @@ def lambda_handler(event, context):
     return {"total": context.step(total, event["values"])}
 "#;
 
-/// A handler that calls its step-marked callable DIRECTLY, which runs it the same way.
+/// A handler whose step is NAMED by calling its step-marked callable and then run through
+/// the context, which is how a durable handler runs a step.
 const DIRECT_STEP_HANDLER: &str = r#"
 from aws_durable_execution_sdk_python import durable_execution, durable_step
 
 
 @durable_step(name="join")
-def join(words):
+def join(context, words):
     return " ".join(words)
 
 
 @durable_execution
 def lambda_handler(event, context):
-    return {"joined": join(event["words"])}
+    return {"joined": context.step(join(event["words"]))}
 "#;
 
 /// A handler that reads the INVOCATION's own context members through the durable context it
@@ -241,7 +244,7 @@ async fn a_durable_handler_written_against_the_sdk_runs_and_succeeds() {
             expected: |_, _| json!({ "total": 9 }),
         },
         Case {
-            case: "a step-marked callable called directly",
+            case: "a step named by calling its step-marked callable",
             source: DIRECT_STEP_HANDLER,
             event: || json!({ "words": ["durable", "step"] }),
             expected: |_, _| json!({ "joined": "durable step" }),

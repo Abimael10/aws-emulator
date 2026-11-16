@@ -36,14 +36,16 @@
 //!   one destination is an address this emulator itself opened a resource's data-plane
 //!   listener at — every other destination raises the error a host answers for it, and no name
 //!   but this machine's own resolves;
-//! * the only host functions the guest can call are the eight on [`HOST_MODULE`]: the
+//! * the only host functions the guest can call are the nine on [`HOST_MODULE`]: the
 //!   invocation log, a sleep clamped to what is left of the run, ONE AWS SDK call into this
 //!   same emulator ([`super::aws_api`], which decides which services are reachable, signs the
 //!   request itself and bounds it by what the run has left), the authentication token an
 //!   SDK mints in its client, the one request a handler sends itself, the one URL it has
-//!   signed, what a called operation's own model says about paging, and the one call a handler
+//!   signed, what a called operation's own model says about paging, the one call a handler
 //!   makes on a stream socket it opened ([`super::guest_socket`], which decides which
-//!   addresses are dialable and bounds every wait by what the run has left). No host path,
+//!   addresses are dialable and bounds every wait by what the run has left), and ONE
+//!   checkpoint of the durable execution this run is the run of
+//!   ([`super::super::durable_steps`]). No host path,
 //!   host environment variable, host credential or
 //!   other function's state is reachable from guest code, and NO bound of the run — no
 //!   deadline, no step count and no memory baseline — is reachable from it either: where one
@@ -109,6 +111,9 @@ pub use super::outcome::{Budget, Completion, Finished, Stop};
 // the host buried inside each check.
 pub use super::run_clock::Clock;
 
+// Where a run of a DURABLE function reports the steps it took, so the execution it is the
+// run of carries them in its history ([`super::super::durable_steps`]).
+use super::super::durable_steps::DurableStepJournal;
 use super::aws_api::{AwsAccess, CallerIdentity, Refusal, MAX_CALLS_PER_RUN};
 use super::outcome::{captured, Capture};
 use super::package::PackageModule;
@@ -262,6 +267,11 @@ pub struct Run<'a> {
     /// supplies it, or `None` for a run with no seam to dispatch a call on — whose
     /// `boto3` reports every call as one that was not made.
     pub aws: Option<&'a AwsAccess>,
+    /// Where this run reports the STEPS of the durable execution it is the run of
+    /// ([`super::super::durable_steps`]), and `None` for an invocation that is no durable
+    /// execution's run — whose durable SDK then records no checkpoint, because there is no
+    /// execution to record one on.
+    pub durable: Option<&'a DurableStepJournal>,
 }
 
 /// Run `request`'s handler to completion.
@@ -353,7 +363,7 @@ impl Prepared {
     pub(super) fn start(request: &Run<'_>, clock: &Clock) -> Result<Self, Box<Finished>> {
         let capture = Arc::new(Mutex::new(Capture::new(request.budget.log_bytes)));
         let bounds = Arc::new(Bounds::new(&request.budget, clock.clone()));
-        let session = Session::new(&capture, &bounds, request.aws);
+        let session = Session::new(&capture, &bounds, request.aws, request.durable);
         let input = match runtime_input(request) {
             Ok(input) => input,
             Err(error) => {
@@ -486,7 +496,8 @@ impl Prepared {
             None => {
                 let capture = Arc::new(Mutex::new(Capture::new(request.budget.log_bytes)));
                 let bounds = Arc::new(Bounds::new(&request.budget, clock.clone()));
-                self.session.bind(&capture, &bounds, request.aws);
+                self.session
+                    .bind(&capture, &bounds, request.aws, request.durable);
                 watch_run(&bounds);
                 (capture, bounds, true)
             }
@@ -533,8 +544,9 @@ impl Prepared {
         let capture = Arc::new(Mutex::new(Capture::new(budget.log_bytes)));
         let bounds = Arc::new(Bounds::new(&budget, clock.clone()));
         // No SDK seam: a callback running as the environment is torn down belongs to no
-        // invocation, so there is no caller whose identity a call could be made as.
-        self.session.bind(&capture, &bounds, None);
+        // invocation, so there is no caller whose identity a call could be made as — and no
+        // durable execution either, so nothing it does is checkpointed on one.
+        self.session.bind(&capture, &bounds, None, None);
         watch_run(&bounds);
         self.torn_down();
     }
@@ -603,6 +615,8 @@ struct Serving {
     bounds: Arc<Bounds>,
     /// How its handler reaches the rest of this emulator, when it was given a seam.
     aws: Option<AwsAccess>,
+    /// Where it reports the steps of the durable execution it is the run of, when it is one.
+    durable: Option<DurableStepJournal>,
 }
 
 impl Session {
@@ -611,12 +625,14 @@ impl Session {
         capture: &Arc<Mutex<Capture>>,
         bounds: &Arc<Bounds>,
         aws: Option<&AwsAccess>,
+        durable: Option<&DurableStepJournal>,
     ) -> Arc<Self> {
         Arc::new(Self {
             serving: Mutex::new(Serving {
                 capture: Arc::clone(capture),
                 bounds: Arc::clone(bounds),
                 aws: aws.cloned(),
+                durable: durable.cloned(),
             }),
             calls: AtomicU64::new(0),
             sockets: super::guest_socket::Sockets::default(),
@@ -631,11 +647,13 @@ impl Session {
         capture: &Arc<Mutex<Capture>>,
         bounds: &Arc<Bounds>,
         aws: Option<&AwsAccess>,
+        durable: Option<&DurableStepJournal>,
     ) {
         let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
         serving.capture = Arc::clone(capture);
         serving.bounds = Arc::clone(bounds);
         serving.aws = aws.cloned();
+        serving.durable = durable.cloned();
         drop(serving);
         self.calls.store(0, Ordering::SeqCst);
         // Nothing of the invocation before it is carried over on a connection either: every
@@ -665,6 +683,16 @@ impl Session {
         )
     }
 
+    /// Where the invocation being served reports the steps of the durable execution it is
+    /// the run of, and `None` for one that is no execution's run.
+    fn durable(&self) -> Option<DurableStepJournal> {
+        self.serving
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .durable
+            .clone()
+    }
+
     /// How the invocation being served reaches the rest of this emulator.
     fn aws(&self) -> Option<AwsAccess> {
         self.serving
@@ -679,10 +707,12 @@ impl Session {
     /// connection that invocation opened, so an environment standing idle holds no socket of
     /// it either.
     fn release_access(&self) {
-        self.serving
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .aws = None;
+        let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
+        serving.aws = None;
+        // Nor the durable execution it was the run of: an environment standing idle is no
+        // run, so there is no execution for it to checkpoint on.
+        serving.durable = None;
+        drop(serving);
         self.sockets.release();
     }
 
@@ -1497,12 +1527,13 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
 }
 
 /// The module the host functions live on, and the whole of what guest code can call of
-/// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`, `pagination`
-/// and `net` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
+/// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`, `pagination`,
+/// `net` and `durable` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
 /// call into this same emulator, the authentication token an SDK mints in its client, the one
 /// request a handler sends itself, the one URL it has signed, what the called service's
-/// own model states about paging one operation through, and the one call a handler makes on a
-/// stream socket it opened to a data-plane listener of this emulator. Nothing else of the
+/// own model states about paging one operation through, the one call a handler makes on a
+/// stream socket it opened to a data-plane listener of this emulator, and one checkpoint of
+/// the durable execution this invocation is the run of. Nothing else of the
 /// host is reachable from guest code, and nothing here moves a bound.
 ///
 /// Installed ONCE per execution environment, with its interpreter: every one of these
@@ -1787,6 +1818,38 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
             Ok(vm.ctx.new_str(answered).into())
         },
     );
+    // ONE CHECKPOINT of the durable execution this invocation is the run of: the runtime's
+    // own durable-execution SDK reports each step it starts, succeeds at or fails an attempt
+    // of through here, and the HOST is what writes it onto that execution's history
+    // ([`super::super::durable_steps`]). Nothing is dispatched and no service answers, so
+    // this spends neither the call count nor the deadline; what the guest decides is only
+    // what its own run DID. An invocation that is no durable execution's run has no
+    // execution to record on, so its checkpoints record nothing.
+    //
+    // The one bound that is this run's is held HERE, where no guest code can reach it, for the
+    // reason every other guest-to-host seam of this module holds one: a handler decides what it
+    // checkpoints, so a document larger than one checkpoint may carry
+    // ([`DurableStepJournal`]'s own ceiling) is REFUSED rather than written, and one invocation
+    // cannot turn a step into an unbounded write.
+    let checkpointing = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "durable",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let document: String = args.bind(vm)?;
+            if document.len() > super::super::durable_steps::MAX_CHECKPOINT_BYTES {
+                return Err(vm.new_runtime_error(format!(
+                    "a durable execution's checkpoint may carry at most {} bytes",
+                    super::super::durable_steps::MAX_CHECKPOINT_BYTES
+                )));
+            }
+            if let Some(journal) = checkpointing.durable() {
+                journal.record(&document);
+            }
+            Ok(vm.ctx.none())
+        },
+    );
     // What the SDK's own PAGINATOR for one operation drives: the input member a continuation
     // value is sent back in, the output member it arrives in, the member a page's size is
     // asked for and the members a page's results arrive in, read out of the CALLED service's
@@ -1830,6 +1893,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "presign",
     "pagination",
     "net",
+    "durable",
 ];
 
 /// What the guest reads back from one AWS SDK call: the service's own answer, or the
@@ -2408,6 +2472,8 @@ mod tests {
                         // These runs are the interpreter's own containment and bounds: no
                         // emulator is standing behind them, so there is no SDK seam either.
                         aws: None,
+                        // Nor a durable execution: nothing here is the run of one.
+                        durable: None,
                     },
                     &clock,
                 );
@@ -3026,6 +3092,7 @@ mod tests {
         let expected = ::serde_json::json!([
             "aws",
             "db_auth_token",
+            "durable",
             "log",
             "net",
             "pagination",

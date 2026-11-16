@@ -462,6 +462,9 @@ async fn run_notebook_cells(
                 // The cells reach no other service of this emulator: a notebook
                 // execution is given no seam to dispatch an AWS call on.
                 aws: None,
+                // It is no Lambda durable execution's run either, so it takes no step of one
+                // and checkpoints nothing onto one.
+                durable: None,
             });
             let _ = sender.send(finished);
         });

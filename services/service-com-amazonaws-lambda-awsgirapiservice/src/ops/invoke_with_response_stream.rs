@@ -554,7 +554,10 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         // that "is returned when the stream has ended and all the payload chunks have been
         // returned" — carrying the error of a handler that raised, and the log tail when
         // the caller asked for one.
-        let invoked = crate::state::run_invocation(invocation)
+        // This operation starts no durable execution — it is not the operation that answers
+        // a `DurableExecutionArn` — so the run it makes is no execution's run and reports no
+        // step onto one.
+        let invoked = crate::state::run_invocation(invocation, None)
             .await
             .map_err(unrunnable)?;
         streamed_response(

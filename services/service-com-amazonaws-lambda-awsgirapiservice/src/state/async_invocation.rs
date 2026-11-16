@@ -252,7 +252,10 @@ pub fn deliver(
             let Some(claimed) = claim(&state, &function_name, &request_id) else {
                 return;
             };
-            let run = super::execution::run_invocation(invocation.clone()).await;
+            let journal = durable_execution
+                .as_ref()
+                .map(|name| super::DurableStepJournal::new(&state, &function_name, name));
+            let run = super::execution::run_invocation(invocation.clone(), journal).await;
             // A THROTTLED attempt is not what became of the event: nothing about the event
             // stopped it, so "Lambda returns the event to the queue and attempts to run the
             // function again" for as long as the event is retained. The entry goes back to
@@ -323,12 +326,28 @@ pub fn deliver(
                      function"
                 );
             }
-            let Some(again) = super::async_delivery::next_attempt_in(
-                ran,
-                function_error.as_deref(),
-                runs,
-                claimed.allowed,
-            ) else {
+            // WHETHER the event is handed to the function again. For an ordinary event that
+            // is the retry policy's answer ([`super::async_delivery`]); for the invocation a
+            // DURABLE EXECUTION is the run of there is no second run of the handler at all
+            // once one has been made. A durable execution is the handle on ONE run of the
+            // function and its steps are checkpointed as they happen
+            // ([`super::durable_steps`]), so the retry a failing durable function gets is its
+            // STEPS' own retry strategy and never a fresh run of the handler: delivering the
+            // event again would run the steps that already succeeded a second time, and the
+            // status the execution ends in is the one that one run came to. An attempt that
+            // found no capacity RAN nothing, so it is still attempted again — a durable
+            // execution whose handler never ran is not one that ran once.
+            let again = if durable_execution.is_some() && ran {
+                None
+            } else {
+                super::async_delivery::next_attempt_in(
+                    ran,
+                    function_error.as_deref(),
+                    runs,
+                    claimed.allowed,
+                )
+            };
+            let Some(again) = again else {
                 settle(&state, &function_name, &request_id, outcome);
                 // The event's deliveries to the FUNCTION are over, so what the configuration
                 // of this qualifier and of this version asks for next is owed: the invocation

@@ -115,6 +115,8 @@ mod durable_execution_run;
 mod durable_execution_sdk_runtime;
 #[path = "all/durable_execution_start.rs"]
 mod durable_execution_start;
+#[path = "all/durable_execution_step_retry.rs"]
+mod durable_execution_step_retry;
 #[path = "all/durable_execution_status_events.rs"]
 mod durable_execution_status_events;
 #[path = "all/durable_execution_stop.rs"]

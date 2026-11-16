@@ -47,6 +47,7 @@ use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::super::durable_steps::DurableStepJournal;
 use super::aws_api::AwsAccess;
 use super::outcome::{Budget, Completion, Finished};
 use super::package::PackageModule;
@@ -169,6 +170,10 @@ pub struct Served {
     pub budget: Budget,
     /// How its handler reaches the rest of this emulator.
     pub aws: Option<AwsAccess>,
+    /// Where it reports the STEPS of the durable execution it is the run of
+    /// ([`super::super::durable_steps`]), and `None` for an invocation that is no durable
+    /// execution's run.
+    pub durable: Option<DurableStepJournal>,
 }
 
 impl Served {
@@ -186,6 +191,7 @@ impl Served {
             tenant_id: self.tenant_id.as_deref(),
             budget: self.budget,
             aws: self.aws.as_ref(),
+            durable: self.durable.as_ref(),
         }
     }
 }

@@ -65,6 +65,8 @@ fn ran(source: &str, event: &str) -> Finished {
                 // These runs are the interpreter's own surface: no emulator stands behind
                 // them, so there is no SDK seam either.
                 aws: None,
+                // Nor a durable execution: nothing here is the run of one.
+                durable: None,
             })
         })
         .expect("a run thread")

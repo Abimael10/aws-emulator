@@ -1002,7 +1002,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if started_durable.execution_name.is_some() {
             crate::state::durable_events::publish(&*self.engine, ctx.callback());
         }
-        let invoked = crate::state::run_invocation(invocation).await;
+        // The run the durable execution this invocation started IS: the steps it takes are
+        // checkpointed onto that execution's history as it takes them
+        // (`crate::state::durable_steps`), which is how the durable-execution SDK this
+        // runtime ships records what the handler did.
+        let journal = started_durable.execution_name.as_ref().map(|name| {
+            crate::state::DurableStepJournal::new(&state, &function_name, name)
+        });
+        let invoked = crate::state::run_invocation(invocation, journal).await;
         // The run was the durable execution's own, so the execution ends in the status this
         // invocation came to: a caller polling the handle it was answered sees a terminal
         // status rather than `RUNNING` for ever (`crate::state::durable_run`).

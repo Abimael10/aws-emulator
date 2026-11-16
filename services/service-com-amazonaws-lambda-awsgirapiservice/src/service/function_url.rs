@@ -483,7 +483,9 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             &prepared.invocation.function_name,
             &prepared.resource,
         );
-        let invoked = match crate::state::run_invocation(prepared.invocation).await {
+        // A function URL request starts no durable execution: the endpoint invokes the
+        // function, so the run it makes is no execution's run and reports no step onto one.
+        let invoked = match crate::state::run_invocation(prepared.invocation, None).await {
             // No run slot of the substrate came free inside this request's whole wait: the
             // capacity that was full is the one a function with no reservation draws on, so
             // the request is answered as the throttle it is rather than as a gateway failure

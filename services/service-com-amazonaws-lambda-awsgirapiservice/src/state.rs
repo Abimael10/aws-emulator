@@ -202,7 +202,8 @@ use crate::ops::types::{
     GetFunctionScalingConfigOutput, GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
     ImageConfig, InstanceRequirements, LayerVersionContentOutput, LayerVersionsListItem,
     LoggingConfig, PropagateTags, ProvisionedConcurrencyConfigListItem, ResolvedS3Object,
-    SelfManagedEventSource, TenancyConfig, VpcConfig,
+    RetryDetails, SelfManagedEventSource, StepFailedDetails, StepStartedDetails,
+    StepSucceededDetails, TenancyConfig, VpcConfig,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -427,6 +428,12 @@ pub use invocation_logs::configured_log_group;
 /// and the queue that drives it in [`async_invocation`]. The record it settles stays in this
 /// module.
 pub mod durable_run;
+
+/// The step CHECKPOINTS the run of a durable function writes into the execution's history
+/// live in [`durable_steps`], beside the run that writes them: the journal a run reports each
+/// step through, and the history events it appends.
+pub mod durable_steps;
+pub use durable_steps::DurableStepJournal;
 
 /// The EventBridge events a durable execution's status changes OWE the account's default
 /// event bus live in [`durable_events`], beside the record whose statuses they report: one
@@ -2387,16 +2394,18 @@ pub struct DurableExecutionRecord {
     /// during the execution."
     ///
     /// The log is APPEND-ONLY and it is the only record of what happened: an event is
-    /// appended by the call that made it happen (the start, and the stop), or by the clock
+    /// appended by the call that made it happen (the start, and the stop), by the RUN of the
+    /// execution as it takes each step ([`durable_steps`]), or by the clock
     /// transition that fell due ([`DurableExecutionRecord::materialize`]), so nothing
     /// reading the history ever invents an event. `EventId` is "the unique identifier for
     /// this event. Event IDs increment sequentially", which is the position in this
     /// vector, counted from 1 ([`DurableExecutionRecord::next_event`]).
     ///
-    /// It is bounded by what can append to it: one event for the start, and one for the
+    /// It is bounded by what can append to it: one event for the start, one for the
     /// TERMINAL transition — the timeout the clock owes, or the stop a caller makes —
     /// which can happen only once, because neither moves an execution that has already
-    /// ended.
+    /// ended, and the step checkpoints of its run, which stop at
+    /// [`durable_steps::MAX_STEP_EVENTS`].
     pub history: Vec<Event>,
 }
 

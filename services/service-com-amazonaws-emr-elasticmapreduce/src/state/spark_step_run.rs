@@ -421,6 +421,9 @@ async fn run_application(
                 tenant_id: None,
                 budget,
                 aws: access.as_ref(),
+                // A Spark step is no Lambda durable execution's run, so it takes no step of
+                // one and checkpoints nothing onto one.
+                durable: None,
             });
             let _ = sender.send(finished);
         });

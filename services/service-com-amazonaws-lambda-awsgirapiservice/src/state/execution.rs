@@ -610,10 +610,18 @@ impl Invoked {
 
 /// Run `invocation`'s handler and report what it came to.
 ///
+/// `durable` is where the run reports the STEPS of the durable execution it IS the run of
+/// ([`super::durable_steps`]), for an invocation that started one, and `None` for every other
+/// invocation — whose handler is the same handler, run the same way, and whose durable SDK
+/// has no execution to checkpoint on.
+///
 /// The run happens on a thread of its own, holding its own share of this module's run memory
 /// and no state guard of this service, and the caller's wait for it is bounded by
 /// [`HOST_WAIT_CEILING`] however long the function's own timeout is.
-pub async fn run_invocation(mut invocation: Invocation) -> Result<Invoked, Unrunnable> {
+pub async fn run_invocation(
+    mut invocation: Invocation,
+    durable: Option<super::durable_steps::DurableStepJournal>,
+) -> Result<Invoked, Unrunnable> {
     let Some(engine) = engine_for(invocation.runtime.as_deref()) else {
         return Err(Unrunnable::NoEngine {
             runtime: invocation
@@ -844,6 +852,7 @@ pub async fn run_invocation(mut invocation: Invocation) -> Result<Invoked, Unrun
                         tenant_id: invocation.tenant_id.clone(),
                         budget,
                         aws: invocation.aws.clone(),
+                        durable,
                     },
                 ),
                 Engine::Node => node::run(&node::Run {
@@ -2059,6 +2068,7 @@ mod tests {
                     tenant_id: None,
                     budget: run_budget(5, MIN_MEMORY_SIZE_MB as i32),
                     aws: None,
+                    durable: None,
                 })
             })
             .expect("a run thread")
