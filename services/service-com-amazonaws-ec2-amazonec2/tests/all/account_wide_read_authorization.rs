@@ -24,6 +24,12 @@
 //! to one resource ARN, an explicit deny of one action and a wildcard deny over the
 //! family), the kind of credential (an assumed-role session, an IAM user's long-term access
 //! key, the account's own published credential) and whether the request carries `DryRun`.
+//!
+//! The harness this suite drives the gate through — the emulator, the role with its
+//! documents, the session minted of it and the assertion of one read — is `pub(crate)` so
+//! that the suite covering the remaining dimension, the documents CHANGING under a live
+//! session (`lookup_role_policy_changes`), drives the gate through this one copy rather
+//! than a second.
 
 use std::sync::Arc;
 
@@ -35,11 +41,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::ec2_query::{error_code, error_message};
 
 /// The Region every call here is signed for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The access key id of the account's own published credential: a key neither STS nor IAM
 /// holds a record for, which is the position AWS account root credentials are in.
-const ACCOUNT_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
 
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -48,7 +54,7 @@ const EC2_API_VERSION: &str = "2016-11-15";
 const IAM_API_VERSION: &str = "2010-05-08";
 
 /// The STS API version a client sends in an awsQuery body.
-const STS_API_VERSION: &str = "2011-06-15";
+pub(crate) const STS_API_VERSION: &str = "2011-06-15";
 
 /// The AWS-managed policy a `cdk bootstrap` lookup role carries, which grants the read
 /// verbs of every service — the one attachment the positive rows are served through.
@@ -63,7 +69,7 @@ const DRY_RUN_OPERATION: &str = "DryRunOperation";
 /// The four `Describe` operations the rows drive: the reads the CDK VPC context provider
 /// walks, which is also the span of the rule — each is its own `ec2:` action, so a grant or
 /// a deny of one says nothing about the others.
-const READS: [&str; 4] = [
+pub(crate) const READS: [&str; 4] = [
     "DescribeAvailabilityZones",
     "DescribeRouteTables",
     "DescribeSubnets",
@@ -72,7 +78,7 @@ const READS: [&str; 4] = [
 
 /// What a row expects the call to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Expect {
+pub(crate) enum Expect {
     /// HTTP 200: the policies in force allow the action.
     Served,
     /// HTTP 403 `UnauthorizedOperation` because a statement about the request says `Deny`.
@@ -83,7 +89,7 @@ enum Expect {
 
 /// The emulator the rows drive: EC2 beside the IAM and STS services on ONE shared engine,
 /// so the policies a row stores and the session it mints are the ones EC2's gate reads.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -100,7 +106,7 @@ fn emulator() -> MultiServiceRouter {
 /// The request itself is built by the harness every suite shares
 /// ([`super::ec2_query::query_call_as`]), so this suite carries no second copy of the
 /// envelope or of its encoding.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     service: &str,
     api_version: &str,
@@ -113,7 +119,7 @@ async fn call_as(
 }
 
 /// One EC2 call signed by `akid`.
-async fn ec2_as(
+pub(crate) async fn ec2_as(
     router: &MultiServiceRouter,
     akid: &str,
     action: &str,
@@ -124,7 +130,7 @@ async fn ec2_as(
 
 /// One IAM call, made by the account's own published credential — the identity that
 /// provisions the roles and users the rows are about.
-async fn iam_call(
+pub(crate) async fn iam_call(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(&str, &str)],
@@ -141,13 +147,13 @@ async fn iam_call(
 }
 
 /// The text of the first `<tag>` element of a query response, or a panic naming the case.
-fn element(case: &str, body: &str, tag: &str) -> String {
+pub(crate) fn element(case: &str, body: &str, tag: &str) -> String {
     super::ec2_query::element(body, tag)
         .unwrap_or_else(|| panic!("case {case:?}: no <{tag}> in {body}"))
 }
 
 /// This emulator's account id, which every ARN below carries.
-fn account() -> &'static str {
+pub(crate) fn account() -> &'static str {
     ::engine::emulator_account_id()
 }
 
@@ -161,7 +167,7 @@ fn trust_policy() -> String {
 }
 
 /// A one-statement identity-based document: `effect` on `action` over `resource`.
-fn statement(effect: &str, action: &str, resource: &str) -> String {
+pub(crate) fn statement(effect: &str, action: &str, resource: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Action":"{action}","Resource":"{resource}"}}]}}"#
     )
@@ -170,7 +176,7 @@ fn statement(effect: &str, action: &str, resource: &str) -> String {
 /// Create the role `role_name` with `inline` policies put on it and `attached` managed
 /// policies attached, then assume it: answers the session's access key id and the ARN
 /// `sts:GetCallerIdentity` reports for it, which a refusal must name.
-async fn session_of(
+pub(crate) async fn session_of(
     router: &MultiServiceRouter,
     case: &str,
     role_name: &str,
@@ -280,7 +286,7 @@ async fn user_key_of(
 
 /// The refusal EC2 words for `principal` asking for `action`, with the clause the rule the
 /// decision was taken under states.
-fn refusal_message(principal: &str, action: &str, expected: Expect) -> String {
+pub(crate) fn refusal_message(principal: &str, action: &str, expected: Expect) -> String {
     let reason = match expected {
         Expect::ExplicitDeny => "with an explicit deny in an identity-based policy".to_string(),
         Expect::NoAllow => format!("because no identity-based policy allows the {action} action"),
@@ -294,7 +300,7 @@ fn refusal_message(principal: &str, action: &str, expected: Expect) -> String {
 
 /// Assert that the call `read` signed by `akid` answered what `expected` requires of it,
 /// and — when it was refused — that the refusal carries EC2's code and sentence.
-async fn assert_read(
+pub(crate) async fn assert_read(
     router: &MultiServiceRouter,
     case: &str,
     akid: &str,

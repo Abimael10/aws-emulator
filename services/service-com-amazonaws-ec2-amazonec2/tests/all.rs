@@ -45,6 +45,8 @@ mod audited_call_documents;
 mod capacity_manager_monitored_tag_key_repeats;
 #[path = "all/instance_metric_publication.rs"]
 mod instance_metric_publication;
+#[path = "all/lookup_role_policy_changes.rs"]
+mod lookup_role_policy_changes;
 #[path = "all/volume_create_notifications.rs"]
 mod volume_create_notifications;
 // The OPTIONAL members a read of an AMI and a read of an instance carry: every Amazon EBS
