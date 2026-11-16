@@ -1,15 +1,57 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the managed nodes of the Systems Manager INTEGRATED EXPERIENCE — the nodes this
+//! account's endpoints hold — narrowed by the request's filters and served one page at a
+//! time. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the node store in [`crate::state`]
+//! (`ComAmazonawsSsmAmazonssmState::managed_nodes`), which a node enters only by
+//! registering: an EC2 instance whose SSM Agent registers, or a hybrid node installed with
+//! an activation code. It is the same store the node describes report and
+//! [`crate::state::inventory`] projects as a node's `AWS:InstanceInformation` item, so a
+//! node listing reports what registering persisted rather than a second copy of it, and an
+//! account that has registered none is reported as holding none. The one write it makes is
+//! materialising the registrations the clock already owed
+//! ([`crate::state::node_registration::settle_registrations`]): an instance that has been
+//! running long enough with a profile that lets its agent register was a managed node at
+//! that instant whether or not anybody called.
+//!
+//! ## Which requests are refused, and with which modelled error
+//!
+//! * An account that has not enabled the Systems Manager integrated experience is answered
+//!   `UnsupportedOperationException` ([`crate::state::node_listing::NOT_ENABLED_MESSAGE`]),
+//!   before anything the request names is looked at. Enabling the experience is what puts
+//!   the Amazon Web Services managed node resource data sync in the account
+//!   ([`crate::state::node_listing::MANAGED_NODE_SYNC_NAME`]), which is what the decision is
+//!   taken from — per Region, because a sync is a regional record.
+//! * A `SyncName` other than that one names no sync a node listing can read — "the name of
+//!   the supported resource data sync is AWS-QuickSetup-ManagedNode" — so it is
+//!   `ResourceDataSyncNotFoundException`, carrying the name and the sync type the listing
+//!   looked for beside the sentence this service words a sync it cannot find with
+//!   ([`crate::state::resource_data_syncs::sync_not_found_message`]).
+//! * A `NextToken` this service did not hand out is `InvalidNextToken`.
+//!
+//! A filter whose `Key` is outside the modelled `NodeFilterKey` enum, and an operator
+//! outside `NodeFilterOperatorType`, are refused by the centralized request walk before this
+//! handler runs, which is what `InvalidFilter` ("the filter name isn't valid") would report;
+//! a filter VALUE no node holds is not a refusal — it simply selects no node, which is how a
+//! caller asks whether any node carries it.
+//!
+//! ## Filtering, aggregation and paging
+//!
+//! Filters intersect and each filter's values union: a node is reported when, for every
+//! filter, one of that filter's values stands in the filter's relation to one of the node's
+//! values for that key ([`crate::state::node_listing::matches_filter`]). Which Regions' nodes
+//! are listed is what `SyncName` decides — the Region the request was signed for when it
+//! names no sync, and the Regions the managed node sync aggregates when it does
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::node_listing_regions`]) — and each node
+//! reports the Region it is held under. A page holds `MaxResults` nodes (the modelled range
+//! 1..50, and up to 50 for a request that names none), and the `NextToken` is the
+//! `(region, node id)` position the next page starts at
+//! ([`crate::state::node_listing::page_token`]), so a page resumes at a node rather than at
+//! an offset into a list that may have changed. That cursor is total because the node store
+//! is keyed by `(region, node id)` and therefore walked in ascending order of both.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +201,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNodes"))
+        use crate::state::node_listing;
+        use crate::state::resource_data_syncs::{sync_not_found_message, SYNC_TYPE_FROM_SOURCE};
+        use crate::state::{non_empty, request_region, INVALID_NEXT_TOKEN};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListNodesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("this service is mounted on an engine that holds no state".to_string()),
+            })
+            .into());
+        };
+
+        // Systems Manager is regional: whether the account has the integrated experience,
+        // and which sync aggregates the nodes, are facts of the endpoint the request was
+        // signed for.
+        let region = request_region(ctx.parts());
+        let named_sync = non_empty(input.sync_name.as_deref());
+        let regions = {
+            let store = state.lock();
+            // An account that has not enabled the integrated experience has no node
+            // listing at all, which is answered before anything the request names is
+            // looked at.
+            if !store.has_integrated_experience(&region) {
+                return Err(ListNodesErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(node_listing::NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // "The name of the supported resource data sync is AWS-QuickSetup-ManagedNode":
+            // any other name names no sync whose nodes this listing could read, so it is
+            // reported as a sync that does not exist — the sync a node listing reads
+            // aggregates data from its source, which is the `SyncFromSource` type.
+            if let Some(named) =
+                named_sync.filter(|named| *named != node_listing::MANAGED_NODE_SYNC_NAME)
+            {
+                return Err(ListNodesErrorModeled::ResourceDataSyncNotFoundException(
+                    ResourceDataSyncNotFoundException {
+                        message: Some(sync_not_found_message(named, SYNC_TYPE_FROM_SOURCE)),
+                        sync_name: Some(named.to_string()),
+                        sync_type: Some(SYNC_TYPE_FROM_SOURCE.to_string()),
+                    },
+                )
+                .into());
+            }
+            store.node_listing_regions(&region, named_sync.is_some())
+        };
+
+        let page_size = node_listing::page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the `(region, node id)` position the next
+        // page starts at, so a value of any other shape was not one of ours.
+        let resume_from = match non_empty(input.next_token.as_deref()) {
+            None => None,
+            Some(token) => match node_listing::page_cursor(token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(ListNodesErrorModeled::InvalidNextToken(InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    })
+                    .into())
+                }
+            },
+        };
+
+        // The registration an instance of a listed Region had already made by now was owed
+        // at the same instant whether or not anybody called, so it is materialised before
+        // the store is read — with no guard of it held.
+        for listed in &regions {
+            crate::state::node_registration::settle_registrations(&*self.engine, listed);
+        }
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        let store = state.lock();
+        let mut nodes = Vec::new();
+        let mut next_token = None;
+        'listing: for listed in &regions {
+            for (id, node) in store.managed_nodes_in_region(listed) {
+                if resume_from.is_some_and(|from| (listed.as_str(), id) < from) {
+                    continue;
+                }
+                // Every filter has to be satisfied, and each filter's values union.
+                if !filters
+                    .iter()
+                    .all(|filter| node_listing::matches_filter(node, listed, filter))
+                {
+                    continue;
+                }
+                if nodes.len() == page_size {
+                    // The page is full and a node is still waiting: hand the caller the
+                    // position it resumes at, so the next request continues where this one
+                    // stopped.
+                    next_token = Some(node_listing::page_token(listed, id));
+                    break 'listing;
+                }
+                nodes.push(node_listing::to_node(listed, node));
+            }
+        }
+
+        Ok(ListNodesOutput {
+            nodes: Some(nodes),
+            next_token,
+        })
     }
 }

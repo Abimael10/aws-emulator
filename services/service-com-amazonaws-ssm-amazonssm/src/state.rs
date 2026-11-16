@@ -279,6 +279,11 @@ pub mod inventory;
 /// managed nodes, and the node record that registration writes.
 pub mod node_registration;
 
+/// The node listing of the Systems Manager integrated experience: whether an account has it
+/// at all, which Regions' nodes one listing reports, and the `Node` a stored managed node is
+/// projected as.
+pub mod node_listing;
+
 /// The Session Manager sessions this endpoint holds: the record a start persists, what
 /// ends one, and how a report filters and pages them.
 pub mod sessions;
@@ -4866,14 +4871,23 @@ pub fn minted_prefixed_hex_id(prefix: &str, digits: usize, sequence: u64, at: Sy
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region.len() <= 64
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+        .filter(|region| region_is_well_formed(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` could be the name of a Region: non-empty, no longer than the modelled
+/// `NodeRegion` (`len 1..64`), and carrying nothing outside `[A-Za-z0-9-]`.
+///
+/// THE ONE reading of that across this service, because a Region name lands inside an ARN
+/// and in a store key: it decides which credential scope [`request_region`] honours, and
+/// which page cursor of a node listing names a Region this store could hold nodes under
+/// ([`node_listing::page_cursor`]).
+pub fn region_is_well_formed(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 64
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

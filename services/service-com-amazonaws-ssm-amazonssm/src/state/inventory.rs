@@ -388,16 +388,15 @@ pub fn instance_information_content(node: &ManagedNodeRecord) -> HashMap<String,
 /// reported to the service, and failing that the day it registered — "The time inventory
 /// item data was captured" (`InventoryResultItem$CaptureTime`) is when the node last said
 /// what it holds, so it comes from the node record rather than from the clock and two
-/// reads of one node report the same instant.
+/// reads of one node report the same instant. That instant is this service's one reading of
+/// when a node last reported ([`super::node_listing::captured_at`], which a node listing
+/// reports as its own `CaptureTime`).
 ///
 /// Rendered as the modelled `InventoryItemCaptureTime` spells it (pattern
 /// `^(20)[0-9][0-9]-…(Z)$`): whole seconds, so the instant is truncated to the second
 /// rather than carrying the fraction a stored timestamp may hold.
 pub fn capture_time(node: &ManagedNodeRecord) -> Option<String> {
-    let stamped = node
-        .properties
-        .last_ping_date_time
-        .or(node.properties.registration_date)?;
+    let stamped = super::node_listing::captured_at(node)?;
     ::aws_smithy_types::DateTime::from_secs(stamped.secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()

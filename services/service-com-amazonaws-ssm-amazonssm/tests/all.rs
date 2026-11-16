@@ -93,6 +93,8 @@ mod managed_node_information;
 mod node_connection_status;
 #[path = "all/node_inventory.rs"]
 mod node_inventory;
+#[path = "all/node_listing.rs"]
+mod node_listing;
 #[path = "all/ops_data_summary.rs"]
 mod ops_data_summary;
 #[path = "all/ops_item_deletion.rs"]
