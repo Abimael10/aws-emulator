@@ -2753,6 +2753,20 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // "currently not supported. You can't update a retention rule's resource type after
         // creation" — so a declaration naming another type asks for a different rule.
         RBIN_RULE => &["ResourceType"],
+        // A Neptune Analytics graph keeps the replicas, the encryption key and the vector
+        // index it was made with: each is a member of `CreateGraph` and of no member of
+        // `UpdateGraph` (which takes the provisioned memory and the two flags), so a
+        // declaration restating one asks for a different graph. (Its NAME is in the same
+        // position through [`name_is_create_only`]: no call of that service renames a graph.)
+        NEPTUNE_GRAPH_GRAPH => &[
+            "KmsKeyIdentifier",
+            "ReplicaCount",
+            "VectorSearchConfiguration",
+        ],
+        // A snapshot is the capture of ONE graph: `graphIdentifier` is a member of
+        // `CreateGraphSnapshot`, and that service publishes no call that changes a snapshot at
+        // all, so a declaration naming another graph asks for a different snapshot.
+        NEPTUNE_GRAPH_GRAPH_SNAPSHOT => &["GraphIdentifier"],
         // A maintenance window TARGET belongs to the window it was registered with and is of
         // the kind the register stated: `WindowId` addresses the target rather than being a
         // value of it, and `ResourceType` is a member of the register and of no update
@@ -3177,6 +3191,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The Recycle Bin retention rule, publishing the ARN and the identifier that service
     // mints for it and the lock state it keeps.
     RBIN_RULE,
+    // The Neptune Analytics graph, publishing the id that service mints for it, the ARN built
+    // around that id and the endpoint it serves the graph on, and the SNAPSHOT of one, whose
+    // `Ref` is the id that service minted for it.
+    NEPTUNE_GRAPH_GRAPH,
+    NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
     "AWS::DynamoDB::Table",
     EC2_DHCP_OPTIONS,
     EC2_INTERNET_GATEWAY,

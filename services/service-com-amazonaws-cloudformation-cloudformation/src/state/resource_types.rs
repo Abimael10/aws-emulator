@@ -86,7 +86,8 @@ use super::template::{
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH,
     APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BRAKET_SPENDING_LIMIT,
-    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT, RBIN_RULE,
+    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
+    NEPTUNE_GRAPH_GRAPH_SNAPSHOT, RBIN_RULE,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -714,6 +715,12 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Neptune::DBInstance",
     "AWS::Neptune::DBParameterGroup",
     "AWS::Neptune::DBSubnetGroup",
+    // Neptune Analytics — a different service from Amazon Neptune above, reached by the
+    // `neptune-graph` signing name. Both types are created in the owning service
+    // (`super::provisioner`): `CreateGraph` POST /graphs and `CreateGraphSnapshot` POST
+    // /snapshots.
+    NEPTUNE_GRAPH_GRAPH,          // CreateGraph
+    NEPTUNE_GRAPH_GRAPH_SNAPSHOT, // CreateGraphSnapshot
     // AWS Network Firewall
     "AWS::NetworkFirewall::Firewall",
     "AWS::NetworkFirewall::FirewallPolicy",

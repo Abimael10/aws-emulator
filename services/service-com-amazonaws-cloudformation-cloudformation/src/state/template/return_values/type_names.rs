@@ -351,6 +351,66 @@ pub(super) const RBIN_RULE_PATH: &str = "rule";
 pub(super) const RBIN_RULE_ID_SALT: &str = "rbin/rule";
 pub(super) const RBIN_RULE_ID_DIGITS: usize = 11;
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of a NEPTUNE ANALYTICS graph: the graph
+/// database that service's own `CreateGraph` makes. The middle segment is the one the
+/// resource-type namespace publishes (`NeptuneGraph`), which is that model's own
+/// `awsService.sdkId` (`Neptune Graph`) written as one word.
+///
+/// "Ref returns the graph id" — the type's primary identifier — and `Fn::GetAtt` reads
+/// [`NEPTUNE_GRAPH_GRAPH_ATTRIBUTES`]. Neptune Analytics MINTS that id
+/// (`^g-[a-z0-9]{10}$`, which no name CloudFormation decides satisfies — the pattern's own
+/// negative lookahead keeps a graph NAME out of that form) and builds the ARN and the endpoint
+/// around it, which is why [`identity_is_service_assigned`] names this type: the identity in
+/// force is the one that service answered.
+pub const NEPTUNE_GRAPH_GRAPH: &str = "AWS::NeptuneGraph::Graph";
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of a SNAPSHOT of such a graph, which that
+/// service's own `CreateGraphSnapshot` takes of the graph a declaration names.
+///
+/// "Ref returns the snapshot id", which that service MINTS (`^gs-[a-z0-9]{10}$`) and which
+/// `GetGraphSnapshot`, `DeleteGraphSnapshot` and `RestoreGraphFromSnapshot` each address one
+/// by — so [`identity_is_service_assigned`] names this type too — and `Fn::GetAtt` reads
+/// [`NEPTUNE_GRAPH_SNAPSHOT_ATTRIBUTES`].
+pub const NEPTUNE_GRAPH_GRAPH_SNAPSHOT: &str = "AWS::NeptuneGraph::GraphSnapshot";
+
+/// Every `Fn::GetAtt` attribute a [`NEPTUNE_GRAPH_GRAPH`] publishes, in the sorted order a
+/// resource's own attribute map holds them in: the endpoint the graph is reached at, its ARN
+/// and the id Neptune Analytics minted.
+///
+/// Source: the type's own "Return values" section. All three are that service's to produce —
+/// the id it mints, the ARN it builds around it and the endpoint it serves the graph on — so
+/// each is a STAND-IN of the form its own model fixes until [`crate::state::provisioner`] has
+/// reported what `CreateGraph` really answered.
+pub(super) const NEPTUNE_GRAPH_GRAPH_ATTRIBUTES: &[&str] =
+    &["Endpoint", "GraphArn", "GraphId"];
+
+/// Every `Fn::GetAtt` attribute a [`NEPTUNE_GRAPH_GRAPH_SNAPSHOT`] publishes, in that same
+/// sorted order: the ARN Neptune Analytics built for the snapshot and the id it minted.
+///
+/// Both are that service's to produce — `CreateGraphSnapshot` takes the graph and a name and
+/// answers the `id` it assigned with the `arn` built around it — so each is a STAND-IN of the
+/// form its own model fixes until [`crate::state::provisioner`] has reported what that create
+/// really answered.
+pub(super) const NEPTUNE_GRAPH_SNAPSHOT_ATTRIBUTES: &[&str] = &["Arn", "Id"];
+
+/// Neptune Analytics' ARN namespace, which is the namespace a graph's ARN carries (that
+/// model's own `awsService.arnNamespace`), and the resource path a graph ARN carries before
+/// the id that service minted.
+pub(super) const NEPTUNE_GRAPH_ARN_NAMESPACE: &str = "neptune-graph";
+pub(super) const NEPTUNE_GRAPH_GRAPH_PATH: &str = "graph";
+
+/// The resource path a SNAPSHOT's ARN carries before the id that service minted, from the same
+/// place: it is the path that service's own `arn` member spells for a snapshot.
+pub(super) const NEPTUNE_GRAPH_SNAPSHOT_PATH: &str = "graph-snapshot";
+
+/// The prefixes a graph id and a snapshot id carry, and how many characters follow either:
+/// `GraphId` is `^g-[a-z0-9]{10}$` and `SnapshotId` is `^gs-[a-z0-9]{10}$`
+/// (`smithy_query(query="shape",shape="GraphId,SnapshotId")` on that service's model), so a
+/// stand-in is that prefix and exactly ten lower-case characters.
+pub(super) const NEPTUNE_GRAPH_ID_PREFIX: &str = "g";
+pub(super) const NEPTUNE_SNAPSHOT_ID_PREFIX: &str = "gs";
+pub(super) const NEPTUNE_GRAPH_ID_DIGITS: usize = 10;
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own
 /// `awsService.cloudFormationName` (`OpenSearchServerless`).

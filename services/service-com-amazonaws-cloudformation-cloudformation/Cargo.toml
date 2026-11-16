@@ -265,6 +265,13 @@ service-com-amazonaws-amplify-amplify = { workspace = true }
 # fails — and the add-on and the node group the stack published are read back through that
 # service's own wire.
 service-com-amazonaws-eks-awswesleyfrontend = { workspace = true }
+# Neptune Analytics, for the `AWS::NeptuneGraph::Graph` and the
+# `AWS::NeptuneGraph::GraphSnapshot` of one a stack really creates there
+# (`state::provisioner::neptune_graphs`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails — and
+# the graph and the snapshot the stack published are read back through that service's own
+# wire.
+service-com-amazonaws-neptunegraph-amazonneptunegraph = { workspace = true }
 
 [lints]
 workspace = true

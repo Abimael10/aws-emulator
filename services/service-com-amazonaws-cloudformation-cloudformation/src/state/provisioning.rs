@@ -4364,6 +4364,16 @@ const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     ("es", "OpenSearch", SdkDiagnostic::Attempts),
     ("iam", "Iam", SdkDiagnostic::Attempts),
     ("lambda", "Lambda", SdkDiagnostic::Attempts),
+    // Neptune Analytics' SDK names it `NeptuneGraph` — that model's own `sdkId`
+    // (`Neptune Graph`) written as one word, exactly as Application Auto Scaling's above is —
+    // and words the ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an
+    // `AWS::NeptuneGraph::Graph` whose declared provisioned memory is below that service's
+    // minimum carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudformation__ec2__neptune-graph.deploy-neptune-graph-provisioned-memory-out-of-range-rejected`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: NeptuneGraph, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: InvalidRequest)`).
+    ("neptune-graph", "NeptuneGraph", SdkDiagnostic::Attempts),
     // Amazon RDS's SDK names it by that model's own `sdkId` (`RDS`) written as one word with
     // a capital initial, and words the bare ENVELOPE — the service, the status and the call's
     // id, with nothing after it — as the recorded `ResourceStatusReason` of an

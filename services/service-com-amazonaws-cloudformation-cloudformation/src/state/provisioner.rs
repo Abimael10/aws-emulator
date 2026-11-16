@@ -506,7 +506,8 @@ use super::template::{
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
+    MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH, NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
+    OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
     REDSHIFT_CLUSTER,
     REDSHIFT_CLUSTER_SUBNET_GROUP, RESOURCE_GROUPS_GROUP, ROUTE53RESOLVER_ENDPOINT,
     ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST, ROUTE53RESOLVER_FIREWALL_RULE_GROUP,
@@ -1127,6 +1128,20 @@ pub(super) enum Provisioner {
     /// two instants that service recorded, the status of its rule-based matching configuration
     /// and the usage statistics it counts) are read off its own report of the domain.
     CustomerProfilesDomain,
+    /// `AWS::NeptuneGraph::Graph`: the Neptune Analytics graph that service's own
+    /// `CreateGraph` makes under the name the template states, `UpdateGraph` reconfigures and
+    /// `DeleteGraph` removes. That service MINTS the `id` the type publishes
+    /// (`^g-[a-z0-9]{10}$`) — the `graphIdentifier` every call on a graph takes — so it is
+    /// read off that create's own answer and is the identity a `Ref` resolves to; both of
+    /// those lifecycle changes leave the graph coming up, so the resource's creation and its
+    /// deletion are each held open on that service's own report of the graph.
+    NeptuneGraphGraph,
+    /// `AWS::NeptuneGraph::GraphSnapshot`: the snapshot OF such a graph that service's own
+    /// `CreateGraphSnapshot` takes under the name the template states and
+    /// `DeleteGraphSnapshot` removes. That service MINTS the `id` the type publishes
+    /// (`^gs-[a-z0-9]{10}$`), which is the identity a `Ref` resolves to, and publishes no call
+    /// that changes a snapshot that exists — so a changed declaration replaces it.
+    NeptuneGraphGraphSnapshot,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1312,6 +1327,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         }
         MEMORYDB_SUBNET_GROUP => Some(Provisioner::MemoryDbGroup(memorydb_groups::Group::Subnet)),
         CUSTOMER_PROFILES_DOMAIN => Some(Provisioner::CustomerProfilesDomain),
+        NEPTUNE_GRAPH_GRAPH => Some(Provisioner::NeptuneGraphGraph),
+        NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some(Provisioner::NeptuneGraphGraphSnapshot),
         RBIN_RULE => Some(Provisioner::RbinRule),
         _ => None,
     }
@@ -1989,6 +2006,16 @@ impl Provisioner {
             // own, so a retention rule a stack creates carries the tags CloudFormation gives
             // it beside the ones the declaration asks for.
             Self::RbinRule => create_rbin_rule(ctx, region, resource, propagated).await,
+            // Both `AWS::NeptuneGraph::*` types publish `Tags`, and each of their creates
+            // takes a `TagMap` of its own, so a graph and a snapshot a stack creates each
+            // carry the tags CloudFormation gives them beside the ones their declaration asks
+            // for.
+            Self::NeptuneGraphGraph => {
+                create_neptune_graph(ctx, region, resource, propagated).await
+            }
+            Self::NeptuneGraphGraphSnapshot => {
+                create_graph_snapshot(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -2143,6 +2170,12 @@ impl Provisioner {
                 // one check its own crate's tag validation makes — so a retention rule carries
                 // the stack's own tags without the three.
                 | Self::RbinRule
+                // Neptune Analytics refuses a tag key in the reserved namespace on every call
+                // that takes tags — the `tags` map of each create and `TagResource` alike, in
+                // the one check its own crate's tag validation makes — so a graph and a
+                // snapshot each carry the stack's own tags without the three.
+                | Self::NeptuneGraphGraph
+                | Self::NeptuneGraphGraphSnapshot
         );
         propagated
             .iter()
@@ -2388,6 +2421,16 @@ impl Provisioner {
             Self::EcsCapacityProvider => {
                 ecs_capacity_provider_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateGraph` answers the graph `CREATING` — a graph serves no query and
+            // publishes no endpoint in it — and `CreateGraphSnapshot` answers the snapshot
+            // `CREATING`, in which there is nothing to restore from, so each resource is held
+            // open until Neptune Analytics reports it `AVAILABLE`.
+            Self::NeptuneGraphGraph => {
+                neptune_graph_readiness(ctx, region, physical_resource_id).await
+            }
+            Self::NeptuneGraphGraphSnapshot => {
+                graph_snapshot_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -2454,6 +2497,13 @@ impl Provisioner {
             // attributes are read off the environment again once it reports it `AVAILABLE`.
             Self::MwaaEnvironment => {
                 mwaa_environment_ready_attributes(ctx, region, physical_resource_id).await
+            }
+            // A graph has no endpoint while it is `CREATING`: the address a client reaches it
+            // at is one Neptune Analytics publishes once the graph is serving, so the type's
+            // attributes are read off the graph again once it reports it `AVAILABLE`. (A
+            // snapshot publishes no attribute at all, so it needs no arm.)
+            Self::NeptuneGraphGraph => {
+                neptune_graph_ready_attributes(ctx, region, physical_resource_id).await
             }
             // A cache cluster has no endpoint while it is `creating`: the address a client
             // connects to is one Amazon ElastiCache fills in as it provisions the cluster,
@@ -2571,6 +2621,15 @@ impl Provisioner {
             // ([`ecs_capacity_providers::ecs_capacity_provider_removal`]).
             Self::EcsCapacityProvider => {
                 ecs_capacity_provider_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteGraph` answers the graph `DELETING` and `DeleteGraphSnapshot` answers the
+            // snapshot `DELETING`, so each is still there when its delete answers and the
+            // deletion is finished once Neptune Analytics no longer holds it.
+            Self::NeptuneGraphGraph => {
+                neptune_graph_removal(ctx, region, physical_resource_id).await
+            }
+            Self::NeptuneGraphGraphSnapshot => {
+                graph_snapshot_removal(ctx, region, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }
@@ -3045,6 +3104,16 @@ impl Provisioner {
             Self::RbinRule => update_rbin_rule(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateGraph` reconfigures the graph the stack created, by the id Neptune
+            // Analytics minted for it, taking the memory it is provisioned with and its two
+            // flags — so a changed declaration of one of those is applied to that graph rather
+            // than replacing it. Its tags travel separately ([`Self::retag`]). (A SNAPSHOT has
+            // no arm: that service publishes no call that changes a snapshot's configuration,
+            // and the one property of that type a deployment can change without replacing it
+            // is its tags, which travel there too.)
+            Self::NeptuneGraphGraph => update_neptune_graph(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -3141,6 +3210,18 @@ impl Provisioner {
             // up carrying is reconciled.
             Self::RbinRule => {
                 retag_rbin_rule(ctx, region, resource, declared, propagated).await
+            }
+            // A graph's tags are Neptune Analytics' own `TagResource` and `UntagResource`:
+            // `CreateGraph`'s `tags` map applies to the graph that call creates, and
+            // `UpdateGraph` carries no tags at all, so this is where the set a graph is to end
+            // up carrying is reconciled. A SNAPSHOT is in the same position: its `Tags` are the
+            // one property of that type a deployment can change without replacing it, and that
+            // service changes a snapshot's tags through those same two calls.
+            Self::NeptuneGraphGraph => {
+                retag_neptune_graph(ctx, region, resource, declared, propagated).await
+            }
+            Self::NeptuneGraphGraphSnapshot => {
+                retag_graph_snapshot(ctx, region, resource, declared, propagated).await
             }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
@@ -3738,6 +3819,14 @@ impl Provisioner {
             // The delete addresses the rule by the identifier inside the ARN Recycle Bin
             // minted for it, which is this resource's physical id.
             Self::RbinRule => delete_rbin_rule(ctx, region, physical_resource_id).await,
+            // Each delete addresses its resource by the id Neptune Analytics minted for it,
+            // which is this resource's physical id.
+            Self::NeptuneGraphGraph => {
+                delete_neptune_graph(ctx, region, physical_resource_id).await
+            }
+            Self::NeptuneGraphGraphSnapshot => {
+                delete_graph_snapshot(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -4300,6 +4389,14 @@ impl Provisioner {
             }
             // Recycle Bin's own read of the rule, by the identifier it minted for it.
             Self::RbinRule => describe_rbin_rule(ctx, region, physical_resource_id).await,
+            // Neptune Analytics' own reads of the graph and of the snapshot, each by the id it
+            // minted for the resource.
+            Self::NeptuneGraphGraph => {
+                describe_neptune_graph(ctx, region, physical_resource_id).await
+            }
+            Self::NeptuneGraphGraphSnapshot => {
+                describe_graph_snapshot(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -4355,6 +4452,10 @@ mod customer_profiles_domains;
 /// Visible to the rest of this service's state because the LOCK STATE a declaration asks for
 /// is read by the return-value catalogue too, beside the arms that provision the rule.
 pub(in crate::state) mod rbin_rules;
+/// The Neptune Analytics arms: the graph an `AWS::NeptuneGraph::Graph` declares and the
+/// snapshot of one an `AWS::NeptuneGraph::GraphSnapshot` declares, created in the service that
+/// owns them so a client's own reads resolve the identities the stack publishes.
+mod neptune_graphs;
 /// The AWS Glue TABLE OPTIMIZER arms: the optimizer an `AWS::Glue::TableOptimizer` declares
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.
@@ -4436,6 +4537,7 @@ use amplify_branches::*;
 use mwaa_environments::*;
 use customer_profiles_domains::*;
 use rbin_rules::*;
+use neptune_graphs::*;
 use glue_table_optimizers::*;
 use iam_identities::*;
 use data_and_storage::*;

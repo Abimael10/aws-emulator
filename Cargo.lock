@@ -11202,6 +11202,7 @@ dependencies = [
  "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-memorydb-amazonmemorydb",
+ "service-com-amazonaws-neptunegraph-amazonneptunegraph",
  "service-com-amazonaws-rbin-amazonrecyclebin",
  "service-com-amazonaws-rds-amazonrdsv19",
  "service-com-amazonaws-s3-amazons3",

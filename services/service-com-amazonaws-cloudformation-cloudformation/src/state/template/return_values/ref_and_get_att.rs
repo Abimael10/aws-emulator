@@ -1514,6 +1514,57 @@ pub(crate) fn return_values(
             );
             (arn, attributes)
         }
+        // Neptune Analytics' own control plane: the graph an `AWS::NeptuneGraph::Graph`
+        // declares and the snapshot an `AWS::NeptuneGraph::GraphSnapshot` declares. "Ref
+        // returns the graph id" / the snapshot id — each type's primary identifier — and a
+        // graph's `Fn::GetAtt` reads [`NEPTUNE_GRAPH_GRAPH_ATTRIBUTES`].
+        //
+        // That service MINTS both ids — `CreateGraph` and `CreateGraphSnapshot` each take the
+        // resource's NAME and answer the id they assigned — so the ids here are STAND-INS of
+        // the forms its own model fixes, which `super::provisioning` re-points at what the
+        // create really answered ([`super::provisioner::Provisioner::NeptuneGraphGraph`] and
+        // its snapshot sibling). A graph's ARN is built around that id the way its own service
+        // builds it, from the one account id this emulator mints; its ENDPOINT is a value only
+        // that service produces, so it stands in ([`service_assigned_document`]) until the
+        // graph reports it.
+        NEPTUNE_GRAPH_GRAPH => {
+            let id = generated_service_id(
+                NEPTUNE_GRAPH_ID_PREFIX,
+                name,
+                NEPTUNE_GRAPH_ID_DIGITS,
+            );
+            attributes.insert(
+                "GraphArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    NEPTUNE_GRAPH_ARN_NAMESPACE,
+                    region,
+                    &format!("{NEPTUNE_GRAPH_GRAPH_PATH}/{id}"),
+                ),
+            );
+            attributes.insert(
+                "Endpoint".to_string(),
+                service_assigned_document(name, "Endpoint"),
+            );
+            attributes.insert("GraphId".to_string(), id.clone());
+            (id, attributes)
+        }
+        NEPTUNE_GRAPH_GRAPH_SNAPSHOT => {
+            let id = generated_service_id(
+                NEPTUNE_SNAPSHOT_ID_PREFIX,
+                name,
+                NEPTUNE_GRAPH_ID_DIGITS,
+            );
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    NEPTUNE_GRAPH_ARN_NAMESPACE,
+                    region,
+                    &format!("{NEPTUNE_GRAPH_SNAPSHOT_PATH}/{id}"),
+                ),
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         // AWS Amplify's own control plane: the app an `AWS::Amplify::App` declares. "Ref
         // returns the ARN of the app"; `Fn::GetAtt` reads [`AMPLIFY_APP_ATTRIBUTES`]. Every
         // one of those is a value only that service can produce — the `appId` it mints, the

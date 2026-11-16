@@ -413,6 +413,14 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // (X-Ray's own Smithy model) — the same bound a sampling rule's name carries, and
         // one a generated name is already inside the characters of but far longer than.
         XRAY_GROUP => rules(32, Characters::AsGenerated),
+        // Neptune Analytics `CreateGraph.graphName` (`GraphName`) and
+        // `CreateGraphSnapshot.snapshotName` (`SnapshotName`): each `@length(min: 1, max: 63)`
+        // with pattern `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$` / `^(?!gs-)…` (that service's own
+        // Smithy model), which admits no upper case, requires a leading letter and admits no
+        // character a generated name carries beyond letters, digits and the hyphen.
+        NEPTUNE_GRAPH_GRAPH | NEPTUNE_GRAPH_GRAPH_SNAPSHOT => {
+            rules(63, Characters::LowercaseAlphanumeric)
+        }
         _ => None,
     }
 }
@@ -714,6 +722,11 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // set name" — so the type publishes `RuleSetName`; the type's last segment is
         // `ReceiptRuleSet`, so neither `ReceiptRuleSetName` nor `Name` finds it.
         SES_RECEIPT_RULE_SET => Some("RuleSetName"),
+        // Neptune Analytics' `CreateGraphSnapshot` takes a `snapshotName`, so the type
+        // publishes `SnapshotName`; the type's last segment is `GraphSnapshot`, so neither
+        // `GraphSnapshotName` nor `Name` finds it. (The GRAPH's own `GraphName` IS the
+        // convention, its last segment being `Graph`.)
+        NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some("SnapshotName"),
         // Amazon Redshift's `CreateCluster` takes a `ClusterIdentifier` — "You use this
         // identifier to refer to the cluster for any subsequent cluster operations" — so
         // the type publishes `ClusterIdentifier`; the type's last segment is `Cluster`, so

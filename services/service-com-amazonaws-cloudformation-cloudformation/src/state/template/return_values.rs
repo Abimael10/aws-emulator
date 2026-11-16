@@ -248,6 +248,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // the lock state it keeps, all three of which these naming rules compute a stand-in
         // for before the rule exists.
         RBIN_RULE => RBIN_RULE_ATTRIBUTES,
+        // A Neptune Analytics graph publishes the endpoint, the ARN and the id that service
+        // produces for it, all three of which these naming rules compute a stand-in for
+        // before the graph exists; a SNAPSHOT of one publishes the ARN and the id that
+        // service produces for it.
+        NEPTUNE_GRAPH_GRAPH => NEPTUNE_GRAPH_GRAPH_ATTRIBUTES,
+        NEPTUNE_GRAPH_GRAPH_SNAPSHOT => NEPTUNE_GRAPH_SNAPSHOT_ATTRIBUTES,
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_THEME => AMPLIFYUIBUILDER_TIMED_ATTRIBUTES,
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,
         AMPLIFY_APP => AMPLIFY_APP_ATTRIBUTES,
@@ -635,6 +641,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `UpdateRule` and `DeleteRule` each address a rule by. A name CloudFormation decides
         // satisfies neither, so the identity in force is the one that service answered.
         || resource_type == RBIN_RULE
+        // A NEPTUNE ANALYTICS graph and a snapshot of one are two more: `CreateGraph` takes
+        // the graph's NAME and `CreateGraphSnapshot` the snapshot's, neither takes an
+        // identifier, and each answers the id that service minted — `^g-[a-z0-9]{10}$` for a
+        // graph and `^gs-[a-z0-9]{10}$` for a snapshot, which is what each type's `Ref`
+        // returns and what every call on the resource takes as its `graphIdentifier` /
+        // `snapshotIdentifier`. Neither modelled name can satisfy those patterns (both
+        // exclude the id prefix by a negative lookahead), so the identity in force is the one
+        // that service answered.
+        || resource_type == NEPTUNE_GRAPH_GRAPH
+        || resource_type == NEPTUNE_GRAPH_GRAPH_SNAPSHOT
         // The three Amplify UI Builder entities are three more: each create takes the app and
         // the environment as its URI labels and the entity's NAME in its payload, takes no
         // identifier at all, and answers the `Uuid` that service assigned — the `id` of the

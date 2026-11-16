@@ -81,6 +81,12 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // identifier it minted ("Ref returns the rule ARN") — the type declares no name a
         // client could name one by.
         RBIN_RULE => "Arn",
+        // A Neptune Analytics graph, identified by the id that service minted for it ("Ref
+        // returns the graph id"), which is the `graphIdentifier` every call on a graph takes,
+        // and a SNAPSHOT of one by the id it minted for the snapshot, which is the
+        // `snapshotIdentifier` every call on one takes.
+        NEPTUNE_GRAPH_GRAPH => "GraphId",
+        NEPTUNE_GRAPH_GRAPH_SNAPSHOT => "Id",
         // An AWS Amplify app, identified by the ARN that service built around the id it minted
         // ("Ref returns the ARN of the app"), which is the type's primary identifier. (The
         // three Amplify UI Builder entities need no row: each is identified by the app, the

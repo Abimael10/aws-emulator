@@ -297,6 +297,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_eks_awswesleyfrontend::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Neptune Analytics, for the `AWS::NeptuneGraph::Graph` a stack really creates there and
+    // the `AWS::NeptuneGraph::GraphSnapshot` it takes OF that graph, so a suite that deploys
+    // one reads the graph and the snapshot back through that service's own wire, by the ids the
+    // stack publishes.
+    router.register_service(
+        service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     (router, engine)
 }
 

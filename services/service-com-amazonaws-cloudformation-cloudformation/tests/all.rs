@@ -363,6 +363,8 @@ mod malformed_policy_document_rollback;
 mod management_event_recording;
 #[path = "all/minted_identity_across_updates.rs"]
 mod minted_identity_across_updates;
+#[path = "all/neptune_graph_provisioning.rs"]
+mod neptune_graph_provisioning;
 #[path = "all/nested_platform_stack_outputs.rs"]
 mod nested_platform_stack_outputs;
 #[path = "all/nested_resource_outputs.rs"]
