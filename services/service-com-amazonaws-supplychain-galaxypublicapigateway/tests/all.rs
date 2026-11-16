@@ -21,6 +21,8 @@ mod data_integration_event_sends;
 mod data_integration_events;
 #[path = "all/data_integration_flows.rs"]
 mod data_integration_flows;
+#[path = "all/data_lake_dataset_listing.rs"]
+mod data_lake_dataset_listing;
 #[path = "all/data_lake_dataset_refusal_wording.rs"]
 mod data_lake_dataset_refusal_wording;
 #[path = "all/data_lake_datasets.rs"]

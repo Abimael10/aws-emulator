@@ -1193,6 +1193,25 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
             .count()
     }
 
+    /// Every stored dataset of `instance_id`'s `namespace` whose name sorts at or after
+    /// `from` (`""` for the whole namespace), in dataset-name order: the contiguous span of
+    /// the key space those datasets occupy, which is the order `ListDataLakeDatasets` pages
+    /// through. The span is SEEKED to `from` rather than scanned from the namespace's first
+    /// dataset, so resuming a page costs the same whatever sits behind the resume key.
+    pub fn namespace_datasets_from<'a>(
+        &'a self,
+        instance_id: &'a str,
+        namespace: &'a str,
+        from: &str,
+    ) -> impl Iterator<Item = &'a DataLakeDatasetRecord> + 'a {
+        self.datasets
+            .range(dataset_key(instance_id, namespace, from)..)
+            .take_while(move |((instance, stored_namespace, _), _)| {
+                instance == instance_id && stored_namespace == namespace
+            })
+            .map(|(_, record)| record)
+    }
+
     /// Drop every dataset of `instance_id`: a dataset is addressed by its instance, so
     /// none of them outlives the instance whose deletion removed it.
     pub fn drop_instance_datasets(&mut self, instance_id: &str) {
