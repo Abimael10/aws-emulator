@@ -31,11 +31,6 @@ hex = { workspace = true }
 # Mints the version-4 UUIDs this service's server-generated identifiers (appArn and
 # policyArn ids, resolutionId) are, rather than hand-rolling the version/variant bits.
 uuid = { version = "1", features = ["v4"] }
-# Digests the app-version resource mapping whose own identity ListAppVersionResources
-# reports when no resolution of that version was ever started. Already recorded as an
-# edge of this package in Cargo.lock (which does not distinguish a dev dependency), so
-# moving it out of [dev-dependencies] leaves the lock file untouched.
-sha2 = { workspace = true }
 # The owning-service reads `state::mapped_resources` resolves a mapping's physical
 # resource through, over the emulator's own in-process callback: the object store's
 # bucket listing, the queue's url, the topic's attributes, the table's and the

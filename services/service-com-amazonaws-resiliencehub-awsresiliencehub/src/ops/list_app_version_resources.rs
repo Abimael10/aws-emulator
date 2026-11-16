@@ -2,11 +2,11 @@
 
 //! @op ListAppVersionResources
 //!
-//! IMPLEMENTED: reports the physical resources the addressed app version holds —
-//! the DRAFT's as the draft writers left them, a published version's as the
-//! snapshot `PublishAppVersion` froze — under the identity of the resolution the
-//! listing is against, honouring `maxResults` as a real page bound with a
-//! resumable `nextToken`. A pure read.
+//! IMPLEMENTED: reports the physical resources a RESOLUTION of the addressed app
+//! version mapped — the one the request names, else that version's current one —
+//! honouring `maxResults` as a real page bound with a resumable `nextToken`. An
+//! app version no resolution has been started for has nothing to report and is
+//! refused with the modelled `ConflictException`. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -205,17 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(app_version_not_found(&input.app_arn, &input.app_version));
         }
 
-        let held = store.app_version(&input.app_arn, &input.app_version);
-        let resolution_id = resolution_of(&store, &input, held)?;
+        let resolution = resolution_of(&store, &input)?;
 
-        // `AppVersionContents::resources` is a `BTreeMap` keyed by the
-        // `logicalResourceId` each resource was created with, so iterating it IS a
-        // total order over the page: a `nextToken` resumes at exactly the element
-        // after the last one returned, and past anything removed since.
-        let listed: Vec<(&String, &PhysicalResource)> = held
-            .into_iter()
-            .flat_map(|held| held.resources.iter())
-            .collect();
+        // The resolution's mapping is a `BTreeMap` keyed by the
+        // `logicalResourceId` each mapped resource was created with, so iterating
+        // it IS a total order over the page: a `nextToken` resumes at exactly the
+        // element after the last one returned, and past anything the resolution
+        // did not map.
+        let listed: Vec<(&String, &PhysicalResource)> = resolution.resources.iter().collect();
         let start = match resume_from.as_deref() {
             None => 0,
             Some(token) => listed
@@ -235,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|(_, resource)| (*resource).clone())
                 .collect(),
-            resolution_id,
+            resolution_id: resolution.resolution_id.clone(),
             next_token,
         })
     }
@@ -246,33 +243,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// operation="ListAppVersionResources").
 const MAX_PAGE_SIZE: i32 = 100;
 
-/// The resolution this listing is against, as the REQUIRED `resolutionId`: the one
-/// the request names, else the addressed version's CURRENT resolution, else the
-/// identity of the mapping itself ([`crate::state::mapping_resolution_id`]) — so
-/// the member is answered for every version a client can list, including one
-/// nobody ever asked for a resolution of.
+/// The resolution this listing is against: the one the request names, else the
+/// addressed version's CURRENT resolution.
+///
+/// This listing is a read OVER a resolution — the output's `resolutionId` is
+/// @required and the resources reported are the ones that resolution mapped — so a
+/// version no resolution has been started for has nothing to answer, which is the
+/// modelled `ConflictException`/409 rather than an empty or edit-buffer listing.
+/// Nothing is synthesized: a `resolutionId` a client reads back out of a listing
+/// is always one `ResolveAppVersionResources` minted and still addresses that
+/// resolution.
 ///
 /// A `resolutionId` the request NAMES has to be a resolution OF the addressed
 /// version: reporting this version's resources under another version's resolution
 /// would answer a mapping that resolution never produced, so it is the modelled
 /// 404 instead.
-fn resolution_of(
-    store: &crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
+fn resolution_of<'store>(
+    store: &'store crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
     input: &ListAppVersionResourcesInput,
-    held: Option<&crate::state::AppVersionContents>,
-) -> Result<String, ListAppVersionResourcesError> {
-    if let Some(named) = input.resolution_id.as_deref() {
-        return store
+) -> Result<&'store crate::state::ResourceResolution, ListAppVersionResourcesError> {
+    match input.resolution_id.as_deref() {
+        Some(named) => store
             .resolution(&input.app_arn, &input.app_version, named)
-            .map(|resolution| resolution.resolution_id.clone())
-            .ok_or_else(|| resolution_not_found(input, named));
+            .ok_or_else(|| resolution_not_found(input, named)),
+        None => store
+            .current_resolution(&input.app_arn, &input.app_version)
+            .ok_or_else(resources_never_resolved),
     }
-    Ok(store
-        .current_resolution(&input.app_arn, &input.app_version)
-        .map(|resolution| resolution.resolution_id.clone())
-        .unwrap_or_else(|| {
-            crate::state::mapping_resolution_id(&input.app_arn, &input.app_version, held)
-        }))
+}
+
+/// The 409 `ConflictException` for a listing of an app version no resolution has
+/// been started for.
+///
+/// The refusal is about the ABSENCE of a resolution, so it names no resource:
+/// `resourceId` and `resourceType` identify the record a conflict applies to and
+/// there is no such record here.
+fn resources_never_resolved() -> ListAppVersionResourcesError {
+    ListAppVersionResourcesErrorModeled::ConflictException(ConflictException {
+        message: Some(crate::state::resources_never_resolved_message()),
+        resource_id: None,
+        resource_type: None,
+    })
+    .into()
 }
 
 /// The `nextToken` form of the stored key a page stopped at: hex-encoded with the

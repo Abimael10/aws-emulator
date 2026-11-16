@@ -697,7 +697,15 @@ async fn a_resource_already_in_the_template_is_refused_with_the_duplicate_confli
     );
 
     // The refused creates stored nothing: the draft holds one resource per
-    // successful create and no more.
+    // successful create and no more. Read the way a client reads an app version's
+    // resources — resolve, then list against that resolution.
+    post(
+        &router,
+        "/resolve-app-version-resources",
+        &json!({"appArn": app_arn, "appVersion": "draft"}),
+    )
+    .await
+    .ok("resolve the draft");
     let listed = post(
         &router,
         "/list-app-version-resources",

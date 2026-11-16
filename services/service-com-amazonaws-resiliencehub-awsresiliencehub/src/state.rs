@@ -8,7 +8,6 @@ use crate::ops::types::{
     App, AppAssessment, AppComponent, FailurePolicy, LogicalResourceId, PhysicalResource,
     ResiliencyPolicy, DISRUPTION_TYPE_VALUES, ESTIMATED_COST_TIER_VALUES,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The region every minted ARN falls back to when the request carries no usable
@@ -411,7 +410,7 @@ impl AppAssessmentRecord {
 }
 
 /// One resource resolution of one app version: the record
-/// `ResolveAppVersionResources` starts and
+/// `ResolveAppVersionResources` starts, `ListAppVersionResources` reads and
 /// `DescribeAppVersionResourcesResolutionStatus` reports.
 ///
 /// The STATUS is not stored: it is derived from the clock in [`Self::status`], so
@@ -426,14 +425,31 @@ pub struct ResourceResolution {
     /// When this resolution finishes: the instant the clock owes its move from
     /// the non-terminal status to the terminal one, whether or not anybody asks.
     pub completes_at: ::std::time::SystemTime,
+    /// The resource mapping THIS resolution produced: the resources the addressed
+    /// app version held when the resolve was started, keyed by
+    /// [`logical_resource_key`] exactly as [`AppVersionContents::resources`] keys
+    /// them.
+    ///
+    /// Captured once, by the call that starts the resolution, and never touched
+    /// again: a resolution is a point-in-time mapping of one app version, so a
+    /// read against it reports what it mapped and nothing a later edit of the
+    /// version's edit buffer added. A client that changed the version and wants
+    /// the change reflected starts a new resolution, which is the resolve-then-read
+    /// loop the API is built around.
+    pub resources: BTreeMap<String, PhysicalResource>,
 }
 
 impl ResourceResolution {
-    /// A resolution started at `now`, finishing one [`RESOLUTION_SPAN`] later.
-    pub fn started_at(now: ::std::time::SystemTime) -> Self {
+    /// A resolution of the mapping `resources`, started at `now` and finishing one
+    /// [`RESOLUTION_SPAN`] later.
+    pub fn started_at(
+        now: ::std::time::SystemTime,
+        resources: BTreeMap<String, PhysicalResource>,
+    ) -> Self {
         Self {
             resolution_id: mint_resolution_id(),
             completes_at: now + RESOLUTION_SPAN,
+            resources,
         }
     }
 
@@ -462,8 +478,9 @@ impl ResourceResolution {
 /// [`MAX_PUBLISHED_APP_VERSIONS_PER_APP`] plus the draft, times
 /// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] per version, the idempotency store
 /// by [`MAX_IDEMPOTENCY_TOKENS`], `resolutions` by the same app versions
-/// times [`MAX_RESOLUTIONS_PER_APP_VERSION`], and `assessments` by `apps` times
-/// [`MAX_ASSESSMENTS_PER_APP`].
+/// times [`MAX_RESOLUTIONS_PER_APP_VERSION`] (each resolution holding the mapping
+/// it captured, itself bounded by [`MAX_RESOURCES_PER_APP_VERSION`]), and
+/// `assessments` by `apps` times [`MAX_ASSESSMENTS_PER_APP`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// Every stored application, keyed by its minted `appArn`. At most
@@ -755,6 +772,9 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
     /// established that `app_arn` names a stored application and that
     /// `app_version` is one of its versions.
     ///
+    /// The resolution CAPTURES the mapping that version holds at `now`, which is
+    /// what every resolution-scoped read of it reports afterwards.
+    ///
     /// Past [`MAX_RESOLUTIONS_PER_APP_VERSION`] the oldest resolution of that
     /// version is forgotten, so a resolve loop cannot grow this map without
     /// bound.
@@ -764,7 +784,11 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
         app_version: &str,
         now: ::std::time::SystemTime,
     ) -> ResourceResolution {
-        let resolution = ResourceResolution::started_at(now);
+        let mapped = self
+            .app_version(app_arn, app_version)
+            .map(|contents| contents.resources.clone())
+            .unwrap_or_default();
+        let resolution = ResourceResolution::started_at(now, mapped);
         let version_resolutions = self
             .resolutions
             .entry(app_arn.to_string())
@@ -1083,46 +1107,6 @@ pub fn logical_resource_key(logical: &LogicalResourceId) -> String {
     })
     .collect::<Vec<_>>()
     .join("/")
-}
-
-/// The identity `ListAppVersionResources` reports for the resource mapping of an
-/// app version that no resolution of its own has been started for.
-///
-/// Every listing answers `resolutionId` — the model makes the member REQUIRED —
-/// and an app version's mapping is resolved from the moment something is written
-/// into it, whether or not a client ever asked for a resolution of that version.
-/// The identity is therefore derived from what is PERSISTED: the version
-/// addressed and the mapping it holds, each logical id together with the physical
-/// resource and the type it maps to. Two reads of an unchanged mapping answer the
-/// same identity, a mapping that changed answers a different one, two versions
-/// holding the same mapping answer different ones, and no part of the value
-/// depends on when it was read or on anything in the request other than the
-/// version it addresses.
-///
-/// OPAQUE: a SHA-256 digest, so a client can read no count, instant or ordering
-/// out of it, and it is well inside the modelled `@length` of `String255`.
-pub fn mapping_resolution_id(
-    app_arn: &str,
-    app_version: &str,
-    contents: Option<&AppVersionContents>,
-) -> String {
-    let mut digest = Sha256::new();
-    absorb(&mut digest, app_arn);
-    absorb(&mut digest, app_version);
-    for (key, resource) in contents.into_iter().flat_map(|held| held.resources.iter()) {
-        absorb(&mut digest, key);
-        absorb(&mut digest, &resource.physical_resource_id.identifier);
-        absorb(&mut digest, &resource.physical_resource_id.r#type);
-        absorb(&mut digest, &resource.resource_type);
-    }
-    format!("{:x}", digest.finalize())
-}
-
-/// Feed one LENGTH-PREFIXED part into `digest`, so two mappings that differ only
-/// in where text falls across parts cannot absorb the same bytes — the reason
-/// [`logical_resource_key`] length-prefixes its members too.
-fn absorb(digest: &mut Sha256, part: &str) {
-    digest.update(format!("{}:{part}", part.len()).as_bytes());
 }
 
 /// The REGION and ACCOUNT an ARN names, each `None` when the ARN carries none
@@ -1706,6 +1690,21 @@ pub fn policy_attachment_not_found_message(policy_arn: &str, app_name: &str) -> 
         "Cannot attach policy {policy_arn} to app {app_name}. \
          Policy {policy_arn} does not exist.'"
     )
+}
+
+/// The `ConflictException` message for a resolution-scoped read of an app version
+/// no resolution has been started for.
+///
+/// A read whose output carries the resolution it is against has nothing to answer
+/// until a resolution of that version exists, and what clears the refusal is
+/// starting one — so the sentence states the condition and names the operation
+/// that starts it. FIXED text: the refusal is about the absence of a resolution,
+/// which has no value to name, so nothing in it comes from the request or from
+/// state.
+pub fn resources_never_resolved_message() -> String {
+    "Resources were never resolved. Use the ResolveAppVersionResources API to \
+     resolve resources first."
+        .to_string()
 }
 
 /// The `ConflictException` message for a `CreateApp` whose `name` another

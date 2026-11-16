@@ -13,15 +13,16 @@
 //!   the publish sequence number `PublishAppVersion` minted it with — so a client
 //!   can key the listing by that member unconditionally;
 //! * `ListAppVersionResources` reports exactly the physical resources the
-//!   addressed app version holds — the draft's as the draft writers left them, a
-//!   published version's as the snapshot it was frozen as, so a later draft change
-//!   cannot alter a published listing — in pages of at most `maxResults` that a
+//!   RESOLUTION it is against mapped — the resources the addressed version held
+//!   when that resolution was started, so a later draft change cannot alter an
+//!   earlier resolution's listing and a published version's listing is the
+//!   snapshot it was frozen as — in pages of at most `maxResults` that a
 //!   `nextToken` resumes exactly where the previous page stopped, under the
-//!   identity of the resolution the listing is against: the one the request names,
-//!   else the version's current resolution, else the identity of the mapping
-//!   itself;
+//!   identity of that resolution: the one the request names, else the version's
+//!   current one;
 //! * an unknown application, an app version the application does not have and a
-//!   `resolutionId` that version has no resolution for are each the modelled 404.
+//!   `resolutionId` that version has no resolution for are each the modelled 404,
+//!   and a version no resolution was ever started for is the modelled 409.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -218,9 +219,13 @@ fn listed_order(resources: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// The identifiers of the resources one version reports, sorted, so a case can
+/// The identifiers of the resources one version maps, sorted, so a case can
 /// compare WHAT a version holds without pinning the order the service pages in.
+///
+/// The version is RESOLVED first: a listing is a read over a resolution, so what a
+/// version holds is read the way a client reads it — resolve, then list.
 async fn held_by(router: &MultiServiceRouter, app_arn: &str, app_version: &str, case: &str) -> Vec<String> {
+    resolve(router, app_arn, app_version).await;
     let listed = list_resources(router, app_arn, app_version, &json!({})).await;
     let mut identifiers = listed_order(&physical_resources(&listed, case));
     identifiers.sort();
@@ -285,8 +290,9 @@ async fn a_published_version_reports_the_mapping_it_froze() {
     let router = emulator();
     let app_arn = create_an_app(&router, "resource-listing-freeze").await;
 
-    // A draft nobody has written to holds no resource — an empty listing of a
-    // version that exists, not a refusal.
+    // A draft nobody has written to maps no resource — an empty listing of a
+    // version that exists, once that version has a resolution to be read against.
+    resolve(&router, &app_arn, DRAFT_APP_VERSION).await;
     let empty = list_resources(&router, &app_arn, DRAFT_APP_VERSION, &json!({})).await;
     assert_eq!(
         physical_resources(&empty, "an untouched draft"),
@@ -362,6 +368,7 @@ async fn a_published_version_reports_the_mapping_it_froze() {
 
     // A read changes nothing a later caller sees: the same request answers the
     // same listing.
+    resolve(&router, &app_arn, RELEASE_APP_VERSION).await;
     let again = list_resources(&router, &app_arn, RELEASE_APP_VERSION, &json!({})).await;
     let repeated = list_resources(&router, &app_arn, RELEASE_APP_VERSION, &json!({})).await;
     assert_eq!(
@@ -381,6 +388,9 @@ async fn pages_through_the_resources_with_every_page_size() {
     for index in 0..RESOURCES {
         add_a_resource(&router, &app_arn, &format!("resource-{index}")).await;
     }
+    // The composed draft is resolved before it is paged through: a listing reports
+    // what a resolution of that version mapped.
+    resolve(&router, &app_arn, DRAFT_APP_VERSION).await;
 
     let unpaged = list_resources(&router, &app_arn, DRAFT_APP_VERSION, &json!({})).await;
     let forward = listed_order(&physical_resources(&unpaged, "unpaged"));
@@ -453,9 +463,10 @@ async fn pages_through_the_resources_with_every_page_size() {
     }
 }
 
-/// The listing always answers `resolutionId`: the identity of the version's
-/// mapping while nobody has resolved that version, the resolution the request
-/// names once it has, and a 404 for a resolution that version does not have.
+/// The listing always answers `resolutionId`, and it is always a resolution
+/// `ResolveAppVersionResources` started: a version nobody resolved has nothing to
+/// answer, a resolved version reports the resolution the request names or its
+/// current one, and a resolution that version does not have is a 404.
 #[tokio::test]
 async fn reports_the_resolution_the_listing_is_against() {
     let router = emulator();
@@ -463,55 +474,45 @@ async fn reports_the_resolution_the_listing_is_against() {
     add_a_resource(&router, &app_arn, "orders").await;
     let published = publish(&router, &app_arn).await;
 
-    // Unresolved, the identity comes from the mapping itself: it is a modelled
-    // `String255`, two reads agree on it, and two versions do not share one.
-    let draft_identity = resolution_of(&router, &app_arn, DRAFT_APP_VERSION, "the draft").await;
-    let release_identity = resolution_of(&router, &app_arn, &published, "the release").await;
-    for (case, app_version, identity) in [
-        ("the draft", DRAFT_APP_VERSION, &draft_identity),
-        ("the release", published.as_str(), &release_identity),
+    // Unresolved, there is nothing to report: neither version answers an identity
+    // of its own, whatever either of them holds.
+    for (case, app_version) in [
+        ("the unresolved draft", DRAFT_APP_VERSION),
+        ("the unresolved release", published.as_str()),
     ] {
-        assert!(
-            RESOLUTION_ID_LENGTH.contains(&identity.chars().count()),
-            "case {case:?}: resolutionId must satisfy String255's modelled length \
-             {RESOLUTION_ID_LENGTH:?}, got {} characters ({identity:?})",
-            identity.chars().count()
-        );
-        let again = resolution_of(&router, &app_arn, app_version, case).await;
-        assert_eq!(
-            &again, identity,
-            "case {case:?}: two reads of an unchanged mapping must report the same \
-             resolutionId, got {again:?} after {identity:?}"
-        );
+        list_resources(&router, &app_arn, app_version, &json!({}))
+            .await
+            .refused(case, 409, "ConflictException");
     }
-    assert_ne!(
-        draft_identity, release_identity,
-        "each app version's mapping is resolved on its own, so the draft and the \
-         release must not report one resolutionId"
-    );
-
-    // The identity tracks the MAPPING: changing the draft changes the draft's,
-    // and leaves the frozen release's alone.
-    add_a_resource(&router, &app_arn, "payments").await;
-    let draft_after = resolution_of(&router, &app_arn, DRAFT_APP_VERSION, "the changed draft").await;
-    assert_ne!(
-        draft_after, draft_identity,
-        "case \"the changed draft\": a mapping that changed is a different resolution"
-    );
-    assert_eq!(
-        resolution_of(&router, &app_arn, &published, "the untouched release").await,
-        release_identity,
-        "case \"the untouched release\": changing the draft must not change what the \
-         release reports"
-    );
 
     // Once a version has a resolution of its own, that is what the listing is
-    // against — addressed by its id or as the version's current one.
+    // against: the handle the resolve minted, the same on every read, and never
+    // shared with another version's resolution.
     let resolution_id = resolve(&router, &app_arn, DRAFT_APP_VERSION).await;
-    assert_eq!(
-        resolution_of(&router, &app_arn, DRAFT_APP_VERSION, "a resolved draft").await,
-        resolution_id,
-        "case \"a resolved draft\": the listing reports the version's current resolution"
+    let release_resolution = resolve(&router, &app_arn, &published).await;
+    for (case, app_version, expected) in [
+        ("the resolved draft", DRAFT_APP_VERSION, &resolution_id),
+        ("the resolved release", published.as_str(), &release_resolution),
+    ] {
+        assert!(
+            RESOLUTION_ID_LENGTH.contains(&expected.chars().count()),
+            "case {case:?}: resolutionId must satisfy String255's modelled length \
+             {RESOLUTION_ID_LENGTH:?}, got {} characters ({expected:?})",
+            expected.chars().count()
+        );
+        for read in ["the first read", "the second read"] {
+            let reported = resolution_of(&router, &app_arn, app_version, case).await;
+            assert_eq!(
+                &reported, expected,
+                "case {case:?} ({read}): the listing must report the resolution the \
+                 resolve started, got {reported:?}"
+            );
+        }
+    }
+    assert_ne!(
+        resolution_id, release_resolution,
+        "each app version is resolved on its own, so the draft and the release must \
+         not report one resolutionId"
     );
     let named = list_resources(
         &router,

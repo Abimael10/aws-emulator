@@ -59,6 +59,8 @@ mod resiliency_policy_deletion;
 mod resiliency_policy_update;
 #[path = "all/resolution_handle_identity.rs"]
 mod resolution_handle_identity;
+#[path = "all/resolution_scoped_resource_listing.rs"]
+mod resolution_scoped_resource_listing;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
