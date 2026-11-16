@@ -29,6 +29,14 @@
 //! governance and risk management, and data privacy), the control objectives inside
 //! each domain, and the common controls each objective is met by.
 //!
+//! An entry's identity — its kind and the opaque identifier its ARN carries — is the
+//! library's own wherever this crate records it in [`PUBLISHED_CATALOG_IDENTIFIERS`], and an
+//! objective whose published common-control set is recorded there carries exactly that set.
+//! An entry's NAME and DESCRIPTION are the library's wording where this crate has it, and
+//! otherwise the library's subject written in its voice, which is all an entry whose
+//! published wording this crate does not have can be served with: the identity is what a
+//! client joins on, and it is what the recorded table fixes.
+//!
 //! The opaque 25-character identifier inside a catalog ARN is assigned by Amazon Web
 //! Services and is derivable from nothing in the request, yet it is part of the entry's
 //! published identity: the library is account-independent, so one ARN names the domain or
@@ -81,10 +89,20 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                 "Asset inventory management",
                 "Discover and record the resources an account holds.",
                 &[
+                    // This entry keeps the slug it has always carried — the slug is
+                    // internal, it is what several published controls name as the common
+                    // control they implement, and it is the hash input, so re-wording the
+                    // entry leaves those references and its minted fallback ARN alone —
+                    // while its name and description are the library's.
                     (
                         "maintain-an-asset-inventory",
-                        "Maintain an asset inventory",
-                        "Keep a current record of the resources an account holds.",
+                        "Inventory of authorized assets and automated discovery",
+                        "Keep a current record of the authorized resources an account holds, and discover the resources in use automatically.",
+                    ),
+                    (
+                        "asset-inventory-reconciliation",
+                        "Asset inventory reconciliation and audit",
+                        "Reconcile the asset inventory against the assets discovered in the environment on a defined schedule, and audit the differences.",
                     ),
                     (
                         "asset-ownership-assignment",
@@ -97,26 +115,55 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                         "Detect assets that are connected to the environment but absent from the inventory.",
                     ),
                     (
-                        "asset-inventory-reconciliation",
-                        "Asset inventory reconciliation",
-                        "Reconcile the asset inventory against discovered assets on a defined schedule.",
+                        "asset-inventory-attributes",
+                        "Asset inventory attributes",
+                        "Record for each inventoried asset the attributes the inventory is relied on for: its owner, its location and the service it supports.",
+                    ),
+                    (
+                        "asset-decommissioning-and-inventory-removal",
+                        "Asset decommissioning and inventory removal",
+                        "Remove an asset from the inventory when it is decommissioned, and record when it left service.",
+                    ),
+                    (
+                        "software-inventory-management",
+                        "Software inventory management",
+                        "Maintain an inventory of the software installed on the assets the inventory holds.",
                     ),
                 ],
             ),
             // The catalog publishes classification as an OBJECTIVE of its own (its
-            // published ARN is recorded in PUBLISHED_CATALOG_IDENTIFIERS below), not as a
-            // common control under the inventory objective. The entry below is the one
-            // this table already held, moved under the objective it belongs to with its
-            // wording unchanged: nothing is added here that the catalog does not publish.
+            // published ARN is recorded in PUBLISHED_CATALOG_IDENTIFIERS below), met by
+            // the common controls that classify an asset along each dimension the
+            // library classifies by.
             (
                 "asset-classification",
                 "Asset classification",
                 "Classify each asset by the sensitivity of the data it holds or the service it provides.",
                 &[
                     (
-                        "asset-classification",
-                        "Asset classification",
+                        "asset-valuation",
+                        "Asset valuation",
+                        "Record what each asset is worth to the business, so that the protection it is given matches what its loss would cost.",
+                    ),
+                    (
+                        "asset-sensitivity",
+                        "Asset sensitivity",
                         "Classify each asset by the sensitivity of the data it holds or the service it provides.",
+                    ),
+                    (
+                        "asset-criticality",
+                        "Asset criticality",
+                        "Record how critical each asset is to the services that depend on it.",
+                    ),
+                    (
+                        "asset-classification-scheme",
+                        "Asset classification scheme",
+                        "Maintain the scheme assets are classified against, and the handling each classification calls for.",
+                    ),
+                    (
+                        "asset-classification-review",
+                        "Asset classification review",
+                        "Review an asset's classification when the data it holds or the service it provides changes.",
                     ),
                 ],
             ),
@@ -126,24 +173,14 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                 "Maintain, repair and retire assets under controlled conditions, so that neither service nor data is put at risk.",
                 &[
                     (
-                        "preventive-maintenance-schedule",
-                        "Preventive maintenance schedule",
-                        "Maintain assets at the intervals their manufacturer or operator defines.",
+                        "asset-performance-management",
+                        "Asset performance management",
+                        "Monitor the condition and performance of assets, and act on what that monitoring reports before an asset fails.",
                     ),
                     (
-                        "maintenance-authorization",
-                        "Maintenance authorization",
-                        "Authorize and supervise maintenance work, including work carried out by third parties.",
-                    ),
-                    (
-                        "secure-asset-disposal",
-                        "Secure asset disposal",
-                        "Remove data from an asset before it is disposed of, resold or returned.",
-                    ),
-                    (
-                        "asset-return-on-termination",
-                        "Asset return on termination",
-                        "Recover the assets issued to personnel when their engagement ends.",
+                        "asset-maintenance-scheduling",
+                        "Asset maintenance scheduling",
+                        "Maintain assets at the intervals their manufacturer or operator defines, and record the work carried out.",
                     ),
                 ],
             ),
@@ -802,7 +839,12 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                     (
                         "change-request-and-approval",
                         "Change request and approval",
-                        "Require a reviewed and approved request before a change is released.",
+                        "Define, document, implement, and maintain a formal process for submitting and approving change requests.",
+                    ),
+                    (
+                        "change-deployment-and-automation",
+                        "Change deployment and automation",
+                        "Release an approved change through an automated, repeatable deployment process, so that what was approved is what reaches the workload.",
                     ),
                     (
                         "emergency-change-review",
@@ -813,16 +855,6 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                         "change-rollback-planning",
                         "Change rollback planning",
                         "Plan how a change is reversed before it is applied.",
-                    ),
-                    (
-                        "segregation-of-development-and-production",
-                        "Segregation of development and production",
-                        "Keep development and test environments separate from production, and their data distinct.",
-                    ),
-                    (
-                        "change-notification",
-                        "Change notification",
-                        "Inform the parties a change affects before it is applied.",
                     ),
                 ],
             ),
@@ -1191,15 +1223,18 @@ pub(super) const LIBRARY_PUBLICATION_TIME: i64 = 1_710_288_000;
 /// is published as and two kinds that share a slug cannot take each other's identifier.
 ///
 /// Source: the Control Catalog's own published ontology, which names every domain by
-/// `arn:{PARTITION}:controlcatalog:::domain/{identifier}` and every objective by
-/// `arn:{PARTITION}:controlcatalog:::objective/{identifier}`. The identifier is assigned
-/// by Amazon Web Services and derivable from nothing in the request, yet it is part of
-/// the entry's published identity rather than a per-run value: the library is
-/// account-independent and read-only, so one identifier names the domain or objective for
-/// every caller, in every partition and on every run — a client harvests it from
-/// `ListDomains` / `ListObjectives` and feeds it back as an `ObjectiveFilter.Domains` or
-/// `CommonControlFilter.Objectives` entry, so an identifier of this emulator's own making
-/// resolves nowhere for a client holding the published one.
+/// `arn:{PARTITION}:controlcatalog:::domain/{identifier}`, every objective by
+/// `arn:{PARTITION}:controlcatalog:::objective/{identifier}` and every common control by
+/// `arn:{PARTITION}:controlcatalog:::common-control/{identifier}`. The identifier is
+/// assigned by Amazon Web Services and derivable from nothing in the request, yet it is
+/// part of the entry's published identity rather than a per-run value: the library is
+/// account-independent and read-only, so one identifier names the domain, objective or
+/// common control for every caller, in every partition and on every run — a client
+/// harvests it from `ListDomains` / `ListObjectives` / `ListCommonControls` or from a
+/// `COMMON_CONTROL` control mapping and feeds it back as an `ObjectiveFilter.Domains` or
+/// `CommonControlFilter.Objectives` entry, or joins it to its own records, so an
+/// identifier of this emulator's own making resolves nowhere for a client holding the
+/// published one.
 ///
 /// An entry this table does not name is served under an identifier minted from its slug
 /// (see `super::catalog_id`), which is all an entry whose published identifier is not
@@ -1218,6 +1253,11 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
         "avh1ncrx6oyndrbsv0rfywvat",
     ),
     (
+        DOMAIN,
+        "secure-development-lifecycle-and-change-management",
+        "eyrstdrz8kmo28x5j8vgal6au",
+    ),
+    (
         OBJECTIVE,
         "asset-inventory-management",
         "ad11p1961s8erra9m185wa1nn",
@@ -1225,6 +1265,97 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
     (OBJECTIVE, "asset-classification", "90gifwthorhxhxq7m0rtss98u"),
     (OBJECTIVE, "asset-maintenance", "3frxxgl64u9kzttiuheywykf7"),
     (OBJECTIVE, "change-management", "14qj3s9axkdma059lhktc14dx"),
+    // The common controls published under the `asset-inventory-management` objective.
+    (
+        COMMON_CONTROL,
+        "maintain-an-asset-inventory",
+        "1ukpmkewk4i92tjmhsvewi4y7",
+    ),
+    (
+        COMMON_CONTROL,
+        "asset-inventory-reconciliation",
+        "d4s7ik8fgv8082v3x31hifzcc",
+    ),
+    (
+        COMMON_CONTROL,
+        "asset-ownership-assignment",
+        "c0qrxhefhmxkbq22tiejp3enn",
+    ),
+    (
+        COMMON_CONTROL,
+        "unauthorized-asset-detection",
+        "1tejgq26c0djpzgskw31uscm4",
+    ),
+    (
+        COMMON_CONTROL,
+        "asset-inventory-attributes",
+        "5u2qgwuw3z1y0lrof60yf6264",
+    ),
+    (
+        COMMON_CONTROL,
+        "asset-decommissioning-and-inventory-removal",
+        "ec1fxlvgtcxlf2nzremqcca7r",
+    ),
+    (
+        COMMON_CONTROL,
+        "software-inventory-management",
+        "eg1hxxu2e77a7w2wv79quwaxl",
+    ),
+    // The common controls published under the `asset-classification` objective.
+    (COMMON_CONTROL, "asset-valuation", "7encqm6cfsw704eoahh3ujr7y"),
+    (COMMON_CONTROL, "asset-sensitivity", "3t7xstyxx02pdwx9qas1h0quh"),
+    (COMMON_CONTROL, "asset-criticality", "dlukqke1ha1ean2txc1juehes"),
+    (
+        COMMON_CONTROL,
+        "asset-classification-scheme",
+        "5m9jk2j28m8m4nr53u4c3br0h",
+    ),
+    (
+        COMMON_CONTROL,
+        "asset-classification-review",
+        "gr180qll01cux9k41amnf002",
+    ),
+    // The common controls published under the `asset-maintenance` objective.
+    (
+        COMMON_CONTROL,
+        "asset-performance-management",
+        "ez1ccu4xkxrmlekcvjqo3jk59",
+    ),
+    (
+        COMMON_CONTROL,
+        "asset-maintenance-scheduling",
+        "ez4hcdf2fpirhuyojurkval9w",
+    ),
+    // The common controls published under the `change-management` objective.
+    (
+        COMMON_CONTROL,
+        "change-request-and-approval",
+        "1nxqoydhsjdyboc4frsrrmev",
+    ),
+    (
+        COMMON_CONTROL,
+        "change-deployment-and-automation",
+        "8xy67kb7kojr38ozqpmrm60d7",
+    ),
+    (
+        COMMON_CONTROL,
+        "emergency-change-review",
+        "2o50zyyv219ir9r7brjq0y37f",
+    ),
+    (
+        COMMON_CONTROL,
+        "change-rollback-planning",
+        "bgzs5hpn3gsbmtvdzi7vuu7nb",
+    ),
+    // Published under the `code-review-and-testing` objective, whose whole set this crate
+    // does not record: the catalog publishes "Development testing" under this identifier, so
+    // the entry this table already held under that name is served under it, rather than
+    // under the minted fallback a client cannot resolve.
+    (
+        COMMON_CONTROL,
+        "development-testing",
+        "blplx8cx7l3qy5jd6eryax5e7",
+    ),
 ];
 
 /// The resource segment a domain's ARN carries, as the modeled `DomainArn` pattern

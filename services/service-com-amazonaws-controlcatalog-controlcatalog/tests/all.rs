@@ -45,6 +45,8 @@ mod pagination_token_spelling;
 mod published_catalog_coverage;
 #[path = "all/published_catalog_identity.rs"]
 mod published_catalog_identity;
+#[path = "all/published_common_control_identity.rs"]
+mod published_common_control_identity;
 #[path = "all/published_control_classification.rs"]
 mod published_control_classification;
 #[path = "all/published_control_identity.rs"]
