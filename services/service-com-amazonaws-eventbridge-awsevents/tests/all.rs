@@ -141,6 +141,8 @@ mod lambda_target_handler_failure_is_not_a_delivery_failure;
 mod lambda_target_handler_records_the_invoking_rule;
 #[path = "all/lambda_target_handler_writes_the_event_detail.rs"]
 mod lambda_target_handler_writes_the_event_detail;
+#[path = "all/lambda_target_marker_reaches_the_function_log_group.rs"]
+mod lambda_target_marker_reaches_the_function_log_group;
 #[path = "all/log_group_target_delivery.rs"]
 mod log_group_target_delivery;
 #[path = "all/missing_resource_wording.rs"]

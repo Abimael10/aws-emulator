@@ -129,6 +129,8 @@ mod dynamodb_stream_event_source_batch_size;
 mod dynamodb_stream_event_source_delivery;
 #[path = "all/dynamodb_stream_event_source_filter_criteria.rs"]
 mod dynamodb_stream_event_source_filter_criteria;
+#[path = "all/dynamodb_stream_event_source_log_delivery.rs"]
+mod dynamodb_stream_event_source_log_delivery;
 #[path = "all/dynamodb_stream_event_source_parallelization.rs"]
 mod dynamodb_stream_event_source_parallelization;
 #[path = "all/environment_variable_key_state.rs"]
