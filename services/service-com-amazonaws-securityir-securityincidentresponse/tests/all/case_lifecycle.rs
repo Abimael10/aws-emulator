@@ -41,12 +41,15 @@ const ACCOUNT_ID: &str = "000000000000";
 
 /// One emulator: a router with only this service mounted on one shared engine, exactly
 /// as the production router mounts it.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite of this test target drives the service through the one
+/// harness rather than standing up a second one of its own.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's concern, not this service's; these
@@ -57,7 +60,7 @@ impl Emulator {
     }
 
     /// Dispatch one request signed into `region`, and return its status and JSON body.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         path: &str,
@@ -97,7 +100,7 @@ impl Emulator {
         (status, value)
     }
 
-    async fn create_case(&self, region: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_case(&self, region: &str, body: Value) -> (u16, Value) {
         self.call("POST", "/v1/create-case", region, Some(body)).await
     }
 
@@ -106,7 +109,7 @@ impl Emulator {
             .await
     }
 
-    async fn list_cases(&self, region: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn list_cases(&self, region: &str, body: Value) -> (u16, Value) {
         self.call("POST", "/v1/list-cases", region, Some(body)).await
     }
 
@@ -1086,7 +1089,7 @@ async fn the_case_store_stops_accepting_cases_at_its_bound() {
 
 /// A minimal, valid `CreateCase` body whose `title` and `reportedIncidentStartDate` vary
 /// with `index`, for suites that care about identity rather than about member fidelity.
-fn create_request(title: &str, index: u32) -> Value {
+pub(crate) fn create_request(title: &str, index: u32) -> Value {
     json!({
         "resolverType": "Self",
         "engagementType": "Investigation",

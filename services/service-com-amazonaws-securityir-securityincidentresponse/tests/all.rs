@@ -15,3 +15,5 @@
 mod case_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_report.rs"]
+mod validation_report;

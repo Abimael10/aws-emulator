@@ -48,10 +48,13 @@
 //! whose recordings show it, and is asked before the envelope.
 //!
 //! [`too_many_properties`], [`missing_required_properties`], [`instance_type_mismatch`],
-//! [`array_too_short`], [`pattern_mismatch`],
+//! [`array_too_short`], [`array_too_long`], [`array_contains_duplicates`],
+//! [`pattern_mismatch`],
 //! [`string_too_long`], [`string_too_short`], [`numeric_above_maximum`],
 //! [`numeric_below_minimum`] and [`enum_value_not_found`] are the SENTENCES that layer states
-//! for the constraint classes it reports on a member it read from the request BODY. A service whose front door words
+//! for the constraint classes it reports on a member it read from the request BODY, and
+//! [`format_attribute_not_supported`] the one it states about ITSELF for a `format`
+//! attribute it implements no check for. A service whose front door words
 //! those findings itself — because it has to tell a body member from one bound to the URI,
 //! which the refusal seam cannot — builds them from here, so the sentences do not drift
 //! per crate. [`expected_vendor`] is the one sentence here that is not a schema finding:
@@ -63,7 +66,9 @@
 //! shows its words for them — has the whole message in one call:
 //! [`pattern_constraint_report`], the bracketed list over [`pattern_mismatch`], which
 //! declines any refusal holding another class so no message is half in one voice and half
-//! in the other.
+//! in the other. A service that states them for EVERY class takes [`schema_finding`], the
+//! one dispatch from a violation class to the sentence that layer states about it, over
+//! [`bracketed_findings`].
 //!
 //! The other difference this module owns is the VALUE half of a clause: a COLLECTION
 //! (list or map) whose `@length` was broken is stated with no value at all —
@@ -196,6 +201,43 @@ pub fn map_entry_count(stored: &str) -> Option<usize> {
 #[must_use]
 pub fn list_item_count(stored: &str) -> Option<usize> {
     collection_size(stored, " items")
+}
+
+/// Which COLLECTION a `@length` violation is about, and how much of it the request
+/// carried.
+///
+/// The two shapes a length bound reaches besides a string, told apart because a schema
+/// finding states a different sentence for each: a list is an ARRAY ([`array_too_short`],
+/// [`array_too_long`]) and a map is the request's own JSON OBJECT, whose ceiling is a
+/// property count ([`too_many_properties`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmittedCollection {
+    /// A list, carrying this many elements.
+    List(usize),
+    /// A map, carrying this many entries.
+    Map(usize),
+}
+
+/// Which collection `violation` is about and how large it was, or `None` when it is about
+/// a string — a caller's own value rather than a collection the walk summarised.
+///
+/// Read off the summary the validating walk stores in place of a value for a collection it
+/// length-checked, through the two shared readings of that summary ([`list_item_count`] and
+/// [`map_entry_count`]): the violation carries the constraint that was broken, not the kind
+/// of shape that broke it, so that summary is the only signal there is.
+///
+/// THE HOME for that dispatch, which every service wording a schema finding needs and each
+/// had to spell for itself:
+/// `services/service-com-amazonaws-pcaconnectorad-pcaconnectorad/src/service/schema_findings.rs`
+/// carries its own `Collection` / `collection_size` copy, written before this module had
+/// one, and is to be migrated onto this entry point rather than copied again.
+#[must_use]
+pub fn submitted_collection(violation: &Violation) -> Option<SubmittedCollection> {
+    let stored = violation.value.as_deref()?;
+    if let Some(found) = list_item_count(stored) {
+        return Some(SubmittedCollection::List(found));
+    }
+    map_entry_count(stored).map(SubmittedCollection::Map)
 }
 
 /// The clause a COLLECTION member's `@length` violation states — the framework's own,
@@ -438,6 +480,46 @@ pub fn array_too_short(found: usize, min: i64) -> String {
     format!(
         "array is too short: must have at least {min} elements but instance has {found} elements"
     )
+}
+
+/// The finding that layer states for an ARRAY carrying more elements than its schema
+/// admits: the maximum the schema declares and the count the instance carries.
+///
+/// The mirror of [`array_too_short`], down to the value half it has none of:
+/// `services/service-com-amazonaws-deadline-deadline/src/state.rs` carries its own inlined
+/// copy of this sentence, written before this module had it, and is to be migrated onto
+/// this one rather than copied again.
+#[must_use]
+pub fn array_too_long(found: usize, max: i64) -> String {
+    format!(
+        "array is too long: must have at most {max} elements but instance has {found} elements"
+    )
+}
+
+/// The finding that layer states for an ARRAY whose elements its schema requires to be
+/// distinct and which carries the same element twice.
+///
+/// The requirement is about the array as a whole rather than about one element, so the
+/// finding states it and nothing else: neither the repeated element nor its position.
+#[must_use]
+pub fn array_contains_duplicates() -> String {
+    "array must not contain duplicate elements".to_string()
+}
+
+/// The finding that layer states about ITSELF for a schema declaring a `format` attribute
+/// the validator implements no check for: the attribute, double-quoted.
+///
+/// It reports on the validator rather than on a value, so it refuses nothing on its own and
+/// names no member. `attribute` is the attribute as the schema spells it (`"double"`,
+/// `"int32"`, `"password"`), which follows the TYPE a member is modelled with.
+///
+/// `services/service-com-amazonaws-connectcontactlens-amazonconnectcontactlens/src/service/invalid_request.rs`
+/// and `services/service-com-amazonaws-deadline-deadline/src/state.rs` carry their own
+/// inlined copies of this sentence, written before this module had it, and are to be
+/// migrated onto this one rather than copied again.
+#[must_use]
+pub fn format_attribute_not_supported(attribute: &str) -> String {
+    format!("format attribute \"{attribute}\" not supported")
 }
 
 /// The finding that layer states for a number above the maximum its schema admits: that
@@ -874,6 +956,91 @@ pub fn in_float_value_rendering(
 #[must_use]
 pub fn bracketed_findings(findings: &[String]) -> String {
     format!("[{}]", findings.join(", "))
+}
+
+/// The ONE finding a JSON-schema layer states about a value that broke a rule its schema
+/// declares, or `None` for a violation that layer states no finding about.
+///
+/// The dispatch from a violation CLASS to its sentence, in one place: every service whose
+/// front door reports these findings was spelling the same `match` over
+/// [`ViolationKind`], and a second copy of it is how one service comes to word a class
+/// differently from another handed the same violation. The sentences themselves are the
+/// ones beside it in this module, so what is single-homed here is which sentence a class
+/// takes and what goes into it.
+///
+/// `echo` is the value the caller submitted, as the collecting walk rendered it
+/// ([`crate::validation::SubmittedEcho`]) rather than as the framework elided it, because
+/// a finding that quotes a value quotes the bytes the request carried.
+///
+/// `None`, so the caller can leave the whole refusal to the framework's envelope rather
+/// than report it half in this layer's voice, for:
+///
+/// * a violation whose value the boundary WITHHELD (a member the model marks
+///   `@sensitive`), and one whose value that walk could not render: a finding states the
+///   value, and this layer neither discloses a withheld one nor invents one;
+/// * an object below a property MINIMUM, which no sentence here states;
+/// * a required property the request left out, which a JSON Schema states about the
+///   OBJECT rather than about one member ([`missing_required_properties`], over the
+///   property names as the schema spells them, which only the caller knows);
+/// * a class added upstream to the `#[non_exhaustive]` [`ViolationKind`].
+///
+/// `services/service-com-amazonaws-pcaconnectorad-pcaconnectorad/src/service/schema_findings.rs`
+/// carries its own copy of this dispatch, written before this module had one, and declines
+/// two classes beside those — a list above its maximum and a repeated element — because no
+/// recording of that service shows its words for them; it is to be migrated onto this entry
+/// point when one does, rather than copied again.
+#[must_use]
+pub fn schema_finding(
+    violation: &Violation,
+    echo: &crate::validation::SubmittedEcho,
+) -> Option<String> {
+    if violation.sensitive {
+        return None;
+    }
+    let submitted = match echo {
+        crate::validation::SubmittedEcho::Rendered(value) => Some(value.as_str()),
+        crate::validation::SubmittedEcho::Absent | crate::validation::SubmittedEcho::Unrendered => {
+            None
+        }
+    };
+    match &violation.kind {
+        // The values the model declares for the enumerated type, in its declared order —
+        // the order the validating walk carries them in — and the submitted value.
+        ViolationKind::EnumValue(permitted) => {
+            Some(enum_value_not_found(submitted?, permitted))
+        }
+        // The expression as the MODEL declares it, anchors included: this is the schema's
+        // own expression, not the per-member clause's rendering of it.
+        ViolationKind::Pattern(pattern) => Some(pattern_mismatch(pattern, submitted?)),
+        // `@length` bounds a string's characters, a list's elements and a map's entries, and
+        // this layer states a different finding for each: a string quotes itself and its
+        // length, an ARRAY states the two counts (it has no scalar rendering to quote), and a
+        // MAP is the request's own JSON OBJECT, so its ceiling is a property count.
+        ViolationKind::MinLength(min) => match submitted_collection(violation) {
+            Some(SubmittedCollection::List(found)) => Some(array_too_short(found, *min)),
+            Some(SubmittedCollection::Map(_)) => None,
+            None => {
+                let value = submitted?;
+                Some(string_too_short(value, value.chars().count(), *min))
+            }
+        },
+        ViolationKind::MaxLength(max) => match submitted_collection(violation) {
+            Some(SubmittedCollection::List(found)) => Some(array_too_long(found, *max)),
+            Some(SubmittedCollection::Map(found)) => Some(too_many_properties(found, *max)),
+            None => {
+                let value = submitted?;
+                Some(string_too_long(value, value.chars().count(), *max))
+            }
+        },
+        // A number outside its `@range`: the bound as the model writes it and the value as
+        // the request carried it, neither re-rendered here.
+        ViolationKind::MinValue(min) => Some(numeric_below_minimum(submitted?, min)),
+        ViolationKind::MaxValue(max) => Some(numeric_above_maximum(submitted?, max)),
+        // A rule about the collection AS A WHOLE, which names neither the value nor the
+        // element that repeated.
+        ViolationKind::UniqueItems => Some(array_contains_duplicates()),
+        _ => None,
+    }
 }
 
 /// The whole message a service states for a request whose values are outside the
