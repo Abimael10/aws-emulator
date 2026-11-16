@@ -99,6 +99,8 @@ mod no_op_updates;
 mod official_lens_catalog;
 #[path = "all/official_lens_catalog_metadata.rs"]
 mod official_lens_catalog_metadata;
+#[path = "all/official_lens_catalog_publication_data.rs"]
+mod official_lens_catalog_publication_data;
 #[path = "all/profile_deletion.rs"]
 mod profile_deletion;
 #[path = "all/profile_lifecycle.rs"]
