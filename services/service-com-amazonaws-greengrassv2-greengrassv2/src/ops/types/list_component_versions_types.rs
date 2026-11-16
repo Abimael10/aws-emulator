@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-greengrassv2-greengrassv2.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.greengrassv2#ListComponentVersionsRequest")]
+// `skip_validation = ["arn"]`: `ComponentARN`'s `@pattern` is judged by the handler
+// rather than at the boundary, for the reason `crate::state::component_arns` states — a
+// value outside it is refused with this service's own sentence, and the component-VERSION
+// ARN `CreateComponentVersion` returns names the same component, so this operation takes
+// it too. Only this member's constraint traits are dropped; every other member of this
+// input keeps its own.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.greengrassv2#ListComponentVersionsRequest",
+    skip_validation = ["arn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListComponentVersionsInput {
     pub arn: String,

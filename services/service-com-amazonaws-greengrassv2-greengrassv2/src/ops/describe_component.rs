@@ -156,6 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // The `arn` this operation takes is judged HERE rather than at the boundary
+        // (`skip_validation` on this input): a value outside `ComponentVersionARN` is
+        // refused with the sentence IoT Greengrass states about it, not with the
+        // framework's constraint envelope (`st::component_arns`). It is judged before
+        // anything else, which is where the boundary check ran.
+        let (name, version) = st::addressed_component_version(&input.arn)
+            .map_err(DescribeComponentErrorModeled::ValidationException)?;
+
         // IAM decides first, before the catalog is read: a caller whose identity-based
         // policies do not allow this action on the component version the request names is
         // refused 403 and learns nothing about whether that version exists
@@ -181,8 +189,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it could not find in the account the request is authorized for, so the
             // name and the version come out of the ARN the caller submitted and the
             // account out of this emulator's own.
-            let (name, version) = st::parse_component_version_arn(&input.arn)
-                .unwrap_or_else(|| (input.arn.clone(), String::new()));
             return Err(DescribeComponentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!(

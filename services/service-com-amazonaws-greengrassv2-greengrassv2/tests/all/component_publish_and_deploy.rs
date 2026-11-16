@@ -574,34 +574,65 @@ async fn a_replayed_client_token_returns_the_first_result_instead_of_a_duplicate
 async fn a_recipe_that_is_not_a_recipe_is_refused() {
     let router = emulator();
 
-    // Each row breaks the recipe in a different way; every one must be a 400
-    // ValidationException, never a 2xx and never a 501.
-    let cases: &[(&str, &str)] = &[
-        ("empty document", ""),
-        ("a sequence, not a mapping", "[1, 2, 3]"),
-        ("a bare scalar", "\"just a string\""),
+    // RULE: a recipe-level refusal is the 403 `AccessDeniedException` IoT Greengrass
+    // answers, stating its recipe diagnosis and then the authorization sentence naming the
+    // caller — a payload it cannot READ as a document is diagnosed at the position reading
+    // it stopped at, and a document it read that specifies no component name or version is
+    // diagnosed as that. Each row breaks the recipe in a different way; `true` marks the
+    // rows whose payload cannot be read at all.
+    let cases: &[(&str, &str, bool)] = &[
+        ("empty document", "", true),
+        ("a sequence, not a mapping", "[1, 2, 3]", false),
+        ("a bare scalar", "\"just a string\"", false),
         (
             "missing ComponentName",
             r#"{"RecipeFormatVersion":"2020-01-25","ComponentVersion":"1.0.0"}"#,
+            false,
         ),
         (
             "missing ComponentVersion",
             r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.NoVersion"}"#,
+            false,
         ),
-        ("unparseable yaml", "ComponentName: [unclosed\n"),
+        ("unparseable yaml", "ComponentName: [unclosed\n", true),
+        ("two documents, not one", "ComponentName: a\n---\nComponentVersion: 1.0.0\n", true),
     ];
 
-    for (label, recipe) in cases {
+    // The caller these requests are signed for, as `sts:GetCallerIdentity` reports it:
+    // every one of those sentences names it, and none of them names anything else.
+    let caller = format!("arn:aws:iam::{ACCOUNT}:user/emulator");
+    let identity_diagnosis = "Invalid Input: The component recipe doesn't specify a component \
+                              name or version. Add ComponentName and ComponentVersion \
+                              parameters to the recipe and try again.";
+
+    for (label, recipe, unreadable) in cases {
         let (status, body) = create_component(&router, recipe, &json!({})).await;
         assert_eq!(
-            status, 400,
-            "case {label:?}: a broken recipe must answer 400, got {status} {body}"
+            status, 403,
+            "case {label:?}: a broken recipe must answer 403, got {status} {body}"
         );
-        assert!(
-            error_code(&body).contains("ValidationException"),
-            "case {label:?}: expected ValidationException, got {}",
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {label:?}: expected AccessDeniedException, got {}",
             error_code(&body)
         );
+        let message = text(&body, "message");
+        let authorization = format!("User: {caller} is not authorized to perform: null");
+        if *unreadable {
+            assert!(
+                message.starts_with("Invalid recipe format; line: ")
+                    && message.ends_with(&format!(". {authorization}")),
+                "case {label:?}: expected a recipe-format diagnosis at a position, then \
+                 {authorization:?}, got {message:?}"
+            );
+        } else {
+            assert_eq!(
+                message,
+                format!("{identity_diagnosis} {authorization}"),
+                "case {label:?}: expected the missing-identity diagnosis, got {message:?}"
+            );
+        }
     }
 
     // A recipe that breaches one of the emulator's bounds on an untrusted
@@ -660,7 +691,9 @@ async fn a_recipe_that_is_not_a_recipe_is_refused() {
     );
     // An anchor on its own expands nothing and is legitimate YAML; only an ALIAS
     // can multiply a document, and the loader resolves one by copying, so these
-    // rows are refused by the pre-load parser event scan rather than by a byte scan.
+    // rows are refused before the load rather than by a byte scan — the first by the
+    // pre-load parser event scan, the second by that same parser declining to read the
+    // document at all.
     let alias_behind_explicit_key =
         "ComponentName: com.example.Explicit\nComponentVersion: 1.0.0\nx: &a [1, 2]\n? *a\n: 1\n";
     let alias_behind_tag =
@@ -672,25 +705,39 @@ async fn a_recipe_that_is_not_a_recipe_is_refused() {
         "[".repeat(2048)
     );
 
-    for (label, recipe) in [
-        ("yaml alias bomb", alias_bomb.as_str()),
-        ("deeply nested flow collections", deep_flow.as_str()),
-        ("flow openers past the pre-parse bound", flow_past_the_bound.as_str()),
-        ("deeply indented block mapping", deep_block.as_str()),
-        ("compact block sequence on one line", compact_sequence.as_str()),
-        ("alias behind the explicit-key indicator", alias_behind_explicit_key),
-        ("alias behind a tag", alias_behind_tag),
-        ("nesting hidden behind a non-comment '#'", depth_behind_hash.as_str()),
-        ("larger than the recipe size bound", oversized.as_str()),
+    // Every row must be refused, and WHICH refusal it gets follows from who refused it: a
+    // document one of the emulator's own bounds measures is the modelled 400
+    // `ValidationException` naming `inlineRecipe` (AWS publishes those documents, so this
+    // refusal is the emulator's alone), while a document the PARSER cannot read at all is
+    // the recipe-format diagnosis AWS answers such a payload with, reported at the position
+    // that parser stopped at. `true` marks the rows the parser declines — the one whose flow
+    // nesting its own grammar will not read, and the one whose tagged alias is not a node it
+    // can build — before any bound of this emulator measures them.
+    for (label, recipe, unreadable) in [
+        ("yaml alias bomb", alias_bomb.as_str(), false),
+        ("deeply nested flow collections", deep_flow.as_str(), true),
+        ("flow openers past the pre-parse bound", flow_past_the_bound.as_str(), false),
+        ("deeply indented block mapping", deep_block.as_str(), false),
+        ("compact block sequence on one line", compact_sequence.as_str(), false),
+        ("alias behind the explicit-key indicator", alias_behind_explicit_key, false),
+        ("alias behind a tag", alias_behind_tag, true),
+        ("nesting hidden behind a non-comment '#'", depth_behind_hash.as_str(), false),
+        ("larger than the recipe size bound", oversized.as_str(), false),
     ] {
         let (status, body) = create_component(&router, recipe, &json!({})).await;
+        let (expected_status, expected_code) = if unreadable {
+            (403, "AccessDeniedException")
+        } else {
+            (400, "ValidationException")
+        };
         assert_eq!(
-            status, 400,
-            "case {label:?}: an out-of-bounds recipe must answer 400, got {status} {body}"
+            status, expected_status,
+            "case {label:?}: an out-of-bounds recipe must answer {expected_status}, got \
+             {status} {body}"
         );
         assert!(
-            error_code(&body).contains("ValidationException"),
-            "case {label:?}: expected ValidationException, got {}",
+            error_code(&body).contains(expected_code),
+            "case {label:?}: expected {expected_code}, got {}",
             error_code(&body)
         );
     }

@@ -520,37 +520,57 @@ async fn a_resource_arn_outside_the_modelled_pattern_is_refused() {
     // `GenericV2ARN`'s pattern
     // (^arn:[^:]*:greengrass:[^:]*:(aws|[0-9]+):(components|deployments|coreDevices):)
     // is what the request must satisfy before any handler runs; each row breaches one
-    // part of it.
+    // part of it. The tagging route reads the ARN's VENDOR field first, so a row whose
+    // value is a well-formed ARN of ANOTHER service is refused as that layer's own bad
+    // request (`BadRequestException`, naming the vendor it expected); every other row
+    // keeps the modelled constraint refusal. Both are a 400.
+    let expected_vendor = "Invalid input resource arn: expected vendor greengrass";
     let rows = [
-        ("no ARN at all", "not-an-arn".to_string()),
+        ("no ARN at all", "not-an-arn".to_string(), None),
         (
             "another service's ARN",
             format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/PresentCore"),
+            Some(expected_vendor),
+        ),
+        (
+            "another service's partition-global ARN",
+            "arn:aws:s3:::a-bucket".to_string(),
+            Some(expected_vendor),
         ),
         (
             "a Greengrass ARN whose resource field is another type",
             format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:things:PresentCore"),
+            None,
         ),
         (
             "an account field that is neither `aws` nor digits",
             format!("arn:aws:greengrass:{REGION}:my-account:deployments:d-1"),
+            None,
         ),
         (
             "a resource type with no identifier field after it",
             format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:deployments"),
+            None,
         ),
     ];
 
-    for (case, arn) in rows {
+    for (case, arn, vendor_sentence) in rows {
         let (status, body) = list_tags(&router, &arn).await;
         assert_eq!(
             status, 400,
             "case {case:?}: an ARN outside the modelled pattern must answer 400, got {status} {body}"
         );
-        assert_eq!(
-            error_code(&body),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {body}"
-        );
+        match vendor_sentence {
+            None => assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {body}"
+            ),
+            Some(sentence) => assert_eq!(
+                (error_code(&body), body["message"].as_str()),
+                ("BadRequestException".to_string(), Some(sentence)),
+                "case {case:?}: expected the tagging layer's vendor refusal, got {body}"
+            ),
+        }
     }
 }

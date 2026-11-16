@@ -238,17 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // run inside the critical section every other request waits on.
         let recipe = match st::parse_recipe(&recipe_bytes) {
             Ok(recipe) => recipe,
-            Err(st::RecipeError::Unparseable(detail)) => {
-                return Err(invalid(detail, "CANNOT_PARSE", Some("inlineRecipe")))
-            }
-            Err(st::RecipeError::OutOfBounds(detail)) => {
-                return Err(invalid(detail, "FIELD_VALIDATION_FAILED", Some("inlineRecipe")))
-            }
-            Err(st::RecipeError::MissingKey(key)) => {
-                return Err(invalid(
-                    format!("The recipe must declare {key}."),
-                    "FIELD_VALIDATION_FAILED",
-                    Some("inlineRecipe"),
+            Err(refused) => {
+                return Err(refuse_recipe(
+                    refused,
+                    &st::authorization::caller_arn(&*self.engine, ctx),
                 ))
             }
         };
@@ -298,28 +291,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateComponentVersionErrorModeled::ConflictException(
                 ConflictException {
-                    // Greengrass reports the version that is already published, the
-                    // account it belongs to and the state it is in, so a client
-                    // re-publishing can tell "already deployable" from "still
-                    // validating". The state is the one the clock owes at this
-                    // instant, not a stored literal.
+                    // Greengrass reports the version that is already published and the
+                    // account it belongs to, and then one of two things: the state that
+                    // version is in, so a client re-publishing can tell "already
+                    // deployable" from "still validating" — or, for a request that
+                    // carried TAGS, that the version cannot be created again WITH tags,
+                    // since the tags of a published version are not the create's to set.
+                    // The state is the one the clock owes at this instant, not a stored
+                    // literal.
                     //
-                    // The fixed text is the recorded response's, verbatim, including
-                    // the brackets around all three of the component, the account and
-                    // the state:
+                    // The fixed text of both is the recorded response's, verbatim,
+                    // including the brackets around the component and the account:
                     //   Component [<name> : <version>] for account [<account>] already
                     //   exists with state: [<state>]
+                    //   Component [<name> : <version>] for account [<account>] already
+                    //   exists and can't be created again with tags.
                     // (the issue report's prose paraphrase of cause 2 dropped the
                     // brackets around the account; the recorded body carries them).
                     message: format!(
-                        "Component [{} : {}] for account [{}] already exists with state: [{}]",
+                        "Component [{} : {}] for account [{}] already exists {}",
                         recipe.component_name,
                         recipe.component_version,
                         st::account_id(),
-                        existing
-                            .status_at(now)
-                            .component_state
-                            .unwrap_or_else(|| st::STATE_REQUESTED.to_string()),
+                        if carries_tags(&input) {
+                            "and can't be created again with tags.".to_string()
+                        } else {
+                            format!(
+                                "with state: [{}]",
+                                existing
+                                    .status_at(now)
+                                    .component_state
+                                    .unwrap_or_else(|| st::STATE_REQUESTED.to_string())
+                            )
+                        },
                     ),
                     resource_id: existing.arn.clone(),
                     resource_type: "COMPONENT_VERSION".to_string(),
@@ -410,6 +414,69 @@ fn output_for(
         creation_timestamp: crate::state::to_datetime(entry.creation_timestamp),
         status: entry.status_at(now),
     }
+}
+
+/// Whether this request asked for TAGS on the version it publishes.
+///
+/// A `tags` object carrying no entry asks for none, so it is not a tagged create: the
+/// member's modelled `@length` minimum is 1 (`smithy_query(query="shape",shape="TagMap")`),
+/// and a map the request did not carry at all is the same request as one carrying an empty
+/// one.
+fn carries_tags(input: &CreateComponentVersionInput) -> bool {
+    input.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+}
+
+/// The sentence IoT Greengrass states about a recipe it READ but that names no component:
+/// it names the two members the recipe reference requires and tells the caller to add
+/// them.
+const MISSING_RECIPE_IDENTITY: &str = "Invalid Input: The component recipe doesn't specify a \
+     component name or version. Add ComponentName and ComponentVersion parameters to the \
+     recipe and try again.";
+
+/// What this operation answers a recipe it will not publish.
+///
+/// Two of the three classes are the ones IoT Greengrass itself diagnoses — a payload it
+/// cannot read as a recipe document, and a document that specifies no component name or
+/// version — and it answers BOTH with `AccessDeniedException` (HTTP 403), stating the
+/// recipe diagnosis and then the authorization sentence that names the caller: the
+/// publication is refused before any action is resolved for it, so the action that
+/// sentence names is `null`. The caller is the principal
+/// `sts:GetCallerIdentity` reports for the credentials the request was signed with
+/// (`crate::state::authorization::caller_arn`).
+///
+/// The third class is this emulator's OWN bound on an untrusted document
+/// (`crate::state::MAX_RECIPE_BYTES` and the bounds beside it) — a refusal AWS does not
+/// make, since it publishes the recipe this emulator declines to parse — so it keeps the
+/// modelled `ValidationException` that names the member at fault rather than being dressed
+/// as one of AWS's recipe diagnoses.
+///
+/// Which of the two a given payload gets is decided by WHO refused it, and that boundary is
+/// the useful one rather than an arbitrary one: this emulator's bounds are measured BEFORE
+/// any parser sees the bytes (and on the loaded tree), state the bound they measured, and
+/// name no position — so they answer the `ValidationException`; everything the document
+/// PARSER declines is a document that could not be read, which is the class AWS diagnoses,
+/// and it is reported at the position the parser stopped at, which is what that diagnosis
+/// states. A document no parser reads is one no recipe can be published from, whichever
+/// limit of the parser's own grammar it broke.
+fn refuse_recipe(
+    refused: crate::state::RecipeError,
+    caller: &str,
+) -> CreateComponentVersionError {
+    use crate::state::RecipeError;
+    let diagnosis = match refused {
+        RecipeError::OutOfBounds(detail) => {
+            return invalid(detail, "FIELD_VALIDATION_FAILED", Some("inlineRecipe"))
+        }
+        RecipeError::InvalidFormat(at) => format!(
+            "Invalid recipe format; line: {}, column: {}.",
+            at.line, at.column
+        ),
+        RecipeError::MissingIdentity => MISSING_RECIPE_IDENTITY.to_string(),
+    };
+    CreateComponentVersionErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: format!("{diagnosis} User: {caller} is not authorized to perform: null"),
+    })
+    .into()
 }
 
 /// A modelled `ValidationException` (HTTP 400) naming the member at fault.

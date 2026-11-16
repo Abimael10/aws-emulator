@@ -150,6 +150,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // The `arn` this operation takes is judged HERE rather than at the boundary
+        // (`skip_validation` on this input), which is what lets it take EITHER ARN that
+        // names one component: the component ARN `ListComponents` reports, and the
+        // component-VERSION ARN `CreateComponentVersion` returns, which is normalised to
+        // the component ARN its versions are held under. A value that is neither is
+        // refused with this service's own sentence about a component ARN
+        // (`st::component_arns`).
+        let (name, component_arn) = st::addressed_component(&input.arn)
+            .map_err(ListComponentVersionsErrorModeled::ValidationException)?;
+
         // IAM decides first, before the catalog is read: a caller whose identity-based
         // policies do not allow this action on the component the request names is refused
         // 403 and learns nothing about whether that component exists
@@ -182,16 +192,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // The input ARN is the NAME-level component ARN `ListComponents` reports, so
-        // it names a component rather than one version. A component this account has
-        // published no version of carries no versions to report, and Greengrass
-        // answers that with an empty list rather than a 404 (recorded: the listing for
-        // a component that does not exist is a 200 whose `componentVersions` is
-        // empty), so the absent component and the component whose last version was
-        // deleted are answered alike.
-        let stored = st::parse_component_arn(&input.arn)
-            .and_then(|name| store.components.get(&name))
-            .filter(|component| component.name_arn == input.arn);
+        // The ARN the request carried addresses ONE component, whichever of the two
+        // shapes it was written in. A component this account has published no version of
+        // carries no versions to report, and Greengrass answers that with an empty list
+        // rather than a 404 (recorded: the listing for a component that does not exist is
+        // a 200 whose `componentVersions` is empty), so the absent component and the
+        // component whose last version was deleted are answered alike.
+        let stored = store
+            .components
+            .get(&name)
+            .filter(|component| component.name_arn == component_arn);
 
         // "Greater versions are listed first" (the operation's own documentation), by
         // semantic-version precedence — the order `version_cmp` states once for this

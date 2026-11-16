@@ -21,10 +21,10 @@ use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region these requests are signed for; every minted ARN carries it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The emulator front door with only this service mounted, over ONE shared engine —
 /// exactly how `core/router` assembles it.
@@ -158,9 +158,10 @@ pub(crate) fn version_arn(name: &str, version: &str) -> String {
     format!("{}:versions:{version}", component_arn(name))
 }
 
-/// Percent-encode the colons in an ARN, the way an AWS SDK encodes an `@httpLabel`.
+/// A value as a client percent-encodes a non-greedy `@httpLabel`: both separators an ARN
+/// carries are encoded, so a value holding either stays ONE path segment.
 pub(crate) fn label(arn: &str) -> String {
-    arn.replace(':', "%3A")
+    arn.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// The wire error code of a `restJson1` error body.

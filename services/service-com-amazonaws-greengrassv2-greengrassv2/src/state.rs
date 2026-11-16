@@ -13,6 +13,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Which ARN each component operation takes, and how a value that is not one is refused.
+pub mod component_arns;
 /// The core-device fleet, the client-device associations, and the pieces the
 /// core-device operations share.
 pub mod core_devices;
@@ -22,6 +24,7 @@ pub mod paging;
 pub mod connectivity_info;
 /// The refusals the legacy Greengrass surface answers in the elder envelope.
 pub mod legacy_refusals;
+pub use component_arns::*;
 pub use connectivity_info::*;
 pub use core_devices::*;
 pub use legacy_refusals::*;
@@ -847,13 +850,25 @@ pub fn iot_job_arn(region: &str, job_id: &str) -> String {
 pub fn parse_component_version_arn(arn: &str) -> Option<(String, String)> {
     let fields: Vec<&str> = arn.split(':').collect();
     match fields.as_slice() {
-        ["arn", _partition, "greengrass", _region, _account, "components", name, "versions", version]
-            if !name.is_empty() && !version.is_empty() =>
+        ["arn", _partition, "greengrass", _region, account, "components", name, "versions", version]
+            if arn_account_field(account) && !name.is_empty() && !version.is_empty() =>
         {
             Some(((*name).to_string(), (*version).to_string()))
         }
         _ => None,
     }
+}
+
+/// Whether an ARN's ACCOUNT field is one this service's ARN shapes admit: the literal
+/// `aws`, which is what an AWS-published component's ARN carries, or an account id's
+/// digits.
+///
+/// Every ARN `@pattern` of this model spells that field `(aws|[0-9]+)`
+/// (`smithy_query(query="shape",shape="ComponentVersionARN")`), so it is read here once
+/// for both readings below — and for [`NamedResource`], whose shape states the same
+/// field.
+pub fn arn_account_field(account: &str) -> bool {
+    account == "aws" || (!account.is_empty() && account.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// The component name a NAME-level component ARN names — the shape
@@ -865,8 +880,8 @@ pub fn parse_component_version_arn(arn: &str) -> Option<(String, String)> {
 pub fn parse_component_arn(arn: &str) -> Option<String> {
     let fields: Vec<&str> = arn.split(':').collect();
     match fields.as_slice() {
-        ["arn", _partition, "greengrass", _region, _account, "components", name]
-            if !name.is_empty() =>
+        ["arn", _partition, "greengrass", _region, account, "components", name]
+            if arn_account_field(account) && !name.is_empty() =>
         {
             Some((*name).to_string())
         }
@@ -904,15 +919,15 @@ impl NamedResource {
         }
         let fields: Vec<&str> = arn.split(':').collect();
         match fields.as_slice() {
-            ["arn", _partition, "greengrass", _region, _account, "deployments", deployment_id]
-                if !deployment_id.is_empty() =>
+            ["arn", _partition, "greengrass", _region, account, "deployments", deployment_id]
+                if arn_account_field(account) && !deployment_id.is_empty() =>
             {
                 Some(Self::Deployment {
                     deployment_id: (*deployment_id).to_string(),
                 })
             }
-            ["arn", _partition, "greengrass", _region, _account, "coreDevices", thing_name]
-                if !thing_name.is_empty() =>
+            ["arn", _partition, "greengrass", _region, account, "coreDevices", thing_name]
+                if arn_account_field(account) && !thing_name.is_empty() =>
             {
                 Some(Self::CoreDevice {
                     core_device_thing_name: (*thing_name).to_string(),
@@ -1187,12 +1202,56 @@ pub struct ParsedRecipe {
 /// Why a submitted recipe was refused.
 #[derive(Debug, Clone)]
 pub enum RecipeError {
-    /// The bytes are not a recipe document at all.
-    Unparseable(String),
-    /// The document parsed but omits a key the recipe reference requires.
-    MissingKey(&'static str),
+    /// The bytes could not be READ as a recipe document, at this position in them.
+    InvalidFormat(RecipePosition),
+    /// The document was read, but it specifies no component name or version — the two
+    /// members the recipe reference requires of every recipe, and the two the control
+    /// plane publishes a version under.
+    MissingIdentity,
     /// The document breaches a bound this emulator puts on an untrusted recipe.
     OutOfBounds(String),
+}
+
+/// Where in a submitted recipe the attempt to read it failed: the line and the column an
+/// IoT Greengrass recipe-format diagnosis reports, both 1-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecipePosition {
+    /// The 1-based line of the document.
+    pub line: usize,
+    /// The 1-based column of that line.
+    pub column: usize,
+}
+
+impl RecipePosition {
+    /// The start of the document, which is where a diagnosis about the document AS A WHOLE
+    /// applies: a payload that is not exactly one document, or a mapping whose members are
+    /// not named by strings. A failure the parser localised reports the parser's own
+    /// position instead ([`Self::of_scan_error`]).
+    pub const START: Self = Self { line: 1, column: 1 };
+
+    /// The position `offset` bytes into `text`: the line is how many line breaks precede
+    /// it, and the column how far it is past the last one.
+    pub fn of_byte(text: &[u8], offset: usize) -> Self {
+        let read = &text[..offset.min(text.len())];
+        let line = read.iter().filter(|byte| **byte == b'\n').count() + 1;
+        let after_break = read
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        Self {
+            line,
+            column: read.len() - after_break + 1,
+        }
+    }
+
+    /// Where the document parser stopped. Its marker counts lines from 1 and columns from
+    /// 0, so only the column is shifted onto the 1-based reading above.
+    fn of_scan_error(error: &::yaml_rust2::ScanError) -> Self {
+        Self {
+            line: error.marker().line(),
+            column: error.marker().col() + 1,
+        }
+    }
 }
 
 /// Pre-flight bounds on an untrusted recipe document, applied BEFORE any parser
@@ -1318,7 +1377,7 @@ fn reject_aliases(text: &str) -> Result<(), RecipeError> {
     let mut detector = AliasDetector::default();
     ::yaml_rust2::parser::Parser::new_from_str(text)
         .load(&mut detector, true)
-        .map_err(|e| RecipeError::Unparseable(format!("the recipe could not be parsed: {e}")))?;
+        .map_err(|e| RecipeError::InvalidFormat(RecipePosition::of_scan_error(&e)))?;
     if detector.saw_alias {
         return Err(RecipeError::OutOfBounds(
             "a recipe must not use YAML aliases".to_string(),
@@ -1368,12 +1427,11 @@ fn load_document(text: &str) -> Result<::yaml_rust2::Yaml, RecipeError> {
     guard_recipe(text)?;
     reject_aliases(text)?;
     let mut documents = ::yaml_rust2::YamlLoader::load_from_str(text)
-        .map_err(|e| RecipeError::Unparseable(format!("the recipe could not be parsed: {e}")))?;
+        .map_err(|e| RecipeError::InvalidFormat(RecipePosition::of_scan_error(&e)))?;
     if documents.len() != 1 {
-        return Err(RecipeError::Unparseable(format!(
-            "the recipe must be exactly one document; found {}",
-            documents.len()
-        )));
+        // A recipe is ONE document; a payload carrying none or several is not one, which
+        // is a fact about the payload rather than about a position inside it.
+        return Err(RecipeError::InvalidFormat(RecipePosition::START));
     }
     let document = documents.remove(0);
     document_within_bounds(&document)?;
@@ -1408,8 +1466,9 @@ fn scalar_string(value: &::yaml_rust2::Yaml) -> Option<String> {
 /// which format the stored bytes are written in. The untrusted bytes pass
 /// [`guard_recipe`] before any parser sees them.
 pub fn parse_recipe(bytes: &[u8]) -> Result<ParsedRecipe, RecipeError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| RecipeError::Unparseable(format!("the recipe is not valid UTF-8: {e}")))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        RecipeError::InvalidFormat(RecipePosition::of_byte(bytes, e.valid_up_to()))
+    })?;
     let document = load_document(text)?;
     let format = if looks_like_json(text)
         && ::serde_json::from_str::<::serde::de::IgnoredAny>(text).is_ok()
@@ -1418,18 +1477,16 @@ pub fn parse_recipe(bytes: &[u8]) -> Result<ParsedRecipe, RecipeError> {
     } else {
         RecipeFormat::Yaml
     };
-    let map = document.as_hash().ok_or_else(|| {
-        RecipeError::Unparseable(
-            "the recipe must be a mapping of recipe keys to values".to_string(),
-        )
-    })?;
+    // A document that is not a mapping carries no recipe member at all, so it specifies
+    // neither the component's name nor its version.
+    let map = document.as_hash().ok_or(RecipeError::MissingIdentity)?;
 
     let component_name = mapping_get(map, "ComponentName")
         .and_then(scalar_string)
-        .ok_or(RecipeError::MissingKey("ComponentName"))?;
+        .ok_or(RecipeError::MissingIdentity)?;
     let component_version = mapping_get(map, "ComponentVersion")
         .and_then(scalar_string)
-        .ok_or(RecipeError::MissingKey("ComponentVersion"))?;
+        .ok_or(RecipeError::MissingIdentity)?;
 
     Ok(ParsedRecipe {
         component_name,
@@ -1438,11 +1495,8 @@ pub fn parse_recipe(bytes: &[u8]) -> Result<ParsedRecipe, RecipeError> {
         publisher: mapping_get(map, "ComponentPublisher").and_then(scalar_string),
         platforms: recipe_platforms(map),
         format,
-        stored_recipe: normalized_recipe(map, format).ok_or_else(|| {
-            RecipeError::Unparseable(
-                "every member of a recipe must be named by a string".to_string(),
-            )
-        })?,
+        stored_recipe: normalized_recipe(map, format)
+            .ok_or(RecipeError::InvalidFormat(RecipePosition::START))?,
     })
 }
 

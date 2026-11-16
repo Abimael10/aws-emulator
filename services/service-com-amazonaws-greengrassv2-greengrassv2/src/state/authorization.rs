@@ -156,6 +156,19 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     Ok(())
 }
 
+/// The ARN of the principal this request speaks for, as `sts:GetCallerIdentity` reports it
+/// — the same spelling a refusal taken here names.
+///
+/// For a refusal this service words itself that names the caller: the principal is resolved
+/// in exactly one place, so the ARN a handler reports and the ARN the gate above blames
+/// cannot differ.
+pub fn caller_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).arn
+}
+
 /// The refusal IAM states an authorization failure with: who was refused, which action, on
 /// which resource, and which of IAM's two rules refused it. Every value in it comes from
 /// the request and from the stored policies — the principal from the credential the request

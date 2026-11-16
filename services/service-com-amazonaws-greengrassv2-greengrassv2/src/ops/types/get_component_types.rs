@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-greengrassv2-greengrassv2.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.greengrassv2#GetComponentRequest")]
+// `skip_validation = ["arn"]`: the same member, the same pattern and the same reason as
+// `DescribeComponentInput` — `ComponentVersionARN`'s `@pattern` is judged by the handler,
+// which answers this service's own invalid-ARN sentence
+// (`crate::state::component_arns`). `recipeOutputFormat` keeps its own constraints.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.greengrassv2#GetComponentRequest",
+    skip_validation = ["arn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetComponentInput {
     pub recipe_output_format: Option<String>,
