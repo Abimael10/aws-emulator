@@ -23,6 +23,10 @@ mod appconfig_refused_create_exception;
 mod appconfig_resource_types;
 #[path = "all/apigateway_account_resource.rs"]
 mod apigateway_account_resource;
+// The usage plan, the api key and the association a template declares — including the ones it
+// leaves unnamed, which CloudFormation names itself.
+#[path = "all/apigateway_metering_resources.rs"]
+mod apigateway_metering_resources;
 // What a resource Amazon API Gateway refused reports on its `CREATE_FAILED` event: that
 // service's own sentence plus its SDK's diagnostic of the refused call.
 #[path = "all/apigateway_refused_resource_sdk_diagnostic.rs"]

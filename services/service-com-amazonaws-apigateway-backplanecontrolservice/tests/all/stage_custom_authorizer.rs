@@ -83,7 +83,8 @@ const UNAUTHORIZED: (u16, &str) = (401, r#"{"message":"Unauthorized"}"#);
 const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":"Internal server error"}"#);
 
 /// The sentence a call the returned policy explicitly DENIES is refused with.
-const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit deny";
+const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \
+                             deny in an identity-based policy";
 
 /// The sentence a call no statement of the returned policy allows is refused with.
 const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";

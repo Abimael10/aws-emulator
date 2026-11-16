@@ -119,6 +119,13 @@ async fn create_request_validator(
             request.insert((*member).to_string(), member_value(property, value)?);
         }
     }
+    // A validator the declaration did not name is created under the name CloudFormation
+    // generated for it ([`super::created_name`]), which is the name that service then reports
+    // for it — never a validator with no name at all.
+    request.insert(
+        "name".to_string(),
+        Value::String(created_name(resource, NAME, every_character)?),
+    );
     let answered = call_rest_json(
         ctx,
         API_GATEWAY_SIGNING_NAME,
@@ -193,9 +200,11 @@ const MODEL_MEMBERS: &[(&str, &str)] = &[
 /// evidence of a change nobody made.
 const MODEL_REPORTED: &[(&str, &str)] = MODEL_MEMBERS;
 
-/// The members `CreateModel` declares `@required`: "the name of the model" and "the content
-/// type for the model", neither of which anything but the declaration can supply.
-const MODEL_REQUIRED: &[(&str, &str)] = &[(NAME, "name"), (MODEL_CONTENT_TYPE, "contentType")];
+/// The member `CreateModel` declares `@required` that only the DECLARATION can supply: "the
+/// content type for the model". Its `name` is required of that call too, and a declaration
+/// stating none is created under the name CloudFormation generated for it ([`model_name`]), so
+/// there is nothing to refuse about it.
+const MODEL_REQUIRED: &[(&str, &str)] = &[(MODEL_CONTENT_TYPE, "contentType")];
 
 /// Create the model an `AWS::ApiGateway::Model` declares on the api it names, so a client that
 /// deployed the stack reads it back through `GetModel` — and so a method mapping its content
@@ -210,16 +219,14 @@ async fn create_model(
     resource: &StoredResource,
 ) -> Result<Created, Refusal> {
     refuse_unpublished(resource, MODEL_PROPERTIES)?;
-    let name = model_name(resource);
+    let name = model_name(resource)?;
     let mut request = Map::new();
     for (property, member) in MODEL_MEMBERS {
         if let Some(value) = stated(resource, property) {
             request.insert((*member).to_string(), member_value(property, value)?);
         }
     }
-    if !name.is_empty() {
-        request.insert("name".to_string(), Value::String(name.clone()));
-    }
+    request.insert("name".to_string(), Value::String(name.clone()));
     if let Some(schema) = stated(resource, MODEL_SCHEMA) {
         request.insert("schema".to_string(), Value::String(model_schema(schema)));
     }
@@ -241,23 +248,14 @@ async fn create_model(
 
 /// The name the model is created under, which is also its identity.
 ///
-/// The declaration's own `Name` where it states one. Where it states none, CloudFormation
-/// names the model itself — and `CreateModel$name` "must be alphanumeric", so the generated
-/// identifier contributes only the alphanumerics it is built from: a name carrying the
-/// separators of a generated id is one that service refuses, which would fail a stack
-/// CloudFormation deploys.
-fn model_name(resource: &StoredResource) -> String {
-    if let Some(declared) = stated(resource, NAME)
-        .map(attribute_text)
-        .filter(|name| !name.is_empty())
-    {
-        return declared;
-    }
-    resource
-        .physical_resource_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect()
+/// The declaration's own `Name` where it states one, and otherwise the name CloudFormation
+/// generated for it ([`super::created_name`]) — reduced to the alphabet the call admits, since
+/// `CreateModel$name` "must be alphanumeric" and a name carrying the separators of a generated
+/// identifier is one that service refuses, which would fail a stack CloudFormation deploys.
+fn model_name(resource: &StoredResource) -> Result<String, Refusal> {
+    created_name(resource, NAME, |character| {
+        character.is_ascii_alphanumeric()
+    })
 }
 
 /// One declared `Schema` as the text `CreateModel` takes it as.
@@ -477,7 +475,7 @@ mod tests {
         ];
         for (case, physical, properties, expected) in cases {
             let resource = declared(APIGATEWAY_MODEL, physical, properties.clone());
-            let name = model_name(&resource);
+            let name = model_name(&resource).expect("a model that can be named");
             assert_eq!(
                 name, *expected,
                 "case {case:?}: expected the model name {expected:?}, got {name:?}"

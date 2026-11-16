@@ -79,6 +79,12 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
 /// rather than travelling in its body.
 const USAGE_PLAN_ID: &str = "UsagePlanId";
 
+/// The property an api key states its own name in, which is `CreateApiKey`'s `name` member.
+/// The type publishes it as OPTIONAL — "if you don't specify a name, CloudFormation generates
+/// a unique physical ID and uses that ID for the API key name" — so a declaration stating none
+/// is created under the name CloudFormation generated ([`super::created_name`]).
+const API_KEY_NAME: &str = "Name";
+
 /// The collection every API key of the account lives in, which is what `CreateApiKey` is
 /// bound to.
 const API_KEYS_URI: &str = "/apikeys";
@@ -119,7 +125,7 @@ const API_KEY_PROPERTIES: &[&str] = &[
     "Description",
     "Enabled",
     "GenerateDistinctId",
-    "Name",
+    API_KEY_NAME,
     "StageKeys",
     "Tags",
     "Value",
@@ -133,7 +139,7 @@ const API_KEY_MEMBERS: &[(&str, &str)] = &[
     ("Description", "description"),
     ("Enabled", "enabled"),
     ("GenerateDistinctId", "generateDistinctId"),
-    ("Name", "name"),
+    (API_KEY_NAME, "name"),
     ("StageKeys", "stageKeys"),
     ("Value", "value"),
 ];
@@ -150,7 +156,7 @@ const API_KEY_REPORTED: &[(&str, &str)] = &[
     ("CustomerId", "customerId"),
     ("Description", "description"),
     ("Enabled", "enabled"),
-    ("Name", "name"),
+    (API_KEY_NAME, "name"),
 ];
 
 /// Create the key an `AWS::ApiGateway::ApiKey` declares, so a client that deployed the stack
@@ -174,6 +180,12 @@ async fn create_api_key(
             request.insert((*member).to_string(), member_value(property, value)?);
         }
     }
+    // A key the declaration did not name is created under the name CloudFormation generated
+    // for it, which is the name that service then reports for the key.
+    request.insert(
+        "name".to_string(),
+        Value::String(created_name(resource, API_KEY_NAME, every_character)?),
+    );
     let tags = gateway_tags(&resource.properties, propagated);
     if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
@@ -244,6 +256,10 @@ const AUTHORIZER_REPORTED: &[(&str, &str)] = AUTHORIZER_MEMBERS;
 
 /// The members `CreateAuthorizer` declares `@required`: "the authorizer's name" and "the
 /// authorizer type", neither of which anything but the declaration can supply.
+///
+/// Both are REQUIRED of this type too, so a declaration stating neither is refused rather than
+/// named by CloudFormation — unlike a key's or a plan's name, which the type publishes as
+/// optional and which [`super::created_name`] therefore generates.
 const AUTHORIZER_REQUIRED: &[(&str, &str)] = &[("Name", "name"), ("Type", "type")];
 
 /// Create the authorizer an `AWS::ApiGateway::Authorizer` declares on the api it names, so a
@@ -324,6 +340,9 @@ const USAGE_PLAN_API_STAGES: &str = "ApiStages";
 /// The property carrying the plan's name, which `CreateUsagePlan` takes as its `@required`
 /// `name` — the one member of these types that is not the property with a lower-cased
 /// initial.
+///
+/// The type publishes it as OPTIONAL, so a declaration stating none is created under the name
+/// CloudFormation generated for it ([`super::created_name`]).
 const USAGE_PLAN_NAME: &str = "UsagePlanName";
 
 /// The properties that ARE `CreateUsagePlan`'s own body members, as `(property, member)`
@@ -356,9 +375,6 @@ const API_STAGE_MEMBERS: &[(&str, &str)] = &[("ApiId", "apiId"), ("Stage", "stag
 /// written and only the `ThrottleSettings` behind it is re-cased.
 const API_STAGE_THROTTLE: &str = "Throttle";
 
-/// The one member `CreateUsagePlan` declares `@required`: the plan's name.
-const USAGE_PLAN_REQUIRED: &[(&str, &str)] = &[(USAGE_PLAN_NAME, "name")];
-
 /// Create the plan an `AWS::ApiGateway::UsagePlan` declares, so a client that deployed the
 /// stack reads it back through `GetUsagePlan` — and so the throttle and quota it declared
 /// are the ones API Gateway meters a key's calls against — rather than a plan that exists
@@ -386,9 +402,13 @@ async fn create_usage_plan(
             api_stages(&resource.resource_type, declared)?,
         );
     }
-    // `CreateUsagePlanRequest$name` is required, and a plan has nowhere else to take its
-    // name from.
-    refuse_missing(resource, &request, USAGE_PLAN_REQUIRED)?;
+    // `CreateUsagePlanRequest$name` is required while the type publishes `UsagePlanName` as
+    // optional, so a plan the declaration did not name is created under the name
+    // CloudFormation generated for it ([`super::created_name`]) rather than refused.
+    request.insert(
+        "name".to_string(),
+        Value::String(created_name(resource, USAGE_PLAN_NAME, every_character)?),
+    );
     let tags = gateway_tags(&resource.properties, propagated);
     if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
@@ -808,12 +828,6 @@ mod tests {
                 "AWS::ApiGateway::Authorizer",
                 AUTHORIZER_REQUIRED,
                 json!({ "name": "auth" }),
-            ),
-            (
-                "a plan stating no name",
-                "AWS::ApiGateway::UsagePlan",
-                USAGE_PLAN_REQUIRED,
-                json!({ "description": "a plan with no name" }),
             ),
         ];
         for (case, resource_type, members, request) in &rows {

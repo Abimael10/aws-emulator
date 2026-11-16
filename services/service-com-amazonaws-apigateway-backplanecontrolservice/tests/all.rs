@@ -28,6 +28,11 @@ mod deployment_mints_the_missing_stage;
 mod stage_lambda_proxy_integration;
 #[path = "all/stage_custom_authorizer.rs"]
 mod stage_custom_authorizer;
+// Declared here, at the head, for the reason the entry at the top of this file records: the
+// SENTENCE the data plane refuses a custom-authorized call with, over every shape of explicit
+// Deny a returned policy can carry, spans API Gateway and AWS Lambda at once.
+#[path = "all/stage_authorizer_deny_sentence.rs"]
+mod stage_authorizer_deny_sentence;
 #[path = "all/passed_through_integration.rs"]
 mod passed_through_integration;
 #[path = "all/stage_cors_preflight.rs"]

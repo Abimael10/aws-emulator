@@ -68,7 +68,8 @@ const OK_BODY: &str = r#"{"message":"ok"}"#;
 
 /// The sentence a call the returned policy explicitly DENIES is refused with, and the status
 /// API Gateway refuses it at.
-const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit deny";
+const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \
+                             deny in an identity-based policy";
 const DENIED_STATUS: u16 = 403;
 
 /// The status and the fixed generic body API Gateway answers when the authorizer cannot be

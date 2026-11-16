@@ -474,7 +474,7 @@ const REST_API_PROPERTIES: &[&str] = &[
     FAIL_ON_WARNINGS.0,
     "MinimumCompressionSize",
     REST_API_MODE,
-    "Name",
+    REST_API_NAME,
     "Parameters",
     "Policy",
     "Tags",
@@ -482,6 +482,12 @@ const REST_API_PROPERTIES: &[&str] = &[
 
 /// The property carrying the OpenAPI definition the api is IMPORTED from, inline.
 const REST_API_BODY: &str = "Body";
+
+/// The property carrying the api's own name, which is `CreateRestApi`'s `@required` `name`.
+/// The type publishes it as optional because an api created from a DEFINITION takes its name
+/// from that document instead — "a name is required if the REST API is not based on an OpenAPI
+/// specification" — so a declaration carrying neither is refused rather than named here.
+const REST_API_NAME: &str = "Name";
 
 /// The property carrying that definition as an Amazon S3 OBJECT instead. The object has to
 /// be FETCHED from S3 before any api can be imported from it, which nothing here does, so a
@@ -513,7 +519,7 @@ const REST_API_MEMBERS: &[(&str, &str)] = &[
     ("DisableExecuteApiEndpoint", "disableExecuteApiEndpoint"),
     ("EndpointConfiguration", "endpointConfiguration"),
     ("MinimumCompressionSize", "minimumCompressionSize"),
-    ("Name", "name"),
+    (REST_API_NAME, "name"),
 ];
 
 /// The property whose member takes the TEXT of a document a template declares as an object:
@@ -592,12 +598,15 @@ async fn create_rest_api(
     if !request.contains_key("name") {
         // `CreateRestApi$name` is required, and an api that is not created from a definition
         // has nowhere else to take its name from — a declaration stating none asks for an api
-        // that call will not make.
+        // that call will not make. The type publishes the property as optional only because a
+        // definition-based api takes its name from that document ("A name is required if the
+        // REST API is not based on an OpenAPI specification"), so this is NOT one of the names
+        // CloudFormation generates for a declaration that states none ([`created_name`]).
         return Err(Refusal {
             code: MISSING_PROPERTY.to_string(),
             message: format!(
-                "{APIGATEWAY_REST_API} requires the Name property when it declares no \
-                 {REST_API_BODY}"
+                "{APIGATEWAY_REST_API} requires the {REST_API_NAME} property when it declares \
+                 no {REST_API_BODY}"
             ),
         });
     }
@@ -1589,6 +1598,69 @@ fn required(resource: &StoredResource, property: &str) -> Result<String, Refusal
     }
 }
 
+/// The name one of these resources is CREATED under: the name its declaration states in
+/// `property`, and otherwise the name CloudFormation generated for it.
+///
+/// A template may leave out the name of every type whose own contract publishes that property
+/// as OPTIONAL — the name is required of the owning API and not of the template, and a
+/// declaration that names the resource nowhere is given "a unique physical ID" that is "used
+/// for the resource name" (`<stack name>-<logical id>-<unique id>`, which
+/// [`crate::state::template::physical_name`] builds and the record carries as its `Name`). So a
+/// create that cannot be made without a name is made with THAT name rather than refused, and
+/// the resource API Gateway holds carries the name the stack reports for it.
+///
+/// Read off the record's `Name` rather than its physical id, because for one of these types
+/// that id is the identity API Gateway MINTS and not a name any create could be made with; the
+/// physical id stands in only where the attribute is not there at all (a record whose attribute
+/// budget was spent), and for a name-identified type it IS that name.
+///
+/// `admits` is the alphabet the create's own name member accepts: a GENERATED name is reduced
+/// to it, because a name that service would refuse could not be provisioned at all. A name the
+/// DECLARATION states is the caller's and travels exactly as written, refusal included.
+///
+/// The ONE reading of a name for both of this module's children, so the key, the plan, the
+/// validator and the model cannot take their names from different places. It is called by the
+/// arms whose type publishes that property as optional with no condition attached; a type that
+/// REQUIRES the name (an authorizer, a VPC link), or requires it unless the declaration carries
+/// something else to take it from (an api named by its OpenAPI definition), is refused by its
+/// own arm instead. A record with no name at all has none any create could be made with, which
+/// is the refusal naming the PROPERTY ([`missing_property`]).
+fn created_name(
+    resource: &StoredResource,
+    property: &str,
+    admits: fn(char) -> bool,
+) -> Result<String, Refusal> {
+    if let Some(declared) = stated(resource, property)
+        .map(attribute_text)
+        .filter(|name| !name.is_empty())
+    {
+        return Ok(declared);
+    }
+    let generated: String = resource
+        .attributes
+        .get(GENERATED_NAME_ATTRIBUTE)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&resource.physical_resource_id)
+        .chars()
+        .filter(|character| admits(*character))
+        .collect();
+    if generated.is_empty() {
+        return Err(missing_property(resource, property));
+    }
+    Ok(generated)
+}
+
+/// The attribute every resource record carries the name CloudFormation decided for it under:
+/// the name the declaration asked for, or the generated one
+/// ([`crate::state::template::provision`] attaches it to every resource it provisions).
+const GENERATED_NAME_ATTRIBUTE: &str = "Name";
+
+/// The alphabet of a name member whose own contract publishes no restriction on it: every
+/// character a generated name is built from.
+fn every_character(_: char) -> bool {
+    true
+}
+
 /// The refusal for a declaration that states none of a property a call here cannot be made
 /// without, naming the PROPERTY rather than relaying the request for API Gateway to refuse by
 /// its own member name.
@@ -1742,6 +1814,133 @@ mod tests {
             deletion_policy: None,
             update_replace_policy: None,
         }
+    }
+
+    /// One row of [`a_resource_the_declaration_does_not_name_takes_the_generated_name`]: the
+    /// case, the type declared, the record's physical id and its `Name` attribute, the property
+    /// the type states its name in, the declaration's properties, the alphabet the create's own
+    /// name member admits, and the name the resource must be created under.
+    type NameRow = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        Value,
+        fn(char) -> bool,
+        &'static str,
+    );
+
+    /// The property an `AWS::ApiGateway::UsagePlan` states its name in, as the child module
+    /// that places it spells it ([`access_control`]).
+    const USAGE_PLAN_NAME_PROPERTY: &str = "UsagePlanName";
+
+    /// RULE: a resource whose type publishes its name property as optional is created under the
+    /// name its declaration states, and — where it states none — under the name CloudFormation
+    /// generated for it, never refused for want of a name the template may leave out.
+    #[test]
+    fn a_resource_the_declaration_does_not_name_takes_the_generated_name() {
+        let alphanumeric: fn(char) -> bool = |character| character.is_ascii_alphanumeric();
+        // Rows differ along WHICH property the type states its name in, whether the declaration
+        // states one at all, where the generated name is read from, and the alphabet the owning
+        // call's own name member admits. `physical`/`generated` are the record's physical id and
+        // its `Name` attribute, which is where the naming rules record what they decided.
+        let rows: Vec<NameRow> = vec![
+            (
+                "a plan whose declaration names it",
+                crate::state::template::APIGATEWAY_USAGE_PLAN,
+                "up12345678",
+                "orders-UsagePlan-7qf3x1",
+                USAGE_PLAN_NAME_PROPERTY,
+                json!({ "UsagePlanName": "orders" }),
+                every_character,
+                "orders",
+            ),
+            (
+                "a plan whose declaration names it nowhere, beside a minted physical id",
+                crate::state::template::APIGATEWAY_USAGE_PLAN,
+                "up12345678",
+                "orders-UsagePlan-7qf3x1",
+                USAGE_PLAN_NAME_PROPERTY,
+                json!({ "Description": "an unnamed plan" }),
+                every_character,
+                "orders-UsagePlan-7qf3x1",
+            ),
+            (
+                "a key whose declaration names it nowhere",
+                crate::state::template::APIGATEWAY_API_KEY,
+                "k1234abcde",
+                "orders-TestApiKey-7qf3x1",
+                "Name",
+                json!({ "Enabled": true }),
+                every_character,
+                "orders-TestApiKey-7qf3x1",
+            ),
+            (
+                "a name property declared empty, which names the resource nowhere",
+                crate::state::template::APIGATEWAY_API_KEY,
+                "k1234abcde",
+                "orders-TestApiKey-7qf3x1",
+                "Name",
+                json!({ "Name": "" }),
+                every_character,
+                "orders-TestApiKey-7qf3x1",
+            ),
+            (
+                "a validator, whose physical id stands in where no attribute recorded the name",
+                crate::state::template::APIGATEWAY_REQUEST_VALIDATOR,
+                "orders-Validator-7qf3x1",
+                "",
+                "Name",
+                json!({ "RestApiId": "a1b2c3d4e5" }),
+                every_character,
+                "orders-Validator-7qf3x1",
+            ),
+            (
+                "a generated name held to an alphanumeric-only name member",
+                crate::state::template::APIGATEWAY_MODEL,
+                "orders-Model-7qf3x1",
+                "orders-Model-7qf3x1",
+                "Name",
+                json!({ "RestApiId": "a1b2c3d4e5" }),
+                alphanumeric,
+                "ordersModel7qf3x1",
+            ),
+        ];
+        for (case, resource_type, physical, generated, property, properties, admits, expected) in
+            &rows
+        {
+            let mut resource = declared(resource_type, physical, properties.clone());
+            if !generated.is_empty() {
+                resource.attributes.insert(
+                    GENERATED_NAME_ATTRIBUTE.to_string(),
+                    (*generated).to_string(),
+                );
+            }
+            let name =
+                created_name(&resource, property, *admits).expect("a resource that can be named");
+            assert_eq!(
+                name, *expected,
+                "case {case:?}: expected the name {expected:?}, got {name:?}"
+            );
+        }
+    }
+
+    /// A record carrying neither a declared name nor a computed one cannot be named at all,
+    /// which is the refusal naming the property rather than a create made with an empty name.
+    #[test]
+    fn a_record_with_no_name_at_all_is_refused() {
+        let resource = declared(
+            crate::state::template::APIGATEWAY_USAGE_PLAN,
+            "",
+            json!({}),
+        );
+        let refused = created_name(&resource, USAGE_PLAN_NAME_PROPERTY, every_character);
+        assert!(
+            refused.is_err(),
+            "case \"no declared name and no computed one\": expected a refusal naming \
+             {USAGE_PLAN_NAME_PROPERTY:?}, got {refused:?}"
+        );
     }
 
     /// Every member one of these arms sends is a published property of its type, and every

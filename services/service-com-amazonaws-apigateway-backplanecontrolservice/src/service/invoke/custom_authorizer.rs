@@ -187,8 +187,14 @@ pub(super) enum Judged {
 }
 
 /// The sentence a call an authorizer's policy explicitly DENIES is refused with.
+///
+/// IAM's own published sentence for that outcome, whole: the decision rested on a `Deny`
+/// statement of the document the authorizer returned, which is an identity-based policy, and
+/// the clause naming it is what tells this refusal from the one a document that merely fails
+/// to allow the invoke earns ([`NOT_AUTHORIZED_MESSAGE`]). Every word of it is fixed text.
 const EXPLICIT_DENY_MESSAGE: &str =
-    "User is not authorized to access this resource with an explicit deny";
+    "User is not authorized to access this resource with an explicit deny in an identity-based \
+     policy";
 
 /// The sentence a call no statement of the authorizer's policy allows is refused with.
 ///

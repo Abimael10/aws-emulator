@@ -90,7 +90,8 @@ const LOOK: Duration = Duration::from_millis(50);
 const BACKEND_MARKER: &str = "BACKEND-INVOKED";
 
 /// The sentence a call the returned policy explicitly DENIES is refused with.
-const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit deny";
+const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \
+                             deny in an identity-based policy";
 
 /// The sentence a call no statement of the returned policy allows is refused with.
 const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";
