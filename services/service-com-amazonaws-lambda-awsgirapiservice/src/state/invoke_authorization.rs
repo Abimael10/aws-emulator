@@ -590,6 +590,13 @@ pub(crate) fn caller<Eng: Send + Sync + 'static>(
             .map(|held| held.arn.clone())
         {
             caller.read_policies_of(&store, &role_arn);
+            // A statement's `Principal` element names a ROLE by that same ARN, and such a
+            // statement covers every session of the role ("the principals in the policy
+            // include the role"), so the session is named by both spellings and both travel
+            // with the request — which is what a resource-based grant is matched against.
+            if !caller.principals.contains(&role_arn) {
+                caller.principals.push(role_arn);
+            }
         }
     } else if ::service_common::iam_role::user_name(&caller.arn).is_some() {
         // An IAM user's permissions are its own, under the ARN it was resolved by.

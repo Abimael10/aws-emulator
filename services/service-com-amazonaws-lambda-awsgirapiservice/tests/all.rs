@@ -459,6 +459,8 @@ mod invoke_authorization_ceiling;
 mod invoke_identity_authorization;
 #[path = "all/invoke_resource_policy_denial.rs"]
 mod invoke_resource_policy_denial;
+#[path = "all/invoke_resource_policy_grant_forms.rs"]
+mod invoke_resource_policy_grant_forms;
 #[path = "all/kinesis_event_source_delivery.rs"]
 mod kinesis_event_source_delivery;
 #[path = "all/kinesis_event_source_handler_run.rs"]
