@@ -47,6 +47,8 @@ mod command_listing;
 mod command_registry;
 #[path = "all/custom_authorizer_invocation.rs"]
 mod custom_authorizer_invocation;
+#[path = "all/default_authorizer_election.rs"]
+mod default_authorizer_election;
 #[path = "all/describe_endpoint.rs"]
 mod describe_endpoint;
 #[path = "all/device_certificate_issuance.rs"]

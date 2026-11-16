@@ -825,6 +825,22 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_AUTHORIZERS`] is the ceiling
     /// `CreateAuthorizer` refuses past.
     pub authorizers: BTreeMap<String, RegisteredAuthorizer>,
+    /// The authorizer the account's DEFAULT AUTHORIZER is set to, by name — the one a
+    /// connection that names no authorizer is authorized by.
+    ///
+    /// One name, not a map, because none of `SetDefaultAuthorizer` /
+    /// `DescribeDefaultAuthorizer` / `ClearDefaultAuthorizer` names a resource: the
+    /// account holds one default at a time. It is an `Option` and not a plain field,
+    /// unlike [`ComAmazonawsIotAwsiotserviceState::indexing_configuration`], because an
+    /// account that has elected none HAS none — the state the reader refuses with the
+    /// modelled `ResourceNotFoundException` instead of describing an authorizer nobody
+    /// elected.
+    ///
+    /// The NAME is recorded and the record resolved against
+    /// [`ComAmazonawsIotAwsiotserviceState::authorizers`] on every read (see
+    /// [`default_authorizer`]), so the default's description is the elected authorizer's
+    /// own and the two cannot drift.
+    pub default_authorizer_name: Option<String>,
     /// Every command that exists, keyed by `commandId`.
     ///
     /// The id is the command's identity — `CreateCommand$commandId` is "A unique
@@ -3335,6 +3351,16 @@ pub use streams::{
 pub mod authorizers;
 pub use authorizers::{
     existing_authorizer_message, undeletable_authorizer_message, INACTIVE_AUTHORIZER_STATUS,
+};
+
+// WHICH authorizer the account has elected as its DEFAULT — the single-valued attachment
+// `SetDefaultAuthorizer` writes, `DescribeDefaultAuthorizer` reads and
+// `ClearDefaultAuthorizer` removes, and the sentences each refusal of it is worded with —
+// lives in `state/default_authorizer.rs`, beside the authorizer records it elects from.
+pub mod default_authorizer;
+pub use default_authorizer::{
+    default_authorizer_deletion_message, duplicate_default_authorizer_message,
+    DefaultAuthorizerRefusal, MISSING_DEFAULT_AUTHORIZER_MESSAGE,
 };
 
 // The VERSIONS of an IoT policy — how one is added, how many a policy holds, and what a

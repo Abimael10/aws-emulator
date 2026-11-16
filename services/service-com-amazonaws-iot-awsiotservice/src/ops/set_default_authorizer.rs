@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetDefaultAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetDefaultAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetDefaultAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Elects one of this account's custom authorizers as its DEFAULT — "this will be used if
+//! a websocket connection is made without specifying an authorizer" — by recording that
+//! authorizer's name in
+//! [`crate::state::ComAmazonawsIotAwsiotserviceState::default_authorizer_name`], and
+//! reports the elected record's name and the ARN its create minted;
+//! `DescribeDefaultAuthorizer` reads the election back and `ClearDefaultAuthorizer`
+//! removes it.
+//!
+//! The default is an attachment to a record and single-valued, so a name the account holds
+//! no authorizer under is refused `ResourceNotFoundException` (404) and the election of the
+//! authorizer that already holds the default is refused `ResourceAlreadyExistsException`
+//! (409); neither records anything, while electing a different authorizer replaces the
+//! election in force. See [`crate::state::default_authorizer`] for the rule and its
+//! wording.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +156,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetDefaultAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetDefaultAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetDefaultAuthorizer"))
+        // `ctx` carries request metadata only; the election is of a record whose ARN was
+        // minted in the region of the call that CREATED it, so this operation reports what
+        // was stored rather than re-minting it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetDefaultAuthorizerErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The default authorizer is an attachment of the ACCOUNT to one authorizer record,
+        // so the election resolves the name against the authorizer store — a name it holds
+        // nothing under is the modelled `ResourceNotFoundException` (HTTP 404), worded by
+        // the authorizer family — and the election of the authorizer that ALREADY holds the
+        // default is the modelled `ResourceAlreadyExistsException` (HTTP 409), naming that
+        // record and its ARN; electing another authorizer replaces the election in force,
+        // because the account's default is single-valued.
+        let authorizer = store
+            .set_default_authorizer(&input.authorizer_name)
+            .map_err(|refusal| match refusal {
+                crate::state::DefaultAuthorizerRefusal::MissingAuthorizer => {
+                    SetDefaultAuthorizerErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::missing_authorizer_message(
+                                &input.authorizer_name,
+                            )),
+                        },
+                    )
+                }
+                crate::state::DefaultAuthorizerRefusal::AlreadyDefault {
+                    authorizer_name,
+                    authorizer_arn,
+                } => SetDefaultAuthorizerErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::duplicate_default_authorizer_message(
+                            &authorizer_name,
+                        )),
+                        resource_id: Some(authorizer_name),
+                        resource_arn: Some(authorizer_arn),
+                    },
+                ),
+            })?;
+
+        // The response is the ELECTED record's own identity, so what this call reports and
+        // what the next `DescribeDefaultAuthorizer` reads are one value.
+        Ok(SetDefaultAuthorizerOutput {
+            authorizer_name: Some(authorizer.authorizer_name.clone()),
+            authorizer_arn: Some(authorizer.authorizer_arn.clone()),
+        })
     }
 }

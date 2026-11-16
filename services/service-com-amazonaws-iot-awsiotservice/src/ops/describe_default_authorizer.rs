@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDefaultAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDefaultAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDefaultAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the authorizer the account has elected as its DEFAULT
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::default_authorizer_name`]) as the
+//! same `AuthorizerDescription` `DescribeAuthorizer` reports for that record, so the
+//! election and the record cannot drift.
+//!
+//! A pure read: an account that has elected none is refused with the modelled
+//! `ResourceNotFoundException` (404) rather than a 200 describing nothing. See
+//! [`crate::state::default_authorizer`] for the rule and its wording.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +141,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDefaultAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDefaultAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDefaultAuthorizer"))
+        // `ctx` carries request metadata only; a read of the elected record needs none of
+        // it — the authorizer's ARN was minted in the region of the call that CREATED it,
+        // and a read reports what was stored rather than re-minting it. This operation
+        // takes no input members at all.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeDefaultAuthorizerErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A pure read of the account's election: the elected authorizer's record is cloned
+        // out as the modelled `AuthorizerDescription`, and an account that has elected no
+        // default is the modelled `ResourceNotFoundException` (HTTP 404) rather than a
+        // hollow 200.
+        let store = state.lock();
+        let authorizer = store.default_authorizer().ok_or_else(|| {
+            DescribeDefaultAuthorizerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        crate::state::MISSING_DEFAULT_AUTHORIZER_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        Ok(DescribeDefaultAuthorizerOutput {
+            authorizer_description: Some(authorizer.description()),
+        })
     }
 }

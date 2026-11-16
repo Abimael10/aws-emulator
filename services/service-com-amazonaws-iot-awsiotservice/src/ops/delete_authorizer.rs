@@ -176,6 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The authorizer holding the account's DEFAULT election is attached to the
+        // account, so it is not torn out from under the connections it authorizes: that
+        // delete is the modelled `DeleteConflictException` (HTTP 409), naming the record
+        // and the clear that frees it. The attachment is read ahead of the status
+        // precondition below, because an authorizer is elected while it is in service, so
+        // clearing the election is what a caller has to do first.
+        if store.is_default_authorizer(&input.authorizer_name) {
+            return Err(DeleteAuthorizerErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(crate::state::default_authorizer_deletion_message(
+                        &input.authorizer_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // An authorizer that is still in service is not torn out from under the clients
         // it authorizes: the delete of one whose persisted status is not
         // `INACTIVE` is the modelled `InvalidRequestException` (HTTP 400), naming the
