@@ -707,6 +707,14 @@ pub const MAX_TARGETS_PER_RULE: usize = 10;
 /// notification rules, notifications, resources, and targets").
 pub const MAX_TAGS_PER_RULE: usize = 50;
 
+/// How this service states that a request would take a notification rule past
+/// [`MAX_TAGS_PER_RULE`], or names more tag keys than one rule can hold: ONE text for the
+/// class, so every tagging path states the bound the same way. It interpolates the bound
+/// itself and nothing of the request.
+pub fn over_tag_limit() -> String {
+    format!("A notification rule holds at most {MAX_TAGS_PER_RULE} tags")
+}
+
 /// Turn the wire `Target` list into the rule's stored targets: every target must carry
 /// both of its members, and an address appears once (a repeated address is one
 /// subscription, with the type last given for it).

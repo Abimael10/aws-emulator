@@ -33,6 +33,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encoding for the `@httpLabel` / `@httpQuery` values a test puts on the request
+# line (an ARN's `:` and `/` have to travel escaped).
+percent-encoding = "2"
 
 [lints]
 workspace = true

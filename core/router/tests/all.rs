@@ -376,6 +376,8 @@ mod cloudformation_fifo_resource_generated_names;
 mod cloudformation_firehose_stream_direct_put_delivers;
 #[path = "all/cloudformation_firehose_stream_stabilisation.rs"]
 mod cloudformation_firehose_stream_stabilisation;
+#[path = "all/cloudformation_generated_table_name_resolves_in_dynamodb.rs"]
+mod cloudformation_generated_table_name_resolves_in_dynamodb;
 #[path = "all/cloudformation_glue_job_redeploy_across_regions.rs"]
 mod cloudformation_glue_job_redeploy_across_regions;
 #[path = "all/cloudformation_grants_acmpca_permissions.rs"]

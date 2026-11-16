@@ -130,10 +130,7 @@ fn not_found(arn: &str) -> TagResourceError {
 /// keeps for one — the bound that stops a caller growing a stored rule without limit.
 fn over_tag_limit() -> TagResourceError {
     TagResourceErrorModeled::LimitExceededException(LimitExceededException {
-        message: Some(format!(
-            "A notification rule holds at most {} tags",
-            crate::state::MAX_TAGS_PER_RULE
-        )),
+        message: Some(crate::state::over_tag_limit()),
     })
     .into()
 }

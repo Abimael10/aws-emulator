@@ -25,6 +25,8 @@ mod error_message_rules;
 mod event_type_catalog_and_next_token;
 #[path = "all/list_event_types.rs"]
 mod list_event_types;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/list_targets.rs"]
 mod list_targets;
 #[path = "all/notification_rule_lifecycle.rs"]
