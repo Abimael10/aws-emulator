@@ -225,8 +225,8 @@ pub struct StoredFilter {
     pub description: Option<String>,
     pub reason: Option<String>,
     /// The tags as sent: `None` when the request carried no `tags` member, and an empty
-    /// map when it carried an empty one, so a read renders back exactly what was stored.
-    /// Sorted so the rendering order is stable.
+    /// map when it carried an empty one. Either way a read reports the tag set as a map
+    /// ([`tag_map`]). Sorted so the rendering order is stable.
     pub tags: Option<BTreeMap<String, String>>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -256,8 +256,8 @@ pub struct StoredCisScanConfiguration {
     /// handler runs.
     pub target_resource_tags: BTreeMap<String, Vec<String>>,
     /// The tags as sent: `None` when the request carried no `tags` member, and an empty
-    /// map when it carried an empty one, so a read renders back exactly what was stored.
-    /// Sorted so the rendering order is stable.
+    /// map when it carried an empty one. Either way a read reports the tag set as a map
+    /// ([`tag_map`]). Sorted so the rendering order is stable.
     pub tags: Option<BTreeMap<String, String>>,
 }
 
@@ -275,16 +275,19 @@ pub struct StoredCodeSecurityScanConfiguration {
     pub name: String,
     /// A `ConfigurationLevel` token: `ACCOUNT` or `ORGANIZATION`.
     pub level: String,
-    /// The scan settings as sent — the rule set categories and the periodic and
-    /// continuous-integration settings — so a read renders back exactly what was stored.
+    /// The scan settings as the service stores them — the rule set categories and the
+    /// periodic and continuous-integration settings as sent, with the periodic schedule
+    /// the service picks itself filled in by
+    /// [`stored_code_security_scan_configuration`] — so a read renders back exactly the
+    /// configuration the scans run under.
     pub configuration: CodeSecurityScanConfiguration,
     /// The scope settings as sent: `None` for a general scan configuration, and present
     /// for a default one, which is the distinction the create's `scopeSettings` member
     /// draws.
     pub scope_settings: Option<ScopeSettings>,
     /// The tags as sent: `None` when the request carried no `tags` member, and an empty
-    /// map when it carried an empty one, so a read renders back exactly what was stored.
-    /// Sorted so the rendering order is stable.
+    /// map when it carried an empty one. Either way a read reports the tag set as a map
+    /// ([`tag_map`]). Sorted so the rendering order is stable.
     pub tags: Option<BTreeMap<String, String>>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -540,35 +543,81 @@ pub fn path_list(paths: &[String]) -> Option<Vec<String>> {
     (!paths.is_empty()).then(|| paths.to_vec())
 }
 
-/// Render a stored tag map for the wire: the tags as stored when the resource carries a
-/// `tags` member at all, and the member left ABSENT when it does not — so a resource
-/// created without tags and one created with an empty map render differently, which is
-/// what each of them was sent as.
+/// Render a stored resource's tag map for the wire: always PRESENT, and EMPTY when the
+/// resource holds no tags at all.
+///
+/// A resource's tag set is part of the resource, so it is reported unconditionally and the
+/// shape of a response never depends on whether tags were ever set: a resource created
+/// without a `tags` member and one created with an empty map both report an empty map, and
+/// a client that indexes or iterates the map never meets an absent member it has to branch
+/// on.
+///
+/// Source: `smithy_query(query="shape", shape="Filter,CisScanConfiguration,TagMap")` and
+/// `smithy_query(query="operation", operation="GetCodeSecurityScanConfiguration")` — every
+/// one of them reports `tags` as a `TagMap`.
 pub fn tag_map(
     tags: Option<&BTreeMap<String, String>>,
-) -> Option<::std::collections::HashMap<String, String>> {
+) -> ::std::collections::HashMap<String, String> {
     tags.map(|tags| {
         tags.iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     })
+    .unwrap_or_default()
 }
 
-/// Render a stored FILTER's tag map for the wire: always PRESENT, and empty when the
-/// filter holds no tags at all.
+/// The cron schedule expression Amazon Inspector itself picks for a periodic code security
+/// scan that was asked for by `frequency` alone, or `None` for a frequency that names no
+/// schedule at all.
 ///
-/// A filter's tag set is reported unconditionally, so the shape of a filter in a response
-/// never depends on whether tags were set: a filter created without tags and one created
-/// with an empty map both report an empty map, and a client reading the tag set
-/// unconditionally never meets an absent member. That is why this is NOT [`tag_map`],
-/// which leaves the member out for the resources that report tags only when they have
-/// them.
+/// A caller may name the frequency without naming a schedule, in which case the service
+/// chooses the day the scan runs on and the configuration it stores carries a schedule
+/// expression matching that frequency; a caller that names the expression keeps its own.
+/// The chosen day is a property of the stored configuration, not of the call, so it is the
+/// same for every configuration of one frequency and stable across reads.
 ///
-/// Source: `smithy_query(query="shape", shape="Filter")` — `tags` targets `TagMap`.
-pub fn filter_tag_map(
-    tags: Option<&BTreeMap<String, String>>,
-) -> ::std::collections::HashMap<String, String> {
-    tag_map(tags).unwrap_or_default()
+/// Source: `smithy_query(query="shape", shape="PeriodicScanConfiguration")` — the
+/// `frequency` member documents that Amazon Inspector chooses the day for the scan to run
+/// when `frequencyExpression` is not provided, and that a provided expression must match
+/// the frequency; `PeriodicScanFrequency` admits `WEEKLY`, `MONTHLY` and `NEVER`.
+pub fn chosen_frequency_expression(frequency: &str) -> Option<String> {
+    // Which day and hour the service picks is not documented, so these are this emulator's
+    // own choice — the earliest day of the span the frequency repeats over, at midnight
+    // UTC. What the model fixes, and what a caller can rely on, is that there IS a schedule
+    // and that it matches the frequency.
+    match frequency {
+        // Midnight UTC on the first day of the week, the day-of-month field left as the
+        // `?` AWS cron format requires when the day-of-week field names the day.
+        "WEEKLY" => Some("cron(0 0 ? * 1 *)".to_string()),
+        // Midnight UTC on the first day of the month, with day-of-week left as `?`.
+        "MONTHLY" => Some("cron(0 0 1 * ? *)".to_string()),
+        // `NEVER` turns periodic scanning off, so there is no schedule to express.
+        "NEVER" => None,
+        // Periodic settings that name no frequency at all run on no schedule either. The
+        // boundary validator refuses a token outside `PeriodicScanFrequency` before any
+        // handler runs, so nothing else reaches here.
+        _ => None,
+    }
+}
+
+/// One `CodeSecurityScanConfiguration` as the service STORES it: what the request carried,
+/// with the periodic schedule the service chooses itself filled in
+/// ([`chosen_frequency_expression`]) when the periodic settings name a frequency but no
+/// expression. Stored this way rather than derived on each read, so every read of the
+/// configuration — and an update that round-trips one — sees the one schedule the
+/// configuration runs on.
+pub fn stored_code_security_scan_configuration(
+    mut configuration: crate::ops::types::CodeSecurityScanConfiguration,
+) -> crate::ops::types::CodeSecurityScanConfiguration {
+    if let Some(periodic) = configuration.periodic_scan_configuration.as_mut() {
+        periodic.frequency_expression = periodic.frequency_expression.take().or_else(|| {
+            periodic
+                .frequency
+                .as_deref()
+                .and_then(chosen_frequency_expression)
+        });
+    }
+    configuration
 }
 
 /// Whether `value` is a well-formed filter ARN of this service — the SHAPE check every
@@ -877,13 +926,9 @@ impl ComAmazonawsInspector2Inspector2State {
                         .collect(),
                 ),
             }),
-            // Rendered exactly as stored: absent when the create carried no `tags`, and an
-            // empty map when it carried an empty one.
-            tags: stored.tags.as_ref().map(|tags| {
-                tags.iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            // Always reported, and empty for a configuration carrying no tags at all
+            // ([`tag_map`]).
+            tags: Some(tag_map(stored.tags.as_ref())),
         }
     }
 

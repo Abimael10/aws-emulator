@@ -6,9 +6,11 @@
 //!
 //! The rule under test: a code security scan configuration is a stored resource — the
 //! create mints its `ScanConfigurationArn` and records the name, level, scan configuration,
-//! scope settings and tags it was sent; the get reports exactly that record plus the
-//! instants it was created and last updated at; and the delete removes the record, so a
-//! later get or delete of the same ARN is refused as a missing resource.
+//! scope settings and tags it was sent; the get reports exactly that record (with the tag
+//! set as a map and the periodic schedule the service chose, both covered by
+//! `code_security_periodic_schedule`) plus the instants it was created and last updated at;
+//! and the delete removes the record, so a later get or delete of the same ARN is refused
+//! as a missing resource.
 //!
 //! Every request goes through the real `MultiServiceRouter` — routing, restJson1
 //! deserialization, modelled-constraint validation, the handler, and restJson1
@@ -107,6 +109,10 @@ struct Row {
     level: &'static str,
     /// The `CodeSecurityScanConfiguration` as sent.
     configuration: Value,
+    /// The `PeriodicScanFrequency` a schedule expression is owed for — set for a row whose
+    /// periodic settings name a frequency without one, so the service chooses the schedule
+    /// itself (see `code_security_periodic_schedule`).
+    chosen_schedule_for: Option<&'static str>,
     /// The `ScopeSettings` as sent, absent for a general scan configuration.
     scope_settings: Option<Value>,
     tags: Option<Value>,
@@ -131,6 +137,7 @@ fn rows() -> Vec<Row> {
             name: "a".to_string(),
             level: "ACCOUNT",
             configuration: json!({ "ruleSetCategories": ["SAST"] }),
+            chosen_schedule_for: None,
             scope_settings: None,
             tags: None,
         },
@@ -143,6 +150,9 @@ fn rows() -> Vec<Row> {
                 "ruleSetCategories": ["SAST", "IAC", "SCA"],
                 "periodicScanConfiguration": { "frequency": "WEEKLY" },
             }),
+            // The create named the frequency and no expression, so the service chooses the
+            // weekly schedule itself.
+            chosen_schedule_for: Some("WEEKLY"),
             scope_settings: Some(json!({ "projectSelectionScope": "ALL" })),
             tags: Some(json!({ "owner": "security-team", "costCenter": "4711" })),
         },
@@ -155,12 +165,14 @@ fn rows() -> Vec<Row> {
                 "ruleSetCategories": ["IAC", "SCA"],
                 "periodicScanConfiguration": {
                     "frequency": "MONTHLY",
-                    "frequencyExpression": "cron(0 0 1 * ? *)",
+                    "frequencyExpression": "cron(0 0 15 * ? *)",
                 },
                 "continuousIntegrationScanConfiguration": {
                     "supportedEvents": ["PULL_REQUEST"],
                 },
             }),
+            // The create named its own schedule, so that is the one stored.
+            chosen_schedule_for: None,
             scope_settings: None,
             tags: Some(json!({})),
         },
@@ -177,6 +189,8 @@ fn rows() -> Vec<Row> {
                     "supportedEvents": ["PULL_REQUEST", "PUSH"],
                 },
             }),
+            // `NEVER` names no schedule, so there is no expression to choose.
+            chosen_schedule_for: None,
             scope_settings: Some(json!({ "projectSelectionScope": "ALL" })),
             tags: Some(json!({ "purpose": "code-security" })),
         },
@@ -189,6 +203,7 @@ fn rows() -> Vec<Row> {
                 "ruleSetCategories": ["SAST", "SCA"],
                 "continuousIntegrationScanConfiguration": { "supportedEvents": ["PUSH"] },
             }),
+            chosen_schedule_for: None,
             scope_settings: None,
             tags: None,
         },
@@ -256,8 +271,26 @@ async fn a_created_configuration_is_read_back_as_stored_and_gone_after_delete() 
             json!(row.level),
             "case {case:?}: expected the level as sent, got {read}"
         );
+        // The configuration as sent, with the schedule the service chose for a row that
+        // named a frequency without one taken out — that schedule is asserted against its
+        // own rule, not against a value this test carries.
+        let mut reported = read["configuration"].clone();
+        if let Some(frequency) = row.chosen_schedule_for {
+            let periodic = reported["periodicScanConfiguration"]
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("case {case:?}: no periodicScanConfiguration in {read}"));
+            let expression = periodic
+                .remove("frequencyExpression")
+                .unwrap_or(Value::Null);
+            let expression = expression.as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: expected a chosen frequencyExpression in {read}")
+            });
+            crate::code_security_periodic_schedule::assert_schedule_matches(
+                case, frequency, expression,
+            );
+        }
         assert_eq!(
-            read["configuration"], row.configuration,
+            reported, row.configuration,
             "case {case:?}: expected the configuration as sent, got {read}"
         );
         match &row.scope_settings {
@@ -272,19 +305,13 @@ async fn a_created_configuration_is_read_back_as_stored_and_gone_after_delete() 
                 "case {case:?}: expected the scope settings as sent, got {read}"
             ),
         }
-        match &row.tags {
-            // Absent when the create carried no `tags`, and the map it carried otherwise —
-            // an empty one included.
-            None => assert_eq!(
-                read["tags"],
-                Value::Null,
-                "case {case:?}: expected no tags member, got {read}"
-            ),
-            Some(tags) => assert_eq!(
-                read["tags"], *tags,
-                "case {case:?}: expected the tags as sent, got {read}"
-            ),
-        }
+        // The tag map is always reported: the map the create carried, and an empty one for
+        // a create that carried no `tags` member at all.
+        let expected_tags = row.tags.clone().unwrap_or_else(|| json!({}));
+        assert_eq!(
+            read["tags"], expected_tags,
+            "case {case:?}: expected tags {expected_tags}, got {read}"
+        );
         let created_at = read["createdAt"]
             .as_f64()
             .unwrap_or_else(|| panic!("case {case:?}: no createdAt timestamp in {read}"));

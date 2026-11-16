@@ -286,19 +286,13 @@ async fn a_created_configuration_is_listed_as_stored_and_gone_after_delete() {
             configuration["targets"]["targetResourceTags"], row.target_resource_tags,
             "case {case:?}: expected the target resource tags as sent, got {configuration}"
         );
-        match &row.tags {
-            // Absent when the create carried no `tags`, and the map it carried otherwise —
-            // an empty one included.
-            None => assert_eq!(
-                configuration["tags"],
-                Value::Null,
-                "case {case:?}: expected no tags member, got {configuration}"
-            ),
-            Some(tags) => assert_eq!(
-                configuration["tags"], *tags,
-                "case {case:?}: expected the tags as sent, got {configuration}"
-            ),
-        }
+        // The tag map is always reported: the map the create carried, and an empty one for
+        // a create that carried no `tags` member at all.
+        let expected_tags = row.tags.clone().unwrap_or_else(|| json!({}));
+        assert_eq!(
+            configuration["tags"], expected_tags,
+            "case {case:?}: expected tags {expected_tags}, got {configuration}"
+        );
         assert_eq!(
             listed["nextToken"],
             Value::Null,

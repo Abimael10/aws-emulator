@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 reason: stored.reason.clone(),
                 // Always present, and EMPTY when the filter holds no tags, so the shape
                 // of a listed filter never depends on whether tags were set.
-                tags: Some(crate::state::filter_tag_map(stored.tags.as_ref())),
+                tags: Some(crate::state::tag_map(stored.tags.as_ref())),
             })
             .collect();
 

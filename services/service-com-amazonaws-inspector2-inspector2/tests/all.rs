@@ -17,6 +17,8 @@ mod account_status_access;
 mod cis_scan_configurations;
 #[path = "all/cis_sessions.rs"]
 mod cis_sessions;
+#[path = "all/code_security_periodic_schedule.rs"]
+mod code_security_periodic_schedule;
 #[path = "all/code_security_scan_configurations.rs"]
 mod code_security_scan_configurations;
 #[path = "all/constraint_refusal_wording.rs"]

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCodeSecurityScanConfiguration
-//! IMPLEMENTED: mints a scan configuration ARN, stores the configuration exactly as it
-//! was sent, and returns that ARN. `GetCodeSecurityScanConfiguration` reads the record
-//! back and `DeleteCodeSecurityScanConfiguration` removes it.
+//! IMPLEMENTED: mints a scan configuration ARN, stores the configuration as it was sent —
+//! with the periodic schedule the service chooses itself filled in when the periodic
+//! settings name a frequency without an expression — and returns that ARN.
+//! `GetCodeSecurityScanConfiguration` reads the record back and
+//! `DeleteCodeSecurityScanConfiguration` removes it.
 //!
 //! ## Shape of an operation
 //!
@@ -211,7 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 owner_id,
                 name: input.name,
                 level: input.level,
-                configuration: input.configuration,
+                configuration: crate::state::stored_code_security_scan_configuration(
+                    input.configuration,
+                ),
                 // Stored as sent: a create carrying `scopeSettings` asks for a DEFAULT
                 // scan configuration and one without it for a general one, so the absence
                 // is kept rather than filled in with a scope the caller did not ask for.

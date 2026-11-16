@@ -192,6 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetCodeSecurityScanConfigurationOutput {
             scan_configuration_arn: Some(stored.arn.clone()),
             name: Some(stored.name.clone()),
+            // Rendered as stored: the periodic schedule the create named, or the one the
+            // service chose for the frequency it asked for.
             configuration: Some(stored.configuration.clone()),
             level: Some(stored.level.clone()),
             // Absent for a general scan configuration, which is what a create carrying no
@@ -199,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scope_settings: stored.scope_settings.clone(),
             created_at: Some(crate::state::timestamp(stored.created_at)),
             last_updated_at: Some(crate::state::timestamp(stored.updated_at)),
-            // Rendered exactly as stored: absent when the create carried no `tags`, and an
-            // empty map when it carried an empty one.
-            tags: crate::state::tag_map(stored.tags.as_ref()),
+            // Always reported, and empty for a configuration created with no tags, so the
+            // shape of the answer never depends on whether tags were set.
+            tags: Some(crate::state::tag_map(stored.tags.as_ref())),
         })
     }
 }
