@@ -39,10 +39,24 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken here for ONE fact about this service's wire: the FORM it
+//! names an error shape in, in the `x-amzn-errortype` response header
+//! ([`error_type_locator`]). That header belongs to the RESPONSE rather than to any
+//! modelled shape — no error shape of this model declares it, so no handler can set it —
+//! so it is completed at the two layers every response passes through: the per-operation
+//! wrapper `override_operation` hands back, for everything an operation answers, and the
+//! definition wrapper `definition` hands back, for a response no operation produced.
 
+/// How this service names, in `x-amzn-errortype`, the error shape a failure is refused
+/// with — the one form every failure of this service carries, whichever operation answered
+/// and whichever layer rendered it.
+pub mod error_type_locator;
+
+use error_type_locator::{ErrorTypeLocatorDefinition, QualifyingErrorType};
 use service_common::shared_path::SharedPathArn;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -111,7 +125,14 @@ fn claims_shared_path_space(parts: &http::request::Parts) -> bool {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its framework-level error renderers wrapped so a response
+    /// no operation produced names its error shape the way this service's wire names it
+    /// ([`error_type_locator`]).
+    entry: ErrorTypeLocatorDefinition<crate::ServiceDefinition<Eng>>,
+    /// The one wrapper every modelled operation is served through, so what an operation
+    /// answers names its error shape that same way. Zero operations of its own: it
+    /// delegates to the entry's own routing table.
+    qualifying: QualifyingErrorType,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -120,7 +141,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: ErrorTypeLocatorDefinition::with_locator(
+                crate::ServiceDefinition::new(engine),
+                error_type_locator::locator(),
+            ),
+            qualifying: QualifyingErrorType::new(error_type_locator::locator()),
         }
     }
 }
@@ -162,12 +187,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve every modelled operation through the one [`QualifyingErrorType`] wrapper,
+        // so whatever that operation answers names its error shape the way this service's
+        // wire names it ([`error_type_locator`]). The wrapper makes no routing decision of
+        // its own: it delegates to the operation the entry's generated routing table names
+        // for the request, which is the only thing that serves it — and it is claimed only
+        // for a request that table can serve, so a request naming no modelled operation
+        // stays the framework's own routing failure.
+        self.entry.routes(req).then_some(&self.qualifying as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

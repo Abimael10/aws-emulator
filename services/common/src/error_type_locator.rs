@@ -48,17 +48,20 @@
 //! The locator is not part of the shape's NAME — every SDK resolves the shape from the text
 //! before the separator (and after a '#') — but it is what such a service's wire carries, and
 //! a client that reads or validates the whole value sees it. [`shape_locator`] derives it
-//! from the service's own Smithy shape id, [`with_error_type_locator`] completes a rendered
-//! response with it, and [`QualifiedErrorTypeDefinition`] covers the responses no operation
-//! produced. A service opts in by wrapping its generated definition and routing its
-//! operations' responses through the same function; nothing here decides whether a service's
-//! wire carries the form.
+//! from the service's own Smithy shape id and [`namespace_locator`] states it for a service
+//! whose wire declares its shapes under a namespace its model does not carry;
+//! [`with_error_type_locator`] completes a rendered response with it,
+//! [`QualifiedErrorTypeOperation`] covers everything the service's operations answer, and
+//! [`QualifiedErrorTypeDefinition`] covers the responses no operation produced. A service
+//! opts in by wrapping its generated definition and routing its operations' responses through
+//! the same locator; nothing here decides whether a service's wire carries the form.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{
-    ErasedServiceDefinition, OperationRoutingTable, Refused, ServerHttpProtocol, ServiceIdentity,
+    BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, OperationRoutingTable,
+    Refused, ServerHttpProtocol, Service, ServiceIdentity,
 };
 
 /// The header a REST-JSON client resolves a failure's error shape from.
@@ -199,6 +202,18 @@ const LOCATOR_SEPARATOR: char = ':';
 /// declares the shape follows it.
 const LOCATOR_ROOT: &str = "http://internal.amazon.com/coral/";
 
+/// The locator a shape name is qualified with, for a service whose shapes are DECLARED in
+/// `namespace`: the separator, the locator root, then that namespace.
+///
+/// A service whose wire declares its shapes under a namespace its Smithy model does not
+/// carry states that namespace itself and calls this; one whose model namespace IS the
+/// declaring namespace takes [`shape_locator`] and restates nothing.
+#[must_use]
+pub fn namespace_locator(namespace: &str) -> String {
+    let namespace = namespace.trim();
+    format!("{LOCATOR_SEPARATOR}{LOCATOR_ROOT}{namespace}/")
+}
+
 /// The locator a shape name is qualified with, for the service whose Smithy shape id is
 /// `service_shape_id`: the separator, the locator root, then the namespace that id carries.
 ///
@@ -206,12 +221,7 @@ const LOCATOR_ROOT: &str = "http://internal.amazon.com/coral/";
 /// that namespace with no edit at the call site.
 #[must_use]
 pub fn shape_locator(service_shape_id: &str) -> String {
-    let namespace = service_shape_id
-        .split('#')
-        .next()
-        .unwrap_or_default()
-        .trim();
-    format!("{LOCATOR_SEPARATOR}{LOCATOR_ROOT}{namespace}/")
+    namespace_locator(service_shape_id.split('#').next().unwrap_or_default())
 }
 
 /// The bare error SHAPE a HEADER value names: the text before the separator, and after any
@@ -257,57 +267,132 @@ pub fn with_error_type_locator(mut resp: RtResponse, locator: &str) -> RtRespons
     resp
 }
 
+/// The modelled operation the service's OWN routing table names for `req`, or `None` when
+/// the request names none.
+fn modelled_operation<'s>(
+    svc: &'s dyn Service,
+    req: &RtRequest,
+) -> Option<&'s dyn ErasedOperation> {
+    let definition = svc.definition();
+    let key = definition.protocol().routing_key(req).ok()?;
+    definition.routing_table().get(key)
+}
+
+/// Serves the modelled operation the service's own routing table names for a request exactly
+/// as that table would, then qualifies the error shape of whatever it answered
+/// ([`with_error_type_locator`]).
+///
+/// It holds no operation of its own and makes no routing decision: the operation it delegates
+/// to is the one the service's table names for the request, so the framework keeps owning the
+/// whole deserialize -> validate -> handle -> serialize sequence and every status, shape and
+/// message it answers with. ONE wrapper covers every operation of a service, and it is the
+/// one place each of their responses passes through — a success included, which it returns
+/// byte for byte.
+pub struct QualifiedErrorTypeOperation {
+    /// The locator every failure served through this wrapper is qualified with
+    /// ([`shape_locator`] / [`namespace_locator`]).
+    locator: String,
+}
+
+impl QualifiedErrorTypeOperation {
+    /// Wrap every operation of a service, qualifying its failures with `locator`.
+    #[must_use]
+    pub fn new(locator: String) -> Self {
+        Self { locator }
+    }
+}
+
+impl ErasedOperation for QualifiedErrorTypeOperation {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let served = match modelled_operation(svc, req) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable through a `Service::override_operation` that claims a request
+                // only when the routing table holds its key ([`QualifiedErrorTypeDefinition::routes`]);
+                // answered as the framework answers an unroutable request rather than
+                // guessed at.
+                None => svc.definition().routing_error_response(req),
+            };
+            with_error_type_locator(served, &self.locator)
+        })
+    }
+
+    /// `None` is "defer to the modelled operation the routing key names" — which is the
+    /// operation this wrapper delegates to, so its model-declared schemes decide and
+    /// wrapping cannot weaken them.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+}
+
 /// A service's generated definition with its framework-level error renderers wrapped, so a
 /// response NO operation produced names its error shape in the qualified form too — a routing
 /// failure, a transport failure detected up front, and a pre-dispatch refusal.
 ///
-/// The locator comes from the wrapped definition's own identity, and identity, the routing
-/// table and the protocol are read straight off it: nothing model-derived is restated here.
-/// The responses operations DO produce are the service's own to route through
-/// [`with_error_type_locator`], at whatever per-operation layer it already has.
-pub struct QualifiedErrorTypeDefinition<D>(D);
+/// The locator is [`shape_locator`] of the wrapped definition's own identity, or the one a
+/// service whose declaring namespace is not its model's states through [`Self::with_locator`];
+/// identity, the routing table and the protocol are read straight off the inner definition, so
+/// nothing model-derived is restated here. The responses operations DO produce are the
+/// service's own to route through [`QualifiedErrorTypeOperation`], or through whatever
+/// per-operation layer it already has.
+pub struct QualifiedErrorTypeDefinition<D> {
+    inner: D,
+    locator: String,
+}
 
 impl<D: ErasedServiceDefinition> QualifiedErrorTypeDefinition<D> {
-    /// Wrap `inner`, qualifying the error shape of every framework-level response it renders.
+    /// Wrap `inner`, qualifying the error shape of every framework-level response it renders
+    /// with the locator its own identity names ([`shape_locator`]).
     pub fn new(inner: D) -> Self {
-        Self(inner)
+        let locator = shape_locator(inner.identity().shape_id());
+        Self { inner, locator }
+    }
+
+    /// Wrap `inner`, qualifying with `locator` — for a service whose wire declares its shapes
+    /// under a namespace its model does not carry ([`namespace_locator`]).
+    pub fn with_locator(inner: D, locator: String) -> Self {
+        Self { inner, locator }
     }
 
     /// Whether the wrapped definition's generated routing table can serve this request — the
     /// condition a service claims a request for its own per-operation wrapper under, so a
     /// request naming no modelled operation stays the framework's routing failure.
     pub fn routes(&self, req: &RtRequest) -> bool {
-        self.0
+        self.inner
             .protocol()
             .routing_key(req)
             .ok()
-            .and_then(|key| self.0.routing_table().get(key))
+            .and_then(|key| self.inner.routing_table().get(key))
             .is_some()
     }
 
-    /// The locator this definition's identity names: the one value every layer qualifies
-    /// with.
+    /// The locator every layer of this service qualifies with.
     #[must_use]
-    pub fn locator(&self) -> String {
-        shape_locator(self.0.identity().shape_id())
+    pub fn locator(&self) -> &str {
+        &self.locator
     }
 }
 
 impl<D: ErasedServiceDefinition> ErasedServiceDefinition for QualifiedErrorTypeDefinition<D> {
     fn identity(&self) -> &ServiceIdentity {
-        self.0.identity()
+        self.inner.identity()
     }
 
     fn protocol(&self) -> &dyn ServerHttpProtocol {
-        self.0.protocol()
+        self.inner.protocol()
     }
 
     fn routing_table(&self) -> &OperationRoutingTable {
-        self.0.routing_table()
+        self.inner.routing_table()
     }
 
     fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
-        with_error_type_locator(self.0.routing_error_response(req), &self.locator())
+        with_error_type_locator(self.inner.routing_error_response(req), self.locator())
     }
 
     fn framework_error_response(
@@ -315,7 +400,10 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for QualifiedErrorTypeD
         error: aws_smithy_schema_server::ProtocolError,
         req: &RtRequest,
     ) -> RtResponse {
-        with_error_type_locator(self.0.framework_error_response(error, req), &self.locator())
+        with_error_type_locator(
+            self.inner.framework_error_response(error, req),
+            self.locator(),
+        )
     }
 
     fn refusal_response(
@@ -325,13 +413,13 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for QualifiedErrorTypeD
         req: &RtRequest,
     ) -> RtResponse {
         with_error_type_locator(
-            self.0.refusal_response(error, chosen, req),
-            &self.locator(),
+            self.inner.refusal_response(error, chosen, req),
+            self.locator(),
         )
     }
 
     fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
-        self.0.wire_protocol(req)
+        self.inner.wire_protocol(req)
     }
 }
 
@@ -517,6 +605,13 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected the locator {expected:?}, got {actual:?}"
+            );
+            // A service that STATES its declaring namespace gets the same locator as one
+            // whose model carries it, so the two ways in cannot disagree.
+            let stated = namespace_locator(shape_id.split('#').next().unwrap_or_default());
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected the stated locator {expected:?}, got {stated:?}"
             );
         }
     }

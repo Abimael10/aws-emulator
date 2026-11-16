@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/chipset_generation_form.rs"]
 mod chipset_generation_form;
+#[path = "all/error_type_locator_form.rs"]
+mod error_type_locator_form;
 #[path = "all/gone_image_delete_refusal.rs"]
 mod gone_image_delete_refusal;
 #[path = "all/image_build_outcome.rs"]
