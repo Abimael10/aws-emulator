@@ -20938,6 +20938,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
  "service-common",

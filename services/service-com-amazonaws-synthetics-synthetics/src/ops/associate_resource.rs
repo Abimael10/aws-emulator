@@ -152,6 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provisioning, a run whose outcome came due); the association itself is this
         // call's own write.
         guard.settle(now);
+        // The datapoints a run finished by that settling owes CloudWatch, published before
+        // this call answers (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
 
         // Both sides of the association have to exist. The group is "a global resource",
         // so it is resolved by name, ARN or id with no Region in play; the canary is

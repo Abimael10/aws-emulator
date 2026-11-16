@@ -149,6 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
         guard.settle(now);
+        // What the clock's own settling just finished is published before this call answers
+        // (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
         let canary = guard.canaries.get_mut(&input.name).ok_or_else(|| {
             StopCanaryError::from(StopCanaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -177,7 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         canary.stop_due = None;
         // The record observably changed, so its modification instant advances with it.
         canary.last_modified = now;
-        canary.close_open_run(now);
+        // The run this stop cut short finished here, and "the run that is in progress
+        // completes on its own, publishes metrics, and uploads artifacts" — so its
+        // datapoints are published with it.
+        let finished = canary.close_open_run(now);
+        guard.finished_runs.extend(finished);
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
 
         Ok(StopCanaryOutput {})
     }

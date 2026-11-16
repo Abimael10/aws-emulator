@@ -161,6 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only what the clock already owed on the canary records (a canary that finished
         // provisioning, a run whose outcome came due); the tags are this call's own write.
         guard.settle(now);
+        // The datapoints a run finished by that settling owes CloudWatch, published before
+        // this call answers (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
 
         // Resolved, merged and written under ONE lock, so two concurrent calls cannot both
         // read the same pre-merge map and one of them lose its pairs. Only the tag map

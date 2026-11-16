@@ -171,6 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
         guard.settle(now);
+        // The datapoints a run finished by that settling owes CloudWatch, published before
+        // this call answers — and before a delete can take the record away
+        // (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
         let canary = guard.canaries.get(&input.name).ok_or_else(|| {
             DeleteCanaryError::from(DeleteCanaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

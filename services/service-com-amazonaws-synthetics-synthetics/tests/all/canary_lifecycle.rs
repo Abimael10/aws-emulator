@@ -29,6 +29,10 @@ const MAX_CANARIES: usize = 100;
 /// The emulator-chosen cap on retained runs per canary.
 const MAX_RETAINED_RUNS_PER_CANARY: usize = 100;
 
+/// The `X-Amz-Target` prefix of the Amazon CloudWatch service, which is how a request
+/// reaches one of its operations ([`Synthetics::cloudwatch`]).
+const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+
 /// One answer from the emulator: enough to assert on a success or a modelled failure.
 ///
 /// `pub(crate)` because the sibling suites in this test target share this harness rather
@@ -90,6 +94,27 @@ impl Synthetics {
     pub(crate) fn with_account_services(
         region: &str,
     ) -> (Self, ::aws_sdk_iam::Client, ::aws_sdk_s3::Client) {
+        Self::mounted_with(region, false)
+    }
+
+    /// [`Synthetics::with_account_services`] with AMAZON CLOUDWATCH mounted on the same
+    /// engine as well.
+    ///
+    /// What a finished run publishes is CloudWatch's OWN series, so a suite reads it back
+    /// through CloudWatch's own operations ([`Synthetics::cloudwatch`]) rather than out of
+    /// any store.
+    pub(crate) fn with_metric_reader(
+        region: &str,
+    ) -> (Self, ::aws_sdk_iam::Client, ::aws_sdk_s3::Client) {
+        Self::mounted_with(region, true)
+    }
+
+    /// The two constructors above: this service, the owners of the resources a run uses, and
+    /// — when `metrics` — the CloudWatch the run's own series live in, on ONE engine.
+    fn mounted_with(
+        region: &str,
+        metrics: bool,
+    ) -> (Self, ::aws_sdk_iam::Client, ::aws_sdk_s3::Client) {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -104,6 +129,13 @@ impl Synthetics {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        if metrics {
+            router.register_service(
+                service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+        }
         let callback = EmbeddedEmulator::from_router(router.clone());
         // The clients are the tree's OWN constructions of these two hops
         // (`service_common::iam_client` / `s3_client`), which is the very seam a canary run
@@ -119,6 +151,52 @@ impl Synthetics {
             iam,
             s3,
         )
+    }
+
+    /// One Amazon CloudWatch call over the SAME router, through CloudWatch's own awsJson1.0
+    /// surface: the `X-Amz-Target` an SDK sends and the `monitoring` credential scope that
+    /// routes the request to that service.
+    ///
+    /// Only a harness built by [`Synthetics::with_metric_reader`] has CloudWatch mounted.
+    pub(crate) async fn cloudwatch(&self, operation: &str, body: Value) -> Answer {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://monitoring.{}.amazonaws.com/", self.region))
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                format!("{CLOUDWATCH_TARGET_PREFIX}.{operation}"),
+            )
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/monitoring/aws4_request, \
+                     SignedHeaders=host, Signature=0",
+                    self.region,
+                ),
+            )
+            .body(Bytes::from(
+                serde_json::to_vec(&body).expect("the test body serialises"),
+            ))
+            .expect("the test request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.into_body();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Answer {
+            status,
+            error_code,
+            body,
+        }
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {

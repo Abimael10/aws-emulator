@@ -43,6 +43,8 @@ mod pattern_quoting;
 mod pattern_requirement_wording;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/run_metrics_reach_cloudwatch.rs"]
+mod run_metrics_reach_cloudwatch;
 #[path = "all/runtime_catalog.rs"]
 mod runtime_catalog;
 #[path = "all/runtime_versions.rs"]

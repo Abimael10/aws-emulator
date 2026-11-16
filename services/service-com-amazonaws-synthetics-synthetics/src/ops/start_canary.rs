@@ -4,6 +4,9 @@
 //! Starts the canary's schedule, performs the run it opens
 //! ([`crate::state::canary_run`]) and records the verdict that work produced.
 //!
+//! The run is observable in two places: its own record, and the CloudWatch series it
+//! publishes when it finishes ([`crate::state::run_metrics`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,6 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let work = {
             let mut guard = state.lock();
             guard.settle(now);
+            // What the clock's own settling just finished is published before this call
+            // answers, so a finished run is observable in CloudWatch as well as in its own
+            // record (`crate::state::run_metrics`).
+            crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
             let canary = guard.canaries.get(&input.name).ok_or_else(not_found)?;
 
             // A canary that is already running has nothing to start, and one with an
@@ -189,6 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let settled = SystemTime::now();
         let mut guard = state.lock();
         guard.settle(settled);
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
         let canary = guard.canaries.get_mut(&input.name).ok_or_else(not_found)?;
         // The lock was released while the run did its work, so the state the start was
         // decided on has to STILL admit it: a concurrent start, stop, update or delete that
@@ -230,6 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The run's outcome is owed by the clock, not by another call.
             outcome_due: Some(outcome_due),
             outcome: Some(outcome),
+            // The run's metrics are generated when the run finishes, which is the instant
+            // the clock owes it its outcome: `CanaryRunTimeline$MetricTimestampForRunAndRetries`,
+            // "The time at which the metrics will be generated for this run or retries".
+            metric_timestamp: Some(outcome_due),
             artifact_s3_location: canary.artifact_s3_location.clone(),
             // A run of the canary itself, not of one of its dry-run configurations.
             dry_run_id: None,

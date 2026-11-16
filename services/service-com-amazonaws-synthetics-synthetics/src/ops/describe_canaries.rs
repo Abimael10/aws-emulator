@@ -254,6 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only what the clock already owed: a canary that finished provisioning, a run
         // whose outcome came due. Paging changes nothing else about the store.
         guard.settle(SystemTime::now());
+        // The datapoints a run finished by that settling owes CloudWatch, published before
+        // this call answers (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
 
         // The store is name-ordered, so this list has a total, stable order and a page
         // boundary in it means the same thing on the next call.

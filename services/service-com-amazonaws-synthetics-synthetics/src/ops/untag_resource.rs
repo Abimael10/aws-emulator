@@ -149,6 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only what the clock already owed on the canary records; the removal is this
         // call's own write.
         guard.settle(now);
+        // The datapoints a run finished by that settling owes CloudWatch, published before
+        // this call answers (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
 
         // The same ARN resolution the tag read and the tag write use, so all three
         // address one stored map.

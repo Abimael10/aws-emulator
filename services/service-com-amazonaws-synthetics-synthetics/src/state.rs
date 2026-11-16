@@ -29,6 +29,10 @@ use crate::ops::types::{
 /// role carries.
 pub mod canary_run;
 
+/// The CloudWatch series a FINISHED canary run is reported as: the second place a run is
+/// observable in, beside its own record.
+pub mod run_metrics;
+
 /// Mint a fresh identifier for a canary or a canary run.
 ///
 /// `Canary$Id` and `CanaryRun$Id` are modelled as `UUID`
@@ -571,6 +575,15 @@ pub struct StoredRun {
     pub outcome_due: Option<SystemTime>,
     /// The verdict the run's own work produced, waiting for that instant.
     pub outcome: Option<RunOutcome>,
+    /// The instant this run's CloudWatch datapoints are stamped at, which is the instant it
+    /// finishes: `CanaryRunTimeline$MetricTimestampForRunAndRetries`, "The time at which the
+    /// metrics will be generated for this run or retries" — known while the run is still
+    /// open, because the clock already owes the run its outcome at that instant.
+    ///
+    /// `None` for a run that generates no metrics of the canary: a dry run exercises a
+    /// configuration the canary does not yet carry, so what it came to is reported on the
+    /// dry run and not as the canary's own health ([`run_metrics`]).
+    pub metric_timestamp: Option<SystemTime>,
     pub artifact_s3_location: String,
     /// The dry run this run belongs to, when it is one.
     ///
@@ -582,6 +595,24 @@ pub struct StoredRun {
 }
 
 impl StoredRun {
+    /// The datapoints this run owes CloudWatch now that it has finished, if it owes any.
+    ///
+    /// A run that generates no metrics of the canary ([`Self::metric_timestamp`] unset) owes
+    /// nothing, and neither does one with no timeline to measure: the span published is the
+    /// run's own, never a chosen number.
+    fn finished(&self) -> Option<run_metrics::FinishedRun> {
+        let at = self.metric_timestamp?;
+        let completed = self.completed?;
+        Some(run_metrics::FinishedRun {
+            canary_name: self.name.clone(),
+            at,
+            passed: self.state == CanaryRunState::Passed,
+            took: completed
+                .duration_since(self.started)
+                .unwrap_or_default(),
+        })
+    }
+
     /// Project this run onto the modelled `CanaryRun` shape.
     pub fn to_canary_run(&self) -> CanaryRun {
         CanaryRun {
@@ -596,7 +627,7 @@ impl StoredRun {
             timeline: Some(CanaryRunTimeline {
                 started: Some(self.started.into()),
                 completed: self.completed.map(Into::into),
-                metric_timestamp_for_run_and_retries: None,
+                metric_timestamp_for_run_and_retries: self.metric_timestamp.map(Into::into),
             }),
             artifact_s3_location: Some(self.artifact_s3_location.clone()),
             dry_run_config: self.dry_run_id.as_ref().map(|id| CanaryDryRunConfigOutput {
@@ -696,14 +727,15 @@ impl StoredCanary {
         canary_arn(&self.region, &self.name)
     }
 
-    /// Materialise every transition the clock already owes at `now`, and nothing else.
+    /// Materialise every transition the clock already owes at `now`, and nothing else, and
+    /// hand back the runs that finishing owes CloudWatch datapoints for.
     ///
     /// Called by reporting and mutating operations alike: these changes were due at this
     /// instant whether or not anybody called, so applying them on a read does not change
     /// what a later caller sees. That includes retention expiry: a run whose data the
     /// canary's retention period no longer covers was already out of range at this
     /// instant, so it is dropped here rather than when somebody happens to look.
-    pub fn settle(&mut self, now: SystemTime) {
+    pub fn settle(&mut self, now: SystemTime) -> Vec<run_metrics::FinishedRun> {
         if self.state == CanaryState::Creating
             && self.ready_due.is_some_and(|due| now >= due)
         {
@@ -712,6 +744,7 @@ impl StoredCanary {
             self.state_reason_code = None;
             self.ready_due = None;
         }
+        let mut finished = Vec::new();
         for run in &mut self.runs {
             if run.state == CanaryRunState::Running
                 && run.outcome_due.is_some_and(|due| now >= due)
@@ -728,6 +761,10 @@ impl StoredCanary {
                 run.state_reason_code = outcome.state_reason_code;
                 run.completed = Some(run.outcome_due.unwrap_or(now));
                 run.outcome_due = None;
+                // A run that has just finished publishes what it came to
+                // ([`run_metrics`]), stamped at the instant its own timeline reports the
+                // metrics are generated at.
+                finished.extend(run.finished());
             }
         }
         // A dry run's own lifecycle moves with the run it started, which the loop above has
@@ -750,6 +787,7 @@ impl StoredCanary {
             self.stop_due = None;
         }
         self.expire_runs(now);
+        finished
     }
 
     /// Whether a run of the canary's own schedule is still open. A dry run is not one: it
@@ -912,11 +950,13 @@ impl StoredCanary {
         canary
     }
 
-    /// Finish whichever run is still open, because the canary was stopped.
+    /// Finish whichever run is still open, because the canary was stopped, and hand back the
+    /// runs that finishing owes CloudWatch datapoints for.
     ///
     /// A dry run is left alone: it runs its own configuration independently of the
     /// canary's schedule, so stopping the canary does not stop it.
-    pub fn close_open_run(&mut self, now: SystemTime) {
+    pub fn close_open_run(&mut self, now: SystemTime) -> Vec<run_metrics::FinishedRun> {
+        let mut finished = Vec::new();
         for run in &mut self.runs {
             if run.state == CanaryRunState::Running && run.dry_run_id.is_none() {
                 // The run was cut short, so whatever its own work established is not what
@@ -927,8 +967,15 @@ impl StoredCanary {
                 run.state_reason_code = Some(RUN_EXECUTION_FAILURE_REASON_CODE.to_string());
                 run.completed = Some(now);
                 run.outcome_due = None;
+                // The run finished HERE rather than at the instant the clock had owed it,
+                // so that is when its metrics are generated: "the run that is in progress
+                // completes on its own, publishes metrics, and uploads artifacts"
+                // (`smithy_query(query="doc",shape="StopCanary")`).
+                run.metric_timestamp = run.metric_timestamp.map(|_| now);
+                finished.extend(run.finished());
             }
         }
+        finished
     }
 
     /// Project this record onto the modelled `Canary` shape. The ONLY way a handler
@@ -1087,15 +1134,27 @@ pub struct ComAmazonawsSyntheticsSyntheticsState {
     /// because `ListGroups` and `ListGroupResources` page over this collection and a
     /// tokenised page boundary needs a total, stable order.
     pub groups: BTreeMap<String, StoredGroup>,
+    /// The runs that have finished and whose CloudWatch datapoints have not been published
+    /// yet ([`run_metrics`]).
+    ///
+    /// A run is finished by the CLOCK, inside the store, where there is no engine to publish
+    /// through; so what it owes is held here until the operation that materialised it
+    /// publishes it ([`run_metrics::publish_finished_runs`]), which that operation does
+    /// before it answers. Held on the store rather than returned, so a run's datapoints
+    /// survive the call that finished the run refusing for a reason of its own.
+    pub finished_runs: Vec<run_metrics::FinishedRun>,
 }
 
 impl ComAmazonawsSyntheticsSyntheticsState {
     /// Apply [`StoredCanary::settle`] to every record, so any operation starts from a
-    /// store in which the clock's own transitions have already happened.
+    /// store in which the clock's own transitions have already happened, and remember what
+    /// the runs it finished owe CloudWatch.
     pub fn settle(&mut self, now: SystemTime) {
+        let mut finished = Vec::new();
         for canary in self.canaries.values_mut() {
-            canary.settle(now);
+            finished.append(&mut canary.settle(now));
         }
+        self.finished_runs.append(&mut finished);
     }
 
     /// The group a `GroupIdentifier` names, if the store holds it.

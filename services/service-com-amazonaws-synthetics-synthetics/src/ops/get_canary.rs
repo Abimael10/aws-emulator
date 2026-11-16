@@ -155,6 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // finished provisioning, a run whose outcome came due); reading changes nothing
         // else about what a later caller sees.
         guard.settle(SystemTime::now());
+        // The datapoints a run finished by that settling owes CloudWatch, published before
+        // this call answers: they were owed at the same instant, whether or not anybody
+        // read (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
         let stored = guard
             .canaries
             .get(&input.name)

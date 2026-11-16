@@ -42,6 +42,11 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 # locked for this package, so no entry is added to Cargo.lock.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The CloudWatch metric store is where a finished canary run's `CloudWatchSynthetics` series
+# lives: the datapoints a run publishes are appended to that service's OWN series — the ones
+# `ListMetrics`, `GetMetricStatistics` and `GetMetricData` read — rather than to a second copy
+# of them (`src/state/run_metrics.rs`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

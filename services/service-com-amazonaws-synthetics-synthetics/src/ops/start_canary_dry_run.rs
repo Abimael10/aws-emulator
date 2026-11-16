@@ -251,6 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Only what the clock already owed at this instant (a canary that finished
             // provisioning, a run whose outcome came due).
             guard.settle(now);
+            // What the clock's own settling just finished is published before this call
+            // answers (`crate::state::run_metrics`).
+            crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
             let canary = guard.canaries.get(&input.name).ok_or_else(not_found)?;
 
             // A canary with an operation still in flight (it is being provisioned, started,
@@ -400,6 +403,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completed: None,
             outcome_due: Some(finish_due),
             outcome: Some(outcome),
+            // A dry run exercises a configuration the canary does not carry, so what this
+            // run comes to is reported on the dry run and not as the canary's own health:
+            // it generates no CloudWatchSynthetics datapoint of the canary
+            // (`crate::state::run_metrics`).
+            metric_timestamp: None,
             artifact_s3_location: config.artifact_s3_location.clone(),
             dry_run_id: Some(dry_run_id.clone()),
         };
@@ -421,6 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.settle(started);
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
         let canary = guard.canaries.get_mut(&input.name).ok_or_else(not_found)?;
         // The lock was released while the run did its work, so the state the dry run was
         // admitted on has to STILL admit it: a concurrent operation that put the canary into
