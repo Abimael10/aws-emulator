@@ -192,11 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(session) = store.session_mut(&region, &input.session_id) else {
             return Err(RunStatementErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // The refusal names the id that resolved to nothing, which is the
-                    // whole address of a session.
-                    message: Some(crate::state::messages::session_not_found(
-                        &input.session_id,
-                    )),
+                    // This operation words its session miss with the service's fixed,
+                    // generic entity sentence, which has no variable part: the id that
+                    // resolved to nothing is NOT named, where the session read and the
+                    // statement-listing surface each name it their own way.
+                    message: Some(
+                        crate::state::messages::RUN_STATEMENT_SESSION_NOT_FOUND.to_string(),
+                    ),
                     from_federation_source: None,
                 },
             )

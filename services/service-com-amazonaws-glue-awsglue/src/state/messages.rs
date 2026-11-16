@@ -545,6 +545,22 @@ pub fn session_id_not_found(session_id: &str) -> String {
     format!("Session ID {session_id} not found")
 }
 
+/// `RunStatement` for a `SessionId` that resolves to no session at all — an id nothing
+/// created, and one whose session has been deleted and its record fully removed.
+///
+/// RECORDED constant, and the whole message: the sentence this operation refuses an
+/// unresolvable session with is the service's fixed, generic entity miss. It has NO
+/// variable part — neither the id the request sent nor the member it was sent under
+/// appears in it — and carries no trailing period.
+///
+/// It is therefore neither the session read's own miss ([`session_not_found`]) nor the
+/// statement-listing surface's ([`session_id_not_found`]): this service words the miss per
+/// operation, and the statement RUN is the operation recorded answering the generic
+/// sentence. It reads the same as the WORKFLOW surface's miss ([`WORKFLOW_NOT_FOUND`]) and
+/// is a separate constant all the same, for the same reason that one is: the surfaces are
+/// recorded independently, so either may be re-worded without the other.
+pub const RUN_STATEMENT_SESSION_NOT_FOUND: &str = "Entity not found";
+
 /// A read of the Glue Identity Center configuration of an account that has none
 /// (`GetGlueIdentityCenterConfiguration`), and the delete of the same absent
 /// singleton.

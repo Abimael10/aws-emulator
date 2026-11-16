@@ -488,8 +488,13 @@ async fn an_address_nothing_holds_is_a_miss() {
         ("a stored id in another case", "HELD"),
     ] {
         for (operation, expected) in [
-            ("RunStatement", messages::session_not_found(id)),
-            // The statement surface words its own session miss, naming the member it
+            // The run words its session miss with the service's fixed, generic entity
+            // sentence, which names nothing of the request.
+            (
+                "RunStatement",
+                messages::RUN_STATEMENT_SESSION_NOT_FOUND.to_string(),
+            ),
+            // The statement READ surface words its own session miss, naming the member it
             // could not resolve.
             ("GetStatement", messages::session_id_not_found(id)),
         ] {
@@ -535,8 +540,8 @@ async fn an_address_nothing_holds_is_a_miss() {
         );
         assert_eq!(
             error_message(&body),
-            messages::session_not_found(session),
-            "case {region}: expected the miss to name the session, got {body}"
+            messages::RUN_STATEMENT_SESSION_NOT_FOUND,
+            "case {region}: expected the run's fixed session miss, got {body}"
         );
     }
 

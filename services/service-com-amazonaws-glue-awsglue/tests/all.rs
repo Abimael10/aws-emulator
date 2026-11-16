@@ -353,6 +353,8 @@ mod response_members;
 mod response_request_id;
 #[path = "all/root_catalog_protection.rs"]
 mod root_catalog_protection;
+#[path = "all/run_statement_session_miss.rs"]
+mod run_statement_session_miss;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
 #[path = "all/schema_registry_updates.rs"]
