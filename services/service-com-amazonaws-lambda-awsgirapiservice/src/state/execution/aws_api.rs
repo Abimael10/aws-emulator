@@ -1981,8 +1981,8 @@ pub struct Answer {
     pub request_id: Option<String>,
     /// The output members of [`Self::body`] that carry BYTES rather than text, as the
     /// base64 the answer's document carries them as — an object's own payload, say, or the
-    /// member a REST-bound answer binds to the whole body whose shape is a blob. The
-    /// SDK the guest calls hands each of them over as the stream its own client answers
+    /// member a REST-bound answer binds to the whole body whose shape is a `@streaming` blob.
+    /// The SDK the guest calls hands each of them over as the stream its own client answers
     /// with ([`super::aws_sdk_guest`]), so a handler reads bytes where it reads bytes on a
     /// managed runtime. Empty for every answer whose members are all text, which is every
     /// AWS JSON one.
@@ -1994,6 +1994,15 @@ pub struct Answer {
     /// of its bytes, and the SDK the guest calls hands over the BYTES, so a handler reads
     /// bytes where it reads bytes on a managed runtime. Empty for an answer carrying none.
     pub blobs: Vec<::serde_json::Value>,
+    /// The member a REST-bound answer binds to the WHOLE body whose shape is a blob the model
+    /// does NOT mark `@streaming`, as the base64 of the body's own bytes.
+    ///
+    /// Such a body is one an SDK COLLECTS rather than hands over unread, so the form the guest
+    /// reads it in is its own SDK's: the JavaScript SDK gives the caller the collected bytes
+    /// themselves ([`super::node_sdk_guest`]), while the Python SDK wraps the payload of every
+    /// output whose payload shape is a blob in a streaming body ([`super::aws_sdk_guest`]).
+    /// Empty for an answer binding none — which is every answer of an AWS JSON service.
+    pub payload_blobs: Vec<String>,
 }
 
 /// Build, sign and dispatch one request, and read the answer back.
@@ -2143,17 +2152,20 @@ async fn sent(
     };
     // A member the answer binds to the WHOLE body whose shape is a blob is the body's own
     // BYTES, with nothing of the protocol encoded around them, so it is not read back as the
-    // text those bytes happened to decode to: the bytes travel as base64 and the SDK the guest
-    // calls hands them over as the stream its own client answers one with
-    // ([`super::rest_json::streamed_payload`]).
-    let (body, streams) = match (&api.protocol, (200..300).contains(&status)) {
+    // text those bytes happened to decode to: the bytes travel as base64, and WHETHER the SDK
+    // the guest calls hands them over as a stream or as the bytes it collected is what that
+    // blob's own shape says ([`super::rest_json::PayloadBlob`]).
+    let (body, streams, payload_blobs) = match (&api.protocol, (200..300).contains(&status)) {
         (Protocol::RestJson(rest), true) => {
-            match super::rest_json::streamed_payload(rest, operation, &body, payload) {
-                Some((document, member)) => (document, vec![member]),
-                None => (body, Vec::new()),
+            match super::rest_json::carried_payload(rest, operation, &body, payload) {
+                Some((document, carried)) if carried.streaming => {
+                    (document, vec![carried.member], Vec::new())
+                }
+                Some((document, carried)) => (document, Vec::new(), vec![carried.member]),
+                None => (body, Vec::new(), Vec::new()),
             }
         }
-        _ => (body, Vec::new()),
+        _ => (body, Vec::new(), Vec::new()),
     };
     // WHICH of the answer's values carry bytes is the called service's own model's to say, so
     // the SDK the guest calls hands each of them over as bytes rather than as the base64 a
@@ -2186,6 +2198,7 @@ async fn sent(
         request_id,
         streams,
         blobs,
+        payload_blobs,
     })
 }
 

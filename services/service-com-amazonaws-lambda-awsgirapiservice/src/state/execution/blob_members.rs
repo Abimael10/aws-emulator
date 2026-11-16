@@ -356,13 +356,21 @@ fn kind_of(shapes: &Map<String, Value>, id: &str) -> &'static str {
     }
 }
 
-/// Whether the shape `id` carries the `@streaming` trait.
-fn is_streaming(shapes: &Map<String, Value>, id: &str) -> bool {
-    shapes
-        .get(id)
+/// Whether the shape `shape` describes carries the `@streaming` trait.
+///
+/// Read from the shape's own traits, so the one answer serves both seams that ask it: the plan
+/// below, which leaves a streaming blob out because an SDK hands one over unread, and
+/// [`super::rest_json`], which reads from it the form a payload blob reaches the guest in.
+pub(super) fn is_streaming_shape(shape: Option<&Value>) -> bool {
+    shape
         .and_then(|shape| shape.get("traits"))
         .and_then(Value::as_object)
         .is_some_and(|traits| traits.contains_key(STREAMING))
+}
+
+/// Whether the shape `id` carries the `@streaming` trait.
+fn is_streaming(shapes: &Map<String, Value>, id: &str) -> bool {
+    is_streaming_shape(shapes.get(id))
 }
 
 /// The members of the shape `id`, or `None` for a shape declaring none.

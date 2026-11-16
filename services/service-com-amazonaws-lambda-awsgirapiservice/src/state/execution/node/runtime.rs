@@ -108,6 +108,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // The major version of the managed runtime this invocation names, which is what the
     // layer search path's own `node<major>` directory is keyed by.
     var nodeMajor = '';
+    // The ENGINE's own `stack` accessor, kept as this runtime found it on `Error.prototype`
+    // before wrapping it ([`installErrorStack`]): it answers the frames of an error, which is
+    // what the wrapper reports under the head line a node runtime opens a stack with.
+    var engineStack = null;
 
     // ---------------------------------------------------------------- paths
 
@@ -873,9 +877,88 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             };
         }
         installAbort();
+        installErrorStack();
         // "Error.stackTraceLimit ... The default value is 10": the number of frames an
         // error's own stack carries, which `NODE_OPTIONS` can set.
         Error.stackTraceLimit = 10;
+    }
+
+    // ---------------------------------------------------------------- error stacks
+
+    // The frames the ENGINE took for `error`, as its own text: one `    at <name> (<unit>)`
+    // line per frame, and nothing else — the engine's stack carries no head line.
+    //
+    // Read through the accessor `Error.prototype` carried before this runtime wrapped it, so
+    // it answers the frames even for an error whose `stack` a handler has since assigned.
+    function engineFrames(error) {
+        if (engineStack === null) {
+            return undefined;
+        }
+        try {
+            return engineStack.call(error);
+        } catch (unavailable) {
+            return undefined;
+        }
+    }
+
+    // The line a stack OPENS with: the error's own string representation — `<name>: <message>`,
+    // the name alone for an error carrying no message, and the message alone for one carrying
+    // no name.
+    function errorHead(error) {
+        var name = error.name === undefined || error.name === null ? 'Error' : String(error.name);
+        var message = error.message === undefined || error.message === null
+            ? ''
+            : String(error.message);
+        if (name === '') {
+            return message;
+        }
+        return message === '' ? name : name + ': ' + message;
+    }
+
+    // `stack` as a node runtime reports it: the error's own head line ([`errorHead`]), then one
+    // line per frame the engine took.
+    //
+    // The engine answers the FRAMES alone, so this runtime wraps its accessor — on
+    // `Error.prototype`, which is where the engine keeps it and where no error carries one of
+    // its own, so EVERY error reads this way whether the engine raised it or the handler
+    // constructed it. That head line is what tells code reading a failure by its `stack` WHAT
+    // failed: a handler that reports an error's stack — which is what a custom resource
+    // provider sends CloudFormation as its failure — otherwise reports frames with no class and
+    // no message in front of them.
+    //
+    // Assigning `stack` still replaces it: the assignment puts an own property on the error, as
+    // it does on a managed runtime, so what a handler put there is what reads back.
+    function installErrorStack() {
+        var held = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+        if (held === undefined || typeof held.get !== 'function') {
+            return;
+        }
+        engineStack = held.get;
+        Object.defineProperty(Error.prototype, 'stack', {
+            configurable: true,
+            get: function () {
+                var taken = engineFrames(this);
+                // `Error.prepareStackTrace`: where one is installed, what IT answers is the
+                // stack — head line and all — so nothing is put in front of it.
+                if (typeof Error.prepareStackTrace === 'function') {
+                    return taken;
+                }
+                var frames = typeof taken === 'string' ? taken : '';
+                while (frames !== '' && frames.charAt(frames.length - 1) === '\n') {
+                    frames = frames.slice(0, frames.length - 1);
+                }
+                var head = errorHead(this);
+                return frames === '' ? head : head + '\n' + frames;
+            },
+            set: function (value) {
+                Object.defineProperty(this, 'stack', {
+                    value: value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true
+                });
+            }
+        });
     }
 
     // The abort pair a cancellable asynchronous call is given: a signal with the one event
@@ -1124,9 +1207,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     // What a node runtime reports for a value a handler threw. An ERROR reports its own
     // class, its message and its stack — whose first line is the "<ErrorType>: <message>"
-    // line, which this engine's stack does not carry, so it is stated here. Anything else
-    // reports the TYPE of the value and the value as text, with no trace at all, because a
-    // value that is not an error carries no stack to report.
+    // line, stated here from the class and the message this runtime reports, so the wording
+    // it reports and the wording the trace opens with are one. Anything else reports the TYPE
+    // of the value and the value as text, with no trace at all, because a value that is not an
+    // error carries no stack to report.
     function raised(error) {
         if (!(error instanceof Error)) {
             return {
@@ -1139,11 +1223,12 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         var type = typeof error.name === 'string' && error.name !== '' ? error.name : 'Error';
         var message = error.message === undefined ? '' : String(error.message);
         var trace = traceLines(type + ': ' + decorated(message));
-        if (typeof error.stack === 'string' && error.stack !== '') {
-            var frames = error.stack.split('\n');
-            for (var index = 0; index < frames.length; index += 1) {
-                if (frames[index] !== '') {
-                    trace.push(frames[index]);
+        var frames = tracedFrames(error);
+        if (frames !== '') {
+            var lines = frames.split('\n');
+            for (var index = 0; index < lines.length; index += 1) {
+                if (lines[index] !== '') {
+                    trace.push(lines[index]);
                 }
             }
         }
@@ -1153,6 +1238,15 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             errorMessage: decorated(message),
             trace: trace
         };
+    }
+
+    // The part of an error's `stack` that follows the head line it opens with
+    // ([`errorHead`]) — which, for an error whose stack a handler ASSIGNED, is the text that
+    // handler put there, since an assigned stack opens with no head line of this runtime's.
+    function tracedFrames(error) {
+        var stack = typeof error.stack === 'string' ? error.stack : '';
+        var head = errorHead(error);
+        return head !== '' && stack.indexOf(head) === 0 ? stack.slice(head.length) : stack;
     }
 
     // How many entries of a reported trace its HEAD line occupies: one per line of the

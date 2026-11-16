@@ -495,6 +495,8 @@ mod map_value_refusals;
 mod missing_policy_refusal;
 #[path = "all/node_error_trace_lines.rs"]
 mod node_error_trace_lines;
+#[path = "all/node_error_stack_head.rs"]
+mod node_error_stack_head;
 #[path = "all/node_handler_crypto_surface.rs"]
 mod node_handler_crypto_surface;
 #[path = "all/node_handler_kms_envelope.rs"]
@@ -615,6 +617,8 @@ mod state_roundtrip;
 mod stream_mapping_iterator_age_series;
 #[path = "all/stream_mapping_retry_allowance.rs"]
 mod stream_mapping_retry_allowance;
+#[path = "all/sdk_answer_payload_form.rs"]
+mod sdk_answer_payload_form;
 #[path = "all/synchronous_invoke_run.rs"]
 mod synchronous_invoke_run;
 #[path = "all/tag_key_shape.rs"]

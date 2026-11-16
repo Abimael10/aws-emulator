@@ -17,9 +17,9 @@
 //! A member bound to the WHOLE body whose shape is a `blob` is the one value here that is not
 //! text: the body IS its bytes, with nothing of the protocol encoded around them. So such a
 //! member travels as the bytes it names in both directions ([`payload_bytes`],
-//! [`streamed_payload`]) rather than as the text the body happens to decode to, and the SDK
-//! the guest calls hands the answer's half over as the stream its own client answers one
-//! with.
+//! [`carried_payload`]) rather than as the text the body happens to decode to, and WHETHER the
+//! blob it targets carries `@streaming` is what decides the form the SDK the guest calls hands
+//! those bytes over in ([`PayloadBlob`]).
 //!
 //! Nothing here is a per-operation table: the model is the authority, so every operation the
 //! service binds is reachable and none is described twice. An operation the model does not
@@ -370,16 +370,29 @@ fn payload_bytes(text: &str) -> Vec<u8> {
         .unwrap_or_else(|_not_base64| text.as_bytes().to_vec())
 }
 
-/// The output member of `operation` that carries the ANSWER's own BYTES, when it has one: the
-/// member bound to the whole response body (`@httpPayload`) whose shape is a `blob`.
-///
-/// An SDK hands such a member over as a readable STREAM rather than as a value of the answer's
-/// document — the Python SDK builds a `botocore.response.StreamingBody` for the payload member
-/// of every output whose payload shape is a blob, and the JavaScript SDK a byte stream —
-/// because the body IS those bytes, with nothing of the protocol encoded around them. So the
-/// bytes are reported apart from the document's text ([`super::aws_api::Answer::streams`])
-/// rather than read back as the text the body happened to decode to.
-pub fn blob_payload(api: &RestApi, operation: &str) -> Option<String> {
+/// The output member of one operation that carries the ANSWER's own BYTES: the member bound to
+/// the whole response body (`@httpPayload`) whose shape is a `blob`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadBlob {
+    /// The member's own name, which is what the answer's document is keyed by.
+    pub member: String,
+    /// Whether the blob it targets carries `@streaming`.
+    ///
+    /// This is what decides the FORM the SDK the guest calls hands those bytes over in. A
+    /// streaming blob is handed over UNREAD — the caller is given a stream and reads it — so
+    /// every SDK answers one as a stream. A blob the model does not mark streaming is a body
+    /// the SDK COLLECTS: the JavaScript SDK hands the caller the collected bytes themselves (a
+    /// byte array), and the Python SDK still wraps any blob payload member in a
+    /// `botocore.response.StreamingBody`, because it reads the payload of every output whose
+    /// payload shape is a blob as a stream whatever the shape's traits say.
+    ///
+    /// Which trait that is, is [`super::blob_members`]'s to say: the seam that leaves a
+    /// streaming blob out of its byte plan and this one decide it from one reading.
+    pub streaming: bool,
+}
+
+/// The payload blob of `operation`'s answer, when its output binds one.
+pub fn blob_payload(api: &RestApi, operation: &str) -> Option<PayloadBlob> {
     let model = api.model();
     let shape = model.operation(operation)?;
     let output = shape
@@ -387,33 +400,38 @@ pub fn blob_payload(api: &RestApi, operation: &str) -> Option<String> {
         .and_then(|output| output.get("target"))
         .and_then(Value::as_str)?;
     model.members(output).iter().find_map(|(name, member)| {
-        (member_trait(member, PAYLOAD).is_some() && model.kind(target(member)) == "blob")
-            .then(|| name.clone())
+        let shape = target(member);
+        (member_trait(member, PAYLOAD).is_some() && model.kind(shape) == "blob").then(|| {
+            PayloadBlob {
+                member: name.clone(),
+                streaming: super::blob_members::is_streaming_shape(model.shape(shape)),
+            }
+        })
     })
 }
 
 /// The answer's document with the bytes of its blob payload in place of the text the body
-/// decoded to, and the member they belong to — `None` for an operation whose answer binds no
-/// blob payload, or a document that is not one this seam built.
+/// decoded to, and the payload those bytes belong to — `None` for an operation whose answer
+/// binds no blob payload, or a document that is not one this seam built.
 ///
 /// The bytes travel to the guest as base64, which is how the one call seam carries bytes in
-/// either direction, and the SDK the guest calls hands them over as the stream its own client
-/// answers with.
-pub fn streamed_payload(
+/// either direction, and the SDK the guest calls hands them over in the form that payload's
+/// own shape says ([`PayloadBlob::streaming`]).
+pub fn carried_payload(
     api: &RestApi,
     operation: &str,
     document: &str,
     bytes: &[u8],
-) -> Option<(String, String)> {
+) -> Option<(String, PayloadBlob)> {
     use ::base64::Engine as _;
 
-    let member = blob_payload(api, operation)?;
+    let carried = blob_payload(api, operation)?;
     let mut read = ::serde_json::from_str::<Map<String, Value>>(document).ok()?;
     read.insert(
-        member.clone(),
+        carried.member.clone(),
         Value::String(::base64::engine::general_purpose::STANDARD.encode(bytes)),
     );
-    Some((Value::Object(read).to_string(), member))
+    Some((Value::Object(read).to_string(), carried))
 }
 
 /// The output document of one answered call, keyed by the output shape's OWN member names —

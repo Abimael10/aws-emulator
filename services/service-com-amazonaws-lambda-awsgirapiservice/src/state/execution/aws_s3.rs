@@ -952,6 +952,9 @@ impl Observed {
             // than as a member of a JSON document, so the bytes of this answer are the ones
             // `streams` names and no value of its document is base64.
             blobs: Vec::new(),
+            // The object bytes an S3 answer carries are a `@streaming` payload, which is what
+            // `streams` names, so no answer of its binds a collected payload blob either.
+            payload_blobs: Vec::new(),
         })
     }
 }
@@ -988,6 +991,7 @@ fn refused<E: ProvideErrorMetadata>(
         request_id: carried.request_id,
         streams: Vec::new(),
         blobs: Vec::new(),
+        payload_blobs: Vec::new(),
     })
 }
 
@@ -1024,6 +1028,7 @@ fn refused_without_a_document<E: ProvideErrorMetadata>(
         request_id: carried.request_id,
         streams: Vec::new(),
         blobs: Vec::new(),
+        payload_blobs: Vec::new(),
     })
 }
 

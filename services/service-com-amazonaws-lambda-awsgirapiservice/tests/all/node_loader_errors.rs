@@ -64,6 +64,23 @@ pub(crate) async fn create_node_function(
     entries: &[(&str, &str)],
     handler: &str,
 ) {
+    create_node_function_within(router, engine, name, entries, handler, 10).await;
+}
+
+/// [`create_node_function`] with the function's own `Timeout` stated, in seconds.
+///
+/// A suite whose handler RUNS — one that loads the runtime's SDK, calls another service and
+/// waits for its answer — states a generous one, because the timeout is a limit of the
+/// function rather than anything such a suite asserts: a run that is slow only because the
+/// host is loaded would otherwise be answered by it instead of by the handler.
+pub(crate) async fn create_node_function_within(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    name: &str,
+    entries: &[(&str, &str)],
+    handler: &str,
+    timeout: i64,
+) {
     let created = create_function(
         router,
         &json!({
@@ -71,7 +88,7 @@ pub(crate) async fn create_node_function(
             "Role": ROLE,
             "Runtime": "nodejs20.x",
             "Handler": handler,
-            "Timeout": 10,
+            "Timeout": timeout,
             "MemorySize": 256,
             "Code": { "ZipFile": zip_file(&package(entries)) },
         }),

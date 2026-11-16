@@ -1912,6 +1912,7 @@ fn call_answer(answered: &Result<super::aws_api::Answer, Refusal>) -> String {
             "requestId": answer.request_id,
             "streams": answer.streams,
             "blobs": answer.blobs,
+            "payloadBlobs": answer.payload_blobs,
         })
         .to_string(),
         Err(refused) => refusal_answer_for(refused),

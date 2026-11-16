@@ -801,6 +801,7 @@ fn call_answer(answered: &Result<Answer, Refusal>) -> String {
         "requestId": answer.request_id,
         "streams": answer.streams,
         "blobs": answer.blobs,
+        "payloadBlobs": answer.payload_blobs,
     })
     .to_string()
 }

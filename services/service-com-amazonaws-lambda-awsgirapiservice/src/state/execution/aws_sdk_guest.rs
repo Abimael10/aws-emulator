@@ -1037,6 +1037,13 @@ class Client:
                 carried = document.get(member)
                 if isinstance(carried, str):
                     document[member] = StreamingBody(base64.b64decode(carried))
+            # The member bound to the WHOLE body whose blob is not a streaming one is handed
+            # over the same way: this SDK reads the payload of every output whose payload
+            # shape is a blob as a stream, whatever that shape's own traits say.
+            for member in answered.get("payloadBlobs") or ():
+                carried = document.get(member)
+                if isinstance(carried, str):
+                    document[member] = StreamingBody(base64.b64decode(carried))
             # Every other value the answer says carries bytes is handed over as those
             # bytes, which is what the SDK gives a caller for a blob member: a JSON
             # protocol travels one as base64 text, so the text is decoded wherever the

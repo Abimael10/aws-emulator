@@ -371,6 +371,7 @@ impl Observed {
             request_id: carried.request_id,
             streams: Vec::new(),
             blobs: Vec::new(),
+            payload_blobs: Vec::new(),
         })
     }
 
@@ -416,6 +417,7 @@ impl Observed {
             request_id: carried.request_id,
             streams: Vec::new(),
             blobs: Vec::new(),
+            payload_blobs: Vec::new(),
         })
     }
 }

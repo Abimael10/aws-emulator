@@ -514,6 +514,7 @@ impl Observed {
             // invalidation members carries bytes.
             streams: Vec::new(),
             blobs: Vec::new(),
+            payload_blobs: Vec::new(),
         })
     }
 }
@@ -550,6 +551,7 @@ fn refused<E: ProvideErrorMetadata>(
         request_id: carried.request_id,
         streams: Vec::new(),
         blobs: Vec::new(),
+        payload_blobs: Vec::new(),
     })
 }
 

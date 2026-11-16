@@ -446,6 +446,24 @@ function streamedBody(base64Text) {
     };
 }
 
+// The member an answer binds to the WHOLE body whose blob is not a streaming one is handed
+// over the way a v3 client hands over a body it COLLECTED: the caller is given the bytes
+// themselves, as a byte array carrying the two transforms a collected body also answers. So a
+// handler reads such a payload as bytes — `Buffer.from(payload)`, `payload.length`, an index —
+// exactly as it does on a managed runtime, where only a streaming body is handed over unread.
+//
+// The transforms of a COLLECTED body answer their value directly, where a streamed body's
+// answer a promise ([`streamedBody`]): the bytes are already read, so there is nothing for a
+// caller to await.
+function collectedBody(base64Text) {
+    var bytes = new Uint8Array(globalThis.Buffer.from(base64Text, 'base64'));
+    bytes.transformToByteArray = function () { return bytes; };
+    bytes.transformToString = function (encoding) {
+        return globalThis.Buffer.from(bytes).toString(encoding === undefined ? 'utf8' : encoding);
+    };
+    return bytes;
+}
+
 // Every OTHER value an answer carries BYTES in is handed over as the byte array a v3 client
 // gives a caller for a blob member, decoded from the base64 a JSON protocol travels it as.
 // `path` is the keys and indices that reach the one value from the document's root, as the
@@ -582,6 +600,14 @@ Client.prototype.send = function (command) {
             : answered.blobs;
         blobs.forEach(function (path) {
             materialiseBytes(document, path);
+        });
+        var collected = answered.payloadBlobs === undefined || answered.payloadBlobs === null
+            ? []
+            : answered.payloadBlobs;
+        collected.forEach(function (member) {
+            if (typeof document[member] === 'string') {
+                document[member] = collectedBody(document[member]);
+            }
         });
         document.$metadata = {
             httpStatusCode: answered.status,
