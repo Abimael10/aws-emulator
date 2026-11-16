@@ -43,6 +43,8 @@ mod image_version_pedigree;
 mod image_version_read_path;
 #[path = "all/image_version_status_publication.rs"]
 mod image_version_status_publication;
+#[path = "all/image_version_status_write_scope.rs"]
+mod image_version_status_write_scope;
 #[path = "all/list_tags_read_path.rs"]
 mod list_tags_read_path;
 #[path = "all/managed_base_image_catalogue.rs"]
