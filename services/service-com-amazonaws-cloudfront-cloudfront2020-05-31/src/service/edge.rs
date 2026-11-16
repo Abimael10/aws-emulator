@@ -156,6 +156,9 @@ pub mod functions;
 /// The `CloudFront-*` request headers the edge generates itself, and the viewer-stated ones
 /// it drops.
 pub mod generated_headers;
+/// The LAMBDA@EDGE function the matched behaviour associates, invoked on the viewer event it
+/// names.
+pub mod lambda_edge;
 /// The real-time log RECORD one served viewer request produces, and the Kinesis data streams
 /// the cache behaviour's real-time log configuration delivers it to.
 pub mod realtime_logs;
@@ -177,7 +180,7 @@ use super::origin_access::{self, OriginAccess};
 use compression::Encoding;
 use crate::ops::types::{
     AllowedMethods, CacheBehavior, DefaultCacheBehavior, ForwardedValues, FunctionAssociations,
-    Origin, ResponseHeadersPolicyConfig, TrustedKeyGroups,
+    LambdaFunctionAssociations, Origin, ResponseHeadersPolicyConfig, TrustedKeyGroups,
 };
 use crate::state::{
     managed_cache_policy, matches_path_pattern, same_domain, CachedEdgeResponse,
@@ -219,6 +222,16 @@ const CACHE_FUNCTION_GENERATED: &str = "FunctionGeneratedResponse from cloudfron
 /// names the function's execution as what went wrong, which is what separates it from a
 /// request the cache or an origin could not answer.
 const CACHE_FUNCTION_EXECUTION_ERROR: &str = "FunctionExecutionError from cloudfront";
+
+/// `X-Cache` for an answer a LAMBDA@EDGE function generated: the function returned a response
+/// object on the viewer-request event, so neither the cache nor an origin produced the answer
+/// and CloudFront reports the function as what did ([`lambda_edge`]).
+const CACHE_LAMBDA_GENERATED: &str = "LambdaGeneratedResponse from cloudfront";
+
+/// `X-Cache` for the answer CloudFront produces when a LAMBDA@EDGE function handed it no
+/// object to continue from: the outcome names that function's execution as what went wrong,
+/// which is what separates it from a request the cache or an origin could not answer.
+const CACHE_LAMBDA_EXECUTION_ERROR: &str = "LambdaExecutionError from cloudfront";
 
 /// The response (and origin-request) header carrying the identifier of the request the
 /// edge served, from `X-Amz-Cf-Id`: "identifies the request that you're interested in".
@@ -291,6 +304,16 @@ const FUNCTION_FAILED_STATUS: u16 = functions::FAILED_STATUS;
 const FUNCTION_FAILED_DETAIL: &str =
     "The CloudFront function associated with the CloudFront distribution is invalid or could \
      not be executed.";
+
+/// The status a viewer request gets when the LAMBDA@EDGE function the matched behaviour
+/// associates produced nothing for the edge to continue from ([`lambda_edge::FAILED_STATUS`]).
+const LAMBDA_FAILED_STATUS: u16 = lambda_edge::FAILED_STATUS;
+
+/// The detail line CloudFront's generated page carries for that failure, which names the
+/// Lambda@Edge association as the thing that could not be carried out.
+const LAMBDA_FAILED_DETAIL: &str =
+    "The Lambda function associated with the CloudFront distribution is invalid or doesn't \
+     have the required permissions.";
 
 /// The detail line CloudFront's generated page carries for a request it refused.
 const BAD_REQUEST_DETAIL: &str = "Bad request.";
@@ -760,6 +783,10 @@ struct Behavior {
     /// `FunctionAssociations` — "a list of CloudFront functions that are associated with a
     /// cache behavior", each naming the viewer event its function runs on ([`functions`]).
     function_associations: Option<FunctionAssociations>,
+    /// `LambdaFunctionAssociations` — "a complex type that contains zero or more
+    /// `LambdaFunctionAssociation` items for this cache behavior", each naming the event its
+    /// Lambda@Edge function is invoked on ([`lambda_edge`]).
+    lambda_function_associations: Option<LambdaFunctionAssociations>,
 }
 
 impl Behavior {
@@ -780,6 +807,7 @@ impl Behavior {
             forwarded_values: behavior.forwarded_values.clone(),
             response_headers_policy_id: behavior.response_headers_policy_id.clone(),
             function_associations: behavior.function_associations.clone(),
+            lambda_function_associations: behavior.lambda_function_associations.clone(),
         }
     }
 
@@ -800,6 +828,7 @@ impl Behavior {
             forwarded_values: behavior.forwarded_values.clone(),
             response_headers_policy_id: behavior.response_headers_policy_id.clone(),
             function_associations: behavior.function_associations.clone(),
+            lambda_function_associations: behavior.lambda_function_associations.clone(),
         }
     }
 
@@ -1217,6 +1246,58 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             }
         }
     }
+    // The LAMBDA@EDGE function the matched behaviour associates on the viewer-request event is
+    // INVOKED here, in the place its event is raised: the same point of the request the
+    // CloudFront function's own event is, and under the same enforcement in front of it. What
+    // the function returns is what the edge continues with, by the same reading: the request it
+    // came back with is re-planned, a response it generated is served with no origin request
+    // made at all, and a run that produced neither leaves the edge nothing to continue from
+    // ([`lambda_edge`]).
+    //
+    // One event of one behaviour runs ONE function: a cache behaviour cannot associate both a
+    // CloudFront function and a Lambda@Edge function on the same event type, so where a stored
+    // configuration carries both, what the CloudFront function above already decided for this
+    // event stands.
+    let running = edge_functions
+        .as_ref()
+        .filter(|_| {
+            edge_refusal.is_none()
+                && function_answer.is_none()
+                && rewritten.is_none()
+                && matches!(plan, Plan::Hit { .. } | Plan::Fetch(_))
+        })
+        .and_then(|running| {
+            running
+                .lambda
+                .viewer_request
+                .as_ref()
+                .map(|associated| (running, associated))
+        });
+    if let Some((running, associated)) = running {
+        let event = function_event(running, req, &cf_id, &running.viewer_path, &running.query);
+        let body = req.body().bytes().map(<[u8]>::to_vec).unwrap_or_default();
+        match lambda_edge::run_viewer_request(ctx, associated, &event, &body).await {
+            functions::Rewritten::Request(request) => {
+                match rewritten_request(req, &running.viewer_path, &request) {
+                    Some(request) => {
+                        // Planned again, for the request the function returned, exactly as a
+                        // CloudFront function's rewrite is.
+                        let store = state.lock();
+                        (_, plan) = plan_request(&store, &request, &cf_id, now);
+                        drop(store);
+                        rewritten = Some(request);
+                    }
+                    None => function_answer = Some(refused_by_edge_function(&cf_id)),
+                }
+            }
+            functions::Rewritten::Response(response) => {
+                function_answer = Some(answer_of_edge_function(response, &cf_id));
+            }
+            functions::Rewritten::Failed => {
+                function_answer = Some(refused_by_edge_function(&cf_id));
+            }
+        }
+    }
     // From here on the request is the one that function returned, where it returned one: the
     // cache key, the origin fetch and the log record are all that request's.
     let req = rewritten.as_ref().unwrap_or(req);
@@ -1322,6 +1403,41 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         response = match functions::run_viewer_response(associated, &event, &response).await {
             Some(answered) => answered,
             None => refused_by_function(&cf_id),
+        };
+    }
+    // The LAMBDA@EDGE function the matched behaviour associates on the viewer-response event,
+    // invoked where that event is raised: on the answer the edge is about to serve, last of
+    // everything that touches it, and only on an answer an ORIGIN produced or the cache held —
+    // a page CloudFront generated itself and a response a viewer-request function generated
+    // are not answers this event is raised for. One event runs one function, for the reason
+    // the viewer-request event above states.
+    if let Some(associated) = edge_functions
+        .as_ref()
+        .filter(|running| {
+            running.associations.viewer_response.is_none()
+                && matches!(
+                    served_from,
+                    edge_metrics::ServedFrom::Origin | edge_metrics::ServedFrom::EdgeCache
+                )
+        })
+        .and_then(|running| {
+            running
+                .lambda
+                .viewer_response
+                .as_ref()
+                .map(|associated| (running, associated))
+        })
+    {
+        let (running, associated) = associated;
+        let (viewer_path, query) = match served_for.as_ref() {
+            Some(served) => (served.viewer_path.as_str(), served.query.as_str()),
+            None => (running.viewer_path.as_str(), running.query.as_str()),
+        };
+        let event = function_event(running, req, &cf_id, viewer_path, query);
+        response = match lambda_edge::run_viewer_response(ctx, associated, &event, &response).await
+        {
+            Some(answered) => answered,
+            None => refused_by_edge_function(&cf_id),
         };
     }
     // What the edge DID with this request is reported as the distribution's own CloudWatch
@@ -1508,8 +1624,9 @@ struct ServedFor {
     response_headers_policy: Option<ResponseHeadersPolicyConfig>,
 }
 
-/// The distribution one viewer request resolved to and the CLOUDFRONT FUNCTIONS its matched
-/// cache behaviour associates, read in one pass under the store's lock before the edge does
+/// The distribution one viewer request resolved to and the FUNCTIONS its matched cache
+/// behaviour associates — the CloudFront functions it runs itself and the Lambda@Edge
+/// functions it invokes — read in one pass under the store's lock before the edge does
 /// anything else with the request.
 ///
 /// Held only for a request whose behaviour really associates a function: a behaviour that
@@ -1527,6 +1644,9 @@ struct EdgeFunctions {
     query: String,
     /// The functions the behaviour associates, by the event each runs on.
     associations: functions::Associations,
+    /// The LAMBDA@EDGE functions the behaviour associates, by the viewer event each is invoked
+    /// on ([`lambda_edge`]).
+    lambda: lambda_edge::Associations,
 }
 
 /// The functions the behaviour this request's path selects associates, or `None` when the
@@ -1543,12 +1663,14 @@ fn associated_functions(
     // decide, whatever that function then rewrites.
     let behavior = select_behavior(resolved.distribution, resolved.viewer_path);
     let associations = functions::associations(store, behavior.function_associations.as_ref());
-    (!associations.is_empty()).then(|| EdgeFunctions {
+    let lambda = lambda_edge::associations(behavior.lambda_function_associations.as_ref());
+    (!associations.is_empty() || !lambda.is_empty()).then(|| EdgeFunctions {
         distribution_id: resolved.distribution.id.clone(),
         domain_name: resolved.distribution.domain_name.clone(),
         viewer_path: resolved.viewer_path.to_string(),
         query: addressed.query.to_string(),
         associations,
+        lambda,
     })
 }
 
@@ -1652,6 +1774,18 @@ fn answer_of_function(answer: functions::Generated, cf_id: &str) -> RtResponse {
         CACHE_FUNCTION_GENERATED,
         cf_id,
     );
+    for (name, value) in answer.headers {
+        let _ = response.headers_mut().try_append(name, value);
+    }
+    response
+}
+
+/// The answer the edge serves for a response a LAMBDA@EDGE viewer-request function GENERATED:
+/// the status, the headers and the bytes that function stated, reported under the cache
+/// outcome that names the Lambda@Edge function as what produced it
+/// ([`CACHE_LAMBDA_GENERATED`]).
+fn answer_of_edge_function(answer: functions::Generated, cf_id: &str) -> RtResponse {
+    let mut response = served(answer.status, answer.body, CACHE_LAMBDA_GENERATED, cf_id);
     for (name, value) in answer.headers {
         let _ = response.headers_mut().try_append(name, value);
     }
@@ -2732,6 +2866,19 @@ fn refused_by_function(cf_id: &str) -> RtResponse {
     )
 }
 
+/// The answer the edge serves when the LAMBDA@EDGE function the matched behaviour associates
+/// produced nothing to continue from: CloudFront's own page for that failure, under the cache
+/// outcome that names the Lambda@Edge function's execution as what went wrong
+/// ([`CACHE_LAMBDA_EXECUTION_ERROR`]).
+fn refused_by_edge_function(cf_id: &str) -> RtResponse {
+    generated_page(
+        LAMBDA_FAILED_STATUS,
+        LAMBDA_FAILED_DETAIL,
+        cf_id,
+        CACHE_LAMBDA_EXECUTION_ERROR,
+    )
+}
+
 /// The redirect CloudFront answers a viewer whose behaviour is `redirect-to-https`: the
 /// status, the HTTPS URL to resubmit the request to, and the page CloudFront serves beside
 /// it.
@@ -3238,6 +3385,7 @@ mod tests {
                 forwarded_values: None,
                 response_headers_policy_id: None,
                 function_associations: None,
+                lambda_function_associations: None,
             };
             let mut req = RtRequest::new(SdkBody::empty());
             req.set_uri("/index.html").expect("a valid URI");
@@ -3527,6 +3675,7 @@ mod tests {
             forwarded_values: None,
             response_headers_policy_id: None,
             function_associations: None,
+            lambda_function_associations: None,
         }
     }
 

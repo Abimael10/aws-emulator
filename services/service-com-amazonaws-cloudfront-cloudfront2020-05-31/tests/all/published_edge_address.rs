@@ -557,6 +557,17 @@ async fn published_domain(router: &MultiServiceRouter, reference: &str) -> Strin
     domain
 }
 
+/// How long the dial below waits to CONNECT to the published address, and how long it then
+/// waits for the whole answer to arrive.
+///
+/// Both are deliberately far past what either step needs: the address is a listener of this
+/// process, and what answers there may run a cache behaviour's associated function, on a
+/// machine that may be busy with every other test of this workspace. What a case asserts is
+/// the ANSWER, never how quickly it came, so these deadlines exist only to fail a dial nothing
+/// is listening on rather than to time one.
+const DIAL_DEADLINE: Duration = Duration::from_secs(60);
+const ANSWER_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Dial `authority` in the clear and send one HTTP/1.1 request, answering the status line
 /// and the headers and body that follow it.
 ///
@@ -605,7 +616,7 @@ pub(crate) async fn dial_with(
         .unwrap_or_else(|error| panic!("the published address {authority} is no address: {error}"))
         .port();
     let mut stream = ::tokio::time::timeout(
-        Duration::from_secs(5),
+        DIAL_DEADLINE,
         ::tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
     )
     .await
@@ -622,7 +633,7 @@ pub(crate) async fn dial_with(
         .await
         .unwrap_or_else(|error| panic!("the request to {authority} was not sent: {error}"));
     let mut answer = Vec::new();
-    let read = ::tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+    let read = ::tokio::time::timeout(ANSWER_DEADLINE, stream.read_to_end(&mut answer))
         .await
         .unwrap_or_else(|_| panic!("the published address {authority} did not answer in time"));
     read.unwrap_or_else(|error| panic!("the answer from {authority} was not read: {error}"));

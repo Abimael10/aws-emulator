@@ -107,13 +107,19 @@ const SET_COOKIE_HEADER: &str = "set-cookie";
 
 /// The headers a function may NOT change on a viewer REQUEST event, so the value the viewer
 /// request already had is kept whatever the function returned for it.
-const READ_ONLY_REQUEST_HEADERS: [&str; 4] = ["content-length", "host", "transfer-encoding", "via"];
+///
+/// `pub(super)` because the same headers are read-only on the same event for a Lambda@Edge
+/// function ([`super::lambda_edge`]): one reading of which values the edge keeps.
+pub(super) const READ_ONLY_REQUEST_HEADERS: [&str; 4] =
+    ["content-length", "host", "transfer-encoding", "via"];
 
 /// The headers a function may NOT change on a viewer RESPONSE event. The two that describe
 /// the bytes the edge is serving are here because the edge — not the function — decided them:
 /// an answer may have been compressed for this viewer before the event ran
 /// ([`super::compression`]), so a function's value for them would describe bytes nobody sent.
-const READ_ONLY_RESPONSE_HEADERS: [&str; 4] = [
+///
+/// `pub(super)` for the reason [`READ_ONLY_REQUEST_HEADERS`] is.
+pub(super) const READ_ONLY_RESPONSE_HEADERS: [&str; 4] = [
     "content-encoding",
     "content-length",
     "transfer-encoding",
@@ -122,8 +128,11 @@ const READ_ONLY_RESPONSE_HEADERS: [&str; 4] = [
 
 /// The smallest and largest status a response object may carry: an HTTP status code names a
 /// class between these, so a value outside them is no status a viewer can be answered with.
-const MIN_STATUS: u64 = 100;
-const MAX_STATUS: u64 = 599;
+///
+/// `pub(super)` because the status a LAMBDA@EDGE response object carries is read against the
+/// same range ([`super::lambda_edge`]).
+pub(super) const MIN_STATUS: u64 = 100;
+pub(super) const MAX_STATUS: u64 = 599;
 
 /// The code of one function association: which function, and the bytes of the `LIVE` stage
 /// that run.
@@ -507,7 +516,11 @@ fn response_object(response: &RtResponse) -> Json {
 /// The phrases RFC 9110 registers for the statuses an origin answers and CloudFront
 /// generates; a status with none is carried by its code alone, which is what the member
 /// documents ("the HTTP status description").
-fn status_reason(status: u16) -> Option<&'static str> {
+/// The reason phrase of `status`, which the response object states beside the code.
+///
+/// `pub(super)` because a Lambda@Edge response object states the same phrase beside its own
+/// status ([`super::lambda_edge`]): one reading of what a status is called.
+pub(super) fn status_reason(status: u16) -> Option<&'static str> {
     ::http::StatusCode::from_u16(status)
         .ok()
         .and_then(|status| status.canonical_reason())
@@ -522,16 +535,27 @@ fn request_headers(request: &Json, viewer: &[(String, String)]) -> Vec<(String, 
         &READ_ONLY_REQUEST_HEADERS,
         Case::Lowercased,
     );
-    for name in READ_ONLY_REQUEST_HEADERS {
-        for (held, value) in viewer.iter().filter(|(held, _)| held == name) {
-            headers.push((held.clone(), value.clone()));
-        }
-    }
+    headers.extend(kept_request_headers(viewer));
     let cookies = cookie_header(member(request, COOKIES_MEMBER));
     if !cookies.is_empty() {
         headers.push((COOKIE_HEADER.to_string(), cookies));
     }
     headers
+}
+
+/// The headers a function may not change on a viewer-REQUEST event, as the VIEWER request had
+/// them: the values that are kept whatever the function returned for those names.
+///
+/// `pub(super)` because the same names are read-only on the same event for a Lambda@Edge
+/// function ([`super::lambda_edge`]), and both planes keep them from the same place.
+pub(super) fn kept_request_headers(viewer: &[(String, String)]) -> Vec<(String, String)> {
+    let mut kept = Vec::new();
+    for name in READ_ONLY_REQUEST_HEADERS {
+        for (held, value) in viewer.iter().filter(|(held, _)| held == name) {
+            kept.push((held.clone(), value.clone()));
+        }
+    }
+    kept
 }
 
 /// The answer's headers as the viewer receives them: what the function returned, with the
@@ -543,13 +567,23 @@ fn response_headers(returned: &Json, response: &RtResponse) -> Vec<(String, Stri
         &READ_ONLY_RESPONSE_HEADERS,
         Case::Lowercased,
     );
-    for name in READ_ONLY_RESPONSE_HEADERS {
-        for value in response.headers().get_all(name) {
-            headers.push((name.to_string(), value.to_string()));
-        }
-    }
+    headers.extend(kept_response_headers(response));
     headers.extend(set_cookie_headers(member(returned, COOKIES_MEMBER)));
     headers
+}
+
+/// The headers a function may not change on a viewer-RESPONSE event, as the EDGE had them for
+/// the answer it is about to serve.
+///
+/// `pub(super)` for the reason [`kept_request_headers`] is.
+pub(super) fn kept_response_headers(response: &RtResponse) -> Vec<(String, String)> {
+    let mut kept = Vec::new();
+    for name in READ_ONLY_RESPONSE_HEADERS {
+        for value in response.headers().get_all(name) {
+            kept.push((name.to_string(), value.to_string()));
+        }
+    }
+    kept
 }
 
 /// The response a function generated: its status, its headers and the bytes it stated.
@@ -605,7 +639,10 @@ fn body_bytes(body: Option<&Json>) -> Vec<u8> {
 }
 
 /// The text `member` carries, when it carries text.
-fn text(object: &Json, member: &str) -> Option<String> {
+///
+/// `pub(super)` because a Lambda@Edge object's members are read the same way
+/// ([`super::lambda_edge`]).
+pub(super) fn text(object: &Json, member: &str) -> Option<String> {
     object
         .get(member)
         .and_then(Json::as_str)

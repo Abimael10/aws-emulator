@@ -128,7 +128,7 @@ pub async fn edge_association_role_refusal(
     // share the IAM reads that judged it.
     let mut judged: Vec<(String, bool)> = Vec::new();
     for function_arn in edge_association_arns(config) {
-        let Some(region) = region_of(function_arn) else {
+        let Some(region) = lambda_region_of(function_arn) else {
             continue;
         };
         if lambda.as_ref().is_none_or(|(held, _)| *held != region) {
@@ -254,7 +254,11 @@ async fn role_withholds_edge_invocation(
 }
 
 /// The Region a Lambda function ARN names, through the crate's one ARN parse.
-fn region_of(function_arn: &str) -> Option<&str> {
+///
+/// `pub(crate)` because the data plane addresses its own invocation of an associated function
+/// to the same Region ([`crate::service::edge::lambda_edge`]): one reading of which Region an
+/// association's ARN names.
+pub(crate) fn lambda_region_of(function_arn: &str) -> Option<&str> {
     ::service_common::arn::parse_of(function_arn, LAMBDA_ARN_NAMESPACE)
         .map(|arn| arn.region)
         .filter(|region| !region.is_empty())
@@ -262,12 +266,15 @@ fn region_of(function_arn: &str) -> Option<&str> {
 
 /// The Lambda client this module's reads are made with.
 ///
+/// `pub(crate)` because the data plane invokes an associated function over the same transport
+/// ([`crate::service::edge::lambda_edge`]): one reading of how this service reaches Lambda.
+///
 /// The transport is the emulator's own, in process, so the call is served by the Lambda this
 /// emulator mounts and no connection is opened; the credentials are the ones the callback
 /// hands over, which sign this call and are never reported or logged. There is nothing to
 /// retry, time out or watch for a stalled stream on that transport, and each of those would
 /// need a sleep implementation this client is not given.
-fn lambda_client(
+pub(crate) fn lambda_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_lambda::Client {

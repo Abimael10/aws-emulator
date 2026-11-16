@@ -260,6 +260,8 @@ mod lambda_edge_association_message;
 mod lambda_edge_config_round_trip;
 #[path = "all/lambda_edge_execution_role_trust.rs"]
 mod lambda_edge_execution_role_trust;
+#[path = "all/lambda_edge_viewer_function.rs"]
+mod lambda_edge_viewer_function;
 #[path = "all/managed_cache_policy_catalog.rs"]
 mod managed_cache_policy_catalog;
 #[path = "all/managed_cache_policy_delete_gate.rs"]
