@@ -300,7 +300,7 @@ async fn no_invocation_is_handed_more_records_than_the_mappings_batch_size() {
 
         // The delivery is also what the mapping reports it came to, read where a client
         // reads it.
-        let seen = results_until(&router, case, &uuid, RESULT_OK).await;
+        let seen = results_until(&router, case, &uuid, RESULT_OK, Instant::now() + BUDGET).await;
         assert_eq!(
             seen.last().map(String::as_str),
             Some(RESULT_OK),

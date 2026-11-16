@@ -456,13 +456,20 @@ pub(crate) async fn stop_mapping(router: &MultiServiceRouter, case: &str, uuid: 
 
 /// Wait until the mapping reports `expected` as its `LastProcessingResult`, answering every
 /// result it reported on the way.
+///
+/// Every pass the mapping makes OVERWRITES that member, so a reader that took whatever result
+/// it found first could be reading a pass that was retried rather than the one it is waiting
+/// for: looking again until `expected` is there waits for THAT attempt, whatever the mapping
+/// came to before it. `deadline` is the CALLER's, so a suite that opens one deadline for the
+/// whole chain it drives shares that patience here instead of this wait taking a span of its
+/// own.
 pub(crate) async fn results_until(
     router: &MultiServiceRouter,
     case: &str,
     uuid: &str,
     expected: &str,
+    deadline: Instant,
 ) -> Vec<String> {
-    let deadline = Instant::now() + BUDGET;
     let mut seen: Vec<String> = Vec::new();
     loop {
         let read = get_mapping(router, case, uuid).await;
@@ -772,7 +779,8 @@ async fn a_dynamodb_stream_mapping_invokes_its_function_with_the_records_it_read
 
         // The records reach the handler, and what it made of them is what the mapping
         // reports: no other component of this emulator decides this value.
-        let seen = results_until(&router, case, &uuid, row.expected_result).await;
+        let seen =
+            results_until(&router, case, &uuid, row.expected_result, Instant::now() + BUDGET).await;
         assert_eq!(
             seen.last().map(String::as_str),
             Some(row.expected_result),
@@ -951,7 +959,7 @@ async fn a_delivered_change_reaches_a_handler_that_writes_it_downstream() {
         // The delivery is what the mapping reports it came to — recorded by the poller
         // just after the invocation returned, so it is waited for rather than read at the
         // instant the item appeared.
-        let seen = results_until(&router, case, &uuid, RESULT_OK).await;
+        let seen = results_until(&router, case, &uuid, RESULT_OK, Instant::now() + BUDGET).await;
         assert_eq!(
             seen.last().map(String::as_str),
             Some(RESULT_OK),

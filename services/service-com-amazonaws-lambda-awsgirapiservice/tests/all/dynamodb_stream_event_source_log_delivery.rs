@@ -35,16 +35,22 @@
 //! written and how many of them one batch may hold, and which group the function logs to (the
 //! default, and one its `LoggingConfig` names). Each row is its OWN test, over an engine of its
 //! own — a test of this target runs in its own process, so the rows run beside each other and no
-//! test carries more than one row's work. The last test varies the remaining dimension — WHEN
-//! the table's stream was turned on: a table created without one, whose stream `UpdateTable`
-//! enables afterwards, is consumed exactly as a table created with one is.
+//! test carries more than one row's work. The last two tests vary the remaining dimensions —
+//! WHEN the table's stream was turned on: a table created without one, whose stream
+//! `UpdateTable` enables afterwards, is consumed exactly as a table created with one is; and
+//! WHICH attempt the mapping reports once a batch has been logged, over a mapping that gave up
+//! on the batch before it.
 //!
 //! No step waits a span of its own choosing and no assertion reads the clock: each row opens one
-//! deadline ([`ROW_BUDGET`]) and every look-again below shares it, so the row is as patient as
-//! the emulator's own run limits allow and still terminates.
+//! deadline ([`ROW_BUDGET`]) and every look-again below shares it — the last of them, the
+//! mapping's own report, holding a share of it back ([`REPORT_RESERVE`]) so the wait before it
+//! cannot spend the row's whole patience — so the row is as patient as the emulator's own run
+//! limits allow and still terminates.
 //!
 //! Nothing here waits a span of its own choosing: every state a row needs is waited for by
-//! looking again until it holds, so no assertion depends on how fast the host runs.
+//! looking again until THE STATE IT ASSERTS holds, the mapping's own report of its last
+//! attempt included — a member every pass the poller makes overwrites — so no assertion depends
+//! on how fast the host runs or on which pass happened to report first.
 //!
 //! Every test here RUNS handlers, so each takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
@@ -58,21 +64,22 @@ use serde_json::json;
 use service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
     HOST_WAIT_CEILING, PERMIT_WAIT,
 };
-use service_com_amazonaws_lambda_awsgirapiservice::state::LAST_PROCESSING_RESULT_OK;
+use service_com_amazonaws_lambda_awsgirapiservice::state::{
+    LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED, LAST_PROCESSING_RESULT_OK,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dynamodb_stream_event_source_delivery::{
-    dynamodb, given_table, KEY, LATEST, NEW_AND_OLD_IMAGES, TRIM_HORIZON,
+    dynamodb, given_table, results_until, KEY, LATEST, NEW_AND_OLD_IMAGES, TRIM_HORIZON,
 };
-use crate::event_source_mappings::{
-    given_enabled_mapping, processing_result_within_budget, router_on, LOOK_AGAIN,
-};
+use crate::event_source_mappings::{given_enabled_mapping, router_on, LOOK_AGAIN};
 use crate::invocation_log_delivery::{
     create_function, events, groups, streams, Created, PYTHON_RUNTIME,
 };
 
 /// How long ONE row is given for every state the clock owes it together — the mapping's poller
-/// taking its batches, the invocations running and their logs reaching the group.
+/// taking its batches, the invocations running, their logs reaching the group and the mapping
+/// reporting the attempt that consumed the batch.
 ///
 /// PATIENCE, not a weakened expectation: every assertion below is unchanged, and the steps SHARE
 /// this one deadline rather than each taking a span of its own, so the row is as patient as it
@@ -85,6 +92,24 @@ const ROW_BUDGET: Duration = PERMIT_WAIT
     .saturating_add(HOST_WAIT_CEILING)
     .saturating_mul(2)
     .saturating_add(Duration::from_secs(60));
+
+/// The share of [`ROW_BUDGET`] kept back for the LAST state a row waits for — the mapping's own
+/// report of the attempt that consumed the batch — so the wait for the log before it cannot
+/// leave that wait with no patience at all.
+///
+/// Taken from the same place the budget itself is: what the emulator allows ONE invocation, the
+/// wait for a share of the run capacity ([`PERMIT_WAIT`]) beside the wait for the run's own
+/// answer ([`HOST_WAIT_CEILING`]). That is the span the attempt a row is waiting for can still
+/// take once a line of an earlier pass is already in the group: such a pass is retried, and the
+/// retry is an invocation like any other. The row's whole patience is unchanged — this only
+/// decides how the row SPENDS it, and both halves stay far above what either state takes.
+const REPORT_RESERVE: Duration = PERMIT_WAIT.saturating_add(HOST_WAIT_CEILING);
+
+/// The instant the wait for the log of a row that shares `deadline` stops at: the row's own
+/// deadline less the share kept back for the report that follows it ([`REPORT_RESERVE`]).
+fn log_deadline(deadline: Instant) -> Instant {
+    deadline.checked_sub(REPORT_RESERVE).unwrap_or(deadline)
+}
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern. No IAM is
 /// mounted beside the services below, so nothing is known about the role and no read or write
@@ -126,18 +151,36 @@ const EVENT_SOURCE: &str = "aws:dynamodb";
 /// handler's source and into what the assertions look for.
 const MARKER: &str = "stream record: ";
 
+/// The key whose record the handler REFUSES to process, so the batch holding it is one the
+/// mapping attempts and gives up on. Nothing in the emulator reads it: the handler reads it off
+/// the record's own keys, and no other row writes an item keyed with it.
+const REFUSED: &str = "refused";
+
+/// How many attempts a mapping gives one batch when it allows no retry: "Discard records after
+/// the specified number of retries. The default value is infinite (-1)"
+/// (`MaximumRetryAttempts`), so a mapping stating zero retries attempts a batch once and then
+/// reads on from past it.
+const NO_RETRIES: i64 = 0;
+
+/// How many records one batch of the mapping below holds, so each record is a batch and an
+/// attempt of its own.
+const ONE_RECORD_PER_BATCH: i64 = 1;
+
 /// The handler every function below runs: one printed line per record of the batch it was
 /// handed, carrying that record's own mutation and key, so a line in the log group is a
 /// consequence of the record having reached the handler.
 ///
 /// It also checks the envelope Lambda hands a stream batch over as, so a batch delivered in
-/// some other shape fails the run instead of being logged.
+/// some other shape fails the run instead of being logged, and it raises for the one key the
+/// rows below refuse a record under ([`REFUSED`]) — before printing anything about it, so such
+/// a record has no line of its own at all.
 fn logging_handler() -> String {
     format!(
         r#"
 MARKER = "{MARKER}"
 EVENT_SOURCE = "{EVENT_SOURCE}"
 KEY = "{KEY}"
+REFUSED = "{REFUSED}"
 
 
 def lambda_handler(event, context):
@@ -151,6 +194,8 @@ def lambda_handler(event, context):
             raise ValueError("a record carries no eventSourceARN")
         change = record["dynamodb"]
         key = change["Keys"][KEY]["S"]
+        if key.startswith(REFUSED):
+            raise RuntimeError("the handler cannot process " + key)
         print(MARKER + record["eventName"] + " " + key)
     return len(records)
 "#
@@ -423,7 +468,7 @@ async fn assert_delivered_and_logged(
         .log_group
         .map_or_else(|| format!("{DEFAULT_GROUP_PREFIX}{function}"), str::to_string);
     let wanted = expected_lines(row);
-    let lines = logged(router, case, &group, &wanted, deadline).await;
+    let lines = logged(router, case, &group, &wanted, log_deadline(deadline)).await;
     for line in &wanted {
         assert!(
             lines.iter().any(|written| written.contains(line)),
@@ -439,16 +484,18 @@ async fn assert_delivered_and_logged(
         "case {case:?}: the delivery must have created {group:?}, got {named:?}"
     );
     // And the mapping says what its attempt at the batch came to, which is the other half a
-    // client watches a consumer by. Read through the suite harness's ONE waiter for that
-    // member, because the mapping's record is written by the poller that took the batch: a row
-    // that asked once would be reading an instant of its own choosing in the middle of the
-    // chain the log read above only proves the start of.
-    let reported = processing_result_within_budget(router, case, &uuid).await;
+    // client watches a consumer by. Waited for by looking again until the mapping reports THAT
+    // attempt, because every pass the mapping makes overwrites the member: a row that took the
+    // first result it found could be reading a pass that was retried — one the host was too
+    // busy to answer in time, say — rather than the one that consumed the batch the log above
+    // only proves the delivery of. The wait shares the row's own deadline, like every other
+    // look-again here.
+    let reported = results_until(router, case, &uuid, LAST_PROCESSING_RESULT_OK, deadline).await;
     assert_eq!(
-        reported.as_deref(),
+        reported.last().map(String::as_str),
         Some(LAST_PROCESSING_RESULT_OK),
         "case {case:?}: the mapping must report the attempt that consumed its batch as \
-         {LAST_PROCESSING_RESULT_OK}, got {reported:?}"
+         {LAST_PROCESSING_RESULT_OK}, saw {reported:?}"
     );
 }
 
@@ -553,6 +600,108 @@ async fn a_stream_enabled_after_the_create_is_consumed_by_its_mapping() {
     );
 
     assert_delivered_and_logged(&router, &row, function, table, &stream_arn, deadline).await;
+}
+
+/// RULE, over the remaining dimension of what the pair reports: `LastProcessingResult` is "the
+/// result of the event source mapping's LAST processing attempt", and every pass the mapping
+/// makes overwrites it — so once a batch has been delivered and logged, the attempt the mapping
+/// reports is the one that CONSUMED that batch, whatever it came to on a batch before it.
+///
+/// This row FORCES the earlier attempt rather than leaving it to a host that happens to be busy
+/// enough to make one: a mapping that allows no retry is handed a record its handler refuses,
+/// gives up on that batch, and then consumes the record written behind it. So a reader of that
+/// member which took whatever result it found first — the attempt that was given up on — would
+/// be reading a pass that is not the one it is waiting for, which is what every row above waits
+/// past.
+#[tokio::test]
+async fn the_attempt_that_consumed_the_batch_is_what_the_mapping_reports() {
+    let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
+    let deadline = Instant::now() + ROW_BUDGET;
+    let case = "a batch given up on, then one consumed, read one record per batch";
+    let router = emulator();
+    let name = "ddb-stream-log-given-up";
+    let stream_arn = given_table(&router, case, name, Some(NEW_AND_OLD_IMAGES)).await;
+    let source = logging_handler();
+    create_function(
+        &router,
+        &Created {
+            case,
+            name,
+            source: &source,
+            runtime: PYTHON_RUNTIME,
+            role: ROLE,
+            log_group: None,
+        },
+    )
+    .await;
+    let uuid = given_enabled_mapping(
+        &router,
+        case,
+        &json!({
+            "FunctionName": name,
+            "EventSourceArn": stream_arn,
+            "StartingPosition": TRIM_HORIZON,
+            "BatchSize": ONE_RECORD_PER_BATCH,
+            "MaximumRetryAttempts": NO_RETRIES,
+            "Enabled": true,
+        }),
+    )
+    .await;
+
+    // The record the handler refuses: the one attempt the mapping gives that batch is spent on
+    // it, so the mapping reports the attempt it gave up on and reads on from past the record.
+    let refused_key = format!("{REFUSED}-0");
+    put_item(&router, case, name, &refused_key, "written").await;
+    let given_up = results_until(
+        &router,
+        case,
+        &uuid,
+        LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
+        deadline,
+    )
+    .await;
+    assert_eq!(
+        given_up.last().map(String::as_str),
+        Some(LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED),
+        "case {case:?}: the attempt its handler refused must be reported as \
+         {LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED}, saw {given_up:?}"
+    );
+
+    // Then the record behind it, which the handler does process: its line is delivered to the
+    // function's group exactly as it is for a mapping that gave up on nothing.
+    let key = item_key(0);
+    put_item(&router, case, name, &key, "written").await;
+    let group = format!("{DEFAULT_GROUP_PREFIX}{name}");
+    let wanted = expected_line(INSERT, &key);
+    let lines = logged(
+        &router,
+        case,
+        &group,
+        std::slice::from_ref(&wanted),
+        log_deadline(deadline),
+    )
+    .await;
+    assert!(
+        lines.iter().any(|written| written.contains(&wanted)),
+        "case {case:?}: the handler's line {wanted:?} must be delivered to {group:?}, got \
+         {lines:?}"
+    );
+    let refused_line = expected_line(INSERT, &refused_key);
+    assert!(
+        !lines.iter().any(|written| written.contains(&refused_line)),
+        "case {case:?}: the record the handler refused must have no line of its own, got \
+         {lines:?}"
+    );
+
+    // And what the mapping reports is the attempt that consumed THAT batch, not the one it gave
+    // up on before it.
+    let reported = results_until(&router, case, &uuid, LAST_PROCESSING_RESULT_OK, deadline).await;
+    assert_eq!(
+        reported.last().map(String::as_str),
+        Some(LAST_PROCESSING_RESULT_OK),
+        "case {case:?}: the mapping must report the attempt that consumed its batch as \
+         {LAST_PROCESSING_RESULT_OK}, saw {reported:?}"
+    );
 }
 
 /// Wait until `DescribeTable` reports the table `ACTIVE` with a stream, and answer that

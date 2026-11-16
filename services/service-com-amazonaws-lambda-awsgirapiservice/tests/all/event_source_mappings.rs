@@ -624,8 +624,12 @@ pub(crate) async fn await_mapping_state(
 /// controls. So a suite that has seen the batch go reads the result the same way it reads
 /// every other piece of work the mapping owes — by looking again until it is there.
 ///
-/// THE ONE waiter for that member in these suites, so no row reads it once at an instant of
-/// its own choosing.
+/// THE ONE waiter for THAT question in these suites — whether an attempt has been reported at
+/// all — so no row reads the member once at an instant of its own choosing. A row that asserts
+/// a NAMED result waits for that result instead
+/// ([`crate::dynamodb_stream_event_source_delivery::results_until`]), because every pass the
+/// mapping makes overwrites the member: the first result there is can be a pass that was
+/// retried rather than the one the row is waiting for.
 pub(crate) async fn processing_result_within_budget(
     router: &MultiServiceRouter,
     case: &str,
