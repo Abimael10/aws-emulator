@@ -548,9 +548,7 @@ fn unstored_resource_calls() -> Vec<(Call, u16, &'static str)> {
 /// Create a domain with one of every resource the calls address, through the same HTTP
 /// surface a client uses.
 async fn served(dz: &Emulator, domain_name: &str) -> Served {
-    let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": domain_name })))
-        .await;
+    let created = dz.create_domain(json!({ "name": domain_name })).await;
     assert_eq!(
         created.status, 201,
         "creating domain {domain_name:?}: expected 201, got {} {:?}",

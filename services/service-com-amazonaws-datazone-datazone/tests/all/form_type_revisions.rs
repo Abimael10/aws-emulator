@@ -672,7 +672,7 @@ async fn a_domain_that_is_not_available_cannot_take_a_form_type() {
     // Read back straight away, so the domain is still in the status the clock owes a
     // transition out of.
     let creating = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "pending-domain" })))
+        .create_domain(json!({ "name": "pending-domain" }))
         .await;
     assert_eq!(
         creating.status, 201,
@@ -707,7 +707,7 @@ async fn a_domain_that_is_not_available_cannot_take_a_form_type() {
     );
 
     // Once the clock has settled the domain, the same call is accepted.
-    tokio::time::sleep(SETTLED).await;
+    dz.await_domain_status(&domain, "AVAILABLE").await;
     let project = dz.project(&domain, "late owner").await;
     let accepted = dz
         .call(

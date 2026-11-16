@@ -218,7 +218,7 @@ async fn tags_given_at_create_are_the_resources_initial_tag_set() {
     ];
 
     for (label, body) in cases {
-        let created = dz.call("POST", "/v2/domains", Some(body.clone())).await;
+        let created = dz.create_domain(body.clone()).await;
         assert_eq!(
             created.status, 201,
             "case {label:?}: expected 201 from CreateDomain, got {} {:?}",

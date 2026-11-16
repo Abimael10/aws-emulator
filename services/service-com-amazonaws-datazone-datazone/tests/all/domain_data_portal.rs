@@ -61,7 +61,7 @@ fn published_portal_url(base: &str, domain_id: &str) -> String {
 async fn created_domains(dz: &Emulator, base: &str) -> Vec<(&'static str, String, String, String)> {
     let mut created = Vec::new();
     for (case, body) in domain_bodies() {
-        let answer = dz.call("POST", "/v2/domains", Some(body.clone())).await;
+        let answer = dz.create_domain(body.clone()).await;
         assert_eq!(
             answer.status, 201,
             "case {base:?}/{case:?}: expected 201 from CreateDomain, got {} {:?}",
@@ -239,7 +239,7 @@ async fn the_portal_page_follows_the_stored_domain() {
     let base = ENDPOINT_BASES[0];
     let dz = Emulator::served_at(base);
     let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "Sales" })))
+        .create_domain(json!({ "name": "Sales" }))
         .await;
     assert_eq!(
         created.status, 201,

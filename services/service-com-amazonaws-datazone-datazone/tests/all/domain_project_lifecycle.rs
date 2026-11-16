@@ -102,9 +102,7 @@ async fn created_domains_are_persisted_and_reported_by_get_and_list() {
     let mut created: Vec<(&'static str, String, Value)> = Vec::new();
 
     for case in domain_cases() {
-        let answer = dz
-            .call("POST", "/v2/domains", Some(case.body.clone()))
-            .await;
+        let answer = dz.create_domain(case.body.clone()).await;
         assert_eq!(
             answer.status, 201,
             "case {:?}: expected 201, got {} {:?}",
@@ -167,7 +165,10 @@ async fn created_domains_are_persisted_and_reported_by_get_and_list() {
         );
     }
 
-    tokio::time::sleep(SETTLED).await;
+    // Wait for the transition the clock owes each domain, looking again until it holds.
+    for (_, id, _) in &created {
+        dz.await_domain_status(id, "AVAILABLE").await;
+    }
 
     for (label, id, request) in &created {
         let got = dz.call("GET", &format!("/v2/domains/{id}"), None).await;
@@ -283,7 +284,7 @@ async fn list_domains_filters_by_status_and_pages_through_every_stored_domain() 
     let dz = Emulator::new();
     let mut expected_ids: Vec<String> = Vec::new();
     for case in domain_cases() {
-        let answer = dz.call("POST", "/v2/domains", Some(case.body)).await;
+        let answer = dz.create_domain(case.body).await;
         assert_eq!(answer.status, 201, "case {:?}: expected 201", case.label);
         expected_ids.push(answer.s("id"));
     }
@@ -306,7 +307,10 @@ async fn list_domains_filters_by_status_and_pages_through_every_stored_domain() 
         available.body
     );
 
-    tokio::time::sleep(SETTLED).await;
+    // Wait for the transition the clock owes each domain, looking again until it holds.
+    for id in &expected_ids {
+        dz.await_domain_status(id, "AVAILABLE").await;
+    }
 
     let creating = dz.call("GET", "/v2/domains?status=CREATING", None).await;
     assert_eq!(
@@ -407,8 +411,8 @@ async fn an_unknown_or_malformed_domain_identifier_is_refused() {
 async fn a_repeated_client_token_returns_the_first_domain() {
     let dz = Emulator::new();
     let body = json!({ "name": "idempotent-domain", "clientToken": "token-one" });
-    let first = dz.call("POST", "/v2/domains", Some(body.clone())).await;
-    let second = dz.call("POST", "/v2/domains", Some(body)).await;
+    let first = dz.create_domain(body.clone()).await;
+    let second = dz.create_domain(body).await;
     assert_eq!(
         first.s("id"),
         second.s("id"),
@@ -419,11 +423,7 @@ async fn a_repeated_client_token_returns_the_first_domain() {
     // A different token, with a name no live domain holds, creates a different domain:
     // only the token makes a request a repeat.
     let other = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "idempotent-domain-two", "clientToken": "token-two" })),
-        )
+        .create_domain(json!({ "name": "idempotent-domain-two", "clientToken": "token-two" }))
         .await;
     assert_ne!(
         first.s("id"),
@@ -433,11 +433,7 @@ async fn a_repeated_client_token_returns_the_first_domain() {
     // A fresh token does NOT excuse a duplicate name: domain names are unique within
     // the account, so this is the modelled conflict rather than a third domain.
     let duplicate = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "idempotent-domain", "clientToken": "token-three" })),
-        )
+        .create_domain(json!({ "name": "idempotent-domain", "clientToken": "token-three" }))
         .await;
     assert_eq!(
         (duplicate.status, duplicate.error_code.as_str()),
@@ -461,13 +457,10 @@ async fn a_repeated_client_token_returns_the_first_domain() {
         .call("DELETE", &format!("/v2/domains/{doomed}"), None)
         .await;
     assert_eq!(deleted.status, 202, "expected 202, got {:?}", deleted.body);
-    tokio::time::sleep(SETTLED).await;
+    // Looked for until the deletion the clock owed has completed.
+    dz.await_domain_gone(&doomed).await;
     let after = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "idempotent-domain", "clientToken": "token-one" })),
-        )
+        .create_domain(json!({ "name": "idempotent-domain", "clientToken": "token-one" }))
         .await;
     assert_eq!(
         after.status, 201,
@@ -819,7 +812,7 @@ async fn a_project_needs_a_domain_that_exists_and_is_available() {
 
     // A domain that has not finished being created cannot take a project yet.
     let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "not-ready" })))
+        .create_domain(json!({ "name": "not-ready" }))
         .await;
     let domain = created.s("id");
     let early = dz
@@ -837,8 +830,9 @@ async fn a_project_needs_a_domain_that_exists_and_is_available() {
         early.body
     );
 
-    // Once the creation the clock owed has settled, the same request succeeds.
-    tokio::time::sleep(SETTLED).await;
+    // Once the creation the clock owed has settled, the same request succeeds. Looked for
+    // until the domain reports the settled status, never waited out.
+    dz.await_domain_status(&domain, "AVAILABLE").await;
     let accepted = dz
         .call(
             "POST",
@@ -954,7 +948,7 @@ async fn each_store_is_bounded_and_refuses_with_the_modelled_quota_error() {
     // Fill the domain store to its ceiling, then one more.
     for n in 0..MAX_DOMAINS {
         let answer = dz
-            .call("POST", "/v2/domains", Some(json!({ "name": format!("d{n}") })))
+            .create_domain(json!({ "name": format!("d{n}") }))
             .await;
         assert_eq!(
             answer.status, 201,
@@ -963,7 +957,7 @@ async fn each_store_is_bounded_and_refuses_with_the_modelled_quota_error() {
         );
     }
     let over = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "one too many" })))
+        .create_domain(json!({ "name": "one too many" }))
         .await;
     assert_eq!(
         (over.status, over.error_code.as_str()),
@@ -973,13 +967,14 @@ async fn each_store_is_bounded_and_refuses_with_the_modelled_quota_error() {
         over.body
     );
 
-    // The same bound holds per domain for projects.
-    tokio::time::sleep(SETTLED).await;
+    // The same bound holds per domain for projects, once a domain has settled enough to
+    // take one: the first domain of the listing is looked at until it reports AVAILABLE.
     let listed = dz.call("GET", "/v2/domains?maxResults=1", None).await;
     let domain = listed.body["items"][0]["id"]
         .as_str()
         .expect("a stored domain")
         .to_string();
+    dz.await_domain_status(&domain, "AVAILABLE").await;
     let projects_uri = format!("/v2/domains/{domain}/projects");
     for n in 0..MAX_PROJECTS_PER_DOMAIN {
         let answer = dz

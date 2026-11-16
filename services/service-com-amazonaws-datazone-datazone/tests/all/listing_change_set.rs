@@ -564,11 +564,7 @@ async fn a_change_set_needs_a_settled_domain_and_a_stored_entity() {
 
     // A domain that is still CREATING cannot take a change set yet.
     let creating = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "listing-still-creating" })),
-        )
+        .create_domain(json!({ "name": "listing-still-creating" }))
         .await;
     assert_eq!(
         creating.status, 201,

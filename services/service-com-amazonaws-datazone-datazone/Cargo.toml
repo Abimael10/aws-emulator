@@ -35,6 +35,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The account's own IAM records, mounted beside DataZone on one engine in
+# `tests/all/domain_execution_role.rs`: a domain create resolves the roles it names against
+# them, so the suite that drives that resolution has to serve IAM too.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

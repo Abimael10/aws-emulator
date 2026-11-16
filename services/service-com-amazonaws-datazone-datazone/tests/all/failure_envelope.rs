@@ -157,9 +157,7 @@ async fn every_failure_body_carries_the_error_shapes_own_members_whichever_rende
 
     // A SUCCESS is not an error envelope at all: it keeps every member the model gives
     // it, including one the rule above would have dropped from a failure.
-    let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "envelope" })))
-        .await;
+    let created = dz.create_domain(json!({ "name": "envelope" })).await;
     assert_eq!(
         created.status, 201,
         "CreateDomain: expected 201, got {} {:?}",

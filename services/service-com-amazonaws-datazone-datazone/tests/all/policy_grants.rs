@@ -24,7 +24,7 @@
 //! 6. A repeated `clientToken` answers with the grant the first request created instead
 //!    of adding a second one.
 
-use crate::harness::{Emulator, SETTLED};
+use crate::harness::Emulator;
 use serde_json::{json, Value};
 
 /// `GrantIdentifier`'s modelled pattern, `^[A-Za-z0-9+/]{10}$`
@@ -542,7 +542,7 @@ async fn an_unknown_or_unsettled_domain_is_refused() {
 
     // A domain the clock has not finished creating cannot take a grant yet.
     let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "unsettled" })))
+        .create_domain(json!({ "name": "unsettled" }))
         .await;
     let domain = created.s("id");
     let creating = dz
@@ -561,7 +561,7 @@ async fn an_unknown_or_unsettled_domain_is_refused() {
     );
 
     // Once the creation the clock owed has settled, the same request is accepted.
-    tokio::time::sleep(SETTLED).await;
+    dz.await_domain_status(&domain, "AVAILABLE").await;
     let settled = dz
         .call(
             "POST",

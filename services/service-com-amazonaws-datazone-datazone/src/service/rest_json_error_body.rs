@@ -28,7 +28,9 @@
 //! [`smithy_server_runtime::Service::override_routing_error`], which answers a request no
 //! modeled operation serves. Everything else about an answer stays with the framework
 //! renderer that owns it — the status, every header including `x-amzn-errortype`, request
-//! deserialization and the whole SUCCESS path are untouched.
+//! deserialization and the whole SUCCESS path are untouched here. (What a SUCCESS body
+//! carries is the neighbouring rule in [`super::recorded_response_members`], applied at the
+//! same protocol seam.)
 //!
 //! One class of failure is left as the framework writes it: a refusal rendered BEFORE a
 //! handler runs (an absent required member, a value outside a modelled bound, an
@@ -42,7 +44,6 @@ use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};
 use aws_smithy_schema::{Schema, ShapeId};
 use aws_smithy_schema_server::protocol::{ProtocolError, ServerProtocol};
 use aws_smithy_schema_server::RestJsonServerProtocol;
-use aws_smithy_types::body::SdkBody;
 use serde_json::{Map, Value};
 
 /// The body member the AWS JSON protocols name the error shape in, which `restJson1`
@@ -75,7 +76,7 @@ pub fn served_error_body(body: &[u8]) -> Option<Vec<u8>> {
 /// untouched — status, headers and every byte of the body exactly as the renderer wrote
 /// them.
 #[must_use]
-pub fn with_served_error_body(mut resp: Response) -> Response {
+pub fn with_served_error_body(resp: Response) -> Response {
     if resp.status().as_u16() < FIRST_ERROR_STATUS {
         return resp;
     }
@@ -90,23 +91,7 @@ pub fn with_served_error_body(mut resp: Response) -> Response {
             None => return resp,
         }
     };
-    // Only a renderer that advertised a length needs it corrected; the framework's error
-    // renderers set `content-type` alone and leave framing to the transport.
-    if resp.headers().get("content-length").is_some() {
-        let length = rewritten.len().to_string();
-        // A decimal length is always a valid header value, so this cannot fail today; if
-        // it ever did, the header is REMOVED rather than left describing the body before
-        // the rewrite, so the two can never disagree.
-        if resp
-            .headers_mut()
-            .try_insert("content-length", length)
-            .is_err()
-        {
-            resp.headers_mut().remove("content-length");
-        }
-    }
-    *resp.body_mut() = SdkBody::from(rewritten);
-    resp
+    super::response_body::with_body(resp, rewritten)
 }
 
 /// This service's wire protocol: `restJson1` exactly as the model declares it, with the
@@ -167,9 +152,15 @@ impl ServerProtocol for DataZoneRestJson {
         operation_name: &str,
         success_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
-        // A SUCCESS is the framework's own, byte for byte.
-        self.inner
-            .serialize_output(output, output_schema, operation_name, success_status)
+        // A SUCCESS is the framework's own, with the one member the live wire renders that
+        // the model snapshot does not declare (see [`super::recorded_response_members`]).
+        let resp = self
+            .inner
+            .serialize_output(output, output_schema, operation_name, success_status)?;
+        Ok(super::recorded_response_members::with_served_success_body(
+            operation_name,
+            resp,
+        ))
     }
 
     fn serialize_error(

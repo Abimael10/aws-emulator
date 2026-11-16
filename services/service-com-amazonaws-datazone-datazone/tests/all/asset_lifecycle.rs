@@ -411,7 +411,7 @@ async fn an_asset_needs_a_settled_domain_and_a_project_that_owns_it() {
 
     // A third domain that is still CREATING: it cannot take an asset yet.
     let creating = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "still-creating" })))
+        .create_domain(json!({ "name": "still-creating" }))
         .await;
     assert_eq!(
         creating.status, 201,

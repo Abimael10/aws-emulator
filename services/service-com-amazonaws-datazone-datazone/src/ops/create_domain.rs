@@ -12,6 +12,17 @@
 //! `clientToken` is the operation's `@idempotencyToken`: a repeat carrying a token
 //! already seen returns the domain that token created rather than a second domain.
 //!
+//! Two things are settled about the request BEFORE anything is read or written, in the
+//! order the service settles them (see `crate::state::domain_admission`):
+//!
+//! * `domainExecutionRole` is a member this SERVICE requires though the model leaves it
+//!   optional — a request that names none is refused `ValidationException` (400) in the
+//!   request boundary's own wording for an absent required member;
+//! * every role the domain would be taken on AS — its execution role and its service
+//!   role — is resolved against this emulator's own IAM, and one this service cannot
+//!   assume is refused `AccessDeniedException` (403) naming that role, with nothing
+//!   stored.
+//!
 //! A domain `name` is unique within the account: a create naming a name a live domain
 //! already holds is refused with the modelled `ConflictException` (409) and nothing is
 //! stored, so the account never holds two domains of one name.
@@ -226,10 +237,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, caller_region, now_ms, root_domain_unit, Domain,
-            StoredSingleSignOn, DEFAULT_DOMAIN_VERSION, DOMAIN_STATUS_CREATING,
+            caller_principal, caller_region, first_unassumable_role, now_ms, required_member_message,
+            root_domain_unit, unable_to_assume_role_message, Domain, StoredSingleSignOn,
+            DEFAULT_DOMAIN_VERSION, DOMAIN_EXECUTION_ROLE_MEMBER, DOMAIN_STATUS_CREATING,
             LIFECYCLE_SETTLE_MS,
         };
+
+        // The member this SERVICE requires though the model leaves it optional: a domain is
+        // run as its execution role, so a request that names none describes no domain the
+        // service can create and is refused before anything is read or written. The wording
+        // is the request boundary's own for an absent required member, naming the member.
+        let Some(domain_execution_role) = input.domain_execution_role else {
+            return Err(CreateDomainErrorModeled::ValidationException(ValidationException {
+                message: required_member_message(DOMAIN_EXECUTION_ROLE_MEMBER),
+            })
+            .into());
+        };
+
+        let region = caller_region(ctx);
+        // Every role the domain would be taken on AS is resolved against this emulator's own
+        // IAM before the domain is minted: a role the service cannot assume backs no domain,
+        // so the create is DENIED and nothing is stored. Asked here, with no store guard
+        // held, and in the order the request carries the two roles.
+        let declared_roles: Vec<&str> = ::std::iter::once(domain_execution_role.as_str())
+            .chain(input.service_role.as_deref())
+            .collect();
+        if let Some(unassumable) = first_unassumable_role(ctx, &region, declared_roles).await {
+            return Err(CreateDomainErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: unable_to_assume_role_message(unassumable),
+            })
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDomainErrorModeled::InternalServerException(InternalServerException {
@@ -262,7 +300,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = caller_region(ctx);
         // The store is bounded, so a create loop cannot grow the emulator's heap
         // without limit; the refusal is the error the operation already models.
         if store.domains.len() >= crate::state::MAX_DOMAINS {
@@ -293,17 +330,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 user_assignment: sso.user_assignment,
                 idc_instance_arn: sso.idc_instance_arn,
             }),
-            // `domainExecutionRole` is optional on input but REQUIRED on
-            // `GetDomainOutput` (smithy_query operation="GetDomain"), because the real
-            // service creates the role itself when the request names none. This is that
-            // service-created role, built through `emulator_arn` — not a recorded value.
-            domain_execution_role: input.domain_execution_role.unwrap_or_else(|| {
-                ::engine::emulator_arn(
-                    "iam",
-                    "",
-                    "role/service-role/AmazonDataZoneDomainExecution",
-                )
-            }),
+            // The role the request named, resolved above: the member is REQUIRED on
+            // `GetDomainOutput` (smithy_query operation="GetDomain") because a stored
+            // domain always has one, and this service requires the request to name it.
+            domain_execution_role,
             service_role: input.service_role,
             kms_key_identifier: input.kms_key_identifier,
             status: DOMAIN_STATUS_CREATING.to_string(),

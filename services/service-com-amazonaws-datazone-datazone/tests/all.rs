@@ -33,6 +33,10 @@ mod create_project_domain_resolution;
 mod delete_asset_denied_scope;
 #[path = "all/domain_data_portal.rs"]
 mod domain_data_portal;
+#[path = "all/domain_execution_role.rs"]
+mod domain_execution_role;
+#[path = "all/domain_listing_members.rs"]
+mod domain_listing_members;
 #[path = "all/domain_name_conflict_and_not_found.rs"]
 mod domain_name_conflict_and_not_found;
 #[path = "all/domain_project_lifecycle.rs"]

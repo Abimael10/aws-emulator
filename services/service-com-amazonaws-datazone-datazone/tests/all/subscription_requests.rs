@@ -64,9 +64,7 @@ const REQUEST_REASON_LEN: std::ops::RangeInclusive<usize> = 1..=4096;
 /// Create a domain and poll `GetDomain` until it reports `AVAILABLE`, which is the
 /// precondition every case below needs.
 async fn settled_domain(dz: &Emulator, name: &str) -> String {
-    let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": name })))
-        .await;
+    let created = dz.create_domain(json!({ "name": name })).await;
     assert_eq!(
         created.status, 201,
         "creating domain {name:?}: expected 201, got {} {:?}",
@@ -609,11 +607,7 @@ async fn a_subscription_request_needs_a_settled_domain_a_listing_and_a_known_pri
     // A domain that has only just been created is still CREATING, so it cannot take a
     // request yet. Created last so the window has not elapsed.
     let creating = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "subscription-unsettled-domain" })),
-        )
+        .create_domain(json!({ "name": "subscription-unsettled-domain" }))
         .await;
     assert_eq!(
         creating.status, 201,

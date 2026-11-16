@@ -149,9 +149,7 @@ fn accounts(count: usize) -> Vec<Value> {
 /// An available domain plus the `rootDomainUnitId` it reports: a new pool must belong
 /// to that unit, so the test needs both.
 async fn available_domain_with_root(dz: &Emulator, name: &str) -> (String, String) {
-    let created = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": name })))
-        .await;
+    let created = dz.create_domain(json!({ "name": name })).await;
     assert_eq!(
         created.status, 201,
         "creating domain {name:?}: expected 201, got {} {:?}",
@@ -401,11 +399,7 @@ async fn an_account_pool_needs_a_domain_that_exists_and_is_available() {
     // A domain that is still being created cannot take a pool yet: it is reported in a
     // non-terminal status, so the request conflicts with that status.
     let creating = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "pool-domain-still-creating" })),
-        )
+        .create_domain(json!({ "name": "pool-domain-still-creating" }))
         .await;
     assert_eq!(
         creating.status, 201,

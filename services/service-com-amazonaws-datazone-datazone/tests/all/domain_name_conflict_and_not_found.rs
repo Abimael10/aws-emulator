@@ -23,7 +23,7 @@
 //! The harness (`Emulator`, `Answer`) is the one the sibling lifecycle suite already
 //! drives this service with.
 
-use crate::harness::{Emulator, SETTLED};
+use crate::harness::Emulator;
 use serde_json::{json, Value};
 
 /// A `DomainId` that no domain in the store has, satisfying the modelled pattern
@@ -114,7 +114,7 @@ async fn a_second_create_domain_with_an_in_use_name_is_refused_and_stores_nothin
 
     for case in duplicate_cases() {
         let first = dz
-            .call("POST", "/v2/domains", Some(create_body(&case.name, &json!({}))))
+            .create_domain(create_body(&case.name, &json!({})))
             .await;
         assert_eq!(
             first.status, 201,
@@ -124,11 +124,7 @@ async fn a_second_create_domain_with_an_in_use_name_is_refused_and_stores_nothin
         let id = first.s("id");
 
         let repeat = dz
-            .call(
-                "POST",
-                "/v2/domains",
-                Some(create_body(&case.name, &case.repeat_extras)),
-            )
+            .create_domain(create_body(&case.name, &case.repeat_extras))
             .await;
         assert_eq!(
             (repeat.status, repeat.error_code.as_str()),
@@ -194,9 +190,7 @@ async fn a_name_differing_from_the_stored_ones_is_accepted() {
     ];
     let mut ids: Vec<String> = Vec::new();
     for name in names {
-        let answer = dz
-            .call("POST", "/v2/domains", Some(json!({ "name": name })))
-            .await;
+        let answer = dz.create_domain(json!({ "name": name })).await;
         assert_eq!(
             answer.status, 201,
             "name {name:?}: a name no live domain holds must be accepted, got {} {:?}",
@@ -219,8 +213,8 @@ async fn a_repeated_client_token_replays_the_first_domain_instead_of_conflicting
     // The `@idempotencyToken` is checked BEFORE the uniqueness rule, so a retry of the
     // same request is a replay (201, the first domain) rather than a 409.
     let body = json!({ "name": "token-domain", "clientToken": "token-one" });
-    let first = dz.call("POST", "/v2/domains", Some(body.clone())).await;
-    let replay = dz.call("POST", "/v2/domains", Some(body)).await;
+    let first = dz.create_domain(body.clone()).await;
+    let replay = dz.create_domain(body).await;
     assert_eq!(
         (replay.status, replay.s("id")),
         (201, first.s("id")),
@@ -248,17 +242,15 @@ async fn a_name_whose_domain_is_gone_can_be_used_again() {
         deleted.status, deleted.body
     );
     // Once the deletion the clock owed has completed the domain is gone, so nothing
-    // holds its name any more.
-    tokio::time::sleep(SETTLED).await;
+    // holds its name any more. Looked for until it holds, never waited out.
+    dz.await_domain_gone(&id).await;
     assert_eq!(
         domains_named(&dz, name).await,
         0,
         "the deleted domain must be gone before the name is reused"
     );
 
-    let again = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": name })))
-        .await;
+    let again = dz.create_domain(json!({ "name": name })).await;
     assert_eq!(
         again.status, 201,
         "a name no live domain holds must be accepted again, got {} {:?}",

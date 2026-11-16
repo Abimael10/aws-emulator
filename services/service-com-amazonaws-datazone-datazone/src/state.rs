@@ -30,6 +30,14 @@ pub use subscription_requests::*;
 mod data_portal;
 pub use data_portal::*;
 
+/// What a domain create settles about its request before it stores anything — the members
+/// this service requires and the roles it would have to assume — and how it words each
+/// refusal. A concern of its own, so it lives in its own module beside this one; everything
+/// it declares is re-exported here, so a handler reaches it as `crate::state::…` like the
+/// rest of the store.
+mod domain_admission;
+pub use domain_admission::*;
+
 /// The span the emulator takes to finish a domain lifecycle step AWS reports as
 /// in-progress (`CREATING` -> `AVAILABLE`, `DELETING` -> gone).
 ///

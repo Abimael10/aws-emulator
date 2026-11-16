@@ -18,7 +18,7 @@
 //! 4. A glossary is scoped to its domain and disappears with it.
 //! 5. A repeated `clientToken` returns the first glossary instead of a second one.
 
-use crate::harness::{Emulator, SETTLED};
+use crate::harness::Emulator;
 use serde_json::{json, Value};
 // The `GlossaryStatus` members as the service stores them, so a drift between the
 // constant and the value on the wire fails here.
@@ -405,7 +405,7 @@ async fn a_glossary_needs_a_domain_that_is_available_and_a_project_in_it() {
     // A domain that is still being created cannot take a glossary yet: it is reported
     // in a non-terminal status, so the request conflicts with that status.
     let creating = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "still-creating" })))
+        .create_domain(json!({ "name": "still-creating" }))
         .await;
     assert_eq!(
         creating.status, 201,
@@ -487,11 +487,7 @@ async fn one_token_string_is_remembered_per_operation_not_per_service() {
     // not consume, or overwrite, the record a domain create left under that token.
     let shared = "shared-client-token";
     let domain = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "token-sharer", "clientToken": shared })),
-        )
+        .create_domain(json!({ "name": "token-sharer", "clientToken": shared }))
         .await;
     assert_eq!(
         domain.status, 201,
@@ -499,9 +495,9 @@ async fn one_token_string_is_remembered_per_operation_not_per_service() {
         domain.status, domain.body
     );
     let domain_id = domain.s("id");
-    // Wait out the chosen `LIFECYCLE_SETTLE_MS` span, plus slack, so the domain has
-    // settled to AVAILABLE and can take a project and a glossary.
-    tokio::time::sleep(SETTLED).await;
+    // Look again until the domain reports AVAILABLE, which is when it can take a project
+    // and a glossary — the condition, never a fixed wait.
+    dz.await_domain_status(&domain_id, "AVAILABLE").await;
     let project = dz
         .call(
             "POST",
@@ -530,11 +526,7 @@ async fn one_token_string_is_remembered_per_operation_not_per_service() {
     // The domain's own record survived: a repeat of the domain create with that token
     // still returns the FIRST domain rather than creating a second one.
     let domain_repeat = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "token-sharer", "clientToken": shared })),
-        )
+        .create_domain(json!({ "name": "token-sharer", "clientToken": shared }))
         .await;
     assert_eq!(
         domain_repeat.s("id"),

@@ -487,7 +487,7 @@ async fn create_asset_type_enforces_its_documented_prerequisites() {
     let project = dz.project(&domain, "Owner").await;
     // A domain that has NOT settled yet: the creation the clock owes is still due.
     let creating = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "still-creating" })))
+        .create_domain(json!({ "name": "still-creating" }))
         .await
         .s("id");
 

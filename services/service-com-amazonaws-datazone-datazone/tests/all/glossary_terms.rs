@@ -589,11 +589,7 @@ async fn a_term_needs_an_available_domain_a_stored_glossary_and_stored_relations
     // A domain that is still being created cannot take a term yet: it is reported in a
     // non-terminal status, so the request conflicts with that status.
     let creating = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "still-creating-terms" })),
-        )
+        .create_domain(json!({ "name": "still-creating-terms" }))
         .await;
     assert_eq!(
         creating.status, 201,

@@ -37,11 +37,13 @@
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
 //! A sixth seam, `override_protocol`, is one this service DOES take: it serves the
-//! model's own `restJson1` codec with the one difference the shared renderer cannot
-//! express — what a FAILURE's body carries (see [`rest_json_error_body`]). That
-//! difference is a property of this service's wire envelope, not of one renderer, so
-//! both seams this service takes — the protocol (a failure a handler raised) and the
-//! routing error (a request no modeled operation serves) — answer through it.
+//! model's own `restJson1` codec with the differences the shared renderer cannot
+//! express — what a FAILURE's body carries (see [`rest_json_error_body`]) and the member
+//! name the live wire renders a domain listing's summaries under (see
+//! [`recorded_response_members`]). Those differences are properties of this service's wire
+//! envelope, not of one renderer, so both seams this service takes — the protocol (a failure
+//! a handler raised, and every success body) and the routing error (a request no modeled
+//! operation serves) — answer through it.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -56,6 +58,14 @@ use std::sync::Arc;
 /// What a failure carries on the wire — the one difference from the model's own
 /// `restJson1` renderer this service takes.
 pub mod rest_json_error_body;
+
+/// What a SUCCESS carries on the wire that this checkout's model snapshot does not declare:
+/// the member name the live wire renders a domain listing's summaries under.
+pub mod recorded_response_members;
+
+/// Replacing the body of a response this service has already rendered, which both of the
+/// seams above do.
+pub mod response_body;
 
 /// The route that answers at the data portal address a domain reports, which this emulator
 /// publishes on its own endpoint.
@@ -195,11 +205,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // The model's own restJson1 codec, with the ONE difference the shared renderer
-        // cannot express: a failure's body carries the error shape's own members and
-        // nothing else, because this protocol names the shape in a header (see
-        // `rest_json_error_body`). Borrowed from the field built in `new`, never
-        // constructed per request.
+        // The model's own restJson1 codec, with the differences the shared renderer cannot
+        // express: a failure's body carries the error shape's own members and nothing else,
+        // because this protocol names the shape in a header (see `rest_json_error_body`),
+        // and a success body carries the member the live wire renders that the model
+        // snapshot does not declare (see `recorded_response_members`). Borrowed from the
+        // field built in `new`, never constructed per request.
         Some(&self.protocol)
     }
 }

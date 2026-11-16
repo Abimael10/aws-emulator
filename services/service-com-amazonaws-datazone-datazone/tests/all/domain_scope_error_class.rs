@@ -35,7 +35,7 @@
 //! The harness (`Emulator`, `Answer`) is the one every suite in this crate drives the
 //! service with.
 
-use crate::harness::{Answer, Emulator, SETTLED};
+use crate::harness::{Answer, Emulator};
 use serde_json::{json, Value};
 
 /// The one `DataZoneEntityType` member (smithy_query shape="DataZoneEntityType").
@@ -318,13 +318,7 @@ async fn the_same_calls_answer_from_state_under_a_domain_the_store_serves() {
 
     // The control for both rules above: the two stages refuse the SCOPE and nothing else,
     // so the same calls, scoped to a domain this store serves, answer from its state.
-    let created = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "boundary domain" })),
-        )
-        .await;
+    let created = dz.create_domain(json!({ "name": "boundary domain" })).await;
     assert_eq!(
         created.status, 201,
         "CreateDomain: expected 201, got {} {:?}",
@@ -332,7 +326,7 @@ async fn the_same_calls_answer_from_state_under_a_domain_the_store_serves() {
     );
     let domain = created.s("id");
     let root_unit = created.s("rootDomainUnitId");
-    tokio::time::sleep(SETTLED).await;
+    dz.await_domain_status(&domain, "AVAILABLE").await;
 
     let project = dz.project(&domain, "boundary owner").await;
 

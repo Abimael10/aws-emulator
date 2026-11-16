@@ -11,10 +11,19 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// The span `crate::state::LIFECYCLE_SETTLE_MS` gives a domain lifecycle step, plus
 /// slack, so a test that waits for a settled domain is not racing the clock.
 pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// A GENEROUS deadline for a transition the clock owes a domain: far longer than
+/// `crate::state::LIFECYCLE_SETTLE_MS`, so a loaded host still reaches it. A wait is for the
+/// CONDITION; this only bounds how long it is looked for.
+const LIFECYCLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long to wait between two looks at a condition the clock owes.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One emulator: a single shared engine behind the DataZone service, driven over HTTP.
 pub(crate) struct Emulator {
@@ -50,9 +59,62 @@ impl Answer {
     }
 }
 
+/// The `domainExecutionRole` the creates in these suites name.
+///
+/// DataZone requires the member though the model leaves it optional, so every create has to
+/// carry one; this is a role ARN of this account, which is what `RoleArn`'s modelled pattern
+/// admits. No IAM is mounted beside DataZone here, so nothing is shown about the role and the
+/// create is admitted — the resolution itself is exercised in
+/// [`crate::domain_execution_role`], which mounts IAM too.
+pub(crate) fn domain_execution_role() -> String {
+    ::engine::emulator_arn("iam", "", "role/service-role/AmazonDataZoneDomainExecution")
+}
+
+/// `body` as a `CreateDomain` request that names an execution role: the body as written when
+/// it already names one, so a case about the member itself still states it.
+pub(crate) fn with_domain_execution_role(mut body: Value) -> Value {
+    if let Some(object) = body.as_object_mut() {
+        object
+            .entry("domainExecutionRole")
+            .or_insert_with(|| json!(domain_execution_role()));
+    }
+    body
+}
+
 impl Emulator {
     pub(crate) fn new() -> Self {
         Self::served_at(smithy_server_runtime::UNSERVED_URL_BASE)
+    }
+
+    /// Send one `CreateDomain`, filling in the [`domain_execution_role`] when `body` does
+    /// not name one: a suite that is not about that member still has to carry it.
+    pub(crate) async fn create_domain(&self, body: Value) -> Answer {
+        self.call(
+            "POST",
+            "/v2/domains",
+            Some(with_domain_execution_role(body)),
+        )
+        .await
+    }
+
+    /// One emulator with DataZone AND IAM mounted on one shared engine, plus that engine.
+    ///
+    /// A domain create resolves the roles it names against this account's own IAM over the
+    /// emulator's in-process callback, so IAM has to be MOUNTED for it to answer at all —
+    /// which is why every other suite here, mounting DataZone alone, still creates domains
+    /// with roles no IAM record backs.
+    pub(crate) fn with_iam() -> (Self, Arc<engine::InMemoryEngine>) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(
+            service_com_amazonaws_datazone_datazone::EmulatedService::new(Arc::clone(&engine)),
+        );
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        (Self { router }, engine)
     }
 
     /// One emulator whose own endpoint is `base`: the base URL
@@ -166,16 +228,53 @@ impl Emulator {
     /// Create a domain and wait until it has settled to `AVAILABLE`, which is the
     /// precondition every project case needs.
     pub(crate) async fn available_domain(&self, name: &str) -> String {
-        let created = self
-            .call("POST", "/v2/domains", Some(json!({ "name": name })))
-            .await;
+        let created = self.create_domain(json!({ "name": name })).await;
         assert_eq!(
             created.status, 201,
             "creating domain {name:?}: expected 201, got {} {:?}",
             created.status, created.body
         );
-        tokio::time::sleep(SETTLED).await;
-        created.s("id")
+        let id = created.s("id");
+        self.await_domain_status(&id, "AVAILABLE").await;
+        id
+    }
+
+    /// Look again until `GetDomain` reports `domain` in `status`, or a generous deadline
+    /// passes. Waits for the CONDITION the clock owes, never for a fixed time.
+    pub(crate) async fn await_domain_status(&self, domain: &str, status: &str) -> Answer {
+        let started = Instant::now();
+        loop {
+            let answer = self.call("GET", &format!("/v2/domains/{domain}"), None).await;
+            if answer.status == 200 && answer.s("status") == status {
+                return answer;
+            }
+            assert!(
+                started.elapsed() < LIFECYCLE_DEADLINE,
+                "domain {domain:?} never reached {status:?}: last answer {} {:?}",
+                answer.status,
+                answer.body
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Look again until the domain a delete removed is GONE — the identifier names no
+    /// domain any more, so even its own read is refused — or a generous deadline passes.
+    pub(crate) async fn await_domain_gone(&self, domain: &str) -> Answer {
+        let started = Instant::now();
+        loop {
+            let answer = self.call("GET", &format!("/v2/domains/{domain}"), None).await;
+            if answer.status != 200 {
+                return answer;
+            }
+            assert!(
+                started.elapsed() < LIFECYCLE_DEADLINE,
+                "domain {domain:?} was never removed: last answer {} {:?}",
+                answer.status,
+                answer.body
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Create a project in a settled domain — the precondition every asset case needs.

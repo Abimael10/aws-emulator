@@ -1,5 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: this header, the one inner attribute at its
+// end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
+// `tests/all/`, sorted by name, and no other line — no prose between the pairs, no blank line,
+// and nothing after the last pair.
+//
+// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the one
+// place its name sorts to. Two branches landing at once then insert two lines in two places
+// and have no prose to duplicate, re-word or mistype, which is what had gone wrong here: both
+// this header and the tail of the list had grown hundreds of re-typed copies of these
+// paragraphs. What a suite covers, and why it drives the assembled router rather than one
+// service crate, belongs in that suite's OWN module header, where it is read beside the test
+// it explains; a note about THIS file belongs in `all/appended_header_notes.rs`,
+// `all/appended_notes.rs`, `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which keep
+// what earlier landings had appended here and are declared below like any other file.
+//
+// EVERY comment in this file is an ordinary `//` one, this header included: a doc comment of
+// the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
+// copy left among or below the declarations compiles no suite of this target at all rather
+// than failing one test. A suite file no `mod` here names is compiled nowhere and its tests
+// never run, a suite left at the top level of `tests/` fails the build, and a second `mod` for
+// one name is `E0428`, which compiles neither copy. This file is a test-target CRATE ROOT, so
+// a bare `mod` would resolve to a SIBLING of it under `tests/`, which the layout check
+// refuses: the `#[path]` above each declaration is what points it into `tests/all/`. Some of
+// the files declared below are shared harnesses or probes rather than suites, and each is
+// declared for that reason.
+//
+// The `all/all_rs_*` suites, `all/declaration_roots_*` and
+// `all/every_suite_file_is_declared.rs` pin every rule above, for this file and for every
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+//
+// The lint allowed below is for the suite files this root compiles: a module header that wraps
+// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
+// is a note rather than a build failure. An inner attribute is legal only ahead of the first
+// item, so it stands at the end of this header.
 // Single integration-test target for the router: this header, the inner attribute below it,
 // and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
 // `tests/all/`, sorted strictly by name, and no other line at all.

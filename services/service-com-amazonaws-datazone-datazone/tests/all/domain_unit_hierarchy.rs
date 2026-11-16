@@ -522,7 +522,7 @@ async fn a_domain_unit_needs_a_stored_domain_an_available_domain_and_a_stored_pa
 
     // And one the clock has not settled yet: created, then used on the very next call.
     let creating = dz
-        .call("POST", "/v2/domains", Some(json!({ "name": "still-creating" })))
+        .create_domain(json!({ "name": "still-creating" }))
         .await;
     let too_early = dz
         .call(

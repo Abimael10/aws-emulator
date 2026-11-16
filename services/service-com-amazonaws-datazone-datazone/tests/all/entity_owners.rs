@@ -682,11 +682,7 @@ async fn an_owner_cannot_be_added_while_the_domain_is_still_being_created() {
     // NOT settled: the call below lands while the domain is still `CREATING`, which is
     // a state the domain cannot take a write in.
     let created = dz
-        .call(
-            "POST",
-            "/v2/domains",
-            Some(json!({ "name": "entity-owners-creating-domain" })),
-        )
+        .create_domain(json!({ "name": "entity-owners-creating-domain" }))
         .await;
     assert_eq!(
         created.status, 201,
@@ -713,7 +709,7 @@ async fn an_owner_cannot_be_added_while_the_domain_is_still_being_created() {
 
     // Once the clock settles the domain, the same request is accepted and the owner is
     // reported by the listing.
-    tokio::time::sleep(crate::harness::SETTLED).await;
+    dz.await_domain_status(&domain, "AVAILABLE").await;
     let accepted = add(&dz, &domain, DOMAIN_UNIT, &root, &Owner::user("early-owner")).await;
     assert_eq!(
         accepted.status, 201,
