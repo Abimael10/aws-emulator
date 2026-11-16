@@ -36,7 +36,8 @@ pub use anomaly_subscriptions::{
     THRESHOLD_VALUE_MAX,
 };
 pub use pagination::{
-    decode_next_token, encode_next_token, page, requested_page_size, Page, UNPAGED,
+    decode_next_token, encode_next_token, page, page_size_below_minimum, requested_page_size, Page,
+    INVALID_NEXT_TOKEN_REFUSAL, MIN_PAGE_SIZE, UNPAGED,
 };
 
 use std::collections::BTreeMap;
@@ -492,6 +493,35 @@ pub const MONITOR_TYPE_DIMENSIONAL: &str = "DIMENSIONAL";
 /// The `MonitorType` value of a customer managed monitor (model enum `MonitorType`).
 pub const MONITOR_TYPE_CUSTOM: &str = "CUSTOM";
 
+/// The refusal a customer managed monitor carrying no `MonitorSpecification` is answered
+/// with — the member that configures such a monitor entirely, since it names no dimension.
+///
+/// Cost Explorer's own sentence, and wholly fixed: it names the member and the monitor kind
+/// in words and nothing from the request, so every such create reads the same. The model
+/// declares no client-input error for the operation, so the wording is recorded wire
+/// behaviour.
+pub const MISSING_CUSTOM_SPECIFICATION_REFUSAL: &str =
+    "MonitorSpecification must be present for custom monitor";
+
+/// The refusal a monitor whose `MonitorName` is empty is answered with.
+///
+/// Cost Explorer's own sentence, fixed text: it names the member and the condition on it
+/// and nothing from the request.
+pub const EMPTY_MONITOR_NAME_REFUSAL: &str = "MonitorName cannot by empty";
+
+/// Check a monitor name against the one rule Cost Explorer enforces on it beyond the
+/// member's modelled constraints: a monitor is named, so the empty string the modelled
+/// length bound (`GenericString`, length 0..1024) admits is not a name.
+///
+/// Shared by every operation that SETS a monitor name — create and update — so the two
+/// cannot drift apart on it.
+pub fn validate_monitor_name(monitor_name: &str) -> Result<(), String> {
+    if monitor_name.is_empty() {
+        return Err(EMPTY_MONITOR_NAME_REFUSAL.to_string());
+    }
+    Ok(())
+}
+
 /// The `MonitorDimension` values a managed monitor analyses on its own, with no
 /// `MonitorSpecification` to narrow them.
 ///
@@ -545,6 +575,7 @@ fn expression_selects_anything(expression: &Expression) -> bool {
 /// Shared by every operation that accepts a whole `AnomalyMonitor`, so create and update
 /// cannot drift apart on it.
 pub fn validate_anomaly_monitor(monitor: &AnomalyMonitor) -> Result<(), String> {
+    validate_monitor_name(&monitor.monitor_name)?;
     let specification = monitor.monitor_specification.as_ref();
     match monitor.monitor_type.as_str() {
         MONITOR_TYPE_DIMENSIONAL => {
@@ -581,16 +612,15 @@ pub fn validate_anomaly_monitor(monitor: &AnomalyMonitor) -> Result<(), String> 
                     ))
                 }
             };
-            let selector = if dimension == MONITOR_DIMENSION_TAG {
-                "Tags"
-            } else {
-                "CostCategories"
-            };
             match configured_key {
                 Some(key) if !key.is_empty() => Ok(()),
+                // ONE sentence for both dimensions: Cost Explorer names the member that is
+                // missing and the dimensions that require it, and nothing else — no
+                // selector, no dimension and no value taken from the request — so the two
+                // dimensions are refused with identical text.
                 _ => Err(format!(
-                    "MonitorSpecification must specify {selector} with a Key when \
-                     MonitorDimension is {dimension}"
+                    "MonitorSpecification must be present for {MONITOR_DIMENSION_TAG} and \
+                     {MONITOR_DIMENSION_COST_CATEGORY} dimensional monitors"
                 )),
             }
         }
@@ -602,9 +632,7 @@ pub fn validate_anomaly_monitor(monitor: &AnomalyMonitor) -> Result<(), String> 
                 ));
             }
             let Some(specification) = specification else {
-                return Err(format!(
-                    "MonitorSpecification is required for a {MONITOR_TYPE_CUSTOM} monitor"
-                ));
+                return Err(MISSING_CUSTOM_SPECIFICATION_REFUSAL.to_string());
             };
             if !expression_selects_anything(specification) {
                 return Err(format!(
@@ -790,6 +818,24 @@ pub const MAX_LIVE_COST_CATEGORIES: usize = 50;
 /// the bound is refused with.
 pub const MAX_ANOMALY_MONITORS: usize = 100;
 
+/// How many Amazon Web Services managed (`DIMENSIONAL`) spend monitors an account may
+/// hold.
+///
+/// `AnomalyMonitor$MonitorType` documents `DIMENSIONAL` as the managed monitor that tracks
+/// a whole cost dimension on the account's behalf, and Cost Explorer provisions ONE of
+/// those per account: a create of a managed monitor for an account that already holds one
+/// is refused rather than stored. Customer managed (`CUSTOM`) monitors, which the caller
+/// configures value by value, are not counted by it — they are bounded only by
+/// [`MAX_ANOMALY_MONITORS`].
+pub const MAX_DIMENSIONAL_ANOMALY_MONITORS: usize = 1;
+
+/// The refusal a create past [`MAX_DIMENSIONAL_ANOMALY_MONITORS`] carries.
+///
+/// Wholly FIXED text: Cost Explorer names no monitor, dimension, ARN or number in it, so
+/// nothing here is interpolated from the request or from the registry.
+pub const DIMENSIONAL_MONITOR_LIMIT_REFUSAL: &str =
+    "Limit exceeded on dimensional spend monitor creation";
+
 /// How many ENDED (tombstoned) definitions the registry retains.
 ///
 /// A tombstone is not a resource the API counts — it is kept only so a Describe or List
@@ -842,6 +888,18 @@ impl ComAmazonawsCostexplorerAwsinsightsindexserviceState {
                 .retain(|arn| arn != monitor_arn);
         }
         true
+    }
+
+    /// How many Amazon Web Services managed (`DIMENSIONAL`) monitors the account holds.
+    ///
+    /// The count the managed-monitor admission gate is taken against, read off the
+    /// registry itself rather than kept beside it, so a monitor deleted out of the
+    /// registry frees its slot by construction.
+    pub fn dimensional_anomaly_monitors(&self) -> usize {
+        self.anomaly_monitors
+            .values()
+            .filter(|monitor| monitor.monitor_type == MONITOR_TYPE_DIMENSIONAL)
+            .count()
     }
 
     /// The id for the next resource this service mints, advancing the shared sequence.

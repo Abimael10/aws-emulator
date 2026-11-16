@@ -8,11 +8,11 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::{
-    CUSTOM_MONITOR_DIMENSION_KEY, MAX_ANOMALY_MONITORS, MONITOR_TYPE_CUSTOM,
+    CUSTOM_MONITOR_DIMENSION_KEY, MAX_ANOMALY_MONITORS, MIN_PAGE_SIZE, MONITOR_TYPE_CUSTOM,
     MONITOR_TYPE_DIMENSIONAL,
 };
 
-use crate::harness::{error_code, Emulator};
+use crate::harness::{error_code, error_message, Emulator};
 
 /// Every value the modelled `MonitorDimension` enum carries
 /// (`smithy_query(query="shape", shape="MonitorDimension")`), with the
@@ -88,6 +88,30 @@ fn custom_body(name: &str, specification: Value) -> Value {
         }
     })
 }
+
+/// The sentence Cost Explorer refuses a managed monitor over a key-configured dimension
+/// whose specification carries no such key with. ONE sentence for both dimensions, naming
+/// the member and the dimensions that require it and nothing from the request.
+const MISSING_KEY_REFUSAL: &str =
+    "MonitorSpecification must be present for TAG and COST_CATEGORY dimensional monitors";
+
+/// The sentence Cost Explorer refuses a create of a second Amazon Web Services managed
+/// monitor with. Fixed text: it names no monitor, dimension, ARN or number.
+const MANAGED_MONITOR_LIMIT_REFUSAL: &str = "Limit exceeded on dimensional spend monitor creation";
+
+/// The sentence Cost Explorer refuses a page size below its minimum with. Fixed text: the
+/// rejected page size is not echoed.
+const PAGE_SIZE_REFUSAL: &str = "Number of results per page cannot be smaller than 1";
+
+/// The sentence Cost Explorer refuses a `NextPageToken` it cannot read with. Fixed text:
+/// the rejected token is not echoed.
+const INVALID_TOKEN_REFUSAL: &str = "Provided token is invalid";
+
+/// The sentence Cost Explorer refuses a customer managed monitor carrying no
+/// `MonitorSpecification` with. Fixed text: it names the member and the monitor kind in
+/// words, and nothing from the request.
+const CUSTOM_MISSING_SPECIFICATION_REFUSAL: &str =
+    "MonitorSpecification must be present for custom monitor";
 
 /// The ARN a successful create answered with.
 fn arn_of(created: &Value) -> String {
@@ -173,81 +197,173 @@ fn assert_monitor_arn(label: &str, arn: &str) {
 /// and every specification form a customer managed monitor is documented to take.
 #[tokio::test]
 async fn a_created_monitor_is_reported_as_it_was_described() {
-    let emulator = Emulator::start();
-
-    let mut cases: Vec<(String, Value)> = Vec::new();
+    // An account holds one Amazon Web Services managed monitor at a time
+    // ([`MAX_DIMENSIONAL_ANOMALY_MONITORS`], asserted in
+    // [`a_second_managed_monitor_for_the_account_is_refused`]), so each managed case is
+    // driven against an account of its own; the customer managed ones, which an account can
+    // hold many of, are driven together.
+    let mut accounts: Vec<Vec<(String, Value)>> = Vec::new();
     for (label, dimension, specification) in managed_monitor_cases() {
-        cases.push((
+        accounts.push(vec![(
             label.to_string(),
             managed_body(&format!("monitor-{dimension}"), dimension, specification),
-        ));
+        )]);
     }
+    let mut custom: Vec<(String, Value)> = Vec::new();
     for (index, (label, specification)) in custom_monitor_cases().into_iter().enumerate() {
-        cases.push((
+        custom.push((
             label.to_string(),
             custom_body(&format!("custom-monitor-{index}"), specification),
         ));
     }
+    accounts.push(custom);
 
-    let mut minted: Vec<String> = Vec::new();
-    for (label, body) in &cases {
-        let created = emulator.ok("CreateAnomalyMonitor", body).await;
-        let arn = arn_of(&created);
-        assert_monitor_arn(label, &arn);
-        assert!(
-            !minted.contains(&arn),
-            "case {label:?}: every monitor gets its own ARN, got a repeat of {arn:?}"
+    for cases in &accounts {
+        let emulator = Emulator::start();
+        let mut minted: Vec<String> = Vec::new();
+        for (label, body) in cases {
+            let created = emulator.ok("CreateAnomalyMonitor", body).await;
+            let arn = arn_of(&created);
+            assert_monitor_arn(label, &arn);
+            assert!(
+                !minted.contains(&arn),
+                "case {label:?}: every monitor gets its own ARN, got a repeat of {arn:?}"
+            );
+            minted.push(arn);
+        }
+
+        let reported = all_monitors(&emulator).await;
+        assert_eq!(
+            reported.len(),
+            cases.len(),
+            "every created monitor must be reported, got {reported:?}"
         );
-        minted.push(arn);
-    }
 
-    let reported = all_monitors(&emulator).await;
-    assert_eq!(
-        reported.len(),
-        cases.len(),
-        "every created monitor must be reported, got {reported:?}"
-    );
-
-    for ((label, body), arn) in cases.iter().zip(&minted) {
-        let sent = &body["AnomalyMonitor"];
-        let monitor = reported
-            .iter()
-            .find(|monitor| monitor["MonitorArn"].as_str() == Some(arn.as_str()))
-            .unwrap_or_else(|| {
-                panic!("case {label:?}: expected the monitor {arn:?} to be reported")
-            });
-        for member in ["MonitorName", "MonitorType", "MonitorDimension"] {
+        for ((label, body), arn) in cases.iter().zip(&minted) {
+            let sent = &body["AnomalyMonitor"];
+            let monitor = reported
+                .iter()
+                .find(|monitor| monitor["MonitorArn"].as_str() == Some(arn.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("case {label:?}: expected the monitor {arn:?} to be reported")
+                });
+            for member in ["MonitorName", "MonitorType", "MonitorDimension"] {
+                assert_eq!(
+                    monitor[member], sent[member],
+                    "case {label:?}: {member} must round-trip, got {monitor}"
+                );
+            }
             assert_eq!(
-                monitor[member], sent[member],
-                "case {label:?}: {member} must round-trip, got {monitor}"
+                monitor["MonitorSpecification"], sent["MonitorSpecification"],
+                "case {label:?}: MonitorSpecification must round-trip, got {monitor}"
+            );
+            let creation_date = monitor["CreationDate"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {label:?}: CreationDate must be present"));
+            assert_year_month_day(label, creation_date);
+            assert_eq!(
+                monitor["LastUpdatedDate"].as_str(),
+                Some(creation_date),
+                "case {label:?}: a monitor nobody updated was last written when it was \
+                 created, got {monitor}"
+            );
+            assert!(
+                monitor.get("LastEvaluatedDate").is_none(),
+                "case {label:?}: nothing has evaluated the monitor, so LastEvaluatedDate must \
+                 be omitted, got {monitor}"
+            );
+            // The member's modelled default is 0, which the wire form may carry explicitly
+            // or omit; both read as "no dimension value has been evaluated".
+            assert_eq!(
+                monitor["DimensionalValueCount"].as_i64().unwrap_or(0),
+                0,
+                "case {label:?}: no cost data has been evaluated, got {monitor}"
             );
         }
-        assert_eq!(
-            monitor["MonitorSpecification"], sent["MonitorSpecification"],
-            "case {label:?}: MonitorSpecification must round-trip, got {monitor}"
-        );
-        let creation_date = monitor["CreationDate"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {label:?}: CreationDate must be present"));
-        assert_year_month_day(label, creation_date);
-        assert_eq!(
-            monitor["LastUpdatedDate"].as_str(),
-            Some(creation_date),
-            "case {label:?}: a monitor nobody updated was last written when it was created, \
-             got {monitor}"
-        );
-        assert!(
-            monitor.get("LastEvaluatedDate").is_none(),
-            "case {label:?}: nothing has evaluated the monitor, so LastEvaluatedDate must be \
-             omitted, got {monitor}"
-        );
-        // The member's modelled default is 0, which the wire form may carry explicitly or
-        // omit; both read as "no dimension value has been evaluated".
-        assert_eq!(
-            monitor["DimensionalValueCount"].as_i64().unwrap_or(0),
-            0,
-            "case {label:?}: no cost data has been evaluated, got {monitor}"
-        );
+    }
+}
+
+/// RULE: an account holds at most [`MAX_DIMENSIONAL_ANOMALY_MONITORS`] Amazon Web Services
+/// managed (`DIMENSIONAL`) monitors, so a create of a managed monitor for an account that
+/// already holds one is refused 400 `ValidationException` carrying Cost Explorer's fixed
+/// sentence, whatever dimension either of them names; customer managed (`CUSTOM`) monitors
+/// are not counted by that limit, and deleting the managed monitor frees its slot again.
+///
+/// The table spans the pairs the rule holds over: every `MonitorDimension` the managed
+/// monitor the account already holds can name, against every dimension the refused create
+/// can name — the recorded case (a service monitor refused a second service monitor) is one
+/// of its sixteen rows.
+#[tokio::test]
+async fn a_second_managed_monitor_for_the_account_is_refused() {
+    for (held_label, held_dimension, held_specification) in managed_monitor_cases() {
+        for (refused_label, refused_dimension, refused_specification) in managed_monitor_cases() {
+            let case = format!("{held_label:?} already held, then {refused_label:?}");
+            let emulator = Emulator::start();
+            let held = arn_of(
+                &emulator
+                    .ok(
+                        "CreateAnomalyMonitor",
+                        &managed_body(
+                            &format!("held-{held_dimension}"),
+                            held_dimension,
+                            held_specification.clone(),
+                        ),
+                    )
+                    .await,
+            );
+
+            let body = managed_body(
+                &format!("refused-{refused_dimension}"),
+                refused_dimension,
+                refused_specification,
+            );
+            let (status, answered) = emulator.call("CreateAnomalyMonitor", &body).await;
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "ValidationException"),
+                "case {case}: expected a 400 ValidationException, got {status}: {answered}"
+            );
+            assert_eq!(
+                error_message(&answered),
+                MANAGED_MONITOR_LIMIT_REFUSAL,
+                "case {case}: the refusal carries Cost Explorer's fixed sentence, got \
+                 {answered}"
+            );
+            let reported = all_monitors(&emulator).await;
+            assert_eq!(
+                reported
+                    .iter()
+                    .map(|monitor| monitor["MonitorArn"].as_str().unwrap_or_default())
+                    .collect::<Vec<_>>(),
+                vec![held.as_str()],
+                "case {case}: a refused create must persist nothing"
+            );
+
+            // A customer managed monitor is not an Amazon Web Services managed one, so the
+            // limit does not count it.
+            for (index, (_, specification)) in custom_monitor_cases().into_iter().enumerate() {
+                emulator
+                    .ok(
+                        "CreateAnomalyMonitor",
+                        &custom_body(&format!("custom-{index}"), specification),
+                    )
+                    .await;
+            }
+            assert_eq!(
+                all_monitors(&emulator).await.len(),
+                1 + custom_monitor_cases().len(),
+                "case {case}: customer managed monitors must not be refused by the managed \
+                 monitor limit"
+            );
+
+            // The count is taken over the registry, so deleting the managed monitor frees
+            // the slot the refused create wanted.
+            emulator
+                .ok("DeleteAnomalyMonitor", &json!({"MonitorArn": held}))
+                .await;
+            let created = emulator.ok("CreateAnomalyMonitor", &body).await;
+            assert_monitor_arn(&case, &arn_of(&created));
+        }
     }
 }
 
@@ -433,26 +549,99 @@ async fn a_monitor_whose_members_contradict_each_other_is_refused() {
     );
 }
 
+/// RULE: a managed monitor over one of the two dimensions that are configured by a key
+/// (`TAG`, `COST_CATEGORY` — from `AnomalyMonitor$MonitorSpecification`) whose
+/// specification carries no such key is refused with ONE sentence naming the member and
+/// both dimensions, identical whichever dimension was asked for and however the key is
+/// missing: Cost Explorer interpolates neither the dimension nor the selector nor any other
+/// value from the request into it.
+///
+/// The table spans both dimensions against every way the key can be missing: no
+/// specification at all, one naming the other dimension's selector, and one whose own
+/// selector names values but no key.
+#[tokio::test]
+async fn the_missing_key_refusal_is_one_sentence_for_both_dimensions() {
+    // Each dimension with the selector that configures it, and the selector that does not.
+    let dimensions = [("TAG", "Tags", "CostCategories"), (
+        "COST_CATEGORY",
+        "CostCategories",
+        "Tags",
+    )];
+
+    let emulator = Emulator::start();
+    let mut sentences: Vec<(String, String)> = Vec::new();
+    for (dimension, selector, other_selector) in dimensions {
+        for (how, specification) in [
+            ("no specification at all", None),
+            (
+                "a specification naming the other selector",
+                Some(json!({other_selector: {"Key": "a-key"}})),
+            ),
+            (
+                "a specification whose selector carries no Key",
+                Some(json!({selector: {"Values": ["a-value"]}})),
+            ),
+        ] {
+            let case = format!("{dimension} with {how}");
+            let (status, answered) = emulator
+                .call(
+                    "CreateAnomalyMonitor",
+                    &managed_body(&format!("missing-key-{dimension}"), dimension, specification),
+                )
+                .await;
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected a 400 ValidationException, got {status}: {answered}"
+            );
+            let message = error_message(&answered);
+            assert_eq!(
+                message, MISSING_KEY_REFUSAL,
+                "case {case:?}: expected Cost Explorer's fixed sentence, got {answered}"
+            );
+            sentences.push((case, message));
+        }
+    }
+
+    let (first_case, first) = sentences
+        .first()
+        .cloned()
+        .expect("the table has at least one case");
+    for (case, message) in &sentences {
+        assert_eq!(
+            message, &first,
+            "case {case:?}: every missing-key refusal reads exactly as {first_case:?} does \
+             ({first:?}), got {message:?}"
+        );
+    }
+    assert!(
+        all_monitors(&emulator).await.is_empty(),
+        "a refused create must persist nothing, got {:?}",
+        all_monitors(&emulator).await
+    );
+}
+
 /// RULE: the account holds at most [`MAX_ANOMALY_MONITORS`] monitors, and a create past
 /// that is refused with the failure the operation models rather than stored.
 #[tokio::test]
 async fn a_create_past_the_monitor_limit_is_refused() {
     let emulator = Emulator::start();
+    // Customer managed monitors: an account holds only one Amazon Web Services managed one
+    // (see [`a_second_managed_monitor_for_the_account_is_refused`]), so the registry's own
+    // bound is reached with the kind an account can hold many of.
+    let filler = |index: usize| {
+        custom_body(
+            &format!("at-the-limit-{index}"),
+            json!({"Tags": {"Key": "Team", "Values": [format!("team-{index}")]}}),
+        )
+    };
     for index in 0..MAX_ANOMALY_MONITORS {
-        emulator
-            .ok(
-                "CreateAnomalyMonitor",
-                &managed_body(&format!("at-the-limit-{index}"), "SERVICE", None),
-            )
-            .await;
+        emulator.ok("CreateAnomalyMonitor", &filler(index)).await;
     }
     // Twice over: the limit holds for every later call, not only the first one past it.
     for attempt in 0..2 {
         let (status, answered) = emulator
-            .call(
-                "CreateAnomalyMonitor",
-                &managed_body("over-the-limit", "SERVICE", None),
-            )
+            .call("CreateAnomalyMonitor", &filler(MAX_ANOMALY_MONITORS))
             .await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
@@ -478,10 +667,14 @@ async fn monitors_are_filtered_by_arn_and_paged_by_max_results() {
     let emulator = Emulator::start();
     let mut minted: Vec<String> = Vec::new();
     for index in 0..6 {
+        // Customer managed monitors, so the account can hold the six this walk pages over.
         let created = emulator
             .ok(
                 "CreateAnomalyMonitor",
-                &managed_body(&format!("paged-{index}"), "SERVICE", None),
+                &custom_body(
+                    &format!("paged-{index}"),
+                    json!({"Tags": {"Key": "Team", "Values": [format!("team-{index}")]}}),
+                ),
             )
             .await;
         minted.push(arn_of(&created));
@@ -580,9 +773,81 @@ async fn monitors_are_filtered_by_arn_and_paged_by_max_results() {
     );
 }
 
+/// RULE: a customer managed monitor is configured entirely by its `MonitorSpecification`
+/// (`AnomalyMonitor$MonitorDimension`: "For customer managed monitors, do not specify this
+/// field"), so a create carrying none is refused 400 `ValidationException` with Cost
+/// Explorer's own fixed sentence — one text for every such create, naming the member and the
+/// monitor kind in words and nothing taken from the request.
+///
+/// The table spans the requests that can carry no specification: different monitor names,
+/// with and without `ResourceTags`, and a monitor name of each extreme the member's length
+/// bound admits.
+#[tokio::test]
+async fn a_custom_monitor_with_no_specification_is_refused_with_one_sentence() {
+    let cases = vec![
+        (
+            "no specification and no tags",
+            json!({"AnomalyMonitor": {
+                "MonitorName": "custom-without-spec",
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+            }}),
+        ),
+        (
+            "no specification, with resource tags",
+            json!({
+                "AnomalyMonitor": {
+                    "MonitorName": "tagged-custom-without-spec",
+                    "MonitorType": MONITOR_TYPE_CUSTOM,
+                },
+                "ResourceTags": [{"Key": "Owner", "Value": "cost-ops"}],
+            }),
+        ),
+        (
+            "no specification, a one-character name",
+            json!({"AnomalyMonitor": {
+                "MonitorName": "c",
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+            }}),
+        ),
+        (
+            "no specification, the longest name the member admits",
+            json!({"AnomalyMonitor": {
+                // `MonitorName` is a `GenericString` of length 0..1024.
+                "MonitorName": "c".repeat(1024),
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+            }}),
+        ),
+    ];
+
+    let emulator = Emulator::start();
+    for (label, body) in &cases {
+        let (status, answered) = emulator.call("CreateAnomalyMonitor", body).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&answered).as_str(),
+                error_message(&answered).as_str()
+            ),
+            (
+                400,
+                "ValidationException",
+                CUSTOM_MISSING_SPECIFICATION_REFUSAL
+            ),
+            "case {label:?}: expected Cost Explorer's fixed sentence, got {status}: {answered}"
+        );
+    }
+    assert!(
+        all_monitors(&emulator).await.is_empty(),
+        "a refused create must persist nothing, got {:?}",
+        all_monitors(&emulator).await
+    );
+}
+
 /// RULE: the two members `GetAnomalyMonitors` can be asked wrongly about are each refused
 /// with the failure the model declares for it — a cursor this service never issued is 400
-/// `InvalidNextTokenException`, and a page size below one is a 400 `ValidationException`.
+/// `InvalidNextTokenException`, and a page size below [`MIN_PAGE_SIZE`] is a 400
+/// `ValidationException` carrying Cost Explorer's fixed sentence, the same text whatever
+/// page size was rejected.
 ///
 /// `MonitorArnList` is not one of them: it is a filter, so an ARN the account holds no
 /// monitor under is selected out rather than refused — asserted in
@@ -609,9 +874,18 @@ async fn a_read_asked_wrongly_is_refused() {
             (400, "InvalidNextTokenException"),
             "case {label:?}: expected a 400 InvalidNextTokenException, got {status}: {answered}"
         );
+        assert_eq!(
+            error_message(&answered),
+            INVALID_TOKEN_REFUSAL,
+            "case {label:?}: the refusal carries Cost Explorer's fixed sentence, got {answered}"
+        );
     }
 
-    for page_size in [0, -1] {
+    // The bound and one past it, and the far end of the member's `Integer` range: every
+    // page size under the minimum is refused, and all of them read the same because the
+    // rejected value is not part of the sentence.
+    let minimum = i32::try_from(MIN_PAGE_SIZE).expect("the minimum page size is an Integer");
+    for page_size in [minimum - 1, minimum - 2, -1, i32::MIN] {
         let (status, answered) = emulator
             .call("GetAnomalyMonitors", &json!({"MaxResults": page_size}))
             .await;
@@ -620,5 +894,24 @@ async fn a_read_asked_wrongly_is_refused() {
             (400, "ValidationException"),
             "case {page_size:?}: expected a 400 ValidationException, got {status}: {answered}"
         );
+        assert_eq!(
+            error_message(&answered),
+            PAGE_SIZE_REFUSAL,
+            "case {page_size:?}: the refusal carries Cost Explorer's fixed sentence, got \
+             {answered}"
+        );
     }
+
+    // The bound itself is a page size, so it is answered rather than refused.
+    let answered = emulator
+        .ok("GetAnomalyMonitors", &json!({"MaxResults": minimum}))
+        .await;
+    assert_eq!(
+        answered["AnomalyMonitors"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        1,
+        "case {minimum:?}: the smallest page size must report one monitor, got {answered}"
+    );
 }

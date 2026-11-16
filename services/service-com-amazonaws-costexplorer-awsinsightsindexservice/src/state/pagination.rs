@@ -30,13 +30,21 @@ pub fn encode_next_token(resume_at: &str) -> String {
 
 /// Decode a `NextToken` back into the ARN its page resumes at.
 ///
-/// `None` for anything that is not a well-formed cursor (not hex, or not UTF-8). A
-/// well-formed cursor naming no stored ARN simply resumes at the first ARN after it,
-/// which is an empty page when none follows.
+/// `None` for anything that is not a well-formed cursor (not hex, or not UTF-8) — refused
+/// with [`INVALID_NEXT_TOKEN_REFUSAL`] by the read that asked. A well-formed cursor naming
+/// no stored ARN simply resumes at the first ARN after it, which is an empty page when none
+/// follows.
 pub fn decode_next_token(token: &str) -> Option<String> {
     let bytes = ::hex::decode(token).ok()?;
     String::from_utf8(bytes).ok()
 }
+
+/// The refusal every paginated read in this service answers a `NextPageToken` it cannot
+/// read with.
+///
+/// Cost Explorer's own sentence, and wholly fixed: the token it rejected is not part of it.
+/// One constant for every such read, so two of them cannot drift apart on it.
+pub const INVALID_NEXT_TOKEN_REFUSAL: &str = "Provided token is invalid";
 
 /// The page size a request asks for: the caller's `MaxResults`, or [`UNPAGED`] when they
 /// named none.
@@ -44,16 +52,32 @@ pub fn decode_next_token(token: &str) -> Option<String> {
 /// `Err` carries the refusal text for a page size that is not one — a count below one, or
 /// one that is not a count at all. The member is a plain integer in the model, so the
 /// bound is not expressible there and the refusal is the caller's to read.
+///
+/// That text is [`page_size_below_minimum`], the FIXED sentence Cost Explorer refuses a
+/// page size under its minimum with: the minimum is the rule's own, and the rejected value
+/// is NOT echoed, so every refused page size reads the same.
 pub fn requested_page_size(max_results: Option<i32>) -> Result<usize, String> {
     match max_results {
         None => Ok(UNPAGED),
         Some(requested) => usize::try_from(requested)
             .ok()
-            .filter(|size| *size >= 1)
-            .ok_or_else(|| {
-                format!("MaxResults {requested} is not a page size; it must be at least 1")
-            }),
+            .filter(|size| *size >= MIN_PAGE_SIZE)
+            .ok_or_else(page_size_below_minimum),
     }
+}
+
+/// The smallest page size a paginated read here is answered for: a page reports at least
+/// one record, so a `PageSize` under one names no page at all.
+pub const MIN_PAGE_SIZE: usize = 1;
+
+/// The refusal every paginated read in this service answers a page size below
+/// [`MIN_PAGE_SIZE`] with.
+///
+/// One sentence for every such read, so two of them cannot drift apart on it. Its only
+/// number is [`MIN_PAGE_SIZE`], the rule's own limit — the rejected page size is not part
+/// of it, so the text does not vary per request.
+pub fn page_size_below_minimum() -> String {
+    format!("Number of results per page cannot be smaller than {MIN_PAGE_SIZE}")
 }
 
 /// One page of a registry: the records it reports, and the cursor that resumes after them.

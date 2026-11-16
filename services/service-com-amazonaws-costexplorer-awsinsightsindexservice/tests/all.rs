@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/anomaly_monitor_delete.rs"]
 mod anomaly_monitor_delete;
+#[path = "all/anomaly_monitor_update.rs"]
+mod anomaly_monitor_update;
 #[path = "all/anomaly_monitors.rs"]
 mod anomaly_monitors;
 #[path = "all/anomaly_subscription_update.rs"]

@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::{
-    MONITOR_ID_AS_MONITOR, MONITOR_TYPE_DIMENSIONAL, SUBSCRIBER_STATUS_CONFIRMED,
+    MONITOR_ID_AS_MONITOR, MONITOR_TYPE_CUSTOM, SUBSCRIBER_STATUS_CONFIRMED,
     SUBSCRIPTION_ID_AS_RESOURCE, THRESHOLD_ABSOLUTE_DIMENSION, THRESHOLD_MATCH_OPTION,
     THRESHOLD_VALUE_MAX,
 };
@@ -63,16 +63,22 @@ const UNKNOWN_MONITOR_STATUS: u16 = 400;
 /// service states the rule in terms of the two members and the condition on them.
 const BOTH_THRESHOLDS_MESSAGE: &str = "Threshold and ThresholdExpression cannot both be non-null";
 
-/// Create one managed cost anomaly monitor and answer with its ARN — a subscription has to
-/// name monitors the account holds.
+/// Create one customer managed cost anomaly monitor and answer with its ARN — a
+/// subscription has to name monitors the account holds.
+///
+/// Customer managed (`MonitorType` `CUSTOM`) rather than Amazon Web Services managed,
+/// because these cases need several monitors at once and an account holds only one managed
+/// monitor — asserted in [`crate::anomaly_monitors`]. The specification is the
+/// cost-allocation-tag form `AnomalyMonitor$MonitorSpecification` documents for a customer
+/// managed monitor.
 async fn create_monitor(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .ok(
             "CreateAnomalyMonitor",
             &json!({"AnomalyMonitor": {
                 "MonitorName": name,
-                "MonitorType": MONITOR_TYPE_DIMENSIONAL,
-                "MonitorDimension": "SERVICE",
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+                "MonitorSpecification": {"Tags": {"Key": "Team", "Values": [name]}},
             }}),
         )
         .await;

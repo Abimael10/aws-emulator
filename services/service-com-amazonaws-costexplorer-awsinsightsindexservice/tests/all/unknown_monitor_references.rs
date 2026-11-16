@@ -18,7 +18,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::{
-    MONITOR_ID_AS_MONITOR, MONITOR_ID_AS_RESOURCE, MONITOR_TYPE_DIMENSIONAL,
+    MONITOR_ID_AS_MONITOR, MONITOR_ID_AS_RESOURCE, MONITOR_TYPE_CUSTOM,
 };
 
 use crate::harness::{error_code, error_message, Emulator};
@@ -33,15 +33,22 @@ const EMAIL_ADDRESS: &str = "cost.ops@example.com";
 /// as a client-input refusal instead.
 const UNKNOWN_MONITOR_STATUS: u16 = 400;
 
-/// Create one managed cost anomaly monitor and answer with its ARN.
+/// Create one customer managed cost anomaly monitor and answer with its ARN.
+///
+/// Customer managed (`MonitorType` `CUSTOM`) rather than Amazon Web Services managed,
+/// because these cases need two monitors at once and an account holds only one managed
+/// monitor — asserted in [`crate::anomaly_monitors`]. Which kind a monitor is is not what
+/// this suite is about: it is about the ARNs that resolve to NO monitor. The specification
+/// is the cost-allocation-tag form `AnomalyMonitor$MonitorSpecification` documents for a
+/// customer managed monitor.
 async fn create_monitor(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .ok(
             "CreateAnomalyMonitor",
             &json!({"AnomalyMonitor": {
                 "MonitorName": name,
-                "MonitorType": MONITOR_TYPE_DIMENSIONAL,
-                "MonitorDimension": "SERVICE",
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+                "MonitorSpecification": {"Tags": {"Key": "Team", "Values": [name]}},
             }}),
         )
         .await;

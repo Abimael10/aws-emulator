@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAnomalyMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAnomalyMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAnomalyMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +134,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAnomalyMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAnomalyMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAnomalyMonitor"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there is no monitor to update and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // A monitor is named, so "the new name for the cost anomaly monitor" cannot be the
+        // empty string the member's modelled length bound admits. Checked through the rule
+        // the create path shares, before any lookup, so a refused update reads the registry
+        // no differently from one that never ran. The model declares no client-input error
+        // for this operation, so the refusal is the 400 `ValidationException` channel.
+        if let Some(monitor_name) = input.monitor_name.as_deref() {
+            crate::state::validate_monitor_name(monitor_name)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        let mut store = state.lock();
+        // The registry is the only place a monitor exists, so the update is a write to the
+        // stored record — and an ARN the account holds no monitor under is the one
+        // unknown-monitor refusal this operation models, whether it never named a monitor
+        // or named one a delete already removed. The monitor is this call's own resource,
+        // so the shared refusal names its id under `resourceId`.
+        let Some(monitor) = store.anomaly_monitors.get_mut(&input.monitor_arn) else {
+            return Err(UpdateAnomalyMonitorErrorModeled::UnknownMonitorException(
+                crate::state::unknown_monitor(
+                    crate::state::MONITOR_ID_AS_RESOURCE,
+                    &input.monitor_arn,
+                ),
+            )
+            .into());
+        };
+
+        // `MonitorName` is "the new name for the cost anomaly monitor", and the only member
+        // this operation can address: the type, the dimension and the specification the
+        // monitor was created with are not in this input, and the ARN and the dates are the
+        // service's own. A request naming no new name therefore leaves the monitor exactly
+        // as it was, `LastUpdatedDate` included — nothing was updated.
+        if let Some(monitor_name) = input.monitor_name {
+            monitor.monitor_name = monitor_name;
+            // "The date when the monitor was last updated": this write is that date, read
+            // off this service's own clock rather than taken from the request.
+            monitor.last_updated_date = crate::state::now_year_month_day();
+        }
+        let monitor_arn = monitor.arn.clone();
+        drop(store);
+
+        Ok(UpdateAnomalyMonitorOutput { monitor_arn })
     }
 }

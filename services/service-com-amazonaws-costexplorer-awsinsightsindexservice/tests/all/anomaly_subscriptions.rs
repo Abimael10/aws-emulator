@@ -8,11 +8,19 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::{
-    MAX_ANOMALY_SUBSCRIPTIONS, MONITOR_TYPE_DIMENSIONAL, SUBSCRIBER_STATUS_CONFIRMED,
+    MAX_ANOMALY_SUBSCRIPTIONS, MIN_PAGE_SIZE, MONITOR_TYPE_CUSTOM, SUBSCRIBER_STATUS_CONFIRMED,
     THRESHOLD_ABSOLUTE_DIMENSION, THRESHOLD_MATCH_OPTION, THRESHOLD_VALUE_MAX,
 };
 
-use crate::harness::{error_code, Emulator};
+use crate::harness::{error_code, error_message, Emulator};
+
+/// The sentence Cost Explorer refuses a page size below its minimum with — one sentence for
+/// every paginated read, with the rejected page size not echoed.
+const PAGE_SIZE_REFUSAL: &str = "Number of results per page cannot be smaller than 1";
+
+/// The sentence Cost Explorer refuses a `NextPageToken` it cannot read with. Fixed text:
+/// the rejected token is not echoed.
+const INVALID_TOKEN_REFUSAL: &str = "Provided token is invalid";
 
 /// An email subscriber address, in the form `SubscriberAddress`'s modelled pattern admits
 /// for the email channel.
@@ -23,16 +31,22 @@ const EMAIL_ADDRESS: &str = "cost.ops@example.com";
 /// registers the subscriber the caller named, it does not resolve the topic.
 const SNS_TOPIC_ARN: &str = "arn:aws:sns:us-east-1:123456789012:cost-anomaly-alerts";
 
-/// Create one managed cost anomaly monitor and answer with its ARN — a subscription has to
-/// name monitors the account holds.
+/// Create one customer managed cost anomaly monitor and answer with its ARN — a
+/// subscription has to name monitors the account holds.
+///
+/// Customer managed (`MonitorType` `CUSTOM`) rather than Amazon Web Services managed,
+/// because these cases need several monitors at once and an account holds only one managed
+/// monitor — asserted in [`crate::anomaly_monitors`]. The specification is the
+/// cost-allocation-tag form `AnomalyMonitor$MonitorSpecification` documents for a customer
+/// managed monitor.
 async fn create_monitor(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .ok(
             "CreateAnomalyMonitor",
             &json!({"AnomalyMonitor": {
                 "MonitorName": name,
-                "MonitorType": MONITOR_TYPE_DIMENSIONAL,
-                "MonitorDimension": "SERVICE",
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+                "MonitorSpecification": {"Tags": {"Key": "Team", "Values": [name]}},
             }}),
         )
         .await;
@@ -911,9 +925,17 @@ async fn a_read_asked_wrongly_is_refused() {
             (400, "InvalidNextTokenException"),
             "case {label:?}: expected a 400 InvalidNextTokenException, got {status}: {answered}"
         );
+        assert_eq!(
+            error_message(&answered),
+            INVALID_TOKEN_REFUSAL,
+            "case {label:?}: the refusal carries Cost Explorer's fixed sentence, got {answered}"
+        );
     }
 
-    for page_size in [0, -1] {
+    // Every page size under the minimum is refused with the SAME sentence — the one every
+    // paginated read in this service shares, with the rejected value not part of it.
+    let minimum = i32::try_from(MIN_PAGE_SIZE).expect("the minimum page size is an Integer");
+    for page_size in [minimum - 1, minimum - 2, -1, i32::MIN] {
         let (status, answered) = emulator
             .call("GetAnomalySubscriptions", &json!({"MaxResults": page_size}))
             .await;
@@ -921,6 +943,12 @@ async fn a_read_asked_wrongly_is_refused() {
             (status, error_code(&answered).as_str()),
             (400, "ValidationException"),
             "case {page_size:?}: expected a 400 ValidationException, got {status}: {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            PAGE_SIZE_REFUSAL,
+            "case {page_size:?}: the refusal carries Cost Explorer's fixed sentence, got \
+             {answered}"
         );
     }
 }

@@ -8,7 +8,7 @@
 //! [`crate::harness`], so nothing here reaches past the HTTP surface a client sees.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::MONITOR_TYPE_DIMENSIONAL;
+use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::MONITOR_TYPE_CUSTOM;
 
 use crate::harness::{error_code, Emulator};
 
@@ -16,15 +16,22 @@ use crate::harness::{error_code, Emulator};
 /// for the email channel.
 const EMAIL_ADDRESS: &str = "cost.ops@example.com";
 
-/// Create one managed cost anomaly monitor and answer with its ARN.
+/// Create one customer managed cost anomaly monitor and answer with its ARN.
+///
+/// Customer managed (`MonitorType` `CUSTOM`) rather than Amazon Web Services managed,
+/// because these cases need several monitors at once and an account holds only one managed
+/// monitor — asserted in [`crate::anomaly_monitors`]. Which kind a monitor is is not what
+/// this suite is about: a delete removes the registry's entry whatever type it carries.
+/// The specification is the cost-allocation-tag form
+/// `AnomalySubscription$MonitorSpecification` documents for a customer managed monitor.
 async fn create_monitor(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .ok(
             "CreateAnomalyMonitor",
             &json!({"AnomalyMonitor": {
                 "MonitorName": name,
-                "MonitorType": MONITOR_TYPE_DIMENSIONAL,
-                "MonitorDimension": "SERVICE",
+                "MonitorType": MONITOR_TYPE_CUSTOM,
+                "MonitorSpecification": {"Tags": {"Key": "Team", "Values": [name]}},
             }}),
         )
         .await;

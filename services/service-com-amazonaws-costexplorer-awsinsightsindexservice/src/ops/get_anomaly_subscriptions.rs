@@ -151,17 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A page resumes at the ARN its cursor names. An unreadable cursor is the one
-        // failure this operation models for the member.
+        // failure this operation models for the member, carrying the sentence every
+        // paginated read in this service shares.
         let resume_at = match input.next_page_token.as_deref() {
             None => None,
             Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
                 GetAnomalySubscriptionsErrorModeled::InvalidNextTokenException(
                     InvalidNextTokenException {
-                        message: Some(
-                            "The pagination token is invalid. Try again without a pagination \
-                             token."
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::INVALID_NEXT_TOKEN_REFUSAL.to_string()),
                     },
                 )
             })?),

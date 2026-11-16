@@ -162,6 +162,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Admission before any write, so a refused create leaves the registry exactly as
         // it was.
+        //
+        // An Amazon Web Services managed monitor is provisioned once per account, so a
+        // second one is refused whatever dimension it names. The count comes from the
+        // registry, so a managed monitor that was deleted frees the slot again. The
+        // refusal is the 400 `ValidationException` channel carrying Cost Explorer's own
+        // fixed sentence: the operation's modelled `LimitExceededException` is the
+        // call-rate failure ("You made too many calls in a short period of time"), not
+        // this one.
+        if monitor.monitor_type == crate::state::MONITOR_TYPE_DIMENSIONAL
+            && store.dimensional_anomaly_monitors() >= crate::state::MAX_DIMENSIONAL_ANOMALY_MONITORS
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::DIMENSIONAL_MONITOR_LIMIT_REFUSAL,
+            ));
+        }
         if store.anomaly_monitors.len() >= crate::state::MAX_ANOMALY_MONITORS {
             return Err(CreateAnomalyMonitorErrorModeled::LimitExceededException(
                 LimitExceededException {
