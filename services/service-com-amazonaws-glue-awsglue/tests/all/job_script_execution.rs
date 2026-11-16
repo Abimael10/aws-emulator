@@ -778,9 +778,10 @@ raise RuntimeError("this attempt failed after writing its object")
 /// instead, which must succeed — so the table cannot pass by every script failing for some
 /// other reason.
 ///
-/// What each row asserts is decided by the script's own EXECUTION and by nothing else: the
-/// module a contained script reaches for is one the engine never registered, so the script
-/// raises on every host and the run carries that exception. The one thing in the path that
+/// What each row asserts is decided by the script's own EXECUTION and by nothing else: what a
+/// contained script reaches for is a capability the engine never registered — the module
+/// itself where the runtime has none, and otherwise the CALL that would need the host — so the
+/// script raises on every host and the run carries that exception. The one thing in the path that
 /// depends on what else the host is doing is WHICH call performs that execution — the start,
 /// or a later read when no interpreter was free for the start — which is why every row reads
 /// the run back until it has come to rest ([`run_to_rest`]) rather than once after the span
@@ -817,9 +818,10 @@ async fn a_script_reaches_nothing_of_the_host() {
         ),
         (
             // The same reach made through the import machinery rather than a statement, and
-            // through the import builtin, so the refusal is not one `import` spells alone.
+            // through the import builtin, so the refusal is not one `import` spells alone:
+            // what the runtime refuses is the call that would start a host process.
             "importing a host module through importlib",
-            "import importlib\nimportlib.import_module(\"subprocess\")\n",
+            "import importlib\nimportlib.import_module(\"subprocess\").run([\"/bin/ls\"])\n",
             false,
         ),
         (

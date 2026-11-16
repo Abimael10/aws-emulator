@@ -514,25 +514,116 @@ pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
 const SOCKET_SOURCE: &str = r#"
 """The socket interface of this runtime: a connection reaches this emulator's own listeners."""
 
+# The address families, the socket types and the protocol numbers, as `<sys/socket.h>` and
+# `<netinet/in.h>` define them on this platform (the values Python's own `socket` module
+# publishes for them). DATA: naming one of them opens nothing.
 AF_UNSPEC = 0
+AF_UNIX = 1
 AF_INET = 2
 AF_INET6 = 10
 SOCK_STREAM = 1
 SOCK_DGRAM = 2
+SOCK_RAW = 3
+SOCK_SEQPACKET = 5
 SOL_SOCKET = 1
-SO_REUSEADDR = 2
-SO_KEEPALIVE = 9
-SO_ERROR = 4
 IPPROTO_IP = 0
+IPPROTO_ICMP = 1
 IPPROTO_TCP = 6
 IPPROTO_UDP = 17
+IPPROTO_IPV6 = 41
+IPPROTO_RAW = 255
+
+# The socket-level options a client library sets on a connection it opened — the send and
+# receive buffer sizes, the linger and the timeouts among them — as
+# `<asm-generic/socket.h>` numbers them.
+SO_DEBUG = 1
+SO_REUSEADDR = 2
+SO_TYPE = 3
+SO_ERROR = 4
+SO_DONTROUTE = 5
+SO_BROADCAST = 6
+SO_SNDBUF = 7
+SO_RCVBUF = 8
+SO_KEEPALIVE = 9
+SO_OOBINLINE = 10
+SO_LINGER = 13
+SO_REUSEPORT = 15
+SO_RCVLOWAT = 18
+SO_SNDLOWAT = 19
+SO_RCVTIMEO = 20
+SO_SNDTIMEO = 21
+SO_ACCEPTCONN = 30
+
+# The TCP-level options of the same kind — the keepalive timers a pooling client arms among
+# them — as `<netinet/tcp.h>` numbers them.
 TCP_NODELAY = 1
+TCP_MAXSEG = 2
+TCP_CORK = 3
+TCP_KEEPIDLE = 4
+TCP_KEEPINTVL = 5
+TCP_KEEPCNT = 6
+TCP_SYNCNT = 7
+TCP_LINGER2 = 8
+TCP_DEFER_ACCEPT = 9
+TCP_WINDOW_CLAMP = 10
+TCP_INFO = 11
+TCP_QUICKACK = 12
+TCP_CONGESTION = 13
+TCP_USER_TIMEOUT = 18
+TCP_FASTOPEN = 23
+
+# The one IPv6-level option a program reads off this module, and the shutdown directions.
+IPV6_V6ONLY = 26
 SHUT_RD = 0
 SHUT_WR = 1
 SHUT_RDWR = 2
+
+# The flags a send or a receive takes, as `<sys/socket.h>` defines them.
+MSG_OOB = 1
+MSG_PEEK = 2
+MSG_DONTROUTE = 4
+MSG_CTRUNC = 8
+MSG_TRUNC = 32
+MSG_DONTWAIT = 64
+MSG_EOR = 128
+MSG_WAITALL = 256
+MSG_NOSIGNAL = 16384
+MSG_MORE = 32768
+
+# The flags an address lookup takes and the errors it reports, as `<netdb.h>` defines them:
+# a client library branches on the error of a lookup this runtime answers for a name.
 AI_PASSIVE = 1
 AI_CANONNAME = 2
+AI_NUMERICHOST = 4
+AI_V4MAPPED = 8
+AI_ALL = 16
+AI_ADDRCONFIG = 32
+AI_NUMERICSERV = 1024
+EAI_BADFLAGS = -1
+EAI_NONAME = -2
+EAI_AGAIN = -3
+EAI_FAIL = -4
+EAI_NODATA = -5
+EAI_FAMILY = -6
+EAI_SOCKTYPE = -7
+EAI_SERVICE = -8
+EAI_ADDRFAMILY = -9
+EAI_MEMORY = -10
+EAI_SYSTEM = -11
 NI_NUMERICHOST = 1
+NI_NUMERICSERV = 2
+NI_NOFQDN = 4
+NI_NAMEREQD = 8
+NI_DGRAM = 16
+
+# The special addresses and the listen ceiling a program names, as `<netinet/in.h>` and
+# `<sys/socket.h>` state them.
+INADDR_ANY = 0
+INADDR_BROADCAST = 0xFFFFFFFF
+INADDR_LOOPBACK = 0x7F000001
+INADDR_NONE = 0xFFFFFFFF
+SOMAXCONN = 4096
+
 has_ipv6 = False
 
 # What `socket.timeout` and `socket.error` are in a current Python: the builtin errors,

@@ -152,9 +152,10 @@ pub const RESOURCE_ID_PREFIX: &str = "resource:";
 /// `_testinternalcapi`, and every other module whose calls land on the host. `posix` and
 /// `_thread` are absent for the same reason, and this module supplies its OWN of each
 /// instead (see [`host_posix_module`], [`host_thread_module`]). Where one of those names a
-/// module of the standard library a handler imports (`socket`, `ssl`, `select`), the module
-/// ITSELF is supplied on the import path in Python ([`runtime_stdlib`]), so the import
-/// succeeds and only the call needing the absent capability is refused.
+/// module of the standard library a handler imports (`socket`, `ssl`, `select`, `signal`,
+/// `subprocess`), the module ITSELF is supplied on the import path in Python
+/// ([`runtime_stdlib`]), so the import succeeds and only the call needing the absent
+/// capability is refused.
 ///
 /// Two of the names here are registered but PATCHED before guest code runs, because the
 /// frozen standard library needs the rest of each: `_io`, whose host file-opening calls
@@ -1435,14 +1436,18 @@ fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
 
 /// The modules of the STANDARD LIBRARY this runtime supplies in place of the frozen ones:
 /// the socket module a Python program expects of its operating system, the HTTP client
-/// built on one and the TLS layer beside it ([`super::guest_http`]), and the waiting
+/// built on one and the TLS layer beside it ([`super::guest_http`]), the waiting
 /// interface the standard library's own `selectors` is built out of
-/// ([`super::guest_select`]). Resolved before the frozen standard library and after the
-/// deployment package's own entries, which is where a runtime's own standard library sits.
+/// ([`super::guest_select`]), and the signal and child-process interfaces beside them
+/// ([`super::guest_signal`], [`super::guest_process`]). Resolved before the frozen standard
+/// library and after the deployment package's own entries, which is where a runtime's own
+/// standard library sits.
 fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
     super::guest_http::runtime_stdlib_modules()
         .into_iter()
         .chain(super::guest_select::runtime_stdlib_modules())
+        .chain(super::guest_signal::runtime_stdlib_modules())
+        .chain(super::guest_process::runtime_stdlib_modules())
         .map(|module| (module.path, ::serde_json::Value::String(module.source)))
         .collect()
 }

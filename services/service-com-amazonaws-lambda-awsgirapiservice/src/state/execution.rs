@@ -128,6 +128,14 @@ pub mod guest_socket;
 /// client library it vendors, imports beside the socket interface.
 pub mod guest_select;
 
+/// The signal interface of that same standard library — the `signal` module a handler, or a
+/// client library it vendors, imports beside the waiting interface.
+pub mod guest_signal;
+
+/// The child-process interface of that same standard library — the `subprocess` module a
+/// handler, a client library it vendors, or the frozen `asyncio` imports.
+pub mod guest_process;
+
 /// The Amazon S3 half of that seam, whose own protocol binds a request per operation.
 mod aws_s3;
 

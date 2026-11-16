@@ -569,6 +569,8 @@ mod python_runtime_os_surface;
 mod python_sandbox_bound_isolation;
 #[path = "all/python_select_surface.rs"]
 mod python_select_surface;
+#[path = "all/python_stdlib_module_surface.rs"]
+mod python_stdlib_module_surface;
 #[path = "all/python_tls_surface.rs"]
 mod python_tls_surface;
 #[path = "all/queue_message_count_snapshot.rs"]

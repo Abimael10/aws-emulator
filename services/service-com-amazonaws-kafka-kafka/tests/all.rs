@@ -111,6 +111,8 @@ mod identity_policy_gate;
 mod iso8601_timestamps;
 #[path = "all/kafka_harness.rs"]
 mod kafka_harness;
+#[path = "all/kafka_version_catalog_fold.rs"]
+mod kafka_version_catalog_fold;
 #[path = "all/kafka_version_catalog_rows.rs"]
 mod kafka_version_catalog_rows;
 #[path = "all/kafka_version_lifecycle_rows.rs"]
