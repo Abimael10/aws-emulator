@@ -43,26 +43,26 @@ const ACTION: &str = "s3tables:GetTableEncryption";
 const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The region every call here is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The namespace the fixture tables live in.
 const NAMESPACE: &str = "auth_ns";
 
 /// The `RoleSessionName` every `AssumeRole` here asks for — the last segment of
 /// the assumed-role ARN a refusal names as the principal.
-const SESSION: &str = "probe";
+pub(crate) const SESSION: &str = "probe";
 
 /// The access-key id standing for the account's own published credential:
 /// neither STS nor IAM holds a record for it, so it resolves to the account's
 /// ambient identity, which holds no IAM policies — the position AWS account root
 /// credentials are in. Every fixture is made with it.
-const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a
 /// refusal must blame it by — what `sts:GetCallerIdentity` reports for that key.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// This service beside the IAM and STS services its callers are made with, all
@@ -71,13 +71,15 @@ struct Principal {
 /// `super::harness::Emulator` mounts this service alone and signs every call
 /// with one key, which is right for a suite about what this service stores; a
 /// suite about WHO is calling needs the two services that hold principals and
-/// their policies, and a credential scope naming a different key per call.
-struct Emulator {
+/// their policies, and a credential scope naming a different key per call. It is
+/// shared with the other suites about who is calling
+/// (`table_bucket_encryption_authorization.rs`) rather than copied.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Nothing here signs: the `Authorization` header carries only the
@@ -102,7 +104,7 @@ impl Emulator {
 
     /// One restJson1 call to this service, signed for [`REGION`] with
     /// `access_key_id` in the credential scope.
-    async fn call_as(
+    pub(crate) async fn call_as(
         &self,
         access_key_id: &str,
         method: &str,
@@ -177,7 +179,7 @@ impl Emulator {
     }
 
     /// A call signed with the account's own credential that must succeed.
-    async fn ok(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn ok(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let reply = self.call_as(ACCOUNT_KEY, method, path, body).await;
         assert!(
             (200..300).contains(&reply.status),
@@ -190,7 +192,7 @@ impl Emulator {
 
     /// One awsQuery call to IAM or STS, signed with the account's own
     /// credential, which must succeed.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         signing_name: &str,
         version: &str,
@@ -253,7 +255,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// One identity-based policy document carrying one statement.
-fn statement(effect: &str, action: &str, resource: &str) -> String {
+pub(crate) fn statement(effect: &str, action: &str, resource: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": effect, "Action": action, "Resource": resource}],
@@ -264,7 +266,11 @@ fn statement(effect: &str, action: &str, resource: &str) -> String {
 /// Create an IAM role carrying one inline policy per document in `policies`,
 /// assume it through STS, and answer the session's access key id with the
 /// session ARN.
-async fn assumed_role(aws: &Emulator, role_name: &str, policies: &[String]) -> Principal {
+pub(crate) async fn assumed_role(
+    aws: &Emulator,
+    role_name: &str,
+    policies: &[String],
+) -> Principal {
     let account = engine::emulator_account_id();
     let trust = json!({
         "Version": "2012-10-17",

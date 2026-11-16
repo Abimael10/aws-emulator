@@ -228,6 +228,12 @@ async fn a_resource_the_store_does_not_hold_is_refused_with_the_services_fixed_n
                 "ListTables",
                 emulator.list_tables(REGION, &absent_arn, &[]).await,
             ),
+            (
+                "DeleteTableBucketEncryption",
+                emulator
+                    .delete_table_bucket_encryption(REGION, &absent_arn)
+                    .await,
+            ),
         ];
         for (operation, reply) in &about_absent_bucket {
             let case = format!("{case} / {operation} on a bucket that was never created");

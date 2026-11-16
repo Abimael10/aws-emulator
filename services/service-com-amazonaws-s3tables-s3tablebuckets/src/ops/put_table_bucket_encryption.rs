@@ -66,6 +66,22 @@
 //!   could not be found.
 //! * `TooManyRequestsException` (HTTP 429) — The limit on the number of requests per second
 //!   was exceeded.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   action cannot be performed because you do not have the required permission. This
+//!   operation's own `errors` list omits the shape its SERVICE models for an identity-based
+//!   refusal, which is the answer a caller holding no `s3tables:PutTableBucketEncryption`
+//!   grant is recorded getting — and the one its sibling `GetTableBucketEncryption` lists.
+//!
+//! ## The two gates in front of the write
+//!
+//! * the CALLER's own identity-based IAM policies, which decide every operation of this
+//!   service that documents a permission (`crate::state::authorization`), and
+//! * KMS's answer about the key a configuration naming `aws:kms` carries
+//!   (`crate::state::kms_key_access`), since the key the configuration names is the key
+//!   S3 Tables would encrypt under.
+//!
+//! Both are decided BEFORE the store is written, so a refused put leaves the configuration
+//! the bucket already carried.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -105,9 +121,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutTableBucketEncryption
 // here — hence the `PutTableBucketEncryptionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3tables#PutTableBucketEncryption")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models that
+// shape (HTTP 403, "The action cannot be performed because you do not have the required
+// permission") and lists it on the sibling read of the same configuration, but this
+// operation's own `errors` list omits it — and an identity-based refusal of a caller
+// holding no `s3tables:PutTableBucketEncryption` grant is what this operation is recorded
+// answering, so the shape is widened in rather than the refusal being answered as some
+// other class.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3tables#PutTableBucketEncryption",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutTableBucketEncryptionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     BadRequestException(BadRequestException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
@@ -145,6 +173,27 @@ fn bucket_not_found() -> PutTableBucketEncryptionError {
 /// models for a configuration this service cannot encrypt a table bucket under.
 fn bad_request(message: String) -> PutTableBucketEncryptionError {
     PutTableBucketEncryptionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `AccessDeniedException` (HTTP 403) — the calling principal's own
+/// identity-based IAM policies do not allow this action on the table bucket the
+/// request addresses. The sentence is IAM's own, built by the gate.
+fn access_denied(message: String) -> PutTableBucketEncryptionError {
+    PutTableBucketEncryptionErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `ForbiddenException` (HTTP 403) — the modelled refusal for a request this
+/// service will not make on the caller's behalf: KMS answers the caller nothing
+/// about the key the configuration names, so there is no key to encrypt the
+/// bucket's tables under. The sentence is KMS's own, built by the gate.
+fn forbidden(message: String) -> PutTableBucketEncryptionError {
+    PutTableBucketEncryptionErrorModeled::ForbiddenException(ForbiddenException {
         message: Some(message),
     })
     .into()
@@ -194,6 +243,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // Setting a table bucket's encryption takes the
+        // `s3tables:PutTableBucketEncryption` permission, and the IAM resource
+        // that permission is granted on is the TABLE BUCKET the request
+        // addresses — the only resource it names. Decided BEFORE anything is
+        // read or written, so a caller holding no grant changes nothing and
+        // learns nothing about the bucket. No guard is held while the decision
+        // is taken. See `crate::state::authorization`.
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.table_bucket_arn,
+        ) {
+            return Err(access_denied(message));
+        }
+
         // The configuration is settled BEFORE the store is reached, so a request
         // this service has no encryption for leaves the bucket's own
         // configuration exactly as it was: the algorithm must be one the model
@@ -206,10 +271,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(bad_request)?;
 
+        // The configuration belongs to a table bucket, so a put against an ARN
+        // the store holds no bucket for is the modeled not-found — answered
+        // before the key is resolved, since a bucket that is not there has no
+        // encryption to set.
+        if !state
+            .lock()
+            .table_buckets
+            .contains_key(&input.table_bucket_arn)
+        {
+            return Err(bucket_not_found());
+        }
+
+        // A configuration naming `aws:kms` names the key S3 Tables would
+        // encrypt the bucket's tables under, so the key is resolved — in the
+        // Region the request was signed for, as the caller itself would resolve
+        // it — before it is stored, and a key KMS answers the caller nothing
+        // about is refused rather than persisted. Asked with no guard of this
+        // store held. See `crate::state::kms_key_access`.
+        if let Some(message) = crate::state::kms_key_access::refusal(
+            &*self.engine,
+            &crate::state::request_region(ctx.parts()),
+            || crate::state::authorization::caller_arn(&*self.engine, ctx),
+            &encryption,
+        ) {
+            return Err(forbidden(message));
+        }
+
         let mut store = state.lock();
 
-        // The configuration belongs to a table bucket, so a put against an ARN
-        // the store holds no bucket for is the modeled not-found.
+        // The bucket is read again under the guard that writes it, so a bucket
+        // deleted while the key was being resolved is the same not-found as one
+        // that was never there.
         let bucket = store
             .table_buckets
             .get_mut(&input.table_bucket_arn)

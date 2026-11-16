@@ -113,7 +113,96 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(s3tables::EmulatedService::new(Arc::clone(&engine)));
+        // The KMS service beside it, on the SAME engine — the assembly
+        // `core/router` performs, minus the other services. A suite that
+        // configures SSE-KMS encryption needs a key KMS itself holds
+        // ([`Self::create_kms_key`]), because what this service stores for such a
+        // configuration is decided by whether KMS resolves the key it names.
+        router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        // And STS, so a suite can ask who the calls below speak for the way a
+        // client does ([`Self::caller_identity_arn`]) rather than spelling a
+        // principal ARN itself.
+        router.register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         Self { router, engine }
+    }
+
+    /// The ARN `sts:GetCallerIdentity` reports for the credential every call
+    /// this harness signs with — the principal a refusal of those calls names.
+    ///
+    /// STS speaks `awsQuery`: a form-encoded `POST /`, answered in XML.
+    pub async fn caller_identity_arn(&self, region: &str) -> String {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://sts.amazonaws.com/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={PRESENTED_AKID}/20260101/{region}/sts/\
+                     aws4_request, SignedHeaders=host, Signature=0000"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                "Action=GetCallerIdentity&Version=2011-06-15".as_bytes().to_vec(),
+            ))
+            .expect("a well-formed STS request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "STS GetCallerIdentity must succeed, got {status} with {text}"
+        );
+        let open = "<Arn>";
+        let close = "</Arn>";
+        let start = text
+            .find(open)
+            .unwrap_or_else(|| panic!("GetCallerIdentity answers an Arn, got {text}"))
+            + open.len();
+        let end = text[start..]
+            .find(close)
+            .unwrap_or_else(|| panic!("the Arn element must close, got {text}"))
+            + start;
+        text[start..end].to_string()
+    }
+
+    /// A fresh customer managed KMS key in `region`, by the ARN KMS minted for
+    /// it — created through KMS's OWN `CreateKey`, so the key a configuration
+    /// names is one that service answers for.
+    ///
+    /// KMS speaks `awsJson1_1`: `POST /` with `X-Amz-Target: TrentService.<op>`.
+    pub async fn create_kms_key(&self, region: &str) -> String {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://kms.{region}.amazonaws.com/"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", "TrentService.CreateKey")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={PRESENTED_AKID}/20260101/{region}/kms/\
+                     aws4_request, SignedHeaders=host;x-amz-target, Signature=0000"
+                ),
+            )
+            .body(bytes::Bytes::from(b"{}".to_vec()))
+            .expect("a well-formed KMS request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let payload: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        assert_eq!(
+            status, 200,
+            "KMS CreateKey in {region} must succeed, got {status} {payload}"
+        );
+        payload["KeyMetadata"]["Arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("KMS CreateKey must report an ARN, got {payload}"))
+            .to_string()
     }
 
     /// Call one operation over the wire. `region` is the region the request's
@@ -216,6 +305,17 @@ impl Emulator {
     pub async fn get_table_bucket_encryption(&self, region: &str, arn: &str) -> Reply {
         self.call(
             "GET",
+            &format!("/buckets/{}/encryption", encode(arn)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `DeleteTableBucketEncryption`: the bucket's ARN is the one path label.
+    pub async fn delete_table_bucket_encryption(&self, region: &str, arn: &str) -> Reply {
+        self.call(
+            "DELETE",
             &format!("/buckets/{}/encryption", encode(arn)),
             region,
             None,

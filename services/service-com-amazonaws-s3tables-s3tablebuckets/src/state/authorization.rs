@@ -161,6 +161,26 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     ))
 }
 
+/// The ARN of the principal this request speaks for, as `sts:GetCallerIdentity`
+/// reports it.
+///
+/// It is the SAME resolution [`refusal`] blames a refused request by ([`caller`]
+/// below), so a refusal this service words itself and a refusal it relays from
+/// another service name one principal. A request whose credential neither STS
+/// nor IAM holds a record for speaks for the account's own published identity,
+/// which is what that operation answers for it too.
+///
+/// Reach for it where a refusal is about something OTHER than this service's own
+/// authorization decision — a resource of another service the caller cannot be
+/// answered about — since the decision itself already carries the principal.
+#[must_use]
+pub fn caller_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).arn
+}
+
 /// The principal a request speaks for, and everything the decision is made from.
 #[derive(Debug, Clone, Default)]
 struct Caller {

@@ -67,6 +67,12 @@ mod service_managed_table_deletes;
 mod state_roundtrip;
 #[path = "all/table_bucket_encryption.rs"]
 mod table_bucket_encryption;
+#[path = "all/table_bucket_encryption_authorization.rs"]
+mod table_bucket_encryption_authorization;
+#[path = "all/table_bucket_encryption_delete.rs"]
+mod table_bucket_encryption_delete;
+#[path = "all/table_bucket_encryption_key_access.rs"]
+mod table_bucket_encryption_key_access;
 #[path = "all/table_bucket_encryption_put.rs"]
 mod table_bucket_encryption_put;
 #[path = "all/table_bucket_lifecycle.rs"]

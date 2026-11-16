@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTableBucketEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTableBucketEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTableBucketEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +61,17 @@
 //!   could not be found.
 //! * `TooManyRequestsException` (HTTP 429) — The limit on the number of requests per second
 //!   was exceeded.
+//!
+//! ## What the delete removes
+//!
+//! A table bucket is ALWAYS encrypted, so what this operation removes is the
+//! configuration the bucket holds of its OWN — the one a create or a put wrote — which
+//! reverts the bucket to the service default (`crate::state::DEFAULT_BUCKET_ENCRYPTION`),
+//! what a read reports for a bucket nothing was ever set on. A bucket that holds none is
+//! therefore refused: there is no configuration of the bucket's to remove, which is the
+//! modelled `NotFoundException`
+//! (`crate::state::ENCRYPTION_CONFIGURATION_NOT_FOUND_MESSAGE`), and the refusal writes
+//! nothing.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -135,6 +137,17 @@ impl From<DeleteTableBucketEncryptionErrorModeled> for DeleteTableBucketEncrypti
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the refusal this operation models for a
+/// table bucket the store does not hold, and for one that holds no encryption
+/// configuration of its own to remove, each worded with the one sentence this
+/// service states that class with.
+fn not_found(message: &str) -> DeleteTableBucketEncryptionError {
+    DeleteTableBucketEncryptionErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `DeleteTableBucketEncryption` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +184,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTableBucketEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableBucketEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTableBucketEncryption"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTableBucketEncryptionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The configuration belongs to a table bucket, so a delete against an
+        // ARN the store holds no bucket for is the modeled not-found.
+        let bucket = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
+
+        // A bucket that holds NO configuration of its own is protected by the
+        // service default, which is not the bucket's to remove: there is no
+        // such configuration, which is the modeled not-found — and the refusal
+        // writes nothing, so a following read reports exactly what it did
+        // before. A bucket that holds one is reverted to that default,
+        // including the KMS key the configuration carried, which is what makes
+        // the key's hold on the bucket end with the delete.
+        if bucket.encryption.take().is_none() {
+            return Err(not_found(
+                crate::state::ENCRYPTION_CONFIGURATION_NOT_FOUND_MESSAGE,
+            ));
+        }
+        let resource = bucket.arn.clone();
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what it
+        // changed and the outcome. Metadata only — never the key the removed
+        // configuration carried.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = resource.as_str(),
+            outcome = "deleted",
+            "table bucket encryption configuration deleted",
+        );
+
+        Ok(DeleteTableBucketEncryptionOutput)
     }
 }

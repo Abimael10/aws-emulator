@@ -24,6 +24,13 @@
 //! whether it carries a KMS key and which one, what the bucket carried before
 //! the put (nothing, S3-managed keys, another KMS key), how many puts are
 //! applied in a row, and the region the bucket lives in.
+//!
+//! Every KMS key a row names is KMS's OWN, created through its `CreateKey` over
+//! the same engine in the region the row works in, because a configuration
+//! naming `aws:kms` is only storable when KMS resolves the key it names
+//! (`table_bucket_encryption_key_access.rs` is the suite of that rule). A row
+//! therefore names a key SLOT and the ARN is resolved from the keys this run
+//! created.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_s3tables_s3tablebuckets as s3tables;
@@ -36,21 +43,56 @@ use super::harness::{expected_bucket_arn, Emulator};
 // `GetTableBucketEncryption` suite rather than copied.
 use super::table_bucket_encryption::reported;
 
-/// Three KMS key ARNs of the form the modeled `kmsKeyArn` pattern accepts
-/// (`^(arn:aws[-a-z0-9]*:kms:[-a-z0-9]*:[0-9]{12}:key/.+)$`), differing in
-/// region and key id so a reported key cannot be a constant.
-const FIRST_KEY_ARN: &str =
-    "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
-const SECOND_KEY_ARN: &str =
-    "arn:aws:kms:us-east-1:000000000000:key/9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210";
-const THIRD_KEY_ARN: &str =
-    "arn:aws:kms:eu-west-1:000000000000:key/fedcba98-7654-3210-fedc-ba9876543210";
+/// The KMS keys this suite's rows name: two in the region most rows work in and
+/// two in the other one, so a row can move a bucket from one key to another
+/// without leaving the region that holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    First,
+    Second,
+    West,
+    WestSecond,
+}
+
+/// The ARNs KMS minted for those keys in this run.
+struct Keys {
+    first: String,
+    second: String,
+    west: String,
+    west_second: String,
+}
+
+impl Keys {
+    /// Create every key, each in the region the rows that name it work in.
+    async fn create(emulator: &Emulator) -> Self {
+        Self {
+            first: emulator.create_kms_key("us-east-1").await,
+            second: emulator.create_kms_key("us-east-1").await,
+            west: emulator.create_kms_key("eu-west-1").await,
+            west_second: emulator.create_kms_key("eu-west-1").await,
+        }
+    }
+
+    /// The ARN of one slot.
+    fn arn(&self, key: Key) -> &str {
+        match key {
+            Key::First => &self.first,
+            Key::Second => &self.second,
+            Key::West => &self.west,
+            Key::WestSecond => &self.west_second,
+        }
+    }
+}
 
 /// The namespace the inheritance case creates its tables in.
 const NAMESPACE: &str = "put_encryption_ns";
 
-/// An `encryptionConfiguration`, as `(sseAlgorithm, kmsKeyArn)`.
-type Configuration = (&'static str, Option<&'static str>);
+/// An `encryptionConfiguration`, as `(sseAlgorithm, the key slot)`.
+type Configuration = (&'static str, Option<Key>);
+
+/// A configuration as a row ASSERTS it: the algorithm, and the key ARN resolved
+/// from the slot the row named.
+type SettledConfiguration = (&'static str, Option<String>);
 
 /// One row: a table bucket created the way the row says, then the puts the row
 /// applies in order, and the configuration a read must report afterwards.
@@ -65,16 +107,16 @@ struct Case {
     /// a read must report.
     puts: &'static [Configuration],
     expected_algorithm: &'static str,
-    expected_kms_key_arn: Option<&'static str>,
+    expected_kms_key: Option<Key>,
 }
 
 /// The body member a put (or a create) carries for `configuration`.
-fn configuration_member(configuration: Configuration) -> Value {
+fn configuration_member(configuration: Configuration, keys: &Keys) -> Value {
     let (algorithm, key) = configuration;
     let mut members = Map::new();
     members.insert("sseAlgorithm".to_string(), json!(algorithm));
     if let Some(key) = key {
-        members.insert("kmsKeyArn".to_string(), json!(key));
+        members.insert("kmsKeyArn".to_string(), json!(keys.arn(key)));
     }
     Value::Object(members)
 }
@@ -88,46 +130,46 @@ fn cases() -> Vec<Case> {
             created_with: None,
             puts: &[("AES256", None)],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
         Case {
             label: "a bucket that named no configuration takes KMS-managed keys with a key",
             region: "us-east-1",
             bucket: "put-encryption-fresh-kms",
             created_with: None,
-            puts: &[("aws:kms", Some(FIRST_KEY_ARN))],
+            puts: &[("aws:kms", Some(Key::First))],
             expected_algorithm: "aws:kms",
-            expected_kms_key_arn: Some(FIRST_KEY_ARN),
+            expected_kms_key: Some(Key::First),
         },
         Case {
             label: "the put replaces the configuration the create named",
             region: "us-east-1",
             bucket: "put-encryption-replaces-create",
             created_with: Some(("AES256", None)),
-            puts: &[("aws:kms", Some(SECOND_KEY_ARN))],
+            puts: &[("aws:kms", Some(Key::Second))],
             expected_algorithm: "aws:kms",
-            expected_kms_key_arn: Some(SECOND_KEY_ARN),
+            expected_kms_key: Some(Key::Second),
         },
         Case {
             label: "a second put moves the bucket to another key",
             region: "us-east-1",
             bucket: "put-encryption-another-key",
-            created_with: Some(("aws:kms", Some(FIRST_KEY_ARN))),
+            created_with: Some(("aws:kms", Some(Key::First))),
             puts: &[
-                ("aws:kms", Some(SECOND_KEY_ARN)),
-                ("aws:kms", Some(THIRD_KEY_ARN)),
+                ("aws:kms", Some(Key::Second)),
+                ("aws:kms", Some(Key::First)),
             ],
             expected_algorithm: "aws:kms",
-            expected_kms_key_arn: Some(THIRD_KEY_ARN),
+            expected_kms_key: Some(Key::First),
         },
         Case {
             label: "a put back to S3-managed keys drops the key the bucket carried",
             region: "us-east-1",
             bucket: "put-encryption-back-to-aes",
-            created_with: Some(("aws:kms", Some(FIRST_KEY_ARN))),
+            created_with: Some(("aws:kms", Some(Key::First))),
             puts: &[("AES256", None)],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
         Case {
             label: "the same configuration put twice: the operation is idempotent",
@@ -135,20 +177,20 @@ fn cases() -> Vec<Case> {
             bucket: "put-encryption-idempotent",
             created_with: None,
             puts: &[
-                ("aws:kms", Some(FIRST_KEY_ARN)),
-                ("aws:kms", Some(FIRST_KEY_ARN)),
+                ("aws:kms", Some(Key::First)),
+                ("aws:kms", Some(Key::First)),
             ],
             expected_algorithm: "aws:kms",
-            expected_kms_key_arn: Some(FIRST_KEY_ARN),
+            expected_kms_key: Some(Key::First),
         },
         Case {
             label: "a bucket in another region, put a key of that region",
             region: "eu-west-1",
             bucket: "put-encryption-west",
             created_with: None,
-            puts: &[("aws:kms", Some(THIRD_KEY_ARN))],
+            puts: &[("aws:kms", Some(Key::West))],
             expected_algorithm: "aws:kms",
-            expected_kms_key_arn: Some(THIRD_KEY_ARN),
+            expected_kms_key: Some(Key::West),
         },
         Case {
             label: "three puts in a row, ending on S3-managed keys",
@@ -156,12 +198,12 @@ fn cases() -> Vec<Case> {
             bucket: "put-encryption-west-sequence",
             created_with: Some(("AES256", None)),
             puts: &[
-                ("aws:kms", Some(THIRD_KEY_ARN)),
-                ("aws:kms", Some(FIRST_KEY_ARN)),
+                ("aws:kms", Some(Key::West)),
+                ("aws:kms", Some(Key::WestSecond)),
                 ("AES256", None),
             ],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
     ]
 }
@@ -184,13 +226,13 @@ fn persisted(emulator: &Emulator, arn: &str, case: &str) -> Option<(String, Opti
 }
 
 /// Create `case`'s table bucket and return its ARN.
-async fn create_bucket(emulator: &Emulator, case: &Case) -> String {
+async fn create_bucket(emulator: &Emulator, case: &Case, keys: &Keys) -> String {
     let mut request = Map::new();
     request.insert("name".to_string(), json!(case.bucket));
     if let Some(configuration) = case.created_with {
         request.insert(
             "encryptionConfiguration".to_string(),
-            configuration_member(configuration),
+            configuration_member(configuration, keys),
         );
     }
     let created = emulator
@@ -217,13 +259,19 @@ async fn create_bucket(emulator: &Emulator, case: &Case) -> String {
 #[tokio::test]
 async fn a_put_makes_its_configuration_the_one_every_later_read_reports() {
     let emulator = Emulator::new();
+    let keys = Keys::create(&emulator).await;
 
     for case in cases() {
-        let arn = create_bucket(&emulator, &case).await;
+        let arn = create_bucket(&emulator, &case, &keys).await;
+        let expected_key = case.expected_kms_key.map(|key| keys.arn(key).to_string());
 
         for (ordinal, configuration) in case.puts.iter().enumerate() {
             let put = emulator
-                .put_table_bucket_encryption(case.region, &arn, &configuration_member(*configuration))
+                .put_table_bucket_encryption(
+                    case.region,
+                    &arn,
+                    &configuration_member(*configuration, &keys),
+                )
                 .await;
             assert_eq!(
                 put.status,
@@ -245,12 +293,13 @@ async fn a_put_makes_its_configuration_the_one_every_later_read_reports() {
             // is not just its last step landing.
             let read = emulator.get_table_bucket_encryption(case.region, &arn).await;
             let (algorithm, key) = reported(&read.body, case.label);
-            let (expected_algorithm, expected_key) = *configuration;
+            let (expected_algorithm, expected_slot) = *configuration;
+            let expected_put_key = expected_slot.map(|slot| keys.arn(slot));
             assert_eq!(
                 (algorithm.as_str(), key.as_deref()),
-                (expected_algorithm, expected_key),
+                (expected_algorithm, expected_put_key),
                 "case {label:?}: after put #{ordinal} expected \
-                 {expected_algorithm:?}/{expected_key:?}, got {algorithm:?}/{key:?}",
+                 {expected_algorithm:?}/{expected_put_key:?}, got {algorithm:?}/{key:?}",
                 label = case.label
             );
         }
@@ -273,10 +322,9 @@ async fn a_put_makes_its_configuration_the_one_every_later_read_reports() {
         );
         assert_eq!(
             key.as_deref(),
-            case.expected_kms_key_arn,
-            "case {label:?}: expected kmsKeyArn {expected:?}, got {key:?}",
-            label = case.label,
-            expected = case.expected_kms_key_arn
+            expected_key.as_deref(),
+            "case {label:?}: expected kmsKeyArn {expected_key:?}, got {key:?}",
+            label = case.label
         );
 
         // The put persisted an EXPLICIT configuration — the record a read
@@ -285,10 +333,7 @@ async fn a_put_makes_its_configuration_the_one_every_later_read_reports() {
         let held = persisted(&emulator, &arn, case.label);
         assert_eq!(
             held,
-            Some((
-                case.expected_algorithm.to_string(),
-                case.expected_kms_key_arn.map(str::to_string)
-            )),
+            Some((case.expected_algorithm.to_string(), expected_key.clone())),
             "case {label:?}: the store must hold the configuration the put named, got {held:?}",
             label = case.label
         );
@@ -333,6 +378,7 @@ async fn the_table_spans_every_modeled_algorithm() {
 #[tokio::test]
 async fn a_put_is_the_default_for_the_tables_created_after_it() {
     let emulator = Emulator::new();
+    let keys = Keys::create(&emulator).await;
     let region = "us-east-1";
 
     let arn = create_bucket(
@@ -344,8 +390,9 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
             created_with: None,
             puts: &[],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
+        &keys,
     )
     .await;
     let namespace = emulator
@@ -363,12 +410,12 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
         ("before any put: the service default", None, "before_any_put"),
         (
             "after a put of KMS-managed keys",
-            Some(("aws:kms", Some(FIRST_KEY_ARN))),
+            Some(("aws:kms", Some(Key::First))),
             "after_kms_put",
         ),
         (
             "after a put moving the bucket to another key",
-            Some(("aws:kms", Some(SECOND_KEY_ARN))),
+            Some(("aws:kms", Some(Key::Second))),
             "after_second_key_put",
         ),
         (
@@ -381,11 +428,15 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
     // Each row's table, and the configuration it must keep for the rest of the
     // suite: a put is the default for the tables created AFTER it and
     // re-encrypts none that already exists.
-    let mut settled: Vec<(&str, &str, Configuration)> = Vec::new();
+    let mut settled: Vec<(&str, &str, SettledConfiguration)> = Vec::new();
     for (case, put, table) in rows {
         if let Some(configuration) = *put {
             let applied = emulator
-                .put_table_bucket_encryption(region, &arn, &configuration_member(configuration))
+                .put_table_bucket_encryption(
+                    region,
+                    &arn,
+                    &configuration_member(configuration, &keys),
+                )
                 .await;
             assert_eq!(
                 applied.status, 200,
@@ -408,8 +459,12 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
             status = created.status,
             body = created.body
         );
-        let expected = put.unwrap_or(("AES256", None));
-        settled.push((case, table, expected));
+        let (expected_algorithm, expected_slot) = put.unwrap_or(("AES256", None));
+        let expected: SettledConfiguration = (
+            expected_algorithm,
+            expected_slot.map(|slot| keys.arn(slot).to_string()),
+        );
+        settled.push((case, table, expected.clone()));
 
         let read = emulator
             .get_table_encryption(region, &arn, NAMESPACE, table)
@@ -423,7 +478,7 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
         let (algorithm, key) = reported(&read.body, case);
         assert_eq!(
             (algorithm.as_str(), key.as_deref()),
-            expected,
+            (expected.0, expected.1.as_deref()),
             "case {case:?}: a table created under the bucket's configuration must report \
              {expected:?}, got {algorithm:?}/{key:?}"
         );
@@ -438,7 +493,7 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
         let (algorithm, key) = reported(&read.body, case);
         assert_eq!(
             (algorithm.as_str(), key.as_deref()),
-            *expected,
+            (expected.0, expected.1.as_deref()),
             "case {case:?}: a later put must leave this table at {expected:?}, got \
              {algorithm:?}/{key:?}"
         );
@@ -448,6 +503,7 @@ async fn a_put_is_the_default_for_the_tables_created_after_it() {
 #[tokio::test]
 async fn a_put_against_a_bucket_the_store_does_not_hold_is_refused() {
     let emulator = Emulator::new();
+    let keys = Keys::create(&emulator).await;
 
     // One resident bucket carrying an explicit configuration, so the refusals
     // below are about the ARN each names and can be shown to write nothing.
@@ -460,15 +516,16 @@ async fn a_put_against_a_bucket_the_store_does_not_hold_is_refused() {
             created_with: None,
             puts: &[],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
+        &keys,
     )
     .await;
     let applied = emulator
         .put_table_bucket_encryption(
             "us-east-1",
             &resident,
-            &configuration_member(("aws:kms", Some(FIRST_KEY_ARN))),
+            &configuration_member(("aws:kms", Some(Key::First)), &keys),
         )
         .await;
     assert_eq!(
@@ -489,8 +546,9 @@ async fn a_put_against_a_bucket_the_store_does_not_hold_is_refused() {
             created_with: None,
             puts: &[],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
+        &keys,
     )
     .await;
     let deleted = emulator.delete_table_bucket("us-east-1", &doomed).await;
@@ -522,7 +580,11 @@ async fn a_put_against_a_bucket_the_store_does_not_hold_is_refused() {
 
     for (case, arn, region) in &rows {
         let put = emulator
-            .put_table_bucket_encryption(region, arn, &configuration_member(("AES256", None)))
+            .put_table_bucket_encryption(
+                region,
+                arn,
+                &configuration_member(("AES256", None), &keys),
+            )
             .await;
         assert_eq!(
             put.status, 404,
@@ -548,7 +610,7 @@ async fn a_put_against_a_bucket_the_store_does_not_hold_is_refused() {
     let held = persisted(&emulator, &resident, "the resident bucket");
     assert_eq!(
         held,
-        Some(("aws:kms".to_string(), Some(FIRST_KEY_ARN.to_string()))),
+        Some(("aws:kms".to_string(), Some(keys.first.clone()))),
         "case \"the resident bucket\": a refused put must change nothing, got {held:?}"
     );
 }
@@ -556,6 +618,7 @@ async fn a_put_against_a_bucket_the_store_does_not_hold_is_refused() {
 #[tokio::test]
 async fn a_configuration_this_service_cannot_store_is_refused_and_writes_nothing() {
     let emulator = Emulator::new();
+    let keys = Keys::create(&emulator).await;
     let region = "us-east-1";
 
     let arn = create_bucket(
@@ -567,8 +630,9 @@ async fn a_configuration_this_service_cannot_store_is_refused_and_writes_nothing
             created_with: None,
             puts: &[],
             expected_algorithm: "AES256",
-            expected_kms_key_arn: None,
+            expected_kms_key: None,
         },
+        &keys,
     )
     .await;
     // The bucket carries an explicit configuration before the refusals, so a
@@ -577,7 +641,7 @@ async fn a_configuration_this_service_cannot_store_is_refused_and_writes_nothing
         .put_table_bucket_encryption(
             region,
             &arn,
-            &configuration_member(("aws:kms", Some(SECOND_KEY_ARN))),
+            &configuration_member(("aws:kms", Some(Key::Second)), &keys),
         )
         .await;
     assert_eq!(
@@ -597,11 +661,11 @@ async fn a_configuration_this_service_cannot_store_is_refused_and_writes_nothing
         ),
         (
             "S3-managed keys carrying a key",
-            json!({ "sseAlgorithm": "AES256", "kmsKeyArn": FIRST_KEY_ARN }),
+            json!({ "sseAlgorithm": "AES256", "kmsKeyArn": keys.first }),
         ),
         (
             "S3-managed keys carrying a key of another region",
-            json!({ "sseAlgorithm": "AES256", "kmsKeyArn": THIRD_KEY_ARN }),
+            json!({ "sseAlgorithm": "AES256", "kmsKeyArn": keys.west }),
         ),
     ];
 
@@ -627,14 +691,14 @@ async fn a_configuration_this_service_cannot_store_is_refused_and_writes_nothing
         let held = persisted(&emulator, &arn, case);
         assert_eq!(
             held,
-            Some(("aws:kms".to_string(), Some(SECOND_KEY_ARN.to_string()))),
+            Some(("aws:kms".to_string(), Some(keys.second.clone()))),
             "case {case:?}: a refused put must change nothing, got {held:?}"
         );
         let read = emulator.get_table_bucket_encryption(region, &arn).await;
         let (algorithm, key) = reported(&read.body, case);
         assert_eq!(
             (algorithm.as_str(), key.as_deref()),
-            ("aws:kms", Some(SECOND_KEY_ARN)),
+            ("aws:kms", Some(keys.second.as_str())),
             "case {case:?}: the read must still report the accepted configuration, got \
              {algorithm:?}/{key:?}"
         );

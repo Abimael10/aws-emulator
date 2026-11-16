@@ -33,6 +33,13 @@ pub use maintenance_jobs::*;
 /// the call site.
 pub mod authorization;
 
+/// Whether KMS resolves the customer managed key an encryption configuration
+/// names for the caller. Named rather than glob-imported, for the same reason
+/// as [`authorization`]: a handler reads
+/// `crate::state::kms_key_access::refusal(..)` and the gate is visible at the
+/// call site.
+pub mod kms_key_access;
+
 /// The tagging rules: which resource a `resourceArn` addresses, and which tag
 /// keys this service accepts.
 mod tagging;
@@ -1513,6 +1520,20 @@ pub const METRICS_CONFIGURATION_NOT_FOUND_MESSAGE: &str = "No such metric config
 /// the CLASS of the failure and takes nothing from the request.
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
     "The specified replication configuration does not exist.";
+
+/// How this service states a table bucket that has no encryption configuration
+/// of its OWN to act on: the `NotFoundException` (HTTP 404) the encryption
+/// operations model. FIXED text, as
+/// [`REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE`] — it names the CLASS of the
+/// failure (there is no such configuration) and takes nothing from the request
+/// or from state.
+///
+/// A bucket nothing was ever put on is protected by
+/// [`DEFAULT_BUCKET_ENCRYPTION`], which is the service's own default rather
+/// than a configuration the bucket holds: there is nothing of the bucket's to
+/// remove, which is the class this sentence states.
+pub const ENCRYPTION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
+    "The specified encryption configuration does not exist.";
 
 /// How this service states a namespace the addressed table bucket does not
 /// hold: the `NotFoundException` (HTTP 404) the namespace and table operations

@@ -745,9 +745,11 @@ async fn each_encryption_put_accounts_for_the_bucket_it_changed() {
         .await
         .text("arn");
     let aes = json!({ "sseAlgorithm": "AES256" });
+    // The key is KMS's own, created over the same engine: a configuration naming
+    // `aws:kms` is only storable when KMS resolves the key it names.
     let kms = json!({
         "sseAlgorithm": "aws:kms",
-        "kmsKeyArn": "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        "kmsKeyArn": emulator.create_kms_key(region).await,
     });
 
     // (case, the configuration put, the outcome the record must carry): the
@@ -811,5 +813,82 @@ async fn each_encryption_put_accounts_for_the_bucket_it_changed() {
             body = refused.body
         );
         capture.assert_silent("PutTableBucketEncryption", case);
+    }
+}
+
+#[tokio::test]
+async fn each_encryption_delete_accounts_for_the_bucket_it_reverted() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    let arn = emulator
+        .create_table_bucket(
+            region,
+            &json!({ "name": "audited-encryption-delete-bucket" }),
+        )
+        .await
+        .text("arn");
+
+    // A bucket holding no configuration of its own has nothing for the delete
+    // to remove, so the refusal changes nothing and accounts for nothing.
+    {
+        let (capture, _guard) = capture_events();
+        let refused = emulator.delete_table_bucket_encryption(region, &arn).await;
+        assert_eq!(
+            refused.status, 404,
+            "case \"a bucket holding no configuration\": expected 404, got {status} {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        capture.assert_silent(
+            "DeleteTableBucketEncryption",
+            "a bucket holding no configuration",
+        );
+    }
+
+    // A delete that reverts the bucket to the service default DOES change it,
+    // so it leaves one record naming the bucket it reverted. The rows differ in
+    // whether the removed configuration carried a KMS key, which the record
+    // names neither way.
+    for (case, configuration) in [
+        ("a configuration of S3-managed keys", json!({ "sseAlgorithm": "AES256" })),
+        (
+            "a configuration naming a KMS key",
+            json!({
+                "sseAlgorithm": "aws:kms",
+                "kmsKeyArn": emulator.create_kms_key(region).await,
+            }),
+        ),
+    ] {
+        let applied = emulator
+            .put_table_bucket_encryption(region, &arn, &configuration)
+            .await;
+        assert_eq!(
+            applied.status, 200,
+            "case {case:?}: the put must succeed, got {status} {body}",
+            status = applied.status,
+            body = applied.body
+        );
+
+        let (capture, _guard) = capture_events();
+        let deleted = emulator.delete_table_bucket_encryption(region, &arn).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case:?}: the delete must succeed, got {status} {body}",
+            status = deleted.status,
+            body = deleted.body
+        );
+        assert_record(
+            &capture,
+            "DeleteTableBucketEncryption",
+            &arn,
+            "deleted",
+            case,
+        );
+        let record = capture.record_for("DeleteTableBucketEncryption", case);
+        assert!(
+            record.field("kms_key_arn").is_none(),
+            "case {case:?}: the record must not carry the key the configuration named: \
+             {record:?}"
+        );
     }
 }

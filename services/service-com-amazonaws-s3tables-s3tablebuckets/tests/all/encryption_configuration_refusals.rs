@@ -24,7 +24,9 @@
 //! `kmsKeyArn` is `@length(1, 2048)` `@pattern`).
 //!
 //! The accepted rows keep the refusals honest: every pairing the model does
-//! allow is stored and read back.
+//! allow is stored and read back — under a key KMS itself holds, since a
+//! configuration naming `aws:kms` is only storable when KMS resolves the key it
+//! names.
 
 use serde_json::{json, Map, Value};
 
@@ -42,10 +44,6 @@ const INVALID_SSE_ALGORITHM: &str = "The specified SSE algorithm is invalid.";
 const INVALID_KMS_KEY_ARN: &str = "The specified KMS key ARN is invalid. Only key ARN format \
                                    'arn:<partition>:kms:<region>:<account-id>:key/<key-id>' is \
                                    supported.";
-
-/// A KMS key ARN of the form the modelled `kmsKeyArn` pattern accepts, for the
-/// rows that refuse something else.
-const KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
 
 /// An `encryptionConfiguration` naming `algorithm`, and `key` when the row
 /// carries one.
@@ -246,11 +244,14 @@ async fn an_algorithm_outside_the_modelled_set_is_refused_with_the_services_sent
 async fn a_key_outside_the_modelled_form_is_refused_with_the_services_sentence() {
     let emulator = Emulator::new();
     let arn = bucket_with_namespace(&emulator, "kms-key-refusals").await;
+    // A key KMS itself holds, so the accepted put below is about the pairing
+    // rather than about the key.
+    let key_arn = emulator.create_kms_key(REGION).await;
 
     // The bucket carries an accepted configuration first, so a refused put is
     // shown to leave the PREVIOUS one rather than an absence.
     let applied = emulator
-        .put_table_bucket_encryption(REGION, &arn, &configuration("aws:kms", Some(KEY_ARN)))
+        .put_table_bucket_encryption(REGION, &arn, &configuration("aws:kms", Some(&key_arn)))
         .await;
     assert_eq!(
         applied.status, 200,
@@ -321,7 +322,7 @@ async fn a_key_outside_the_modelled_form_is_refused_with_the_services_sentence()
         let (algorithm, key) = reported(&emulator, &arn).await;
         assert_eq!(
             (algorithm.as_str(), key.as_deref()),
-            ("aws:kms", Some(KEY_ARN)),
+            ("aws:kms", Some(key_arn.as_str())),
             "case {malformed:?}: a refused put must change nothing"
         );
     }
@@ -331,16 +332,17 @@ async fn a_key_outside_the_modelled_form_is_refused_with_the_services_sentence()
 async fn every_pairing_the_model_allows_is_stored_and_read_back() {
     let emulator = Emulator::new();
     let arn = bucket_with_namespace(&emulator, "encryption-accepted").await;
+    // Two keys KMS itself holds, so the pairings below differ in the key as
+    // well as in the algorithm.
+    let first_key = emulator.create_kms_key(REGION).await;
+    let second_key = emulator.create_kms_key(REGION).await;
 
     // The modelled values, each with the key the model documents for it:
     // `kmsKeyArn` is "required only when `sseAlgorithm` is set to `aws:kms`".
     let accepted: [(&str, Option<&str>); 3] = [
         ("AES256", None),
-        ("aws:kms", Some(KEY_ARN)),
-        (
-            "aws:kms",
-            Some("arn:aws-us-gov:kms:us-gov-west-1:000000000000:key/another-key"),
-        ),
+        ("aws:kms", Some(first_key.as_str())),
+        ("aws:kms", Some(second_key.as_str())),
     ];
 
     for (algorithm, key) in accepted {
