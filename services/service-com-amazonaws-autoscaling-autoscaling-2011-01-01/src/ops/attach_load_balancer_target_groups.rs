@@ -14,10 +14,15 @@
 //! group owes in line with its new attachments ([`crate::state::elbv2_targets`]), which is
 //! what `DescribeTargetHealth` then reports.
 //!
-//! Every ARN the request names therefore has to name a target group of the Region and
+//! Every ARN the request names therefore has to RESOLVE to a target group of the Region and
 //! account the call is addressed to: an ARN of another Region names a target group this
-//! endpoint could never register an instance in, so the call is refused whole — nothing is
+//! endpoint could never register an instance in, and one Elastic Load Balancing v2 holds no
+//! target group under names nothing at all, so the call is refused whole — nothing is
 //! attached and nothing is registered.
+//!
+//! Whether the CALLER may attach anything to the group at all is decided first, against the
+//! group's own ARN ([`crate::service::authorization`]): a request IAM does not permit
+//! changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -181,6 +186,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.auto_scaling_group_name;
         let requested = input.target_group_ar_ns;
+        // Whether IAM lets this caller change THIS group, decided against the group's own
+        // ARN before anything is read or written ([`crate::service::authorization`]): a
+        // caller the policies in force do not permit to attach target groups to it attaches
+        // none, and the group is left exactly as it was.
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
         // The member's own documented bound, which the model does not express as a
         // length, so it is checked here rather than at the boundary — the same bound, and
         // the same refusal, the detach of a target group is held to.
@@ -189,14 +207,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::too_many_target_groups_message(),
             ));
         }
-        // Every ARN has to name a target group of the Region and account this request is
-        // addressed to: a target group is identified within one Region, and the group is in
-        // the Region the request is signed for, so an ARN of anywhere else names nothing
-        // this endpoint could register an instance in. Checked on the INPUT, before the
-        // group is looked up or touched, so the attachment the group would then claim can
-        // never be one that cannot resolve.
+        // Every ARN has to RESOLVE to a target group of the Region and account this request
+        // is addressed to: a target group is identified within one Region, and the group is
+        // in the Region the request is signed for, so an ARN of anywhere else — and one
+        // Elastic Load Balancing v2 holds no target group under at all — names nothing this
+        // endpoint could register an instance in. Checked on the INPUT, before the group is
+        // looked up or touched, so the attachment the group would then claim can never be
+        // one that cannot resolve.
         let region = crate::state::request_region(ctx.parts());
-        if crate::state::elbv2_targets::first_unattachable_target_group(
+        if crate::state::elbv2_targets::first_unresolvable_target_group(
+            &*self.engine,
             &region,
             requested.iter().map(String::as_str),
         )

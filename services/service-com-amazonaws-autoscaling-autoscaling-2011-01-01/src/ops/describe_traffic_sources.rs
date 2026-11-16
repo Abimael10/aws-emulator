@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrafficSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrafficSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrafficSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the TRAFFIC SOURCES one Auto Scaling group is attached to, in the order the group
+//! came to hold them, with the state each attachment is in — the collection
+//! [`crate::ops::attach_traffic_sources`] writes and `DetachTrafficSources` removes from,
+//! read off the group itself ([`crate::state::StoredGroup::traffic_sources`]).
+//!
+//! "If you provide a traffic source type, then the results only include that traffic source
+//! type. If you do not provide a traffic source type, then the results include all the
+//! traffic sources for the specified Auto Scaling group", so `TrafficSourceType` SELECTS
+//! from what the group holds and changes nothing else about the answer.
+//!
+//! The state is DERIVED, every time, from the registrations the attachment owes and the ones
+//! Elastic Load Balancing v2 holds ([`crate::state::elbv2_targets::attachment_states`]) — the
+//! same reading `DescribeLoadBalancerTargetGroups` reports for an attachment named under the
+//! group's own `TargetGroupARNs`, because the two members carry the same association and a
+//! client must not read two states for one attachment.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +167,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrafficSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrafficSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrafficSources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeTrafficSourcesErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        let selected_type = input.traffic_source_type;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // The group is resolved BEFORE the rest of the request is read: this read reports the
+        // traffic sources of the group it names, so a name no group answers to is refused for
+        // the group whatever else the request carries — in the detail form the sibling read of
+        // the same attachments serves.
+        let Some(group) = state.groups.get(&group_name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message_as_not_findable(&group_name),
+            ));
+        };
+
+        // What the group HOLDS, in attachment order, narrowed to the type the request asked
+        // about when it asked about one.
+        let held: Vec<crate::ops::types::TrafficSourceIdentifier> = group
+            .traffic_sources
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|source| match selected_type.as_deref() {
+                Some(wanted) => source.r#type.as_deref() == Some(wanted),
+                None => true,
+            })
+            .collect();
+        let identifiers: Vec<String> = held
+            .iter()
+            .map(|source| source.identifier.clone())
+            .collect();
+        let states =
+            crate::state::elbv2_targets::attachment_states(&*self.engine, group, &identifiers, now);
+        let reported: Vec<TrafficSourceState> = held
+            .into_iter()
+            .zip(states)
+            .map(|(source, attachment_state)| TrafficSourceState {
+                // "This is replaced by `Identifier`" (`TrafficSourceState$TrafficSource`):
+                // the deprecated member carries the same value, which is what a client
+                // reading the older member still gets.
+                traffic_source: Some(source.identifier.clone()),
+                identifier: Some(source.identifier),
+                r#type: source.r#type,
+                state: Some(attachment_state.to_string()),
+            })
+            .collect();
+
+        // The page this read resumes at, from the token a previous one issued: a token this
+        // read did not issue is a bad VALUE for the member that carried it, answered with the
+        // service-common `ValidationError` naming the member and the value submitted.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::next_token_value_violation_message(&token),
+                    ));
+                }
+            },
+        };
+        // "The maximum number of items to return with this call. The maximum value is 50"
+        // (`DescribeTrafficSourcesRequest$MaxRecords`): the member carries no modelled range,
+        // so a page size outside this operation's own ceiling is refused here rather than
+        // quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range_within(
+            input.max_records,
+            MAX_TRAFFIC_SOURCE_MAX_RECORDS,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message_within(
+                    max_records,
+                    MAX_TRAFFIC_SOURCE_MAX_RECORDS,
+                ),
+            ));
+        }
+        // A token this service issued always points inside the list it was issued for; one
+        // that points past the end was not issued for this list.
+        if offset > 0 && offset >= reported.len() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::next_token_value_violation_message(&token),
+            ));
+        }
+        let (traffic_sources, next_token) = crate::state::page(
+            &reported,
+            offset,
+            Some(
+                input
+                    .max_records
+                    .unwrap_or(MAX_TRAFFIC_SOURCE_MAX_RECORDS),
+            ),
+        );
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &group_name,
+            "traffic source attachments read",
+        );
+        Ok(DescribeTrafficSourcesOutput {
+            // A collection of the group is reported as a LIST, empty when the group holds
+            // nothing in it, rather than leaving the member out: "attached to nothing" and
+            // "this service does not report attachments" are not the same answer.
+            traffic_sources: Some(traffic_sources),
+            next_token,
+        })
     }
 }
+
+/// The largest page this read serves, which is also the page a request that asks for none
+/// takes: "the maximum number of items to return with this call. The maximum value is 50"
+/// (`DescribeTrafficSourcesRequest$MaxRecords`).
+const MAX_TRAFFIC_SOURCE_MAX_RECORDS: i32 = 50;

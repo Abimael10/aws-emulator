@@ -17,8 +17,10 @@
 //! through `DescribeAutoScalingGroups` (the implemented reader of a group's
 //! `TargetGroupARNs`), so no row can pass on an accepted-but-unstored change.
 
-use crate::support::{borrowed, new_engine, p, query, router_with, tag_value, tag_values,
-                     xml_unescape, REGION};
+use crate::support::{borrowed, create_target_group, emulator, p, query, seed_subnets, tag_value,
+                     tag_values, vpc_of, xml_unescape};
+
+use smithy_server_runtime::MultiServiceRouter;
 
 /// The launch source every group here is created from — a launch TEMPLATE, because no
 /// account can create a launch configuration (see
@@ -30,27 +32,39 @@ const LAUNCH_SOURCE: (&str, &str) = ("LaunchTemplate.LaunchTemplateName", "lt-1"
 /// target groups."
 const MAX_TARGET_GROUPS_PER_CALL: usize = 10;
 
-/// The ARN of the `n`-th Elastic Load Balancing target group this suite names: a target
-/// group ARN as Elastic Load Balancing spells one, built through the emulator's own ARN
-/// writer rather than written out, so the ARNs a detach carries are the shape a client
-/// sends.
-fn target_group_arn(index: usize) -> String {
-    engine::emulator_arn(
-        "elasticloadbalancing",
-        REGION,
-        &format!("targetgroup/tg-{index}/{index:016x}"),
-    )
+/// How many target groups this suite names: the per-call bound plus the two more a row needs
+/// to name one the group never held.
+const SEEDED_TARGET_GROUPS: usize = MAX_TARGET_GROUPS_PER_CALL + 2;
+
+/// The emulator every test here drives, with the target groups its rows name already created
+/// in Elastic Load Balancing v2 itself — an association names a target group the account
+/// HOLDS, which is what a create and an attach of one resolve — answered 1-based, the way the
+/// rows number them.
+async fn emulator_with_target_groups() -> (MultiServiceRouter, Vec<String>) {
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 1);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
+    let mut arns = Vec::with_capacity(SEEDED_TARGET_GROUPS);
+    for index in 1..=SEEDED_TARGET_GROUPS {
+        arns.push(create_target_group(&router, &format!("tg-{index}"), 80, "instance", &vpc_id).await);
+    }
+    (router, arns)
+}
+
+/// The ARN of the `index`-th target group of that set, numbered from one as the rows do.
+fn target_group_arn(seeded: &[String], index: usize) -> String {
+    seeded[index - 1].clone()
 }
 
 /// The first `count` target group ARNs.
-fn target_group_arns(count: usize) -> Vec<String> {
-    (1..=count).map(target_group_arn).collect()
+fn target_group_arns(seeded: &[String], count: usize) -> Vec<String> {
+    seeded[..count].to_vec()
 }
 
 /// Create a group holding `attached` target groups, with no capacity so nothing is
 /// launched, and fail the test if the create itself is refused.
 async fn create_group(
-    router: &smithy_server_runtime::MultiServiceRouter,
+    router: &MultiServiceRouter,
     name: &str,
     attached: &[String],
 ) {
@@ -78,7 +92,7 @@ async fn create_group(
 
 /// Post one detach and answer its status, wire error code and message.
 async fn detach(
-    router: &smithy_server_runtime::MultiServiceRouter,
+    router: &MultiServiceRouter,
     name: &str,
     arns: &[String],
 ) -> (u16, String, String) {
@@ -100,7 +114,7 @@ async fn detach(
 /// The target groups the group reports through the implemented reader of its
 /// `TargetGroupARNs`, in the order it holds them.
 async fn attached_target_groups(
-    router: &smithy_server_runtime::MultiServiceRouter,
+    router: &MultiServiceRouter,
     name: &str,
 ) -> Vec<String> {
     let (status, body) = query(
@@ -165,16 +179,16 @@ fn accepted_rows() -> Vec<DetachRow> {
 /// reports what is left through its own reader.
 #[tokio::test]
 async fn a_detach_removes_exactly_the_attached_target_groups_it_names() {
-    let router = router_with(new_engine());
+    let (router, seeded) = emulator_with_target_groups().await;
 
     for (row, (case, held, detached)) in accepted_rows().into_iter().enumerate() {
         let name = format!("asg-accepted-{row}");
-        let attached = target_group_arns(held);
+        let attached = target_group_arns(&seeded, held);
         create_group(&router, &name, &attached).await;
 
         let requested: Vec<String> = detached
             .iter()
-            .map(|position| target_group_arn(*position))
+            .map(|position| target_group_arn(&seeded, *position))
             .collect();
         let (status, code, message) = detach(&router, &name, &requested).await;
         assert_eq!(
@@ -246,22 +260,22 @@ fn refusal_rows() -> Vec<RefusalRow> {
 /// it held before the call, which is what makes the refusal whole.
 #[tokio::test]
 async fn a_detach_naming_a_target_group_the_group_does_not_hold_is_refused_whole() {
-    let router = router_with(new_engine());
+    let (router, seeded) = emulator_with_target_groups().await;
 
     for (row, (case, held, requested_positions, unattached_positions)) in
         refusal_rows().into_iter().enumerate()
     {
         let name = format!("asg-refused-{row}");
-        let attached = target_group_arns(held);
+        let attached = target_group_arns(&seeded, held);
         create_group(&router, &name, &attached).await;
 
         let requested: Vec<String> = requested_positions
             .iter()
-            .map(|position| target_group_arn(*position))
+            .map(|position| target_group_arn(&seeded, *position))
             .collect();
         let unattached: Vec<String> = unattached_positions
             .iter()
-            .map(|position| target_group_arn(*position))
+            .map(|position| target_group_arn(&seeded, *position))
             .collect();
 
         let (status, code, message) = detach(&router, &name, &requested).await;
@@ -292,9 +306,9 @@ async fn a_detach_naming_a_target_group_the_group_does_not_hold_is_refused_whole
 /// first call left in place is still there.
 #[tokio::test]
 async fn detaching_an_already_detached_target_group_is_refused() {
-    let router = router_with(new_engine());
+    let (router, seeded) = emulator_with_target_groups().await;
 
-    let attached = target_group_arns(2);
+    let attached = target_group_arns(&seeded, 2);
     create_group(&router, "asg-twice", &attached).await;
 
     let first = vec![attached[0].clone()];
@@ -335,9 +349,9 @@ async fn detaching_an_already_detached_target_group_is_refused() {
 /// single target group more is refused without detaching anything.
 #[tokio::test]
 async fn a_detach_past_the_documented_per_call_maximum_is_refused() {
-    let router = router_with(new_engine());
+    let (router, seeded) = emulator_with_target_groups().await;
 
-    let attached = target_group_arns(MAX_TARGET_GROUPS_PER_CALL + 1);
+    let attached = target_group_arns(&seeded, MAX_TARGET_GROUPS_PER_CALL + 1);
     create_group(&router, "asg-bound", &attached).await;
 
     // One past the bound: refused, and every attachment survives.
@@ -385,12 +399,12 @@ async fn a_detach_past_the_documented_per_call_maximum_is_refused() {
 /// group-scoped mutation of this service, and names the group that is missing.
 #[tokio::test]
 async fn a_detach_of_an_absent_group_is_refused() {
-    let router = router_with(new_engine());
+    let (router, seeded) = emulator_with_target_groups().await;
 
-    create_group(&router, "asg-present", &target_group_arns(1)).await;
+    create_group(&router, "asg-present", &target_group_arns(&seeded, 1)).await;
 
     for name in ["asg-absent", "ASG-Absent", "asg-present-but-longer"] {
-        let (status, code, message) = detach(&router, name, &target_group_arns(1)).await;
+        let (status, code, message) = detach(&router, name, &target_group_arns(&seeded, 1)).await;
         assert_eq!(
             status, 400,
             "case {name:?}: expected HTTP 400, got {status} with {code:?} {message:?}"
@@ -414,7 +428,7 @@ async fn a_detach_of_an_absent_group_is_refused() {
     let actual = attached_target_groups(&router, "asg-present").await;
     assert_eq!(
         actual,
-        target_group_arns(1),
+        target_group_arns(&seeded, 1),
         "expected the stored group to keep its target group, got {actual:?}"
     );
 }

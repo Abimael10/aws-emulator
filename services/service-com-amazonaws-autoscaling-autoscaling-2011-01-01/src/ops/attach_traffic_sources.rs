@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachTrafficSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachTrafficSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachTrafficSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches traffic sources to one Auto Scaling group, as a WHOLE: the attachment is
+//! additive — "this operation is additive and does not detach existing traffic sources from
+//! the Auto Scaling group" — so the traffic sources the request names join the ones the group
+//! already holds, each held once however many times it is named, in the order the group came
+//! to hold them.
+//!
+//! A traffic source is what makes the group's instances receive traffic: `elbv2` names "the
+//! ARN of an Application Load Balancer, Gateway Load Balancer, or Network Load Balancer
+//! target group" (`TrafficSourceIdentifier$Type`), which is the same association
+//! `AttachLoadBalancerTargetGroups` adds under its own member — so such an identifier has to
+//! RESOLVE to a target group Elastic Load Balancing v2 holds in the Region and account the
+//! call is addressed to, exactly as that operation's does, and the call is otherwise refused
+//! whole: nothing is attached and nothing is registered
+//! ([`crate::state::elbv2_targets::first_unresolvable_target_group`]). Once attached, the
+//! group's instances are registered as targets of that target group, which is what
+//! `DescribeTargetHealth` then reports ([`crate::state::elbv2_targets`]).
+//!
+//! An identifier of any other kind of traffic source — a Classic Load Balancer's name
+//! (`elb`), a VPC Lattice target group (`vpc-lattice`) — names a resource this emulator holds
+//! no store for, so nothing is resolved for it and nothing is concluded from that silence.
+//!
+//! Whether the CALLER may attach anything to the group at all is decided first, against the
+//! group's own ARN ([`crate::service::authorization`]): a request IAM does not permit changes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +169,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachTrafficSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachTrafficSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachTrafficSources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AttachTrafficSourcesErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.traffic_sources;
+        // Whether IAM lets this caller change THIS group, decided against the group's own ARN
+        // before anything is read or written ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
+        // The member's own documented bound — "you can specify up to 10 traffic sources" —
+        // which the model does not express as a length, so it is checked here rather than at
+        // the boundary, and refused with the sentence this service words a request updating
+        // too many associations at once in ([`crate::state::too_many_target_groups_message`],
+        // the same ten the attach of target groups is held to).
+        if requested.len() > crate::state::MAX_TARGET_GROUPS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_target_groups_message(),
+            ));
+        }
+        // Every identifier that names an Elastic Load Balancing v2 TARGET GROUP has to
+        // resolve to one, for the reason the module docs state. Checked on the INPUT, before
+        // the group is looked up or touched.
+        let region = crate::state::request_region(ctx.parts());
+        let target_groups: Vec<&str> = requested
+            .iter()
+            .filter(|source| {
+                crate::state::elbv2_targets::names_a_target_group(
+                    source.r#type.as_deref(),
+                    &source.identifier,
+                )
+            })
+            .map(|source| source.identifier.as_str())
+            .collect();
+        if crate::state::elbv2_targets::first_unresolvable_target_group(
+            &*self.engine,
+            &region,
+            target_groups.iter().copied(),
+        )
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::elbv2_targets::UNATTACHABLE_TARGET_GROUPS_MESSAGE.to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+
+            let Some(group) = state.groups.get_mut(&name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message(&name),
+                ));
+            };
+
+            // Additive, and each traffic source held ONCE: one the group already holds keeps
+            // the position it has, so attaching it twice leaves the attachments exactly as
+            // one call did. Two entries are the same traffic source when they name the same
+            // identifier — the identifier is what the association IS.
+            let mut attached = group.traffic_sources.clone().unwrap_or_default();
+            for mut source in requested {
+                // The TYPE the attachment is held under is the kind of traffic source the
+                // identifier names: "required if the identifier is the name of a Classic Load
+                // Balancer", so a request naming an ARN may leave it out — and the
+                // association is then held, and reported, as what that ARN is
+                // ([`crate::state::elbv2_targets::names_a_target_group`]), rather than as a
+                // traffic source of no kind at all.
+                if source.r#type.as_deref().unwrap_or_default().trim().is_empty()
+                    && crate::state::elbv2_targets::names_a_target_group(None, &source.identifier)
+                {
+                    source.r#type =
+                        Some(crate::state::elbv2_targets::TRAFFIC_SOURCE_TYPE_ELBV2.to_string());
+                }
+                if !attached
+                    .iter()
+                    .any(|held| held.identifier == source.identifier)
+                {
+                    attached.push(source);
+                }
+            }
+            // What the group would then HOLD, which is what this process bounds: every
+            // instance of the group owes a registration in every attachment, so the ceiling
+            // counts both collections the attachment is named in.
+            if crate::state::attachment_count_past_ceiling(&[
+                group.attached_target_groups().len(),
+                attached.len(),
+            ])
+            .is_some()
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::too_many_attached_target_groups_message(),
+                ));
+            }
+            group.traffic_sources = Some(attached);
+        }
+
+        crate::state::audit(ctx.parts(), Self::NAME, &name, "traffic sources attached");
+        // The instances of the group are targets of what it is now attached to, which is the
+        // whole point of the attachment. The store's lock is released above: the reconcile
+        // takes it itself.
+        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        Ok(AttachTrafficSourcesOutput {})
     }
 }

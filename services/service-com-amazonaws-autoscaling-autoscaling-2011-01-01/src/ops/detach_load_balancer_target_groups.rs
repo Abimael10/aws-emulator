@@ -168,6 +168,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.auto_scaling_group_name;
         let requested = input.target_group_ar_ns;
+        // Whether IAM lets this caller change THIS group's attachments, decided against the
+        // group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]): a request the policies in force do not permit
+        // detaches nothing.
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
         // The member's own documented bound, which the model does not express as a
         // length, so it is checked here rather than at the boundary.
         if requested.len() > crate::state::MAX_TARGET_GROUPS_PER_CALL {

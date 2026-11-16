@@ -21,6 +21,12 @@
 //! cannot resolve, and a load balancer whose own groups and addresses are unknown all leave the
 //! question UNDECIDED ([`interface_admits_check`] answers `None`), and an undecided question
 //! fails no check.
+//!
+//! Silence is not the same as an answer of NONE, though: a load balancer this store holds a
+//! record for states which security groups it is associated with, and a record stating none —
+//! where a Network Load Balancer created without one sits — is a source no rule naming a
+//! source security group names, so only a rule naming an address range that covers the load
+//! balancer's own node addresses admits its checks ([`CheckSource::groups_resolved`]).
 
 use ::std::collections::{BTreeSet, HashMap};
 use ::std::sync::Arc;
@@ -48,8 +54,10 @@ pub type GuardingGroups = Arc<[String]>;
 /// rather than by id), and the addresses its own network interfaces hold
 /// ([`super::service_interfaces`]), which are the addresses its checks come from.
 ///
-/// Every field may be empty, which says that this service does not know that half of the
-/// source rather than that the load balancer has none.
+/// An EMPTY field says that this service does not know that half of the source rather than
+/// that the load balancer has none — except where [`CheckSource::groups_resolved`] says the
+/// groups themselves were read, which is what tells a load balancer associated with NO
+/// security group from one whose association is unknown.
 #[derive(Debug, Default, Clone)]
 pub struct CheckSource {
     /// The `GroupId` of each security group the load balancer is associated with.
@@ -58,13 +66,31 @@ pub struct CheckSource {
     pub group_names: Vec<String>,
     /// The addresses the load balancer's own network interfaces hold.
     pub addresses: Vec<String>,
+    /// Whether the security groups the load balancer is associated with were READ off its
+    /// own record: with them read, an empty list is a load balancer in no security group —
+    /// the position a Network Load Balancer created without one is in, whose checks no rule
+    /// naming a source security group admits ("if your target group's protocol is TCP … and
+    /// your load balancer has no associated security groups, you must allow traffic from the
+    /// load balancer nodes' private IP addresses", Network Load Balancer target security
+    /// groups) — and without them the question a group grant poses cannot be read at all.
+    pub groups_resolved: bool,
 }
 
 impl CheckSource {
     /// Whether this source says nothing at all about where a check comes from, in which case
     /// no rule can be read as naming it or as not naming it.
     fn is_unknown(&self) -> bool {
-        self.group_ids.is_empty() && self.group_names.is_empty() && self.addresses.is_empty()
+        !self.groups_resolved
+            && self.group_ids.is_empty()
+            && self.group_names.is_empty()
+            && self.addresses.is_empty()
+    }
+
+    /// Whether a rule that names a source SECURITY GROUP can be read against this source:
+    /// the groups the load balancer is associated with are known, whether it is in some or
+    /// in none.
+    fn reads_group_grants(&self) -> bool {
+        self.groups_resolved || !self.group_ids.is_empty() || !self.group_names.is_empty()
     }
 }
 
@@ -170,9 +196,11 @@ fn admits_source(permission: &ec2_types::IpPermission, source: &CheckSource) -> 
         if names_group {
             return Some(true);
         }
-        if source.group_ids.is_empty() && source.group_names.is_empty() {
+        if !source.reads_group_grants() {
             // The groups the load balancer is associated with are not known, so a grant
-            // naming a group cannot be read either way.
+            // naming a group cannot be read either way. A load balancer whose record WAS
+            // read is known either way — one associated with no group at all is named by no
+            // such grant.
             undecided = true;
         }
     }
@@ -287,6 +315,87 @@ mod tests {
             group_ids: vec!["sg-0000000000000000a".to_string()],
             group_names: vec!["alb".to_string()],
             addresses: vec!["10.0.0.5".to_string()],
+            groups_resolved: true,
+        }
+    }
+
+    /// RULE: a load balancer whose record states it is in NO security group is named by no
+    /// rule naming a source security group, so only a rule covering its own node addresses
+    /// admits its checks — the position a Network Load Balancer created without a group is
+    /// in. A load balancer whose groups were never read answers neither way.
+    #[test]
+    fn a_load_balancer_in_no_security_group_is_named_by_no_group_grant() {
+        let target_group = "sg-0000000000000000b".to_string();
+        // Where the checks come from: the load balancer's own node address, in a group of
+        // its own or in none at all.
+        let in_no_group = CheckSource {
+            group_ids: Vec::new(),
+            group_names: Vec::new(),
+            addresses: vec!["10.0.0.5".to_string()],
+            groups_resolved: true,
+        };
+        let unread = CheckSource {
+            groups_resolved: false,
+            ..in_no_group.clone()
+        };
+        for (case, rules, expected, unread_expected) in [
+            (
+                "a rule naming a source security group",
+                vec![permission("tcp", Some((80, 80)), &["sg-0000000000000000c"], &[])],
+                Some(false),
+                None,
+            ),
+            (
+                "a rule naming every protocol from a source security group",
+                vec![permission("-1", None, &["sg-0000000000000000c"], &[])],
+                Some(false),
+                None,
+            ),
+            (
+                "a rule naming a range that covers the load balancer's own address",
+                vec![permission("tcp", Some((80, 80)), &[], &["10.0.0.0/23"])],
+                Some(true),
+                Some(true),
+            ),
+            (
+                "a rule naming a range that covers no address of it",
+                vec![permission("tcp", Some((80, 80)), &[], &["192.168.0.0/16"])],
+                Some(false),
+                Some(false),
+            ),
+            (
+                "a group grant beside a range that covers its address",
+                vec![
+                    permission("tcp", Some((80, 80)), &["sg-0000000000000000c"], &[]),
+                    permission("tcp", Some((80, 80)), &[], &["10.0.0.0/23"]),
+                ],
+                Some(true),
+                Some(true),
+            ),
+        ] {
+            let ingress = HashMap::from([(target_group.clone(), rules)]);
+            let admitted = interface_admits_check(
+                ::std::slice::from_ref(&target_group),
+                &ingress,
+                80,
+                &in_no_group,
+            );
+            assert_eq!(
+                admitted, expected,
+                "case {case:?} from a load balancer in no security group: expected \
+                 {expected:?}, got {admitted:?}"
+            );
+            let unread_answer = interface_admits_check(
+                ::std::slice::from_ref(&target_group),
+                &ingress,
+                80,
+                &unread,
+            );
+            assert_eq!(
+                unread_answer, unread_expected,
+                "case {case:?} from a load balancer whose groups were not read: expected \
+                 {unread_expected:?}, got {unread_answer:?}"
+            );
         }
     }
 

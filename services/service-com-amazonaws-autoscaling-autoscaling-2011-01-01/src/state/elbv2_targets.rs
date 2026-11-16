@@ -106,7 +106,7 @@ const TARGET_TYPE_INSTANCE: &str = "instance";
 /// The `TrafficSourceIdentifier$Type` of a traffic source whose `Identifier` is a target
 /// group ARN of Elastic Load Balancing v2 — "`elbv2` if `Identifier` is the ARN of an
 /// Application Load Balancer, Gateway Load Balancer, or Network Load Balancer target group".
-const TRAFFIC_SOURCE_TYPE_ELBV2: &str = "elbv2";
+pub const TRAFFIC_SOURCE_TYPE_ELBV2: &str = "elbv2";
 
 /// One registration an Auto Scaling group owes in one Elastic Load Balancing v2 target
 /// group.
@@ -257,6 +257,82 @@ where
 /// rather than reporting a partial result.
 pub const UNATTACHABLE_TARGET_GROUPS_MESSAGE: &str =
     "Provided Target Groups may not be valid. Please ensure they exist and try again.";
+
+/// Whether a traffic source's identifier names an Elastic Load Balancing v2 TARGET GROUP, so
+/// it has to resolve to one.
+///
+/// `TrafficSourceIdentifier$Type` says what the identifier is — "`elbv2` if `Identifier` is
+/// the ARN of an Application Load Balancer, Gateway Load Balancer, or Network Load Balancer
+/// target group", "`elb` if `Identifier` is the name of a Classic Load Balancer",
+/// "`vpc-lattice` if `Identifier` is the ARN of a VPC Lattice target group" — and it is
+/// "required if the identifier is the name of a Classic Load Balancer", so a request may leave
+/// it out for an ARN. An identifier the request typed as `elbv2` is one, and one that is
+/// WRITTEN as an Elastic Load Balancing target group ARN is one whatever the request left
+/// out; nothing else is.
+pub fn names_a_target_group(source_type: Option<&str>, identifier: &str) -> bool {
+    match source_type.map(str::trim) {
+        Some(TRAFFIC_SOURCE_TYPE_ELBV2) => true,
+        Some(stated) if !stated.is_empty() => false,
+        _ => TARGET_GROUP.admits(identifier),
+    }
+}
+
+/// The FIRST entry of `requested` that names no target group this endpoint could associate
+/// an Auto Scaling group of the Region `region` with, in request order — either because the
+/// value is not a target group ARN of that Region and account
+/// ([`first_unattachable_target_group`]) or because Elastic Load Balancing v2 holds NO
+/// target group under it. `None` when every entry resolves.
+///
+/// Resolving the ARN is what makes an attachment one that can take a registration: the
+/// association is what registers the group's instances as targets of that target group, so
+/// an ARN that resolves to nothing is an association no instance could ever be registered
+/// through — the condition the refusal above words ("please ensure they exist").
+///
+/// A READ of the other service's store, under that store's lock alone, exactly as
+/// [`unresolved_attachments`] reads it — this module's header states the order. On an engine
+/// that carries no such store the existence half answers nothing: there is then no target
+/// group this service could register into at all, so nothing may be concluded from its
+/// silence and only the ARN's own form decides.
+pub fn first_unresolvable_target_group<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    region: &str,
+    requested: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let requested: Vec<&str> = requested.into_iter().collect();
+    if let Some(unattachable) = first_unattachable_target_group(region, requested.iter().copied()) {
+        return Some(unattachable.to_string());
+    }
+    let state = elbv2::service_state(engine)?;
+    let store = state.lock();
+    requested
+        .into_iter()
+        .find(|arn| !store.target_groups.contains_key(*arn))
+        .map(str::to_string)
+}
+
+/// Whether an instance running in `instance_vpc` is OUTSIDE the VPC `target_group_vpc` of a
+/// target group — the one condition that makes a registration of it there impossible.
+///
+/// "The specified target does not exist, is not in the same VPC as the target group, or has
+/// an unsupported instance type" is what Elastic Load Balancing v2 refuses a
+/// `RegisterTargets` of such a target with (`InvalidTargetException`), and an Auto Scaling
+/// group's own registration is the same write into the same target group: an instance of a
+/// group attached to a target group of another VPC is therefore NOT registered there, while
+/// the attachment itself stands exactly as the client made it.
+///
+/// `false` whenever the question is not decided — a target group carrying no VPC (a `lambda`
+/// or `alb` group belongs to none) and an instance whose VPC the account's Amazon EC2 store
+/// did not answer ([`crate::state::ec2_instances::vpcs_of`]) — because a value neither side
+/// reports cannot disagree, and nothing is withheld on silence.
+fn in_another_vpc(target_group_vpc: Option<&str>, instance_vpc: Option<&str>) -> bool {
+    match (target_group_vpc, instance_vpc) {
+        (Some(group), Some(instance)) => !group.is_empty() && !instance.is_empty() && group != instance,
+        _ => false,
+    }
+}
 
 /// The target groups `group` is attached to that Elastic Load Balancing v2 no longer
 /// holds, in attachment order: the attachments that can take no registration at all,
@@ -534,6 +610,9 @@ pub fn settle_every_group<Eng: Send + Sync + 'static>(engine: &Eng) {
 /// not the shared in-memory one): there is then no target group to register into and none
 /// this service could have registered into, so there is nothing to add and nothing to clean
 /// up — which is why this answers nothing rather than failing the request that called it.
+///
+/// A registration is withheld from a target group of ANOTHER VPC ([`in_another_vpc`]): the
+/// instance could not be registered there by a caller either, so it is not registered here.
 pub fn reconcile<Eng: Send + Sync + 'static>(
     engine: &Eng,
     group_name: &str,
@@ -543,6 +622,15 @@ pub fn reconcile<Eng: Send + Sync + 'static>(
     let Some(state) = elbv2::service_state(engine) else {
         return;
     };
+    // Where each instance of the wanted set RUNS, read from the account's own Amazon EC2
+    // store BEFORE the Elastic Load Balancing v2 store is locked, so the two stores are
+    // never held at once — the lock order this module's header states.
+    let vpcs = crate::state::ec2_instances::vpcs_of(
+        engine,
+        wanted
+            .iter()
+            .map(|registration| registration.instance_id.as_str()),
+    );
     let scope = Scope::of_group(group_name);
     // The wanted set INDEXED by the target group it belongs to, once, so the pass below
     // costs each target group only what that target group itself holds rather than a walk
@@ -572,6 +660,13 @@ pub fn reconcile<Eng: Send + Sync + 'static>(
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
+            // A target group of another VPC takes none of this group's instances.
+            .filter(|registration| {
+                !in_another_vpc(
+                    group.vpc_id.as_deref(),
+                    vpcs.get(&registration.instance_id).map(String::as_str),
+                )
+            })
             .map(|registration| {
                 (
                     (registration.instance_id.clone(), group.port),

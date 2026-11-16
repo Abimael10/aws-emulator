@@ -291,6 +291,11 @@ struct Checked {
     /// The `NetworkInterfaceId` of every own interface those load balancers hold, which is
     /// what the addresses their checks come from are read off.
     source_interface_ids: Vec<String>,
+    /// Whether the load balancers forwarding to this group were READ out of this store, so
+    /// [`Checked::source_group_ids`] is what they are associated with rather than what this
+    /// pass failed to resolve — the difference between a load balancer in no security group
+    /// and one whose association is unknown ([`super::health_check_firewall::CheckSource`]).
+    source_groups_resolved: bool,
 }
 
 /// What one check observed about a registration: `Some(true)` for one something in this
@@ -597,11 +602,15 @@ fn checked_registration(
     // so they are where a check of this target arrives from.
     let mut source_group_ids: Vec<String> = Vec::new();
     let mut source_interface_ids: Vec<String> = Vec::new();
+    let mut source_groups_resolved = false;
     for load_balancer in group
         .load_balancer_arns
         .iter()
         .filter_map(|arn| store.load_balancers.get(arn))
     {
+        // The record answered which groups this load balancer is associated with — none of
+        // them, where it carries none.
+        source_groups_resolved = true;
         source_group_ids.extend(load_balancer.security_groups.iter().cloned());
         source_interface_ids.extend(load_balancer.network_interface_ids.iter().cloned());
     }
@@ -619,6 +628,7 @@ fn checked_registration(
         guarding_group_ids: GuardingGroups::clone(&target.guarded_by),
         source_group_ids,
         source_interface_ids,
+        source_groups_resolved,
     }
 }
 
@@ -849,6 +859,7 @@ fn health_check_is_blocked(target: &Checked, held: &Inventory) -> bool {
             .flatten()
             .cloned()
             .collect(),
+        groups_resolved: target.source_groups_resolved,
     };
     super::health_check_firewall::interface_admits_check(groups, &held.ingress, port, &source)
         == Some(false)
@@ -1264,6 +1275,7 @@ mod tests {
                 guarding_group_ids: Vec::new().into(),
                 source_group_ids: Vec::new(),
                 source_interface_ids: Vec::new(),
+                source_groups_resolved: false,
             };
             let observed = observe(&checked, Some(&held));
             assert_eq!(
@@ -1385,6 +1397,9 @@ mod tests {
                     guarding_group_ids: declared.into(),
                     source_group_ids: vec![load_balancer_group.clone()],
                     source_interface_ids: vec![load_balancer_interface.clone()],
+                    // The load balancer's own record was read, which is where its groups
+                    // come from.
+                    source_groups_resolved: true,
                 };
                 let observed = observe(&checked, Some(&held));
                 assert_eq!(
@@ -1474,6 +1489,7 @@ mod tests {
                     guarding_group_ids: Vec::new().into(),
                     source_group_ids: vec![load_balancer_group.clone()],
                     source_interface_ids: vec![load_balancer_interface.clone()],
+                    source_groups_resolved: true,
                 };
                 let observed = observe(&checked, Some(&held));
                 assert_eq!(

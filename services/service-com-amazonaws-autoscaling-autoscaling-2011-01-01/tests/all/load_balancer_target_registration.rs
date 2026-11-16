@@ -52,7 +52,7 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 // their one copy for every suite here.
 use crate::support::{
     borrowed, create_launch_template, create_target_group, elbv2_query, emulator, p, query,
-    seed_subnets, tag_value, tag_values, vpc_of, xml_unescape, SeededSubnet, REGION,
+    seed_subnets, tag_value, tag_values, vpc_of, xml_unescape, SeededSubnet,
 };
 
 /// The most target groups ONE attach may name, from the model's own documentation for
@@ -868,17 +868,29 @@ async fn a_described_group_reports_its_collections_as_lists() {
     }
 }
 
-/// The ARN of the `index`-th target group this suite names without creating it: a target
-/// group ARN as Elastic Load Balancing spells one, built through the emulator's own ARN
-/// writer rather than written out. The attachment bound is about how many ARNs ONE group may
-/// HOLD, which no target group has to exist for — the registrations the preceding suites
-/// assert are what needs a target group that does.
-fn target_group_arn(index: usize) -> String {
-    engine::emulator_arn(
-        "elasticloadbalancing",
-        REGION,
-        &format!("targetgroup/tg-bulk-{index}/{index:016x}"),
-    )
+/// The ARNs of the target groups the ceiling rows name, created in Elastic Load Balancing
+/// v2 itself: `MAX_TARGET_GROUPS_PER_GROUP` of them plus the one past the ceiling, since an
+/// attach RESOLVES every ARN it names against that service's own target groups, so the
+/// ceiling is walked over target groups the account really holds.
+async fn bulk_target_groups(
+    router: &MultiServiceRouter,
+    vpc_id: &str,
+    count: usize,
+) -> Vec<String> {
+    let mut arns = Vec::with_capacity(count);
+    for index in 0..count {
+        arns.push(
+            create_target_group(
+                router,
+                &format!("tg-bulk-{index}"),
+                80,
+                TARGET_TYPE_INSTANCE,
+                vpc_id,
+            )
+            .await,
+        );
+    }
+    arns
 }
 
 /// The ceiling on what ONE group may HOLD, whatever call put the attachments there: a run of
@@ -892,7 +904,11 @@ fn target_group_arn(index: usize) -> String {
 async fn one_group_holds_at_most_the_ceiling_of_attachments() {
     let (router, engine) = emulator();
     let subnets = seed_subnets(&engine, 1);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
     create_launch_template(&router, "lt-ceiling").await;
+    // Every target group the rows below name, created in Elastic Load Balancing v2 itself:
+    // the ceiling plus the first one past it.
+    let bulk = bulk_target_groups(&router, &vpc_id, MAX_TARGET_GROUPS_PER_GROUP + 1).await;
 
     // The message both handlers refuse past the ceiling with, read from the crate so the
     // rows cannot drift from it.
@@ -914,7 +930,7 @@ async fn one_group_holds_at_most_the_ceiling_of_attachments() {
     while held < MAX_TARGET_GROUPS_PER_GROUP {
         let batch: Vec<String> = (held..(held + MAX_TARGET_GROUPS_PER_CALL)
             .min(MAX_TARGET_GROUPS_PER_GROUP))
-            .map(target_group_arn)
+            .map(|index| bulk[index].clone())
             .collect();
         let (status, code, message) = attach(&router, "asg-ceiling", &batch).await;
         assert_eq!(
@@ -936,7 +952,7 @@ async fn one_group_holds_at_most_the_ceiling_of_attachments() {
     let (status, code, message) = attach(
         &router,
         "asg-ceiling",
-        std::slice::from_ref(&target_group_arn(MAX_TARGET_GROUPS_PER_GROUP)),
+        std::slice::from_ref(&bulk[MAX_TARGET_GROUPS_PER_GROUP]),
     )
     .await;
     assert_eq!(
@@ -989,7 +1005,7 @@ async fn one_group_holds_at_most_the_ceiling_of_attachments() {
         rows.into_iter().enumerate()
     {
         let name = format!("asg-ceiling-create-{row}");
-        let arns: Vec<String> = (0..count).map(target_group_arn).collect();
+        let arns: Vec<String> = bulk[..count].to_vec();
         let mut params = vec![
             p("AutoScalingGroupName", name.clone()),
             p("LaunchTemplate.LaunchTemplateName", "lt-ceiling"),

@@ -157,12 +157,14 @@ impl Denied {
 /// `group_name`, or `None` when the IAM policies in force permit it.
 ///
 /// Every Auto Scaling action but the account-wide reads is judged by IAM against the ARN of
-/// the GROUP the request addresses, and a request names that group by NAME: the ARN it is
-/// judged on is the group's, with the resource-id segment left as the wildcard IAM itself
-/// writes for an id a request does not state (and which a group being CREATED does not have
-/// yet). So the decision is a handler's to take — only the handler knows which resource its
-/// operation addresses — and it is taken BEFORE the handler reads or writes anything, because
-/// a refused request must leave the account exactly as it was.
+/// the GROUP the request addresses, and a request names that group by NAME: so the ARN it is
+/// judged on — and the one a refusal names — is the group's OWN, as this service minted it
+/// and as `DescribeAutoScalingGroups` reports it under `AutoScalingGroupARN`. A name this
+/// store holds no group under has no such ARN to read: the id segment is then the wildcard
+/// IAM itself writes for an id a request does not state, which is the position a group being
+/// CREATED is in. The decision is a handler's to take — only the handler knows which resource
+/// its operation addresses — and it is taken BEFORE the handler reads or writes anything,
+/// because a refused request must leave the account exactly as it was.
 ///
 /// Carried as this service's own 403 `AccessDenied` error
 /// ([`crate::scaffolded::Scaffolded::access_denied`]), so it is rendered in the same envelope
@@ -174,13 +176,30 @@ pub fn group_action_refusal<Eng: Send + Sync + 'static, E>(
     group_name: &str,
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
     let region = crate::state::request_region(ctx.parts());
-    // The group's own ARN form, built by the one writer of it, with the wildcard in place of
-    // the resource id this service mints.
-    let resource = crate::state::group_arn(&region, EVERY_RESOURCE, group_name);
+    let resource = group_resource_arn(engine, &region, group_name);
     let refusal = authorize_on_resource(engine, ctx, operation, &resource).err()?;
     Some(crate::scaffolded::Scaffolded::access_denied(
         refusal.message(),
     ))
+}
+
+/// The ARN IAM judges an action on the group `group_name` against: the ARN the group itself
+/// carries, read from this service's own store, and the wildcard-id form of it
+/// ([`crate::state::group_arn`]) for a name no group of the account answers to.
+///
+/// The store's lock is taken for the one lookup and released before this returns, so the
+/// decision below holds no guard — and this reads only, which is what an authorization
+/// decision may do.
+fn group_resource_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    group_name: &str,
+) -> String {
+    let held = crate::state::service_state(engine).and_then(|state| {
+        let store = state.lock();
+        store.groups.get(group_name).map(|group| group.arn.clone())
+    });
+    held.unwrap_or_else(|| crate::state::group_arn(region, EVERY_RESOURCE, group_name))
 }
 
 /// Whether IAM lets this request perform the action of `operation` on `resource`.

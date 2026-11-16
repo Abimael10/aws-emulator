@@ -594,18 +594,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(refusal);
         }
-        // A group is associated with target groups of its OWN Region and account: a target
-        // group is identified within one Region, so an ARN of anywhere else names nothing
-        // the group could ever register an instance in. Refused on the input — as the
-        // attach of the same member is — so the create stores no attachment that cannot
-        // resolve.
-        if crate::state::elbv2_targets::first_unattachable_target_group(
+        // A group is associated with target groups of its OWN Region and account that
+        // Elastic Load Balancing v2 really HOLDS: the association is what registers the
+        // group's instances as targets, so an ARN of another Region, and one that resolves to
+        // no target group at all, names nothing the group could ever register an instance in.
+        // Refused on the input — as the attach of the same member is — so the create stores no
+        // attachment that cannot resolve. The identifier of an `elbv2` traffic source carries
+        // the same association, so it is resolved the same way.
+        let associated: Vec<&str> = input
+            .target_group_ar_ns
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(
+                input
+                    .traffic_sources
+                    .iter()
+                    .flatten()
+                    .filter(|source| {
+                        crate::state::elbv2_targets::names_a_target_group(
+                            source.r#type.as_deref(),
+                            &source.identifier,
+                        )
+                    })
+                    .map(|source| source.identifier.as_str()),
+            )
+            .collect();
+        if crate::state::elbv2_targets::first_unresolvable_target_group(
+            &*self.engine,
             &region,
-            input
-                .target_group_ar_ns
-                .iter()
-                .flatten()
-                .map(String::as_str),
+            associated.iter().copied(),
         )
         .is_some()
         {

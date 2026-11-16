@@ -131,6 +131,19 @@ const UNAVAILABLE: (&str, &str, &str) = (
 );
 const UNHEALTHY_TIMED_OUT: (&str, &str, &str) =
     (UNHEALTHY_STATE, "Target.Timeout", "Request timed out");
+/// The `unhealthy` a load balancer that reads no response out of the check itself reports:
+/// "`Target.FailedHealthChecks` - The load balancer received an error while establishing a
+/// connection to the target or the target response was malformed" (`TargetHealth$Reason`).
+///
+/// Which failure a family of load balancer words a check nothing answered as is the
+/// family's own: an Application Load Balancer waits out the check's timeout and reports
+/// [`UNHEALTHY_TIMED_OUT`], while a Network or Gateway Load Balancer hands the connection on
+/// and reports the failed checks ([`unhealthy_for`]).
+const UNHEALTHY_FAILED_CHECKS: (&str, &str, &str) = (
+    UNHEALTHY_STATE,
+    "Target.FailedHealthChecks",
+    "Health checks failed",
+);
 /// The other `initial` the model names, for a registration whose checks have STARTED and
 /// have not decided yet: "`Elb.InitialHealthChecking` - The load balancer is still sending
 /// the target the minimum number of health checks required to determine its health status"
@@ -140,6 +153,24 @@ const INITIAL_HEALTH_CHECKING: (&str, &str, &str) = (
     "Elb.InitialHealthChecking",
     "Health checks in progress",
 );
+
+/// How the family `family` of load balancer words an `unhealthy` verdict its checks reached.
+///
+/// The verdict itself is the same fact for every family — the group's
+/// `UnhealthyThresholdCount` consecutive checks found nothing answering — and the reason is
+/// how the load balancer performing them reports it: an Application Load Balancer sends an
+/// HTTP request and waits out `HealthCheckTimeoutSeconds` for a response, which is the
+/// `Target.Timeout` its own reason table words; a Network or Gateway Load Balancer reports
+/// `Target.FailedHealthChecks` instead, the reason code the Network Load Balancer's target
+/// health documentation gives a target whose checks did not succeed.
+fn unhealthy_for(family: super::LoadBalancerFamily) -> (&'static str, &'static str, &'static str) {
+    match family {
+        super::LoadBalancerFamily::Application => UNHEALTHY_TIMED_OUT,
+        super::LoadBalancerFamily::Network | super::LoadBalancerFamily::Gateway => {
+            UNHEALTHY_FAILED_CHECKS
+        }
+    }
+}
 
 /// The `TargetHealthStateEnum` value of a registration the load balancer can route to.
 ///
@@ -451,8 +482,9 @@ impl TargetGroupRecord {
             // The checks have run and this registration answered none of them: the load
             // balancer considers a target unhealthy once the group's threshold of
             // consecutive failures is reached, and `TargetHealth$Reason` words that for a
-            // check nothing answered.
-            return reported(UNHEALTHY_TIMED_OUT);
+            // check nothing answered — as the family of load balancer checking it words it
+            // ([`unhealthy_for`]).
+            return reported(unhealthy_for(self.family()));
         }
         if target.probe.is_failing() {
             // A check has failed and the group's threshold of consecutive failures has not

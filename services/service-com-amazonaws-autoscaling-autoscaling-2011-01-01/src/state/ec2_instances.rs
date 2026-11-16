@@ -565,6 +565,41 @@ pub fn subnet_of<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) ->
     store.instances.get(instance_id)?.subnet_id.clone()
 }
 
+/// The VPC each of `instance_ids` runs IN, keyed by instance id, as the account's own
+/// Amazon EC2 store holds it: the VPC of the subnet the instance was placed in.
+///
+/// An instance the store holds no record of, one placed by Availability Zone alone (which
+/// is in no subnet, so in no VPC this service can read), one whose subnet the store no
+/// longer holds, and every instance on an engine carrying no Amazon EC2 store at all are
+/// simply ABSENT from the answer: what a consumer does with a VPC it could not read is its
+/// own rule, and nothing may be concluded from silence.
+///
+/// The store is read ONCE for the whole batch, so the cost does not grow with the account's
+/// inventory; EC2's store lock is taken for that one pass and released before this returns.
+pub fn vpcs_of<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    instance_ids: I,
+) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let ids: BTreeSet<&str> = instance_ids.into_iter().collect();
+    if ids.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        return BTreeMap::new();
+    };
+    let store = state.lock();
+    ids.into_iter()
+        .filter_map(|instance_id| {
+            let subnet_id = store.instances.get(instance_id)?.subnet_id.as_deref()?;
+            let vpc_id = store.subnets.get(subnet_id)?.vpc_id.clone()?;
+            Some((instance_id.to_string(), vpc_id))
+        })
+        .collect()
+}
+
 /// The `StateReason` code of an instance terminated because a caller's capacity change
 /// scaled the group in: the client asked for the shutdown, which is the code Amazon EC2
 /// records for a termination a caller asked for.
