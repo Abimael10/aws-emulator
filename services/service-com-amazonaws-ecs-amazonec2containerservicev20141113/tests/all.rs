@@ -164,6 +164,10 @@ mod load_balancer_refusal_order;
 mod load_balancer_target_group_placement;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
+// The capacity ECS MANAGED SCALING acquires for a cluster holding tasks it cannot place: the
+// desired capacity it raises its provider's Auto Scaling group to, and the tasks that then run.
+#[path = "all/managed_capacity_scaling.rs"]
+mod managed_capacity_scaling;
 // The spellings a Managed Instances launch template's `monitoring` option is accepted in,
 // beside the option the stored template reports (`probe_monitoring`).
 #[path = "all/managed_instances_monitoring_spelling.rs"]

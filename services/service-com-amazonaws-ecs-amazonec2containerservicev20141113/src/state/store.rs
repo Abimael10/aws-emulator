@@ -297,6 +297,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // daemon tasks" — so the placement an instance that joined is owed, and the stop a
         // task whose instance is gone earns, are materialised here.
         self.maintain_daemon_tasks(now);
+        // What ECS MANAGED SCALING now owes: a cluster that holds tasks it cannot place
+        // through a provider whose Auto Scaling group Amazon ECS manages is one it acquires
+        // capacity for, and the action that does it falls due one span from the instant the
+        // shortfall arose ([`super::managed_capacity_scaling`]). Noted here, beside the
+        // placements above that produce the shortfall; TAKEN by the pass that holds no lock
+        // of this store ([`settle_managed_capacity_scaling`]), because the capacity change is
+        // made against the Auto Scaling store.
+        self.note_managed_capacity_demand(now);
         // Every status a task moved into during THIS pass becomes an event here, under the
         // same lock that materialised it. A transition the clock owes is observable for one
         // span only, so a pass that materialises one and a later writer that supersedes it

@@ -90,25 +90,48 @@ pub(crate) async fn create_auto_scaling_group_in(
     case: &str,
 ) {
     let zone = format!("{region}a");
-    let body = [
-        ("Action", "CreateAutoScalingGroup"),
-        ("Version", AUTO_SCALING_API_VERSION),
-        ("AutoScalingGroupName", name),
-        ("LaunchTemplate.LaunchTemplateName", CAPACITY_LAUNCH_TEMPLATE),
-        ("MinSize", "0"),
-        ("MaxSize", "0"),
-        ("AvailabilityZones.member.1", zone.as_str()),
-    ]
-    .iter()
-    .map(|(key, value)| {
-        // An `application/x-www-form-urlencoded` value carries only RFC 3986's unreserved
-        // set literally; everything else is percent-encoded.
-        let value =
-            percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC);
-        format!("{key}={value}")
-    })
-    .collect::<Vec<String>>()
-    .join("&");
+    let (status, payload) = auto_scaling_in(
+        router,
+        region,
+        &[
+            ("Action", "CreateAutoScalingGroup"),
+            ("Version", AUTO_SCALING_API_VERSION),
+            ("AutoScalingGroupName", name),
+            ("LaunchTemplate.LaunchTemplateName", CAPACITY_LAUNCH_TEMPLATE),
+            ("MinSize", "0"),
+            ("MaxSize", "0"),
+            ("AvailabilityZones.member.1", zone.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected Auto Scaling CreateAutoScalingGroup to answer 200 for \
+         {name} in {region}, got {status} with {payload}"
+    );
+}
+
+/// One `awsQuery` call to Amazon EC2 Auto Scaling, in `region`, returning the HTTP status and
+/// the XML body it answered — the ONE place these suites reach that service's wire, so a suite
+/// that creates a group, reads one back or waits for one to move spells no request of its own.
+///
+/// Every parameter value is percent-encoded here, so a caller passes values as written.
+pub(crate) async fn auto_scaling_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let body = params
+        .iter()
+        .map(|(key, value)| {
+            // An `application/x-www-form-urlencoded` value carries only RFC 3986's unreserved
+            // set literally; everything else is percent-encoded.
+            let value =
+                percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC);
+            format!("{key}={value}")
+        })
+        .collect::<Vec<String>>()
+        .join("&");
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://autoscaling.{region}.amazonaws.com/"))
@@ -124,12 +147,25 @@ pub(crate) async fn create_auto_scaling_group_in(
         .expect("a well-formed awsQuery request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    let payload = String::from_utf8_lossy(response.body()).to_string();
+    (status, String::from_utf8_lossy(response.body()).to_string())
+}
+
+/// The same, in [`SIGNED_REGION`] and asserting the 200 every accepted call answers.
+pub(crate) async fn auto_scaling(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+    case: &str,
+) -> String {
+    let mut body = vec![("Action", action), ("Version", AUTO_SCALING_API_VERSION)];
+    body.extend_from_slice(params);
+    let (status, payload) = auto_scaling_in(router, SIGNED_REGION, &body).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected Auto Scaling CreateAutoScalingGroup to answer 200 for \
-         {name} in {region}, got {status} with {payload}"
+        "case {case:?}: expected Auto Scaling {action} to answer 200, got {status} with \
+         {payload}"
     );
+    payload
 }
 
 /// The ARN Amazon EC2 Auto Scaling reports for the group it holds under `name`, read through
@@ -144,40 +180,13 @@ pub(crate) async fn auto_scaling_group_arn(
     name: &str,
     case: &str,
 ) -> String {
-    let body = [
-        ("Action", "DescribeAutoScalingGroups"),
-        ("Version", AUTO_SCALING_API_VERSION),
-        ("AutoScalingGroupNames.member.1", name),
-    ]
-    .iter()
-    .map(|(key, value)| {
-        let value =
-            percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC);
-        format!("{key}={value}")
-    })
-    .collect::<Vec<String>>()
-    .join("&");
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://autoscaling.{SIGNED_REGION}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
-                 /autoscaling/aws4_request, SignedHeaders=host, Signature=00"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed awsQuery request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = String::from_utf8_lossy(response.body()).to_string();
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected Auto Scaling to report the group {name}, got {status} with \
-         {payload}"
-    );
+    let payload = auto_scaling(
+        router,
+        "DescribeAutoScalingGroups",
+        &[("AutoScalingGroupNames.member.1", name)],
+        case,
+    )
+    .await;
     let (_, after) = payload
         .split_once("<AutoScalingGroupARN>")
         .unwrap_or_else(|| panic!("case {case:?}: no AutoScalingGroupARN for {name} in {payload}"));

@@ -372,6 +372,12 @@ pub use capacity_provider_deletion::*;
 mod capacity_provider_scaling;
 pub use capacity_provider_scaling::*;
 
+/// ECS MANAGED SCALING: the capacity Amazon ECS itself acquires, by raising the desired
+/// capacity of the Auto Scaling group of a provider whose scaling it manages, for a cluster
+/// holding tasks it cannot place.
+mod managed_capacity_scaling;
+pub use managed_capacity_scaling::*;
+
 /// The ECS MANAGED DAEMON scheduler: the revisions a daemon's configuration is captured as,
 /// the deployments that roll them out, and the one daemon task each container instance of
 /// the daemon's capacity providers runs.
@@ -4223,6 +4229,12 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Bounded by the subnets Amazon VPC holds, since a subnet it has none of resolves to no
     /// placement to record.
     pub subnet_placements: HashMap<String, SubnetPlacement>,
+    /// `(clusterName, capacityProviderName)` -> what ECS MANAGED SCALING owes that pair: the
+    /// tasks the cluster cannot place through the provider, and when the scaling action they
+    /// call for falls due ([`managed_capacity_scaling`]). An entry exists only while such a
+    /// shortfall stands, so the map is the set of clusters Amazon ECS is acquiring capacity
+    /// for, and it is bounded by the clusters and providers this store holds.
+    pub managed_capacity_demands: HashMap<(String, String), ManagedCapacityDemand>,
     /// Monotonic source of task ids, so every task ARN is distinct.
     next_task_seq: u64,
     /// Monotonic source of container ids, so every container ARN is distinct.

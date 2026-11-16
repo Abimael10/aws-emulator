@@ -333,6 +333,8 @@ mod cloudformation_domain_endpoint_outputs;
 mod cloudformation_drift_detection_status_change_events;
 #[path = "all/cloudformation_dynamodb_table_in_place_update.rs"]
 mod cloudformation_dynamodb_table_in_place_update;
+#[path = "all/cloudformation_ec2_capacity_ecs_service_converges.rs"]
+mod cloudformation_ec2_capacity_ecs_service_converges;
 #[path = "all/cloudformation_ec2_cdk_vpc_estate.rs"]
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/cloudformation_ec2_ebs_instance_estate.rs"]

@@ -106,6 +106,11 @@ pub fn advance_task_clock<Eng: Send + Sync + 'static>(engine: &Eng, now: SystemT
     if let Some(state) = service_state(engine) {
         state.lock().advance_clock(now);
     }
+    // The capacity Amazon ECS itself acquires for a cluster that holds tasks it cannot place:
+    // the pass above noted what managed scaling owes, and this takes the actions that have
+    // fallen due, against the Auto Scaling store with no guard of this one held
+    // ([`super::settle_managed_capacity_scaling`]).
+    super::settle_managed_capacity_scaling(engine, now);
     settle_task_launches(engine);
 }
 

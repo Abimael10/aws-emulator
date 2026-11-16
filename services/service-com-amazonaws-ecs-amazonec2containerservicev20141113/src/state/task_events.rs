@@ -262,6 +262,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // is waiting on and which no reader may be there to materialise
             // ([`super::service_action_events`]).
             self.next_service_transition_due_at(now),
+            // And so is the managed-scaling action a cluster holding unplaceable tasks is
+            // owed: nothing calls again between the placement and the capacity appearing, so
+            // the pump is what takes it ([`super::managed_capacity_scaling`]).
+            self.next_managed_capacity_due_at(),
         ]
         .into_iter()
         .flatten()
