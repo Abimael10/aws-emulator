@@ -116,7 +116,10 @@ async fn cloudwatch(router: &MultiServiceRouter, operation: &str, body: &Value) 
 }
 
 /// Percent-encode one form value the way an AWS SDK encodes an `awsQuery` body.
-fn form_encode(value: &str) -> String {
+///
+/// `pub(crate)` because `tests/all/pipe_dead_letter_destination.rs` reaches another
+/// `awsQuery` service (Amazon SNS) through the same encoding rather than a copy of it.
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

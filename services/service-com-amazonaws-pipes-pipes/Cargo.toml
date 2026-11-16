@@ -36,6 +36,10 @@ service-common = { path = "../common" }
 # Functions Express workflow (`StartSyncExecution`). Only the generated clients are
 # needed: the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
 aws-sdk-sqs = { version = "1", default-features = false }
+# The Amazon SNS surface a pipe whose `DeadLetterConfig.Arn` names a TOPIC records a
+# discarded batch through: `Publish` with the pointer at that batch as the message. The
+# member admits "either an Amazon SNS topic or Amazon SQS queue ARN", so both are served.
+aws-sdk-sns = { version = "1", default-features = false }
 # The EventBridge surface a pipe whose target is an event bus delivers through: `PutEvents`
 # with the configured `EventBridgeEventBusParameters` and the record as the event detail.
 aws-sdk-eventbridge = { version = "1", default-features = false }
@@ -82,6 +86,11 @@ tokio = { workspace = true, features = ["time"] }
 # one engine in the data-plane tests, because a delivery is asserted where a client sees
 # it: on the target queue, with the source queue drained and the enrichment run.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# A pipe may name an Amazon SNS topic as its dead-letter destination, and whether a pipe
+# comes up at all turns on what that ARN names, so the notification service is mounted
+# beside pipes in the dead-letter-destination suite and the topic is created the way a
+# client creates one.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 # A pipe whose target is a Lambda function is asserted against the function's own run, so
 # Lambda is mounted beside pipes in that suite and the handler's deployment package — a

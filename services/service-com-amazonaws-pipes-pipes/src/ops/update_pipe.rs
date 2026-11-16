@@ -314,6 +314,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdatePipeErrorModeled::ValidationException(violation).into());
         }
 
+        // The other half of the bring-up decision, asked here because it is asked of the
+        // configuration this update would LEAVE the pipe in rather than of the account's
+        // records: an update that stores a dead-letter destination no pipe may name is an
+        // update that cannot be completed, exactly as a creation that named one is.
+        let unservable = unservable.or_else(|| {
+            crate::state::bring_up::configuration_refusal(
+                &pipe.source,
+                effective_source_parameters,
+            )
+        });
+
         // Only the members the request carries move; the rest stay as stored.
         if let Some(description) = input.description.clone() {
             // `PipeDescription` admits the empty string, which is how a caller CLEARS the

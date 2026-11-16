@@ -44,6 +44,36 @@
 // so it stands in this header rather than in the list below.
 // Single integration-test target for the router: the canonical DECLARATION LIST of every
 // cross-service suite under `tests/all/`, and nothing else.
+//
+// Single integration-test target for the router: a declaration list, and nothing else.
+// Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
+// file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
+// blank line, and nothing after the last pair. Two branches landing at once then insert two
+// lines in two places and have no prose to duplicate, re-word or mistype, which is what had
+// gone wrong here: the tail of this file had grown hundreds of re-typed copies of its own
+// header. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name sorts
+// to; what that suite covers, and why it drives the assembled router rather than one service
+// crate, belongs in that suite's OWN module header, where it is read beside the test it
+// explains, and a note about THIS file belongs in `all/appended_notes.rs`.
+// EVERY comment in this file is an ORDINARY `//` one, this header included: an inner doc
+// comment is legal only before the first item, so one appended past the declarations is
+// `E0753` and compiles no suite of this target at all — and with none anywhere in the file, no
+// appended, re-typed or merged copy of one of its lines can be one. A suite file no `mod` here
+// names is compiled nowhere, a suite left at the top level of `tests/` fails the build, and a
+// second `mod` for one name is `E0428`.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// this file (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each
+// `mod` is what points it into `tests/all/`. Some of the files below are shared harnesses or
+// probes rather than suites; all are declared, because a file no declaration names is compiled
+// nowhere.
+// The `all/all_rs_*` suites, `all/every_suite_file_is_declared.rs` and
+// `all/declaration_roots_are_canonical_and_complete.rs` check every rule above, for this file
+// and for every service crate's `tests/all.rs`, so check there rather than leaving a note
+// here.
+// The module headers of the suites this root compiles wrap without the indentation
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the whole
+// target. An inner attribute, like an inner doc comment, is legal only before the first item,
+// so it stands in this header rather than in the list below.
 // Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
 // `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
 // `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
@@ -142,6 +172,8 @@ mod agent_registry_discovery_routes_probe;
 mod agent_registry_signing_name_routing;
 #[path = "all/all_rs_carries_no_inner_doc_comment.rs"]
 mod all_rs_carries_no_inner_doc_comment;
+#[path = "all/all_rs_carries_one_header_block.rs"]
+mod all_rs_carries_one_header_block;
 #[path = "all/all_rs_declares_each_suite_once.rs"]
 mod all_rs_declares_each_suite_once;
 #[path = "all/all_rs_inner_doc_comments_precede_the_first_item.rs"]

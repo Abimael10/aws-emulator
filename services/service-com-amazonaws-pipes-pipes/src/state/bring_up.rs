@@ -20,6 +20,13 @@
 //! 2. the SOURCE itself: a `Source` naming a resource the service that owns it does not
 //!    hold is a source with nothing to poll.
 //!
+//! Both of those are read off the ACCOUNT's records and the owner of the source, which is
+//! why they are asked with no store locked ([`refusal`]). The third thing decided here is
+//! read off the CONFIGURATION alone ([`configuration_refusal`]): the dead-letter destination
+//! a stream source's parameters name, which the request boundary cannot refuse because the
+//! call itself is accepted, and which a pipe whose batches have retries to spend could not
+//! give up on a batch without.
+//!
 //! The TARGET side is deliberately NOT among them. A delivery the target refuses — a role
 //! that may not write to it, a target that is not there — is one EXECUTION of a RUNNING
 //! pipe failing, counted as such ([`super::metrics`]) with the records left on the source
@@ -33,8 +40,34 @@
 //! document or a policy attachment whose document this account does not carry — each shows
 //! nothing, and a pipe carrying it comes up.
 
+/// Why the pipe reading `source` under the source parameters `source_parameters` cannot be
+/// brought up, decided from the CONFIGURATION ALONE, or `None` when nothing of the kind can be
+/// shown.
+///
+/// The half of the bring-up decision that asks no other service and reads no store, so a
+/// lifecycle write can take it with the pipes store locked and against the configuration the
+/// write would LEAVE the pipe in: what it answers is not what the account holds but what the
+/// configuration says. Its one question is the dead-letter destination
+/// ([`super::data_plane::dead_letter_refusal`]), which the request boundary cannot refuse,
+/// because the member is an ARN of no fixed service and AWS accepts the call. The answer is
+/// the sentence that states the rule the destination broke, reported as the pipe's
+/// `StateReason` as it stands.
+///
+/// Every lifecycle write that reports a pipe up asks BOTH this and [`refusal`], so none of
+/// them can bring up a pipe another would not.
+pub fn configuration_refusal(
+    source: &str,
+    source_parameters: Option<&crate::ops::types::PipeSourceParameters>,
+) -> Option<String> {
+    let reason = super::data_plane::dead_letter_refusal(source, source_parameters)?;
+    Some(super::execution_role::within_the_reason_bound(reason))
+}
+
 /// Why the pipe that would run as `role_arn` over the source `source` cannot be brought up,
 /// or `None` when nothing of the kind can be shown.
+///
+/// The half of the decision that asks the ACCOUNT's own records and the owner of the source,
+/// so it is taken with no store locked; [`configuration_refusal`] is the other half.
 ///
 /// The one decision behind every lifecycle write that reports a pipe up (`CreatePipe`,
 /// `StartPipe`, `UpdatePipe`), so none of them can bring up a pipe another would not.

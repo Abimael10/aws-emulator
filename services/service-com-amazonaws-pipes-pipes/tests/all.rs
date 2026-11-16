@@ -27,6 +27,8 @@ mod pipe_configuration_rules;
 mod pipe_data_plane;
 #[path = "all/pipe_dead_letter.rs"]
 mod pipe_dead_letter;
+#[path = "all/pipe_dead_letter_destination.rs"]
+mod pipe_dead_letter_destination;
 #[path = "all/pipe_deletion_stops_delivery.rs"]
 mod pipe_deletion_stops_delivery;
 #[path = "all/pipe_fifo_delivery.rs"]

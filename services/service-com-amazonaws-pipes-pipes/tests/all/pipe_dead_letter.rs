@@ -134,7 +134,14 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One `awsJson` RPC call against Kinesis.
-async fn kinesis(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` because `tests/all/pipe_dead_letter_destination.rs` drives the same stream
+/// fixture through this one path rather than a copy of it.
+pub(crate) async fn kinesis(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     rpc(router, "kinesis", "Kinesis_20131202", operation, body).await
 }
 
@@ -144,7 +151,9 @@ async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: &Value) ->
 }
 
 /// A one-shard stream called `name`, waited out until it is ACTIVE; answers its ARN.
-async fn given_stream(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` for the reason [`kinesis`] is.
+pub(crate) async fn given_stream(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = kinesis(
         router,
         "CreateStream",
@@ -220,7 +229,9 @@ async fn given_streamed_table(router: &MultiServiceRouter, name: &str) -> String
 
 /// Put one record carrying `payload` on `stream`; answers the sequence number the stream
 /// named it by, which is what a dead letter's pointer has to bound.
-async fn put_record(
+///
+/// `pub(crate)` for the reason [`kinesis`] is.
+pub(crate) async fn put_record(
     router: &MultiServiceRouter,
     stream: &str,
     case: &str,

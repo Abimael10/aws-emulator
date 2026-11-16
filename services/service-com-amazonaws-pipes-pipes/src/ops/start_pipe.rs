@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // last call left it mid-transition is not startable — the move in flight has to
         // land first, so a second move is refused with the conflict error the model
         // declares rather than interleaved with it.
-        let (source, role_arn) = {
+        let (source, source_parameters, role_arn) = {
             let mut state = store.lock();
             state.settle_due_transitions();
             let pipe = state.pipes.get(&input.name).ok_or_else(|| {
@@ -193,15 +193,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            (pipe.source.clone(), pipe.role_arn.clone())
+            (
+                pipe.source.clone(),
+                pipe.source_parameters.clone(),
+                pipe.role_arn.clone(),
+            )
         };
 
         // Whether the pipe could poll that source under that role: a start asks the pipe to
         // run, and a pipe that could not take its source's records is a start that cannot
         // be completed. Decided with NO store lock held, because the owner of the source is
-        // asked about it and no request waits on that behind this lock.
-        let unservable =
-            crate::state::bring_up::refusal(ctx, &*self.engine, &source, &role_arn).await;
+        // asked about it and no request waits on that behind this lock. The configuration
+        // the pipe already holds is asked about too, so a start cannot bring up a pipe the
+        // creation that stored that configuration would have failed.
+        let unservable = crate::state::bring_up::refusal(ctx, &*self.engine, &source, &role_arn)
+            .await
+            .or_else(|| {
+                crate::state::bring_up::configuration_refusal(&source, source_parameters.as_ref())
+            });
 
         // The start itself, decided and written in ONE critical section, so of two
         // simultaneous starts on a resting pipe the first one through is the only one

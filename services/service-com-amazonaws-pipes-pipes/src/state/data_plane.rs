@@ -146,7 +146,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ::serde_json::{json, Value};
 
 use super::{pipe_state, ComAmazonawsPipesPipesState, PipeRecord};
-use crate::ops::types::PipeTargetParameters;
+use crate::ops::types::{PipeSourceParameters, PipeTargetParameters};
 
 mod dead_letter;
 mod event_bus;
@@ -3384,8 +3384,6 @@ struct SourceConfiguration {
     window_seconds: Option<i32>,
     /// `MaximumRetryAttempts`, for a source whose parameters carry one.
     retry_attempts: Option<i32>,
-    /// `DeadLetterConfig.Arn`, for a source whose parameters carry one.
-    dead_letter_arn: Option<String>,
 }
 
 /// What this record asks the stages to do, or why this data plane does not serve it.
@@ -3407,7 +3405,6 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
         window_seconds,
         default_batch_size,
         retry_attempts,
-        dead_letter_arn,
     } = match parsed.vendor {
         SQS_NAMESPACE => {
             let queue_name = parsed.resource;
@@ -3426,7 +3423,6 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
                 // are retried for as long as the queue holds them, and there is no
                 // dead-letter destination of the PIPE's — the queue has one of its own.
                 retry_attempts: None,
-                dead_letter_arn: None,
             }
         }
         DYNAMODB_NAMESPACE => {
@@ -3455,10 +3451,6 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
                 window_seconds: stream.maximum_batching_window_in_seconds,
                 default_batch_size: DEFAULT_STREAM_BATCH_SIZE,
                 retry_attempts: stream.maximum_retry_attempts,
-                dead_letter_arn: stream
-                    .dead_letter_config
-                    .as_ref()
-                    .and_then(|configured| configured.arn.clone()),
             }
         }
         KINESIS_NAMESPACE => {
@@ -3491,10 +3483,6 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
                 window_seconds: stream.maximum_batching_window_in_seconds,
                 default_batch_size: DEFAULT_STREAM_BATCH_SIZE,
                 retry_attempts: stream.maximum_retry_attempts,
-                dead_letter_arn: stream
-                    .dead_letter_config
-                    .as_ref()
-                    .and_then(|configured| configured.arn.clone()),
             }
         }
         other => {
@@ -3521,13 +3509,12 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
     // stream source's parameters): the negative value, and a source whose parameters name
     // none, are a batch attempted for as long as its source holds it.
     let maximum_retry_attempts = retry_attempts.and_then(|allowed| u32::try_from(allowed).ok());
-    // Where the record of a batch this pipe gives up on goes. A destination this data plane
-    // cannot write to is a configuration it does not serve: the pipe polls nothing rather
-    // than discarding batches whose record would reach nobody.
-    let dead_letter = match dead_letter_arn
-        .as_deref()
-        .filter(|arn| !arn.is_empty())
-    {
+    // Where the record of a batch this pipe gives up on goes, read through the one reading of
+    // the member in this tree ([`configured_dead_letter_arn`]), which is also the one the
+    // lifecycle refuses a pipe on. A destination no pipe may name is a configuration this
+    // data plane does not serve: the pipe polls nothing rather than discarding batches whose
+    // record would reach nobody.
+    let dead_letter = match configured_dead_letter_arn(&pipe.source, parameters) {
         None => None,
         Some(arn) => Some(dead_letter::resolve(arn)?),
     };
@@ -3691,6 +3678,50 @@ pub(super) fn source_record_action(source: &str) -> Option<&'static str> {
     }
 }
 
+/// Why the dead-letter destination the pipe reading `source` under `parameters` configures is
+/// one no pipe may name, or `None` when it configures none or configures one a pipe may name.
+///
+/// This is the question the lifecycle asks before it reports a pipe up
+/// ([`super::bring_up`]): the destination is not checked when the request is validated —
+/// AWS accepts the call — so a pipe whose dead letters would have nowhere to go settles in
+/// the failure state of the move that was in flight instead of reaching RUNNING.
+pub(super) fn dead_letter_refusal(
+    source: &str,
+    parameters: Option<&PipeSourceParameters>,
+) -> Option<String> {
+    dead_letter::refusal(configured_dead_letter_arn(source, parameters)?)
+}
+
+/// The `DeadLetterConfig.Arn` the pipe reading `source` configures, or `None` when it
+/// configures none.
+///
+/// `DeadLetterConfig` is a member of a STREAM source's parameters only
+/// (`PipeSourceKinesisStreamParameters`, `PipeSourceDynamoDBStreamParameters`), and which of
+/// those two shapes holds a pipe's parameters is decided by the kind of resource its `Source`
+/// names — the same reading [`resolve_run`] makes, so the lifecycle and the data plane cannot
+/// read two different destinations off one record. An absent member and the empty string
+/// configure no destination alike.
+fn configured_dead_letter_arn<'a>(
+    source: &str,
+    parameters: Option<&'a PipeSourceParameters>,
+) -> Option<&'a str> {
+    let parsed = ::service_common::arn::parse(source)?;
+    let configured = match parsed.vendor {
+        KINESIS_NAMESPACE if parsed.resource_type() == KINESIS_STREAM_RESOURCE => parameters
+            .and_then(|p| p.kinesis_stream_parameters.as_ref())
+            .and_then(|stream| stream.dead_letter_config.as_ref()),
+        DYNAMODB_NAMESPACE if parsed.resource.contains(STREAM_SEGMENT) => parameters
+            .and_then(|p| p.dynamo_db_stream_parameters.as_ref())
+            .and_then(|stream| stream.dead_letter_config.as_ref()),
+        // Every other source kind's parameters shape carries no such member at all, so such
+        // a pipe configures no dead-letter destination of its own.
+        _ => None,
+    };
+    configured
+        .and_then(|configured| configured.arn.as_deref())
+        .filter(|arn| !arn.is_empty())
+}
+
 /// Whether the service that OWNS the source `source` names answers that it holds no such
 /// resource.
 ///
@@ -3784,6 +3815,7 @@ fn queue_url(region: &str, account: &str, name: &str) -> String {
 #[derive(Default)]
 struct Clients {
     sqs: Option<(String, ::aws_sdk_sqs::Client)>,
+    sns: Option<(String, ::aws_sdk_sns::Client)>,
     eventbridge: Option<(String, ::aws_sdk_eventbridge::Client)>,
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
     sfn: Option<(String, ::aws_sdk_sfn::Client)>,
@@ -3841,6 +3873,7 @@ macro_rules! callback_client {
 
 impl Clients {
     callback_client!(sqs, aws_sdk_sqs, "sqs");
+    callback_client!(sns, aws_sdk_sns, "sns");
     // EventBridge publishes its endpoint and signs under `events`.
     callback_client!(eventbridge, aws_sdk_eventbridge, "events");
     callback_client!(lambda, aws_sdk_lambda, "lambda");
@@ -3890,11 +3923,151 @@ mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpointed_through, enrichment_events, path_view, render_template, resolved_parameter,
-        target_body, MAX_TEMPLATE_BYTES, MESSAGE_GROUP_ID,
+        checkpointed_through, dead_letter_refusal, enrichment_events, path_view, render_template,
+        resolved_parameter, target_body, PipeSourceParameters, MAX_TEMPLATE_BYTES,
+        MESSAGE_GROUP_ID, TRIM_HORIZON_POSITION,
     };
     use ::serde_json::{json, Value};
     use ::std::collections::BTreeSet;
+
+    /// Source parameters carrying `arn` as the `DeadLetterConfig.Arn` of the stream-source
+    /// member `member` names, which is how a pipe configures a destination.
+    fn configured(member: &str, arn: Option<&str>) -> PipeSourceParameters {
+        use crate::ops::types::{
+            DeadLetterConfig, PipeSourceDynamoDBStreamParameters,
+            PipeSourceKinesisStreamParameters,
+        };
+
+        let config = arn.map(|arn| DeadLetterConfig {
+            arn: Some(arn.to_string()),
+        });
+        let mut parameters = PipeSourceParameters::default();
+        match member {
+            "KinesisStreamParameters" => {
+                parameters.kinesis_stream_parameters = Some(PipeSourceKinesisStreamParameters {
+                    starting_position: TRIM_HORIZON_POSITION.to_string(),
+                    dead_letter_config: config,
+                    ..PipeSourceKinesisStreamParameters::default()
+                });
+            }
+            "DynamoDBStreamParameters" => {
+                parameters.dynamo_db_stream_parameters = Some(PipeSourceDynamoDBStreamParameters {
+                    starting_position: TRIM_HORIZON_POSITION.to_string(),
+                    dead_letter_config: config,
+                    ..PipeSourceDynamoDBStreamParameters::default()
+                });
+            }
+            other => panic!("no stream-source parameters member named {other:?}"),
+        }
+        parameters
+    }
+
+    /// The `Source` of a pipe polling the kind of resource `member` configures: which
+    /// parameters member a pipe's destination is read from follows from the resource its
+    /// `Source` names.
+    fn source_of(member: &str) -> &'static str {
+        match member {
+            "KinesisStreamParameters" => "arn:aws:kinesis:us-east-1:000000000000:stream/orders",
+            "DynamoDBStreamParameters" => {
+                "arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/2026-01-01T00:00:00.000"
+            }
+            other => panic!("no stream-source parameters member named {other:?}"),
+        }
+    }
+
+    /// RULE: a configured dead-letter destination is read from the source-parameters member
+    /// of the kind of resource the pipe's `Source` names — both stream sources declare
+    /// `DeadLetterConfig` under the same shape — and one naming neither an Amazon SQS queue
+    /// nor an Amazon SNS topic is refused, while a configuration naming no destination
+    /// refuses nothing.
+    ///
+    /// The rows differ along which member carries the configuration and along what its ARN
+    /// names, which is what the rule generalises over.
+    #[test]
+    fn a_dead_letter_destination_is_read_from_either_stream_sources_parameters() {
+        // (case, the member, the configured ARN, whether it is refused)
+        let rows: [(&str, &str, Option<&str>, bool); 8] = [
+            (
+                "a kinesis source naming a queue",
+                "KinesisStreamParameters",
+                Some("arn:aws:sqs:us-east-1:000000000000:dead-letters"),
+                false,
+            ),
+            (
+                "a kinesis source naming a topic",
+                "KinesisStreamParameters",
+                Some("arn:aws:sns:us-east-1:000000000000:dead-letters"),
+                false,
+            ),
+            (
+                "a kinesis source naming a stream",
+                "KinesisStreamParameters",
+                Some("arn:aws:kinesis:us-east-1:000000000000:stream/dead-letters"),
+                true,
+            ),
+            (
+                "a kinesis source naming nothing",
+                "KinesisStreamParameters",
+                None,
+                false,
+            ),
+            (
+                "a kinesis source naming the empty string",
+                "KinesisStreamParameters",
+                Some(""),
+                false,
+            ),
+            (
+                "a dynamodb-stream source naming a queue",
+                "DynamoDBStreamParameters",
+                Some("arn:aws:sqs:us-east-1:000000000000:dead-letters"),
+                false,
+            ),
+            (
+                "a dynamodb-stream source naming a function",
+                "DynamoDBStreamParameters",
+                Some("arn:aws:lambda:us-east-1:000000000000:function:dead-letters"),
+                true,
+            ),
+            (
+                "a dynamodb-stream source naming nothing",
+                "DynamoDBStreamParameters",
+                None,
+                false,
+            ),
+        ];
+        for (case, member, arn, refused) in rows {
+            let parameters = configured(member, arn);
+            let source = source_of(member);
+            let answered = dead_letter_refusal(source, Some(&parameters));
+            assert_eq!(
+                answered.is_some(),
+                refused,
+                "case {case:?}: expected refused={refused}, got {answered:?}"
+            );
+            if let (Some(reason), Some(arn)) = (&answered, arn) {
+                assert!(
+                    reason.contains(arn),
+                    "case {case:?}: expected the refusal to name {arn}, got {reason:?}"
+                );
+            }
+            // A QUEUE source's parameters carry no such member at all, so the same
+            // configuration read for one is no destination.
+            let unread = dead_letter_refusal(
+                "arn:aws:sqs:us-east-1:000000000000:orders",
+                Some(&parameters),
+            );
+            assert!(
+                unread.is_none(),
+                "case {case:?}: a queue source configures no dead-letter destination, got \
+                 {unread:?}"
+            );
+        }
+        assert!(
+            dead_letter_refusal(source_of("KinesisStreamParameters"), None).is_none(),
+            "a configuration with no source parameters at all configures no destination"
+        );
+    }
 
     /// RULE: a shard has ONE position, so an attempt that processed part of the batch read
     /// from it leaves that shard read on from the FIRST record it did not process: the

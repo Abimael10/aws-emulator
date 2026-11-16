@@ -291,14 +291,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the pipe this call creates could poll its source at all — the role it is
         // to act as, and the source itself — decided against the account's own records
         // BEFORE the pipes store is locked, so nothing waits on it behind that lock. A pipe
-        // that could not is one whose creation cannot be completed.
+        // that could not is one whose creation cannot be completed; so is one whose
+        // configuration names a dead-letter destination no pipe may name, which is decided
+        // from the request's own `SourceParameters`.
         let unservable = crate::state::bring_up::refusal(
             ctx,
             &*self.engine,
             &input.source,
             &input.role_arn,
         )
-        .await;
+        .await
+        .or_else(|| {
+            crate::state::bring_up::configuration_refusal(
+                &input.source,
+                input.source_parameters.as_ref(),
+            )
+        });
         let mut state = store.lock();
         state.settle_due_transitions();
 

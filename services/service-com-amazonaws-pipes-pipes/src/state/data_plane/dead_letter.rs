@@ -16,12 +16,21 @@
 //! shard and the run of sequence numbers the discarded batch covered, so a client can read
 //! exactly those records off the stream again — the records' own payloads are never copied
 //! into it.
+//!
+//! WHICH destinations a pipe may name is also this module's: "either an Amazon SNS topic or
+//! Amazon SQS queue ARN" ([`resolve`]), and a value naming anything else is a destination no
+//! pipe may dead-letter to — which is why the lifecycle asks the same question before it
+//! brings a pipe up at all ([`super::super::bring_up`]).
 
 use std::time::SystemTime;
 
 use ::serde_json::{json, Value};
 
 use super::{Clients, FailedAttempt, LiveRecord, RunningPipe, SEND_MESSAGE_ACTION};
+
+/// The IAM action a dead letter written to an Amazon SNS topic is authorized under: the
+/// action name of the SNS API call that takes it.
+pub(super) const PUBLISH_ACTION: &str = "sns:Publish";
 
 /// The version the message's own envelope reports: the layout below, which is the one every
 /// dead letter this emulator writes carries.
@@ -39,55 +48,98 @@ pub(super) const KINESIS_BATCH_INFO: &str = "KinesisBatchInfo";
 /// See [`KINESIS_BATCH_INFO`].
 pub(super) const DYNAMODB_BATCH_INFO: &str = "DDBStreamBatchInfo";
 
-/// The ARN service namespace of the one dead-letter destination this emulator writes to.
+/// The ARN service namespaces a dead-letter destination may be named in: "for Amazon
+/// Kinesis stream and Amazon DynamoDB stream sources, specify either an Amazon SNS topic or
+/// Amazon SQS queue ARN" (`DeadLetterConfig$Arn`). A value in any other namespace names no
+/// destination a pipe may dead-letter to.
 const SQS_NAMESPACE: &str = "sqs";
+/// See [`SQS_NAMESPACE`].
+const SNS_NAMESPACE: &str = "sns";
 
 /// Where a pipe's dead letters go: the resource its `DeadLetterConfig.Arn` names.
 ///
 /// "For Amazon Kinesis stream and Amazon DynamoDB stream sources, specify either an Amazon
-/// SNS topic or Amazon SQS queue ARN" (`DeadLetterConfig$Arn`). An Amazon SQS queue is the
-/// one of those two this emulator serves, so it is the one addressed here; a destination of
-/// any other kind is a configuration this data plane does not serve at all ([`resolve`]),
-/// which leaves the source untouched rather than discarding batches whose record would go
-/// nowhere.
+/// SNS topic or Amazon SQS queue ARN" (`DeadLetterConfig$Arn`), so those two are the kinds
+/// addressed here — a queue the record is SENT to, and a topic it is PUBLISHED to. A
+/// destination in any other service namespace is one no pipe may name ([`resolve`]).
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Destination {
-    /// The queue's ARN as the pipe configured it: the resource the write is authorized on.
-    arn: String,
-    /// The url Amazon SQS takes that queue's `SendMessage` at.
-    url: String,
-    /// The Region the ARN names — a dead letter is written in the destination's own Region.
-    region: String,
+pub(super) enum Destination {
+    /// An Amazon SQS queue: the record travels as one message on it.
+    Queue {
+        /// The queue's ARN as the pipe configured it: the resource the write is authorized
+        /// on.
+        arn: String,
+        /// The url Amazon SQS takes that queue's `SendMessage` at.
+        url: String,
+        /// The Region the ARN names — a dead letter is written in the destination's own
+        /// Region.
+        region: String,
+    },
+    /// An Amazon SNS topic: the record travels as one message published to it, which its
+    /// own subscriptions then carry.
+    Topic {
+        /// The topic's ARN as the pipe configured it, which is both the resource the write
+        /// is authorized on and what `Publish` addresses.
+        arn: String,
+        /// See [`Self::Queue::region`].
+        region: String,
+    },
 }
 
 impl Destination {
     /// The ARN the pipe named this destination by.
     pub(super) fn arn(&self) -> &str {
-        &self.arn
+        match self {
+            Self::Queue { arn, .. } | Self::Topic { arn, .. } => arn,
+        }
     }
 }
 
-/// The destination the `DeadLetterConfig.Arn` `arn` names, or why this data plane does not
-/// write to it.
+/// Why `arn` names no dead-letter destination a pipe may configure.
+///
+/// The fixed text is the rule AWS states for the member itself — "For Amazon Kinesis stream
+/// and Amazon DynamoDB stream sources, specify either an Amazon SNS topic or Amazon SQS queue
+/// ARN" (`DeadLetterConfig$Arn`, `smithy_query(query="doc", shape="DeadLetterConfig",
+/// member="Arn")`) — and the one variable part is the destination the configuration names,
+/// read from the pipe's own record. One sentence for every value the member cannot carry, so
+/// the lifecycle's bring-up decision ([`super::super::bring_up`]) and this data plane's own
+/// reading of a pipe's configuration report such a value identically.
+fn unsupported_destination(arn: &str) -> String {
+    format!(
+        "DeadLetterConfig.Arn {arn} is not valid. For Amazon Kinesis stream and Amazon \
+         DynamoDB stream sources, specify either an Amazon SNS topic or Amazon SQS queue ARN."
+    )
+}
+
+/// The destination the `DeadLetterConfig.Arn` `arn` names, or why it names none a pipe may
+/// dead-letter to.
 pub(super) fn resolve(arn: &str) -> Result<Destination, String> {
-    let parsed = ::service_common::arn::parse(arn)
-        .ok_or_else(|| format!("its DeadLetterConfig.Arn {arn} is not a resource ARN"))?;
-    if parsed.vendor != SQS_NAMESPACE {
-        return Err(format!(
-            "its DeadLetterConfig.Arn names a {} resource, and only an Amazon SQS queue \
-             dead-letter destination is written to by this emulator",
-            parsed.vendor
-        ));
-    }
+    let Some(parsed) = ::service_common::arn::parse(arn) else {
+        return Err(unsupported_destination(arn));
+    };
+    // Neither a queue nor a topic carries a resource type or a path: a value whose resource
+    // field is compound names something else of that service's — a subscription, a platform
+    // endpoint — and not the destination itself.
     let name = parsed.resource;
-    if name.contains('/') || name.contains(':') {
-        return Err(format!("its DeadLetterConfig.Arn {arn} names no queue"));
+    let compound = name.contains('/') || name.contains(':');
+    match parsed.vendor {
+        SQS_NAMESPACE if !compound => Ok(Destination::Queue {
+            arn: arn.to_string(),
+            url: super::queue_url(parsed.region, parsed.account, name),
+            region: parsed.region.to_string(),
+        }),
+        SNS_NAMESPACE if !compound => Ok(Destination::Topic {
+            arn: arn.to_string(),
+            region: parsed.region.to_string(),
+        }),
+        _ => Err(unsupported_destination(arn)),
     }
-    Ok(Destination {
-        arn: arn.to_string(),
-        url: super::queue_url(parsed.region, parsed.account, name),
-        region: parsed.region.to_string(),
-    })
+}
+
+/// Why the `DeadLetterConfig.Arn` `arn` cannot be a pipe's dead-letter destination, or
+/// `None` when it names one.
+pub(super) fn refusal(arn: &str) -> Option<String> {
+    resolve(arn).err()
 }
 
 /// The batch a pipe discarded, as a dead letter POINTS AT it: which shard it was read from
@@ -166,7 +218,9 @@ pub(super) fn payload(
 ///
 /// The same question every other stage's call is preceded by is asked here too: a role that
 /// may not write to the destination is a dead letter that does not happen, and the caller
-/// keeps the batch rather than discarding a record of it nothing holds.
+/// keeps the batch rather than discarding a record of it nothing holds. WHICH call is made
+/// and which action it is authorized under follow from the kind of destination the pipe
+/// named: `SendMessage` on a queue, `Publish` on a topic.
 pub(super) async fn send(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
@@ -174,24 +228,45 @@ pub(super) async fn send(
     destination: &Destination,
     body: &Value,
 ) -> Result<(), String> {
-    if let Some(detail) = record.refusal(SEND_MESSAGE_ACTION, &destination.arn) {
-        return Err(detail);
+    match destination {
+        Destination::Queue { arn, url, region } => {
+            if let Some(detail) = record.refusal(SEND_MESSAGE_ACTION, arn) {
+                return Err(detail);
+            }
+            clients
+                .sqs(callback, region)
+                .send_message()
+                .queue_url(url)
+                .message_body(body.to_string())
+                .send()
+                .await
+                .map_err(|error| not_taken(arn, &error))?;
+        }
+        Destination::Topic { arn, region } => {
+            if let Some(detail) = record.refusal(PUBLISH_ACTION, arn) {
+                return Err(detail);
+            }
+            clients
+                .sns(callback, region)
+                .publish()
+                .topic_arn(arn)
+                .message(body.to_string())
+                .send()
+                .await
+                .map_err(|error| not_taken(arn, &error))?;
+        }
     }
-    clients
-        .sqs(callback, &destination.region)
-        .send_message()
-        .queue_url(&destination.url)
-        .message_body(body.to_string())
-        .send()
-        .await
-        .map_err(|error| {
-            format!(
-                "the dead-letter queue {} did not take the record of the discarded batch ({})",
-                destination.arn,
-                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
-            )
-        })?;
     Ok(())
+}
+
+/// What a destination that did not take the record of a discarded batch is reported with:
+/// the destination and what its own service answered.
+fn not_taken<E: ::std::error::Error>(arn: &str, error: &E) -> String {
+    format!(
+        "the dead-letter destination {arn} did not take the record of the discarded batch \
+         ({})",
+        ::aws_smithy_types::error::display::DisplayErrorContext(error)
+    )
 }
 
 /// The instant `at` as the text a dead letter reports a time in, or `None` for one that
@@ -203,7 +278,9 @@ pub(super) fn instant_text(at: &::aws_smithy_types::DateTime) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::super::{test_support::kinesis_run, CallFailure, FailedAttempt, Stage};
-    use super::{payload, resolve, DiscardedBatch, DYNAMODB_BATCH_INFO, KINESIS_BATCH_INFO};
+    use super::{
+        payload, refusal, resolve, DiscardedBatch, DYNAMODB_BATCH_INFO, KINESIS_BATCH_INFO,
+    };
 
     /// One discarded batch of two records read from one shard.
     fn discarded(member: &'static str) -> DiscardedBatch {
@@ -334,16 +411,16 @@ mod tests {
         }
     }
 
-    /// RULE: only a destination this data plane can write to is served — the Amazon SQS
-    /// queue of the two kinds `DeadLetterConfig.Arn` admits — and every other value is
-    /// refused rather than taken for one.
+    /// RULE: a dead-letter destination is one of the two kinds `DeadLetterConfig.Arn`
+    /// admits — "either an Amazon SNS topic or Amazon SQS queue ARN" — and a value naming
+    /// anything else is refused rather than taken for one.
     ///
     /// The rows differ along what the configured ARN names, which is what the rule
     /// generalises over.
     #[test]
-    fn only_a_queue_destination_is_written_to() {
-        // (case, the configured ARN, whether it resolves)
-        let rows: [(&str, &str, bool); 5] = [
+    fn only_a_queue_or_topic_destination_is_written_to() {
+        // (case, the configured ARN, whether it names a destination)
+        let rows: [(&str, &str, bool); 9] = [
             (
                 "a queue",
                 "arn:aws:sqs:us-east-1:000000000000:dead-letters",
@@ -357,11 +434,31 @@ mod tests {
             (
                 "an sns topic",
                 "arn:aws:sns:us-east-1:000000000000:dead-letters",
+                true,
+            ),
+            (
+                "an sns topic in another partition",
+                "arn:aws-us-gov:sns:us-gov-west-1:000000000000:dead-letters",
+                true,
+            ),
+            (
+                "an sns subscription rather than the topic",
+                "arn:aws:sns:us-east-1:000000000000:dead-letters:8f3a",
                 false,
             ),
             (
                 "a kinesis stream",
                 "arn:aws:kinesis:us-east-1:000000000000:stream/dead-letters",
+                false,
+            ),
+            (
+                "a lambda function",
+                "arn:aws:lambda:us-east-1:000000000000:function:dead-letters",
+                false,
+            ),
+            (
+                "an eventbridge event bus",
+                "arn:aws:events:us-east-1:000000000000:event-bus/dead-letters",
                 false,
             ),
             ("not an ARN at all", "dead-letters", false),
@@ -372,6 +469,12 @@ mod tests {
                 resolved.is_ok(),
                 served,
                 "case {case:?}: expected served={served}, got {resolved:?}"
+            );
+            assert_eq!(
+                refusal(arn).is_none(),
+                served,
+                "case {case:?}: the refusal and the resolution have to agree, got {:?}",
+                refusal(arn)
             );
             if let Ok(destination) = resolved {
                 assert_eq!(
