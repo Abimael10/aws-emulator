@@ -269,6 +269,8 @@ mod package_version_history;
 mod package_versions;
 #[path = "all/pagination_contract.rs"]
 mod pagination_contract;
+#[path = "all/path_segment_escapes.rs"]
+mod path_segment_escapes;
 #[path = "all/published_catalog_order.rs"]
 mod published_catalog_order;
 #[path = "all/published_domain_address.rs"]

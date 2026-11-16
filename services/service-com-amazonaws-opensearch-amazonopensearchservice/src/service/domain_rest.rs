@@ -55,6 +55,12 @@
 //! with the legacy Amazon Elasticsearch Service model, whose own modelled path space is
 //! disjoint from both addressings above.
 //!
+//! Whichever addressing a request arrived under, the names its path carries are the VALUES
+//! its segments stand for and not the text they arrived as: a path segment travels
+//! percent-encoded, so an index name or a document id holding a character that would divide
+//! the path is read from the decoded segment ([`path_segments`]) — which is what a client
+//! indexing documents keyed by anything hierarchical addresses them by.
+//!
 //! # What it answers, and what decides it
 //!
 //! Every status, header and byte is computed from what a create, an update or a write
@@ -932,6 +938,7 @@ fn answered<Eng: Send + Sync + 'static>(engine: &Eng, incoming: &Incoming<'_>) -
     let request = Request {
         method: &incoming.method,
         path: &resolved.request_path,
+        segments: path_segments(&resolved.request_path),
         query: incoming.query,
         body: incoming.body,
         principal: &principal,
@@ -1279,10 +1286,40 @@ fn resolved_indexes<'a>(
     Ok(resolved.into_iter().collect())
 }
 
+/// The VALUES a request target's path carries, one per non-empty segment: each segment
+/// PERCENT-DECODED, which is what the surface below reads every route against.
+///
+/// A URI's path is a sequence of percent-encoded segments (RFC 3986 §3.3), so a character
+/// that would otherwise divide the path — the `/` inside a document id taken from a
+/// hierarchical key, say — reaches the server escaped, and the value the segment names is
+/// what the escape STANDS FOR and never the escape text. Decoding here is what makes that
+/// one rule hold for every route at once: the index a path addresses, the id a document is
+/// written and read under, and every other name a segment carries.
+///
+/// The decoding is `percent-encoding`'s, the same one a query value is read with
+/// ([`Request::parameter`]), so this states no grammar of its own; a segment whose escapes
+/// do not decode as UTF-8 is taken as it arrived, which is the most that can be said about
+/// it. An empty segment is dropped, so a trailing or doubled `/` names no segment.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            ::percent_encoding::percent_decode_str(part)
+                .decode_utf8()
+                .map_or_else(|_| part.to_string(), ::std::borrow::Cow::into_owned)
+        })
+        .collect()
+}
+
 /// One data-plane request, as the surface below reads it.
 struct Request<'a> {
     method: &'a str,
     path: &'a str,
+    /// The VALUES the request target's path segments carry, which is what every route of
+    /// this surface is read against ([`Request::segments`]) — resolved once, when the
+    /// request is read, because a segment's value is not a slice of the target it arrived
+    /// in.
+    segments: Vec<String>,
     query: &'a str,
     body: &'a [u8],
     /// The ARN of the principal the request speaks for, empty when none was resolved.
@@ -1352,8 +1389,12 @@ impl Request<'_> {
     }
     /// The path's segments, with empty ones dropped so a trailing or doubled `/` names no
     /// segment of its own.
+    ///
+    /// Each one is the VALUE its segment carries, not the text it arrived as: a path
+    /// segment is percent-encoded on the wire, so what the caller named is what the escapes
+    /// stand for ([`path_segments`]).
     fn segments(&self) -> Vec<&str> {
-        self.path.split('/').filter(|part| !part.is_empty()).collect()
+        self.segments.iter().map(String::as_str).collect()
     }
 
     /// The index this request's own path ADDRESSES, or `None` for a path that addresses the
@@ -1438,11 +1479,14 @@ fn serve_resolved(
     across: &CrossCluster,
     files: &state::analysis::PackageFiles,
 ) -> RtResponse {
-    // IAM first, as AWS takes it: the resource is the domain path the request addresses. A
-    // request the CLUSTER authenticated out of its own internal user database speaks for an
-    // identity that exists only inside the cluster, so there is no AWS principal for IAM to
-    // decide about and the cluster's own decision below is the whole of its authorization.
-    let resource = format!("{}/{}", domain.arn, request.path.trim_start_matches('/'));
+    // IAM first, as AWS takes it: the resource is the domain path the request addresses,
+    // built from the VALUES that path's segments carry ([`path_segments`]) — the resource a
+    // policy names a document or an index by is the decoded one, so an id a client had to
+    // escape to send is decided about under the name it is stored and read under. A request
+    // the CLUSTER authenticated out of its own internal user database speaks for an identity
+    // that exists only inside the cluster, so there is no AWS principal for IAM to decide
+    // about and the cluster's own decision below is the whole of its authorization.
+    let resource = format!("{}/{}", domain.arn, request.segments.join("/"));
     if !request.internal_user {
         if let Err(refusal) = ingest::iam_decision(
             domain,

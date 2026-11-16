@@ -528,6 +528,9 @@ fn searched(
     let searching = Request {
         method: "POST",
         path: &path,
+        // The pattern is the monitor's own index pattern — already a value, not the text a
+        // request target carried — so it names this search's first segment as it stands.
+        segments: vec![pattern.to_string(), "_search".to_string()],
         query: "",
         body: &body,
         principal: request.principal,
