@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.instances.contains_key(&input.instance_id) {
             return Err(CreateDataLakeDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("instance {} does not exist", input.instance_id)),
+                    message: Some(crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

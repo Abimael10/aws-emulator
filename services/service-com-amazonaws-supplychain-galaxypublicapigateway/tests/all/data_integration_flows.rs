@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -34,6 +35,15 @@ const REGION: &str = "us-east-1";
 /// here, independently of the handler, so a change to the service's wording fails this
 /// suite instead of travelling with it.
 const FLOW_NOT_FOUND_SENTENCE: &str = "Flow not found.";
+
+/// How long a poll loop waits for the condition it is about before giving up, and how long
+/// it waits between looks.
+///
+/// Generous on purpose: the loop ends as soon as the condition holds, so the deadline is
+/// only there to end a case that can never satisfy it and never a budget the host has to
+/// beat.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How a create refuses a name the addressed instance already holds a flow under; only the
 /// flow name comes from the request.
@@ -152,6 +162,31 @@ fn flow_of(case: &str, body: &Value) -> Value {
     body.get("flow")
         .cloned()
         .unwrap_or_else(|| panic!("case {case}: response carries no `flow` member: {body}"))
+}
+
+/// Look again until the deletion of `instance_id` has SETTLED — until `GetInstance`
+/// answers 404 — or until [`POLL_DEADLINE`].
+///
+/// `DeleteInstance` ACCEPTS a deletion: the instance moves to `Deleting` and stays
+/// addressable, with the flows addressed by it, while the deletion settles; the removal is
+/// the clock's work, materialised by whichever CALL next observes the store — which is why
+/// each look is a request.
+async fn wait_until_deleted(emulator: &Emulator, instance_id: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/api/instance/{instance_id}"), None)
+            .await;
+        if status == 404 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the deletion of {instance_id} never settled; GetInstance still answers {status} \
+             with {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A string member of a payload.
@@ -948,6 +983,17 @@ async fn a_flow_does_not_outlive_its_instance() {
         status, 200,
         "case delete: DeleteInstance expected 200, got {status} with {body}"
     );
+    // A flow goes when the accepted deletion SETTLES: while the instance is `Deleting` its
+    // flows are still readable.
+    for name in ["cascade-one", "cascade-two"] {
+        let (status, body) = emulator.get_flow(&instance_id, name).await;
+        assert_eq!(
+            status, 200,
+            "case {name}: a Deleting instance's flow is still readable, got {status} with \
+             {body}"
+        );
+    }
+    wait_until_deleted(&emulator, &instance_id).await;
 
     for name in ["cascade-one", "cascade-two"] {
         let (status, body) = emulator.get_flow(&instance_id, name).await;

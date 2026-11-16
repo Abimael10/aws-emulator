@@ -168,10 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetInstanceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "instance {} does not exist",
-                        input.instance_id.as_str()
-                    )),
+                    message: Some(crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into()),

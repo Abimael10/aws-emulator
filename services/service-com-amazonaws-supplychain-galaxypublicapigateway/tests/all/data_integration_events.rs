@@ -20,7 +20,7 @@
 //! answers from persisted records, which is what every assertion below pins.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -45,6 +45,15 @@ const MAX_RESULTS_MAX: i64 = 20;
 
 /// The `@default` the model gives `maxResults`, applied when a request omits it.
 const MAX_RESULTS_DEFAULT: usize = 10;
+
+/// How long a poll loop waits for the condition it is about before giving up, and how long
+/// it waits between looks.
+///
+/// Generous on purpose: the loop ends as soon as the condition holds, so the deadline is
+/// only there to end a case that can never satisfy it and never a budget the host has to
+/// beat.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The emulator under test: one engine, one service, driven through the router.
 struct Emulator {
@@ -230,9 +239,33 @@ fn event_id(index: u64) -> String {
     format!("{index:08x}-0000-4000-8000-{index:012x}")
 }
 
+/// Look again until the deletion of `instance_id` has SETTLED — until `GetInstance`
+/// answers 404 — or until [`POLL_DEADLINE`].
+///
+/// `DeleteInstance` ACCEPTS a deletion: the instance moves to `Deleting` and stays
+/// addressable, with the events addressed by it, while the deletion settles; the removal
+/// is the clock's work, materialised by whichever CALL next observes the store — which is
+/// why each look is a request.
+async fn wait_until_deleted(emulator: &Emulator, instance_id: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/api/instance/{instance_id}"), None)
+            .await;
+        if status == 404 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the deletion of {instance_id} never settled; GetInstance still answers {status} \
+             with {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The `events` member of a success body, as a list.
-fn events_of(case: &str, body: &Value) -> Vec<Value> {
-    body.get("events")
+fn events_of(case: &str, body: &Value) -> Vec<Value> {    body.get("events")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_else(|| panic!("case {case:?}: response carries no `events` list: {body}"))
@@ -824,6 +857,14 @@ async fn an_instances_events_are_bounded_and_reclaimed_with_the_instance() {
         status, 200,
         "case {case:?}: DeleteInstance expected 200, got {status} with {body}"
     );
+    // The events go when the accepted deletion SETTLES: while the instance is `Deleting`
+    // they are still held.
+    assert_eq!(
+        emulator.stored_events(&doomed),
+        3,
+        "case {case:?}: the events of a Deleting instance must still be held"
+    );
+    wait_until_deleted(&emulator, &doomed).await;
     assert_eq!(
         emulator.stored_events(&doomed),
         0,
@@ -874,6 +915,9 @@ async fn an_instance_this_account_does_not_hold_is_an_authorization_failure() {
         status, 200,
         "DeleteInstance expected 200, got {status} with {body}"
     );
+    // An instance is this account's until its accepted deletion settles, so the row below
+    // about a deleted instance waits for the removal the clock owes.
+    wait_until_deleted(&emulator, &deleted).await;
 
     let rows: Vec<(&str, String)> = vec![
         ("never created", event_id(0xfeed)),

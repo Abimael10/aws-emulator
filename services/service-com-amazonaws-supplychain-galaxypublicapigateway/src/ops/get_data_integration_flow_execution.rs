@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataIntegrationFlowExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataIntegrationFlowExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataIntegrationFlowExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored run of one data-integration flow from
+//! [`crate::state`]. The gateway authorizes the call against the addressed INSTANCE
+//! first, so an `instanceId` naming no instance of this account is an
+//! `AccessDeniedException` (403) and not a not-found; within a live instance, a flow the
+//! instance does not hold and an `executionId` that flow does not hold are each a
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataIntegrationFlowExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataIntegrationFlowExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataIntegrationFlowExecution"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetDataIntegrationFlowExecutionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the supplychain data integration store is unavailable on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read performs: the instance transitions the clock owed at
+        // `now`, which were due whether or not anybody read anything.
+        store.materialize_due_transitions(now);
+
+        // Same gateway rule as every instance-scoped call: an `instanceId` naming no
+        // instance of this account is refused by the authorization step, before the
+        // addressed flow or execution is looked up at all.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(
+                GetDataIntegrationFlowExecutionErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::instance_authorization_failure_message(
+                            input.instance_id.as_str(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An execution belongs to a flow of that instance, so a flow the instance does
+        // not hold names no execution at all — reported as the flow's own not-found
+        // rather than as the execution's, because it is the flow that is missing.
+        if store.flow(&input.instance_id, &input.flow_name).is_none() {
+            return Err(
+                GetDataIntegrationFlowExecutionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::FLOW_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        match store.flow_execution(&input.instance_id, &input.flow_name, &input.execution_id) {
+            Some(record) => Ok(GetDataIntegrationFlowExecutionOutput {
+                flow_execution: record.to_wire(),
+            }),
+            None => Err(
+                GetDataIntegrationFlowExecutionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::FLOW_EXECUTION_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

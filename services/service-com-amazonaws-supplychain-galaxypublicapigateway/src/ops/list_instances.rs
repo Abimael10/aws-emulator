@@ -78,6 +78,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The smallest `maxResults` this service serves a page for.
+///
+/// RECORDED behaviour, not modelled: `InstanceMaxResults` carries `@range(min: 0, max: 20)`
+/// (`smithy_query(query="shape", shape="InstanceMaxResults")`), but the recorded wire
+/// response of a listing asking for zero is a `ValidationException` stating that the member
+/// must have a value greater than or equal to ONE — the service's published minimum page
+/// size, which the model's lower bound understates. The model's bound therefore lets the
+/// value through the boundary walk and this handler enforces the published one, with the
+/// service's own constraint wording
+/// ([`crate::service::validation::one_violation_message`]) so a caller cannot tell the two
+/// refusals apart.
+pub const MIN_MAX_RESULTS: i32 = 1;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -180,15 +193,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name_filter = input.instance_name_filter.unwrap_or_default();
         let state_filter = input.instance_state_filter.unwrap_or_default();
         // `maxResults` carries `@range(0..20)` and `@default(10)`, both applied before
-        // this handler runs, so the value is already in range here. A value outside the
-        // modelled range is therefore unreachable — and is refused as the modelled
-        // `ValidationException` rather than quietly read as a page of zero, so the
-        // invariant is stated where it is relied on.
+        // this handler runs, so the value is already within the MODELLED range here. The
+        // service's published minimum is higher than the modelled one
+        // ([`MIN_MAX_RESULTS`]), so a page size below it is refused here rather than read
+        // as a page of zero.
+        if input.max_results < MIN_MAX_RESULTS {
+            return Err(ListInstancesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::validation::one_violation_message(
+                        "maxResults",
+                        ::smithy_server_runtime::ViolationKind::MinValue(
+                            MIN_MAX_RESULTS.to_string(),
+                        ),
+                    )),
+                },
+            )
+            .into());
+        }
+        // A value above the modelled maximum is unreachable for the same reason — and is
+        // refused as the modelled `ValidationException` rather than quietly read as a page
+        // of zero, so the invariant is stated where it is relied on.
         let page_size = usize::try_from(input.max_results).map_err(|_| {
             ListInstancesError::from(ListInstancesErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
-                        "maxResults must be between 0 and 20, got {}",
+                        "maxResults must be between {MIN_MAX_RESULTS} and 20, got {}",
                         input.max_results
                     )),
                 },

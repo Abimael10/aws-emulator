@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInstance
-//! IMPLEMENTED: removes the instance from the shared store ([`crate::state`]) and
-//! reports the final record, in `Deleting` — the state AWS moves an instance to when it
-//! accepts the deletion. After it the id is gone: `GetInstance` answers
-//! `ResourceNotFoundException` (404) and `ListInstances` no longer lists it. An id no
-//! live instance holds is a `ResourceNotFoundException` (404).
+//! IMPLEMENTED: accepts the deletion of the stored instance ([`crate::state`]) and
+//! reports the record in `Deleting` — the state AWS moves an instance to when it accepts
+//! the deletion. The record STAYS addressable while the deletion settles, so a reader
+//! sees it in `Deleting` and a mutation of it is refused by the state gate; the clock
+//! owes its removal, with everything addressed by it, [`crate::state::INSTANCE_DELETION_DELAY`]
+//! later, after which `GetInstance` answers `ResourceNotFoundException` (404) and
+//! `ListInstances` no longer lists it. An id no live instance holds is a
+//! `ResourceNotFoundException` (404); the operation is `@idempotent`, so a repeat while
+//! the deletion settles reports the same record without moving its due instant.
 //!
 //! ## Shape of an operation
 //!
@@ -166,38 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due_transitions(now);
 
-        let Some(mut record) = store.instances.remove(&input.instance_id) else {
+        let Some(record) = store.instances.get_mut(&input.instance_id) else {
             return Err(DeleteInstanceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "instance {} does not exist",
-                        input.instance_id.as_str()
-                    )),
+                    message: Some(crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
         };
 
-        // The idempotency tokens that named this instance go with it, so a replayed
-        // CreateInstance cannot be answered with a record that no longer exists.
-        store
-            .idempotency
-            .retain(|_, instance_id| instance_id != &record.instance_id);
-
-        // Every data-lake dataset is addressed by its instance, so this instance's
-        // datasets go with it rather than staying reachable under an instance the store
-        // no longer holds. Its data-lake namespaces, its data-integration flows and its
-        // data-integration events go for the same reason — which is also what keeps each
-        // of those per-instance bounds counted over LIVE instances only.
-        store.drop_instance_datasets(&record.instance_id);
-        store.drop_instance_namespaces(&record.instance_id);
-        store.drop_instance_flows(&record.instance_id);
-        store.drop_instance_events(&record.instance_id);
-
-        record.state = crate::state::INSTANCE_STATE_DELETING.to_string();
-        // Wire-only: the record is already out of the store, so this stamp shapes the
-        // final payload this call returns and persists nothing.
-        record.touch(now);
+        // Accepting the deletion moves the instance to `Deleting` and records WHEN the
+        // removal falls due; the record and everything addressed by it stay in the store
+        // until then, so `Deleting` is a state a caller can observe and the resources of
+        // an instance being deleted do not vanish ahead of it. The removal itself is the
+        // clock's work, materialised by whichever call next observes the store
+        // (`crate::state::ComAmazonawsSupplychainGalaxypublicapigatewayState::materialize_due_transitions`).
+        record.begin_deletion(now);
 
         Ok(DeleteInstanceOutput {
             instance: record.to_wire(),

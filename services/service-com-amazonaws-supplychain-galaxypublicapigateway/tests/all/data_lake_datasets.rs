@@ -14,6 +14,7 @@
 //! validation failure that persists nothing.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -29,6 +30,15 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region these tests sign for unless a case names another one.
 const REGION: &str = "us-east-1";
+
+/// How long a poll loop waits for the condition it is about before giving up, and how long
+/// it waits between looks.
+///
+/// Generous on purpose: the loop ends as soon as the condition holds, so the deadline is
+/// only there to end a case that can never satisfy it and never a budget the host has to
+/// beat.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The emulator under test: one engine, one service, driven through the router.
 struct Emulator {
@@ -139,6 +149,31 @@ impl Emulator {
 /// it: `/api/datalake/instance/{instanceId}/namespaces/{namespace}/datasets/{name}`.
 fn dataset_path(instance_id: &str, namespace: &str, name: &str) -> String {
     format!("/api/datalake/instance/{instance_id}/namespaces/{namespace}/datasets/{name}")
+}
+
+/// Look again until the deletion of `instance_id` has SETTLED — until `GetInstance`
+/// answers 404 — or until [`POLL_DEADLINE`].
+///
+/// `DeleteInstance` ACCEPTS a deletion: the instance moves to `Deleting` and stays
+/// addressable, with the datasets addressed by it, while the deletion settles; the removal
+/// is the clock's work, materialised by whichever CALL next observes the store — which is
+/// why each look is a request.
+async fn wait_until_deleted(emulator: &Emulator, instance_id: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/api/instance/{instance_id}"), None)
+            .await;
+        if status == 404 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the deletion of {instance_id} never settled; GetInstance still answers {status} \
+             with {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The `dataset` member of a response body.
@@ -727,6 +762,17 @@ async fn deleting_an_instance_drops_its_datasets() {
         status, 200,
         "case delete: DeleteInstance expected 200, got {status} with {body}"
     );
+    // A dataset goes when the accepted deletion SETTLES: while the instance is `Deleting`
+    // its datasets are still addressable.
+    for namespace in PREDEFINED_NAMESPACES {
+        let (status, body) = emulator.get_dataset(&doomed, namespace, "kept").await;
+        assert_eq!(
+            status, 200,
+            "case {namespace}: a Deleting instance's dataset is still readable, got {status} \
+             with {body}"
+        );
+    }
+    wait_until_deleted(&emulator, &doomed).await;
 
     for namespace in PREDEFINED_NAMESPACES {
         let (status, body) = emulator.get_dataset(&doomed, namespace, "kept").await;

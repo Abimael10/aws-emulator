@@ -20,6 +20,7 @@
 //! instance the call is addressed to.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -47,6 +48,40 @@ const RESERVED_NAME_SENTENCE: &str =
 /// The sentence a namespace read refuses a name the instance's data lake does not hold
 /// with — fixed, and echoing nothing of the request.
 const NAMESPACE_NOT_FOUND_SENTENCE: &str = "Namespace not found.";
+
+/// How long a poll loop waits for the condition it is about before giving up, and how long
+/// it waits between looks.
+///
+/// Generous on purpose: the loop ends as soon as the condition holds, so the deadline is
+/// only there to end a case that can never satisfy it and never a budget the host has to
+/// beat.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Look again until the deletion of `instance_id` has SETTLED — until `GetInstance`
+/// answers 404 — or until [`POLL_DEADLINE`].
+///
+/// `DeleteInstance` ACCEPTS a deletion: the instance moves to `Deleting` and stays
+/// addressable, with the resources addressed by it, while the deletion settles; the
+/// removal is the clock's work, materialised by whichever CALL next observes the store —
+/// which is why each look is a request rather than a peek at the store.
+async fn wait_until_deleted(emulator: &Emulator, instance_id: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/api/instance/{instance_id}"), None)
+            .await;
+        if status == 404 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the deletion of {instance_id} never settled; GetInstance still answers {status} \
+             with {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// The published bounds of `DataLakeNamespaceName` (`@length(min: 1, max: 50)`).
 const NAME_MIN_LENGTH: usize = 1;
@@ -692,6 +727,15 @@ async fn deleting_an_instance_releases_its_namespaces() {
         status, 200,
         "DeleteInstance expected 200, got {status} with {body}"
     );
+    // The namespaces are released when the accepted deletion settles, not when it is
+    // accepted: while the instance is `Deleting` its data lake is still addressable.
+    assert_eq!(
+        emulator.stored_namespaces(&doomed),
+        3,
+        "case \"while the deletion settles\": the namespaces of a Deleting instance must \
+         still be held"
+    );
+    wait_until_deleted(&emulator, &doomed).await;
 
     assert_eq!(
         emulator.stored_namespaces(&doomed),

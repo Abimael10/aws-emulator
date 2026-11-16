@@ -21,11 +21,25 @@
 //! before and after a mutation.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_supplychain_galaxypublicapigateway::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The `InstanceState` a mutation of an instance is served in, and the one a readiness
+/// poll converges on.
+const INSTANCE_STATE_ACTIVE: &str = "Active";
+
+/// How long a poll loop waits for the condition it is about before giving up, and how long
+/// it waits between looks.
+///
+/// Generous on purpose: each loop below waits for a CONDITION the emulator has reached, so
+/// the deadline is only there to end a case that can never satisfy it, and never a budget
+/// the host has to beat.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// A SigV4 `Authorization` header whose credential scope names this service (`scn`), which
 /// is how the router picks the service that claims the request. Signature verification is
@@ -162,6 +176,51 @@ impl Emulator {
             .cloned()
             .unwrap_or_else(|| panic!("case {case}: the page carries no `instances` list: {body}"))
     }
+
+    /// Look again until `id` reports `Active`, or until [`POLL_DEADLINE`].
+    ///
+    /// `CreateInstance` is asynchronous: the instance is `Initializing` until the clock
+    /// owes it the transition, and a MUTATION of it is served only once it is `Active`. A
+    /// case that goes on to mutate waits for that CONDITION rather than for a span.
+    async fn wait_until_active(&self, case: &str, id: &str) {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let instance = self.get(case, id).await;
+            if instance.get("state").and_then(Value::as_str) == Some(INSTANCE_STATE_ACTIVE) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case}: {id} never became Active, last read {instance}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Look again until the deletion of `id` has SETTLED — until `GetInstance` answers 404
+    /// — or until [`POLL_DEADLINE`].
+    ///
+    /// `DeleteInstance` ACCEPTS a deletion: the instance moves to `Deleting` and stays
+    /// addressable, holding its own domain label, while the deletion settles; only then
+    /// does the record leave the store. A case about what the store holds AFTERWARDS waits
+    /// for that condition.
+    async fn wait_until_deleted(&self, case: &str, id: &str) {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let (status, body) = self
+                .send("GET", &format!("/api/instance/{id}"), None)
+                .await;
+            if status == 404 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case}: the deletion of {id} never settled; GetInstance still answers \
+                 {status} with {body}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
 }
 
 /// The `instanceId` of an `instance` payload.
@@ -283,7 +342,9 @@ async fn every_instance_operation_reports_the_domain_set_and_a_stable_version() 
         );
 
         // Two mutations, each changing a different member: neither moves the domain set
-        // and neither moves the version.
+        // and neither moves the version. A mutation is served once the instance is
+        // `Active`, so the case waits for the state the clock owes it first.
+        emulator.wait_until_active(case, &id).await;
         let mutations: Vec<(&str, Value)> = vec![
             ("rename", json!({ "instanceName": "domain-projection-two" })),
             (
@@ -375,10 +436,11 @@ async fn the_domain_set_is_derived_from_each_instance_own_label() {
         "case side by side: each instance must report its own hostname, got {hostnames:?}"
     );
 
-    // The label of a deleted instance is free again, and whoever takes it reports that
-    // label's hostnames under a different instanceId.
+    // The label of a deleted instance is free again once the deletion has settled, and
+    // whoever takes it reports that label's hostnames under a different instanceId.
     let (first_id, first_label) = labels_by_id[0].clone();
     emulator.delete("free the label", &first_id).await;
+    emulator.wait_until_deleted("free the label", &first_id).await;
     let reused = emulator
         .create("reuse the label", json!({ "webAppDnsDomain": &first_label }))
         .await;
@@ -435,9 +497,11 @@ async fn a_resumed_page_survives_the_deletion_of_the_instance_it_stopped_on() {
         })
         .to_string();
 
-    emulator
-        .delete("delete the instance the token stopped on", &newest_first[1])
-        .await;
+    let case = "delete the instance the token stopped on";
+    emulator.delete(case, &newest_first[1]).await;
+    // The record leaves the store when the accepted deletion settles, which is what the
+    // resumed page below is about: a token naming a POSITION still resumes correctly.
+    emulator.wait_until_deleted(case, &newest_first[1]).await;
 
     let resumed = emulator
         .list(
@@ -517,8 +581,11 @@ async fn list_instances_reports_the_most_recently_created_instance_first() {
         );
     }
 
-    // Removing the newest promotes the one created before it.
+    // Removing the newest promotes the one created before it, once the deletion settles.
     emulator.delete("delete the newest", &newest_first[0]).await;
+    emulator
+        .wait_until_deleted("delete the newest", &newest_first[0])
+        .await;
     let page = emulator.list("after deleting the newest", "?maxResults=20").await;
     let ids: Vec<String> = page
         .iter()

@@ -12,9 +12,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DataIntegrationEvent, DataIntegrationEventDatasetTargetDetails, DataIntegrationFlow,
-    DataIntegrationFlowSource, DataIntegrationFlowTarget, DataIntegrationFlowTransformation,
-    DataLakeDataset, DataLakeDatasetPartitionSpec, DataLakeDatasetSchema, DataLakeNamespace,
-    Instance,
+    DataIntegrationFlowExecution, DataIntegrationFlowExecutionOutputMetadata,
+    DataIntegrationFlowExecutionSourceInfo, DataIntegrationFlowSource, DataIntegrationFlowTarget,
+    DataIntegrationFlowTransformation, DataLakeDataset, DataLakeDatasetPartitionSpec,
+    DataLakeDatasetSchema, DataLakeNamespace, Instance,
 };
 
 /// The sentence AWS Supply Chain refuses the Product Bill Of Materials (BOM) import API
@@ -49,6 +50,28 @@ pub const INSTANCE_STATE_ACTIVE: &str = "Active";
 /// `InstanceState` for an instance whose deletion has been accepted.
 pub const INSTANCE_STATE_DELETING: &str = "Deleting";
 
+/// How this service refuses a call whose `instanceId` names no instance it holds
+/// (`ResourceNotFoundException`, HTTP 404).
+///
+/// Its SOURCE is the recorded wire response of such a call: the sentence is FIXED — it
+/// names the resource kind and nothing else, and in particular does not echo the
+/// `instanceId` the request asked about, the same way the service's other recorded
+/// not-found sentences carry no request value ([`NAMESPACE_NOT_FOUND_MESSAGE`],
+/// [`FLOW_NOT_FOUND_MESSAGE`]). Stated once, here, so no instance-scoped handler can
+/// drift into a sentence of its own for this one refusal.
+pub const INSTANCE_NOT_FOUND_MESSAGE: &str = "Instance not found.";
+
+/// How this service refuses a call that asks to MUTATE an instance which is not in
+/// `Active` ([`INSTANCE_STATE_ACTIVE`]) — a `ValidationException` (HTTP 400), because what
+/// refused the call is the instance's state machine rather than the instance's existence.
+///
+/// Its SOURCE is the recorded wire response of an `UpdateInstance` issued while the
+/// addressed instance was still settling its deletion. The whole sentence is fixed: it
+/// names the state the operation requires and carries nothing from the request. Stated
+/// once, here, so every operation gated on an instance's state states one sentence.
+pub const INSTANCE_NOT_ACTIVE_MESSAGE: &str =
+    "Instance must be in Active state to perform this operation.";
+
 /// How long after `CreateInstance` the clock owes an instance its
 /// `Initializing` -> `Active` transition.
 ///
@@ -58,6 +81,17 @@ pub const INSTANCE_STATE_DELETING: &str = "Deleting";
 /// `Initializing` (and so a readiness poll has something to converge on), and short
 /// enough that the poll terminates promptly.
 pub const INSTANCE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteInstance` the clock owes an instance its removal from the store.
+///
+/// CHOSEN, not documented: AWS answers `DeleteInstance` with the instance in `Deleting`
+/// and never states how long the deletion then takes. The span is deliberately non-zero,
+/// because `Deleting` is a state the recorded service lets a caller OBSERVE: an instance
+/// whose deletion has been accepted is still addressable while it settles — a read reports
+/// it in `Deleting` and a mutation is refused by the state gate
+/// ([`INSTANCE_NOT_ACTIVE_MESSAGE`]) rather than as a not-found — and only once the span
+/// has passed does the record, and everything addressed by it, cease to exist.
+pub const INSTANCE_DELETION_DELAY: Duration = Duration::from_secs(3);
 
 /// The `versionNumber` an instance of this service reports.
 ///
@@ -164,6 +198,12 @@ pub struct InstanceRecord {
     /// whichever call next observes the record (see
     /// [`ComAmazonawsSupplychainGalaxypublicapigatewayState::materialize_due_transitions`]).
     pub active_due: SystemTime,
+    /// The instant at which this instance's accepted deletion settles — when the record,
+    /// and everything addressed by it, leaves the store. `None` for an instance no
+    /// `DeleteInstance` has been accepted for. Stored rather than slept on, for the same
+    /// reason as [`Self::active_due`]: the removal is owed at that instant whether or not
+    /// anybody calls, so whichever call next observes the store materialises it.
+    pub deletion_due: Option<SystemTime>,
 }
 
 impl InstanceRecord {
@@ -191,6 +231,7 @@ impl InstanceRecord {
             tags: BTreeMap::new(),
             creation_seq,
             active_due: now + INSTANCE_ACTIVATION_DELAY,
+            deletion_due: None,
         }
     }
 
@@ -227,6 +268,29 @@ impl InstanceRecord {
     /// version ([`INSTANCE_VERSION_NUMBER`]), not a count of the writes it has taken.
     pub fn touch(&mut self, now: SystemTime) {
         self.last_modified_time = now;
+    }
+
+    /// Whether this instance is in the one state a mutation of it is served in
+    /// ([`INSTANCE_STATE_ACTIVE`]). An instance still initializing, or already settling
+    /// its deletion, is not.
+    pub fn is_active(&self) -> bool {
+        self.state == INSTANCE_STATE_ACTIVE
+    }
+
+    /// Accept a deletion of this instance at `now`: the record moves to `Deleting` and
+    /// the clock owes its removal [`INSTANCE_DELETION_DELAY`] later. The record STAYS in
+    /// the store until then, which is what makes `Deleting` an observable state.
+    ///
+    /// Idempotent, as `DeleteInstance` is: a second accepted deletion of an instance
+    /// already settling leaves the first one's due instant, so repeating the call does not
+    /// push the removal further out.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.deletion_due.is_some() {
+            return;
+        }
+        self.state = INSTANCE_STATE_DELETING.to_string();
+        self.deletion_due = Some(now + INSTANCE_DELETION_DELAY);
+        self.touch(now);
     }
 }
 
@@ -590,6 +654,43 @@ impl DataIntegrationEventRecord {
     }
 }
 
+/// How a data-integration event read refuses an `eventId` the addressed instance holds no
+/// event under (`ResourceNotFoundException`, HTTP 404).
+///
+/// No recording fixes this sentence, so its FORM is this service's recorded not-found
+/// family — one fixed sentence naming the resource and echoing nothing from the request, as
+/// the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) and the namespace read
+/// ([`NAMESPACE_NOT_FOUND_MESSAGE`]) answer. Stated once, here, and re-verified against a
+/// recording when one covers this read.
+pub const EVENT_NOT_FOUND_MESSAGE: &str = "Event not found.";
+
+/// The one `DataIntegrationEventType` whose event names its target dataset itself.
+///
+/// SOURCE: the `eventType` member's own documentation — "scn.data.dataset - Send data
+/// directly to any specified dataset" — which is also the one type the `datasetTarget`
+/// member is documented for ("The target dataset configuration for scn.data.dataset event
+/// type"). Every other type names a dataset of the `asc` namespace the service keeps for
+/// it.
+pub const DATA_INTEGRATION_EVENT_TYPE_DATASET: &str = "scn.data.dataset";
+
+/// The `DataIntegrationEventDatasetLoadStatus` an accepted event's load reports.
+///
+/// RECORDED behaviour: an event accepted for a dataset that exists reports its load as
+/// succeeded — the value `SUCCEEDED` of that enum
+/// (`smithy_query(query="shape", shape="DataIntegrationEventDatasetLoadStatus")`).
+pub const DATASET_LOAD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How a send refuses a `datasetTarget` whose `datasetIdentifier` names no dataset this
+/// instance's data lake holds (`ResourceNotFoundException`, HTTP 404).
+///
+/// Its SOURCE is the recorded wire response of such a send: the fixed text is "Target
+/// dataset resource arn: " / " is not valid", and the only interpolated part is the ARN
+/// the request's `datasetTarget.datasetIdentifier` carried. Stated once, here, beside the
+/// service's other refusal sentences.
+pub fn dataset_target_not_valid_message(dataset_identifier: &str) -> String {
+    format!("Target dataset resource arn: {dataset_identifier} is not valid")
+}
+
 /// How a data-integration flow is addressed: `(instanceId, name)` — the two `@httpLabel`
 /// members every flow operation's URI carries, in that order.
 ///
@@ -762,6 +863,179 @@ impl DataIntegrationFlowRecord {
     }
 }
 
+/// How a flow-execution read refuses an `executionId` the addressed flow does not hold
+/// (`ResourceNotFoundException`, HTTP 404).
+///
+/// No recording fixes this sentence, so its FORM is this service's recorded not-found
+/// family — one fixed sentence naming the resource and echoing nothing from the request,
+/// as the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]), the namespace read
+/// ([`NAMESPACE_NOT_FOUND_MESSAGE`]) and the flow read ([`FLOW_NOT_FOUND_MESSAGE`]) all
+/// answer. Stated once, here, and re-verified against a recording when one covers this
+/// read.
+pub const FLOW_EXECUTION_NOT_FOUND_MESSAGE: &str = "Flow execution not found.";
+
+/// The key one flow execution is stored under: its instance, its flow's name, then its
+/// own `executionId` — the three `@httpLabel` members `GetDataIntegrationFlowExecution`'s
+/// URI carries, in that order.
+///
+/// A `BTreeMap` over the triple keeps one flow's executions contiguous and in
+/// `executionId` order, which is the order a listing of them pages through.
+pub type FlowExecutionKey = (String, String, String);
+
+/// The [`FlowExecutionKey`] for one execution, so every handler builds the key the same
+/// way.
+pub fn flow_execution_key(
+    instance_id: &str,
+    flow_name: &str,
+    execution_id: &str,
+) -> FlowExecutionKey {
+    (
+        instance_id.to_string(),
+        flow_name.to_string(),
+        execution_id.to_string(),
+    )
+}
+
+/// One persisted run of a data-integration flow — the whole record, not the wire shape.
+/// [`DataIntegrationFlowExecutionRecord::to_wire`] projects it onto the modelled
+/// `DataIntegrationFlowExecution` structure, so a handler answers from exactly these
+/// stored values.
+///
+/// A flow execution is created by the flow RUNNING, never by a caller: the model binds no
+/// operation that starts one, so the only producers are this service's own ingestion
+/// paths. Each member is held exactly as the modelled shape carries it, including the
+/// ones a run leaves absent (an execution still in progress has no `endTime`, a
+/// successful one no `message`).
+#[derive(Debug, Clone)]
+pub struct DataIntegrationFlowExecutionRecord {
+    pub instance_id: String,
+    pub flow_name: String,
+    pub execution_id: String,
+    pub status: Option<String>,
+    pub source_info: Option<DataIntegrationFlowExecutionSourceInfo>,
+    pub message: Option<String>,
+    pub start_time: Option<SystemTime>,
+    pub end_time: Option<SystemTime>,
+    pub output_metadata: Option<DataIntegrationFlowExecutionOutputMetadata>,
+}
+
+impl DataIntegrationFlowExecutionRecord {
+    /// This record as the modelled `DataIntegrationFlowExecution` shape the flow-execution
+    /// read returns.
+    pub fn to_wire(&self) -> DataIntegrationFlowExecution {
+        DataIntegrationFlowExecution {
+            instance_id: self.instance_id.clone(),
+            flow_name: self.flow_name.clone(),
+            execution_id: self.execution_id.clone(),
+            status: self.status.clone(),
+            source_info: self.source_info.clone(),
+            message: self.message.clone(),
+            start_time: self.start_time.map(as_date_time),
+            end_time: self.end_time.map(as_date_time),
+            output_metadata: self.output_metadata.clone(),
+        }
+    }
+}
+
+/// Which resource of this service one `AscResourceArn` names.
+///
+/// The ARN's resource portion is the inverse of the helpers that MINT it
+/// ([`instance_arn`], [`namespace_arn`], [`dataset_arn`]), so a resource is addressed by
+/// exactly the path its own ARN spells and nothing else resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// One AWS Supply Chain instance, by its `instanceId`.
+    Instance(String),
+    /// One data lake namespace, by its [`namespace_key`].
+    Namespace((String, String)),
+    /// One data lake dataset, by its [`DatasetKey`].
+    Dataset(DatasetKey),
+}
+
+/// The ARN of one AWS Supply Chain instance.
+///
+/// The modelled `AscResourceArn` pattern
+/// (`^arn:aws:scn(?::([a-z0-9-]+):([0-9]+):instance)?/(<uuid>)[-_./A-Za-z0-9]*$`) is what
+/// fixes the shape: the instance segment carries the `instanceId`, and a resource WITHIN
+/// the instance extends this path ([`namespace_arn`], [`dataset_arn`]).
+pub fn instance_arn(region: &str, instance_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("instance/{instance_id}"))
+}
+
+/// Which resource `arn` names, or `None` for an ARN of this partition and account whose
+/// resource portion names nothing this service mints.
+/// Both forms the modelled pattern admits are read: the full
+/// `arn:aws:scn:<region>:<account>:instance/<id>…` an operation of this service mints, and
+/// the account-less `arn:aws:scn/<id>…` the pattern's optional group leaves out. The
+/// REGION is not matched: this service's stores are keyed by the resource's own
+/// identifiers rather than partitioned by region, so an ARN naming another region still
+/// names the same resource. The ACCOUNT is matched, because an ARN naming another account
+/// names no resource this emulator holds.
+pub fn tagged_resource(arn: &str) -> Option<TaggedResource> {
+    let rest = arn.strip_prefix(&format!("arn:aws:{ARN_SERVICE}"))?;
+    let path = match rest.strip_prefix('/') {
+        // `arn:aws:scn/<id>…`: no region, account or `instance` segment to read.
+        Some(path) => path,
+        None => {
+            let mut fields = rest.strip_prefix(':')?.splitn(3, ':');
+            let _region = fields.next()?;
+            if fields.next()? != ::engine::emulator_account_id() {
+                return None;
+            }
+            fields.next()?.strip_prefix("instance/")?
+        }
+    };
+    let segments: Vec<&str> = path.split('/').collect();
+    match segments.as_slice() {
+        [instance_id] => Some(TaggedResource::Instance((*instance_id).to_string())),
+        [instance_id, "namespaces", name] => {
+            Some(TaggedResource::Namespace(namespace_key(instance_id, name)))
+        }
+        [instance_id, "namespaces", namespace, "datasets", name] => Some(TaggedResource::Dataset(
+            dataset_key(instance_id, namespace, name),
+        )),
+        _ => None,
+    }
+}
+
+/// How many tags one resource of this service carries in this store.
+///
+/// The number is the modelled bound, not the emulator's own: `TagMap`'s own `@length`
+/// (`min: 0, max: 200`) is what the model admits in ONE request, so a resource cannot be
+/// made to hold more than the model would let a caller send in a single call. Tag keys are
+/// caller-supplied strings and a tag write MERGES into what the resource already carries,
+/// so this is the growth term a caller controls and it is enforced at that one write site,
+/// which refuses past the cap with the `ValidationException` (HTTP 400) `TagResource`
+/// declares for an input the service cannot satisfy.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// How a tagging operation refuses a `resourceArn` that is well formed for this service
+/// but names a resource the store does not hold (`ResourceNotFoundException`, HTTP 404).
+///
+/// The sentence is the one this service answers a read of THAT KIND of resource with, so a
+/// tag call and a read of the same resource report one not-found rather than two: an
+/// instance ARN gets [`INSTANCE_NOT_FOUND_MESSAGE`], a namespace ARN
+/// [`NAMESPACE_NOT_FOUND_MESSAGE`], a dataset ARN [`dataset_not_found_message`]. An ARN
+/// whose resource portion names no resource kind this service mints
+/// ([`tagged_resource`] reads none) gets the same sentence stated for the resource it
+/// failed to name, which keeps the family's form — a fixed sentence naming the resource and
+/// echoing nothing from the request.
+pub fn resource_not_found_message(arn: &str) -> String {
+    match tagged_resource(arn) {
+        Some(TaggedResource::Instance(_)) => INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+        Some(TaggedResource::Namespace(_)) => NAMESPACE_NOT_FOUND_MESSAGE.to_string(),
+        Some(TaggedResource::Dataset((_, namespace, name))) => {
+            dataset_not_found_message(&name, &namespace)
+        }
+        None => RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+    }
+}
+
+/// How this service refuses a call addressing a resource it holds no kind of record for:
+/// the not-found sentence of the family ([`INSTANCE_NOT_FOUND_MESSAGE`] and the rest) with
+/// the resource named only as what it is.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
 /// Per-service state for com-amazonaws-supplychain-galaxypublicapigateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
@@ -789,20 +1063,35 @@ pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// addresses one by. A `BTreeMap` so one instance's events are contiguous and in
     /// `eventId` order, which is the order `ListDataIntegrationEvents` pages through.
     pub events: BTreeMap<DataIntegrationEventKey, DataIntegrationEventRecord>,
+    /// `clientToken` -> the event it recorded, so a replayed `SendDataIntegrationEvent`
+    /// (the operation is `@idempotent` and its `clientToken` is an `@idempotencyToken`)
+    /// answers with the event the first call recorded instead of recording a second one.
+    /// An entry is only ever written beside an event and dropped with it, so this table
+    /// holds no more entries than there are stored events.
+    pub event_idempotency: HashMap<String, DataIntegrationEventKey>,
     /// Every live data-integration flow, keyed by [`FlowKey`] (`instanceId` then `name`)
     /// — the pair that identifies one flow, as every flow operation's two `@httpLabel`
     /// members do.
     pub flows: BTreeMap<FlowKey, DataIntegrationFlowRecord>,
+    /// Every run of a flow this service holds, keyed by [`FlowExecutionKey`]. A
+    /// `BTreeMap` so one flow's executions are contiguous and in `executionId` order.
+    pub flow_executions: BTreeMap<FlowExecutionKey, DataIntegrationFlowExecutionRecord>,
 }
 
 impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// Materialise every state transition the clock already owes at `now`.
     ///
     /// Called at the top of each instance operation — including the reporting ones —
-    /// because the `Initializing` -> `Active` transition was owed at `now` whether or
-    /// not anybody called: it is the clock's work, not the reader's. Nothing else about
-    /// a record changes here, so repeated reads stay identical once the transition is
-    /// done.
+    /// because both transitions were owed at `now` whether or not anybody called: they
+    /// are the clock's work, not the reader's. Nothing else about a record changes here,
+    /// so repeated reads stay identical once the transitions are done.
+    ///
+    /// Two transitions are owed:
+    ///
+    /// * `Initializing` -> `Active`, [`INSTANCE_ACTIVATION_DELAY`] after the create;
+    /// * the REMOVAL of an instance whose deletion was accepted, together with everything
+    ///   addressed by it ([`Self::remove_instance`]), [`INSTANCE_DELETION_DELAY`] after
+    ///   the delete — which is why a `Deleting` record is still readable before then.
     ///
     /// The scan runs under the state lock and touches every stored record, so its cost
     /// is bounded by [`MAX_INSTANCES`] — the cap `CreateInstance` enforces — and by
@@ -813,6 +1102,32 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
                 record.state = INSTANCE_STATE_ACTIVE.to_string();
             }
         }
+        let settled: Vec<String> = self
+            .instances
+            .values()
+            .filter(|record| record.deletion_due.is_some_and(|due| due <= now))
+            .map(|record| record.instance_id.clone())
+            .collect();
+        for instance_id in settled {
+            self.remove_instance(&instance_id);
+        }
+    }
+
+    /// Take `instance_id` out of this store, with everything addressed by it.
+    ///
+    /// Every other resource of this service is addressed by an `instanceId`, so none of
+    /// them outlives the instance whose deletion removed it — which is also what keeps
+    /// each per-instance bound counted over LIVE instances only. The idempotency tokens
+    /// that named this instance go too, so a replayed `CreateInstance` cannot be answered
+    /// with a record the store no longer holds.
+    pub fn remove_instance(&mut self, instance_id: &str) {
+        self.instances.remove(instance_id);
+        self.idempotency.retain(|_, named| named != instance_id);
+        self.drop_instance_datasets(instance_id);
+        self.drop_instance_namespaces(instance_id);
+        self.drop_instance_flows(instance_id);
+        self.drop_instance_flow_executions(instance_id);
+        self.drop_instance_events(instance_id);
     }
 
     /// The creation-order position of the next instance this store takes: strictly
@@ -917,6 +1232,23 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     pub fn drop_instance_events(&mut self, instance_id: &str) {
         self.events
             .retain(|(instance, _), _| instance != instance_id);
+        // The idempotency tokens that named this instance's events go with them, so a
+        // replayed send cannot be answered with an event the store no longer holds.
+        self.event_idempotency
+            .retain(|_, (instance, _)| instance != instance_id);
+    }
+
+    /// A fresh `eventId` for `instance_id`: a lowercase-hex v4 UUID, as the model's `UUID`
+    /// shape requires, that this instance's event store does not already hold.
+    ///
+    /// `None` when [`ID_MINT_ATTEMPTS`] draws collided, for the same reason as
+    /// [`Self::fresh_instance_id`].
+    pub fn fresh_event_id(&self, instance_id: &str) -> Option<String> {
+        (0..ID_MINT_ATTEMPTS).map(|_| new_uuid_v4()).find(|candidate| {
+            !self
+                .events
+                .contains_key(&data_integration_event_key(instance_id, candidate))
+        })
     }
 
     /// Drop every namespace of `instance_id`, for the same reason as
@@ -956,6 +1288,60 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// not outlive the instance whose deletion removed it.
     pub fn drop_instance_flows(&mut self, instance_id: &str) {
         self.flows.retain(|(instance, _), _| instance != instance_id);
+    }
+
+    /// The stored run `execution_id` of flow `flow_name` of instance `instance_id`, or
+    /// `None` when that flow holds no execution under that id.
+    pub fn flow_execution(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        execution_id: &str,
+    ) -> Option<&DataIntegrationFlowExecutionRecord> {
+        self.flow_executions
+            .get(&flow_execution_key(instance_id, flow_name, execution_id))
+    }
+
+    /// Drop every flow execution of `instance_id`, for the same reason as
+    /// [`Self::drop_instance_flows`]: an execution belongs to a flow of that instance, so
+    /// it does not outlive the instance whose deletion removed it.
+    pub fn drop_instance_flow_executions(&mut self, instance_id: &str) {
+        self.flow_executions
+            .retain(|(instance, _, _), _| instance != instance_id);
+    }
+
+    /// The tags of the resource `arn` names, or `None` when this store holds no such
+    /// resource.
+    ///
+    /// One resolution for both tagging directions ([`Self::resource_tags_mut`] is the
+    /// write side), so what a tag read reports and what a tag write changes cannot
+    /// disagree about which resource an ARN names.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        match tagged_resource(arn)? {
+            TaggedResource::Instance(instance_id) => {
+                self.instances.get(&instance_id).map(|record| &record.tags)
+            }
+            TaggedResource::Namespace(key) => self.namespaces.get(&key).map(|record| &record.tags),
+            TaggedResource::Dataset(key) => self.datasets.get(&key).map(|record| &record.tags),
+        }
+    }
+
+    /// The tags of the resource `arn` names, for a caller that is about to change them;
+    /// `None` when this store holds no such resource.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        match tagged_resource(arn)? {
+            TaggedResource::Instance(instance_id) => self
+                .instances
+                .get_mut(&instance_id)
+                .map(|record| &mut record.tags),
+            TaggedResource::Namespace(key) => self
+                .namespaces
+                .get_mut(&key)
+                .map(|record| &mut record.tags),
+            TaggedResource::Dataset(key) => {
+                self.datasets.get_mut(&key).map(|record| &mut record.tags)
+            }
+        }
     }
 }
 

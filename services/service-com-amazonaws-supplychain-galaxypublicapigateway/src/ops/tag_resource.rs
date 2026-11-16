@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the tags the request carries onto the STORED record of the
+//! resource `resourceArn` names ([`crate::state`]), merging them into the tags it already
+//! carries. IAM decides the call first, so a principal whose identity-based policies do
+//! not allow `scn:TagResource` on that ARN is refused `AccessDeniedException` (403) and no
+//! tag is written; a well-formed ARN naming a resource the store does not hold is a
+//! `ResourceNotFoundException` (404), and a write that would push the resource past
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] is refused `ValidationException` (400) — the
+//! one class this operation declares for an input the service cannot satisfy.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // IAM decides the call BEFORE anything is read or written, and against the ARN the
+        // REQUEST carried — so the decision does not depend on whether that resource
+        // exists, and a refused call tells an unauthorized caller nothing about it.
+        if let Some(refusal) = crate::service::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.resource_arn.as_str(),
+        ) {
+            return Err(TagResourceErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain instance store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The instance transitions the clock owed at `now` — including the removal of an
+        // instance whose deletion has settled, so a tag is not written onto a resource
+        // that no longer exists.
+        store.materialize_due_transitions(now);
+
+        let not_found = crate::state::resource_not_found_message(input.resource_arn.as_str());
+        let Some(tags) = store.resource_tags_mut(input.resource_arn.as_str()) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(not_found),
+                },
+            )
+            .into());
+        };
+
+        // A tag write ADDS the keys it carries and replaces the value of a key the
+        // resource already holds; a key the request does not name is left alone, which is
+        // what makes `UntagResource` the only way to take one off. The count is capped at
+        // the one site that grows it, before anything is written, so a refused call leaves
+        // every tag the resource carried.
+        let grown = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(*key))
+            .count();
+        if tags.len() + grown > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "the number of tags on this resource has reached the quota of {}",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

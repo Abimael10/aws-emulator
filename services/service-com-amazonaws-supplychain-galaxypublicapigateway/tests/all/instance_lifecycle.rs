@@ -160,6 +160,35 @@ async fn wait_for_an_instant_after(epoch_seconds: f64) {
     }
 }
 
+/// How long a poll loop waits between looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Look again until the deletion of `id` has SETTLED — until `GetInstance` answers 404 —
+/// or until [`POLL_DEADLINE`].
+///
+/// `DeleteInstance` ACCEPTS a deletion: the instance moves to `Deleting` and stays
+/// addressable while the deletion settles, and only then does the record, with everything
+/// addressed by it, leave the store. A case about what the store holds AFTERWARDS waits
+/// for that CONDITION rather than for a span, so it ends as soon as the removal has
+/// happened whatever the host's speed.
+async fn wait_until_deleted(emulator: &Emulator, case: &str, id: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, body) = emulator
+            .send("GET", &format!("/api/instance/{id}"), None)
+            .await;
+        if status == 404 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the deletion of {id} never settled; GetInstance still answers \
+             {status} with {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The whole lifecycle from the issue's reproduction script: create, replay the token,
 /// poll to `Active`, list, rename, read the rename back, delete, and observe the 404.
 #[tokio::test]
@@ -309,7 +338,8 @@ async fn an_instance_round_trips_through_create_poll_list_rename_and_delete() {
         "case read the rename back: a read must not move lastModifiedTime, got {after_rename}"
     );
 
-    // Delete it: the final payload reports `Deleting`, and the id is then gone.
+    // Delete it: the final payload reports `Deleting`, the record stays addressable while
+    // the deletion settles, and only then is the id gone.
     let (status, body) = emulator
         .send("DELETE", &format!("/api/instance/{id}"), None)
         .await;
@@ -329,6 +359,22 @@ async fn an_instance_round_trips_through_create_poll_list_rename_and_delete() {
         "case delete: the final payload is the instance that was deleted"
     );
 
+    // While the deletion settles the instance is still readable, in `Deleting`, with the
+    // members it carried before the delete.
+    let deleting = emulator.get("read while deleting", &id).await;
+    assert_eq!(
+        deleting.get("state").and_then(Value::as_str),
+        Some(INSTANCE_STATE_DELETING),
+        "case read while deleting: the record must still be addressable, got {deleting}"
+    );
+    assert_eq!(
+        deleting.get("instanceName").and_then(Value::as_str),
+        Some("demo-renamed"),
+        "case read while deleting: the stored members must survive the accepted deletion, \
+         got {deleting}"
+    );
+
+    wait_until_deleted(&emulator, "read after delete", &id).await;
     let (status, body) = emulator.send("GET", &format!("/api/instance/{id}"), None).await;
     assert_eq!(
         status, 404,
@@ -578,20 +624,22 @@ async fn list_instances_pages_at_every_page_size_and_honours_its_filters() {
         );
     }
 
-    // `maxResults` is modelled `@range(0..20)`; its lower bound returns no instance, and
-    // no token either — a token that cannot advance would make a paging client spin.
+    // `maxResults` is modelled `@range(0..20)`, but the service's published minimum page
+    // size is ONE: a listing asking for zero is refused rather than answered with an empty
+    // page, with the service's own constraint wording.
     let (status, body) = emulator.send("GET", "/api/instance?maxResults=0", None).await;
     assert_eq!(
-        status, 200,
-        "case maxResults=0: expected 200, got {status} with {body}"
+        status, 400,
+        "case maxResults=0: a page size below the published minimum must be refused, got \
+         {status} with {body}"
     );
-    assert!(
-        instances_of("maxResults=0", &body).is_empty(),
-        "case maxResults=0: a page of zero holds no instance, got {body}"
-    );
-    assert!(
-        body.get("nextToken").and_then(Value::as_str).is_none(),
-        "case maxResults=0: a page that cannot advance must carry no nextToken, got {body}"
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(
+            "1 validation error detected: Value at 'maxResults' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1"
+        ),
+        "case maxResults=0: expected the published-minimum wording, got {body}"
     );
     // ...and it consumed nothing: the next list still reports every instance.
     let (status, body) = emulator.send("GET", "/api/instance?maxResults=20", None).await;
@@ -976,7 +1024,8 @@ async fn a_web_app_dns_domain_is_held_by_one_live_instance_at_a_time() {
             "case {domain}: expected a ConflictException envelope, got {body}"
         );
 
-        // Deleting the holder frees the domain, so the same create now succeeds.
+        // Deleting the holder frees the domain once the deletion has settled, so the same
+        // create succeeds again — the holder keeps the domain while it is `Deleting`.
         let (status, body) = emulator
             .send("DELETE", &format!("/api/instance/{holder}"), None)
             .await;
@@ -984,6 +1033,7 @@ async fn a_web_app_dns_domain_is_held_by_one_live_instance_at_a_time() {
             status, 200,
             "case {domain}: DeleteInstance expected 200, got {status} with {body}"
         );
+        wait_until_deleted(&emulator, domain, &holder).await;
         let reused = emulator
             .create(domain, json!({ "webAppDnsDomain": domain }))
             .await;

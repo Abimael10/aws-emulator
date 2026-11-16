@@ -3,7 +3,9 @@
 //! @op UpdateInstance
 //! IMPLEMENTED: applies the members the request carries to the STORED instance record
 //! in [`crate::state`] and reports the updated record. A member the request omits is
-//! left as it was; an id no live instance holds is a `ResourceNotFoundException` (404).
+//! left as it was; an id no live instance holds is a `ResourceNotFoundException` (404),
+//! and an instance that is not `Active` — one still initializing, or one settling an
+//! accepted deletion — is refused by the state gate with a `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -166,14 +168,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.instances.get_mut(&input.instance_id) else {
             return Err(UpdateInstanceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "instance {} does not exist",
-                        input.instance_id.as_str()
-                    )),
+                    message: Some(crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
         };
+
+        // A mutation of an instance is served only while the instance is `Active`: an
+        // instance still initializing, or already settling an accepted deletion, is
+        // refused by the STATE machine (`ValidationException`, HTTP 400) rather than as a
+        // not-found, because the instance does exist and nothing about it changes.
+        if !record.is_active() {
+            return Err(UpdateInstanceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::INSTANCE_NOT_ACTIVE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // Absent member = leave the stored value alone; present member = replace it.
         let mut changed = false;

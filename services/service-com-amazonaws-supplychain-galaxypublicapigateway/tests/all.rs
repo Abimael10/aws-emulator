@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/bill_of_materials_import_jobs.rs"]
 mod bill_of_materials_import_jobs;
+#[path = "all/constraint_refusal_wording.rs"]
+mod constraint_refusal_wording;
+#[path = "all/data_integration_event_sends.rs"]
+mod data_integration_event_sends;
 #[path = "all/data_integration_events.rs"]
 mod data_integration_events;
 #[path = "all/data_integration_flows.rs"]
@@ -23,9 +27,15 @@ mod data_lake_dataset_refusal_wording;
 mod data_lake_datasets;
 #[path = "all/data_lake_namespaces.rs"]
 mod data_lake_namespaces;
+#[path = "all/flow_executions.rs"]
+mod flow_executions;
+#[path = "all/instance_deletion_window.rs"]
+mod instance_deletion_window;
 #[path = "all/instance_domain_projection.rs"]
 mod instance_domain_projection;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

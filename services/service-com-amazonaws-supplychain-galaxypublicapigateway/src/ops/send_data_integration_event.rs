@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendDataIntegrationEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendDataIntegrationEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records the event the request carries in the shared store
+//! ([`crate::state`]) and reports the `eventId` it was recorded under, which the event
+//! reads then answer from. The gateway authorizes the call against the addressed INSTANCE
+//! first, so an `instanceId` naming no instance of this account is an
+//! `AccessDeniedException` (403); a `datasetTarget` naming a dataset this instance's data
+//! lake does not hold is a `ResourceNotFoundException` (404) and records nothing; a send
+//! past the per-instance event cap is the modelled `ServiceQuotaExceededException` (402);
+//! and a replayed `clientToken` answers with the event the first call recorded.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendDataIntegrationEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The event's `data` payload is NOT stored: the modelled `DataIntegrationEvent` shape the
+//! reads answer carries no member for it, so nothing a read reports could come from it —
+//! and the member is `@sensitive`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +190,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendDataIntegrationEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendDataIntegrationEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendDataIntegrationEvent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SendDataIntegrationEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data integration store is unavailable on this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due_transitions(now);
+
+        // Same gateway rule as every instance-scoped call: an `instanceId` naming no
+        // instance of this account is refused by the authorization step, before anything
+        // the request carries is looked at.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(SendDataIntegrationEventErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A replayed `clientToken` answers with the event the first call recorded: the
+        // operation is `@idempotent` and its token is an `@idempotencyToken`, so a retry
+        // must not record a second event.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(recorded) = store
+                .event_idempotency
+                .get(token)
+                .and_then(|key| store.events.get(key))
+            {
+                return Ok(SendDataIntegrationEventOutput {
+                    event_id: recorded.event_id.clone(),
+                });
+            }
+        }
+
+        // An event of the type that names its own target dataset is recorded against THAT
+        // dataset, so a target the instance's data lake does not hold names nothing to load
+        // into and the event is not recorded at all. Every other event type names a dataset
+        // the service keeps for it, which no request addresses.
+        let dataset_target_details = match input.dataset_target {
+            Some(target) => {
+                let resolved = crate::state::tagged_resource(&target.dataset_identifier)
+                    .and_then(|named| match named {
+                        crate::state::TaggedResource::Dataset(key) => Some(key),
+                        _ => None,
+                    })
+                    .filter(|key| store.datasets.contains_key(key));
+                if resolved.is_none() {
+                    return Err(
+                        SendDataIntegrationEventErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(crate::state::dataset_target_not_valid_message(
+                                    &target.dataset_identifier,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Some(DataIntegrationEventDatasetTargetDetails {
+                    dataset_identifier: target.dataset_identifier,
+                    operation_type: target.operation_type,
+                    dataset_load_execution: DataIntegrationEventDatasetLoadExecutionDetails {
+                        status: crate::state::DATASET_LOAD_STATUS_SUCCEEDED.to_string(),
+                        // No failure to report for a load the store accepted.
+                        message: None,
+                    },
+                })
+            }
+            None => None,
+        };
+
+        // The store holds its events for the life of the process and this is the only
+        // operation that adds one, so the per-instance count is capped here and a send past
+        // the cap is refused with the modelled quota error rather than stored.
+        if store.data_integration_events_at_capacity(&input.instance_id) {
+            return Err(
+                SendDataIntegrationEventErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the number of data integration events of this instance has reached \
+                             the quota of {}",
+                            crate::state::MAX_DATA_INTEGRATION_EVENTS_PER_INSTANCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(event_id) = store.fresh_event_id(&input.instance_id) else {
+            return Err(SendDataIntegrationEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint a fresh eventId".to_string()),
+                },
+            )
+            .into());
+        };
+        // "The timestamp (in epoch seconds) associated with the event. If not provided, it
+        // will be assigned with current timestamp" (the member's own documentation).
+        let event_timestamp = input
+            .event_timestamp
+            .and_then(|stamp| ::std::time::SystemTime::try_from(stamp).ok())
+            .unwrap_or(now);
+        let record = crate::state::DataIntegrationEventRecord {
+            instance_id: input.instance_id.clone(),
+            event_id: event_id.clone(),
+            event_type: input.event_type,
+            event_group_id: input.event_group_id,
+            event_timestamp,
+            dataset_target_details,
+        };
+        let key = crate::state::data_integration_event_key(&input.instance_id, &event_id);
+        store.events.insert(key.clone(), record);
+        if let Some(token) = input.client_token {
+            store.event_idempotency.insert(token, key);
+        }
+
+        Ok(SendDataIntegrationEventOutput { event_id })
     }
 }
