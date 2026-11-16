@@ -65,6 +65,8 @@ mod sns_topic_read_through;
 mod sqs_queue_read_through;
 #[path = "all/ssm_parameter_read_through.rs"]
 mod ssm_parameter_read_through;
+#[path = "all/stabilization_barrier.rs"]
+mod stabilization_barrier;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unsupported_actions.rs"]
