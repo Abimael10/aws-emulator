@@ -66,6 +66,9 @@ mod container_insights_metrics;
 mod container_instance_not_found;
 #[path = "all/container_instances.rs"]
 mod container_instances;
+// The conditional forms a container's program decides its exit status with.
+#[path = "all/container_program_conditionals.rs"]
+mod container_program_conditionals;
 // What a container whose program this emulator runs nothing of reports, and what it does
 // not.
 #[path = "all/container_program_not_performed.rs"]
@@ -76,6 +79,10 @@ mod container_reservation_refusals;
 mod container_runtime;
 #[path = "all/container_secret_injection.rs"]
 mod container_secret_injection;
+// What a container definition's `secrets` reference resolves to, and the stop a task whose
+// reference resolves to nothing earns.
+#[path = "all/container_secret_values.rs"]
+mod container_secret_values;
 #[path = "all/continue_service_deployment_validation.rs"]
 mod continue_service_deployment_validation;
 #[path = "all/daemon_reference_family_refusals.rs"]

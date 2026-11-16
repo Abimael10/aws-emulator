@@ -20,9 +20,12 @@
 //! names, and the task is stopped at the instant it would otherwise have started, with the
 //! stop code of a task that never ran ([`STOP_CODE_TASK_FAILED_TO_START`]) and the
 //! `stoppedReason` the agent words for a resource it could not retrieve
-//! ([`unable_to_retrieve_secret_message`]). A launch whose role MAY read it runs, and each
-//! entry's value is in the environment of the container's program
-//! ([`super::container_runtime`]).
+//! ([`unable_to_retrieve_secret_message`]). The same stop is earned by a launch whose role
+//! MAY read a reference that still resolves to no value — "you can also specify a specific
+//! JSON key within the secret", and a document that states no such key states no value for it
+//! — because the resource the container was to be given could not be produced either way. A
+//! launch whose references all resolve runs, and each entry's value is in the environment of
+//! the container's program ([`super::container_runtime`]).
 //!
 //! Both halves ask the service that OWNS the secret: whether the role may read it, and
 //! whether there is a value to read, are answered by Secrets Manager's own gate over its own
@@ -37,16 +40,25 @@
 //!
 //! # Where each half happens
 //!
-//! The DECISION is taken at launch, in the pass that fetches the images the task's containers
-//! run ([`evaluate_image_pulls`]): the agent retrieves the execution resources — the registry
-//! authentication and the secrets — in one step before any container of the task starts,
-//! which is why the two verdicts are recorded together and why the reason a refusal carries
-//! names them together.
+//! Both halves happen at LAUNCH, before any container of the task exists, because that is
+//! where the agent retrieves a task's execution resources:
 //!
-//! The VALUE is read where the container's program starts, by the run that performs it
-//! ([`super::container_runtime`]): that read is a call to another emulated service, which a
-//! store pass cannot make. A secret that cannot be read THERE — one deleted between the
-//! decision and the start, a `json-key` the value does not state — starts no program and
+//! * WHETHER the execution role may read each reference is decided in the pass that fetches
+//!   the images the task's containers run ([`evaluate_image_pulls`]): the registry
+//!   authentication and the secrets are one step of the agent's, which is why the two
+//!   verdicts are recorded together and why the reason a refusal carries names them together;
+//! * the VALUE each reference selects is read by the retrieval pass
+//!   ([`settle_secret_retrievals`]), which runs after it: that read is a call to another
+//!   emulated service, which a store pass cannot make, so it is made off the store's lock and
+//!   its verdict is recorded on the task the same way. A reference whose value cannot be
+//!   produced — a `json-key` the retrieved document does not state, a value that is no
+//!   document at all — stops the task at the instant it would otherwise have started, with
+//!   the stop of a task that never ran, and no container of it starts.
+//!
+//! The value is read AGAIN where the container's program starts
+//! ([`super::container_runtime`]), because nothing of it is kept in this service's store: the
+//! container's environment is built from what the owning service answers then. A value that
+//! has gone away between the two — a secret deleted in between — starts no program and
 //! records no exit code, because nothing ran.
 //!
 //! LOCK ORDER: the cross-service reads here take the Secrets Manager store's lock (which
@@ -62,6 +74,7 @@
 
 use std::collections::BTreeMap;
 
+use ::aws_sdk_secretsmanager::error::ProvideErrorMetadata;
 use ::service_com_amazonaws_secretsmanager_secretsmanager::state::secret_retrieval;
 
 use super::*;
@@ -347,7 +360,10 @@ const SECRET_RESOURCE_TYPE: &str = "secret";
 ///
 /// `None` when a secret the container takes could not be read at all — the container's
 /// program is then not started, because the agent starts no container whose secrets it could
-/// not resolve, and a container that never ran reports no exit code.
+/// not resolve, and a container that never ran reports no exit code. A launch whose values
+/// could not be read is normally stopped before this is reached
+/// ([`settle_secret_retrievals`]); what is left for this to meet is a value that went away
+/// between that step and the start.
 ///
 /// Each value is read through Secrets Manager's OWN `GetSecretValue` over the emulator's
 /// in-process callback, with the version the reference selects, so what the container sees is
@@ -366,22 +382,163 @@ pub async fn fetched_environment(
         let Some(reference) = SecretsManagerReference::parse(&secret.value_from) else {
             continue;
         };
-        let value = retrieved_value(callback, &reference).await?;
+        let value = retrieved_value(callback, &reference).await.ok()?;
         resolved.insert(secret.name.clone(), value);
     }
     Some(resolved)
 }
 
+/// What ONE launched task's execution resources are RETRIEVED for: the task the verdict
+/// belongs to, and the values its revision has the agent fetch before any of its containers
+/// starts.
+///
+/// Collected from the stored tasks under this service's lock
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::launches_awaiting_secret_retrieval`])
+/// and retrieved through the owning service's own API with no lock held, which is why the
+/// values it needs are copied out rather than read from the record.
+#[derive(Debug, Clone)]
+pub struct SecretRetrieval {
+    /// The task the retrieval is made for.
+    pub task_arn: String,
+    /// The values its revision has the agent fetch ([`definition_secrets`]).
+    pub secrets: Vec<ContainerSecret>,
+}
+
+impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
+    /// Every launch whose execution resources have not been RETRIEVED yet — one that is
+    /// still on its way up, whose roles have been assumed and whose images have been fetched
+    /// ([`TaskRecord::pull_started_at`]) without anything blocking the launch — with the
+    /// values to retrieve for it; and MARK each as retrieved, so one launch retrieves them
+    /// once however many passes run.
+    ///
+    /// The order is the step's: the retrieval is made as the execution role, so a launch
+    /// whose roles Amazon ECS has not assumed has nothing to retrieve with, and one the
+    /// authorization step has already refused ([`unretrievable_secret`]) is stopping for
+    /// that refusal rather than for anything a value could add.
+    pub(super) fn launches_awaiting_secret_retrieval(&mut self) -> Vec<SecretRetrieval> {
+        let awaiting: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                !task.secrets_retrieved
+                    && task.launch_failure.is_none()
+                    && task.launch_roles_assumed
+                    && task.pull_started_at.is_some()
+                    && task.desired_status == STATUS_RUNNING
+                    && task.is_pending()
+            })
+            .map(|task| task.task_arn.clone())
+            .collect();
+        let mut retrievals = Vec::new();
+        for task_arn in awaiting {
+            let Some(task) = self.tasks.get(&task_arn).cloned() else {
+                continue;
+            };
+            let secrets = self.launched_task_secrets(&task);
+            if let Some(held) = self.tasks.get_mut(&task_arn) {
+                held.secrets_retrieved = true;
+            }
+            if !secrets.is_empty() {
+                retrievals.push(SecretRetrieval { task_arn, secrets });
+            }
+        }
+        retrievals
+    }
+
+    /// Record why the execution resources of one launch could not be retrieved — the
+    /// `stoppedReason` the stop the clock then owes carries ([`TaskRecord::fail_launch`]),
+    /// which is the same stop a resource the authorization step refused earns
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::record_image_pulls`]).
+    ///
+    /// Only a task that is still on its way UP takes it: one that has started has its
+    /// containers already, and one that is stopping is on its way out either way.
+    pub(super) fn record_secret_retrieval(&mut self, task_arn: &str, failure: Option<String>) {
+        let Some(failure) = failure else {
+            return;
+        };
+        if let Some(task) = self.tasks.get_mut(task_arn) {
+            if task.launch_failure.is_none()
+                && task.desired_status == STATUS_RUNNING
+                && task.is_pending()
+            {
+                task.launch_failure = Some(failure);
+            }
+        }
+    }
+}
+
+/// Retrieve the execution resources of every launch that is waiting for them, and record the
+/// launch failure of each launch whose resources could not be produced.
+///
+/// Call it with NO guard of this store held, from a door that has just placed a task or from
+/// the clock pump: it takes the lock itself to collect the launches
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::launches_awaiting_secret_retrieval`])
+/// and the retrievals it starts are in-process tasks that outlive the call — the read is a
+/// call to the service that HOLDS the value, which no store pass can make. With no async
+/// runtime to start them on nothing is retrieved, and a container whose values cannot be read
+/// starts no program either way ([`fetched_environment`]).
+pub fn settle_secret_retrievals<Eng: Send + Sync + 'static>(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    engine: &::std::sync::Arc<Eng>,
+) {
+    let Some(state) = service_state(&**engine) else {
+        return;
+    };
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let retrievals = state.lock().launches_awaiting_secret_retrieval();
+    for retrieval in retrievals {
+        let recorded = ::engine::ServiceState::clone(&state);
+        let callback = callback.clone();
+        runtime.spawn(async move {
+            let failure = unretrievable_secret_value(&callback, &retrieval.secrets).await;
+            recorded
+                .lock()
+                .record_secret_retrieval(&retrieval.task_arn, failure);
+        });
+    }
+}
+
+/// Why the execution resources of a launch could not be RETRIEVED — the `stoppedReason` of
+/// the first value of `secrets` the agent could not produce — and `None` when every one of
+/// them was produced, or names a store this module does not retrieve from.
+///
+/// This is the second half of the agent's one resource-retrieval step: the first asks the
+/// owning service whether the execution role may read the secret at all
+/// ([`unretrievable_secret`]), and this reads the VALUE the reference selects. A reference
+/// whose selector names no key of the document it retrieved resolves to nothing, so there is
+/// nothing to expose to the container and the task is stopped before any container of it
+/// starts, exactly as a refused read stops it.
+///
+/// Nothing of any value is kept or logged: what is answered is the agent's account of the
+/// failure, which names the secret and the selector and never what was retrieved.
+pub async fn unretrievable_secret_value(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    secrets: &[ContainerSecret],
+) -> Option<String> {
+    for secret in secrets {
+        let Some(reference) = SecretsManagerReference::parse(&secret.value_from) else {
+            continue;
+        };
+        if let Err(failure) = retrieved_value(callback, &reference).await {
+            return Some(unable_to_retrieve_secret_message(&failure));
+        }
+    }
+    None
+}
+
 /// The value `reference` exposes: the secret's string value, or the value of the JSON key
 /// the reference selects within it.
 ///
-/// `None` when the retrieval was refused, when the secret holds no string value, or when the
-/// key the reference selects is not in the document — each of them a resource the agent could
-/// not retrieve, so the container it was for starts nothing.
+/// `Err` carries the agent's account of why there was no value to expose — the retrieval the
+/// owning service refused, a value that is no JSON document when the reference selects a key
+/// within one, or a key that document does not state — which is what the `stoppedReason` of
+/// the task it was retrieved for reports ([`unable_to_retrieve_secret_message`]).
 async fn retrieved_value(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     reference: &SecretsManagerReference,
-) -> Option<String> {
+) -> Result<String, String> {
     let mut request = secrets_manager_client(callback, &reference.region)
         .get_secret_value()
         .secret_id(&reference.secret_arn);
@@ -401,24 +558,64 @@ async fn retrieved_value(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a secret a container takes could not be retrieved, so its program is not run"
             );
-            return None;
+            // The refusal the owning service answered, in the shape every other relayed
+            // refusal of this module carries: the error class it named, then its sentence.
+            let class = error
+                .code()
+                .unwrap_or(RESOURCE_NOT_FOUND_CLASS)
+                .to_string();
+            let message = error
+                .message()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| SECRET_HOLDS_NO_VALUE.to_string());
+            return Err(format!("{class}: {message}"));
         }
     };
-    let held = answer.secret_string()?;
+    let Some(held) = answer.secret_string() else {
+        return Err(no_string_value_message(&reference.secret_arn));
+    };
     let Some(json_key) = &reference.json_key else {
-        return Some(held.to_string());
+        return Ok(held.to_string());
     };
     // "You can also specify a specific JSON key within the secret": the value is read as the
     // key/value document a secret of that shape holds, and the key's own value is what the
-    // container is given — a document that states no such key states no value for it.
-    let document: ::serde_json::Value = ::serde_json::from_str(held).ok()?;
-    let selected = document.get(json_key)?;
-    Some(match selected {
+    // container is given — a value that is no such document states no key, and a document
+    // that states no such key states no value for it.
+    let document: ::serde_json::Value = ::serde_json::from_str(held)
+        .map_err(|_| invalid_json_message(&reference.secret_arn))?;
+    let selected = document
+        .get(json_key)
+        .ok_or_else(|| json_key_not_found_message(json_key, &reference.secret_arn))?;
+    Ok(match selected {
         // A string field is exposed as its characters; every other JSON value as the text
         // the document writes it with.
         ::serde_json::Value::String(text) => text.clone(),
         other => other.to_string(),
     })
+}
+
+/// What a refusal that carries no sentence of its own says about the value: there was none to
+/// retrieve.
+const SECRET_HOLDS_NO_VALUE: &str = "there is no value to retrieve for this secret";
+
+/// The agent's account of a secret whose retrieved value is not the JSON document the
+/// reference reads a key out of, worded as the agent words it for the value it could not
+/// read a key from.
+fn invalid_json_message(secret_arn: &str) -> String {
+    format!("Invalid JSON format for secret {secret_arn}")
+}
+
+/// The agent's account of a reference whose JSON key the retrieved document does not state:
+/// there is no value for the variable the entry spells, so no container of the task starts.
+fn json_key_not_found_message(json_key: &str, secret_arn: &str) -> String {
+    format!("json key {json_key} not found in secret: {secret_arn}")
+}
+
+/// The agent's account of a reference naming a secret that holds no STRING value — a secret
+/// whose value was stored as binary holds nothing the environment of a container can be given
+/// as text.
+fn no_string_value_message(secret_arn: &str) -> String {
+    format!("secret {secret_arn} holds no string value")
 }
 
 /// A Secrets Manager client over the in-process callback into this same emulator.

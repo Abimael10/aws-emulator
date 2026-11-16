@@ -3840,6 +3840,15 @@ pub struct TaskRecord {
     /// ECS pulls an image AS the execution role, so nothing is fetched for a launch whose
     /// roles it has not assumed.
     pub launch_roles_assumed: bool,
+    /// Whether the VALUES the agent fetches for this task's containers have been retrieved
+    /// already ([`settle_secret_retrievals`]) — `false` for a task that has only just been
+    /// placed, whoever placed it, and `true` once the retrieval has been STARTED for it, so
+    /// each launch retrieves them once.
+    ///
+    /// Recorded on the task for the reason [`Self::launch_roles_assumed`] is: the retrieval
+    /// is one step of the launch, taken for whichever tasks the store holds when it starts,
+    /// and a task placed after a pass collected its launches has not had it taken.
+    pub secrets_retrieved: bool,
     /// The task execution role this task's image pull is made as — the one the placement
     /// resolved ([`resolved_execution_role_arn`]) — and `None` for a task whose revision
     /// and overrides name none.

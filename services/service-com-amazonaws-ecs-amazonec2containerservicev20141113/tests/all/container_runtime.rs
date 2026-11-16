@@ -584,11 +584,11 @@ async fn a_program_that_never_ends_is_bounded_and_claims_no_exit_status() {
         ),
         (
             "an until loop whose condition and body are forms it declines",
-            "echo up; until case x in esac; do case x in esac; done",
+            "echo up; until for x in x; do :; done; do for x in x; do :; done; done",
         ),
         (
             "a while loop whose condition is a declined form negated",
-            "echo up; while ! case x in esac; do case x in esac; done",
+            "echo up; while ! for x in x; do :; done; do for x in x; do :; done; done",
         ),
     ];
 

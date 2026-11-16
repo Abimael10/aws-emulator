@@ -630,6 +630,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // records yet: that happens below, with the guard dropped
                 // ([`crate::state::evaluate_launch_role_assumptions`]).
                 launch_roles_assumed: false,
+                // Nothing has retrieved the values this placement's containers take yet:
+                // that happens once its roles are assumed and its images are fetched
+                // ([`crate::state::settle_secret_retrievals`]).
+                secrets_retrieved: false,
                 // The task execution role this placement resolved — the one its
                 // `overrides` name, else the revision's own — which is the principal the
                 // image pull of this task is made as

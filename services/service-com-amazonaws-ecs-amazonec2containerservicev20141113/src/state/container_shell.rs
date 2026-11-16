@@ -134,11 +134,13 @@ const SIGTERM_NAMES: [&str; 3] = ["TERM", "SIGTERM", "15"];
 /// Each one's whole effect is inside the container's own session, which is why it can be
 /// performed in process: `echo` writes to the container's output, `true`, `false` and `:`
 /// answer a status, `exit` ends the session, `export`/`unset` change its variables, `trap`
-/// records what a signal does to it, `sleep` waits, and `wait` answers for the jobs it has
-/// none of. A command that is not one of these needs a program, a filesystem or a network
-/// this container does not have.
+/// records what a signal does to it, `sleep` waits, `wait` answers for the jobs it has none
+/// of, and `test` — with its `[ ... ]` spelling — answers a question about the words it was
+/// given ([`ContainerShell::run_test`]). A command that is not one of these needs a program,
+/// a filesystem or a network this container does not have.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
-    "echo", "true", "false", ":", "exit", "export", "unset", "trap", "sleep", "wait",
+    "echo", "true", "false", ":", "exit", "export", "unset", "trap", "sleep", "wait", "test",
+    "[",
 ];
 
 /// The commands an assignment written before them persists in the session for: POSIX's
@@ -494,13 +496,14 @@ impl ContainerShell {
     /// Run one of the COMPOUND command forms this container performs.
     ///
     /// A brace group and a subshell are the list they hold; a `while`/`until` loop runs its
-    /// body for as long as its condition says, and an `if` runs the branch its condition
-    /// chose. The loop needs no bound of its own: every command it performs comes out of
-    /// the run's command budget, and a loop that outlasts it abandons the run.
+    /// body for as long as its condition says, an `if` runs the branch its condition chose,
+    /// and a `case` runs the branch whose pattern its word matched. The loop needs no bound
+    /// of its own: every command it performs comes out of the run's command budget, and a
+    /// loop that outlasts it abandons the run.
     ///
     /// A subshell's effects are NOT confined to a child session here: there is no process
-    /// to fork, so a variable it sets is set in this one. Every other compound form —
-    /// `for`, `case`, an arithmetic command — is one this container does not perform.
+    /// to fork, so a variable it sets is set in this one. Every other compound form — a
+    /// `for` loop, an arithmetic command — is one this container does not perform.
     fn run_compound_command<'a>(
         &'a mut self,
         compound: &'a ::brush_parser::ast::CompoundCommand,
@@ -519,8 +522,97 @@ impl ContainerShell {
                 ::brush_parser::ast::CompoundCommand::UntilClause(clause) => {
                     self.run_loop(clause, false).await
                 }
+                ::brush_parser::ast::CompoundCommand::IfClause(clause) => {
+                    self.run_if_clause(clause).await
+                }
+                ::brush_parser::ast::CompoundCommand::CaseClause(clause) => {
+                    self.run_case_clause(clause).await
+                }
                 _ => self.declined(),
             }
+        })
+    }
+
+    /// Run a `case WORD in PATTERN) LIST;; ... esac`: the list of the FIRST item one of whose
+    /// patterns the word matches, and success for a `case` no pattern of which matched —
+    /// "the exit status of case shall be zero if no patterns are matched".
+    ///
+    /// The word and every pattern are expanded first, as the shell expands them, and the
+    /// comparison is the shell's pattern match ([`case_pattern_matches`]). A pattern this
+    /// session does not read, or a word whose expansion it cannot resolve, is a form this
+    /// container does not perform.
+    ///
+    /// Each ITEM takes a step out of the run's budget before its patterns are compared, the
+    /// way a loop iteration does ([`Self::take_command_budget`]): that is what bounds the
+    /// comparisons a program with many items can ask for, on top of the one step the `case`
+    /// itself took as a command.
+    fn run_case_clause<'a>(
+        &'a mut self,
+        clause: &'a ::brush_parser::ast::CaseClauseCommand,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            let Some(value) = self.expand_word(&clause.value.value) else {
+                return self.declined();
+            };
+            for item in &clause.cases {
+                if !self.take_command_budget().await {
+                    return EXIT_COMMAND_NOT_FOUND;
+                }
+                for pattern in &item.patterns {
+                    let Some(expanded) = self.expand_word(&pattern.value) else {
+                        return self.declined();
+                    };
+                    let Some(matched) = case_pattern_matches(&expanded, &value) else {
+                        return self.declined();
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    return match &item.cmd {
+                        // An item with no list of its own runs nothing, which is the
+                        // status POSIX gives it.
+                        None => EXIT_SUCCESS,
+                        Some(list) => self.run_compound_list(list).await,
+                    };
+                }
+            }
+            EXIT_SUCCESS
+        })
+    }
+
+    /// Run an `if LIST; then LIST; elif LIST; then LIST; else LIST; fi`: the branch whose
+    /// condition answered success, and success for an `if` no branch of which ran — "the
+    /// exit status of the if compound command shall be ... zero, if no then compound-list or
+    /// else compound-list is executed".
+    fn run_if_clause<'a>(
+        &'a mut self,
+        clause: &'a ::brush_parser::ast::IfClauseCommand,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            let condition = self.run_compound_list(&clause.condition).await;
+            if self.stopped() {
+                return condition;
+            }
+            if condition == EXIT_SUCCESS {
+                return self.run_compound_list(&clause.then).await;
+            }
+            for otherwise in clause.elses.iter().flatten() {
+                match otherwise.condition.as_ref() {
+                    // An `elif`, which carries its own condition and its own branch.
+                    Some(condition) => {
+                        let answered = self.run_compound_list(condition).await;
+                        if self.stopped() {
+                            return answered;
+                        }
+                        if answered == EXIT_SUCCESS {
+                            return self.run_compound_list(&otherwise.body).await;
+                        }
+                    }
+                    // The `else` branch, which runs when no condition before it did.
+                    None => return self.run_compound_list(&otherwise.body).await,
+                }
+            }
+            EXIT_SUCCESS
         })
     }
 
@@ -995,9 +1087,47 @@ impl ContainerShell {
                 // child processes" — this session has none, so there is nothing to wait
                 // for and the utility answers success.
                 "wait" => EXIT_SUCCESS,
+                "test" | "[" => self.run_test(name, arguments),
                 _ => self.declined(),
             }
         })
+    }
+
+    /// `test EXPRESSION`, and its `[ EXPRESSION ]` spelling: the question the expression
+    /// asks, answered as a status — success for true, failure for false.
+    ///
+    /// The utility is a shell BUILT-IN whose whole effect is its status, so this container
+    /// performs the half of it that is about the words it was given and nothing else
+    /// ([`::service_common::posix_shell_session::value_test_answer`]): an expression of one
+    /// argument, `-z`/`-n`, the string comparisons and the integer comparisons, each
+    /// optionally negated with a leading `!`. Every other form — a question about a file,
+    /// which this container has no filesystem to answer, or an expression joined with `-a`
+    /// or `-o` — is one this session does not answer, so it is a command that did not run
+    /// ([`Self::declined`]) rather than an answer of false.
+    fn run_test(&mut self, name: &str, arguments: &[String]) -> i32 {
+        let mut arguments = arguments.to_vec();
+        if name == "[" {
+            // The `[` spelling is the same utility, and its last argument is the closing
+            // bracket rather than part of the question; an invocation that does not close
+            // is the usage this session does not read.
+            if arguments.last().map(String::as_str) != Some("]") {
+                return self.declined();
+            }
+            arguments.pop();
+        }
+        let negated = arguments.first().map(String::as_str) == Some("!");
+        if negated {
+            arguments.remove(0);
+        }
+        let Some(answer) = ::service_common::posix_shell_session::value_test_answer(&arguments)
+        else {
+            return self.declined();
+        };
+        if answer != negated {
+            EXIT_SUCCESS
+        } else {
+            EXIT_FAILURE
+        }
     }
 
     /// `trap ACTION SIGNAL...`: record what each named signal does to this session.
@@ -1099,7 +1229,8 @@ impl ContainerShell {
     /// The pieces come from `brush-parser`'s word parser, so what is quoted, what is a
     /// parameter expansion and what is literal text is the shell's own reading of the word.
     /// A parameter this session holds nothing for expands to nothing, which is what an
-    /// unset parameter expands to. A command substitution, an arithmetic expansion or a
+    /// unset parameter expands to, and an escape sequence stands for the character it
+    /// escapes ([`escaped_text`]). A command substitution, an arithmetic expansion or a
     /// tilde prefix is an expansion whose value this container cannot resolve — it would
     /// have to run a command, or resolve a home directory it does not have — so the word
     /// has no expansion here and the command carrying it is not run. Nor does a word that
@@ -1108,7 +1239,7 @@ impl ContainerShell {
     fn expand_word(&mut self, word: &str) -> Option<String> {
         let options = ::brush_parser::ParserOptions::default();
         let pieces = ::brush_parser::word::parse(word, &options).ok()?;
-        let expanded = self.expand_pieces(&pieces, MAX_WORD_DEPTH)?;
+        let expanded = self.expand_pieces(&pieces, MAX_WORD_DEPTH, false)?;
         self.expansion_left = self.expansion_left.checked_sub(expanded.len())?;
         Some(expanded)
     }
@@ -1116,10 +1247,14 @@ impl ContainerShell {
     /// [`Self::expand_word`]'s walk over the pieces a word parsed into, with `depth` levels
     /// of quoting left: a word nested past [`MAX_WORD_DEPTH`] has no expansion here, so
     /// this walk's own recursion stays in range whatever the word nests.
+    ///
+    /// `double_quoted` is whether these pieces stand INSIDE a double-quoted sequence, which
+    /// is what decides how an escape sequence reads ([`escaped_text`]).
     fn expand_pieces(
         &self,
         pieces: &[::brush_parser::word::WordPieceWithSource],
         depth: usize,
+        double_quoted: bool,
     ) -> Option<String> {
         let depth = depth.checked_sub(1)?;
         let mut expanded = String::new();
@@ -1128,10 +1263,13 @@ impl ContainerShell {
                 ::brush_parser::word::WordPiece::Text(text)
                 | ::brush_parser::word::WordPiece::SingleQuotedText(text) => text.clone(),
                 ::brush_parser::word::WordPiece::DoubleQuotedSequence(inner) => {
-                    self.expand_pieces(inner, depth)?
+                    self.expand_pieces(inner, depth, true)?
                 }
                 ::brush_parser::word::WordPiece::ParameterExpansion(parameter) => {
                     self.expand_parameter(parameter)?
+                }
+                ::brush_parser::word::WordPiece::EscapeSequence(sequence) => {
+                    escaped_text(sequence, double_quoted)?
                 }
                 _ => return None,
             };
@@ -1150,9 +1288,9 @@ impl ContainerShell {
     /// and WHICH values take the default is the form's own: `${NAME:-WORD}` substitutes it
     /// for a parameter that is unset or empty, `${NAME-WORD}` only for one that is unset,
     /// so a variable the container's environment sets to the empty string keeps it under
-    /// the second form. Every other form — a substring, a replacement, a length, an
-    /// indirection, a positional or special parameter — is one this container does not
-    /// resolve.
+    /// the second form. The length form (`${#NAME}`) is how many characters that value has.
+    /// Every other form — a substring, a replacement, an indirection, a positional or
+    /// special parameter — is one this container does not resolve.
     fn expand_parameter(&self, parameter: &::brush_parser::word::ParameterExpr) -> Option<String> {
         match parameter {
             ::brush_parser::word::ParameterExpr::Parameter {
@@ -1186,6 +1324,20 @@ impl ContainerShell {
                     Some(held.unwrap_or_default().to_string())
                 }
             }
+            ::brush_parser::word::ParameterExpr::ParameterLength {
+                parameter: ::brush_parser::word::Parameter::Named(name),
+                indirect: false,
+            } => {
+                // "${#parameter}: String Length. The length in characters of the value of
+                // parameter shall be substituted." A parameter this session holds nothing
+                // for has no value, so its length is zero.
+                let held = self
+                    .variables
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                Some(held.chars().count().to_string())
+            }
             _ => None,
         }
     }
@@ -1196,3 +1348,61 @@ impl ContainerShell {
 fn signal_key(operand: &str) -> String {
     operand.to_ascii_uppercase()
 }
+
+/// The text ONE escape sequence of a word stands for, and `None` for a sequence this
+/// container does not read.
+///
+/// A backslash is the shell's escape character, and WHICH characters it escapes depends on
+/// where it stands: unquoted, "the backslash shall preserve the literal value of the
+/// following character", while inside double quotes it does so only before `$`, `` ` ``,
+/// `"`, `\` and a newline — before anything else the backslash itself is literal. A
+/// backslash before a newline is a line continuation either way, so it stands for nothing.
+fn escaped_text(sequence: &str, double_quoted: bool) -> Option<String> {
+    // The piece is the sequence as the word was written, so the backslash may or may not
+    // still be on it; what it escapes is the one character after it either way.
+    let escaped = sequence.strip_prefix('\\').unwrap_or(sequence);
+    let mut characters = escaped.chars();
+    let character = characters.next()?;
+    if characters.next().is_some() {
+        // More than one character after the backslash is no escape sequence this reads.
+        return None;
+    }
+    match character {
+        '\n' => Some(String::new()),
+        '\\' | '"' | '$' | '`' => Some(character.to_string()),
+        // Unquoted, the backslash preserves whatever follows it; inside double quotes it
+        // keeps its own literal value before every other character.
+        _ if !double_quoted => Some(character.to_string()),
+        _ => Some(format!("\\{character}")),
+    }
+}
+
+/// Whether the shell PATTERN `pattern` matches `value`, and `None` for a pattern this
+/// container does not read.
+///
+/// A `case` pattern is a shell pattern: "an asterisk is a pattern that shall match any
+/// string, including the null string" and a question mark matches any one character — the two
+/// wildcards this workspace's own matcher walks
+/// ([`::service_common::iam_authorization::wildcard_match`], whose single-pass walk costs the
+/// product of the two lengths and never recurses, so a pattern a caller wrote cannot make one
+/// match run away). The comparison is case-sensitive, as the shell's is.
+///
+/// A BRACKET EXPRESSION (`[abc]`, `[!a-z]`) is a third pattern construct that matcher does
+/// not read, so a pattern carrying one is not matched here and the command carrying it did not
+/// run — the fail-closed answer this session gives every other form it does not perform.
+///
+/// The pattern arrives EXPANDED, so a wildcard character that reached it through a quote or an
+/// escape is read as the wildcard it spells rather than as the literal character the shell
+/// would make of it.
+fn case_pattern_matches(pattern: &str, value: &str) -> Option<bool> {
+    if pattern.contains(BRACKET_EXPRESSION_OPEN) {
+        return None;
+    }
+    Some(::service_common::iam_authorization::wildcard_match(
+        pattern, value, true,
+    ))
+}
+
+/// What opens a bracket expression in a shell pattern, which is the construct
+/// [`case_pattern_matches`] does not read.
+const BRACKET_EXPRESSION_OPEN: char = '[';

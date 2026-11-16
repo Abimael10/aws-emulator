@@ -2309,39 +2309,22 @@ impl ShellSession {
 
     /// [`Self::run_test`]'s reading of the question, or `None` for a form it does not
     /// answer.
+    ///
+    /// The questions about the TREE are this session's own, because only a session holding
+    /// one can answer them; the questions about VALUES are the same wherever the utility is
+    /// performed, so they are read by the shared [`value_test_answer`].
     fn test_answer(&self, arguments: &[String]) -> Option<bool> {
-        match arguments {
-            [] => Some(false),
-            [value] => Some(!value.is_empty()),
-            [operator, value] => match operator.as_str() {
-                "-e" => Some(self.tree_holds(value)),
-                "-f" => Some(self.tree_holds_file(value)),
-                "-d" => Some(self.tree_holds_directory(value)),
-                "-s" => Some(self.read_path(value).is_some_and(|held| !held.is_empty())),
-                "-r" | "-w" => Some(self.tree_holds(value)),
-                "-z" => Some(value.is_empty()),
-                "-n" => Some(!value.is_empty()),
-                _ => None,
-            },
-            [left, operator, right] => match operator.as_str() {
-                "=" | "==" => Some(left == right),
-                "!=" => Some(left != right),
-                "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
-                    let left = left.trim().parse::<i64>().ok()?;
-                    let right = right.trim().parse::<i64>().ok()?;
-                    Some(match operator.as_str() {
-                        "-eq" => left == right,
-                        "-ne" => left != right,
-                        "-lt" => left < right,
-                        "-le" => left <= right,
-                        "-gt" => left > right,
-                        _ => left >= right,
-                    })
-                }
-                _ => None,
-            },
-            _ => None,
+        if let [operator, value] = arguments {
+            match operator.as_str() {
+                "-e" => return Some(self.tree_holds(value)),
+                "-f" => return Some(self.tree_holds_file(value)),
+                "-d" => return Some(self.tree_holds_directory(value)),
+                "-s" => return Some(self.read_path(value).is_some_and(|held| !held.is_empty())),
+                "-r" | "-w" => return Some(self.tree_holds(value)),
+                _ => {}
+            }
         }
+        value_test_answer(arguments)
     }
 
     /// `sh -c PROGRAM` (and `bash -c`), and `sh FILE`: the program performed in THIS
@@ -2635,6 +2618,52 @@ impl ArithmeticVariables for ShellSession {
 
     fn set_arithmetic_value(&mut self, name: &str, value: i64) -> bool {
         self.set_variable(name.to_string(), value.to_string())
+    }
+}
+
+/// What the `test` utility (and its `[ ... ]` spelling) answers for the questions that are
+/// about VALUES alone — the whole of the utility that needs nothing but its arguments — or
+/// `None` for a form this does not answer, which includes every question about a file.
+///
+/// POSIX's `test` "evaluate[s] expression" and answers it as a status, and these are the
+/// primaries whose answer is a property of the words themselves: an expression of no
+/// arguments is false, one of a single argument is true when that argument is not the empty
+/// string, `-z`/`-n` ask whether a string is empty or not, `=`/`!=` compare two strings, and
+/// `-eq`/`-ne`/`-lt`/`-le`/`-gt`/`-ge` compare two integers (`==` is the equality spelling
+/// bash also takes). A primary about a FILE (`-e`, `-f`, `-d`, `-s`, `-r`, `-w`) is a
+/// question about a tree, so it is the caller's to answer where it holds one and unanswerable
+/// — `None` — where it holds none.
+///
+/// Shared because the reading is the same wherever the utility is performed: a session with
+/// a tree of its own answers the file primaries itself and falls back to this
+/// ([`ShellSession::test_answer`]), and a session with no tree at all has only these.
+pub fn value_test_answer(arguments: &[String]) -> Option<bool> {
+    match arguments {
+        [] => Some(false),
+        [value] => Some(!value.is_empty()),
+        [operator, value] => match operator.as_str() {
+            "-z" => Some(value.is_empty()),
+            "-n" => Some(!value.is_empty()),
+            _ => None,
+        },
+        [left, operator, right] => match operator.as_str() {
+            "=" | "==" => Some(left == right),
+            "!=" => Some(left != right),
+            "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                let left = left.trim().parse::<i64>().ok()?;
+                let right = right.trim().parse::<i64>().ok()?;
+                Some(match operator.as_str() {
+                    "-eq" => left == right,
+                    "-ne" => left != right,
+                    "-lt" => left < right,
+                    "-le" => left <= right,
+                    "-gt" => left > right,
+                    _ => left >= right,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 

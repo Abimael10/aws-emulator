@@ -682,6 +682,11 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
     };
+    // The execution resources of every launch that is waiting for them are retrieved BEFORE
+    // the pump's claim is taken, so a door that has just placed a task has the values its
+    // containers take read before the clock could start it, whether or not a pump was already
+    // running ([`super::settle_secret_retrievals`]).
+    super::settle_secret_retrievals(ctx.callback(), engine);
     // The container data plane is settled BEFORE the pump's claim is taken, so a door that
     // finds a pump already running still has the containers of the task it just wrote
     // started or signalled ([`super::settle_container_runtime`]).
@@ -723,6 +728,10 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
             // otherwise start — and again after it, for the tasks that pass placed
             // ([`super::advance_task_clock`], the same prologue every operation runs).
             super::advance_task_clock(&*engine, SystemTime::now());
+            // The execution resources of a launch the CLOCK placed, which no door is there
+            // to retrieve for it: the values its containers take are read as the execution
+            // role before any of them starts ([`super::settle_secret_retrievals`]).
+            super::settle_secret_retrievals(&callback, &engine);
             // A task the clock has just started or stopped is one the load balancers its
             // service binds have to be brought in line with — the same side effect the door
             // that wrote a status settles, owed here for the statuses NO door wrote
