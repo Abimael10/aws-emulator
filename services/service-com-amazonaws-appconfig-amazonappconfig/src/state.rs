@@ -2294,10 +2294,14 @@ const DEPLOYMENT_EVENT_ACTION_POINTS: &[&str] = &[
 /// two notification extensions that need one, and none at all for the rest, the EventBridge
 /// one publishing to the account's default event bus.
 ///
+/// Each notification row's sentence opens on what that extension DELIVERS and where —
+/// events to Amazon EventBridge, events to the configured Amazon SNS topic, messages to the
+/// configured Amazon SQS queue — and only the remainder of the sentence is shared between
+/// them, so a row's sentence is copied from the catalogue entry it belongs to rather than
+/// written from a sibling's.
+///
 /// What is INFERRED rather than published, and so may be corrected by any later reading of
-/// one of these extensions: the prose `name` of the three notification rows, the published
-/// sentence of the SNS and SQS rows (written to the one the EventBridge row publishes,
-/// which the three share but for the destination it names), and every row's
+/// one of these extensions: the prose `name` of the three notification rows, and every row's
 /// `action_points`, which are read off what the extension's own description says it does
 /// (see each row's comment) because the catalogue listing does not report an extension's
 /// actions at all. Each is a value a reader of this catalogue should treat as this
@@ -2366,10 +2370,10 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
     AwsAuthoredExtension {
         id: "AWS.AppConfig.DeploymentNotificationsToSns",
         name: "AppConfig deployment events to Amazon SNS",
-        description: "Sends events to an Amazon SNS topic when a deployment of configuration \
-                      data in AppConfig is started, completed, or rolled back. Can be associated \
-                      to the following resources in AppConfig: Application, Environment, \
-                      Configuration Profile.",
+        description: "Sends events to the configured Amazon SNS topic when a deployment of \
+                      configuration data in AppConfig is started, completed, or rolled back. Can \
+                      be associated to the following resources in AppConfig: Application, \
+                      Environment, Configuration Profile.",
         action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
         parameters: &[AwsAuthoredParameter {
             name: "topicArn",
@@ -2381,10 +2385,10 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
     AwsAuthoredExtension {
         id: "AWS.AppConfig.DeploymentNotificationsToSqs",
         name: "AppConfig deployment events to Amazon SQS",
-        description: "Sends events to an Amazon SQS queue when a deployment of configuration \
-                      data in AppConfig is started, completed, or rolled back. Can be associated \
-                      to the following resources in AppConfig: Application, Environment, \
-                      Configuration Profile.",
+        description: "Sends messages to the configured Amazon SQS queue when a deployment of \
+                      configuration data in AppConfig is started, completed, or rolled back. Can \
+                      be associated to the following resources in AppConfig: Application, \
+                      Environment, Configuration Profile.",
         action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
         parameters: &[AwsAuthoredParameter {
             name: "queueArn",

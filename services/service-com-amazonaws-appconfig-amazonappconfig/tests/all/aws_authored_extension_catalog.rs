@@ -41,11 +41,8 @@ struct PublishedExtension {
     id: &'static str,
     /// The prose name published beside the id.
     name: &'static str,
-    /// The published sentence describing what the extension does, verbatim, for an entry
-    /// whose sentence this suite's source quotes; `None` for one it does not, where what is
-    /// asserted is the rule itself — the entry carries a published sentence, the same one
-    /// however it is read — rather than a text written here.
-    description: Option<&'static str>,
+    /// The published sentence describing what the extension does, verbatim.
+    description: &'static str,
     /// The parameter names an association of this extension supplies values for.
     parameters: &'static [&'static str],
 }
@@ -59,67 +56,66 @@ const DESCRIPTION_MAX: usize = 1024;
 /// its own.
 ///
 /// Source: the catalogue an AppConfig `ListExtensions` call reports for such an account, as
-/// the issue this suite grew from quotes it entry by entry, together with the AWS AppConfig
-/// User Guide's predefined-extension list for the parameter each association supplies. That
-/// source quotes four of the six published sentences; the Amazon SNS and Amazon SQS rows
-/// carry `None`, so this suite asserts the rule for them rather than a sentence it would
-/// have had to invent.
+/// the issues this suite grew from quote it entry by entry, together with the AWS AppConfig
+/// User Guide's predefined-extension list for the parameter each association supplies. The
+/// rows differ in how their sentence opens as well as in which product it names: the
+/// EventBridge entry sends events to EventBridge, the Amazon SNS entry events to the
+/// configured topic and the Amazon SQS entry messages to the configured queue, so no row's
+/// sentence can be read off a sibling's.
 const PUBLISHED_CATALOGUE: &[PublishedExtension] = &[
     PublishedExtension {
         id: "AWS.AppConfig.FeatureFlags",
         name: "AppConfig Feature Flags Helper",
-        description: Some(
-            "Validates AppConfig feature flag data automatically against a JSON schema that \
-             includes structure and constraints. Also transforms feature flag data prior to \
-             sending to the client. This extension is automatically associated to configuration \
-             profiles with type \"AWS.AppConfig.FeatureFlags\".",
-        ),
+        description: "Validates AppConfig feature flag data automatically against a JSON schema \
+                      that includes structure and constraints. Also transforms feature flag data \
+                      prior to sending to the client. This extension is automatically associated \
+                      to configuration profiles with type \"AWS.AppConfig.FeatureFlags\".",
         parameters: &[],
     },
     PublishedExtension {
         id: "AWS.AppConfig.JiraIntegration",
         name: "AppConfig integration with Atlassian Jira",
-        description: Some(
-            "Exports feature flag data from AWS AppConfig into Jira. The lifecycle of each \
-             feature flag in AppConfig is tracked in Jira as an individual issue. Customers can \
-             see in Jira when flags are updated, turned on or off. Works in conjunction with the \
-             AppConfig app in the Atlassian Marketplace and is automatically associated to \
-             configuration profiles configured within that app.",
-        ),
+        description: "Exports feature flag data from AWS AppConfig into Jira. The lifecycle of \
+                      each feature flag in AppConfig is tracked in Jira as an individual issue. \
+                      Customers can see in Jira when flags are updated, turned on or off. Works \
+                      in conjunction with the AppConfig app in the Atlassian Marketplace and is \
+                      automatically associated to configuration profiles configured within that \
+                      app.",
         parameters: &[],
     },
     PublishedExtension {
         id: "AWS.Evidently.ProjectImporter",
         name: "Amazon CloudWatch Evidently Project importer",
-        description: Some(
-            "Imports Evidently Project data for use with its client-side evaluation feature, \
-             powered by AppConfig. This extension is automatically associated to \
-             ConfigurationProfiles created by Evidently.",
-        ),
+        description: "Imports Evidently Project data for use with its client-side evaluation \
+                      feature, powered by AppConfig. This extension is automatically associated \
+                      to ConfigurationProfiles created by Evidently.",
         parameters: &[],
     },
     PublishedExtension {
         id: "AWS.AppConfig.DeploymentNotificationsToEventBridge",
         name: "AppConfig deployment events to Amazon EventBridge",
-        description: Some(
-            "Sends events to Amazon EventBridge when a deployment of configuration data in \
-             AppConfig is started, completed, or rolled back. Can be associated to the following \
-             resources in AppConfig: Application, Environment, Configuration Profile.",
-        ),
+        description: "Sends events to Amazon EventBridge when a deployment of configuration data \
+                      in AppConfig is started, completed, or rolled back. Can be associated to \
+                      the following resources in AppConfig: Application, Environment, \
+                      Configuration Profile.",
         parameters: &[],
     },
     PublishedExtension {
         id: "AWS.AppConfig.DeploymentNotificationsToSns",
         name: "AppConfig deployment events to Amazon SNS",
-        // The source this table is written from does not quote this entry's sentence.
-        description: None,
+        description: "Sends events to the configured Amazon SNS topic when a deployment of \
+                      configuration data in AppConfig is started, completed, or rolled back. Can \
+                      be associated to the following resources in AppConfig: Application, \
+                      Environment, Configuration Profile.",
         parameters: &["topicArn"],
     },
     PublishedExtension {
         id: "AWS.AppConfig.DeploymentNotificationsToSqs",
         name: "AppConfig deployment events to Amazon SQS",
-        // The source this table is written from does not quote this entry's sentence.
-        description: None,
+        description: "Sends messages to the configured Amazon SQS queue when a deployment of \
+                      configuration data in AppConfig is started, completed, or rolled back. Can \
+                      be associated to the following resources in AppConfig: Application, \
+                      Environment, Configuration Profile.",
         parameters: &["queueArn"],
     },
 ];
@@ -223,9 +219,9 @@ async fn the_authored_catalogue_is_exactly_the_published_entry_set() {
     }
 }
 
-/// Every published entry carries AppConfig's published description — the quoted sentence
-/// where this suite's source quotes one, and in every case a sentence within the modelled
-/// bound that every reader of the entry reports identically.
+/// Every published entry carries AppConfig's published description verbatim — the sentence
+/// published for THAT extension, within the modelled bound, reported identically by every
+/// reader of the entry.
 ///
 /// Rows: the whole published catalogue. Cases within a row: the listing's summary, and
 /// `GetExtension` by id, by prose name, by the ARN of the published version, and by that
@@ -249,14 +245,12 @@ async fn every_published_entry_reports_its_published_description_verbatim() {
             .unwrap_or_else(|| {
                 panic!("case {case:?}: a published entry carries a description, got {summary}")
             });
-        if let Some(quoted) = published.description {
-            assert_eq!(
-                served, quoted,
-                "case {case:?}: expected the published description, got {served:?}"
-            );
-        }
-        // Published for every entry, whether or not this suite quotes the sentence: text
-        // AppConfig keys to the extension, within the member's modelled bound.
+        assert_eq!(
+            served, published.description,
+            "case {case:?}: expected the published description, got {served:?}"
+        );
+        // Published for every entry: text AppConfig keys to the extension, within the
+        // member's modelled bound.
         assert!(
             !served.trim().is_empty() && served.len() <= DESCRIPTION_MAX,
             "case {case:?}: expected a published sentence of at most {DESCRIPTION_MAX} \
