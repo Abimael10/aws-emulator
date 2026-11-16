@@ -405,6 +405,12 @@ pub use page_token_form::*;
 mod task_definition_capabilities;
 pub use task_definition_capabilities::*;
 
+/// The task placement CONSTRAINTS a placement is held to: the one task per container
+/// instance a `distinctInstance` constraint caps a group at, and the hosts a task it leaves
+/// unplaced is reported as rejected on.
+mod task_placement_constraints;
+pub use task_placement_constraints::*;
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";

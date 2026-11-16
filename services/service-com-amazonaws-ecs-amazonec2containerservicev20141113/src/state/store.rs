@@ -3475,6 +3475,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         } else {
             room.placements
         };
+        // What the service's own placement constraints leave room for: a service whose
+        // constraints ask for distinct instances places at most one task of its group per
+        // container instance, so a pass places as many as there are free hosts and the
+        // scheduler comes back for the rest when more capacity registers
+        // ([`Self::constrained_placement_room`]).
+        let placements = self.constrained_placement_room(
+            &service.cluster_name,
+            &format!("service:{}", service.name),
+            placement.launch_type.as_deref(),
+            &service.placement_constraints,
+            placements,
+        );
         // Nothing is changed when the placement would not fit: the cap is checked before
         // the first task is touched.
         if self.tasks.len() + placements > MAX_TASKS {
@@ -3576,6 +3588,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         live.sort();
 
         let to_place = desired.saturating_sub(live.len());
+        // The same room the service's own scheduler is held to: a task set of a service
+        // whose constraints ask for distinct instances places at most one task of the group
+        // per container instance ([`Self::constrained_placement_room`]).
+        let to_place = self.constrained_placement_room(
+            &task_set.cluster_name,
+            &format!("service:{}", service.name),
+            placement.launch_type.as_deref(),
+            &service.placement_constraints,
+            to_place,
+        );
         if self.tasks.len() + to_place > MAX_TASKS {
             return Err(TaskCapacityExceeded);
         }
@@ -3735,8 +3757,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             ),
             placement.platform_version.as_deref(),
         );
+        // The group every task of a service belongs to, which is what a `distinctInstance`
+        // constraint caps at one task per container instance
+        // ([`super::requires_distinct_instances`]).
+        let group = format!("service:{}", service.name);
+        // The host this task takes: a service whose placement constraints cap it at one task
+        // per container instance gets one that runs no task of the group yet, and any other
+        // service the scheduler's ordinary choice ([`super::caps_distinct_instances`], which
+        // is what keeps a placement made on no container instance at all — Fargate, or a
+        // capacity provider — out of the cap).
         let container_instance_arn =
-            self.select_task_host(&service.cluster_name, placement.launch_type.as_deref());
+            if caps_distinct_instances(&service.placement_constraints, placement.launch_type.as_deref())
+            {
+                self.select_distinct_task_host(
+                    &service.cluster_name,
+                    &group,
+                    placement.launch_type.as_deref(),
+                )
+            } else {
+                self.select_task_host(&service.cluster_name, placement.launch_type.as_deref())
+            };
         let availability_zone = self.task_availability_zone(
             container_instance_arn.as_deref(),
             &configured_subnets(placement.network_configuration.as_ref()),
@@ -3784,7 +3824,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             started_by: Some(placement.started_by.clone()),
             // `Task$group`: "The name of the task group associated with the task", which
             // for a service's task is `service:<service name>`.
-            group: format!("service:{}", service.name),
+            group,
             service_name: Some(service.name.clone()),
             // A service's task belongs to no daemon: the two schedulers place their own
             // tasks and neither maintains the other's.

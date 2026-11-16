@@ -682,6 +682,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| format!("family:{}", definition.family));
 
+        // WHICH hosts this run may place its tasks on, under the constraints it states:
+        // "Use distinctInstance to ensure that each task in a particular group is running
+        // on a different container instance", so such a run places at most one task of its
+        // group per container instance and reports the hosts the surplus was rejected on
+        // rather than over-placing or refusing the whole call
+        // ([`crate::state::DistinctInstancePlacement`]). A run stating no such constraint —
+        // and one whose placement is not made on the cluster's own container instances at
+        // all, which is what the constraint is over ([`crate::state::caps_distinct_instances`])
+        // — is placed by the scheduler's ordinary choice, one host per task
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::select_task_host`]).
+        let constrained = crate::state::caps_distinct_instances(
+            input.placement_constraints.as_deref().unwrap_or_default(),
+            launch_type.as_deref(),
+        )
+        .then(|| {
+            guard.distinct_instance_placement(
+                &cluster_name,
+                &group,
+                launch_type.as_deref(),
+                requested,
+            )
+        });
+        // A constrained run places one task per host it was given, so it may place fewer
+        // tasks than were asked for; an unconstrained one places every task asked for.
+        let placing = constrained
+            .as_ref()
+            .map_or(requested, |placement| placement.hosts.len());
+        let failures = constrained
+            .as_ref()
+            .map_or_else(Vec::new, crate::state::DistinctInstancePlacement::failures);
+
         // "Specifies whether to propagate the tags from the task definition to the
         // task. If no value is specified, the tags aren't propagated."
         let tags = crate::state::standalone_task_tags(
@@ -726,8 +757,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|name| guard.capacity_providers.get(name)),
             guard.registered_container_instances(&cluster_name),
         );
-        let mut created = Vec::with_capacity(requested);
-        for _ in 0..count {
+        let mut created = Vec::with_capacity(placing);
+        for placed in 0..placing {
             let task_id = guard.next_task_id();
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
             // The elastic network interface an `awsvpc` task is allocated, out of the
@@ -747,8 +778,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition.container_definitions,
                 schedule.last_status,
             );
-            let container_instance_arn =
-                guard.select_task_host(&cluster_name, launch_type.as_deref());
+            // The host this task takes: the one the constrained placement reserved for it,
+            // else the scheduler's ordinary choice.
+            let container_instance_arn = match constrained.as_ref() {
+                Some(placement) => placement.hosts.get(placed).cloned(),
+                None => guard.select_task_host(&cluster_name, launch_type.as_deref()),
+            };
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),
@@ -878,7 +913,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(RunTaskOutput {
             tasks: Some(created),
-            failures: Some(Vec::new()),
+            // "Any failures associated with the call": one entry per candidate host a task
+            // this run could not place was rejected on, and none for a run that placed
+            // every task it was asked for.
+            failures: Some(failures),
         })
     }
 }

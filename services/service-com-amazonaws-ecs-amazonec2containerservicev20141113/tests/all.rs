@@ -109,6 +109,8 @@ mod deployment_rollout_report_coupling;
 mod describe_failure_identifiers;
 #[path = "all/describe_service_deployments.rs"]
 mod describe_service_deployments;
+#[path = "all/distinct_instance_placement.rs"]
+mod distinct_instance_placement;
 #[path = "all/domain_refusal_wording.rs"]
 mod domain_refusal_wording;
 #[path = "all/draining_instance_relocation.rs"]
