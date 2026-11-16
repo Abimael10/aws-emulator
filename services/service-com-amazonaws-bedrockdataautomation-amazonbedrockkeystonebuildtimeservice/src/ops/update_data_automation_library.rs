@@ -153,8 +153,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Only ARN minting needs the request's region, and this operation mints
-        // nothing: it keys on the `libraryArn` the caller supplies.
-        let _ = ctx;
+        // nothing: it keys on the `libraryArn` the caller supplies — which has to be an ARN
+        // this endpoint admits, decided on the INPUT before the lookup
+        // (`crate::state::library_arn`).
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                UpdateDataAutomationLibraryErrorModeled::ValidationException(refusal).into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateDataAutomationLibraryError::Modeled(
                 UpdateDataAutomationLibraryErrorModeled::InternalServerException(
@@ -170,8 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The refusal for a `libraryArn` that resolves to no stored library is the
         // service's FIXED sentence, single-homed in `crate::state`, with nothing taken
-        // from the request — the same sentence `GetDataAutomationLibrary` answers.
-        let Some(record) = store.libraries.get_mut(&input.library_arn) else {
+        // from the request — the same sentence `GetDataAutomationLibrary` answers. The
+        // lookup materialises the library removals the clock has already made due first, so
+        // an update of a library whose delete has settled is that refusal too.
+        let Some(record) =
+            store.live_library_mut(&input.library_arn, ::std::time::SystemTime::now())
+        else {
             return Err(
                 UpdateDataAutomationLibraryErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

@@ -171,6 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The `libraryArn` this submission ingests into has to be one this endpoint admits:
+        // refused on the INPUT, before anything is resolved or minted, with the rule and the
+        // sentence single-homed in `crate::state::library_arn`.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                InvokeDataAutomationLibraryIngestionJobErrorModeled::ValidationException(refusal)
+                    .into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             InvokeDataAutomationLibraryIngestionJobError::Modeled(
                 InvokeDataAutomationLibraryIngestionJobErrorModeled::InternalServerException(
@@ -192,7 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // submission's Amazon S3 locations below: no lock of this service's state is held
         // across that in-process call.
         {
-            let store = state.lock();
+            let mut store = state.lock();
+            // A library whose delete has settled resolves to nothing, which is the refusal
+            // below (`crate::state::library_deletion`).
+            store.settle_library_deletions(::std::time::SystemTime::now());
             if !store.libraries.contains_key(&input.library_arn) {
                 return Err(
                     InvokeDataAutomationLibraryIngestionJobErrorModeled::ResourceNotFoundException(
@@ -334,7 +346,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             store.ingestion_job_idempotency.insert(token, job_arn.clone());
         }
+        let (ingested_library, ingested_type) = (record.library_arn.clone(), record.entity_type.clone());
+        let populates = record.operation_type == crate::state::library_entity_types::UPSERT_OPERATION;
         store.ingestion_jobs.insert(job_arn.clone(), record);
+
+        // An accepted UPSERT submission gives the LIBRARY the entity type it names: from
+        // here on `GetDataAutomationLibrary` reports that type among the library's
+        // `entityTypes`, with the metadata derived from the jobs this store holds for the
+        // pair (`crate::state::library_entity_types`). Recorded after the job is stored, so
+        // the submission being accepted is one of the jobs that metadata counts.
+        if populates {
+            store.record_library_entity_type(&ingested_library, &ingested_type);
+        }
 
         // Answer with the identity of the job that is now PERSISTED, read back out of the
         // store rather than from the value just built: a later

@@ -140,7 +140,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A `libraryArn` of another Region addresses nothing this endpoint serves: that is a
+        // fact about the INPUT, decided before the lookup, so it is the modelled
+        // `ValidationException` rather than a resource that happens to be missing. The rule
+        // and its sentence are single-homed in `crate::state::library_arn`.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(GetDataAutomationLibraryErrorModeled::ValidationException(refusal).into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetDataAutomationLibraryError::Modeled(
                 GetDataAutomationLibraryErrorModeled::InternalServerException(
@@ -152,22 +158,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
 
         // The refusal for a `libraryArn` that resolves to nothing is the service's
         // FIXED sentence, single-homed in `crate::state`, with nothing taken from the
-        // request.
-        let record = store.libraries.get(&input.library_arn).ok_or_else(|| {
-            GetDataAutomationLibraryErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-        })?;
+        // request. The lookup goes through `live_library`, which first materialises the
+        // library removals the clock has already made due, so a library whose delete has
+        // settled resolves to nothing here — that write is owed at the same instant whether
+        // or not anybody called, which is why a read may take it.
+        let record = store
+            .live_library(&input.library_arn, ::std::time::SystemTime::now())
+            .ok_or_else(|| {
+                GetDataAutomationLibraryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?;
 
-        // A read REPORTS the stored record and writes nothing: a library this
-        // service has created is ACTIVE from the create onwards, so there is no
-        // transition for a read to materialise.
+        // A read REPORTS the stored record and moves nothing of its own: the status it
+        // answers is the record's — ACTIVE, or DELETING while the removal an accepted delete
+        // owes is still settling.
         Ok(GetDataAutomationLibraryOutput {
             library: Some(record.to_library()),
         })

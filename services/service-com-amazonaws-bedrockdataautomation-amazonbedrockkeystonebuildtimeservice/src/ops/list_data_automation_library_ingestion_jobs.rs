@@ -151,7 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The `libraryArn` this listing is OF has to be one this endpoint admits: refused on
+        // the INPUT, before any lookup, with the rule and the sentence single-homed in
+        // `crate::state::library_arn`.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                ListDataAutomationLibraryIngestionJobsErrorModeled::ValidationException(refusal)
+                    .into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListDataAutomationLibraryIngestionJobsError::Modeled(
                 ListDataAutomationLibraryIngestionJobsErrorModeled::InternalServerException(
@@ -163,8 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        // A read: it only projects what is already stored.
-        let store = state.lock();
+        // A read: it projects what is already stored, having first materialised the library
+        // removals the clock has already made due — the jobs of a library whose delete has
+        // settled went with it (`crate::state::library_deletion`).
+        let mut store = state.lock();
+        // ONE clock read for the whole call, so the removals it materialises and the
+        // statuses it reports are as of one instant.
+        let now = ::std::time::SystemTime::now();
+        store.settle_library_deletions(now);
 
         // The listing is OF one library, named by the request's required `libraryArn`, so
         // an ARN this store holds no library under has no job collection to enumerate:
@@ -229,7 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // ONE clock read for the whole page, so two items of one page cannot be reported
         // as of two different instants.
-        let now = ::std::time::SystemTime::now();
         Ok(ListDataAutomationLibraryIngestionJobsOutput {
             jobs: Some(page.iter().map(|record| record.to_summary(now)).collect()),
             next_token,

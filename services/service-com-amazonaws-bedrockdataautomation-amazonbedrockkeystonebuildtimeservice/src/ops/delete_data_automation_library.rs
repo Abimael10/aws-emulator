@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataAutomationLibrary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataAutomationLibrary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataAutomationLibrary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts the deletion of ONE DataAutomationLibrary and answers the status that leaves it
+//! in. The removal itself is owed by the clock rather than performed here
+//! (`crate::state::library_deletion`): the library reports `DELETING` from this call
+//! onwards, and from the instant the removal falls due it resolves to nothing — a read of it
+//! is the modelled `ResourceNotFoundException`, a listing no longer enumerates it, and its
+//! `libraryName` is free for another create.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataAutomationLibrary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataAutomationLibraryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataAutomationLibrary"))
+        // A `libraryArn` of another Region addresses nothing this endpoint serves: refused
+        // on the INPUT, before the lookup, with the rule and the sentence single-homed in
+        // `crate::state::library_arn` — the same admission check the library's read and
+        // update take.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                DeleteDataAutomationLibraryErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDataAutomationLibraryError::Modeled(
+                DeleteDataAutomationLibraryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // ONE clock read backs both the removals already due and the instant this
+        // deletion's own removal falls due, so the two cannot come from two different
+        // reads.
+        let now = ::std::time::SystemTime::now();
+        // A library whose earlier delete has already settled resolves to nothing, which is
+        // the refusal below — the same sentence a read of it gives.
+        store.settle_library_deletions(now);
+
+        // The delete is `@idempotent`: accepting it again leaves the library with the due
+        // instant the FIRST delete set, so repeating the call cannot postpone a removal.
+        let accepted = store
+            .accept_library_deletion(&input.library_arn, now)
+            .ok_or_else(|| {
+                DeleteDataAutomationLibraryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?;
+
+        // Answered from the record that is now PERSISTED, so the status this call reports is
+        // the one a read of the library reports until the removal settles.
+        let library = accepted.to_library();
+        Ok(DeleteDataAutomationLibraryOutput {
+            library_arn: Some(library.library_arn),
+            status: Some(library.status),
+        })
     }
 }

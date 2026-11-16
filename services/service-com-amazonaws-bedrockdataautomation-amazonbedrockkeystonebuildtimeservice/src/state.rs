@@ -60,6 +60,22 @@ pub mod library_ingestion;
 /// account's object store holds. Used by `InvokeDataAutomationLibraryIngestionJob`.
 pub mod ingestion_locations;
 
+/// The entity types a DataAutomationLibrary holds — the one its create provisions and the
+/// ones ingestion populates — and the metadata a read reports for each. Used by
+/// `CreateDataAutomationLibrary`, `InvokeDataAutomationLibraryIngestionJob` and
+/// `GetDataAutomationLibrary`.
+pub mod library_entity_types;
+
+/// Which `DataAutomationLibraryArn` this service admits on its input, and what it answers
+/// for one it does not. Used by every operation that resolves a `libraryArn`.
+pub mod library_arn;
+
+/// What `DeleteDataAutomationLibrary` starts, and what the clock owes it: the status a
+/// library reports while its deletion is settling, and the removal every later call
+/// materialises. Used by `DeleteDataAutomationLibrary` and by every operation that resolves
+/// a `libraryArn`.
+pub mod library_deletion;
+
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
 ///
 /// `CreateBlueprintRequest$blueprintStage` is OPTIONAL and targets the enum
@@ -775,25 +791,36 @@ pub const LIBRARY_NAME_CONFLICT_MESSAGE: &str =
     "A library with this name already exists. Please choose a different name.";
 
 /// [`BLUEPRINT_ARN_NOT_FOUND_MESSAGE`] for a library: what this service answers when
-/// a `libraryArn` it was handed names no DataAutomationLibrary this store holds. The
-/// resource kind is named the way this service names it in a refusal (`Library`), and
-/// nothing is taken from the request.
-pub const LIBRARY_ARN_NOT_FOUND_MESSAGE: &str = "Library Arn not found.";
+/// a `libraryArn` it was handed names no DataAutomationLibrary this store holds.
+///
+/// RECORDED for this resource kind: the read of a library whose delete has settled answers
+/// this sentence, which is entirely FIXED text — it carries no ARN, name or id from the
+/// request — so it is spelled once here and never formatted. The blueprint and the project
+/// word the same class differently ([`BLUEPRINT_ARN_NOT_FOUND_MESSAGE`],
+/// [`PROJECT_ARN_NOT_FOUND_MESSAGE`]), each as its own recording words it.
+pub const LIBRARY_ARN_NOT_FOUND_MESSAGE: &str = "The specified library Arn not found.";
 
 /// A stored DataAutomationLibrary: exactly the members the modeled
 /// `DataAutomationLibrary` shape carries, plus the tag list the create accepted.
 ///
-/// No status member: the only status a stored library has is [`LIBRARY_ACTIVE`]
-/// (see that constant), so there is nothing per-record to keep.
+/// No status member: a stored library is [`LIBRARY_ACTIVE`] until a delete is accepted for
+/// it, from which instant its status is read off [`Self::deletion_due`] (see
+/// [`library_deletion`]), so there is no status to keep per record.
 #[derive(Debug, Clone)]
 pub struct DataAutomationLibraryRecord {
     pub library_arn: String,
     pub library_name: String,
     pub library_description: Option<String>,
     pub creation_time: ::aws_smithy_types::DateTime,
-    /// The entity types this library HOLDS, which is what a read reports. A create
-    /// stands the library up empty; entities arrive through an ingestion job.
+    /// The entity types this library HOLDS, which is what a read reports: the one its
+    /// create provisioned, plus the ones ingestion has populated
+    /// ([`library_entity_types`]).
     pub entity_types: Vec<EntityTypeInfo>,
+    /// When the removal `DeleteDataAutomationLibrary` accepted for this library falls due,
+    /// and `None` for a library no delete has been accepted for. A library carrying one
+    /// reports [`library_deletion::LIBRARY_DELETING`] until the next call materialises the
+    /// removal ([`library_deletion`] states the whole rule).
+    pub deletion_due: Option<SystemTime>,
     pub kms_key_id: Option<String>,
     pub kms_encryption_context: Option<HashMap<String, String>>,
     pub tags: Vec<Tag>,
@@ -811,12 +838,31 @@ impl DataAutomationLibraryRecord {
             creation_time: self.creation_time,
             library_name: self.library_name.clone(),
             library_description: self.library_description.clone(),
-            status: LIBRARY_ACTIVE.to_string(),
-            // What the record HOLDS, so a library standing up empty reports an empty
-            // list rather than inventing an entity type it was never given.
+            // ACTIVE until a delete is accepted for it, DELETING from then until the
+            // removal the clock owes is materialised and the library resolves to nothing.
+            status: self.status().to_string(),
+            // What the record HOLDS: the type its create provisioned and every type an
+            // ingestion has populated, each with the metadata derived from the jobs this
+            // store holds for it ([`library_entity_types`]).
             entity_types: Some(self.entity_types.clone()),
             kms_key_id: self.kms_key_id.clone(),
             kms_encryption_context: self.kms_encryption_context.clone(),
+        }
+    }
+
+    /// The modelled `DataAutomationLibraryStatus` this library reports: the ready status
+    /// until a delete is accepted for it, and [`library_deletion::LIBRARY_DELETING`] from
+    /// then on.
+    ///
+    /// A pure function of the stored record, so reporting it writes nothing. Which library
+    /// records still EXIST is [`library_deletion`]'s question: once the removal falls due
+    /// the record is gone, so no read can report `DELETING` for ever.
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        if self.deletion_due.is_some() {
+            library_deletion::LIBRARY_DELETING
+        } else {
+            LIBRARY_ACTIVE
         }
     }
 

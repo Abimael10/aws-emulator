@@ -331,10 +331,18 @@ async fn an_update_persists_the_description_the_request_carries() {
             "case {case:?}: an updated library reads back {}: {fetched:?}",
             state::LIBRARY_ACTIVE
         );
+        let held: Vec<String> = fetched
+            .get("entityTypes")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no entityTypes in {fetched:?}"))
+            .iter()
+            .map(|item| string_at(item, "entityType", case))
+            .collect();
         assert_eq!(
-            fetched.get("entityTypes").and_then(Value::as_array),
-            Some(&Vec::new()),
-            "case {case:?}: an update must not invent entityTypes: {fetched:?}"
+            held,
+            vec![state::library_entity_types::PROVISIONED_ENTITY_TYPE.to_string()],
+            "case {case:?}: an update must leave the entity types the library held: \
+             {fetched:?}"
         );
         assert_eq!(
             fetched.get("kmsEncryptionContext"),
@@ -492,17 +500,19 @@ async fn updating_a_library_arn_that_resolves_to_nothing_is_the_modeled_404() {
     let (router, engine) = emulator();
 
     // Every row is a well-formed `DataAutomationLibraryArn` (so the modelled pattern
-    // admits it and the request reaches the handler) that names no stored library: a
-    // never-created id, an id in another region, and an id at each published bound of
-    // the modelled 12..36 id length.
+    // admits it and the request reaches the handler) that names no stored library, in the
+    // Region the request is signed for — a never-created id, an id carrying the pattern's
+    // hyphen, and an id at each published bound of the modelled 12..36 id length. An ARN of
+    // ANOTHER Region is not a lookup miss at all but an input the endpoint does not admit;
+    // `tests/all/library_arn_region_admission.rs` covers that class.
     let unknown = [
         (
             "never created",
             "arn:aws:bedrock:us-east-1:000000000000:data-automation-library/0000000a-00000000000000ff",
         ),
         (
-            "another region",
-            "arn:aws:bedrock:eu-west-1:000000000000:data-automation-library/dead-beef-1234",
+            "an id carrying the pattern's hyphen",
+            "arn:aws:bedrock:us-east-1:000000000000:data-automation-library/dead-beef-1234",
         ),
         (
             "id at the 12-character lower bound",

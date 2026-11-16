@@ -166,10 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // Every library removal the clock has already made due is materialised first, so a
+        // create under the `libraryName` of a library whose delete has settled is a create
+        // rather than the conflict below — a released name is free
+        // (`crate::state::library_deletion`).
+        let (created_at_instant, created_at) = crate::state::now_pair();
+        store.settle_library_deletions(created_at_instant);
+
         // An `@idempotencyToken` replay returns the library the first call created
         // rather than creating a second one, and answers about the record that is
         // STORED — which is what a second call reports.
-        let created_at = crate::state::now();
         if let Some(token) = input.client_token.as_deref() {
             if let Some(arn) = store.library_create_idempotency.get(token).cloned() {
                 if let Some(record) = store.libraries.get(&arn) {
@@ -227,9 +233,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             library_name: input.library_name.clone(),
             library_description: input.library_description,
             creation_time: created_at,
-            // A create stands the library up with no entity types in it; they arrive
-            // through an ingestion job, never through the create.
-            entity_types: Vec::new(),
+            // A create stands the library up holding the entity type it provisions; the
+            // other modelled type arrives through an ingestion job
+            // (`crate::state::library_entity_types`).
+            entity_types: crate::state::library_entity_types::provisioned_entity_types(),
+            // No delete has been accepted for a library this call is standing up, so it is
+            // ACTIVE and no removal is owed for it.
+            deletion_due: None,
             kms_key_id,
             kms_encryption_context,
             tags: input.tags.unwrap_or_default(),

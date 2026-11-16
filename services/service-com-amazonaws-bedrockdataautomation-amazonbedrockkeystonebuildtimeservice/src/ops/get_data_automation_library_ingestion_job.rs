@@ -148,7 +148,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The `libraryArn` this job is addressed through has to be one this endpoint admits:
+        // refused on the INPUT, before any lookup, with the rule and the sentence
+        // single-homed in `crate::state::library_arn`.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                GetDataAutomationLibraryIngestionJobErrorModeled::ValidationException(refusal)
+                    .into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetDataAutomationLibraryIngestionJobError::Modeled(
                 GetDataAutomationLibraryIngestionJobErrorModeled::InternalServerException(
@@ -160,8 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        // A read: it only projects what is already stored.
-        let store = state.lock();
+        // A read: it projects what is already stored, having first materialised the library
+        // removals the clock has already made due — a job of a library whose delete has
+        // settled went with it (`crate::state::library_deletion`).
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.settle_library_deletions(now);
 
         // The request addresses a job THROUGH its library, so the library has to resolve
         // first: an unresolved `libraryArn` is refused with the service's fixed sentence
@@ -194,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetDataAutomationLibraryIngestionJobOutput {
-            job: Some(record.to_job(::std::time::SystemTime::now())),
+            job: Some(record.to_job(now)),
         })
     }
 }

@@ -3,7 +3,8 @@
 //! The data automation library INGESTION JOB this store holds: the record
 //! `InvokeDataAutomationLibraryIngestionJob` mints, the status the clock owes it, and the
 //! two projections `GetDataAutomationLibraryIngestionJob` and
-//! `ListDataAutomationLibraryIngestionJobs` serve.
+//! `ListDataAutomationLibraryIngestionJobs` serve. What an accepted submission gives the
+//! LIBRARY it ingests into is [`super::library_entity_types`].
 //!
 //! RULE. An ingestion job is a resource OF the one library its `libraryArn` names
 //! (`smithy_query(query="operation",operation="InvokeDataAutomationLibraryIngestionJob")`

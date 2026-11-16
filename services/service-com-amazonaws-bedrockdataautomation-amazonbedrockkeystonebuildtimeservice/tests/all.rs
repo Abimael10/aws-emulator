@@ -19,6 +19,10 @@ mod blueprint_optimization;
 mod blueprint_stage_copy;
 #[path = "all/constraint_requirement_wording.rs"]
 mod constraint_requirement_wording;
+#[path = "all/data_automation_library_deletion.rs"]
+mod data_automation_library_deletion;
+#[path = "all/data_automation_library_entity_types.rs"]
+mod data_automation_library_entity_types;
 #[path = "all/data_automation_library_lifecycle.rs"]
 mod data_automation_library_lifecycle;
 #[path = "all/data_automation_library_listing.rs"]
@@ -35,6 +39,8 @@ mod data_automation_project_update;
 mod identity_authorization;
 #[path = "all/ingestion_submission_consistency.rs"]
 mod ingestion_submission_consistency;
+#[path = "all/library_arn_region_admission.rs"]
+mod library_arn_region_admission;
 #[path = "all/library_ingestion_jobs.rs"]
 mod library_ingestion_jobs;
 #[path = "all/optimization_profile_resolution.rs"]

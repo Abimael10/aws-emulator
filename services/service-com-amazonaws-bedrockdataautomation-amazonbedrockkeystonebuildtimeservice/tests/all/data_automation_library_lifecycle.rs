@@ -377,12 +377,22 @@ async fn a_well_formed_create_answers_the_modeled_201_and_persists_the_library()
                  back none, got {read_context:?}"
             ),
         }
-        // A library stands up with nothing ingested into it, so it reports no entity
-        // type — not one it was never given.
+        // A library stands up holding the entity type its create provisions — recorded for
+        // this resource (`state::library_entity_types`) — and nothing beyond it: the other
+        // modelled type arrives only through an ingestion job, which
+        // `tests/all/data_automation_library_entity_types.rs` covers.
+        let provisioned: Vec<String> = fetched
+            .get("entityTypes")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no entityTypes in {fetched:?}"))
+            .iter()
+            .map(|item| string_at(item, "entityType", case))
+            .collect();
         assert_eq!(
-            fetched.get("entityTypes").and_then(Value::as_array),
-            Some(&Vec::new()),
-            "case {case:?}: a just-created library holds no entityTypes: {fetched:?}"
+            provisioned,
+            vec![state::library_entity_types::PROVISIONED_ENTITY_TYPE.to_string()],
+            "case {case:?}: a just-created library holds the provisioned entity type alone: \
+             {fetched:?}"
         );
         // `creationTime` is `@required`, so a read that omitted it would be
         // unparseable; this also pins the modelled `date-time` wire form.
@@ -579,17 +589,19 @@ async fn a_library_arn_that_resolves_to_nothing_is_the_modeled_404() {
     let router = emulator();
 
     // Every row is a well-formed `DataAutomationLibraryArn` (so the modelled pattern
-    // admits it and the request reaches the handler) that names no stored library: a
-    // never-created id, and an id belonging to a different region and partition-legal
-    // account field.
+    // admits it and the request reaches the handler) that names no stored library, in the
+    // Region the request is signed for: a never-created id, an id carrying the pattern's
+    // hyphen, and an id at the 12-character lower bound. An ARN of ANOTHER Region is not a
+    // lookup miss at all but an input the endpoint does not admit;
+    // `tests/all/library_arn_region_admission.rs` covers that class.
     let unknown = [
         (
             "never created",
             "arn:aws:bedrock:us-east-1:000000000000:data-automation-library/0000000a-00000000000000ff",
         ),
         (
-            "another region",
-            "arn:aws:bedrock:eu-west-1:000000000000:data-automation-library/dead-beef-1234",
+            "an id carrying the pattern's hyphen",
+            "arn:aws:bedrock:us-east-1:000000000000:data-automation-library/dead-beef-1234",
         ),
         (
             "id at the 12-character lower bound",

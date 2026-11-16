@@ -156,8 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        // A read: it only projects what is already stored.
-        let store = state.lock();
+        // A read: it projects what is already stored, having first materialised the library
+        // removals the clock has already made due — that write is owed at the same instant
+        // whether or not anybody called, and it is what keeps a library whose delete has
+        // settled out of the listing (`crate::state::library_deletion`).
+        let mut store = state.lock();
+        store.settle_library_deletions(::std::time::SystemTime::now());
 
         let cursor = match input.next_token.as_deref() {
             None => None,
