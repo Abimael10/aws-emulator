@@ -41,6 +41,8 @@ mod document_default_version;
 mod document_identity_and_deletion;
 #[path = "all/document_listing.rs"]
 mod document_listing;
+#[path = "all/document_permissions.rs"]
+mod document_permissions;
 #[path = "all/document_versions.rs"]
 mod document_versions;
 #[path = "all/cloud_connectors.rs"]

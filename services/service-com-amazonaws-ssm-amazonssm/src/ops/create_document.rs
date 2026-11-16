@@ -365,6 +365,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The default version" of a document that holds one version is that
             // version; `UpdateDocumentDefaultVersion` is what moves it afterwards.
             default_version: crate::state::FIRST_DOCUMENT_VERSION,
+            // A create shares the document with nobody: `ModifyDocumentPermission` is
+            // what records a share on it.
+            shared_with: ::std::collections::BTreeMap::new(),
         };
         let description = record
             .description_of_version(crate::state::DOCUMENT_VERSION_DEFAULT)

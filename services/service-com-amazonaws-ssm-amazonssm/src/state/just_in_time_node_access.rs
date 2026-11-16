@@ -374,6 +374,7 @@ mod tests {
             owner: ::engine::emulator_account_id().to_string(),
             versions: Vec::new(),
             default_version: super::super::FIRST_DOCUMENT_VERSION,
+            shared_with: ::std::collections::BTreeMap::new(),
         }
     }
 

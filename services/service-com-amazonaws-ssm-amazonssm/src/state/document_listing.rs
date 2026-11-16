@@ -242,15 +242,18 @@ impl DocumentListingFilter {
 /// Whether `record` belongs to the owner class `wanted` names.
 ///
 /// `Self` and `Private` both name the documents this account holds: a document created
-/// here is owned by this account and is shared with nobody, because no operation of this
-/// API has recorded a share. By the same token nothing here is owned by every account or
-/// by a third party, so `Public` and `ThirdParty` name no document. A value outside the
-/// published classes ([`DOCUMENT_OWNER_VALUES`]) names no owner at all, which the listing
-/// refuses before the walk, so this arm is a backstop.
+/// here is owned by this account. `Public` names the documents shared with every account,
+/// which is the share `ModifyDocumentPermission` records
+/// ([`super::document_permissions`]), so a document this account has shared publicly
+/// belongs to that class too. Nothing here is published by a third party, so `ThirdParty`
+/// names no document. A value outside the published classes ([`DOCUMENT_OWNER_VALUES`])
+/// names no owner at all, which the listing refuses before the walk, so this arm is a
+/// backstop.
 fn owner_matches(record: &DocumentRecord, wanted: &str) -> bool {
     match wanted {
         OWNER_AMAZON => record.owner == PUBLISHED_DOCUMENT_OWNER,
         OWNER_SELF | OWNER_PRIVATE => record.owner == ::engine::emulator_account_id(),
+        OWNER_PUBLIC => record.is_shared_publicly(),
         _ => false,
     }
 }

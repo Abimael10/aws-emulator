@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDocumentPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDocumentPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Share an SSM document with other accounts, or stop sharing it — the write half of this
+//! service's document-permission slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDocumentPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It records the share on the document itself ([`crate::state::document_permissions`]),
+//! so `DescribeDocumentPermission` reports what this call persisted: each account the
+//! document is shared with, at the version the share named. A share of an account already
+//! shared the document moves it to that version, and a removal outranks an add of the same
+//! account.
+//!
+//! Implementing this operation is what gives `DescribeDocumentPermission` a share to
+//! report, so the two are implemented together.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +163,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDocumentPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDocumentPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDocumentPermission"))
+        use crate::state::document_permissions as permissions;
+
+        // `Name`'s and `SharedDocumentVersion`'s patterns and both account lists' lengths
+        // are MODELLED constraints, so the centralized walk has already refused anything
+        // outside them: reaching here means each list names at most twenty accounts — "you
+        // can specify a maximum of 20 accounts per API operation to share a private
+        // document" — and every value in them is an account id.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ModifyDocumentPermissionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        // `PermissionType` is a modelled enum, so the walk has already refused a value
+        // outside its value set with a `ValidationException` before this handler runs:
+        // this is the backstop that keeps a type this API does not support from ever being
+        // served as if it were the one it does.
+        if !DOCUMENT_PERMISSION_TYPE_VALUES.contains(&input.permission_type.as_str()) {
+            return Err(ModifyDocumentPermissionErrorModeled::InvalidPermissionType(
+                InvalidPermissionType {
+                    message: Some(permissions::INVALID_PERMISSION_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "You must specify a value for this parameter or the AccountIdsToRemove
+        // parameter": a call that names no account in either list asks for no change at
+        // all, which is a request this operation cannot carry out rather than a no-op.
+        let accounts_to_add = input.account_ids_to_add.as_deref().unwrap_or_default();
+        let accounts_to_remove = input.account_ids_to_remove.as_deref().unwrap_or_default();
+        if accounts_to_add.is_empty() && accounts_to_remove.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                permissions::NO_ACCOUNTS_TO_MODIFY,
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The document this shares, resolved the way every document call resolves one —
+        // which also materialises the status move the clock already owed. A name neither
+        // the account's documents nor the published catalogue holds names no document,
+        // which is what `InvalidDocument` reports.
+        let Some(record) = store.resolve_document_for_request(&input.name, &region, now) else {
+            return Err(ModifyDocumentPermissionErrorModeled::InvalidDocument(
+                InvalidDocument {
+                    message: Some(crate::state::document_not_found_message(&input.name)),
+                },
+            )
+            .into());
+        };
+
+        // A document Systems Manager publishes resolves for a read, but "If you created
+        // the document, you are the owner": it is Amazon's to share, so it is not
+        // available to this account to share — the miss `InvalidDocument` reports ("the
+        // document isn't available to the user").
+        if record.owner != ::engine::emulator_account_id() {
+            return Err(ModifyDocumentPermissionErrorModeled::InvalidDocument(
+                InvalidDocument {
+                    message: Some(permissions::NOT_AVAILABLE_TO_SHARE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // What this document's sharing becomes, worked out before anything is written so a
+        // call past a quota persists nothing: removals outrank adds, and the version a
+        // share grants is the one the call named or the default version when it named none.
+        let shared_version = permissions::shared_version(input.shared_document_version.as_deref());
+        let shared = permissions::shared_after(
+            &record.shared_with,
+            accounts_to_add,
+            accounts_to_remove,
+            &shared_version,
+        );
+
+        // The two quotas `DocumentPermissionLimit` publishes: how many accounts ONE
+        // document may be shared privately with, and how many documents this account may
+        // share publicly. A document already shared publicly is one of the publicly shared
+        // documents, so re-sharing it publicly is no new public share.
+        let publicly_shared_elsewhere = store
+            .publicly_shared_documents(&region)
+            .saturating_sub(usize::from(record.is_shared_publicly()));
+        let limit_reached =
+            if permissions::private_accounts(&shared) > permissions::MAX_SHARED_ACCOUNTS {
+                Some(permissions::shared_account_limit_message())
+            } else if permissions::shared_publicly(&shared)
+                && publicly_shared_elsewhere >= permissions::MAX_PUBLICLY_SHARED_DOCUMENTS
+            {
+                Some(permissions::public_share_limit_message())
+            } else {
+                None
+            };
+        if let Some(message) = limit_reached {
+            return Err(ModifyDocumentPermissionErrorModeled::DocumentPermissionLimit(
+                DocumentPermissionLimit {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Persisted on the document itself, so every later read of it — and the delete a
+        // still-shared document refuses — reports this share. A document the account owns
+        // is held in this store, so the lookup resolves; answering success without writing
+        // would report a share nothing holds, which is why a miss is a server failure.
+        let Some(document) = store.document_mut(&region, &record.name) else {
+            return Err(ModifyDocumentPermissionErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the document store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        document.shared_with = shared;
+        Ok(ModifyDocumentPermissionOutput {})
     }
 }

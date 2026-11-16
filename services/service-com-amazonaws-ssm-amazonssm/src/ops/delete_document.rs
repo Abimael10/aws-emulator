@@ -208,6 +208,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "You attempted to delete a document while it is still shared. You must stop
+        // sharing the document before you can delete it" (`InvalidDocumentOperation`): a
+        // document `ModifyDocumentPermission` shares reaches other accounts, so the share
+        // has to be withdrawn before the document — or any version of it — can go.
+        if record.is_shared() {
+            return Err(DeleteDocumentErrorModeled::InvalidDocumentOperation(
+                InvalidDocumentOperation {
+                    message: Some(
+                        crate::state::document_permissions::STILL_SHARED.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // "Some SSM document types require that you specify a Force flag before you can
         // delete the document. For example, you must specify a Force flag to delete a
         // document of type ApplicationConfigurationSchema" (`Force`): a delete of such a

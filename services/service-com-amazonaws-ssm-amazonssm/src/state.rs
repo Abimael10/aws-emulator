@@ -188,6 +188,9 @@ pub mod document_platforms;
 /// narrow it, and the identity each one is reported by.
 pub mod document_listing;
 
+/// Which accounts an SSM document is shared with, and at which version of it.
+pub mod document_permissions;
+
 /// Whether a read may have a `SecureString`'s value decrypted for its caller, which is a
 /// decision the KMS key the value is sealed under makes rather than this service.
 pub mod secure_string;
@@ -3054,6 +3057,11 @@ pub struct DocumentRecord {
     pub versions: Vec<DocumentVersionRecord>,
     /// "The default version", the one a read that names no version resolves to.
     pub default_version: u64,
+    /// The accounts this document is shared with, each mapped to "the version of the
+    /// current document shared with that account": what `ModifyDocumentPermission`
+    /// records and `DescribeDocumentPermission` reports (see [`document_permissions`]).
+    /// Empty for a document nobody has shared, which is every document a create mints.
+    pub shared_with: BTreeMap<String, String>,
 }
 
 /// Why a read's `DocumentVersion` / `VersionName` pair names no version of a document,
@@ -3850,6 +3858,10 @@ impl ComAmazonawsSsmAmazonssmState {
                 active_due: None,
             }],
             default_version: FIRST_DOCUMENT_VERSION,
+            // A document Systems Manager publishes is Amazon's to share and already
+            // reaches every account, so the account reading it has recorded no share of
+            // its own on it.
+            shared_with: BTreeMap::new(),
         })
     }
 

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDocumentPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDocumentPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDocumentPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the accounts an SSM document is shared with, from the sharing
+//! `ModifyDocumentPermission` persisted on that document
+//! ([`crate::state::document_permissions`]): the account ids and, for each one, the
+//! version of the document it is shared at. A document the account did not create is not
+//! its to share — "the name of the document for which you are the owner" — so a permission
+//! read of one Systems Manager publishes is refused rather than reported as shared with
+//! nobody. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDocumentPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDocumentPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDocumentPermission"))
+        use crate::state::document_permissions as permissions;
+
+        // `Name`'s pattern and `MaxResults`'s range are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeDocumentPermissionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        // `PermissionType` is a modelled enum, so the walk has already refused a value
+        // outside its value set with a `ValidationException` before this handler runs:
+        // this is the backstop that keeps a type this API does not support from ever being
+        // served as if it were the one it does.
+        if !DOCUMENT_PERMISSION_TYPE_VALUES.contains(&input.permission_type.as_str()) {
+            return Err(DescribeDocumentPermissionErrorModeled::InvalidPermissionType(
+                InvalidPermissionType {
+                    message: Some(permissions::INVALID_PERMISSION_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let page_size = permissions::permission_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token is the account id a page of this document's sharing stopped at: a
+        // value that is not an account id at all, or one naming an account the document is
+        // not shared with, resumes nothing this read handed out.
+        let invalid_token = || {
+            DescribeDocumentPermissionErrorModeled::InvalidNextToken(InvalidNextToken {
+                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+            })
+        };
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if permissions::is_account_id(token) => Some(token),
+            Some(_) => return Err(invalid_token().into()),
+        };
+
+        // The document the request names, resolved through the endpoint it was signed for
+        // by the one lookup every document read uses; it also materialises the status move
+        // the clock already owed. A name neither the account's documents nor the published
+        // catalogue holds names no document, which is what `InvalidDocument` reports.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = state
+            .lock()
+            .resolve_document_for_request(&input.name, &region, now)
+        else {
+            return Err(DescribeDocumentPermissionErrorModeled::InvalidDocument(
+                InvalidDocument {
+                    message: Some(crate::state::document_not_found_message(&input.name)),
+                },
+            )
+            .into());
+        };
+
+        // "The name of the document for which you are the owner": the catalogue Systems
+        // Manager publishes resolves for a read, but those documents are Amazon's to share
+        // and carry no sharing of this account's. Reporting one as shared with nobody would
+        // answer for permissions that are not this account's to hold, so the read is
+        // refused with the same miss the share of such a document reports — one answer for
+        // the one cause, in the words `InvalidDocument` carries.
+        if record.owner != ::engine::emulator_account_id() {
+            return Err(DescribeDocumentPermissionErrorModeled::InvalidDocument(
+                InvalidDocument {
+                    message: Some(permissions::NOT_AVAILABLE_TO_SHARE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The accounts this document is shared with, as the store holds them: a document
+        // nobody has shared reports the EMPTY list rather than no list at all.
+        if resume_from.is_some_and(|token| !record.shares_with(token)) {
+            return Err(invalid_token().into());
+        }
+        let page = record.sharing_page(resume_from, page_size);
+        Ok(DescribeDocumentPermissionOutput {
+            account_ids: Some(page.account_ids),
+            account_sharing_info_list: Some(page.sharing),
+            next_token: page.next_token,
+        })
     }
 }
