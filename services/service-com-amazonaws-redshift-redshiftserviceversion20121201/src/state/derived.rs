@@ -704,7 +704,9 @@ pub fn vpc_interface_endpoint(
 /// does not set the AQUA configuration status." So the configuration status a
 /// request asks for is IGNORED and the cluster reports the automatic
 /// configuration (`auto`, of the `AquaConfigurationStatus` enum) with AQUA not in
-/// use (`disabled`, of the `AquaStatus` enum).
+/// use (`disabled`, of the `AquaStatus` enum). One rule for every path that
+/// reports a cluster's AQUA configuration — the cluster reads and the retired
+/// `ModifyAquaConfiguration` — so the modify and the read cannot disagree.
 pub fn retired_aqua_configuration() -> AquaConfiguration {
     AquaConfiguration {
         aqua_status: Some("disabled".to_string()),
@@ -712,19 +714,33 @@ pub fn retired_aqua_configuration() -> AquaConfiguration {
     }
 }
 
-/// What a `ModifyAquaConfiguration` call is answered with.
+/// How the retired AQUA path answers a request naming a cluster the account does
+/// not hold.
 ///
-/// The operation is RETIRED — "this operation is retired. Calling this operation
-/// does not change AQUA configuration. Amazon Redshift automatically determines
-/// whether to use AQUA" (`smithy_query(query="doc",
-/// operation="ModifyAquaConfiguration")`) — and the recorded Amazon Redshift
-/// answer to a call of it is the service's internal-failure refusal, carrying
-/// this sentence verbatim: there is no backend left behind the retired path, so
-/// the refusal is decided before the request is looked at and names nothing from
-/// it. The code (`InternalFailure`) and the status (500) are the common AWS
-/// ones, which the model does not list for this operation (its faults are
-/// `ClusterNotFoundFault`, `InvalidClusterStateFault` and
-/// `UnsupportedOperationFault`), so both come from the recording.
+/// `ModifyAquaConfiguration` is RETIRED — "this operation is retired. Calling
+/// this operation does not change AQUA configuration. Amazon Redshift
+/// automatically determines whether to use AQUA" (`smithy_query(query="doc",
+/// operation="ModifyAquaConfiguration")`) — yet it still answers a cluster this
+/// account holds with that cluster's configuration. Only the lookup of a cluster
+/// that is NOT there surfaces, and the recorded Amazon Redshift answer to it is
+/// the service's internal-failure refusal carrying this sentence verbatim: fixed
+/// text with no variable part, naming neither the identifier the request asked
+/// about nor the operation. The code (`InternalFailure`) and the status (500) are
+/// the common AWS ones rather than the `ClusterNotFoundFault` the model lists, so
+/// all three come from the recording.
+///
+/// The two halves of that answer come from DIFFERENT recorded calls, which is why
+/// one of them is a 200 and the other this 500. The call naming a cluster the
+/// account holds is recorded being SERVED: 200 with the cluster's
+/// service-determined configuration, the requested status ignored, and the same
+/// pair reported by a following cluster read (the recorded units
+/// `redshift.aqua-configuration-modify-transition`, which modifies and then
+/// re-reads the cluster, and `redshift.aqua-configuration-modify-input-ignored`,
+/// which asks for two opposite statuses in turn). The call naming an identifier
+/// no cluster was created under is recorded being REFUSED with this sentence (the
+/// recorded unit `redshift.modify-aqua-configuration-unsupported-rejected`). So
+/// the success path is not read off the refusal's recording, nor the refusal off
+/// the success's.
 pub const AQUA_CONFIGURATION_INTERNAL_FAILURE: &str =
     "An internal error has occurred. Please try your query again at a later time.";
 

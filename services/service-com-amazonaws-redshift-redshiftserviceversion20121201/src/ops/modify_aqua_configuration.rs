@@ -1,24 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyAquaConfiguration
-//! The RETIRED AQUA path: every call is answered with Amazon Redshift's
-//! internal-failure refusal, and nothing about any cluster changes.
+//! The RETIRED AQUA path: the call is SERVED, it changes no cluster, and it
+//! reports the AQUA configuration the cluster it names already carries.
 //!
 //! "This operation is retired. Calling this operation does not change AQUA
 //! configuration. Amazon Redshift automatically determines whether to use AQUA"
-//! — so there are two things this operation must NOT do. It must not report a
-//! success, because a 200 carrying the automatic configuration would say the
-//! retired call was served; and it must not resolve the cluster the request
-//! names, because the recorded Amazon Redshift answer to a call naming a cluster
-//! that does not exist is the same refusal as to any other call: the retired path
-//! reaches no backend that could look a cluster up. The refusal is therefore
-//! decided before the request is read at all, and carries the sentence and the
-//! code the recording shows
-//! ([`crate::state::AQUA_CONFIGURATION_INTERNAL_FAILURE`]).
+//! — a retired modification is still an operation ON the cluster it names, so it
+//! keeps that cluster's preconditions and loses only its EFFECT. The
+//! `AquaConfigurationStatus` the request asks for is therefore read and
+//! discarded, no record is written, and the configuration reported back is the
+//! cluster's own — the automatic one every cluster carries
+//! ([`crate::state::retired_aqua_configuration`]), which is exactly what the
+//! cluster reads report for it, so a caller cannot see the modify and the read
+//! disagree. Asking twice for two different statuses therefore answers the same
+//! configuration both times.
 //!
-//! Which AQUA configuration a cluster reports is unaffected and belongs to the
-//! cluster: it is the automatic one every cluster carries
-//! ([`crate::state::retired_aqua_configuration`]), reported by the cluster reads.
+//! Two things the retired path does NOT answer with a success. A cluster this
+//! account does not hold is refused with the service's own internal-failure
+//! sentence rather than with the `ClusterNotFoundFault` the model lists — the
+//! retired path keeps no lookup a caller can read a not-found out of, and that
+//! refusal is what the recording of a call naming an identifier nothing was
+//! created under shows, while the 200 above is what the recording of a call
+//! naming a cluster the account holds shows: two different recorded calls, each
+//! answered here as it was recorded
+//! ([`crate::state::AQUA_CONFIGURATION_INTERNAL_FAILURE`] names both). A cluster
+//! that is not serving is refused with `InvalidClusterStateFault`, one of the two
+//! cluster-state faults the model lists for this operation, worded by the rule
+//! every operation that needs a running cluster words it by
+//! ([`crate::state::invalid_cluster_state_message`]).
+//!
+//! `UnsupportedOperationFault`, the third fault the model lists, is left
+//! unreachable: no recorded call of this operation is refused with it, and the
+//! retired path has no condition of its own left to raise it for.
 //!
 //! ## Shape of an operation
 //!
@@ -97,12 +111,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyAquaConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyAquaConfiguration")]
+// `DependentServiceUnavailableFault` is widened in, exactly as `ModifyCluster`
+// widens it: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyAquaConfiguration",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyAquaConfigurationErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,25 +173,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::MODIFY_AQUA_CONFIGURATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Answer the retired call.
-    ///
-    /// Reads nothing and writes nothing: the refusal is a property of the
-    /// operation, not of the request or of any cluster, so neither the store nor
-    /// the request's own members are looked at.
+    /// Answer the retired call: resolve the cluster, then report its AQUA
+    /// configuration.
     async fn handle(
         &self,
-        _input: Self::Input,
+        input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation reads no record of this service and writes none: the
-        // refusal below is the operation's own, so the engine stays untouched.
-        let _ = &self.engine;
-        // The operation models no fault for "retired", so the refusal travels on
-        // the error channel's `InternalFailure` — the code and the status the
-        // recorded Amazon Redshift answer carries, and the ones a client
-        // branches on.
-        Err(crate::scaffolded::Scaffolded::internal_failure(
-            crate::state::AQUA_CONFIGURATION_INTERNAL_FAILURE,
-        ))
+        // One lock-held step, and nothing is awaited while the store is locked.
+        self.report_aqua_configuration(&input)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyAquaConfiguration<Eng> {
+    /// The AQUA configuration this call reports.
+    ///
+    /// Two preconditions, in the order every cluster modification checks them:
+    /// the cluster has to be one this account holds, and it has to be serving.
+    /// Past them there is nothing left for a RETIRED modification to do, so the
+    /// configuration the cluster already carries is reported back and NO record
+    /// is written — the `AquaConfigurationStatus` the request asked for included,
+    /// which is read off the input and discarded.
+    fn report_aqua_configuration(
+        &self,
+        input: &ModifyAquaConfigurationInput,
+    ) -> Result<ModifyAquaConfigurationOutput, ModifyAquaConfigurationError> {
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyAquaConfigurationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::service_common::clock::now(&*self.engine);
+        let mut store = state.lock();
+        // The only state change this call can cause is the one the CLOCK already
+        // owed every other caller at this instant.
+        store.settle(now);
+
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            // The retired path's own answer to a cluster that is not there, which
+            // is NOT the `ClusterNotFoundFault` the model lists: see
+            // [`st::AQUA_CONFIGURATION_INTERNAL_FAILURE`] for where its code, its
+            // status and its sentence come from.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                st::AQUA_CONFIGURATION_INTERNAL_FAILURE,
+            ));
+        };
+        let cluster = &store.clusters[position].cluster;
+        let cluster_status = cluster.cluster_status.clone().unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(
+                ModifyAquaConfigurationErrorModeled::InvalidClusterStateFault(
+                    InvalidClusterStateFault {
+                        message: Some(st::invalid_cluster_state_message(
+                            &input.cluster_identifier,
+                            &cluster_status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The cluster's own configuration, which is the automatic one every
+        // cluster carries: a cluster record from before that member was derived
+        // reports the same rule rather than nothing.
+        Ok(ModifyAquaConfigurationOutput {
+            aqua_configuration: Some(
+                cluster
+                    .aqua_configuration
+                    .clone()
+                    .unwrap_or_else(st::retired_aqua_configuration),
+            ),
+        })
     }
 }

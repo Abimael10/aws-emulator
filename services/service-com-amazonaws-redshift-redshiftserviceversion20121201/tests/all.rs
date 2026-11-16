@@ -15,6 +15,8 @@
 mod account_attributes;
 #[path = "all/advisor_recommendations.rs"]
 mod advisor_recommendations;
+#[path = "all/aqua_configuration.rs"]
+mod aqua_configuration;
 #[path = "all/authentication_profiles.rs"]
 mod authentication_profiles;
 #[path = "all/batch_delete_cluster_snapshots.rs"]

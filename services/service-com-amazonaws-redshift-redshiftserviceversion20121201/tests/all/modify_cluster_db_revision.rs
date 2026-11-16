@@ -1,25 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ModifyClusterDbRevision` and `ModifyAquaConfiguration`: the two cluster
-//! modifications whose answer is decided before any revision or AQUA work, end to
-//! end over the awsQuery wire.
+//! `ModifyClusterDbRevision`: the cluster modification whose answer is decided
+//! before any revision work, end to end over the awsQuery wire.
 //!
 //! Every case drives a real HTTP request through the same `MultiServiceRouter`
 //! the production router builds (the harness is shared with
 //! [`crate::cluster_lifecycle`]), so each assertion covers the whole walk:
 //! form-urlencoded deserialize -> handler -> XML serialize.
 //!
-//! Two rules are under test, and each row is one member of the class the rule
-//! generalises over rather than one recorded request:
+//! One rule is under test, and each row is one member of the class it
+//! generalises over rather than one recorded request: `ModifyClusterDbRevision`
+//! resolves the CLUSTER first — before the revision the request names is looked
+//! at at all — so a cluster this account does not hold is `ClusterNotFound`
+//! (404), a cluster the service is still working on is `InvalidClusterState`
+//! (400), and a cluster that runs the latest revision this service publishes a
+//! target of is `ClusterOnLatestRevision` (400).
 //!
-//! 1. `ModifyClusterDbRevision` resolves the CLUSTER first — before the revision
-//!    the request names is looked at at all — so a cluster this account does not
-//!    hold is `ClusterNotFound` (404), a cluster the service is still working on
-//!    is `InvalidClusterState` (400), and a cluster that runs the latest revision
-//!    this service publishes a target of is `ClusterOnLatestRevision` (400).
-//! 2. `ModifyAquaConfiguration` is RETIRED: every call is answered with Amazon
-//!    Redshift's internal-failure refusal, whatever the request names and whether
-//!    or not the cluster exists, and no cluster changes.
+//! The retired AQUA modification has its own suite,
+//! [`crate::aqua_configuration`].
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
@@ -233,88 +231,4 @@ async fn a_cluster_on_its_latest_revision_has_nothing_to_be_moved_onto() {
             after.body
         );
     }
-}
-
-#[tokio::test]
-async fn the_retired_aqua_path_answers_the_internal_failure_refusal_for_every_call() {
-    let emulator = Emulator::new();
-    available_cluster(&emulator, "aqua-cluster").await;
-
-    // The class: every call, whatever it names. The cluster is NOT resolved, so
-    // a request naming one this account holds is answered exactly as one naming
-    // a cluster that was never created.
-    let rows: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        (
-            "a cluster this account does not hold",
-            vec![
-                ("ClusterIdentifier", "no-such-cluster"),
-                ("AquaConfigurationStatus", "enabled"),
-            ],
-        ),
-        (
-            "a cluster this account holds, asking for AQUA",
-            vec![
-                ("ClusterIdentifier", "aqua-cluster"),
-                ("AquaConfigurationStatus", "enabled"),
-            ],
-        ),
-        (
-            "a cluster this account holds, asking for no AQUA",
-            vec![
-                ("ClusterIdentifier", "aqua-cluster"),
-                ("AquaConfigurationStatus", "disabled"),
-            ],
-        ),
-        (
-            "the automatic configuration",
-            vec![
-                ("ClusterIdentifier", "aqua-cluster"),
-                ("AquaConfigurationStatus", "auto"),
-            ],
-        ),
-        (
-            "no configuration status at all",
-            vec![("ClusterIdentifier", "aqua-cluster")],
-        ),
-    ];
-
-    for (case, params) in rows {
-        let refused = emulator.call("ModifyAquaConfiguration", &params).await;
-        assert_eq!(
-            (refused.status, refused.error_code().as_deref()),
-            (500, Some("InternalFailure")),
-            "case {case:?}: expected 500 InternalFailure, got {} / {:?} with body {}",
-            refused.status,
-            refused.error_code(),
-            refused.body
-        );
-        // Fixed text end to end: the refusal is about the retired path, so
-        // nothing in it comes from the request.
-        assert_eq!(
-            refused.text("Message").as_deref(),
-            Some(state::AQUA_CONFIGURATION_INTERNAL_FAILURE),
-            "case {case:?}: expected Amazon Redshift's own sentence, got {:?}",
-            refused.text("Message")
-        );
-        assert_eq!(
-            refused.text("AquaConfiguration"),
-            None,
-            "case {case:?}: expected no configuration in a refusal, got {:?}",
-            refused.text("AquaConfiguration")
-        );
-    }
-
-    // The cluster is untouched, and the AQUA configuration it reports is the
-    // automatic one every cluster carries — which the retired calls neither
-    // changed nor were able to read.
-    let read = emulator
-        .call("DescribeClusters", &[("ClusterIdentifier", "aqua-cluster")])
-        .await;
-    assert_eq!(
-        (read.text("AquaStatus"), read.text("AquaConfigurationStatus")),
-        (Some("disabled".to_string()), Some("auto".to_string())),
-        "case the cluster after the retired calls: expected the automatic configuration, got \
-         body {}",
-        read.body
-    );
 }
