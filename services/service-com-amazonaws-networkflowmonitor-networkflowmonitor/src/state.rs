@@ -1034,6 +1034,19 @@ impl ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
         }
     }
 
+    /// Whether any monitor this store holds was created under the scope `scope_arn`
+    /// names.
+    ///
+    /// A monitor names its scope by a `@required` ARN (`CreateMonitor.scopeArn`), so
+    /// such a monitor is a live reference to that scope: this is what a destructive
+    /// operation on the scope consults before it removes anything, so a scope a monitor
+    /// still depends on is not taken out from under it ([`scope_in_use`]).
+    pub fn scope_is_referenced(&self, scope_arn: &str) -> bool {
+        self.monitors
+            .values()
+            .any(|monitor| monitor.scope_arn == scope_arn)
+    }
+
     /// The tags of the resource an ARN names, or `None` when the ARN names nothing
     /// in this store.
     ///
@@ -1395,6 +1408,27 @@ pub const INVALID_SCOPE_ID: &str = "The provided Scope ARN is not valid";
 pub fn invalid_scope_id() -> ValidationException {
     ValidationException {
         message: Some(INVALID_SCOPE_ID.to_string()),
+    }
+}
+
+/// The wording a delete of a scope some monitor still names is refused with.
+///
+/// The sentence is wholly fixed — it has no variable parts: the caller already named
+/// the scope it addressed, and what it has to be told is that the scope still has
+/// monitors associated with it, which is the same whichever scope and however many
+/// monitors.
+pub const SCOPE_IN_USE: &str = "Scope can't be deleted as there's monitors associated with it";
+
+/// The modelled 400 for a destructive request on a scope that a monitor still
+/// references ([`ComAmazonawsNetworkflowmonitorNetworkflowmonitorState::scope_is_referenced`]).
+///
+/// A monitor holds a `@required` `scopeArn`, so removing the scope while monitors
+/// name it would leave each of them pointing at an ARN this store no longer resolves.
+/// The request is therefore refused BEFORE anything is written, in the real service's
+/// own wording for the condition, and the caller deletes the monitors first.
+pub fn scope_in_use() -> ValidationException {
+    ValidationException {
+        message: Some(SCOPE_IN_USE.to_string()),
     }
 }
 

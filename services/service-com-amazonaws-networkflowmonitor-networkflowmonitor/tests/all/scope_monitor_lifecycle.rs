@@ -1407,7 +1407,9 @@ async fn deleting_a_scope_retires_its_arn_and_frees_its_client_token() {
         let scope_id = created.text("scopeId");
         let scope_arn = created.text("scopeArn");
 
-        // A monitor under the scope, so the ARN is live before the delete.
+        // A monitor under the scope, so the ARN is live before the delete — and a
+        // scope a monitor still references is not deletable, so the monitor goes
+        // first (`scope_referential_integrity.rs` is the suite about that refusal).
         let monitor_name = format!("orphan-{index}");
         let monitor = emulator
             .create_monitor(json!({
@@ -1420,6 +1422,11 @@ async fn deleting_a_scope_retires_its_arn_and_frees_its_client_token() {
             monitor.status, 200,
             "case {case:?}: the monitor under the live scope must be created, got {} with body {}",
             monitor.status, monitor.body
+        );
+        assert_eq!(
+            emulator.delete_monitor(&monitor_name).await.status,
+            200,
+            "case {case:?}: the referencing monitor must delete before the scope does"
         );
 
         assert_eq!(

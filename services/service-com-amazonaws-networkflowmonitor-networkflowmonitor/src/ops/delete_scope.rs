@@ -7,12 +7,13 @@
 //! its ARN any more. Deleting an id the store does not hold is that same 404: the
 //! scope is gone after the first call, which is what `@idempotent` amounts to here.
 //!
-//! "Deletes a scope that has been defined" is all the model documents, so this
-//! handler deletes exactly the scope: it neither cascades into the monitors created
-//! under the scope's ARN nor invents an "in use" refusal for them, so a monitor keeps
-//! reporting the `scopeArn` it was created with (now the ARN of a resource that no
-//! longer exists), while a later `CreateMonitor` naming that ARN is refused because
-//! the ARN resolves to no scope.
+//! A monitor names its scope by a `@required` ARN (`CreateMonitor.scopeArn`), so a
+//! live monitor is a reference to the scope: a delete of a scope some monitor still
+//! names is REFUSED (the modelled `ValidationException`,
+//! [`crate::state::scope_in_use`]) before anything is written, rather than removing
+//! the scope and leaving those monitors pointing at an ARN nothing resolves. The
+//! handler never cascades either: the caller deletes the monitors first, and the same
+//! delete then succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -170,8 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
 
         // The same missing-scope refusal `GetScope` answers with, so the reader a
-        // teardown polls after this call and this call itself word it alike.
-        let Some(scope) = state.scopes.remove(&input.scope_id) else {
+        // teardown polls after this call and this call itself word it alike. The
+        // record is only READ here: nothing is removed until the guard below has
+        // passed, so a refused delete leaves the scope and its indices exactly as
+        // they were and the next `GetScope` still reports its status.
+        let Some(scope) = state.scopes.get(&input.scope_id) else {
             return Err(DeleteScopeErrorModeled::ResourceNotFoundException(
                 crate::state::scope_not_found(
                     &crate::state::request_region(ctx.parts()),
@@ -180,15 +184,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let scope_arn = scope.scope_arn.clone();
 
-        // The records that named the scope go with it: its ARN, so no later operation
-        // resolves an ARN to a scope that is gone, and the idempotency record, so a
-        // replayed `CreateScope` mints a new scope rather than answering with a dead
-        // one and the store stays bounded by the scopes that are still live.
-        state.arn_index.remove(&scope.scope_arn);
+        // The referential guard: a monitor was created against this scope's ARN and
+        // holds it as a `@required` member, so while any such monitor is in the store
+        // the scope is in use and the delete is refused. Deleting it anyway would
+        // leave every one of those monitors naming an ARN this store no longer
+        // resolves, with nothing having told the caller.
+        if state.scope_is_referenced(&scope_arn) {
+            return Err(
+                DeleteScopeErrorModeled::ValidationException(crate::state::scope_in_use()).into(),
+            );
+        }
+
+        // Past the guard, the records that named the scope go with it: its ARN, so no
+        // later operation resolves an ARN to a scope that is gone, and the idempotency
+        // record, so a replayed `CreateScope` mints a new scope rather than answering
+        // with a dead one and the store stays bounded by the scopes that are still
+        // live.
+        state.scopes.remove(&input.scope_id);
+        state.arn_index.remove(&scope_arn);
         state
             .scope_idempotency
-            .retain(|_, scope_id| scope_id != &scope.scope_id);
+            .retain(|_, scope_id| scope_id != &input.scope_id);
 
         // `DeleteScopeOutput` models no members: the answer is the 200 itself.
         Ok(DeleteScopeOutput {})

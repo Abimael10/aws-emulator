@@ -31,6 +31,8 @@ mod scope_listing;
 mod scope_monitor_lifecycle;
 #[path = "all/scope_quota.rs"]
 mod scope_quota;
+#[path = "all/scope_referential_integrity.rs"]
+mod scope_referential_integrity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wire_status_and_error_classes.rs"]
