@@ -48,6 +48,9 @@ rcgen = "0.13"
 # services in this tree use, with the same `default-features = false` + `std` spelling, so
 # no time-zone database is pulled in.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Codec for the opaque base64 `nextToken` every paginated list of this service hands out
+# and decodes, whose own decode error names the character that stopped it.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

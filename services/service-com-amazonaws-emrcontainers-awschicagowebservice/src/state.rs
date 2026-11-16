@@ -476,26 +476,123 @@ pub fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
         .saturating_add(i64::from(value.subsec_nanos()) / 1_000_000)
 }
 
-/// The opaque `nextToken` a `@paginated` list in this service hands back: the place
+/// The codec every `nextToken` of this service is written with: the STANDARD base64
+/// alphabet, so the token a listing hands back is the opaque base64 value this service's
+/// pagination token is, and a value that is not base64 at all fails to DECODE before
+/// anything is resolved from it.
+///
+/// Padding is accepted but not required by the DECODER, so a token whose trailing `=` a
+/// client dropped still decodes — the latitude a decoder that pads on demand gives. That
+/// latitude ends at the canonical-spelling check in [`decode_list_cursor`], which re-encodes
+/// the position it read and compares it with the token the client sent, so an unpadded token
+/// is still refused as one no listing issued.
+const LIST_CURSOR_CODEC: ::base64::engine::GeneralPurpose = ::base64::engine::GeneralPurpose::new(
+    &::base64::alphabet::STANDARD,
+    ::base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(::base64::engine::DecodePaddingMode::Indifferent),
+);
+
+/// The padding character of the standard base64 alphabet, which closes a value's last unit
+/// rather than carrying data — so it is not an illegal character, and a value that
+/// misplaces it is refused as a malformed unit instead.
+const BASE64_PAD: u8 = b'=';
+
+/// How a base64 decoder reports a value carrying a character its alphabet does not hold:
+/// it stops at that character and names it by the lower-case hex code of its byte, so the
+/// sentence is composed from the token the request carried and names nothing else about it.
+pub fn illegal_base64_character_message(byte: u8) -> String {
+    bounded_message(format!("Illegal base64 character {byte:x}"))
+}
+
+/// How a base64 decoder reports a value whose last 4-character unit carries too few bits
+/// to decode — a dangling character left over after the whole units.
+pub const DANGLING_BASE64_UNIT_MESSAGE: &str = "Last unit does not have enough valid bits";
+
+/// How a base64 decoder reports a value whose last 4-character unit is not one: padding
+/// where no padding belongs, or too little of it.
+pub const MALFORMED_BASE64_UNIT_MESSAGE: &str = "Input byte array has wrong 4-byte ending unit";
+
+/// The bytes a `nextToken` decodes to, or why it is not a base64 value at all.
+///
+/// Every account of WHY comes from the codec's own error rather than from a second,
+/// hand-rolled pass over the token: the decoder stops at the first character its alphabet
+/// does not hold, and that is the character the refusal names.
+fn decode_list_cursor_bytes(token: &str) -> Result<Vec<u8>, PageRefusal> {
+    use ::base64::Engine as _;
+
+    match LIST_CURSOR_CODEC.decode(token) {
+        Ok(bytes) => Ok(bytes),
+        Err(::base64::DecodeError::InvalidByte(_, byte)) if byte != BASE64_PAD => Err(
+            PageRefusal::Undecodable(illegal_base64_character_message(byte)),
+        ),
+        Err(::base64::DecodeError::InvalidLength(_)) => Err(PageRefusal::Undecodable(
+            DANGLING_BASE64_UNIT_MESSAGE.to_string(),
+        )),
+        Err(::base64::DecodeError::InvalidByte(..) | ::base64::DecodeError::InvalidPadding) => Err(
+            PageRefusal::Undecodable(MALFORMED_BASE64_UNIT_MESSAGE.to_string()),
+        ),
+        // The value decodes; only its last unit carries bits a decoder that pads on demand
+        // discards. Whatever those bytes are, they are not a cursor this service minted, so
+        // it is refused as a token no listing issued rather than as a decode failure.
+        Err(::base64::DecodeError::InvalidLastSymbol(..)) => Err(PageRefusal::UnknownNextToken),
+    }
+}
+
+/// The ENVELOPE a `nextToken` of this service is handed out in: `payload`, written as hex
+/// and base64-encoded ([`LIST_CURSOR_CODEC`]).
+///
+/// The hex step is what keeps the token a value a client can put in `nextToken` — an
+/// `@httpQuery` member — without escaping it: base64 of lower-case hex can only produce
+/// `A-Za-z0-9` and the trailing `=`, so the token never carries the `+` a query string
+/// reads as a space. It costs the opacity nothing: a caller must not read a cursor, the
+/// service only has to resume from it.
+pub fn encode_cursor_envelope(payload: &str) -> String {
+    use ::base64::Engine as _;
+
+    LIST_CURSOR_CODEC.encode(::hex::encode(payload))
+}
+
+/// What a `nextToken`'s envelope carries, or why that token carries nothing: a value that
+/// is not base64 at all is refused as the decode failure it is, in the decoder's own words
+/// ([`decode_list_cursor_bytes`]), and one that decodes to anything
+/// [`encode_cursor_envelope`] cannot have written is refused as a token no listing issued.
+pub fn decode_cursor_envelope(token: &str) -> Result<String, PageRefusal> {
+    let decoded = decode_list_cursor_bytes(token)?;
+    let hex = String::from_utf8(decoded).map_err(|_| PageRefusal::UnknownNextToken)?;
+    let payload = ::hex::decode(&hex).map_err(|_| PageRefusal::UnknownNextToken)?;
+    String::from_utf8(payload).map_err(|_| PageRefusal::UnknownNextToken)
+}
+
+/// What a `nextToken` of this service carries inside its envelope: the place
 /// `(createdAt, creation sequence)` in a newest-first order the next page starts at,
 /// prefixed with the SCOPE that issued it ([`list_cursor_scope`]), so a cursor one listing
 /// at one region's endpoint minted is never read as a position in any other order.
 ///
-/// One encoder for every paginated list here, so the five cannot drift apart. The
-/// components are joined by `:`, which neither a decimal millisecond (it may carry a
+/// The components are joined by `:`, which neither a decimal millisecond (it may carry a
 /// leading `-`) nor a sequence can contain, so the split in [`decode_list_cursor`] is
 /// unambiguous whatever the stored instant is: a scope may carry `:` itself, and is matched
-/// as a whole prefix, which leaves exactly the two numeric components after it. A client
-/// must not read a cursor; the service only has to resume from it.
-pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) -> String {
+/// as a whole prefix, which leaves exactly the two numeric components after it.
+pub fn list_cursor_payload(scope: &str, created_at_millis: i64, sequence: u64) -> String {
     format!("{scope}:{created_at_millis}:{sequence}")
 }
 
-/// The place in a newest-first order a `nextToken` names.
+/// The opaque `nextToken` a `@paginated` list in this service hands back: the position
+/// [`list_cursor_payload`] writes, in the envelope every token of this service is handed
+/// out in ([`encode_cursor_envelope`]).
 ///
-/// `None` — refused as an invalid request — when the token is not a cursor this `scope`
-/// issued, so a token cannot be carried from one listing to another's, nor from one
-/// region's endpoint to another's ([`list_cursor_scope`]).
+/// One encoder for every paginated list here, so the five cannot drift apart.
+pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) -> String {
+    encode_cursor_envelope(&list_cursor_payload(scope, created_at_millis, sequence))
+}
+
+/// The place in a newest-first order a `nextToken` names, or why that token names none.
+///
+/// The token is DECODED first — a value that is not base64 is refused as the decode failure
+/// it is ([`decode_cursor_envelope`]) — and only then resolved against the form
+/// [`encode_list_cursor`] mints. A token that decodes but is not a cursor this `scope`
+/// issued is refused as one no listing here issued, so a token cannot be carried from one
+/// listing to another's, nor from one region's endpoint to another's
+/// ([`list_cursor_scope`]).
 ///
 /// A token is one this `scope` issued only when it is byte for byte what
 /// [`encode_list_cursor`] writes for the position it decodes to. Parsing a decimal is
@@ -503,15 +600,23 @@ pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) ->
 /// signed zero, none of which the encoder can ever produce — so the decoded position is
 /// re-encoded and compared with the token the client sent: every spelling but the
 /// canonical one is a fabrication, and is refused rather than read as a page position.
-pub fn decode_list_cursor(scope: &str, token: &str) -> Option<(i64, u64)> {
-    let rest = token.strip_prefix(scope)?.strip_prefix(':')?;
+pub fn decode_list_cursor(scope: &str, token: &str) -> Result<(i64, u64), PageRefusal> {
+    let payload = decode_cursor_envelope(token)?;
+    let position = cursor_position(scope, &payload).ok_or(PageRefusal::UnknownNextToken)?;
+    (encode_list_cursor(scope, position.0, position.1) == token)
+        .then_some(position)
+        .ok_or(PageRefusal::UnknownNextToken)
+}
+
+/// The position a decoded cursor payload spells for `scope`, when it spells one at all.
+fn cursor_position(scope: &str, payload: &str) -> Option<(i64, u64)> {
+    let rest = payload.strip_prefix(scope)?.strip_prefix(':')?;
     let mut parts = rest.split(':');
     let (Some(created_at_millis), Some(sequence), None) = (parts.next(), parts.next(), parts.next())
     else {
         return None;
     };
-    let position: (i64, u64) = (created_at_millis.parse().ok()?, sequence.parse().ok()?);
-    (encode_list_cursor(scope, position.0, position.1) == token).then_some(position)
+    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
 }
 
 /// The scope [`encode_list_cursor`] tags a cursor with: the `listing` that minted it AND
@@ -614,14 +719,17 @@ impl ListPosition for ManagedEndpointRecord {
     }
 }
 
-/// Why a `@paginated` list cannot serve the page a request asked for. Both are invalid
+/// Why a `@paginated` list cannot serve the page a request asked for. All are invalid
 /// requests: each list refuses them with its OWN modelled `ValidationException`, carrying
 /// [`PageRefusal::message`], so the wording cannot differ between two listings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageRefusal {
     /// `maxResults` named a page of fewer than one item, carrying the value requested.
     MaxResultsBelowOne(i32),
-    /// `nextToken` is not a cursor this listing's scope issued.
+    /// `nextToken` is not a base64 value at all, so nothing was resolved from it: the
+    /// decoder's own account of what stopped it ([`decode_list_cursor_bytes`]).
+    Undecodable(String),
+    /// `nextToken` decodes, but it is not a cursor this listing's scope issued.
     UnknownNextToken,
 }
 
@@ -632,6 +740,10 @@ impl PageRefusal {
             Self::MaxResultsBelowOne(limit) => {
                 format!("maxResults must be at least 1, but {limit} was requested")
             }
+            // A token that is not base64 is refused by the DECODER, so the decoder's
+            // sentence is the refusal's: it names the character that stopped it and
+            // nothing else of the token.
+            Self::Undecodable(why) => why.clone(),
             Self::UnknownNextToken => "nextToken is not a valid pagination token".to_string(),
         }
     }
@@ -654,10 +766,12 @@ pub struct ListPage<'a, R> {
 /// * `nextToken` is the POSITION in that order the next page starts at, not the identity of
 ///   a row, so a record whose state changed between pages cannot invalidate a token the
 ///   client already holds: resuming reports everything ordered at or after the cursor, with
-///   no repeats and no gaps. A token no [`decode_list_cursor`] of this `scope` accepts is
-///   refused, so a cursor minted by another listing — or by another region's endpoint,
-///   whose records are a different set in a different order — is never read as a position
-///   in this one ([`list_cursor_scope`]);
+///   no repeats and no gaps. A token is a base64 value, so one the decoder rejects is
+///   refused in the decoder's own words, and one that decodes but that no
+///   [`decode_list_cursor`] of this `scope` accepts is refused as a token this listing
+///   never issued — so a cursor minted by another listing, or by another region's endpoint,
+///   whose records are a different set in a different order, is never read as a position in
+///   this one ([`list_cursor_scope`]);
 /// * a `nextToken` comes back only while records remain after the page.
 ///
 /// One rule for every paginated list here, beside the one cursor encoder, so the two halves
@@ -680,7 +794,7 @@ pub fn page_of<'a, R: ListPosition>(
     let start = match next_token {
         None => 0,
         Some(token) => {
-            let cursor = decode_list_cursor(scope, token).ok_or(PageRefusal::UnknownNextToken)?;
+            let cursor = decode_list_cursor(scope, token)?;
             ordered
                 .iter()
                 .position(|record| record.list_position() <= cursor)
@@ -850,18 +964,22 @@ pub fn message_about(prefix: &str, value: &str, suffix: &str) -> String {
 /// A resource kind this service refuses a request for when the request names one that is
 /// not there.
 ///
-/// The wording of such a refusal belongs to the ERROR CLASS that carries it, not to the
-/// resource:
+/// A refusal's error CLASS and its wording are one pair, so the two always agree — the
+/// class a call is refused in is never relabelled while the sentence stays, and never the
+/// other way round:
 ///
-/// * a `ResourceNotFoundException` — the class an operation that MODELS a not-found error
-///   reports a missing resource in — is worded from the identifier the request named the
-///   resource by, in ONE form: `<Resource type> <identifier> doesn't exist.`
+/// * a `ResourceNotFoundException` — the class this service reports a missing resource as
+///   a MISSING RESOURCE in — is worded from the identifier the request named the resource
+///   by, in ONE form: `<Resource type> <identifier> doesn't exist.`
 ///   ([`ResourceKind::not_found_message`]). The resource type is spelled the way the
 ///   service spells it in a message, which is NOT derivable from the shape name, so each
-///   kind carries its own spelling here.
-/// * a `ValidationException` — the only client error an operation that models no not-found
-///   error has to report it in — is worded as a SHORT FIXED sentence carrying no
-///   identifier at all ([`ResourceKind::validation_not_found_message`]).
+///   kind carries its own spelling here. An operation whose modelled error list omits that
+///   shape still answers it, widened onto its own error enum, rather than carrying this
+///   wording under another code.
+/// * a `ValidationException` — the class an operation refuses the CALL as invalid in,
+///   which is what every delete of this service answers an id it holds nothing under with
+///   — is worded as a SHORT FIXED sentence carrying no identifier at all
+///   ([`ResourceKind::validation_not_found_message`]).
 ///
 /// Every operation that reports a resource missing takes its wording from this type —
 /// beside [`PageRefusal::message`], the other wording this service shares — so the message
@@ -904,27 +1022,31 @@ impl ResourceKind {
     }
 
     /// The `message` a refusal carries when the request names no such resource of this
-    /// region and the operation has to report it through its modelled `ValidationException`
-    /// because it models no not-found error at all (`DeleteJobTemplate`,
-    /// `DeleteSecurityConfiguration`, `DeleteVirtualCluster`, `DeleteManagedEndpoint`,
-    /// `CancelJobRun`, `ListJobRuns`, `ListManagedEndpoints` — smithy_query: digest).
+    /// region and the operation refuses the call as INVALID rather than reporting the
+    /// resource missing — the class an operation that models no not-found error has to
+    /// refuse a delete in (`DeleteJobTemplate`, `DeleteSecurityConfiguration`,
+    /// `DeleteVirtualCluster`, `DeleteManagedEndpoint` — smithy_query: digest).
     ///
     /// That class is worded as a short sentence of FIXED text, with no identifier
     /// interpolated into it, which is a different sentence from the not-found wording a
     /// read of the same resource answers with ([`not_found_message`](Self::not_found_message)).
-    /// The sentences are not one template either — a job template's says the template does
-    /// not exist, a security configuration's says the configuration was not found — so each
-    /// kind carries the sentence this service words for it. A kind for which only the
-    /// not-found wording of the class above is known keeps it, rather than a short sentence
-    /// invented here: a message this service never emits would be as wrong as the one it
-    /// replaces.
+    /// The sentences are not one template either — a virtual cluster's names the resource
+    /// as the model's shape spells it, a job template's says the template does not exist, a
+    /// security configuration's says the configuration was not found — so each kind carries
+    /// the sentence this service words for it.
+    ///
+    /// A missing JOB RUN has no sentence here: this service reports one as the resource
+    /// it is, in the not-found class carrying [`not_found_message`](Self::not_found_message),
+    /// whichever operation reaches for it ([`ResourceKind`]'s own docs).
     pub fn validation_not_found_message(self, identifier: &str) -> String {
         match self {
+            Self::VirtualCluster => "VirtualCluster does not exist".to_string(),
+            // The model calls the resource a managed endpoint hosts an `Endpoint`, and so
+            // does this sentence ([`Self::resource_type`]).
+            Self::ManagedEndpoint => "Endpoint does not exist".to_string(),
             Self::JobTemplate => "Template does not exist".to_string(),
             Self::SecurityConfiguration => "Security configuration not found".to_string(),
-            Self::VirtualCluster | Self::JobRun | Self::ManagedEndpoint => {
-                self.not_found_message(identifier)
-            }
+            Self::JobRun => self.not_found_message(identifier),
         }
     }
 }

@@ -168,10 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.virtual_cluster(&region, &input.id) else {
             return Err(DeleteVirtualClusterErrorModeled::ValidationException(
                 ValidationException {
-                    // This service's wording for a missing resource reported in THIS error
-                    // class ([`crate::state::ResourceKind`]): the refusal is carried by
-                    // this operation's own modelled error, but what it SAYS is that the
-                    // cluster does not exist.
+                    // This service's wording for a resource it holds nothing under,
+                    // reported in THIS error class ([`crate::state::ResourceKind`]): a
+                    // short fixed sentence naming the resource and nothing of the request
+                    // — not the id it asked for — because the refusal says the CALL is
+                    // invalid rather than reporting the resource missing.
                     message: Some(
                         crate::state::ResourceKind::VirtualCluster
                             .validation_not_found_message(&input.id),

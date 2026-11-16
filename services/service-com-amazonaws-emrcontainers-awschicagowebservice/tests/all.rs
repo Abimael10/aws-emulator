@@ -49,10 +49,14 @@ mod managed_endpoint_session_credentials;
 mod managed_endpoint_type_admission;
 #[path = "all/managed_endpoint_wire_form.rs"]
 mod managed_endpoint_wire_form;
+#[path = "all/mutation_refusal_error_class.rs"]
+mod mutation_refusal_error_class;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/paginated_page_bounds.rs"]
 mod paginated_page_bounds;
+#[path = "all/pagination_token_decoding.rs"]
+mod pagination_token_decoding;
 #[path = "all/refusal_message_bound.rs"]
 mod refusal_message_bound;
 #[path = "all/refusal_wording_by_error_class.rs"]

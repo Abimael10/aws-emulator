@@ -453,7 +453,10 @@ async fn a_cross_region_mutate_is_refused_and_leaves_the_resource_as_it_was() {
                 method: "DELETE",
                 path: format!("/virtualclusters/{cluster}/jobruns/{}", fixture.job_run),
                 body: None,
-                code: "ValidationException",
+                // A run of another region is a run this endpoint holds nothing under, and
+                // this service reports a missing resource in the not-found class
+                // ([`crate::not_found_message`] pins that class).
+                code: "ResourceNotFoundException",
             },
             MutateCase {
                 label: "StartJobRun",

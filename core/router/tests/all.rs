@@ -61,12 +61,6 @@
 // and have no prose to duplicate, re-word or mistype, which is what had gone wrong here: this
 // header and the tail of the list had each grown hundreds of re-typed copies of these
 // paragraphs, and no suite of this target ran.
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
-// place its name sorts to. That list holds those pairs and nothing else: no prose between
-// them, no blank line, and nothing at all after the last one. Two branches landing at once
-// then insert two lines in two places and have no prose to duplicate, re-word or mistype,
-// which is what had gone wrong here — this header and the tail of the list had each grown
-// hundreds of re-typed copies of these paragraphs, and no suite of this target ran.
 //
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains. A

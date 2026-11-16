@@ -19,7 +19,8 @@
 //! The two halves matter together, so both are driven here:
 //!
 //! * a spelling the encoder never writes (a `+` sign, leading zeros, a signed zero,
-//!   trailing whitespace) is refused, even when the position it would name is a real one;
+//!   trailing whitespace), sealed in the same envelope a real token is handed out in, is
+//!   refused, even when the position it would name is a real one;
 //! * a canonically spelled cursor is accepted whatever position it names — including one
 //!   older or newer than every stored record, and a negative millisecond, which the
 //!   encoder CAN write — so the refusal keys on the spelling and not on the position
@@ -236,9 +237,16 @@ async fn issued_token(emr: &Emr, listing: &Listing) -> String {
 }
 
 /// The `(created_at_millis, sequence)` components of a token this listing issued, as the
-/// decimal text the service wrote them as.
+/// decimal text the service wrote them as — read out of the token through the service's own
+/// envelope, so this suite cannot drift from the form a token is handed out in.
 fn components(listing: &Listing, token: &str) -> (String, String) {
-    let rest = token
+    let payload = state::decode_cursor_envelope(token).unwrap_or_else(|refusal| {
+        panic!(
+            "case {:?}: the issued token {token:?} is not one this service minted: {refusal:?}",
+            listing.label
+        )
+    });
+    let rest = payload
         .strip_prefix(&listing.scope)
         .and_then(|rest| rest.strip_prefix(':'))
         .unwrap_or_else(|| {
@@ -254,56 +262,61 @@ fn components(listing: &Listing, token: &str) -> (String, String) {
 }
 
 /// Spellings of a position that the service's cursor encoder can never write, so no
-/// listing may resume from one. The rows differ along the component that is re-spelled
-/// (the millisecond, the sequence, both), the way it is re-spelled (a `+` sign, leading
-/// zeros, a signed zero, trailing whitespace) and whether the position named is a real
-/// one (`millis`/`sequence` come from a token the listing just issued) or one older than
-/// every stored record (`0`, which read as a position would report an EMPTY page).
+/// listing may resume from one. Each is sealed in the envelope a real token is handed out
+/// in (`state::encode_cursor_envelope`), so the row tests the SPELLING of the position and
+/// not the token's envelope, which the decoder would refuse first.
+///
+/// The rows differ along the component that is re-spelled (the millisecond, the sequence,
+/// both), the way it is re-spelled (a `+` sign, leading zeros, a signed zero, trailing
+/// whitespace) and whether the position named is a real one (`millis`/`sequence` come from
+/// a token the listing just issued) or one older than every stored record (`0`, which read
+/// as a position would report an EMPTY page).
 fn forged_spellings(scope: &str, millis: &str, sequence: &str) -> Vec<(String, String)> {
+    let sealed = |payload: String| state::encode_cursor_envelope(&payload);
     vec![
         (
             "a plus-signed millisecond".to_string(),
-            format!("{scope}:+{millis}:{sequence}"),
+            sealed(format!("{scope}:+{millis}:{sequence}")),
         ),
         (
             "a plus-signed sequence".to_string(),
-            format!("{scope}:{millis}:+{sequence}"),
+            sealed(format!("{scope}:{millis}:+{sequence}")),
         ),
         (
             "both components plus-signed".to_string(),
-            format!("{scope}:+{millis}:+{sequence}"),
+            sealed(format!("{scope}:+{millis}:+{sequence}")),
         ),
         (
             "a millisecond padded with a leading zero".to_string(),
-            format!("{scope}:0{millis}:{sequence}"),
+            sealed(format!("{scope}:0{millis}:{sequence}")),
         ),
         (
             "a sequence padded with a leading zero".to_string(),
-            format!("{scope}:{millis}:0{sequence}"),
+            sealed(format!("{scope}:{millis}:0{sequence}")),
         ),
         (
             "both components zero-padded".to_string(),
-            format!("{scope}:000{millis}:000{sequence}"),
+            sealed(format!("{scope}:000{millis}:000{sequence}")),
         ),
         (
             "a plus-signed zero position".to_string(),
-            format!("{scope}:+0:+0"),
+            sealed(format!("{scope}:+0:+0")),
         ),
         (
             "a zero-padded zero position".to_string(),
-            format!("{scope}:0000:0000"),
+            sealed(format!("{scope}:0000:0000")),
         ),
         (
             "a negatively signed zero millisecond".to_string(),
-            format!("{scope}:-0:0"),
+            sealed(format!("{scope}:-0:0")),
         ),
         (
             "a negatively signed zero sequence".to_string(),
-            format!("{scope}:0:-0"),
+            sealed(format!("{scope}:0:-0")),
         ),
         (
             "a trailing space after the sequence".to_string(),
-            format!("{scope}:{millis}:{sequence}%20"),
+            sealed(format!("{scope}:{millis}:{sequence} ")),
         ),
     ]
 }

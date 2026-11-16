@@ -10,10 +10,12 @@
 //!
 //! The rule under test: EMR on EKS words a not-found refusal of THIS class the same way,
 //! from the identifier the request named the resource by — `<Resource type> <identifier>
-//! doesn't exist.` — whichever operation issues it and whichever of its modelled client
-//! errors carries it. The two operations whose `ValidationException` reports a missing
-//! resource as a short fixed sentence instead are the other class, pinned by
-//! [`crate::refusal_wording_by_error_class`].
+//! doesn't exist.` — whichever operation issues it, and carries it in the not-found error
+//! class, including where the operation's own `errors` list omits that shape. The deletes,
+//! which refuse the CALL as invalid for an id they hold nothing under, are the other class
+//! — a short fixed sentence in a `ValidationException` — pinned by
+//! [`crate::refusal_wording_by_error_class`] and
+//! [`crate::mutation_refusal_error_class`].
 //!
 //! The tables span what that rule generalises over: which resource is missing (a virtual
 //! cluster, a job run, a managed endpoint, a job template, a security configuration),
@@ -49,10 +51,12 @@ const ENDPOINT: &str = "Endpoint";
 const JOB_TEMPLATE: &str = "Job Template";
 const SECURITY_CONFIGURATION: &str = "Security Configuration";
 
-/// The client errors this service's operations carry a not-found refusal in: the modelled
-/// `ResourceNotFoundException` where the operation declares one, and its
-/// `ValidationException` where it does not (smithy_query: digest).
+/// The client error this service carries a not-found refusal in, whichever operation
+/// reports it (smithy_query: digest — the shape is `ResourceNotFoundException`, HTTP 400).
 const NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The client error a call refused as INVALID is carried by, which the rule under test is
+/// NOT: it is the class the tagging operations below answer an unresolvable reference in.
 const INVALID_REQUEST: &str = "ValidationException";
 
 /// The form under test, written once: the resource type, the identifier the request named
@@ -130,14 +134,15 @@ fn session_body() -> Value {
     })
 }
 
-/// Every operation of this service that resolves a resource by id, aimed at an `absent`
-/// id: the ones that resolve a virtual cluster by the `@httpLabel` of the path, the ones
-/// that resolve a job run or a managed endpoint UNDER the `host` cluster that really
-/// exists, and the ones that resolve a job template or a security configuration a request
-/// references.
+/// Every operation of this service that reports a resource it resolves by id MISSING, aimed
+/// at an `absent` id: the ones that resolve a virtual cluster by the `@httpLabel` of the
+/// path, the ones that resolve a job run or a managed endpoint UNDER the `host` cluster that
+/// really exists, and the ones that resolve a job template or a security configuration a
+/// request references.
 ///
-/// A listing whose path label SCOPES its collection resolves no resource, so it is not one
-/// of these: see the module docs.
+/// A delete is not one of these: it refuses the CALL as invalid instead, which is the other
+/// class — see the module docs. Nor is a listing whose path label SCOPES its collection: it
+/// resolves no resource at all.
 fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe> {
     vec![
         probe(
@@ -157,15 +162,6 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             format!("/virtualclusters/{absent}"),
             Some(json!({"clientToken": format!("tok-update-{index}")})),
             NOT_FOUND,
-        ),
-        probe(
-            format!("DeleteVirtualCluster, {label}"),
-            VIRTUAL_CLUSTER,
-            absent,
-            "DELETE",
-            format!("/virtualclusters/{absent}"),
-            None,
-            INVALID_REQUEST,
         ),
         probe(
             format!("StartJobRun into an absent cluster, {label}"),
@@ -210,6 +206,8 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             None,
             NOT_FOUND,
         ),
+        // `CancelJobRun` reports a run it holds nothing under in this class too, though
+        // its own modelled `errors` list omits the shape: the class goes with the wording.
         probe(
             format!("CancelJobRun, {label}"),
             JOB_RUN,
@@ -217,7 +215,7 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             "DELETE",
             format!("/virtualclusters/{host}/jobruns/{absent}"),
             None,
-            INVALID_REQUEST,
+            NOT_FOUND,
         ),
         probe(
             format!("DescribeManagedEndpoint, {label}"),
@@ -227,15 +225,6 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             format!("/virtualclusters/{host}/endpoints/{absent}"),
             None,
             NOT_FOUND,
-        ),
-        probe(
-            format!("DeleteManagedEndpoint, {label}"),
-            ENDPOINT,
-            absent,
-            "DELETE",
-            format!("/virtualclusters/{host}/endpoints/{absent}"),
-            None,
-            INVALID_REQUEST,
         ),
         probe(
             format!("GetManagedEndpointSessionCredentials on an absent endpoint, {label}"),

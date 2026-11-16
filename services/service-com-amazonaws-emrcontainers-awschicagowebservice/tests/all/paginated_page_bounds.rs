@@ -18,9 +18,10 @@
 //!    walking the pages reports exactly the unpaged listing, in the same (newest-first)
 //!    order, with no repeats and no gaps.
 //! 2. A `nextToken` comes back only while rows remain after the page.
-//! 3. A page of fewer than one row, and a `nextToken` the listing's own scope never
-//!    issued, are refused with the modelled `ValidationException` (HTTP 400) carrying one
-//!    wording for every listing, and change nothing a later reader sees.
+//! 3. A page of fewer than one row, a `nextToken` that is not a base64 value at all, and a
+//!    `nextToken` the listing's own scope never issued, are refused with the modelled
+//!    `ValidationException` (HTTP 400) carrying one wording per kind for every listing, and
+//!    change nothing a later reader sees.
 
 use std::collections::BTreeSet;
 
@@ -314,7 +315,8 @@ async fn every_paginated_list_walks_its_stored_set_under_the_shared_page_bounds(
 /// shape and one wording — and a refused request changes nothing.
 #[tokio::test]
 async fn every_paginated_list_refuses_an_unservable_page_the_same_way() {
-    // The wording the shared rule answers with, once for all five listings.
+    // The wording the shared rule answers a token that DECODES but names no position with,
+    // once for all five listings.
     let bad_token = "nextToken is not a valid pagination token".to_string();
 
     for which in EVERY_LISTING {
@@ -325,6 +327,9 @@ async fn every_paginated_list_refuses_an_unservable_page_the_same_way() {
         // The foreign cursor is minted by the one encoder every paginated list here uses,
         // so this row cannot drift from the cursor format.
         let foreign_cursor = state::encode_list_cursor(&listing.foreign_scope, 1, 2);
+        // A token that IS base64 but carries no cursor: the envelope every token of this
+        // service is handed out in, around a value no cursor encoder wrote.
+        let decodable_non_cursor = state::encode_cursor_envelope("a:b");
         let rows: Vec<(String, String, String)> = vec![
             (
                 "maxResults below one".to_string(),
@@ -344,24 +349,27 @@ async fn every_paginated_list_refuses_an_unservable_page_the_same_way() {
                     i32::MIN
                 ),
             ),
+            // A token is a base64 value, so one the decoder cannot read is refused in the
+            // decoder's own words, naming the hex code of the character that stopped it
+            // (`-` is 0x2d, `:` is 0x3a).
             (
-                "a forged nextToken".to_string(),
+                "a nextToken that is not base64 at all".to_string(),
                 "?nextToken=not-a-cursor".to_string(),
-                bad_token.clone(),
+                "Illegal base64 character 2d".to_string(),
             ),
             (
-                "a nextToken with one component".to_string(),
-                "?nextToken=12345".to_string(),
-                bad_token.clone(),
-            ),
-            (
-                "a nextToken carrying no scope".to_string(),
+                "a nextToken carrying a character outside the base64 alphabet".to_string(),
                 "?nextToken=1:2".to_string(),
-                bad_token.clone(),
+                "Illegal base64 character 3a".to_string(),
             ),
             (
-                "a nextToken whose parts are not numbers".to_string(),
-                "?nextToken=a:b".to_string(),
+                "a nextToken that is not a whole number of base64 units".to_string(),
+                "?nextToken=12345".to_string(),
+                "Last unit does not have enough valid bits".to_string(),
+            ),
+            (
+                "a base64 nextToken carrying no cursor".to_string(),
+                format!("?nextToken={decodable_non_cursor}"),
                 bad_token.clone(),
             ),
             (

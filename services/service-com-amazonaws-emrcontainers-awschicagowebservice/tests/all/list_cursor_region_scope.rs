@@ -386,8 +386,11 @@ async fn a_cursor_tagged_with_another_region_is_refused_where_the_records_are() 
             let token = issued_token(&emr, home, &here).await;
             let home_scope = here.scope_in(home);
             let (millis, sequence) = state::decode_list_cursor(&home_scope, &token)
-                .unwrap_or_else(|| {
-                    panic!("case {label:?}: {token:?} is not a cursor of the scope {home_scope:?}")
+                .unwrap_or_else(|refusal| {
+                    panic!(
+                        "case {label:?}: {token:?} is not a cursor of the scope {home_scope:?}: \
+                         {refusal:?}"
+                    )
                 });
 
             // The rows differ in the position the foreign cursor names: one a record

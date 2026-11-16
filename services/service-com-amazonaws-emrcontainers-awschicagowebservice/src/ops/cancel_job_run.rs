@@ -5,6 +5,14 @@
 //! CANCELLED ([`crate::state::TRANSITION_SPAN`]), at which point its `finishedAt` is the
 //! instant the cancellation came due. A following `DescribeJobRun` observes both steps.
 //!
+//! An `id` the cluster holds no run under is reported as the MISSING RESOURCE it is, in
+//! this service's not-found class and its not-found wording ([`crate::state::ResourceKind`])
+//! — the shape is widened onto this operation's error enum below, because the class a
+//! refusal is carried in goes with the sentence it carries and this operation's own
+//! `errors` list omits the shape. A run that IS stored but has ended is a different
+//! refusal: the call is invalid for the state the run reached, and that is the modelled
+//! `ValidationException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -64,6 +72,9 @@
 //!
 //! * `InternalServerException` (HTTP 500) — This is an internal server exception.
 //! * `ValidationException` (HTTP 400) — There are invalid parameters in the client request.
+//! * `ResourceNotFoundException` (HTTP 400) — The specified resource was not found. Widened
+//!   in through `extra_errors` (see below): the model's own `errors` list for this
+//!   operation omits it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -79,10 +90,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-emrcontainers-awschicag
 // here — hence the `CancelJobRunError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.emrcontainers#CancelJobRun")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: the `id` label names a
+// job run that may not exist, and this service reports a missing resource in that class
+// with that class's wording ([`crate::state::ResourceKind`]) — the sibling operation
+// addressed by the same pair of labels (`DescribeJobRun`) declares the shape for exactly
+// this case, while this operation's own `errors` list omits it. The shape is this service's
+// own (`com.amazonaws.emrcontainers#ResourceNotFoundException`, HTTP 400), declared in
+// `types/shared_types.rs`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.emrcontainers#CancelJobRun",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CancelJobRunErrorModeled {
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -148,20 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle();
 
-        // This operation models no not-found error, so a job run that is not stored
-        // under this virtual cluster in this region is refused as an invalid request
-        // rather than answered with a silent success.
+        // A job run that is not stored under this virtual cluster in this region is
+        // reported MISSING — never answered with a silent success — and a missing resource
+        // of this service is reported in its not-found class, carrying that class's own
+        // wording built from the id the request named the run by
+        // ([`crate::state::ResourceKind`]). The class and the sentence go together, so the
+        // shape is widened onto this operation's error enum rather than the sentence being
+        // carried under a code that says the request was invalid.
         let Some(record) = state.job_run(&region, &input.virtual_cluster_id, &input.id) else {
-            return Err(CancelJobRunErrorModeled::ValidationException(
-                ValidationException {
-                    // This service's wording for a missing resource reported in THIS error
-                    // class ([`crate::state::ResourceKind`]): the refusal is carried by
-                    // this operation's own modelled error, but what it SAYS is that the run
-                    // does not exist.
-                    message: Some(
-                        crate::state::ResourceKind::JobRun
-                            .validation_not_found_message(&input.id),
-                    ),
+            return Err(CancelJobRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ResourceKind::JobRun.not_found_message(&input.id)),
                 },
             )
             .into());
