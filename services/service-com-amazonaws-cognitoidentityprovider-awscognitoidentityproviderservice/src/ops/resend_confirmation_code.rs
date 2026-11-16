@@ -355,11 +355,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmatio
             // naming a user nobody registered is answered the way a request naming
             // one that exists is: with a reported delivery, to a SIMULATED
             // destination, since nothing was sent and no code is stored for a user
-            // that does not exist. `LEGACY` answers `UserNotFoundException`.
+            // that does not exist — one derived from the username the request
+            // submitted, so the answer carries no literal of its own.
+            // `LEGACY` answers `UserNotFoundException`.
             if hides_user_existence {
                 return Ok(Resent {
                     answer: ResendConfirmationCodeOutput {
-                        code_delivery_details: crate::state::simulated_code_delivery_details(),
+                        code_delivery_details: crate::state::simulated_code_delivery_details(
+                            &input.username,
+                        ),
                     },
                     issued: None,
                 });

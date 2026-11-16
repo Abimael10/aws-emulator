@@ -259,6 +259,8 @@ mod sign_in_lambda_triggers;
 mod sign_in_metric_reads;
 #[path = "all/sign_up_client_secret.rs"]
 mod sign_up_client_secret;
+#[path = "all/simulated_code_delivery_destination.rs"]
+mod simulated_code_delivery_destination;
 #[path = "all/sms_caller_role_and_recovery_delivery.rs"]
 mod sms_caller_role_and_recovery_delivery;
 #[path = "all/software_token_setup.rs"]

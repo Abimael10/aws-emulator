@@ -947,18 +947,21 @@ async fn an_mfa_preference_an_administrator_sets_is_what_the_readers_report() {
 }
 
 /// One row of the simulated-delivery table: the username asked about, which no call
-/// of this suite registers.
-const GHOST_USERNAMES: &[(&str, &str)] = &[
-    ("a plain name", "nobody-here"),
-    ("an email-shaped name", "nobody@example.com"),
-    ("a name shaped like a generated sub", "11111111-2222-3333-4444-555555555555"),
-    ("a non-ASCII name", "ユーザー-不在"),
+/// of this suite registers, each with the `Destination` the simulated delivery for it
+/// reports: nothing was sent, so the address reported is read out of the `Username` the
+/// request submitted and masked the way every real destination is — a name carrying no
+/// domain of its own stands for both halves of the address — rather than being a literal
+/// that would tell the two paths apart.
+const GHOST_USERNAMES: &[(&str, &str, &str)] = &[
+    ("a plain name", "nobody-here", "n***@n***"),
+    ("an email-shaped name", "nobody@example.com", "n***@e***"),
+    (
+        "a name shaped like a generated sub",
+        "11111111-2222-3333-4444-555555555555",
+        "1***@1***",
+    ),
+    ("a non-ASCII name", "ユーザー-不在", "ユ***@ユ***"),
 ];
-
-/// The `Destination` a simulated delivery reports: it identifies nobody, and it is
-/// the same value whatever the request named, so no two usernames can be told apart
-/// by the answer they get.
-const SIMULATED_DESTINATION: &str = "a***@b***";
 
 #[tokio::test]
 async fn a_recovery_request_for_a_user_nobody_registered_reports_a_simulated_delivery() {
@@ -984,7 +987,7 @@ async fn a_recovery_request_for_a_user_nobody_registered_reports_a_simulated_del
     )
     .await;
 
-    for (name_case, username) in GHOST_USERNAMES {
+    for (name_case, username, destination) in GHOST_USERNAMES {
         for operation in ["ForgotPassword", "ResendConfirmationCode"] {
             // The client that suppresses user-existence errors reports a delivery,
             // to a simulated destination.
@@ -1005,7 +1008,7 @@ async fn a_recovery_request_for_a_user_nobody_registered_reports_a_simulated_del
                 json!({
                     "AttributeName": "email",
                     "DeliveryMedium": "EMAIL",
-                    "Destination": SIMULATED_DESTINATION,
+                    "Destination": destination,
                 }),
                 "case {case:?}: expected a simulated delivery, got {payload}"
             );
@@ -1030,7 +1033,7 @@ async fn a_recovery_request_for_a_user_nobody_registered_reports_a_simulated_del
 
     // Nothing was stored for any of them: a user nobody registered is still
     // unknown to the administrative reader, so no later call can sign in as one.
-    for (name_case, username) in GHOST_USERNAMES {
+    for (name_case, username, _) in GHOST_USERNAMES {
         let (status, payload) = dispatch(
             &emulator,
             "AdminGetUser",

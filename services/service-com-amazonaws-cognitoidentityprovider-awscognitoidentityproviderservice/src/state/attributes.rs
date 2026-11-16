@@ -777,7 +777,8 @@ pub fn masked_destination(destination: &str) -> String {
         .collect()
 }
 
-/// The delivery details a message to a SIMULATED destination is reported with.
+/// The delivery details a message to a SIMULATED destination is reported with,
+/// for a request that named `username`.
 ///
 /// `PreventUserExistenceErrors` set to `ENABLED` "suppresses messages that might
 /// indicate a valid user exists" (this service's model): the account-confirmation
@@ -785,11 +786,15 @@ pub fn masked_destination(destination: &str) -> String {
 /// nobody registered exactly as they answer one naming a user that exists —
 /// reporting a delivery — rather than with a refusal that tells the caller the
 /// account does not exist. Nothing was sent and nothing is stored, so the
-/// destination reported is a SIMULATED one: a fixed masked address, which names
-/// nothing of the request and nothing of this emulator's state, so no two
-/// usernames can be told apart by the answer they get.
-pub fn simulated_code_delivery_details() -> Option<CodeDeliveryDetailsType> {
-    code_delivery_details(SIMULATED_DESTINATION_ATTRIBUTE, SIMULATED_DESTINATION)
+/// destination reported is a SIMULATED one, and it is derived from the request
+/// that asked for it ([`simulated_destination`]) rather than being a literal:
+/// a destination that is the same characters whatever the request named tells
+/// the caller, by itself, that no such user exists.
+pub fn simulated_code_delivery_details(username: &str) -> Option<CodeDeliveryDetailsType> {
+    code_delivery_details(
+        SIMULATED_DESTINATION_ATTRIBUTE,
+        &simulated_destination(username),
+    )
 }
 
 /// The attribute a simulated delivery is reported against: an email address is
@@ -797,11 +802,25 @@ pub fn simulated_code_delivery_details() -> Option<CodeDeliveryDetailsType> {
 /// travels by is the one [`delivery_medium`] maps it to.
 pub(super) const SIMULATED_DESTINATION_ATTRIBUTE: &str = "email";
 
-/// The address [`simulated_code_delivery_details`] reports, which identifies
-/// nobody: it is reported through the same masking every real destination is
-/// reported through ([`masked_destination`]), so the answer for a user nobody
-/// registered has the shape of the answer for one that exists.
-pub(super) const SIMULATED_DESTINATION: &str = "a@b";
+/// The address [`simulated_code_delivery_details`] reports a code went to, read
+/// out of the `Username` the request submitted — the one thing a request naming
+/// a user nobody registered carries.
+///
+/// It is reported through the masking every real destination is reported through
+/// ([`masked_destination`]), which discloses the first character of an address's
+/// local part and the first character of its domain and nothing else. Both come
+/// from the submitted username: a username already in address form gives each
+/// from its own part, and one that carries no domain at all is read as the local
+/// part alone, its first character standing for the domain's too. So the answer
+/// for a user nobody registered has the shape AND the derivation of the answer
+/// for one that exists, and differs between two usernames exactly as two real
+/// addresses do.
+pub(super) fn simulated_destination(username: &str) -> String {
+    match username.split_once('@') {
+        Some((local, domain)) if !local.is_empty() && !domain.is_empty() => username.to_string(),
+        _ => format!("{username}@{username}"),
+    }
+}
 
 /// The delivery details for a verification message sent to `value` for
 /// `attribute`, or `None` for an attribute no message is sent for.

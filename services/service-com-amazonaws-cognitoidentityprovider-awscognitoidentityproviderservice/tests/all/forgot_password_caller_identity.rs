@@ -70,12 +70,15 @@ const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination 
 /// identity.
 const OTHER_USERNAME: &str = "someoneelse";
 
-/// The `Destination` a delivery to a SIMULATED destination reports — the answer owed
-/// to a request naming a user nobody registered, by an app client whose
-/// `PreventUserExistenceErrors` is `ENABLED`. It identifies nobody, and it is the
-/// same value whatever the request named, so no two usernames can be told apart by
-/// the answer they get.
-const SIMULATED_DESTINATION: &str = "a***@b***";
+/// The `Destination` a delivery to a SIMULATED destination reports for the subject of a
+/// row naming a user nobody registered — the answer owed by an app client whose
+/// `PreventUserExistenceErrors` is `ENABLED`. Nothing was sent, so the address reported is
+/// read out of the `Username` the request submitted and masked the way every real
+/// destination is: each row's username is `caller<index>`, which carries no domain of its
+/// own, so its first character stands for both halves of the address and only that
+/// character is ever disclosed. The answer therefore carries no literal that tells this
+/// path apart from the one a registered user takes.
+const SIMULATED_DESTINATION: &str = "c***@c***";
 
 /// The email addresses subject users are created with, as `(local part, domain, the
 /// `Destination` Amazon Cognito reports for that address)`
@@ -727,7 +730,8 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
                     assert_eq!(
                         details["Destination"],
                         json!(SIMULATED_DESTINATION),
-                        "case {case:?}: expected the simulated destination, got {payload}"
+                        "case {case:?}: expected the simulated destination \
+                         {SIMULATED_DESTINATION:?} derived from {username:?}, got {payload}"
                     );
                     for pool in [home, away] {
                         let sent = outstanding_reset_code(&engine, pool, &username);

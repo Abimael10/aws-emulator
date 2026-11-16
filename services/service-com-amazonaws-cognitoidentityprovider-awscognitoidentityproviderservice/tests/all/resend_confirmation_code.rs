@@ -692,12 +692,15 @@ async fn a_resend_is_refused_for_a_request_it_cannot_serve() {
             if matches!(subject, Subject::UnknownUserHidden) {
                 // A user nobody registered, asked for through a client that
                 // suppresses user-existence errors: the delivery reported is to a
-                // SIMULATED destination, and nothing is stored for a user that
-                // does not exist.
+                // SIMULATED destination — the submitted username read as an
+                // address and masked, which for this row's `subject<index>` name
+                // discloses its first character for both halves of the address —
+                // and nothing is stored for a user that does not exist.
                 assert_eq!(
                     payload["CodeDeliveryDetails"]["Destination"],
-                    json!("a***@b***"),
-                    "case {case:?}: expected a simulated destination, got {payload}"
+                    json!("s***@s***"),
+                    "case {case:?}: expected the simulated destination derived from \
+                     {username:?}, got {payload}"
                 );
                 assert!(
                     after.is_none(),

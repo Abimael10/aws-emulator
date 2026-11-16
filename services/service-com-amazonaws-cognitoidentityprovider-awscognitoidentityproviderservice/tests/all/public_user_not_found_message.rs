@@ -314,22 +314,45 @@ async fn an_absent_user_of_a_public_operation_is_refused_as_an_unresolved_pair()
     // `smithy_query(query="shape",shape="UsernameType")`): both published length
     // bounds, a non-ASCII name, an email-shaped name, a name shaped like the
     // generated `sub` that `Username` also accepts, and the stored name re-cased,
-    // which names a different user in a pool that compares case-sensitively.
+    // which names a different user in a pool that compares case-sensitively. The third
+    // column is the `Destination` a delivery reported for that name owes: nothing was
+    // sent, so the address is read out of the submitted `Username` and masked the way
+    // every real destination is — an address-shaped name discloses the first character of
+    // each of its own halves, and a name carrying no domain discloses its first character
+    // for both — so no literal in the answer tells this path apart from the one a
+    // registered user takes.
     let longest = "u".repeat(128);
     let usernames = [
-        ("a plain name", "absent-user".to_string()),
-        ("the 128-character length maximum", longest),
-        ("the one-character length minimum", "z".to_string()),
-        ("a non-ASCII name", "ユーザー-不在①".to_string()),
-        ("an email-shaped name", "absent@example.test".to_string()),
+        ("a plain name", "absent-user".to_string(), "a***@a***"),
+        ("the 128-character length maximum", longest, "u***@u***"),
+        (
+            "the one-character length minimum",
+            "z".to_string(),
+            "z***@z***",
+        ),
+        (
+            "a non-ASCII name",
+            "ユーザー-不在①".to_string(),
+            "ユ***@ユ***",
+        ),
+        (
+            "an email-shaped name",
+            "absent@example.test".to_string(),
+            "a***@e***",
+        ),
         (
             "a name shaped like a generated sub",
             "11111111-2222-3333-4444-555555555555".to_string(),
+            "1***@1***",
         ),
-        ("the stored name re-cased", "PRESENT".to_string()),
+        (
+            "the stored name re-cased",
+            "PRESENT".to_string(),
+            "P***@P***",
+        ),
     ];
 
-    for (name_case, username) in &usernames {
+    for (name_case, username, destination) in &usernames {
         for (operation, body) in public_requests(&open_client, username) {
             let case = format!("{operation} with {name_case}");
             let (status, payload) =
@@ -368,8 +391,9 @@ async fn an_absent_user_of_a_public_operation_is_refused_as_an_unresolved_pair()
                 );
                 assert_eq!(
                     payload["CodeDeliveryDetails"]["Destination"],
-                    json!("a***@b***"),
-                    "case {case:?}: expected a simulated destination, got {payload}"
+                    json!(destination),
+                    "case {case:?}: expected the simulated destination {destination:?} \
+                     derived from {username:?}, got {payload}"
                 );
                 continue;
             }
