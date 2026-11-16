@@ -206,7 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `groupBy` that names no dimension a summary can be grouped by
         // cannot be honoured, so the request is refused rather than silently
-        // summarised along another dimension.
+        // summarised along another dimension — or, where the member names no
+        // dimension at all, along one the caller never named.
+        if input.group_by.trim().is_empty() {
+            return Err(no_group_dimension());
+        }
         let dimension = match crate::state::parse_group_dimension(&input.group_by) {
             Some(dimension) => dimension,
             None => return Err(unknown_group_by(&input.group_by)),
@@ -465,14 +469,44 @@ fn savings_percentage_is_defined(filter: Option<&Filter>) -> bool {
         && filter.action_types.is_none()
 }
 
+/// The member every refusal of the grouping is attributed to: the one carrying
+/// the dimension, so it is the member a caller has to change to get the request
+/// served.
+const GROUP_BY: &str = "groupBy";
+
+/// What that member asks this operation to do with the dimension it names,
+/// which is how the refusals of this operation's groupings state it.
+const GROUP_ACTION: &str = "group";
+
+/// How a refusal of the grouping names the dimensions a summary CAN be grouped
+/// by (`crate::state::GROUP_DIMENSIONS`), so both refusals of the member — a
+/// value that names none of them, and a value that names nothing at all — state
+/// the same set.
+const GROUP_DIMENSIONS: &str = "a dimension recommendations can be grouped by";
+
 /// Refuse a `groupBy` that names no dimension recommendations can be summarised
 /// by.
 fn unknown_group_by(group_by: &str) -> ListRecommendationSummariesError {
     stated_refusal(
-        format!("Invalid groupBy specified. Cannot group by {group_by} for this operation."),
-        "groupBy",
-        format!("{group_by} is not a dimension recommendations can be grouped by"),
+        format!(
+            "Invalid {GROUP_BY} specified. Cannot {GROUP_ACTION} by {group_by} for this \
+             operation."
+        ),
+        GROUP_BY,
+        format!("{group_by} is not {GROUP_DIMENSIONS}"),
     )
+}
+
+/// Refuse a `groupBy` that names no dimension at all: a blank value, which this
+/// required member admits. The rule and its wording are the service's one
+/// wording of that refusal class
+/// ([`crate::service::unspecified_dimension`]), which both sibling readers of a
+/// dimension answer with too, so the three cannot drift apart.
+fn no_group_dimension() -> ListRecommendationSummariesError {
+    ListRecommendationSummariesErrorModeled::ValidationException(
+        crate::service::unspecified_dimension(GROUP_BY, GROUP_ACTION, GROUP_BY, GROUP_DIMENSIONS),
+    )
+    .into()
 }
 
 /// Refuse a `filter` member this API documents as unsupported: `member` is the

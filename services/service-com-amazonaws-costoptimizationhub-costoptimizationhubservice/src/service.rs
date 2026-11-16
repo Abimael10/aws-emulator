@@ -341,6 +341,43 @@ pub(crate) fn stated_validation_exception(
     }
 }
 
+/// This service's refusal of a dimension-naming member a request SUPPLIED while
+/// naming no dimension in it: a value that is empty or whitespace only.
+///
+/// Such a value reaches a handler because the members that name a dimension
+/// target a plain `String` with no `@length` and no `@pattern`
+/// (`smithy_query(query="operation", operation="ListRecommendationSummaries")`:
+/// `groupBy` targets `String`), so presence alone satisfies the constraint walk.
+/// A request that sets the member asks for a grouping or an ordering while
+/// leaving out what it would be grouped or ordered by, which no operation can
+/// honour, so it is refused rather than served along a dimension the caller
+/// never named — and the refusal STATES that rule instead of quoting the blank
+/// value back, which would name no dimension at all.
+///
+/// The one place this refusal class is worded, so every operation of this
+/// service that takes a dimension names it the same way: `member` is the member
+/// the request set, `action` the verb that member asks of the dimension
+/// (`group`, `order`), `field_name` the member the diagnosis is attributed to —
+/// the one carrying the dimension, which is what a caller has to change — and
+/// `dimensions` the phrase naming the set that operation accepts for it.
+pub(crate) fn unspecified_dimension(
+    member: &str,
+    action: &str,
+    field_name: &str,
+    dimensions: &str,
+) -> ValidationException {
+    stated_validation_exception(
+        format!(
+            "Invalid {member} specified. Cannot {action} by an unspecified dimension for this \
+             operation."
+        ),
+        vec![ValidationExceptionDetail {
+            field_name: field_name.to_string(),
+            message: format!("{dimensions} is required whenever {member} is specified"),
+        }],
+    )
+}
+
 /// How this service words the refusal of a request for Cost Optimization Hub
 /// data about accounts other than the caller's: one fixed sentence naming the
 /// member accounts of the organization and the reason the caller cannot have

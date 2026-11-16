@@ -337,16 +337,26 @@ fn render(row: &crate::state::StoredRecommendation, mode: Option<&str>) -> Recom
     }
 }
 
-/// The member every refusal of an `orderBy` is attributed to: the one that says
-/// which dimension the rows are ordered on, so it is the member a caller has to
-/// change to get the request served.
+/// The member the request sets to ask for an ordering, the verb it asks of the
+/// dimension, and the member every refusal of an `orderBy` is attributed to: the
+/// one that says which dimension the rows are ordered on, so it is the member a
+/// caller has to change to get the request served.
+const ORDER_BY: &str = "orderBy";
+const ORDER_ACTION: &str = "order";
 const DIMENSION_MEMBER: &str = "orderBy.dimension";
+
+/// How a refusal of the ordering names the dimensions recommendations CAN be
+/// sorted by, so both refusals of the member state the same set.
+const ORDER_DIMENSIONS: &str = "a dimension recommendations can be sorted by";
 
 /// Refuse an `orderBy.dimension` that names no `Recommendation` member.
 fn unknown_dimension(dimension: &str) -> ListRecommendationsError {
     stated_refusal(
-        format!("Invalid orderBy specified. Cannot order by {dimension} for this operation."),
-        format!("{dimension} is not a dimension recommendations can be sorted by"),
+        format!(
+            "Invalid {ORDER_BY} specified. Cannot {ORDER_ACTION} by {dimension} for this \
+             operation."
+        ),
+        format!("{dimension} is not {ORDER_DIMENSIONS}"),
     )
 }
 
@@ -356,12 +366,13 @@ fn unknown_dimension(dimension: &str) -> ListRecommendationsError {
 /// its own does not say which values it orders — so it is refused instead of
 /// being served in an order the caller did not ask for.
 fn no_dimension() -> ListRecommendationsError {
-    stated_refusal(
-        "Invalid orderBy specified. Cannot order by an unspecified dimension for this operation."
-            .to_string(),
-        "a dimension recommendations can be sorted by is required whenever orderBy is specified"
-            .to_string(),
-    )
+    ListRecommendationsErrorModeled::ValidationException(crate::service::unspecified_dimension(
+        ORDER_BY,
+        ORDER_ACTION,
+        DIMENSION_MEMBER,
+        ORDER_DIMENSIONS,
+    ))
+    .into()
 }
 
 /// One refused `orderBy`, in the envelope every handler-raised refusal of this

@@ -65,5 +65,7 @@ mod shared_recommendation_view;
 mod state_roundtrip;
 #[path = "all/summary_metrics_and_refusals.rs"]
 mod summary_metrics_and_refusals;
+#[path = "all/unspecified_dimension_refusal.rs"]
+mod unspecified_dimension_refusal;
 #[path = "all/validation_exception_fields.rs"]
 mod validation_exception_fields;

@@ -938,12 +938,25 @@ impl MetricDimension {
 const START: &str = "timePeriod.start";
 const END: &str = "timePeriod.end";
 
+/// The member every refusal of the grouping is attributed to: the one carrying
+/// the dimension these metrics are grouped by, and what that member asks this
+/// operation to do with the dimension it names.
+const GROUP_BY: &str = "groupBy";
+const GROUP_ACTION: &str = "group";
+
+/// How a refusal of the grouping names the dimensions these metrics CAN be
+/// grouped by, so both refusals of the member state the same set.
+const GROUP_DIMENSIONS: &str = "a dimension cost efficiency metrics can be grouped by";
+
 /// Refuse a `groupBy` that names no dimension these metrics can be grouped by.
 fn unknown_group_by(group_by: &str) -> ListEfficiencyMetricsError {
     stated_refusal(
-        format!("Invalid groupBy specified. Cannot group by {group_by} for this operation."),
-        "groupBy",
-        format!("{group_by} is not a dimension cost efficiency metrics can be grouped by"),
+        format!(
+            "Invalid {GROUP_BY} specified. Cannot {GROUP_ACTION} by {group_by} for this \
+             operation."
+        ),
+        GROUP_BY,
+        format!("{group_by} is not {GROUP_DIMENSIONS}"),
     )
 }
 
@@ -953,22 +966,37 @@ fn unknown_group_by(group_by: &str) -> ListEfficiencyMetricsError {
 /// asks for — so it is refused rather than served along a dimension the caller
 /// did not name.
 fn no_group_dimension() -> ListEfficiencyMetricsError {
-    stated_refusal(
-        "Invalid groupBy specified. Cannot group by an unspecified dimension for this operation."
-            .to_string(),
-        "groupBy",
-        "a dimension cost efficiency metrics can be grouped by is required whenever groupBy is \
-         specified"
-            .to_string(),
+    ListEfficiencyMetricsErrorModeled::ValidationException(
+        crate::service::unspecified_dimension(
+            GROUP_BY,
+            GROUP_ACTION,
+            GROUP_BY,
+            GROUP_DIMENSIONS,
+        ),
     )
+    .into()
 }
+
+/// The member the request sets to ask for an ordering, the verb it asks of the
+/// dimension, and the member every refusal of an `orderBy` is attributed to: the
+/// one that says which dimension the groups are ordered on.
+const ORDER_BY: &str = "orderBy";
+const ORDER_ACTION: &str = "order";
+const ORDER_DIMENSION: &str = "orderBy.dimension";
+
+/// How a refusal of the ordering names the dimensions these groups CAN be sorted
+/// by, so both refusals of the member state the same set.
+const ORDER_DIMENSIONS: &str = "a dimension cost efficiency metrics can be sorted by";
 
 /// Refuse an `orderBy.dimension` that names no member these groups carry.
 fn unknown_order_dimension(dimension: &str) -> ListEfficiencyMetricsError {
     stated_refusal(
-        format!("Invalid orderBy specified. Cannot order by {dimension} for this operation."),
+        format!(
+            "Invalid {ORDER_BY} specified. Cannot {ORDER_ACTION} by {dimension} for this \
+             operation."
+        ),
         ORDER_DIMENSION,
-        format!("{dimension} is not a dimension cost efficiency metrics can be sorted by"),
+        format!("{dimension} is not {ORDER_DIMENSIONS}"),
     )
 }
 
@@ -978,19 +1006,16 @@ fn unknown_order_dimension(dimension: &str) -> ListEfficiencyMetricsError {
 /// orders — so it is refused instead of being served in an order the caller did
 /// not ask for.
 fn no_order_dimension() -> ListEfficiencyMetricsError {
-    stated_refusal(
-        "Invalid orderBy specified. Cannot order by an unspecified dimension for this operation."
-            .to_string(),
-        ORDER_DIMENSION,
-        "a dimension cost efficiency metrics can be sorted by is required whenever orderBy is \
-         specified"
-            .to_string(),
+    ListEfficiencyMetricsErrorModeled::ValidationException(
+        crate::service::unspecified_dimension(
+            ORDER_BY,
+            ORDER_ACTION,
+            ORDER_DIMENSION,
+            ORDER_DIMENSIONS,
+        ),
     )
+    .into()
 }
-
-/// The member every refusal of an `orderBy` is attributed to: the one that says
-/// which dimension the groups are ordered on.
-const ORDER_DIMENSION: &str = "orderBy.dimension";
 
 /// How a refusal about the period names the member it is about: the service
 /// states it in the capitalization of the shape the member targets
