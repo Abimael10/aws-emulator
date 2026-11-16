@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates an ACM certificate with a responder gateway. Only an `EXTERNAL`
+//! responder gateway terminates TLS for callers outside the fabric, so only one of
+//! those takes a certificate; the association is stored against the (gateway,
+//! certificate) pair and read back by `GetCertificateAssociation`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateCertificate"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateCertificateErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // The URI addresses a responder gateway, so an id this store holds no
+        // responder gateway for is not found — including one naming a requester
+        // gateway, which has no certificate surface at all.
+        let Some(gateway) = store.responder_gateways.get(&input.gateway_id) else {
+            return Err(AssociateCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+        // A certificate is only served to callers outside the fabric, which is what
+        // an EXTERNAL gateway is for; the precondition is read off the stored
+        // gateway's own type.
+        if !gateway.is_external() {
+            return Err(AssociateCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::CERTIFICATE_EXTERNAL_ONLY_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // This operation mints no id: the (gateway, certificate) pair IS the
+        // association's identity, so a retry — with the caller's `clientToken` or
+        // without it — addresses the record already there rather than making a
+        // second one. That is what the token would otherwise buy, and it holds for a
+        // retry that carries a fresh token too.
+        let key = (input.gateway_id.clone(), input.acm_certificate_arn.clone());
+        if let Some(existing) = store.certificate_associations.get(&key) {
+            if existing.association_in_force() {
+                return Ok(AssociateCertificateOutput {
+                    gateway_id: existing.gateway_id.clone(),
+                    acm_certificate_arn: existing.acm_certificate_arn.clone(),
+                    status: existing.status.clone(),
+                });
+            }
+        } else if store
+            .certificate_associations
+            .keys()
+            .filter(|(gateway_id, _)| *gateway_id == input.gateway_id)
+            .count()
+            >= crate::state::CERTIFICATE_ASSOCIATIONS_PER_GATEWAY_QUOTA
+        {
+            // The store's own bound, checked before the insert.
+            return Err(
+                AssociateCertificateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds its limit of {} certificate associations per gateway",
+                            crate::state::CERTIFICATE_ASSOCIATIONS_PER_GATEWAY_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Association is asynchronous: the certificate is in place once the clock
+        // makes the transition due, and a caller reading straight after this call
+        // still sees the pending status.
+        let association = crate::state::CertificateAssociation {
+            gateway_id: input.gateway_id,
+            acm_certificate_arn: input.acm_certificate_arn,
+            status: crate::state::CERTIFICATE_STATUS_PENDING_ASSOCIATION.to_string(),
+            settles_at: Some(now + crate::state::PROVISIONING_DELAY),
+            associated_at: now,
+            updated_at: now,
+        };
+        let output = AssociateCertificateOutput {
+            gateway_id: association.gateway_id.clone(),
+            acm_certificate_arn: association.acm_certificate_arn.clone(),
+            status: association.status.clone(),
+        };
+        store.certificate_associations.insert(key, association);
+        Ok(output)
     }
 }

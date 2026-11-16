@@ -143,12 +143,10 @@ pub fn tagged_resource<'a>(resource_arn: &'a str, region: &str) -> Option<Tagged
 /// The tags the addressed record holds, or `None` when this store holds no such
 /// record.
 ///
-/// The table of what can be addressed at all: a gateway of either kind, and a link
-/// read from either of its two ends. A routing rule resolves to nothing because no
-/// operation stores one yet (`CreateLinkRoutingRule` is still a stub), so an ARN
-/// naming one is answered exactly as an ARN naming a gateway that was never created
-/// is; when that create lands, this reader and [`resource_tags_mut`] are the two
-/// places that learn where the record lives.
+/// The table of what can be addressed at all: a gateway of either kind, a link read
+/// from either of its two ends, and a routing rule read through its own link from
+/// either of that link's ends. An ARN naming a record this store does not hold is
+/// answered exactly as an ARN naming a gateway that was never created is.
 pub fn resource_tags<'a>(
     state: &'a ComAmazonawsRtbfabricRtbfabricState,
     resource: TaggedResource<'_>,
@@ -168,7 +166,13 @@ pub fn resource_tags<'a>(
             gateway_id,
             link_id,
         } => state.find_link(gateway_id, link_id).map(|link| &link.tags),
-        TaggedResource::LinkRoutingRule { .. } => None,
+        TaggedResource::LinkRoutingRule {
+            gateway_id,
+            link_id,
+            rule_id,
+        } => state
+            .find_routing_rule(gateway_id, link_id, rule_id)
+            .map(|rule| &rule.tags),
     }
 }
 
@@ -199,6 +203,12 @@ pub fn resource_tags_mut<'a>(
         } => state
             .find_link_mut(gateway_id, link_id)
             .map(|link| &mut link.tags),
-        TaggedResource::LinkRoutingRule { .. } => None,
+        TaggedResource::LinkRoutingRule {
+            gateway_id,
+            link_id,
+            rule_id,
+        } => state
+            .find_routing_rule_mut(gateway_id, link_id, rule_id)
+            .map(|rule| &mut rule.tags),
     }
 }

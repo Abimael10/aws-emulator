@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             return Err(CreateLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no gateway with id {} exists", input.gateway_id),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());
@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.gateway_exists(&input.peer_gateway_id) {
             return Err(CreateLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no gateway with id {} exists", input.peer_gateway_id),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

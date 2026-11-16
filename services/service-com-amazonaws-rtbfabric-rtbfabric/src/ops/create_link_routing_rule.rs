@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLinkRoutingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLinkRoutingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLinkRoutingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a routing rule on a link between two stored gateways: the rule the link's
+//! routing-rule surface then reports, released with the link it routes for.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLinkRoutingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLinkRoutingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLinkRoutingRule"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLinkRoutingRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // A rule routes for one stored link, addressed from either of that link's
+        // two ends — exactly as the link itself is.
+        let Some(link) = store.find_link(&input.gateway_id, &input.link_id) else {
+            return Err(CreateLinkRoutingRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+        let link_id = link.link_id.clone();
+
+        // Every member of the modelled `RuleCondition` is optional, so a structure
+        // stating no condition at all passes the schema layer and has to be refused
+        // here: a rule that matches on nothing matches everything.
+        if !crate::state::conditions_stated(&input.conditions) {
+            return Err(CreateLinkRoutingRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::RULE_CONDITIONS_EMPTY_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // See `create_requester_gateway` for the `@idempotencyToken` contract; the
+        // token is scoped to this operation, so it never collides with a create of
+        // another resource.
+        let fingerprint = crate::state::parameter_fingerprint(&format!(
+            "gatewayId={:?}|linkId={:?}|priority={:?}|conditions={:?}|tags={}",
+            input.gateway_id,
+            input.link_id,
+            input.priority,
+            input.conditions,
+            crate::state::canonical_tags(input.tags.as_ref()),
+        ));
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_token);
+        if let Some(prior) = store.idempotency.get(&token).cloned() {
+            if prior.fingerprint != fingerprint {
+                return Err(CreateLinkRoutingRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "clientToken {} was already used for a {} request with different parameters",
+                            input.client_token,
+                            Self::NAME,
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(rule) = store
+                .routing_rules
+                .get(&(link_id.clone(), prior.resource_id.clone()))
+            {
+                return Ok(CreateLinkRoutingRuleOutput {
+                    rule_id: rule.rule_id.clone(),
+                    status: rule.status.clone(),
+                    created_at: crate::state::timestamp(rule.created_at),
+                });
+            }
+        }
+
+        // The store's own bounds, checked before the insert.
+        if store.routing_rules.len() >= crate::state::ROUTING_RULE_QUOTA {
+            return Err(
+                CreateLinkRoutingRuleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds its limit of {} routing rules",
+                            crate::state::ROUTING_RULE_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.idempotency.len() >= crate::state::IDEMPOTENCY_QUOTA {
+            return Err(
+                CreateLinkRoutingRuleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds its limit of {} client-token records",
+                            crate::state::IDEMPOTENCY_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let rule_id = store.mint_rule_id();
+        let rule = crate::state::LinkRoutingRule {
+            rule_id: rule_id.clone(),
+            link_id: link_id.clone(),
+            priority: input.priority,
+            conditions: input.conditions,
+            // Creation is asynchronous: the rule routes once the clock makes the
+            // transition due, so a caller reading straight after this call still
+            // sees the transient status.
+            status: crate::state::RULE_STATUS_CREATION_IN_PROGRESS.to_string(),
+            settles_at: Some(now + crate::state::PROVISIONING_DELAY),
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let output = CreateLinkRoutingRuleOutput {
+            rule_id: rule.rule_id.clone(),
+            status: rule.status.clone(),
+            created_at: crate::state::timestamp(rule.created_at),
+        };
+        store.routing_rules.insert((link_id, rule_id.clone()), rule);
+        store.idempotency.insert(
+            token,
+            crate::state::IdempotentCreate {
+                resource_id: rule_id,
+                fingerprint,
+            },
+        );
+        Ok(output)
     }
 }

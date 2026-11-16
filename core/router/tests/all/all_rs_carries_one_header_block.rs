@@ -19,7 +19,7 @@
 //! It reads one file; it starts no router and reaches no network.
 
 // The declaration root this rule is about, read through the sibling declaration suite rather
-// than opened a second time.
+// than opened a second time, and what that sibling states for a crate holding no such root.
 use crate::all_rs_declares_each_suite_once::all_rs;
 // Where a root's header ends comes from the sibling that owns that boundary for the other
 // inner construct, so no two suites of this target can disagree about it.

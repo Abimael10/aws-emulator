@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(link) = store.find_link_mut(&input.gateway_id, &input.link_id) else {
             return Err(RejectLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no link with id {} exists on gateway {}",
-                        input.link_id, input.gateway_id
-                    ),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

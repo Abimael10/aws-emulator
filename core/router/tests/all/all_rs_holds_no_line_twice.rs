@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 // The declaration root this rule is about, read through the sibling declaration suite rather
-// than opened a second time.
+// than opened a second time, and what that sibling states for a crate holding no such root.
 use crate::all_rs_declares_each_suite_once::all_rs;
 // The header half of the rule, and where a root's header ends, from the siblings that own
 // them: the header block is read by its own suite's reader, not by a second copy here.

@@ -199,10 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(gateway) = store.responder_gateways.get(&input.gateway_id) else {
             return Err(GetResponderGatewayErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no responder gateway with id {} exists",
-                        input.gateway_id
-                    ),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

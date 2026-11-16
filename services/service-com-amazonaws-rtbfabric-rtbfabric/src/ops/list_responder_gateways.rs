@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResponderGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResponderGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResponderGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the responder gateways this store holds, a page at a time, in the
+//! total order their ids give.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResponderGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResponderGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResponderGateways"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListResponderGatewaysErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        // Reporting only, and this response carries no status, so the listing takes
+        // the store immutably and leaves every record exactly as the next caller
+        // would have found it.
+        let store = state.lock();
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_next_token(Self::NAME, token, now).map_err(|refusal| {
+                    ListResponderGatewaysErrorModeled::ValidationException(ValidationException {
+                        message: refusal.message(Self::NAME),
+                    })
+                })?,
+            ),
+            None => None,
+        };
+
+        // `maxResults` is modelled `range(min: 1, max: 10)` with a default of 10,
+        // and the boundary validator refuses anything outside that window before
+        // this handler runs. An in-process caller can still hand over a value the
+        // wire never carries, so a value at or below zero takes the MODELLED
+        // DEFAULT — a page of one is not what an absent member asks for — and
+        // anything above the maximum is capped at it.
+        let page_size = match input.max_results {
+            requested if requested > 0 => {
+                usize::try_from(requested.min(MAX_PAGE_SIZE)).unwrap_or(DEFAULT_PAGE_SIZE)
+            }
+            _ => DEFAULT_PAGE_SIZE,
+        };
+
+        // Ordered by `gatewayId`. An id is unique, so that is a total order over
+        // the stored records: a page boundary is stable across calls, and a walk
+        // neither repeats a gateway nor skips one.
+        let mut gateway_ids: Vec<&str> = store
+            .responder_gateways
+            .keys()
+            .map(String::as_str)
+            .collect();
+        gateway_ids.sort_unstable();
+
+        let start = match resume_after.as_deref() {
+            Some(cursor) => gateway_ids.partition_point(|id| *id <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(gateway_ids.len());
+        let page: Vec<String> = gateway_ids[start..end]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+
+        // A token only when gateways remain after this page, so a caller stops
+        // paging exactly when the enumeration is exhausted.
+        let next_token = (end < gateway_ids.len())
+            .then(|| {
+                page.last()
+                    .map(|cursor| crate::state::encode_next_token(Self::NAME, cursor, now))
+            })
+            .flatten();
+
+        Ok(ListResponderGatewaysOutput {
+            gateway_ids: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The largest page this operation returns, from the modelled `maxResults`
+/// range (`range(min: 1, max: 10)`).
+const MAX_PAGE_SIZE: i32 = 10;
+
+/// The page size a request that names no `maxResults` gets: the member's own
+/// modelled default, which is also the range's maximum.
+const DEFAULT_PAGE_SIZE: usize = 10;

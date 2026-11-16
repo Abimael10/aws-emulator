@@ -165,16 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_all(now);
 
-        let removed = store
-            .find_link_key(&input.gateway_id, &input.link_id)
-            .and_then(|key| store.links.remove(&key));
+        let removed = store.release_link(&input.gateway_id, &input.link_id);
         let Some(removed) = removed else {
             return Err(DeleteLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no link with id {} exists on gateway {}",
-                        input.link_id, input.gateway_id
-                    ),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());

@@ -227,6 +227,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A managed endpoint serves the domain name the caller asks for only while
+        // that domain is allowlisted for managed endpoints. An allowlist is granted
+        // outside this API — the model carries no operation that adds one and no
+        // member that presents one — so this emulator holds none: a create pairing a
+        // managed endpoint with a domain name of the caller's own is refused, and
+        // stores no gateway, rather than serving a name nothing allowlisted. A
+        // managed endpoint named without a `domainName` asks for no such name and is
+        // created as usual.
+        if let (Some(domain_name), Some(_)) = (
+            input.domain_name.as_deref(),
+            input.managed_endpoint_configuration.as_ref(),
+        ) {
+            return Err(CreateResponderGatewayErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Domain name '{domain_name}' for managed endpoint not allowlisted."
+                    ),
+                },
+            )
+            .into());
+        }
+
         // See `create_requester_gateway` for the `@idempotencyToken` contract; the
         // token is scoped to this operation, so the two creates never collide.
         let fingerprint = crate::state::parameter_fingerprint(&format!(
@@ -297,17 +319,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let gateway_id = store.mint_gateway_id();
-        let is_external =
-            input.gateway_type.as_deref() == Some(crate::state::GATEWAY_TYPE_EXTERNAL);
-        let gateway = crate::state::ResponderGateway {
+        let mut gateway = crate::state::ResponderGateway {
             // Stored exactly as the caller named it: a gateway reached through a
             // managed endpoint has no domain name, and the service does not
             // invent one.
             domain_name: input.domain_name,
-            // Only an EXTERNAL gateway accepts inbound external links, so only it
-            // has a public inbound endpoint.
-            external_inbound_endpoint: is_external
-                .then(|| crate::state::external_inbound_endpoint(&gateway_id, &region)),
+            // Set below, from the stored gateway's own type.
+            external_inbound_endpoint: None,
             // Creation is asynchronous: see `create_requester_gateway`.
             status: crate::state::GATEWAY_STATUS_PENDING_CREATION.to_string(),
             settles_at: Some(now + crate::state::PROVISIONING_DELAY),
@@ -327,6 +345,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
         };
+        // Only an EXTERNAL gateway accepts inbound external links, so only it has a
+        // public inbound endpoint. The type is read off the record through the one
+        // reading of it the whole crate shares.
+        if gateway.is_external() {
+            gateway.external_inbound_endpoint =
+                Some(crate::state::external_inbound_endpoint(&gateway_id, &region));
+        }
 
         let output = CreateResponderGatewayOutput {
             gateway_id: gateway.gateway_id.clone(),

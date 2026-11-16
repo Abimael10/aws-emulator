@@ -12,11 +12,30 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+/// The `/responder-gateway/{gatewayId}/certificate` surface's record.
+mod certificates;
+/// The one encoding this service's paginated reads state a page boundary in.
+mod page_tokens;
+/// The routing rules a link carries.
+mod routing_rules;
 /// The `/tags/{resourceArn}` surface's one reading of a caller-supplied ARN and of
 /// the record it addresses.
 mod tagging;
 // Named rather than glob, so this module's public surface stays explicit, and every
 // path a handler uses (`crate::state::…`) keeps resolving.
+pub use certificates::{
+    CertificateAssociation, CERTIFICATE_ASSOCIATIONS_PER_GATEWAY_QUOTA,
+    CERTIFICATE_EXTERNAL_ONLY_MESSAGE, CERTIFICATE_STATUS_ASSOCIATED,
+    CERTIFICATE_STATUS_DISASSOCIATED, CERTIFICATE_STATUS_PENDING_ASSOCIATION,
+    CERTIFICATE_STATUS_PENDING_DISASSOCIATION,
+};
+pub use page_tokens::{
+    decode_next_token, encode_next_token, TokenRefusal, MAX_TOKEN_LENGTH, TOKEN_LIFETIME,
+};
+pub use routing_rules::{
+    conditions_stated, LinkRoutingRule, ROUTING_RULE_QUOTA, RULE_CONDITIONS_EMPTY_MESSAGE,
+    RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,
+};
 pub use tagging::{
     resource_tags, resource_tags_mut, tagged_resource, tagging_unresolved, TaggedResource,
     ARN_VENDOR, TAGGING_UNRESOLVED_CODE, TAGGING_UNRESOLVED_MESSAGE, TAGGING_UNRESOLVED_STATUS,
@@ -49,11 +68,11 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// emulator models neither Service Quotas nor an account's adjustments, so this
 /// is the emulator's OWN bound on the store rather than a claim about any
 /// account's limit. It sits far above any workflow an emulator serves, and it is
-/// what stops the state growing without end: `DeleteRequesterGateway` releases a
-/// requester gateway's record, its links and its client tokens
-/// ([`ComAmazonawsRtbfabricRtbfabricState::release_requester_gateway`]), while
-/// `DeleteResponderGateway` is still a stub, so for a responder gateway this bound
-/// is the only thing that holds.
+/// what stops the state growing without end: each gateway delete releases that
+/// gateway's record, its links, its routing rules, its certificate associations
+/// and its client tokens
+/// ([`ComAmazonawsRtbfabricRtbfabricState::release_requester_gateway`] and
+/// [`ComAmazonawsRtbfabricRtbfabricState::release_responder_gateway`]).
 pub const GATEWAY_QUOTA: usize = 1_000;
 
 /// How many links the store holds before `CreateLink` refuses with the modelled
@@ -67,13 +86,14 @@ pub const LINK_QUOTA: usize = 5_000;
 /// How many `@idempotencyToken` records the store keeps before a create refuses
 /// with the modelled `ServiceQuotaExceededException` (HTTP 402).
 ///
-/// A record is written ONLY by a create that actually stored a gateway, so the
-/// map cannot hold more than the two gateway quotas; the bound is checked anyway,
-/// so the retention rule survives a future create that forgets it. Each record is
-/// fixed size — both the key and the parameter fingerprint are 32-byte digests —
-/// so a `clientToken` or a request body the model leaves unbounded in length
-/// cannot grow the bytes retained per record.
-pub const IDEMPOTENCY_QUOTA: usize = 2 * GATEWAY_QUOTA;
+/// A record is written ONLY by a create that actually stored a resource whose id
+/// this service minted — the two gateway creates and the routing-rule create — so
+/// the map cannot hold more than those resources' own quotas; the bound is checked
+/// anyway, so the retention rule survives a future create that forgets it. Each
+/// record is fixed size — both the key and the parameter fingerprint are 32-byte
+/// digests — so a `clientToken` or a request body the model leaves unbounded in
+/// length cannot grow the bytes retained per record.
+pub const IDEMPOTENCY_QUOTA: usize = 2 * GATEWAY_QUOTA + ROUTING_RULE_QUOTA;
 
 /// `RequesterGatewayStatus`/`ResponderGatewayStatus` member: creation accepted,
 /// the gateway is not usable yet.
@@ -86,6 +106,11 @@ pub const GATEWAY_STATUS_DELETED: &str = "DELETED";
 
 /// The message this service's `ResourceNotFoundException` carries: fixed text
 /// naming neither the resource asked for nor its id.
+///
+/// Every not-found path of this service answers with it — a gateway of either
+/// kind, a link, a routing rule, a certificate association — so the refusal says
+/// the same thing whichever resource was addressed, and no path echoes an id the
+/// caller supplied back at them.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
 
 /// `LinkStatus` member: the link request is accepted and not yet put to the peer.
@@ -176,6 +201,14 @@ impl ResponderGateway {
             self.settles_at = None;
             self.updated_at = due;
         }
+    }
+
+    /// Whether this gateway is `EXTERNAL` — the type that takes links from outside
+    /// the fabric, and the only one a certificate can be associated with. A gateway
+    /// created without a `gatewayType` is not external: the member is optional, and
+    /// nothing is assumed for a caller that left it out.
+    pub fn is_external(&self) -> bool {
+        self.gateway_type.as_deref() == Some(GATEWAY_TYPE_EXTERNAL)
     }
 }
 
@@ -274,9 +307,11 @@ pub struct LinkCounts {
 /// Per-service state for com-amazonaws-rtbfabric-rtbfabric. A handler reaches it through [`service_state`].
 ///
 /// Every map below is bounded: gateways by [`GATEWAY_QUOTA`], links by
-/// [`LINK_QUOTA`] and the idempotency records by [`IDEMPOTENCY_QUOTA`], each
-/// checked by the create that would insert, BEFORE it inserts. That is also what
-/// bounds the per-request work the linear scans here do under the state lock.
+/// [`LINK_QUOTA`], routing rules by [`ROUTING_RULE_QUOTA`], one gateway's
+/// certificate associations by [`CERTIFICATE_ASSOCIATIONS_PER_GATEWAY_QUOTA`] and
+/// the idempotency records by [`IDEMPOTENCY_QUOTA`], each checked by the call that
+/// would insert, BEFORE it inserts. That is also what bounds the per-request work
+/// the linear scans here do under the state lock.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRtbfabricRtbfabricState {
     /// Keyed by `gatewayId`. Bounded by [`GATEWAY_QUOTA`]; released by
@@ -284,11 +319,20 @@ pub struct ComAmazonawsRtbfabricRtbfabricState {
     /// [`release_requester_gateway`](Self::release_requester_gateway).
     pub requester_gateways: HashMap<String, RequesterGateway>,
     /// Keyed by `gatewayId`. Bounded by [`GATEWAY_QUOTA`]; released by
-    /// `DeleteResponderGateway` once that is implemented.
+    /// `DeleteResponderGateway` through
+    /// [`release_responder_gateway`](Self::release_responder_gateway).
     pub responder_gateways: HashMap<String, ResponderGateway>,
     /// Keyed by (the `gatewayId` the link was opened from, `linkId`). Bounded by
     /// [`LINK_QUOTA`]; released by `DeleteLink`.
     pub links: HashMap<(String, String), Link>,
+    /// Keyed by (`linkId`, `ruleId`). Bounded by [`ROUTING_RULE_QUOTA`]; released
+    /// with the link it routes for ([`release_link`](Self::release_link)).
+    pub routing_rules: HashMap<(String, String), LinkRoutingRule>,
+    /// Keyed by (`gatewayId`, `acmCertificateArn`) — the pair that identifies one
+    /// certificate association. Bounded by
+    /// [`CERTIFICATE_ASSOCIATIONS_PER_GATEWAY_QUOTA`] per gateway, and so by that
+    /// bound times [`GATEWAY_QUOTA`] in all.
+    pub certificate_associations: HashMap<(String, String), CertificateAssociation>,
     /// Keyed by [`idempotency_key`], which folds the operation and the caller's
     /// `clientToken` into one 32-byte digest: a token is scoped to the operation
     /// it was presented to. Bounded by [`IDEMPOTENCY_QUOTA`], and written only by
@@ -316,6 +360,11 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         format!("link-{}", self.next_suffix())
     }
 
+    /// A fresh `ruleId`, matching the modelled `^rule-[a-z0-9-]{1,25}$`.
+    pub fn mint_rule_id(&mut self) -> String {
+        format!("rule-{}", self.next_suffix())
+    }
+
     /// Whether `gateway_id` names a stored gateway of either kind.
     pub fn gateway_exists(&self, gateway_id: &str) -> bool {
         self.requester_gateways.contains_key(gateway_id)
@@ -336,6 +385,12 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         }
         for link in self.links.values_mut() {
             link.settle(now);
+        }
+        for rule in self.routing_rules.values_mut() {
+            rule.settle(now);
+        }
+        for association in self.certificate_associations.values_mut() {
+            association.settle(now);
         }
     }
 
@@ -361,6 +416,48 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .iter()
             .find(|(_, link)| link.link_id == link_id && link.has_end(gateway_id))
             .map(|(key, _)| key.clone())
+    }
+
+    /// The routing rule `rule_id` on the link `link_id`, addressed from either of
+    /// that link's two ends.
+    ///
+    /// A rule is only addressable through its own link, so a rule id that exists on
+    /// ANOTHER link resolves to nothing here, exactly as one nothing minted does.
+    pub fn find_routing_rule(
+        &self,
+        gateway_id: &str,
+        link_id: &str,
+        rule_id: &str,
+    ) -> Option<&LinkRoutingRule> {
+        self.find_link(gateway_id, link_id)?;
+        self.routing_rules
+            .get(&(link_id.to_string(), rule_id.to_string()))
+    }
+
+    /// [`find_routing_rule`](Self::find_routing_rule)'s rule, for an operation that
+    /// changes it.
+    pub fn find_routing_rule_mut(
+        &mut self,
+        gateway_id: &str,
+        link_id: &str,
+        rule_id: &str,
+    ) -> Option<&mut LinkRoutingRule> {
+        self.find_link(gateway_id, link_id)?;
+        self.routing_rules
+            .get_mut(&(link_id.to_string(), rule_id.to_string()))
+    }
+
+    /// Release the link `link_id` addressed from `gateway_id`: the record, and every
+    /// routing rule that routed for it, since a rule cannot outlive its link.
+    ///
+    /// `None` when that gateway is no end of any link of that id, which is the
+    /// not-found the caller is answered with.
+    pub fn release_link(&mut self, gateway_id: &str, link_id: &str) -> Option<Link> {
+        let key = self.find_link_key(gateway_id, link_id)?;
+        let released = self.links.remove(&key)?;
+        self.routing_rules
+            .retain(|(rule_link_id, _), _| *rule_link_id != released.link_id);
+        Some(released)
     }
 
     /// Whether a link already joins these two gateways, in either orientation: a
@@ -394,18 +491,48 @@ impl ComAmazonawsRtbfabricRtbfabricState {
     ///
     /// `None` when no requester gateway of that id is stored, which is the
     /// not-found the caller is answered with. Otherwise the record removed, and
-    /// with it:
-    ///
-    /// * every link the gateway was an end of — a link is one record joining two
-    ///   stored gateways and cannot outlive either of them;
-    /// * every client-token record that minted it, so the id a replayed token
-    ///   would answer with is never one the store no longer holds.
+    /// with it everything [`release_dependents`](Self::release_dependents) holds to
+    /// that gateway.
     pub fn release_requester_gateway(&mut self, gateway_id: &str) -> Option<RequesterGateway> {
         let released = self.requester_gateways.remove(gateway_id)?;
+        self.release_dependents(gateway_id);
+        Some(released)
+    }
+
+    /// Release the responder gateway `gateway_id`, exactly as
+    /// [`release_requester_gateway`](Self::release_requester_gateway) releases the
+    /// other kind: the two gateway stores are separate, and what hangs off a gateway
+    /// does not depend on which kind it is.
+    pub fn release_responder_gateway(&mut self, gateway_id: &str) -> Option<ResponderGateway> {
+        let released = self.responder_gateways.remove(gateway_id)?;
+        self.release_dependents(gateway_id);
+        Some(released)
+    }
+
+    /// Release everything the store holds BECAUSE the gateway `gateway_id` was
+    /// stored:
+    ///
+    /// * every link the gateway was an end of — a link is one record joining two
+    ///   stored gateways and cannot outlive either of them — and every routing rule
+    ///   that routed for one of those links;
+    /// * every certificate association on that gateway, which is a fact about a
+    ///   gateway that no longer exists;
+    /// * every client-token record that minted a resource of that gateway, so the id
+    ///   a replayed token would answer with is never one the store no longer holds.
+    fn release_dependents(&mut self, gateway_id: &str) {
+        let orphaned: Vec<String> = self
+            .links
+            .values()
+            .filter(|link| link.has_end(gateway_id))
+            .map(|link| link.link_id.clone())
+            .collect();
         self.links.retain(|_, link| !link.has_end(gateway_id));
+        self.routing_rules
+            .retain(|(rule_link_id, _), _| !orphaned.contains(rule_link_id));
+        self.certificate_associations
+            .retain(|(association_gateway_id, _), _| association_gateway_id != gateway_id);
         self.idempotency
             .retain(|_, record| record.resource_id != gateway_id);
-        Some(released)
     }
 }
 

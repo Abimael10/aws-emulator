@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLinkRoutingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLinkRoutingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLinkRoutingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one routing rule on one link, as `CreateLinkRoutingRule` stored it.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLinkRoutingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLinkRoutingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLinkRoutingRule"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLinkRoutingRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // Reporting only: the sole write is the status transition the clock had
+        // already made due at this instant, owed whether or not anybody read.
+        store.settle_all(now);
+
+        // A rule is addressed through its own link, from either of that link's two
+        // ends: a gateway that is no end of the link, a link id nothing minted and a
+        // rule id this link does not carry are all not found.
+        let Some(rule) =
+            store.find_routing_rule(&input.gateway_id, &input.link_id, &input.rule_id)
+        else {
+            return Err(GetLinkRoutingRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetLinkRoutingRuleOutput {
+            // The rule as addressed: the gateway in the URI, and the link the rule
+            // routes for.
+            gateway_id: input.gateway_id.clone(),
+            link_id: rule.link_id.clone(),
+            rule_id: rule.rule_id.clone(),
+            priority: rule.priority,
+            conditions: rule.conditions.clone(),
+            status: rule.status.clone(),
+            created_at: crate::state::timestamp(rule.created_at),
+            updated_at: crate::state::timestamp(rule.updated_at),
+            tags: (!rule.tags.is_empty()).then(|| rule.tags.clone()),
+        })
     }
 }

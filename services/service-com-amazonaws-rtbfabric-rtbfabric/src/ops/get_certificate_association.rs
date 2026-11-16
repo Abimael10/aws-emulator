@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCertificateAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCertificateAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCertificateAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one ACM certificate's association with a responder gateway, as
+//! `AssociateCertificate` and `DisassociateCertificate` left it.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCertificateAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCertificateAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCertificateAssociation"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCertificateAssociationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rtbfabric emulator has no state store for this request"
+                        .to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // Reporting only: the sole write is the status transition the clock had
+        // already made due at this instant, owed whether or not anybody read.
+        store.settle_all(now);
+
+        // The gateway, then the association on it: an id this store holds no
+        // responder gateway for, and a certificate that gateway never carried, are
+        // both not found.
+        let key = (input.gateway_id.clone(), input.acm_certificate_arn.clone());
+        let found = if store.responder_gateways.contains_key(&input.gateway_id) {
+            store.certificate_associations.get(&key)
+        } else {
+            None
+        };
+        let Some(association) = found else {
+            return Err(
+                GetCertificateAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetCertificateAssociationOutput {
+            gateway_id: association.gateway_id.clone(),
+            acm_certificate_arn: association.acm_certificate_arn.clone(),
+            status: association.status.clone(),
+            associated_at: Some(crate::state::timestamp(association.associated_at)),
+            updated_at: Some(crate::state::timestamp(association.updated_at)),
+        })
     }
 }
