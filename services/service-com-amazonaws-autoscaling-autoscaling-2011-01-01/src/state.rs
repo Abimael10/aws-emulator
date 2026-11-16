@@ -165,6 +165,19 @@ pub use lifecycle_events::{
     drive_lifecycle_clock, InstanceLifecycle, InstanceLifecycleChange, PendingLifecycleEvent,
 };
 
+/// The instances a caller asks a group to launch outright — `LaunchInstances` — beside
+/// the capacity changes that launch them to converge on a desired capacity: where such a
+/// launch places them, what it answers, and the one launch a repeat of its client token
+/// is.
+pub mod requested_launches;
+
+pub use requested_launches::{
+    launch_suspended_message, RequestedLaunch, RequestedLaunchOutcome, RequestedPlacement,
+    StoredLaunchRequest, INSUFFICIENT_CAPACITY_CODE, LAUNCH_BLOCKED_CODE,
+    MAX_INSTANCES_PER_LAUNCH, MAX_RETAINED_LAUNCH_REQUESTS, RETRY_STRATEGIES,
+    RETRY_STRATEGY_NONE, RETRY_WITH_GROUP_CONFIGURATION,
+};
+
 /// The two spellings of the Availability Zones a group places its instances in — their
 /// NAMES and their IDS — which a group reports both of however the request named them.
 pub mod availability_zone_ids;
@@ -1010,6 +1023,11 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     /// The running pump's task handle, kept so the pump it replaces is aborted rather than
     /// merely forgotten.
     lifecycle_clock_pump: Option<::tokio::task::JoinHandle<()>>,
+    /// What each launch request's client token answered, oldest first: a repeat of a token
+    /// is answered with what its first request produced rather than launching again
+    /// ([`requested_launches`]). At most [`MAX_RETAINED_LAUNCH_REQUESTS`] entries, the
+    /// oldest dropped first.
+    launch_requests: Vec<StoredLaunchRequest>,
 }
 
 /// A shorter name for this service's state, for use inside the crate.
@@ -1567,6 +1585,8 @@ impl AutoScalingState {
                 // A capacity change launches from the group's own launch source.
                 desired_configuration: None,
                 destination: LaunchDestination::Group,
+                // And places across the whole of the group's own configuration.
+                placement: None,
             },
         );
         let launched_ids = launch.launched_ids.clone();
@@ -1766,8 +1786,20 @@ impl AutoScalingState {
             }
         }
         let region = group.region.clone();
-        let zones = group.availability_zones.clone();
-        let vpc_zone_identifier = group.vpc_zone_identifier.clone();
+        // Where the instances go: the placement the CALLER named, when a launch request
+        // named one of the group's own ([`requested_launches`]), and otherwise the whole of
+        // the group's configuration — which is what every launch the group makes for itself
+        // places from.
+        let (zones, vpc_zone_identifier) = match request.placement {
+            Some(placement) => (
+                placement.zones.clone(),
+                placement.vpc_zone_identifier.clone(),
+            ),
+            None => (
+                group.availability_zones.clone(),
+                group.vpc_zone_identifier.clone(),
+            ),
+        };
         let tags = group.tags.clone();
         let protected = group.new_instances_protected_from_scale_in;
         // Everything the group already holds, its warm pool included: the placement of a
@@ -2172,6 +2204,8 @@ impl AutoScalingState {
                 due,
                 desired_configuration,
                 destination: LaunchDestination::Group,
+                // A replacement places across the whole of the group's own configuration.
+                placement: None,
             },
         );
         let launched_ids = launch.launched_ids.clone();
@@ -2270,6 +2304,12 @@ struct GroupLaunch<'a> {
     desired_configuration: Option<&'a DesiredConfiguration>,
     /// Which of the group's two instance collections the launch places into.
     destination: LaunchDestination,
+    /// Where the launch places its instances, when the CALLER named a placement narrower
+    /// than the group's own configuration (`LaunchInstances`): a subset of the group's
+    /// zones and subnets, resolved and checked against the group before it reaches here
+    /// ([`requested_launches`]). `None` places from the group's own configuration, which
+    /// is what every launch the group makes for itself does.
+    placement: Option<&'a RequestedPlacement>,
 }
 
 /// What one launch into a group produced: the instances it placed, how many units of

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op LaunchInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `LaunchInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`LaunchInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Launches a stated number of instances into one Auto Scaling group, from that group's
+//! own launch source and in the placement the request names, and answers the instances it
+//! launched beside the units it could not place. The state it reads and writes — the
+//! group, its instances, the activities and lifecycle events each launch records, and the
+//! answer each client token produced — is [`crate::state::requested_launches`].
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +174,336 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `LaunchInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(LaunchInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("LaunchInstances"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(LaunchInstancesErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name.clone();
+        // Whether IAM lets this caller launch into THIS group, decided against the group's
+        // own ARN before anything is read or written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                "LaunchInstances",
+                &name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+
+        // "You cannot specify both AvailabilityZones and AvailabilityZoneIds"
+        // (`LaunchInstancesRequest$AvailabilityZoneIds`): the two are two spellings of ONE
+        // placement, so a request states at most one of them — the same rule, and the same
+        // sentence, as the create and the update of a group state it with.
+        if input.availability_zones.is_some() && input.availability_zone_ids.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You cannot specify both AvailabilityZones and AvailabilityZoneIds in the same \
+                 request",
+            ));
+        }
+        // `RetryStrategy` is an enum of the model, whose values the wire carries as a
+        // string: a value outside the set names no strategy, so it is refused the way every
+        // other value outside a set this service checks is.
+        if let Some(strategy) = input.retry_strategy.as_deref() {
+            if !crate::state::RETRY_STRATEGIES.contains(&strategy) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::constraint_violation_message(
+                        strategy,
+                        "retryStrategy",
+                        &format!(
+                            "Member must satisfy enum value set: {}",
+                            crate::state::stated_value_set(
+                                crate::state::RETRY_STRATEGIES.iter().copied()
+                            )
+                        ),
+                    ),
+                ));
+            }
+        }
+        let retry_with_group_configuration =
+            input.retry_strategy.as_deref() == Some(crate::state::RETRY_WITH_GROUP_CONFIGURATION);
+
+        let region = crate::state::request_region(ctx.parts());
+        // A zone exists in exactly one Region, so a value that is neither a name nor an id
+        // of a zone of the signed Region names no placement at all. Resolved against Amazon
+        // EC2's own catalog, before this service's store is locked.
+        if let Some(refusal) = crate::state::group_configuration::unknown_availability_zone_error(
+            &region,
+            input.availability_zones.as_deref(),
+            input.availability_zone_ids.as_deref(),
+        ) {
+            return Err(refusal);
+        }
+        // The zones the request named, whichever spelling it used: the ids name the SAME
+        // zones ([`crate::state::availability_zone_ids`]).
+        let mut requested_zones = input.availability_zones.clone().unwrap_or_default();
+        if requested_zones.is_empty() {
+            requested_zones = crate::state::zone_names_of(
+                &region,
+                input.availability_zone_ids.as_deref().unwrap_or_default(),
+            );
+        }
+        // The subnets the request named, as the one comma-separated value every reader of a
+        // group's subnets takes, and the zones they are in — read from the account's own
+        // Amazon EC2 store BEFORE this service's own is locked, so only one store is ever
+        // held at a time.
+        let requested_subnets = input.subnet_ids.clone().unwrap_or_default();
+        let requested_identifier = (!requested_subnets.is_empty()).then(|| requested_subnets.join(","));
+        let mut subnet_zones: Vec<String> = Vec::new();
+        if let Some(identifier) = requested_identifier.as_deref() {
+            match crate::state::ec2_subnets::zones_of(&*self.engine, &region, identifier) {
+                crate::state::ec2_subnets::ZoneResolution::Zones(zones) => subnet_zones = zones,
+                // A subnet the account cannot launch into has no zone to place an instance
+                // in.
+                crate::state::ec2_subnets::ZoneResolution::UnknownSubnet(subnet_id) => {
+                    return Err(crate::state::ec2_subnets::unknown_subnet_error(&subnet_id));
+                }
+            }
+        }
+        // "If both are specified, the subnets must reside in the specified Availability
+        // Zones" (`LaunchInstancesRequest$SubnetIds`).
+        if !requested_zones.is_empty()
+            && subnet_zones
+                .iter()
+                .any(|zone| !requested_zones.contains(zone))
+        {
+            return Err(crate::state::ec2_subnets::zone_mismatch_error());
+        }
+        // Where the launch places: the zones the request named, or the zones of the subnets
+        // it named when it named the placement that way.
+        let placement_zones = if requested_zones.is_empty() {
+            subnet_zones.clone()
+        } else {
+            requested_zones.clone()
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        let Some(group) = state.groups.get(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
+        };
+        let group_zones = group.availability_zones.clone();
+        let group_identifier = group.vpc_zone_identifier.clone();
+        let (desired_capacity, max_size) = (group.desired_capacity, group.max_size);
+        let held = desired_capacity.max(group.active_instance_count());
+
+        // A repeat of one request is ONE launch: the token's first answer is what this
+        // answers, and nothing is launched a second time. A token already used for other
+        // parameters is a different request under one token, which is what the modelled
+        // mismatch states. (The modelled `IdempotentCallInProgressFault` reports a call
+        // under the same token still in flight; a launch here is made and finished under
+        // the store's own lock, so no caller ever observes one in flight.)
+        let fingerprint = request_fingerprint(&input);
+        if let Some(stored) = state.launch_request(&input.client_token) {
+            if stored.fingerprint != fingerprint {
+                return Err(
+                    LaunchInstancesErrorModeled::IdempotentParameterMismatchError(
+                        IdempotentParameterMismatchError {
+                            message: Some(IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let outcome = stored.outcome.clone();
+            crate::state::audit(
+                ctx.parts(),
+                "LaunchInstances",
+                &name,
+                "answered the launch this client token already made",
+            );
+            return Ok(launch_instances_output(&name, &input.client_token, outcome));
+        }
+
+        // A group places instances only in the subnets it was configured with: a subnet
+        // outside them is a placement this group could never make, and a request that named
+        // a subnet is told about the subnet rather than about the zone it happens to be in.
+        let group_subnets: Vec<String> = crate::state::ec2_subnets::subnet_ids(
+            group_identifier.as_deref().unwrap_or_default(),
+        )
+        .into_iter()
+        .map(::std::string::ToString::to_string)
+        .collect();
+        if requested_subnets
+            .iter()
+            .any(|subnet_id| !group_subnets.contains(subnet_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                SUBNET_NOT_IN_GROUP_MESSAGE,
+            ));
+        }
+        // "Must match or be included in the Auto Scaling group's Availability Zone
+        // configuration" (`LaunchInstancesRequest$AvailabilityZones`): the same rule for the
+        // zones, whichever spelling the request stated them in.
+        if placement_zones
+            .iter()
+            .any(|zone| !group_zones.contains(zone))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                ZONE_NOT_IN_GROUP_MESSAGE,
+            ));
+        }
+        // "Either AvailabilityZones or SubnetIds must be specified for groups with multiple
+        // Availability Zone configurations" (the same member): with several zones to choose
+        // from, which one the instances go in is the caller's to state.
+        if placement_zones.is_empty() && group_zones.len() > 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                PLACEMENT_REQUIRED_MESSAGE,
+            ));
+        }
+
+        // "Although this value can exceed 100 for instance weights, the actual instance
+        // count is limited to 100 instances per launch"
+        // (`LaunchInstancesRequest$RequestedCapacity`).
+        let instances = input
+            .requested_capacity
+            .clamp(0, crate::state::MAX_INSTANCES_PER_LAUNCH);
+        // The group's desired capacity rises by what this launch places, and a group never
+        // holds a capacity above the maximum it was configured with — so a launch that
+        // would take it past that maximum is refused instead of placing part of it.
+        if held.saturating_add(instances) > max_size {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Launching {instances} instance(s) would take the AutoScalingGroup: {name} \
+                 above its max size: {max_size}"
+            )));
+        }
+
+        // The launch places into the zones the request named and, within them, the subnets
+        // it named — or the group's own, which is what a request that named only a zone of a
+        // subnet-placed group launches into.
+        let placement = (!placement_zones.is_empty()).then(|| crate::state::RequestedPlacement {
+            zones: placement_zones,
+            vpc_zone_identifier: requested_identifier.clone().or(group_identifier),
+        });
+        let outcome = state.launch_requested_instances(
+            &*self.engine,
+            &crate::state::RequestedLaunch {
+                group_name: &name,
+                count: usize::try_from(instances).unwrap_or(0),
+                placement: placement.as_ref(),
+                retry_with_group_configuration,
+            },
+            now,
+        );
+        state.record_launch_request(crate::state::StoredLaunchRequest {
+            client_token: input.client_token.clone(),
+            fingerprint,
+            outcome: outcome.clone(),
+        });
+
+        crate::state::audit(ctx.parts(), "LaunchInstances", &name, "instances launched");
+        // The instances this launch placed settle on the clock, and the lifecycle events
+        // that report them are published as they fall due, with no further call from
+        // anybody. The store's lock is released first: the pump takes it itself.
+        drop(state);
+        // Those instances are also targets of the target groups the group is attached to, so
+        // each one launched is registered there.
+        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        Ok(launch_instances_output(&name, &input.client_token, outcome))
     }
 }
+
+/// What this operation answers a request that reached the launch with: the group, the
+/// token the launch was made under, and what the launch produced.
+///
+/// ONE projection, so the answer a launch produces and the answer a repeat of its client
+/// token is given are the same answer. A list with nothing in it is left unfilled: there is
+/// no instance, and no error, to report.
+fn launch_instances_output(
+    name: &str,
+    client_token: &str,
+    outcome: crate::state::RequestedLaunchOutcome,
+) -> LaunchInstancesOutput {
+    LaunchInstancesOutput {
+        auto_scaling_group_name: Some(name.to_string()),
+        client_token: Some(client_token.to_string()),
+        instances: (!outcome.instances.is_empty()).then_some(outcome.instances),
+        errors: (!outcome.errors.is_empty()).then_some(outcome.errors),
+    }
+}
+
+/// Everything a request states about WHAT to launch, as one value.
+///
+/// A client token identifies one request, so a repeat of the token carrying other
+/// parameters is a second request under one token: this is what two requests under one
+/// token are compared on. The token itself is not part of it — it is the key — and neither
+/// is anything the service decides for itself.
+fn request_fingerprint(input: &LaunchInstancesInput) -> String {
+    let members: [String; 5] = [
+        input.auto_scaling_group_name.clone(),
+        input.requested_capacity.to_string(),
+        input.availability_zones.clone().unwrap_or_default().join(","),
+        input
+            .availability_zone_ids
+            .clone()
+            .unwrap_or_default()
+            .join(","),
+        input.subnet_ids.clone().unwrap_or_default().join(","),
+    ];
+    // The retry strategy is part of the request too: a repeat that asks for the shortfall
+    // to be retried asks for something the first request did not.
+    format!(
+        "{}\n{}",
+        members.join("\n"),
+        input.retry_strategy.clone().unwrap_or_default()
+    )
+}
+
+/// What a request carrying a client token another request already used, for other
+/// parameters, is refused with.
+///
+/// The rule the modelled error states, worded as the sentence that states it: "the
+/// parameters in the current request do not match the parameters from a previous request
+/// with the same client token"
+/// (`smithy_query(query="shape",shape="IdempotentParameterMismatchError")`). Fixed text: it
+/// carries no value of either request.
+const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "The parameters in the current request do not match the parameters from a previous request \
+     with the same client token";
+
+/// What a request naming an Availability Zone the group is not configured with is refused
+/// with.
+///
+/// "Must match or be included in the Auto Scaling group's Availability Zone configuration"
+/// (`smithy_query(query="doc",shape="LaunchInstancesRequest",member="AvailabilityZones")`):
+/// fixed text stating that rule, naming neither the zone nor the group, because a request
+/// may name either spelling of the zone and the group may have several.
+const ZONE_NOT_IN_GROUP_MESSAGE: &str =
+    "The specified Availability Zones must match or be included in the Availability Zone \
+     configuration of the Auto Scaling group";
+
+/// The same rule for the subnets a request names: a group places its instances in the
+/// subnets it was configured with, so one it was not configured with is a placement the
+/// group could never make. Fixed text, for the same reason.
+const SUBNET_NOT_IN_GROUP_MESSAGE: &str =
+    "The specified subnets must be included in the subnet configuration of the Auto Scaling \
+     group";
+
+/// What a request that states no placement for a group with several Availability Zones is
+/// refused with.
+///
+/// "Either AvailabilityZones or SubnetIds must be specified for groups with multiple
+/// Availability Zone configurations"
+/// (`smithy_query(query="doc",shape="LaunchInstancesRequest",member="AvailabilityZones")`):
+/// fixed text stating that rule, with nothing of the request in it.
+const PLACEMENT_REQUIRED_MESSAGE: &str =
+    "Either AvailabilityZones or SubnetIds must be specified for Auto Scaling groups with \
+     multiple Availability Zone configurations";

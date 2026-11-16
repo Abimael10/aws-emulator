@@ -59,6 +59,8 @@ mod instance_refresh_skip_matching;
 mod instance_scale_in_protection;
 #[path = "all/launch_configurations_are_unavailable.rs"]
 mod launch_configurations_are_unavailable;
+#[path = "all/launch_instances.rs"]
+mod launch_instances;
 #[path = "all/launch_source_instance_profile.rs"]
 mod launch_source_instance_profile;
 #[path = "all/launch_template_instance_profiles.rs"]

@@ -478,6 +478,8 @@ impl AutoScalingState {
                 // A warm pool launches from the group's own launch source.
                 desired_configuration: None,
                 destination: LaunchDestination::WarmPool,
+                // And places across the whole of the group's own configuration.
+                placement: None,
             },
         );
         let launched_ids = launch.launched_ids.clone();
