@@ -18,7 +18,11 @@
 //! there is no container image to run and nothing is started outside this process. A
 //! container whose launch names no argument vector at all runs nothing — the image's own
 //! entry point is what would run, and this emulator holds no image, so no output and no
-//! exit code is invented for it.
+//! exit code is invented for it. The same holds for a launch whose vector needs a program,
+//! a command form or an expansion that session does not perform: the image holds that
+//! program, so the run produced no status of the container's own and none is reported
+//! ([`ContainerOutcome::Abandoned`]) — which is also why such a task is not stopped as one
+//! whose essential container exited.
 //!
 //! What the program SEES is its definition's environment with the launch's own overrides
 //! applied, and then the values the agent fetched for it — a container definition's

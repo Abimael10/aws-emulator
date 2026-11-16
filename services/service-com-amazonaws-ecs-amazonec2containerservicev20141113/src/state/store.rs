@@ -742,6 +742,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 service_connect_defaults: None,
                 attachments_status: None,
                 attachments_update_due_at: None,
+                // Nothing has published a Container Insights datapoint for it yet.
+                insights_published_at: None,
+                insights_published_tally: None,
             },
         );
     }

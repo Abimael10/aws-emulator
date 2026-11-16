@@ -176,13 +176,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 
 /// The error class Secrets Manager refuses an unauthorized read with, which is the AWS
 /// common `AccessDeniedException` — the class the agent's own account of a failed retrieval
-/// names.
-const ACCESS_DENIED_CLASS: &str = "AccessDeniedException";
+/// names, and of a stream it was not allowed to create ([`super::log_driver_init`]).
+pub(super) const ACCESS_DENIED_CLASS: &str = "AccessDeniedException";
 
 /// The error class Secrets Manager answers a read of a secret it holds nothing for with
 /// (`ResourceNotFoundException`, "Secrets Manager can't find the resource that you asked
-/// for", its own model).
-const RESOURCE_NOT_FOUND_CLASS: &str = "ResourceNotFoundException";
+/// for", its own model) — the class CloudWatch Logs answers a missing log group with too
+/// ([`super::log_driver_init`]).
+pub(super) const RESOURCE_NOT_FOUND_CLASS: &str = "ResourceNotFoundException";
 
 /// How many attempts at the retrieval the stop's reason reports: the agent states how often
 /// it retried the call it could not complete, and this emulator makes that call ONCE — the

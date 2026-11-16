@@ -314,6 +314,10 @@ pub mod parameter_pairs;
 /// model declares `AccessDeniedException` asks to perform.
 pub mod identity_authorization;
 
+/// Serving another service's LOG DRIVER the log stream it delivers a workload's output to,
+/// on the role that driver acts as.
+pub mod log_stream_creation;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {

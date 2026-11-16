@@ -435,6 +435,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // has no attachment to update and reports no status at all.
             attachments_status: None,
             attachments_update_due_at: None,
+            // Nothing has published a Container Insights datapoint for this cluster yet
+            // ([`crate::state::settle_container_insights`]).
+            insights_published_at: None,
+            insights_published_tally: None,
         };
         // Associating capacity providers with a cluster is what updates its ATTACHMENTS —
         // `Cluster$attachments`: "When using a capacity provider with a cluster, the

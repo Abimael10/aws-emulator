@@ -724,6 +724,11 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
             // that wrote a status settles, owed here for the statuses NO door wrote
             // ([`super::settle_load_balancer_targets`]).
             super::settle_load_balancer_targets(&*engine);
+            // The Container Insights series each cluster the setting is ON for owes, which
+            // the collection interval makes due whether or not anybody called
+            // ([`super::settle_container_insights`]) — taken off the very records the pass
+            // above has just moved, with no guard of this store held.
+            super::settle_container_insights(&*engine);
             // A task the clock has just started is one whose containers are now running, and
             // one it has just stopped is one whose containers are signalled: the same side
             // effect the door that wrote a status settles, owed here for the statuses NO

@@ -178,7 +178,9 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Create the task execution role the Fargate revisions name, through IAM's OWN API, with a
-/// trust policy that lets Amazon ECS assume it — and answer its ARN.
+/// trust policy that lets Amazon ECS assume it and the grant its log delivery needs — the two
+/// actions the `awslogs` driver performs under that role: it creates the stream it delivers
+/// to and writes the container's lines into it — and answer its ARN.
 async fn create_execution_role(router: &MultiServiceRouter, case: &str) -> String {
     let document = json!({
         "Version": "2012-10-17",
@@ -195,6 +197,26 @@ async fn create_execution_role(router: &MultiServiceRouter, case: &str) -> Strin
         &[
             ("RoleName", EXECUTION_ROLE.to_string()),
             ("AssumeRolePolicyDocument", document),
+        ],
+        case,
+    )
+    .await;
+    let delivery = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "*",
+        }],
+    })
+    .to_string();
+    iam(
+        router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", EXECUTION_ROLE.to_string()),
+            ("PolicyName", "log-delivery".to_string()),
+            ("PolicyDocument", delivery),
         ],
         case,
     )

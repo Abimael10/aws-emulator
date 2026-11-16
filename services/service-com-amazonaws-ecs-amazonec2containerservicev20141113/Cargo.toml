@@ -94,6 +94,23 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # group it names, through that service's own API (`state::container_logs`), so what a client
 # reads back with `GetLogEvents` is what the log service stored.
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# The CloudWatch service, which OWNS the metric store this service's own Container Insights
+# metrics are published into: a cluster the `containerInsights` setting is on for publishes
+# the ECS/ContainerInsights series counted off this store's records
+# (`crate::state::container_insights`), appended to that service's own store in the shared
+# engine so one metric has one home — a client reads them back with that service's
+# `ListMetrics` and `GetMetricStatistics`. They cannot travel over `PutMetricData`, which is
+# for a client's own namespaces. No cycle: that crate does not depend on this one.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The CloudWatch Logs service, which SERVES the stream creation the `awslogs` log driver of a
+# launched task's container needs: whether the task's execution role may create that stream,
+# and whether this account holds the log group the configuration names, which decides whether
+# the task's containers can be launched at all (`crate::state::log_driver_init` ->
+# `…cloudwatchlogs…::state::log_stream_creation::serve_log_stream_creation`). The log group
+# and the policies on the role are that service's and IAM's own records, held in their own
+# stores in the shared engine, so the creation is answered by the service that owns them
+# rather than by a copy kept here. No cycle: that crate does not depend on this one.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The AWS SDK for Secrets Manager, driven over the same in-process callback: a container's
 # `secrets` entry is read through that service's own `GetSecretValue` before the container's
 # program starts (`state::container_secrets`), so the value injected into a container is the
@@ -157,8 +174,8 @@ service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # CloudWatch Logs is mounted beside Amazon ECS on one engine for the same reason: the
 # `awslogs` log driver delivers a container's output to that service, and the suite reads it
-# back with that service's own `GetLogEvents`.
-service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# back with that service's own `GetLogEvents`. The crate itself is a dependency above, for
+# the stream-creation gate a launch's logger is decided by.
 # `percent-encoding`: RFC 3986 percent-encoding for the `application/x-www-form-urlencoded`
 # body the test harness posts to Amazon EC2 Auto Scaling's awsQuery endpoint, so the group a
 # capacity provider binds onto is created through that service's own API — and to IAM's, so a

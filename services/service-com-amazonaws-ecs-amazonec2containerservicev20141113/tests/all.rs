@@ -21,6 +21,10 @@ mod arn_account_and_refusal_classes;
 mod arn_region_scope;
 #[path = "all/attachment_state_reports.rs"]
 mod attachment_state_reports;
+// Whether the `awslogs` logger a launched task's containers configure can be initialised,
+// and the stop a task whose logger cannot earns.
+#[path = "all/awslogs_logger_initialisation.rs"]
+mod awslogs_logger_initialisation;
 #[path = "all/awsvpc_configuration_store.rs"]
 mod awsvpc_configuration_store;
 #[path = "all/awsvpc_interface_subnet_and_identity.rs"]
@@ -55,10 +59,17 @@ mod cluster_scoped_capacity_providers;
 mod cluster_tombstone;
 #[path = "all/container_health_checks.rs"]
 mod container_health_checks;
+// The Container Insights metrics a cluster the setting is on for publishes.
+#[path = "all/container_insights_metrics.rs"]
+mod container_insights_metrics;
 #[path = "all/container_instance_not_found.rs"]
 mod container_instance_not_found;
 #[path = "all/container_instances.rs"]
 mod container_instances;
+// What a container whose program this emulator runs nothing of reports, and what it does
+// not.
+#[path = "all/container_program_not_performed.rs"]
+mod container_program_not_performed;
 #[path = "all/container_reservation_refusals.rs"]
 mod container_reservation_refusals;
 #[path = "all/container_runtime.rs"]

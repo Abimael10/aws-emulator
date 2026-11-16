@@ -313,8 +313,25 @@ fn secret_policy(statements: &[(&str, &str)]) -> String {
     .to_string()
 }
 
+/// The inline policy every role below carries BESIDE the row's own: the two actions the
+/// `awslogs` log driver of these revisions performs under the execution role — it creates the
+/// stream it delivers to and writes the container's lines into it — so what each row is
+/// decided by is the SECRET grant it was given and not a grant the delivery needs.
+fn log_delivery_policy() -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "*",
+        }],
+    })
+    .to_string()
+}
+
 /// Create the IAM role `name` trusting this service, carrying `document` as its inline policy
-/// when the row gives one — each step through IAM's OWN API — and answer the role's ARN.
+/// when the row gives one, and the grant its log delivery needs
+/// ([`log_delivery_policy`]) — each step through IAM's OWN API — and answer the role's ARN.
 async fn role(
     router: &MultiServiceRouter,
     name: &str,
@@ -327,6 +344,17 @@ async fn role(
         &[
             ("RoleName", name.to_string()),
             ("AssumeRolePolicyDocument", ecs_trust()),
+        ],
+        case,
+    )
+    .await;
+    iam(
+        router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", name.to_string()),
+            ("PolicyName", "log-delivery".to_string()),
+            ("PolicyDocument", log_delivery_policy()),
         ],
         case,
     )

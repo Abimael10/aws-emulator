@@ -298,8 +298,11 @@ where
 /// status it ends with, where the text comes from (literal, the container's environment),
 /// whether a write ends its line at all, which command FORM produced it (a simple command,
 /// an and-or list, a loop) and whether the launch named a shell program or an argument
-/// vector the image exec's directly — including a vector naming a utility the container has
-/// no program for, which is the status a shell reports for one.
+/// vector the image exec's directly.
+///
+/// A program whose vector needs a command, a command form or an expansion this container
+/// does not perform ends with no status of its own at all, which is
+/// `all/container_program_not_performed.rs`.
 #[tokio::test]
 async fn a_containers_output_and_exit_status_are_its_programs_own() {
     let router = emulator();
@@ -385,38 +388,6 @@ async fn a_containers_output_and_exit_status_are_its_programs_own() {
             environment: &[],
             delivered: &["direct"],
             exit_code: 0,
-        },
-        Case {
-            name: "a vector naming a utility the container has no program for",
-            command: &["definitely-not-a-utility"],
-            environment: &[],
-            delivered: &[],
-            exit_code: 127,
-        },
-        // The three rows below are the CONFINEMENT: this container has no filesystem, no
-        // process to start and no host to reach, so each of these forms fails closed with
-        // the status a shell reports for a command it could not run — nothing is read,
-        // written or started, and nothing is delivered.
-        Case {
-            name: "a utility of the host's filesystem",
-            command: &["sh", "-c", "cat /etc/passwd"],
-            environment: &[],
-            delivered: &[],
-            exit_code: 127,
-        },
-        Case {
-            name: "a redirection into a host path",
-            command: &["sh", "-c", "echo secret > /tmp/emulator-escape"],
-            environment: &[],
-            delivered: &[],
-            exit_code: 127,
-        },
-        Case {
-            name: "a command substitution, which would have to run a command",
-            command: &["sh", "-c", "echo $(echo inner)"],
-            environment: &[],
-            delivered: &[],
-            exit_code: 127,
         },
     ];
 

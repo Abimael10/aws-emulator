@@ -41,6 +41,21 @@
 //! therefore no language subset to keep in step with a specification: a command either
 //! names one of those utilities, or it did not run.
 //!
+//! A run that reached such a command CLAIMS NOTHING about the container
+//! ([`ContainerOutcome::Abandoned`]): the status above is what the declining command answered
+//! INSIDE the session — which is what the `&&`, `||` and loop conditions around it read — and
+//! it is not reported as the container's own `exitCode`. The image a container runs holds the
+//! program this session has none of, so a run that needed it produced no exit status at all,
+//! exactly as a container whose launch names no argument vector produces none; reporting one
+//! would be reporting an outcome for work nothing ran — and that outcome would stop the task
+//! the essential container it was claimed for belongs to.
+//!
+//! It is the WHOLE RUN that claims nothing, not the one command: a program that recovers from
+//! a command this session declined (`not-a-utility || echo fallback`) still ran none of the
+//! program the image holds for that command, so the status it ends with is not an exit status
+//! of the container's either. What it WROTE is delivered all the same — the lines the session
+//! performed are lines the container really wrote — and only the status is withheld.
+//!
 //! # The other reader of this grammar
 //!
 //! `service-com-amazonaws-codebuild-codebuild-20161006`'s `state::build_shell` reads a
@@ -279,9 +294,10 @@ impl ContainerProgram {
 pub enum ContainerOutcome {
     /// The program ended on its own, with this status — the container's `exitCode`.
     Exited(i32),
-    /// The run was given up on before the program ended, because a bound of this emulator
-    /// was spent (its command budget or its deadline). NOTHING is claimed about the
-    /// container: it reports no exit code, because none was produced.
+    /// The program did not end with a status of its own: a bound of this emulator was spent
+    /// (its command budget or its deadline), or the program needed a command, command form
+    /// or expansion this session does not perform ([`ContainerShell::declined`]). NOTHING is
+    /// claimed about the container: it reports no exit code, because none was produced.
     Abandoned,
 }
 
@@ -334,6 +350,10 @@ pub struct ContainerShell {
     /// Whether a bound of this emulator ended the run before the program did, which is what
     /// makes the outcome [`ContainerOutcome::Abandoned`].
     abandoned: bool,
+    /// Whether this run reached a command, command FORM or expansion this session does not
+    /// perform ([`Self::declined`]) — which makes the outcome
+    /// [`ContainerOutcome::Abandoned`] for the reason the module docs give.
+    unperformed: bool,
     /// Whether the termination signal has arrived and its handler has not run yet.
     pending_term: bool,
     /// Whether the termination handler is running, so the checkpoint inside it does not
@@ -373,6 +393,7 @@ impl ContainerShell {
             commands_since_yield: 0,
             exit_status: None,
             abandoned: false,
+            unperformed: false,
             pending_term: false,
             delivering_term: false,
             output,
@@ -403,11 +424,24 @@ impl ContainerShell {
         // The last line the program wrote may not have ended in a newline; the container's
         // output ends where the container does, so it is delivered as the line it is.
         self.flush_pending_line().await;
-        if self.abandoned {
+        if self.abandoned || self.unperformed {
             ContainerOutcome::Abandoned
         } else {
             ContainerOutcome::Exited(status)
         }
+    }
+
+    /// The status a shell answers INSIDE this session for a command, command FORM or
+    /// expansion it does not perform ([`EXIT_COMMAND_NOT_FOUND`]) — recording that the run
+    /// reached one, so nothing is claimed about the container it was for (see the module
+    /// docs).
+    ///
+    /// The status is still what the program around the declined command reads, so an `&&`,
+    /// an `||` or a loop condition over it behaves as a shell's does; what it is NOT is the
+    /// container's own `exitCode`.
+    fn declined(&mut self) -> i32 {
+        self.unperformed = true;
+        EXIT_COMMAND_NOT_FOUND
     }
 
     /// Run one shell PROGRAM text and answer the status the shell answered for it.
@@ -419,7 +453,7 @@ impl ContainerShell {
     fn run_text<'a>(&'a mut self, text: &'a str) -> ShellFuture<'a, i32> {
         Box::pin(async move {
             if !within_parse_bounds(text) {
-                return EXIT_COMMAND_NOT_FOUND;
+                return self.declined();
             }
             let Ok(tokens) = ::brush_parser::tokenize_str(text) else {
                 return EXIT_SYNTAX_ERROR;
@@ -485,7 +519,7 @@ impl ContainerShell {
                 ::brush_parser::ast::CompoundCommand::UntilClause(clause) => {
                     self.run_loop(clause, false).await
                 }
-                _ => EXIT_COMMAND_NOT_FOUND,
+                _ => self.declined(),
             }
         })
     }
@@ -744,11 +778,11 @@ impl ContainerShell {
                     // A redirection names a file this container has no filesystem for, so a
                     // command carrying one did not run.
                     if redirects.is_some() {
-                        return EXIT_COMMAND_NOT_FOUND;
+                        return self.declined();
                     }
                     self.run_compound_command(compound).await
                 }
-                _ => EXIT_COMMAND_NOT_FOUND,
+                _ => self.declined(),
             }
         })
     }
@@ -790,7 +824,7 @@ impl ContainerShell {
                 match item {
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::Word(word) => {
                         let Some(expanded) = self.expand_word(&word.value) else {
-                            return EXIT_COMMAND_NOT_FOUND;
+                            return self.declined();
                         };
                         words.push(expanded);
                     }
@@ -799,17 +833,17 @@ impl ContainerShell {
                         _,
                     ) => {
                         let Some(pair) = self.assignment_of(assignment) else {
-                            return EXIT_COMMAND_NOT_FOUND;
+                            return self.declined();
                         };
                         assignments.push(pair);
                     }
-                    _ => return EXIT_COMMAND_NOT_FOUND,
+                    _ => return self.declined(),
                 }
             }
             let name = match simple.word_or_name.as_ref() {
                 Some(word) => match self.expand_word(&word.value) {
                     Some(expanded) => Some(expanded),
-                    None => return EXIT_COMMAND_NOT_FOUND,
+                    None => return self.declined(),
                 },
                 None => None,
             };
@@ -819,7 +853,7 @@ impl ContainerShell {
             if persists {
                 for (name, value) in assignments {
                     if !self.set_variable(name, value) {
-                        return EXIT_COMMAND_NOT_FOUND;
+                        return self.declined();
                     }
                 }
             }
@@ -904,7 +938,7 @@ impl ContainerShell {
             // The catalog is what this container provides: a command outside it needs a
             // program, a filesystem or a network this container does not have.
             if !BUILT_IN_COMMANDS.contains(&name) {
-                return EXIT_COMMAND_NOT_FOUND;
+                return self.declined();
             }
             match name {
                 "echo" => {
@@ -943,7 +977,7 @@ impl ContainerShell {
                         // nothing.
                         if let Some((name, value)) = argument.split_once('=') {
                             if !self.set_variable(name.to_string(), value.to_string()) {
-                                return EXIT_COMMAND_NOT_FOUND;
+                                return self.declined();
                             }
                         }
                     }
@@ -961,7 +995,7 @@ impl ContainerShell {
                 // child processes" — this session has none, so there is nothing to wait
                 // for and the utility answers success.
                 "wait" => EXIT_SUCCESS,
-                _ => EXIT_COMMAND_NOT_FOUND,
+                _ => self.declined(),
             }
         })
     }

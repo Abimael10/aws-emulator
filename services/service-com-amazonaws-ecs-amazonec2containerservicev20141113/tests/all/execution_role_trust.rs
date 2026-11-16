@@ -196,8 +196,25 @@ fn trust(effect: &str, principals: &[&str], actions: &[&str]) -> String {
     .to_string()
 }
 
-/// Create the IAM role `name` carrying `document` as its trust policy — through IAM's own
-/// API — and answer the role's ARN.
+/// The inline policy every role below carries: the two actions the `awslogs` log driver of
+/// the container definition in this suite performs under the execution role — it creates the
+/// stream it delivers to and writes the container's lines into it — so the launch is decided
+/// by the TRUST policy this suite is about and not by a grant the delivery needs.
+fn log_delivery_policy() -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "*",
+        }],
+    })
+    .to_string()
+}
+
+/// Create the IAM role `name` carrying `document` as its trust policy and the grant its log
+/// delivery needs ([`log_delivery_policy`]) — each step through IAM's own API — and answer
+/// the role's ARN.
 async fn role(router: &MultiServiceRouter, name: &str, document: &str, case: &str) -> String {
     iam(
         router,
@@ -205,6 +222,17 @@ async fn role(router: &MultiServiceRouter, name: &str, document: &str, case: &st
         &[
             ("RoleName", name.to_string()),
             ("AssumeRolePolicyDocument", document.to_string()),
+        ],
+        case,
+    )
+    .await;
+    iam(
+        router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", name.to_string()),
+            ("PolicyName", "log-delivery".to_string()),
+            ("PolicyDocument", log_delivery_policy()),
         ],
         case,
     )

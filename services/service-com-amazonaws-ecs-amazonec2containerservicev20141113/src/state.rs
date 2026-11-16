@@ -290,6 +290,11 @@ pub use circuit_breaker::*;
 mod load_balancer_targets;
 pub use load_balancer_targets::*;
 
+/// The Container Insights metrics a cluster the `containerInsights` setting is ON for
+/// publishes into CloudWatch.
+mod container_insights;
+pub use container_insights::*;
+
 /// The CLASSIC load balancer a `loadBalancers` entry attaches a service to: whether the
 /// account holds it, and the network mode that kind of attachment can reach a task in.
 mod classic_load_balancers;
@@ -313,6 +318,12 @@ pub use container_shell::*;
 /// The `awslogs` log driver: where the output of a container that runs is delivered.
 mod container_logs;
 pub use container_logs::*;
+
+/// Whether the `awslogs` driver a launched task's containers configure can be INITIALISED —
+/// the stream it delivers to created as the task's execution role — and the stop a launch
+/// whose logger cannot be earns.
+mod log_driver_init;
+pub use log_driver_init::*;
 
 /// The cross-field rules a registration's CONTAINER DEFINITIONS have to meet: the members
 /// whose values the agent fetches under the task execution role, the log driver that needs
@@ -3049,6 +3060,14 @@ pub struct ClusterRecord {
     /// never slept on: [`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]
     /// materialises it.
     pub attachments_update_due_at: Option<SystemTime>,
+    /// When this cluster's Container Insights series was last published, and `None` for a
+    /// cluster nothing has been published for yet — which is what spaces that series
+    /// ([`PUBLISH_SPACING`], [`settle_container_insights`]).
+    pub insights_published_at: Option<SystemTime>,
+    /// The cluster-level counts that last collection carried, so a collection is taken as
+    /// soon as they MOVE rather than only when the spacing has elapsed (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::due_container_insights`]).
+    pub insights_published_tally: Option<(usize, usize, usize)>,
 }
 
 impl ClusterRecord {

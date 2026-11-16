@@ -144,6 +144,10 @@ pub struct TaskLaunch {
     /// retrieved as that same execution role, in the same step as the registry
     /// authentication this fetch takes.
     pub secrets: Vec<ContainerSecret>,
+    /// Where the `awslogs` driver of each of the task's containers delivers that
+    /// container's output ([`super::log_driver_init`]), which the agent initialises as that
+    /// same execution role before the container it is for runs.
+    pub log_targets: Vec<AwsLogsTarget>,
 }
 
 /// The `stoppedReason` of a task whose containers could not be launched because an image
@@ -249,6 +253,17 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
     for (launch, failure) in launches.iter().zip(failures.iter_mut()) {
         if failure.1.is_none() {
             failure.1 = unretrievable_secret(engine, launch);
+        }
+    }
+    // The LOGGER each container's `awslogs` configuration describes, which the agent
+    // initialises as that same role before it starts the container: a task whose logger
+    // cannot be validated fails to start exactly as one whose execution resources could not
+    // be retrieved does ([`super::log_driver_init`]). Decided after them, because the agent
+    // retrieves the task's resources and then creates each container, and with no lock held:
+    // the verdict is the owning service's.
+    for (launch, failure) in launches.iter().zip(failures.iter_mut()) {
+        if failure.1.is_none() {
+            failure.1 = uninitialisable_logger(engine, launch);
         }
     }
     state.lock().record_image_pulls(&failures, now);
@@ -561,6 +576,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .collect(),
                 execution_role_arn: task.execution_role_arn.clone(),
                 secrets: self.launched_task_secrets(task),
+                log_targets: self.launched_task_log_targets(task),
             })
             .collect()
     }
