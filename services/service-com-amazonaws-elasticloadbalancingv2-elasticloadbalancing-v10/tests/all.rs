@@ -131,6 +131,8 @@ mod target_group_health_checks;
 mod target_group_in_use_refusal;
 #[path = "all/target_group_layer_7_health_check.rs"]
 mod target_group_layer_7_health_check;
+#[path = "all/target_type_protocol_pairing.rs"]
+mod target_type_protocol_pairing;
 #[path = "all/target_validation_and_quotas.rs"]
 mod target_validation_and_quotas;
 #[path = "all/trust_store_lifecycle.rs"]

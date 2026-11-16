@@ -134,6 +134,14 @@ pub mod health_check_schedule;
 
 pub use health_check_schedule::{check_health_check_schedule, HEALTH_CHECK_SCHEDULE_MESSAGE};
 
+/// Which target-group protocols each target TYPE can be routed to over, read once for
+/// every operation that settles the pair.
+pub mod target_type_protocol;
+
+pub use target_type_protocol::{
+    check_target_type_protocol, protocols_for_target_type, LOAD_BALANCER_TARGET_TYPE,
+};
+
 /// The ADDRESS a load balancer publishes as its `DNSName`, and the socket of this
 /// emulator's own that answers there.
 pub mod load_balancer_endpoint;

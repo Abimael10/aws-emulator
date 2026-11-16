@@ -275,15 +275,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // always enabled and can't be disabled." The model cannot express that, so
         // the handler refuses the combination rather than discarding the input.
         if !lambda && input.health_check_enabled == Some(false) {
-            return Err(CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
-                InvalidConfigurationRequestException {
-                    message: Some(format!(
-                        "Health checks cannot be disabled for a target group whose target type is {target_type}"
-                    )),
-                },
-            )
-            .into());
+            return Err(invalid_configuration(format!(
+                "Health checks cannot be disabled for a target group whose target type is \
+                 {target_type}"
+            )));
         }
+        // What the target group's members ARE and how traffic reaches them are not
+        // independent members: a target of a given kind is only reachable over a protocol
+        // this service can forward to that kind of target
+        // ([`crate::state::check_target_type_protocol`]). The model declares the two
+        // separately and states no dependency, so the pairing is refused here — as the
+        // modelled "the requested configuration is not valid", because both values are
+        // perfectly good on their own and it is the combination no target group can hold.
+        crate::state::check_target_type_protocol(&target_type, input.protocol.as_deref())
+            .map_err(refuse)?;
         validate_health_check_protocol(
             input.health_check_protocol.as_deref(),
             input.protocol.as_deref(),
@@ -428,6 +433,30 @@ fn validate_name(name: &str) -> Result<(), CreateTargetGroupError> {
         .map_err(crate::scaffolded::Scaffolded::validation_error)
 }
 
+/// The refusal a rule read in `crate::state` answered, under the code Elastic Load
+/// Balancing answers that CLASS of rule with: a value the request has to fix is a
+/// `ValidationError`, while a combination of members no target group can hold is the
+/// modelled `InvalidConfigurationRequest`.
+fn refuse(refusal: crate::state::Refusal) -> CreateTargetGroupError {
+    match refusal {
+        crate::state::Refusal::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation_error(message)
+        }
+        crate::state::Refusal::Configuration(message) => invalid_configuration(message),
+    }
+}
+
+/// The modelled "the requested configuration is not valid" refusal, for a pairing of
+/// members the service forbids but the model cannot express.
+fn invalid_configuration(message: String) -> CreateTargetGroupError {
+    CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The refusal a create that names no VPC for a target type whose targets live in one
 /// earns.
 ///
@@ -511,17 +540,9 @@ fn validate_protocol_version(
     } else {
         format!("'{}' protocol", protocol.unwrap_or_default())
     };
-    Err(
-        CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
-            InvalidConfigurationRequestException {
-                message: Some(format!(
-                    "You cannot specify the protocol version for a target group with the \
-                     {carried}"
-                )),
-            },
-        )
-        .into(),
-    )
+    Err(invalid_configuration(format!(
+        "You cannot specify the protocol version for a target group with the {carried}"
+    )))
 }
 
 /// The tags to store. `CreateTargetGroup` models no duplicate-key error, so a

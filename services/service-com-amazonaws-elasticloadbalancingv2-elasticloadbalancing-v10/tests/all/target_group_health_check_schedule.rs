@@ -337,7 +337,10 @@ fn assert_schedule_refusal(case: &str, reply: &Reply) {
 
 /// Read one target group back by NAME, which is how a refused create is checked to have
 /// stored nothing.
-async fn describe_by_name(router: &MultiServiceRouter, name: &str) -> Reply {
+///
+/// `pub(crate)` because the sibling suites in this one test binary read a target group back
+/// the same way: one reader for the crate, so no suite drifts on how a name is selected.
+pub(crate) async fn describe_by_name(router: &MultiServiceRouter, name: &str) -> Reply {
     let mut form = action("DescribeTargetGroups");
     form.push(p("Names.member.1", name));
     call(router, &form).await

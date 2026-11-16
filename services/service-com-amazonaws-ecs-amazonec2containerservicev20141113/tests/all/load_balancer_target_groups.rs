@@ -205,10 +205,16 @@ pub(crate) async fn create_unattached_target_group(
     target_type: &str,
     case: &str,
 ) -> String {
-    // A `lambda` target group takes no protocol, port or VPC; every other type does.
+    // A `lambda` target group takes no protocol, port or VPC; every other type does, and the
+    // protocol has to be one that target type is reached over. An `alb` target is a whole
+    // Application Load Balancer, which the load balancer in front of it passes TCP
+    // connections to; a host target (`instance`, `ip`) takes the HTTP protocol these rows
+    // use. Which target types an ECS service may bind is what the rows below are about, and
+    // that is unchanged by the protocol its group speaks.
     let mut params: Vec<(&str, &str)> = vec![("Name", name), ("TargetType", target_type)];
     if target_type != "lambda" {
-        params.extend([("Protocol", "HTTP"), ("Port", "80"), ("VpcId", VPC)]);
+        let protocol = if target_type == "alb" { "TCP" } else { "HTTP" };
+        params.extend([("Protocol", protocol), ("Port", "80"), ("VpcId", VPC)]);
     }
     let (status, body) = elb_call(router, "CreateTargetGroup", &params).await;
     assert_eq!(
