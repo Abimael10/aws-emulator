@@ -2,7 +2,8 @@
 
 //! @op DescribeEventTopics
 //! Reports which Amazon SNS topics receive status messages from a directory, from the
-//! associations this service persisted. Implemented here — this is the ONLY file to
+//! associations this service persisted — each in the `Status` the service that OWNS topics
+//! answers for the topic it points at. Implemented here — this is the ONLY file to
 //! touch for this operation.
 //!
 //! ## Shape of an operation
@@ -182,6 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
 
+        // The topic a binding points at belongs to Amazon SNS, so the `Status` each
+        // association is reported in is resolved in the store of the service that OWNS
+        // topics — once per call, for every association this answer carries. A binding
+        // whose topic that service does not hold is reported in the modelled
+        // `Topic not found` rather than as one that holds: it is the directory's only
+        // notification channel, and nothing would reach it.
+        let topics = crate::state::SnsTopics::read(&*self.engine);
+
         // "If this member is null, associations for all Directory IDs are returned" —
         // and an id that names no stored directory is reported rather than answered
         // with an empty list.
@@ -192,17 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::refusal(crate::state::no_such_directory(directory_id)),
                     )
                 })?;
-                directory.event_topic_list(wanted.as_ref())
+                directory.event_topic_list(wanted.as_ref(), &topics)
             }
             None => store
                 .directories_in_creation_order()
                 .into_iter()
-                .flat_map(|directory| directory.event_topic_list(wanted.as_ref()))
+                .flat_map(|directory| directory.event_topic_list(wanted.as_ref(), &topics))
                 .collect(),
         };
 
-        // Every member reported comes off the stored association, so a topic nothing
-        // registered cannot appear and one that was registered cannot be missing.
+        // Every member reported but the status comes off the stored association, so a
+        // topic nothing registered cannot appear and one that was registered cannot be
+        // missing; the status comes off the owner of topics, so it cannot claim a channel
+        // that is not there.
         Ok(DescribeEventTopicsOutput {
             event_topics: Some(event_topics),
         })

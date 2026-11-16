@@ -102,6 +102,11 @@ pub mod directory_updates;
 pub mod ec2_network_interfaces;
 pub mod ec2_security_groups;
 pub mod ec2_subnets;
+/// The Amazon SNS topic associations one directory holds, and the status each of them
+/// reports once the service that OWNS topics has been asked whether it still holds the
+/// topic a binding points at. Re-exported below, so the three operations that reach them do
+/// so as `crate::state::<name>`.
+pub mod event_topics;
 pub mod security_log;
 pub mod subnet_zones;
 
@@ -128,6 +133,9 @@ pub use ec2_security_groups::{
     placement_vpc_id, provision_controllers_group, release_controllers_group,
 };
 pub use ec2_subnets::{resolve_subnet_networks, vpc_absence};
+pub use event_topics::{
+    EventTopicRegistration, SnsTopics, TOPIC_STATUS_REGISTERED, TOPIC_STATUS_TOPIC_NOT_FOUND,
+};
 pub use subnet_zones::placement_defect;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -695,14 +703,6 @@ pub const CANCELLABLE_SCHEMA_EXTENSION_STATUSES: [&str; 3] = [
 /// without end. Past it `StartSchemaExtension` is refused with the generic
 /// `ClientException` the model offers.
 pub const MAX_SCHEMA_EXTENSIONS_PER_DIRECTORY: usize = 100;
-
-/// The `TopicStatus` of an association this emulator has just made.
-///
-/// The first value of the modelled `TopicStatus` enum, and the one the `Status`
-/// member ("The topic registration status") reports for a registration that holds:
-/// the other values describe a topic the SNS data plane this emulator does not have
-/// would have to report on.
-pub const TOPIC_STATUS_REGISTERED: &str = "Registered";
 
 /// The `DataAccessStatus` of a directory nothing has enabled the Directory Service Data
 /// API for: the `Disabled` value of the modelled `DataAccessStatus` enum
@@ -1642,37 +1642,6 @@ pub fn cursor_filter(parts: &[&str]) -> String {
     parts.join(&CURSOR_FILTER_SEPARATOR.to_string())
 }
 
-/// One stored association between a directory and an Amazon SNS topic: what
-/// `RegisterEventTopic` persisted and `DescribeEventTopics` reports.
-#[derive(Debug, Clone)]
-pub struct EventTopicRegistration {
-    pub topic_name: String,
-    /// The topic's ARN, built once at registration through [`sns_topic_arn`] so every
-    /// later read reports the same one.
-    pub topic_arn: String,
-    /// When the association was made — the `CreatedDateTime` member's "the date and
-    /// time of when you associated your directory with the Amazon SNS topic".
-    pub created_at: SystemTime,
-    /// One of the modelled `TopicStatus` values; [`TOPIC_STATUS_REGISTERED`] here.
-    pub status: String,
-}
-
-impl EventTopicRegistration {
-    /// This association as the modelled `EventTopic`, reported for `directory_id`.
-    ///
-    /// The one place a stored registration is rendered, so `DescribeEventTopics`
-    /// reports exactly what was persisted.
-    pub fn to_event_topic(&self, directory_id: &str) -> EventTopic {
-        EventTopic {
-            directory_id: Some(directory_id.to_string()),
-            topic_name: Some(self.topic_name.clone()),
-            topic_arn: Some(self.topic_arn.clone()),
-            created_date_time: Some(as_timestamp(self.created_at)),
-            status: Some(self.status.clone()),
-        }
-    }
-}
-
 /// One stored log subscription of a directory: what `CreateLogSubscription` persisted,
 /// `ListLogSubscriptions` reports and `DeleteLogSubscription` removes.
 ///
@@ -2534,18 +2503,6 @@ impl Directory {
         zones.sort();
         zones.dedup();
         zones
-    }
-
-    /// This directory's associations as the modelled `EventTopics` list, in topic-name
-    /// order, narrowed to `wanted` when the request asked for particular topic names.
-    pub fn event_topic_list(&self, wanted: Option<&BTreeSet<&String>>) -> Vec<EventTopic> {
-        self.event_topics
-            .values()
-            .filter(|registration| {
-                wanted.is_none_or(|names| names.contains(&registration.topic_name))
-            })
-            .map(|registration| registration.to_event_topic(&self.directory_id))
-            .collect()
     }
 
     /// This directory's schema extensions in the order they were started \u2014 the order

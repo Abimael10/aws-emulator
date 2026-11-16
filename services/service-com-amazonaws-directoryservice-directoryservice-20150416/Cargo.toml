@@ -36,6 +36,11 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # in the shared engine, through its own record types, so what was forwarded is what
 # `logs:FilterLogEvents` reports.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The SNS store, for the topic a `RegisterEventTopic` binds a directory to: topics are that
+# service's resources, so whether one is there to publish status messages to — and with it
+# the `TopicStatus` `DescribeEventTopics` reports — is knowable only from its own store
+# (`state::event_topics`).
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 # The PCA Connector for AD store, for the connector an `EnableCAEnrollmentPolicy` enrolls a
 # directory's clients through: connectors are that service's resources, so whether one
 # exists, is this directory's and is in an active state is knowable only from its own store
@@ -69,6 +74,11 @@ sha2 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The SNS service, mounted beside this one in the event-topic suites: a topic is that
+# service's resource, so that a binding is reported `Registered` only while SNS holds its
+# topic can only be driven end to end with the owner of topics on the same engine. Already
+# a dependency of `src/`; an integration test reaches it through this list.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 # RFC 3986 percent-encoding, for the `@httpLabel` ARN the CA-enrollment suite sends to the
 # PCA Connector for AD service over its REST path (`tests/all/ca_enrollment_policy.rs`).
 percent-encoding = "2.3"

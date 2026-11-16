@@ -95,6 +95,8 @@ mod domain_controllers;
 mod error_envelopes;
 #[path = "all/event_topic_deregistration.rs"]
 mod event_topic_deregistration;
+#[path = "all/event_topic_presence.rs"]
+mod event_topic_presence;
 #[path = "all/event_topics.rs"]
 mod event_topics;
 #[path = "all/harness.rs"]

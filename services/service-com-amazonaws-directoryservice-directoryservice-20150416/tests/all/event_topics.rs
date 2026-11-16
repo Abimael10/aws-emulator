@@ -6,7 +6,10 @@
 //! `X-Amz-Target: DirectoryService_20150416.<Operation>` and an `awsJson1_1` body. The
 //! harness (`service`, `call`, `ok`, `refused`, `create_directory`) is the one
 //! `directory_lifecycle.rs` already defines, so nothing here reaches into the state
-//! struct and a response that is not computed from persisted state cannot pass.
+//! struct and a response that is not computed from persisted state cannot pass. Amazon SNS
+//! is mounted beside this service on the same engine (`event_topic_presence::ds_and_sns`),
+//! because a binding is reported as one that holds only while the owner of topics holds
+//! the topic it points at, so every row here creates its topic there first.
 //!
 //! The cases assert RULES over sets of inputs rather than one recorded call:
 //! `RegisterEventTopic` then `DescribeEventTopics` over a table of directories whose
@@ -14,7 +17,8 @@
 //! topic names (including both published `TopicName` length bounds and one past the
 //! upper one); the `TopicArn` Region over two signing Regions; the narrowing the
 //! `DirectoryId` and `TopicNames` filters perform over a table of filters; and the
-//! refusal of a directory that does not exist over a table of absent ids.
+//! refusal of a directory that does not exist over a table of absent ids. Which `Status`
+//! an association is reported in is the sibling `event_topic_presence` suite's rule.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,11 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::directory_lifecycle::{
     call, call_in_region, create_directory, minimal_create, ok, refused, service, REGION,
 };
-
-/// The `TopicStatus` a registration that holds reports: the first value of the modelled
-/// `TopicStatus` enum (`smithy_query(query="shape",shape="TopicStatus")` lists
-/// `Registered`, `Topic not found`, `Failed`, `Deleted`).
-const STATUS_REGISTERED: &str = "Registered";
+use crate::event_topic_presence::{create_topic, ds_and_sns, STATUS_REGISTERED};
 
 /// The published bounds of the modelled `TopicName` shape: `length 1..256`.
 const TOPIC_NAME_MIN_LEN: usize = 1;
@@ -43,8 +43,14 @@ const TOPIC_GUARD: usize = 50;
 /// (`state::MAX_TOPIC_NAMES_PER_REQUEST`).
 const TOPIC_NAMES_GUARD: usize = 100;
 
-/// `RegisterEventTopic` for `topic_name`, asserting it was accepted.
+/// `RegisterEventTopic` for `topic_name`, asserting it was accepted — against a topic the
+/// service that OWNS topics really holds.
+///
+/// A binding is reported `Registered` only while SNS holds the topic it points at
+/// (`tests/all/event_topic_presence.rs` is that rule's suite), so every row here gives the
+/// topic to its owner first: the associations these cases assert over are live ones.
 async fn register(router: &MultiServiceRouter, directory_id: &str, topic_name: &str, case: &str) {
+    create_topic(router, topic_name, REGION, case).await;
     ok(
         router,
         "RegisterEventTopic",
@@ -63,7 +69,10 @@ fn event_topics(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// `DescribeEventTopics` with `body`, returning its `EventTopics` list.
-async fn describe(router: &MultiServiceRouter, body: Value, case: &str) -> Vec<Value> {
+///
+/// `pub(crate)` so the sibling suite that drives the `Status` rule reads an answer the same
+/// way rather than standing up a second reader.
+pub(crate) async fn describe(router: &MultiServiceRouter, body: Value, case: &str) -> Vec<Value> {
     let answer = ok(router, "DescribeEventTopics", body, case).await;
     event_topics(&answer, case)
 }
@@ -117,7 +126,7 @@ struct TopicCase {
 
 #[tokio::test]
 async fn registered_event_topics_are_reported_from_persisted_state() {
-    let router = service();
+    let router = ds_and_sns();
 
     // The rows differ along everything a registration varies in: how many topics a
     // directory publishes to (none, one, several) and the form and length of the topic
@@ -324,7 +333,7 @@ async fn the_topic_arn_names_the_region_the_request_was_signed_for() {
 
 #[tokio::test]
 async fn event_topics_are_narrowed_by_the_filters_the_request_gives() {
-    let router = service();
+    let router = ds_and_sns();
 
     let first = create_directory(&router, minimal_create("one.example.com"), "filters").await;
     let second = create_directory(&router, minimal_create("two.example.com"), "filters").await;
@@ -467,7 +476,7 @@ async fn event_topics_are_narrowed_by_the_filters_the_request_gives() {
 
 #[tokio::test]
 async fn an_absent_directory_is_refused_by_both_operations() {
-    let router = service();
+    let router = ds_and_sns();
 
     let existing = create_directory(&router, minimal_create("present.example.com"), "absent").await;
     register(&router, &existing, "kept", "absent").await;
@@ -535,7 +544,7 @@ async fn an_absent_directory_is_refused_by_both_operations() {
 
 #[tokio::test]
 async fn associations_are_capped_by_the_documented_per_directory_guard() {
-    let router = service();
+    let router = ds_and_sns();
 
     let directory_id = create_directory(&router, minimal_create("busy.example.com"), "guard").await;
     for index in 0..TOPIC_GUARD {

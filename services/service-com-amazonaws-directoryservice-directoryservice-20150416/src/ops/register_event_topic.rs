@@ -180,18 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The topic a binding points at is Amazon SNS's resource, not this service's: a
+        // register records the binding whether or not that service holds the topic today,
+        // because the modelled `TopicStatus` enum carries a value for a topic that is not
+        // there and only a recorded binding can report it. Which status this one reports is
+        // resolved on every read ([`crate::state::SnsTopics`]), so a topic deleted after
+        // the binding was made stops being reported as one that holds.
         directory.event_topics.insert(
             input.topic_name.clone(),
             crate::state::EventTopicRegistration {
                 topic_arn: crate::state::sns_topic_arn(&region, &input.topic_name),
                 topic_name: input.topic_name,
                 created_at: now,
-                status: crate::state::TOPIC_STATUS_REGISTERED.to_string(),
             },
         );
 
         // The operation models no output members: `DescribeEventTopics` is what reports
-        // the association back.
+        // the association back — including the `Status` the service that OWNS topics
+        // answers for the one this call bound, which is not a value this call decides.
         Ok(RegisterEventTopicOutput {})
     }
 }

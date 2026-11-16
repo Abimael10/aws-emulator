@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: this header, the one inner attribute at its
+// end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
+// `tests/all/`, sorted by name, and no other line.
+//
 // Single integration-test target for the router: this header, then one
 // `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
 // name, and no other line — no prose between the pairs, no blank line, and nothing after the
@@ -72,6 +76,13 @@
 //
 // EVERY comment in this file is an ordinary `//` one, this header included. A doc comment of
 // the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
+// copy left among or below the declarations compiles no suite of this target at all. A suite
+// file no declaration names is compiled nowhere and its tests never run, a second declaration
+// of one name compiles neither copy, and a suite left at the top level of `tests/` fails the
+// build. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
+// it under `tests/`, which the layout check refuses: the `#[path]` above each declaration is
+// what points it into `tests/all/`. Some of the files declared below are shared harnesses or
+// probes rather than suites, and each is declared for that reason.
 // copy left among or below the declarations compiles no suite of this target at all; with
 // none anywhere in the file, no appended, re-typed or merged copy of one of these lines can
 // be one. A suite file no declaration names is compiled nowhere and its tests never run, a
@@ -86,6 +97,10 @@
 // `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
 // service crate's own `tests/all.rs`, so check there rather than leaving a note here.
 //
+// The lint allowed below is for the suite files this root compiles: a module header wrapping
+// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
+// is a note rather than a build failure. An inner attribute is legal only ahead of the first
+// item, so it stands with this block.
 // place its name sorts to. Past this block the file holds those pairs and nothing else: no
 // prose between them, no blank line, and nothing at all after the last of them — so two
 // branches landing at once insert two lines in two places and have nothing here to duplicate,
