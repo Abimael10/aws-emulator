@@ -40,7 +40,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 
 /// The XML namespace a client's S3 payload carries.
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+///
+/// `pub(crate)`, like the harness below it: the round-trip suite
+/// ([`super::notification_configuration_round_trip`]) writes its own container — one that also
+/// names an `Id` — and puts the same namespace on it rather than spelling a second one.
+pub(crate) const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The code every one of these refusals carries, and the status it is rendered with.
 const INVALID_ARGUMENT: &str = "InvalidArgument";
@@ -70,15 +74,19 @@ const FUNCTION_ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:objec
 /// `NotificationConfiguration`'s members and on each configuration's ARN member
 /// (`smithy_query(query="shape",shape="NotificationConfiguration")` and
 /// `smithy_query(query="shape",shape="LambdaFunctionConfiguration")`).
+///
+/// `pub(crate)`, with the three readers below it: the round-trip suite
+/// ([`super::notification_configuration_round_trip`]) drives the same three configuration
+/// elements through this one naming of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Destination {
+pub(crate) enum Destination {
     Topic,
     Queue,
     Function,
 }
 
 impl Destination {
-    fn element(self) -> &'static str {
+    pub(crate) fn element(self) -> &'static str {
         match self {
             Self::Topic => "TopicConfiguration",
             Self::Queue => "QueueConfiguration",
@@ -88,11 +96,21 @@ impl Destination {
 
     /// The element the reference is carried in, which is also the field a refusal about it
     /// names.
-    fn member(self) -> &'static str {
+    pub(crate) fn member(self) -> &'static str {
         match self {
             Self::Topic => "Topic",
             Self::Queue => "Queue",
             Self::Function => "CloudFunction",
+        }
+    }
+
+    /// A destination of this kind in this emulator's account — the reference a configuration
+    /// whose subject is the DOCUMENT rather than the destination carries.
+    pub(crate) fn reference(self) -> &'static str {
+        match self {
+            Self::Topic => TOPIC_ARN,
+            Self::Queue => QUEUE_ARN,
+            Self::Function => FUNCTION_ARN,
         }
     }
 }
@@ -133,7 +151,11 @@ fn payload(
 
 /// `PUT /<bucket>?notification` carrying `body`, with destination validation skipped so the
 /// answer is about the DOCUMENT rather than about whether the destination exists.
-async fn put(router: &MultiServiceRouter, bucket: &str, body: &str) -> Answer {
+///
+/// `pub(crate)`, with the two helpers below it: the round-trip suite
+/// ([`super::notification_configuration_round_trip`]) drives the subresource through this one
+/// harness instead of standing up a second one.
+pub(crate) async fn put(router: &MultiServiceRouter, bucket: &str, body: &str) -> Answer {
     send(
         router,
         "PUT",
@@ -145,12 +167,12 @@ async fn put(router: &MultiServiceRouter, bucket: &str, body: &str) -> Answer {
 }
 
 /// `GET /<bucket>?notification`.
-async fn read(router: &MultiServiceRouter, bucket: &str) -> Answer {
+pub(crate) async fn read(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?notification"), &[], "").await
 }
 
 /// Create `bucket` and answer the router it was created on.
-async fn bucket_on(router: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn bucket_on(router: &MultiServiceRouter, bucket: &str) {
     let created = create_bucket(router, bucket, None, None).await;
     assert_eq!(
         created.status, 200,

@@ -259,6 +259,8 @@ mod multipart_upload_listing;
 mod multipart_upload_resume_position;
 #[path = "all/not_modified_version_headers.rs"]
 mod not_modified_version_headers;
+#[path = "all/notification_configuration_round_trip.rs"]
+mod notification_configuration_round_trip;
 #[path = "all/notification_destination_encryption.rs"]
 mod notification_destination_encryption;
 #[path = "all/notification_destination_validation.rs"]
