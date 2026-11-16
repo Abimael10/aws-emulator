@@ -35,6 +35,8 @@ mod list_namespaces;
 mod list_tags_for_resource;
 #[path = "all/list_tables_row_wire_forms.rs"]
 mod list_tables_row_wire_forms;
+#[path = "all/list_tables_rows_after_refused_writes.rs"]
+mod list_tables_rows_after_refused_writes;
 #[path = "all/list_tables_summary_members.rs"]
 mod list_tables_summary_members;
 #[path = "all/maintenance_request_refusals.rs"]
