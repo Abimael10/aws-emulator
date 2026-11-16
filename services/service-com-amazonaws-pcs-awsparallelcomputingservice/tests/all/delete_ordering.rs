@@ -9,10 +9,11 @@
 //! first" (`DeleteComputeNodeGroup`) and "You must delete all queues and compute node
 //! groups associated with the cluster before you can delete the cluster"
 //! (`DeleteCluster`) — and a delete attempted out of that order is refused with
-//! `ConflictException` (HTTP 409) while the resource it names stays exactly as it was. A
+//! `ConflictException` while the resource it names stays exactly as it was. A
 //! delete made in order is accepted, reports the resource `DELETING`, and the clock then
-//! removes it, so the read answers `ResourceNotFoundException` (404) and the listing drops
-//! it.
+//! removes it, so the read answers `ResourceNotFoundException` and the listing drops
+//! it. Every refusal of a client carries one status, the service's
+//! [`CLIENT_ERROR_STATUS`], and names its class in the body.
 //!
 //! The suites are tables. Their rows differ along what the rule generalises over: the form
 //! of the identifier each call addresses a resource by (its generated id or its name, the
@@ -21,6 +22,7 @@
 //! workflow happened to use.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
@@ -170,9 +172,9 @@ async fn assert_conflict(
 ) {
     let (status, refused) = call(router, operation, body).await;
     assert_eq!(
-        status, 409,
-        "case {case}: expected {operation} {body} to be refused 409, got {status} with \
-         {refused}"
+        status, CLIENT_ERROR_STATUS,
+        "case {case}: expected {operation} {body} to be refused with the client-error \
+         status, got {status} with {refused}"
     );
     assert_eq!(
         error_code(&refused),
@@ -336,7 +338,7 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
             let (status, again) = call(&router, "DeleteQueue", &body).await;
             assert_eq!(
                 (status, error_code(&again).as_str()),
-                (409, "ConflictException"),
+                (CLIENT_ERROR_STATUS, "ConflictException"),
                 "case {case}: expected a second DeleteQueue to conflict, got {status} with \
                  {again}"
             );
@@ -351,7 +353,7 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
             let (status, gone) = call(&router, "GetQueue", &body).await;
             assert_eq!(
                 (status, error_code(&gone).as_str()),
-                (404, "ResourceNotFoundException"),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
                 "case {case}: expected the queue to be gone, got {status} with {gone}"
             );
         }
@@ -396,7 +398,7 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
         let (status, gone) = call(&router, "GetComputeNodeGroup", &delete_group).await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
-            (404, "ResourceNotFoundException"),
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
             "case {case}: expected the group to be gone, got {status} with {gone}"
         );
         let (status, listed) = call(
@@ -426,7 +428,7 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
         let (status, gone) = call(&router, "GetCluster", &cluster_body).await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
-            (404, "ResourceNotFoundException"),
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
             "case {case}: expected the cluster to be gone, got {status} with {gone}"
         );
     }
@@ -473,16 +475,19 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
         );
     }
 
-    // The clock then removes all three, so every read of them is a miss.
+    // The clock then removes all three, so every read of them is a miss. The CLUSTER is
+    // gone too, so a child read is refused about the caller (the cluster is the boundary
+    // such a call is authorized on) while the cluster's own read is a not-found.
     wait_past_the_owed_transition().await;
     wait_past_the_owed_transition().await;
-    for (operation, body) in [
+    for (operation, body, expected_code) in [
         (
             "GetQueue",
             json!({
                 "clusterIdentifier": cluster.id.clone(),
                 "queueIdentifier": queue.id.clone(),
             }),
+            "AccessDeniedException",
         ),
         (
             "GetComputeNodeGroup",
@@ -490,26 +495,29 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
                 "clusterIdentifier": cluster.id.clone(),
                 "computeNodeGroupIdentifier": group.id.clone(),
             }),
+            "AccessDeniedException",
         ),
         (
             "GetCluster",
             json!({"clusterIdentifier": cluster.id.clone()}),
+            "ResourceNotFoundException",
         ),
     ] {
         let (status, gone) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
-            (404, "ResourceNotFoundException"),
+            (CLIENT_ERROR_STATUS, expected_code),
             "case {case}: expected {operation} to report the resource gone, got {status} \
              with {gone}"
         );
     }
 }
 
-/// RULE: a delete names a cluster and a resource inside it, so a name neither holds is
-/// `ResourceNotFoundException` (404) naming the resource the request could not resolve:
-/// `resourceId` is the identifier as supplied and `resourceType` the KIND of identifier
-/// that did not resolve.
+/// RULE: a delete names a cluster and a resource inside it, so a resource INSIDE a cluster
+/// that holds no such resource is `ResourceNotFoundException` naming the resource the
+/// request could not resolve: `resourceId` is the identifier as supplied and `resourceType`
+/// the KIND of identifier that did not resolve. (A delete naming no CLUSTER is refused
+/// about the caller instead — see `tests/all/cluster_scoped_refusals.rs`.)
 #[tokio::test]
 async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
     let router = emulator();
@@ -517,19 +525,9 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
     let cluster = active_cluster(&router, case, "lonely-cluster").await;
 
     // Each row: the operation, the request, the identifier that does not resolve, and the
-    // `resourceType` the refusal reports for it. Each operation resolves the cluster
-    // first, so a row naming no cluster is refused about the cluster whichever resource
-    // inside one it also names.
+    // `resourceType` the refusal reports for it. Every row names a cluster that exists, so
+    // the refusal is about the resource inside it.
     let rows: Vec<(&str, Value, &str, &str)> = vec![
-        (
-            "DeleteQueue",
-            json!({
-                "clusterIdentifier": "no-such-cluster",
-                "queueIdentifier": "work",
-            }),
-            "no-such-cluster",
-            "Cluster ID",
-        ),
         (
             "DeleteQueue",
             json!({
@@ -540,13 +538,13 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
             "Queue ID",
         ),
         (
-            "DeleteComputeNodeGroup",
+            "DeleteQueue",
             json!({
-                "clusterIdentifier": "no-such-cluster",
-                "computeNodeGroupIdentifier": "nodes",
+                "clusterIdentifier": cluster.name.clone(),
+                "queueIdentifier": "pcs_00000000000000000000",
             }),
-            "no-such-cluster",
-            "Cluster ID",
+            "pcs_00000000000000000000",
+            "Queue ID",
         ),
         (
             "DeleteComputeNodeGroup",
@@ -558,10 +556,13 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
             "Compute Node Group ID",
         ),
         (
-            "ListComputeNodeGroups",
-            json!({"clusterIdentifier": "no-such-cluster"}),
-            "no-such-cluster",
-            "Cluster ID",
+            "DeleteComputeNodeGroup",
+            json!({
+                "clusterIdentifier": cluster.name.clone(),
+                "computeNodeGroupIdentifier": "pcs_11111111111111111111",
+            }),
+            "pcs_11111111111111111111",
+            "Compute Node Group ID",
         ),
     ];
 
@@ -569,9 +570,9 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
         let (status, refused) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected {operation} {body} to answer 404, got {status} with \
-             {refused}"
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+            "case {case}: expected {operation} {body} to answer the client-error status, got \
+             {status} with {refused}"
         );
         // The refusal names the identifier it could not resolve and the kind of
         // identifier that was.
@@ -674,7 +675,7 @@ async fn the_compute_node_group_listing_pages_in_creation_order() {
     .await;
     assert_eq!(
         (status, error_code(&refused).as_str()),
-        (400, "ValidationException"),
+        (CLIENT_ERROR_STATUS, "ValidationException"),
         "case {case}: expected an unissued token to be refused, got {status} with {refused}"
     );
 }

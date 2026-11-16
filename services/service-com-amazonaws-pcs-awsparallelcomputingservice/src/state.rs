@@ -49,6 +49,11 @@
 /// subnets.
 pub mod ec2_subnets;
 
+/// Why a request about a resource inside a cluster is refused when the cluster it names
+/// cannot be resolved: the cluster is the authorization boundary of everything nested in
+/// one.
+pub mod cluster_authorization;
+
 /// The IAM instance profile a compute node group's instances assume, resolved against the
 /// service that owns instance profiles.
 pub mod instance_profile;

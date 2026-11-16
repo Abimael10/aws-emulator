@@ -7,6 +7,7 @@
 //! the harness [`crate::cluster_lifecycle`] already builds.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 
 use crate::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
 
@@ -541,7 +542,7 @@ async fn update_cluster_refuses_a_cluster_it_cannot_find_or_cannot_update() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, CLIENT_ERROR_STATUS,
             "case UpdateCluster {identifier}: expected a not-found, got {missing}"
         );
         assert_eq!(
@@ -570,7 +571,7 @@ async fn update_cluster_refuses_a_cluster_it_cannot_find_or_cannot_update() {
     )
     .await;
     assert_eq!(
-        status, 409,
+        status, CLIENT_ERROR_STATUS,
         "case update while CREATING: expected a conflict, got {refused}"
     );
     assert_eq!(
@@ -636,8 +637,11 @@ async fn a_not_found_refusal_names_the_resource_kind_and_no_identifier() {
     // the same for every one of them, so it carries none of them.
     let unknown = ["no-such-cluster", "AnotherMissingOne", "pcs_0123456789abcdef"];
     for identifier in unknown {
-        // (operation, request, the kind the refusal names)
-        let cases: [(&str, Value, &str); 5] = [
+        // (operation, request, the kind the refusal names). A child operation naming an
+        // unknown CLUSTER is refused about the caller instead (see
+        // `tests/all/cluster_scoped_refusals.rs`), so every row here either addresses the
+        // cluster itself or names a cluster that exists.
+        let cases: [(&str, Value, &str); 4] = [
             (
                 "GetCluster",
                 json!({"clusterIdentifier": identifier}),
@@ -645,11 +649,6 @@ async fn a_not_found_refusal_names_the_resource_kind_and_no_identifier() {
             ),
             (
                 "DeleteCluster",
-                json!({"clusterIdentifier": identifier}),
-                "cluster",
-            ),
-            (
-                "ListQueues",
                 json!({"clusterIdentifier": identifier}),
                 "cluster",
             ),
@@ -670,7 +669,7 @@ async fn a_not_found_refusal_names_the_resource_kind_and_no_identifier() {
         for (operation, request, kind) in cases {
             let (status, missing) = call(&router, operation, &request).await;
             assert_eq!(
-                status, 404,
+                status, CLIENT_ERROR_STATUS,
                 "case {operation} {identifier}: expected a not-found, got {missing}"
             );
             assert_eq!(
@@ -714,7 +713,7 @@ async fn a_duplicate_cluster_name_is_refused_with_the_services_own_sentence() {
         )
         .await;
         assert_eq!(
-            status, 409,
+            status, CLIENT_ERROR_STATUS,
             "case duplicate {name}: expected a conflict, got {refused}"
         );
         assert_eq!(

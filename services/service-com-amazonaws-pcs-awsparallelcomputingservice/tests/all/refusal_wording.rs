@@ -7,7 +7,7 @@
 //! Three rules under test:
 //!
 //! 1. a value that violates a member constraint is refused with `ValidationException`
-//!    (400) whose message is built from the REQUEST and the MODEL in the standard
+//!    whose message is built from the REQUEST and the MODEL in the standard
 //!    constraint-violation framing — how many violations were detected, then
 //!    `Value at '<member>' failed to satisfy constraint: <constraint>` per violation —
 //!    carrying reason `fieldValidationFailed` and one `fieldList` entry per violation, and
@@ -15,22 +15,27 @@
 //!    ceiling), the three resource-name members that carry the same pattern, and the forms
 //!    a name can miss that pattern in.
 //! 2. a resource a request named by IDENTIFIER and the service cannot find is
-//!    `ResourceNotFoundException` (404) carrying the service's fixed sentence for that KIND
+//!    `ResourceNotFoundException` carrying the service's fixed sentence for that KIND
 //!    of resource, the identifier exactly as supplied in `resourceId`, and the kind of
 //!    IDENTIFIER that did not resolve in `resourceType`. The rows span the three kinds, the
 //!    operations that resolve them, and the two identifier forms the `*Identifier` patterns
-//!    allow.
+//!    allow. A call naming no CLUSTER is refused about the caller instead, which is
+//!    `crate::cluster_scoped_refusals`.
 //! 3. `RegisterComputeNodeGroupInstance` is how a compute node Amazon EC2 instance PCS
 //!    launched collects its Slurm bootstrap material — "this API action isn't intended for
 //!    you to use" (its own documentation) — so a caller that cannot be attributed to such
-//!    an instance is denied `AccessDeniedException` (403) and handed none of that material.
+//!    an instance is denied `AccessDeniedException` and handed none of that material.
 //!    The rows span the cluster-identifier forms, whether the cluster exists at all, and
 //!    the length bounds `bootstrapId` admits.
+//!
+//! Every refusal of a client carries one status, the service's [`CLIENT_ERROR_STATUS`],
+//! and names its class in the body.
 //!
 //! Each test builds its own engine, so the state one test writes is invisible to the
 //! others.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::MAX_STORED_LIST_ENTRIES;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -231,9 +236,9 @@ async fn a_member_constraint_violation_is_stated_in_the_standard_framing() {
         let (status, refused) = call(&router, operation, &request).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected {operation} to answer 400 ValidationException, got \
-             {status} with {refused}"
+            (CLIENT_ERROR_STATUS, "ValidationException"),
+            "case {case:?}: expected {operation} to answer the client-error status with \
+             ValidationException, got {status} with {refused}"
         );
         let expected = format!(
             "1 validation error(s) detected: Value at '{member}' failed to satisfy constraint: \
@@ -272,9 +277,10 @@ async fn a_not_found_names_the_identifier_it_could_not_resolve_and_its_kind() {
     let cluster = active_cluster(&router, "lookup-cluster").await;
 
     // Each row: the call, the identifier that resolves to nothing, the kind of resource
-    // the sentence names, and the kind of identifier `resourceType` reports. Every
-    // operation resolves the cluster first, so a call naming no cluster is refused about
-    // the cluster whichever resource inside one it also names.
+    // the sentence names, and the kind of identifier `resourceType` reports. Every row
+    // either addresses the cluster itself or names a cluster that EXISTS: a child operation
+    // naming a cluster that does not is refused about the caller instead
+    // (`crate::cluster_scoped_refusals`).
     let rows: Vec<(&str, Value, &str, &str, &str)> = vec![
         (
             "GetCluster",
@@ -294,23 +300,6 @@ async fn a_not_found_names_the_identifier_it_could_not_resolve_and_its_kind() {
             "DeleteCluster",
             json!({"clusterIdentifier": "AnotherMissingOne"}),
             "AnotherMissingOne",
-            "cluster",
-            "Cluster ID",
-        ),
-        (
-            "ListQueues",
-            json!({"clusterIdentifier": "pcs_22222222222222222222"}),
-            "pcs_22222222222222222222",
-            "cluster",
-            "Cluster ID",
-        ),
-        (
-            "CreateQueue",
-            json!({
-                "clusterIdentifier": "pcs_22222222222222222222",
-                "queueName": "work",
-            }),
-            "pcs_22222222222222222222",
             "cluster",
             "Cluster ID",
         ),
@@ -361,8 +350,9 @@ async fn a_not_found_names_the_identifier_it_could_not_resolve_and_its_kind() {
         let (status, refused) = call(&router, operation, &request).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected 404 ResourceNotFoundException, got {status} with {refused}"
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+            "case {case}: expected the client-error status with ResourceNotFoundException, \
+             got {status} with {refused}"
         );
         // The sentence is fixed per kind of resource: it names the kind and echoes no
         // identifier, whatever form the caller supplied.
@@ -443,11 +433,13 @@ async fn registering_a_compute_node_group_instance_denies_a_caller_that_is_not_o
         .await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
-            (403, "AccessDeniedException"),
-            "case {case:?}: expected 403 AccessDeniedException, got {status} with {refused}"
+            (CLIENT_ERROR_STATUS, "AccessDeniedException"),
+            "case {case:?}: expected the client-error status with AccessDeniedException, got \
+             {status} with {refused}"
         );
+        // A refusal of the CALLER carries its sentence in the `Message` member.
         assert_eq!(
-            refused["message"].as_str(),
+            refused["Message"].as_str(),
             Some("This API must be called from an EC2 instance."),
             "case {case:?}: got {refused}"
         );

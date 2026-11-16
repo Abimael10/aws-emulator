@@ -34,6 +34,10 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec the modeled sequence reads and answers in. This
+//!   service serves the model's own `awsJson1_0` with the REFUSAL envelope it answers:
+//!   one status for the whole client-error class, and a refusal of the caller stating its
+//!   sentence in the member that layer reports it in. See [`wire`].
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -45,6 +49,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How this service's `awsJson1_0` responses carry a REFUSAL — the status every client
+/// error is answered with, and the member an authorization refusal states its sentence in.
+///
+/// Public: its client-error status is read by this crate's suites rather than restated.
+pub mod wire;
+
 /// The `com-amazonaws-pcs-awsparallelcomputingservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +62,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because `override_protocol` hands
+    /// out a borrow of it rather than a new one per request.
+    protocol: wire::PcsJsonProtocol,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +74,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: wire::PcsJsonProtocol::new(),
         }
     }
 }
@@ -135,5 +149,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model-derived protocol is `awsJson1_0`, and so is this one: it delegates
+        // routing, request deserialization and every success body to the framework's own
+        // `awsJson1_0`, and differs only in the REFUSAL envelope — the status a client
+        // error is answered with, and the member a refusal of the caller carries its
+        // sentence in. See [`wire`] for both rules.
+        Some(&self.protocol)
     }
 }

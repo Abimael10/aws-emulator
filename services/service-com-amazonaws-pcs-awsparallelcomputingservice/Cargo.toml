@@ -37,6 +37,11 @@ aws-sdk-iam = { version = "1", default-features = false }
 aws-sdk-ec2 = { version = "1", default-features = false }
 # The tree's shared IAM-ARN reading, in-process IAM client and `@pattern` rendering.
 service-common = { path = "../common" }
+# WHO a request speaks for: the principal `sts:GetCallerIdentity` answers with, read from
+# the same session registry (`src/state/cluster_authorization.rs`), so the principal an
+# authorization refusal of this service blames is the one the caller reads back from STS
+# for its own credentials.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

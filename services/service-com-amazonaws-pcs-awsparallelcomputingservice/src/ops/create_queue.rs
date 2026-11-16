@@ -197,6 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateQueueErrorModeled::ValidationException(refusal).into());
         }
 
+        // The principal a refusal of the CALLER names, read before this service's store is
+        // locked so the session registry is never reached while the guard is held.
+        let caller = crate::state::cluster_authorization::caller_principal_arn(&*self.engine, ctx);
+
         // The caller-sized lists this create would PERSIST. The model bounds neither
         // `ComputeNodeGroupConfigurationList` nor the Slurm settings list, so one
         // request could otherwise size one stored record arbitrarily. `tags` needs no
@@ -242,9 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle();
 
+        // The cluster is the boundary this call is authorized on, so an identifier that
+        // resolves to no cluster of this account is a permissions failure rather than a
+        // not-found; see `crate::state::cluster_authorization`. The principal it names was
+        // read before this store was locked.
         let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
-            return Err(CreateQueueErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            return Err(CreateQueueErrorModeled::AccessDeniedException(
+                crate::state::cluster_authorization::cluster_denied(
+                    &caller,
+                    Self::NAME,
+                    &input.cluster_identifier,
+                ),
             )
             .into());
         };

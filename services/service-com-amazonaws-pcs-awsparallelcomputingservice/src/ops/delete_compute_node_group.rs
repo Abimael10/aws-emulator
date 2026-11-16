@@ -168,7 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteComputeNodeGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -178,12 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The principal a refusal of the CALLER names, read before this service's store is
+        // locked so the session registry is never reached while the guard is held.
+        let caller = crate::state::cluster_authorization::caller_principal_arn(&*self.engine, ctx);
+
         let mut state = state.lock();
         state.settle();
 
+        // The cluster is the boundary this call is authorized on, so an identifier that
+        // resolves to no cluster of this account is a permissions failure rather than a
+        // not-found; see `crate::state::cluster_authorization`.
         let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
-            return Err(DeleteComputeNodeGroupErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            return Err(DeleteComputeNodeGroupErrorModeled::AccessDeniedException(
+                crate::state::cluster_authorization::cluster_denied(
+                    &caller,
+                    Self::NAME,
+                    &input.cluster_identifier,
+                ),
             )
             .into());
         };

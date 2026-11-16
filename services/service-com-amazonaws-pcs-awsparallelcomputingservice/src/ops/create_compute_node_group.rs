@@ -321,12 +321,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateComputeNodeGroupErrorModeled::ValidationException(refusal).into());
         }
 
+        // The principal a refusal of the CALLER names, read before this service's store is
+        // locked so the session registry is never reached while the guard is held.
+        let caller = crate::state::cluster_authorization::caller_principal_arn(&*self.engine, ctx);
+
         let mut state = state.lock();
         state.settle();
 
+        // The cluster is the boundary this call is authorized on, so an identifier that
+        // resolves to no cluster of this account is a permissions failure rather than a
+        // not-found; see `crate::state::cluster_authorization`. It is asked AFTER the
+        // references this create carries into other services are resolved, so a request
+        // naming a profile or a subnet that does not exist is answered about that.
         let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
-            return Err(CreateComputeNodeGroupErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            return Err(CreateComputeNodeGroupErrorModeled::AccessDeniedException(
+                crate::state::cluster_authorization::cluster_denied(
+                    &caller,
+                    Self::NAME,
+                    &input.cluster_identifier,
+                ),
             )
             .into());
         };

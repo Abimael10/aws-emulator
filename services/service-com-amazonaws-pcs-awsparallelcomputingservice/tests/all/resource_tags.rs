@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
     MAX_TAGS_PER_RESOURCE, TRANSITION_SPAN,
 };
@@ -399,17 +400,34 @@ async fn a_tag_write_past_the_resource_tag_quota_is_refused_and_persists_nothing
         edited.len()
     );
 
-    // Rows: how many NEW keys a write at the ceiling asks for, against what the service
-    // answers. `RequestTagMap` is modelled @length(min: 1, max: 200), so a request
-    // carrying more than 200 entries is refused at the boundary (400) before the quota is
-    // ever consulted, and one carrying none is refused the same way.
-    let past: Vec<(&str, usize, u16)> = vec![
-        ("one new key past the ceiling", 1, 402),
-        ("a handful past the ceiling", 7, 402),
-        ("a request at the modelled maximum", 200, 402),
-        ("a request one past the modelled maximum", 201, 400),
+    // Rows: how many NEW keys a write at the ceiling asks for, against the error CLASS the
+    // service answers with. `RequestTagMap` is modelled @length(min: 1, max: 200), so a
+    // request carrying more than 200 entries is refused at the boundary before the quota is
+    // ever consulted, and one carrying none is refused the same way. Every refusal of a
+    // client carries one status, so the class in the body is what tells them apart.
+    let past: Vec<(&str, usize, &str)> = vec![
+        (
+            "one new key past the ceiling",
+            1,
+            "ServiceQuotaExceededException",
+        ),
+        (
+            "a handful past the ceiling",
+            7,
+            "ServiceQuotaExceededException",
+        ),
+        (
+            "a request at the modelled maximum",
+            200,
+            "ServiceQuotaExceededException",
+        ),
+        (
+            "a request one past the modelled maximum",
+            201,
+            "ValidationException",
+        ),
     ];
-    for (case, new_keys, expected_status) in past {
+    for (case, new_keys, expected_code) in past {
         let request = bulk_tags(case, new_keys);
         let (status, body) = call(
             &router,
@@ -418,16 +436,12 @@ async fn a_tag_write_past_the_resource_tag_quota_is_refused_and_persists_nothing
         )
         .await;
         assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected HTTP {expected_status} for {new_keys} new keys, got \
+            (status, body["__type"].as_str()),
+            (CLIENT_ERROR_STATUS, Some(expected_code)),
+            "case {case:?}: expected {expected_code} for {new_keys} new keys, got \
              {status} with {body:?}"
         );
-        if expected_status == 402 {
-            assert_eq!(
-                body["__type"],
-                json!("ServiceQuotaExceededException"),
-                "case {case:?}: expected the modelled quota error, got {body:?}"
-            );
+        if expected_code == "ServiceQuotaExceededException" {
             assert_eq!(
                 body["message"],
                 json!(format!(
@@ -453,9 +467,9 @@ async fn a_tag_write_past_the_resource_tag_quota_is_refused_and_persists_nothing
     )
     .await;
     assert_eq!(
-        status, 400,
-        "case an empty tag map: expected HTTP 400 from the modelled minimum, got {status} \
-         with {body:?}"
+        status, CLIENT_ERROR_STATUS,
+        "case an empty tag map: expected the client-error status from the modelled \
+         minimum, got {status} with {body:?}"
     );
 
     // Freeing a key makes room for exactly one more, so the ceiling is a bound on the
@@ -501,9 +515,10 @@ async fn a_tag_write_past_the_resource_tag_quota_is_refused_and_persists_nothing
         )
         .await;
         assert_eq!(
-            status, 402,
-            "case {kind:?} one request past the ceiling: expected HTTP 402, got {status} with \
-             {body:?}"
+            (status, body["__type"].as_str()),
+            (CLIENT_ERROR_STATUS, Some("ServiceQuotaExceededException")),
+            "case {kind:?} one request past the ceiling: expected the modelled quota error, \
+             got {status} with {body:?}"
         );
         let after = listed_tags(&router, arn).await;
         assert_eq!(
@@ -525,7 +540,7 @@ async fn a_tag_write_past_the_resource_tag_quota_is_refused_and_persists_nothing
         (
             "a create one past the ceiling",
             MAX_TAGS_PER_RESOURCE + 1,
-            402,
+            CLIENT_ERROR_STATUS,
         ),
     ] {
         let name = format!("tags-on-create-{tag_count}");
@@ -567,7 +582,7 @@ async fn a_tag_write_past_the_resource_tag_quota_is_refused_and_persists_nothing
             )
             .await;
             assert_eq!(
-                status, 404,
+                status, CLIENT_ERROR_STATUS,
                 "case {case:?}: expected no cluster to have been created, got {status} with \
                  {refused:?}"
             );
@@ -646,9 +661,9 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
         ] {
             let (status, body) = call(&router, operation, &request).await;
             assert_eq!(
-                status, 404,
-                "case {operation} on an absent {resource_type}: expected HTTP 404, got {status} \
-                 with {body:?}"
+                status, CLIENT_ERROR_STATUS,
+                "case {operation} on an absent {resource_type}: expected the client-error \
+                 status, got {status} with {body:?}"
             );
             assert_eq!(
                 body["__type"],
@@ -718,9 +733,9 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case ListTagsForResource on a deleted cluster: expected HTTP 404, got {status} with \
-         {body:?}"
+        status, CLIENT_ERROR_STATUS,
+        "case ListTagsForResource on a deleted cluster: expected the client-error status, \
+         got {status} with {body:?}"
     );
     assert_eq!(
         body["__type"],

@@ -9,19 +9,19 @@
 //! REFERENCES in the service that owns instance profiles before it resolves the resource of
 //! its own the request names:
 //!
-//! * a reference IAM holds no instance profile for is HTTP 400 `ValidationException`,
+//! * a reference IAM holds no instance profile for is `ValidationException`,
 //!   whether or not the cluster exists — so a request naming a profile that does not exist
-//!   and a cluster that does not exist is answered about the profile, never 404 about the
+//!   and a cluster that does not exist is answered about the profile, never about the
 //!   cluster. The refusal carries IAM's own answer through, with the tail AWS appends to a
 //!   failure of a call a service made on the caller's behalf (the service that answered,
 //!   its status, the id of that call and the attempts made), and a value that names no
 //!   instance profile of this account at all is refused in PCS's own words, since nobody
 //!   was asked about it;
 //! * a reference IAM does hold is passed on, and the create then resolves its cluster: a
-//!   cluster that does not exist is HTTP 404 `ResourceNotFoundException` reporting the
-//!   `clusterIdentifier` supplied and the kind of identifier that did not resolve, and a
-//!   cluster that does gets the compute node group, which reads back through
-//!   `GetComputeNodeGroup` carrying the profile it was created with.
+//!   cluster that does not exist is `AccessDeniedException`, since the cluster is the
+//!   boundary the call is authorized on, and a cluster that does gets the compute node
+//!   group, which reads back through `GetComputeNodeGroup` carrying the profile it was
+//!   created with.
 //!
 //! The read and delete paths of a compute node group reference no instance profile and keep
 //! resolving their cluster first, which the PCS crate's own suites cover.
@@ -262,16 +262,18 @@ fn create_body(cluster: &str, name: &str, profile_arn: &str, subnet: &str) -> se
 enum Expected {
     /// The profile resolves and the cluster exists, so the group is created.
     Created,
-    /// IAM answered that it holds no instance profile under that name: 400
+    /// IAM answered that it holds no instance profile under that name:
     /// `ValidationException` carrying IAM's own sentence about the name it was asked
     /// about, plus the tail of the call behind it.
     ProfileAbsentInIam(&'static str),
-    /// The value names no instance profile of this account: 400 `ValidationException` in
+    /// The value names no instance profile of this account: `ValidationException` in
     /// PCS's own words, since no call was made about it.
     ProfileNotOfThisAccount,
-    /// The profile resolves and the cluster does not exist: 404
-    /// `ResourceNotFoundException` reporting the identifier supplied.
-    ClusterNotFound(&'static str),
+    /// The profile resolves and the cluster does not exist. The cluster is the boundary a
+    /// compute node group create is authorized on, so the refusal is
+    /// `AccessDeniedException` naming the caller, the action and the identifier supplied —
+    /// which the PCS crate's own suites cover in full.
+    ClusterDenied(&'static str),
 }
 
 /// One row of the table.
@@ -333,14 +335,14 @@ fn cases(account: &str, cluster_id: &str) -> Vec<Case> {
             cluster: ABSENT_CLUSTER_ID.to_string(),
             group: "absent-cluster-id",
             profile_arn: held.clone(),
-            expected: Expected::ClusterNotFound(ABSENT_CLUSTER_ID),
+            expected: Expected::ClusterDenied(ABSENT_CLUSTER_ID),
         },
         Case {
             case: "a profile IAM holds, on a cluster name that names no cluster",
             cluster: ABSENT_CLUSTER_NAME.to_string(),
             group: "absent-cluster-name",
             profile_arn: held,
-            expected: Expected::ClusterNotFound(ABSENT_CLUSTER_NAME),
+            expected: Expected::ClusterDenied(ABSENT_CLUSTER_NAME),
         },
     ]
 }
@@ -611,28 +613,30 @@ fn a_compute_node_group_is_created_only_for_an_instance_profile_iam_holds() {
                             case.case
                         );
                     }
-                    Expected::ClusterNotFound(identifier) => {
+                    Expected::ClusterDenied(identifier) => {
                         assert_eq!(
                             (status, error_code(&body).as_str()),
-                            (404, "ResourceNotFoundException"),
+                            (400, "AccessDeniedException"),
                             "case {:?}: a resolvable profile on an absent cluster must be \
-                             refused 404 ResourceNotFoundException, got {status} {body}",
+                             refused about the caller, got {status} {body}",
                             case.case
                         );
-                        assert_eq!(
-                            error_message(&body),
-                            "AWS PCS couldn't find the cluster you specified.",
-                            "case {:?}: expected the service's own sentence, got {body}",
+                        // The sentence names the action and the identifier the request
+                        // supplied, and the refusal reports nothing of a not-found.
+                        let message = body["Message"].as_str().unwrap_or_default();
+                        assert!(
+                            message.contains("is not authorized to perform: \
+                                              pcs:CreateComputeNodeGroup on resource: ")
+                                && message.contains(identifier),
+                            "case {:?}: expected the IAM sentence naming the action and \
+                             {identifier:?}, got {body}",
                             case.case
                         );
-                        assert_eq!(
-                            (
-                                body["resourceId"].as_str(),
-                                body["resourceType"].as_str()
-                            ),
-                            (Some(*identifier), Some("Cluster ID")),
-                            "case {:?}: expected the identifier and its kind in the \
-                             modelled members, got {body}",
+                        assert!(
+                            body.get("resourceId").is_none()
+                                && body.get("resourceType").is_none(),
+                            "case {:?}: a refusal of the caller must report no resource, \
+                             got {body}",
                             case.case
                         );
                     }

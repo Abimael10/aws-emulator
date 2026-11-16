@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
     MAX_CLUSTERS, MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER, MAX_QUEUES_PER_CLUSTER,
     MAX_STORED_LIST_ENTRIES, TRANSITION_SPAN,
@@ -194,7 +195,7 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
     )
     .await;
     assert_eq!(
-        status, 409,
+        status, CLIENT_ERROR_STATUS,
         "case CreateQueue while CREATING: expected a conflict, got {refused}"
     );
     assert_eq!(
@@ -226,7 +227,7 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
     )
     .await;
     assert_eq!(
-        status, 409,
+        status, CLIENT_ERROR_STATUS,
         "case duplicate CreateCluster: expected a conflict, got {conflict}"
     );
     assert_eq!(
@@ -242,7 +243,7 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, CLIENT_ERROR_STATUS,
         "case GetCluster on an unknown identifier: got {missing}"
     );
     assert_eq!(
@@ -292,7 +293,7 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, CLIENT_ERROR_STATUS,
             "case GetCluster {identifier} after the delete came due: got {gone}"
         );
     }
@@ -424,7 +425,7 @@ async fn a_compute_node_group_and_a_queue_round_trip_through_their_readers() {
     )
     .await;
     assert_eq!(
-        status, 409,
+        status, CLIENT_ERROR_STATUS,
         "case DeleteCluster with children: expected a conflict, got {refused}"
     );
 }
@@ -466,12 +467,15 @@ async fn a_child_create_refuses_a_cluster_it_cannot_find() {
     for (operation, request) in cases {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {operation} on an unknown cluster: expected 404, got {status} {body}"
+            status, CLIENT_ERROR_STATUS,
+            "case {operation} on an unknown cluster: expected the client-error status, got \
+             {status} {body}"
         );
+        // The cluster is the boundary a child operation is authorized on, so an identifier
+        // that resolves to no cluster of this account is a permissions failure.
         assert_eq!(
             body["__type"],
-            json!("ResourceNotFoundException"),
+            json!("AccessDeniedException"),
             "case {operation} on an unknown cluster: got {body}"
         );
     }
@@ -484,7 +488,7 @@ async fn a_child_create_refuses_a_cluster_it_cannot_find() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, CLIENT_ERROR_STATUS,
         "case CreateQueue naming an absent compute node group: got {status} {body}"
     );
 
@@ -517,8 +521,15 @@ async fn a_child_create_refuses_a_cluster_it_cannot_find() {
     ] {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {operation} on an unknown child: expected 404, got {status} {body}"
+            status, CLIENT_ERROR_STATUS,
+            "case {operation} on an unknown child: expected the client-error status, got \
+             {status} {body}"
+        );
+        // The cluster DID resolve, so the refusal is about the child the request named.
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {operation} on an unknown child: got {body}"
         );
     }
 }
@@ -761,7 +772,7 @@ async fn an_idempotency_token_replays_the_first_create_instead_of_conflicting() 
     other["clientToken"] = json!("cluster-token-0002");
     let (status, conflict) = call(&router, "CreateCluster", &other).await;
     assert_eq!(
-        status, 409,
+        status, CLIENT_ERROR_STATUS,
         "case CreateCluster with a new token on a taken name: got {status} {conflict}"
     );
 
@@ -875,7 +886,7 @@ async fn an_idempotency_token_cannot_be_replayed_into_another_cluster() {
     elsewhere["clientToken"] = json!(token);
     let (status, refused) = call(&router, "CreateQueue", &elsewhere).await;
     assert_eq!(
-        status, 409,
+        status, CLIENT_ERROR_STATUS,
         "case replay into another cluster: expected a conflict, got {status} {refused}"
     );
     let (status, queues) = call(
@@ -946,14 +957,10 @@ async fn a_create_past_a_store_ceiling_is_refused_with_the_modelled_quota_error(
     )
     .await;
     assert_eq!(
-        status, 402,
+        (status, refused["__type"].as_str()),
+        (CLIENT_ERROR_STATUS, Some("ServiceQuotaExceededException")),
         "case one cluster past the ceiling: expected the modelled quota error, got \
          {status} {refused}"
-    );
-    assert_eq!(
-        refused["__type"],
-        json!("ServiceQuotaExceededException"),
-        "case one cluster past the ceiling: got {refused}"
     );
 }
 
@@ -985,7 +992,8 @@ async fn a_child_create_past_its_cluster_ceiling_is_refused_with_the_modelled_qu
     )
     .await;
     assert_eq!(
-        status, 402,
+        (status, refused["__type"].as_str()),
+        (CLIENT_ERROR_STATUS, Some("ServiceQuotaExceededException")),
         "case one compute node group past the ceiling: got {status} {refused}"
     );
 
@@ -1004,7 +1012,7 @@ async fn a_child_create_past_its_cluster_ceiling_is_refused_with_the_modelled_qu
     )
     .await;
     assert_eq!(
-        status, 402,
+        status, CLIENT_ERROR_STATUS,
         "case one queue past the ceiling: got {status} {refused}"
     );
     assert_eq!(
