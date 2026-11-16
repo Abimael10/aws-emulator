@@ -23,6 +23,8 @@ mod broker_lifecycle;
 mod broker_read_wire_form;
 #[path = "all/broker_restart.rs"]
 mod broker_restart;
+#[path = "all/broker_restart_scope.rs"]
+mod broker_restart_scope;
 #[path = "all/configuration_deleted_id.rs"]
 mod configuration_deleted_id;
 #[path = "all/configuration_document_syntax.rs"]

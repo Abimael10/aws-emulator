@@ -72,7 +72,7 @@ const GOOD_PASSWORD: &str = "GoodPassword12";
 
 /// `POST /v1/brokers/{BrokerId}/reboot` — the operation under test, with the error code
 /// a restJson1 client branches on.
-async fn reboot(mq: &Mq, broker_id: &str) -> (u16, String, Value) {
+pub(crate) async fn reboot(mq: &Mq, broker_id: &str) -> (u16, String, Value) {
     mq.call_with_code("POST", &format!("/v1/brokers/{broker_id}/reboot"), None)
         .await
 }
@@ -106,7 +106,7 @@ async fn create_user_with_code(
 
 /// The broker read taken once the broker reports `wanted`, looking again until it does
 /// or [`PATIENCE`] runs out. The condition, never the clock, is what is waited on.
-async fn poll_until_state(mq: &Mq, broker_id: &str, wanted: &str) -> Value {
+pub(crate) async fn poll_until_state(mq: &Mq, broker_id: &str, wanted: &str) -> Value {
     let deadline = Instant::now() + PATIENCE;
     loop {
         let (status, described) = mq.describe_broker(broker_id).await;

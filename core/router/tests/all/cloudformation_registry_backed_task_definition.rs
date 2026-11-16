@@ -616,7 +616,9 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
         // However the declaration composed it, the image the revision carries names this
         // repository through the URI the OWNING service reports for it — the same value the
         // read above pinned, which is what `${Registry.RepositoryUri}` resolves to — with the
-        // declared tag.
+        // declared tag. A declaration that spelled the registry host itself wrote the very
+        // stand-in CloudFormation had computed for that attribute, so the deployment brought
+        // it into step with what the create answered.
         let expected_image = format!("{}:{}", published_repository_uri(&repository), row.tag);
         // Addressed by the FAMILY alone, which is "the latest ACTIVE revision in that
         // family" — the read that answered `ClientException` while nothing was registered.

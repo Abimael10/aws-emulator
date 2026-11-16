@@ -64,7 +64,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::dynamodb_stream_event_source_delivery::{
     dynamodb, given_table, KEY, LATEST, NEW_AND_OLD_IMAGES, TRIM_HORIZON,
 };
-use crate::event_source_mappings::{get_mapping, given_enabled_mapping, router_on, LOOK_AGAIN};
+use crate::event_source_mappings::{
+    given_enabled_mapping, processing_result_within_budget, router_on, LOOK_AGAIN,
+};
 use crate::invocation_log_delivery::{
     create_function, events, groups, streams, Created, PYTHON_RUNTIME,
 };
@@ -437,14 +439,16 @@ async fn assert_delivered_and_logged(
         "case {case:?}: the delivery must have created {group:?}, got {named:?}"
     );
     // And the mapping says what its attempt at the batch came to, which is the other half a
-    // client watches a consumer by.
-    let reading = get_mapping(router, &uuid).await;
+    // client watches a consumer by. Read through the suite harness's ONE waiter for that
+    // member, because the mapping's record is written by the poller that took the batch: a row
+    // that asked once would be reading an instant of its own choosing in the middle of the
+    // chain the log read above only proves the start of.
+    let reported = processing_result_within_budget(router, case, &uuid).await;
     assert_eq!(
-        reading.string("LastProcessingResult").as_deref(),
+        reported.as_deref(),
         Some(LAST_PROCESSING_RESULT_OK),
         "case {case:?}: the mapping must report the attempt that consumed its batch as \
-         {LAST_PROCESSING_RESULT_OK}, got {}",
-        reading.text()
+         {LAST_PROCESSING_RESULT_OK}, got {reported:?}"
     );
 }
 
