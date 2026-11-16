@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies one write to a STORED AS2 profile: the `CertificateIds` the request names
+//! REPLACE that profile's certificate attachments in this service's state, so the
+//! existing `DescribeProfile` read reports them without this operation touching the
+//! read path.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProfile"))
+        use crate::state as st;
+
+        // The profile is addressed by the identifier the request carries and keeps the
+        // ARN it was minted with, so this operation reads no request metadata; the
+        // engine comes from `self`.
+        let _ = ctx;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateProfileErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // `ProfileId`'s modelled length and pattern are enforced before this handler
+        // runs, so an id reaching here is well-formed: the only way this write can fail
+        // is that the store holds no such profile — never created, or already deleted —
+        // which is this service's not-found refusal, and it changes nothing.
+        let stored = guard.profiles.get_mut(&input.profile_id).ok_or_else(|| {
+            st::not_found(UpdateProfileErrorModeled::ResourceNotFoundException(
+                st::unknown_profile(&input.profile_id),
+            ))
+        })?;
+
+        // Nothing can be refused past here. The ONE attachment rule, in
+        // `state::Profile`: the list this request names REPLACES the stored one, and a
+        // request that names none leaves the profile's attachments as they are.
+        stored.apply_certificate_ids(input.certificate_ids);
+        drop(guard);
+
+        Ok(UpdateProfileOutput {
+            profile_id: input.profile_id,
+        })
     }
 }

@@ -37,6 +37,8 @@ mod error_message_rules;
 // sorted list or appended after it, so those are the lines a concurrent change also
 // edits, and this declaration kept landing on top of one. Fold it into the list once the
 // churn settles.
+#[path = "all/protocol_family_gate.rs"]
+mod protocol_family_gate;
 #[path = "all/workflow_step_contract.rs"]
 mod workflow_step_contract;
 #[path = "all/feature_probe.rs"]
@@ -221,7 +223,7 @@ mod agreement_directory_conflict_message;
 // a server's S3 domain is stored with.
 #[path = "all/delivered_object_provenance.rs"]
 mod delivered_object_provenance;
-// `protocol_family_gate`, likewise appended: WHICH refusal a server write that asks for a
-// protocol its identity provider cannot serve at all is answered with.
-#[path = "all/protocol_family_gate.rs"]
-mod protocol_family_gate;
+// `profile_certificate_attachments`, likewise appended: which certificates a profile
+// write attaches, and what the profile read then reports.
+#[path = "all/profile_certificate_attachments.rs"]
+mod profile_certificate_attachments;

@@ -1116,10 +1116,10 @@ impl User {
 
 /// One stored AS2 profile, keyed by `ProfileId`.
 ///
-/// Everything `DescribeProfile` and `ListProfiles` report is RESOLVED here, at create
-/// time, so a reader projects the stored record without re-deriving anything: the
-/// minted id, its ARN, the AS2-name, the profile type and the certificate ids and tags
-/// the create carried.
+/// Everything `DescribeProfile` and `ListProfiles` report is RESOLVED here, by the
+/// create and by every later write, so a reader projects the stored record without
+/// re-deriving anything: the minted id, its ARN, the AS2-name, the profile type, the
+/// tags the create carried and the certificate ids the last profile write established.
 #[derive(Debug, Clone)]
 pub struct Profile {
     /// The minted `p-` + 17 hex-digit identifier (`^p-([0-9a-f]{17})$`).
@@ -1129,11 +1129,26 @@ pub struct Profile {
     pub as2_id: String,
     /// `LOCAL` or `PARTNER` — the `ProfileType` enum, enforced before a handler runs.
     pub profile_type: String,
-    /// The certificate identifiers the create named, stored as given: a profile
+    /// The certificate identifiers a profile write named, stored as given: a profile
     /// REFERENCES certificates by id, and no operation of this service resolves that
     /// reference against the certificate map, so nothing here rewrites or drops an id.
     pub certificate_ids: Vec<String>,
     pub tags: Vec<Tag>,
+}
+
+impl Profile {
+    /// Apply one profile write's `CertificateIds` to this stored profile.
+    ///
+    /// A write that NAMES the member replaces the whole attachment list with the ids it
+    /// carries — an empty list attaches none — and a write that leaves the member out
+    /// names no new value at all, so the profile keeps the attachments its last write
+    /// established. One place for that rule, so every read of the profile reports the
+    /// ids the last write left.
+    pub fn apply_certificate_ids(&mut self, certificate_ids: Option<Vec<String>>) {
+        if let Some(certificate_ids) = certificate_ids {
+            self.certificate_ids = certificate_ids;
+        }
+    }
 }
 
 /// One stored Transfer Family server, keyed by `ServerId`.
