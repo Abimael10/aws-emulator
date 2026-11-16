@@ -37,7 +37,11 @@ use crate::codedeploy_lifecycle::{s3_revision, terminal_deployment, xml_field, E
 
 /// The Region every call below is signed for, which is therefore the Region the
 /// deployments run in and the Region the topics live in.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` here and below: the sibling suite about what one notification
+/// REPORTS drives the same topics, queues and groups through this harness rather
+/// than standing up a second copy of it.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The service role every deployment group here is created with; CodeDeploy only
 /// stores it.
@@ -88,7 +92,7 @@ fn grant_to_sns(queue_arn: &str) -> String {
 
 /// A topic named `name` with one SQS queue subscribed to it: the topic's ARN (what
 /// a `triggerTargetArn` names) and the queue's URL (where a notification is read).
-async fn given_topic(emulator: &Emulator, name: &str) -> (String, String) {
+pub(crate) async fn given_topic(emulator: &Emulator, name: &str) -> (String, String) {
     let created = sqs(
         emulator,
         "CreateQueue",
@@ -136,16 +140,20 @@ async fn given_topic(emulator: &Emulator, name: &str) -> (String, String) {
 /// the notifications that are not JSON documents — the verification notification
 /// is the one that is not.
 #[derive(Debug, Default)]
-struct Inbox {
-    documents: Vec<Value>,
-    plain: Vec<String>,
+pub(crate) struct Inbox {
+    pub(crate) documents: Vec<Value>,
+    pub(crate) plain: Vec<String>,
 }
 
-/// Receive everything waiting on the queue at `url` and fold it into `inbox`.
+/// Receive everything waiting on the queue at `url` and fold it into `inbox`,
+/// REMOVING what it read from the queue when `remove` is set.
 ///
-/// A received message stays invisible for the queue's visibility timeout, so
-/// repeated calls accumulate rather than re-read.
-async fn drain_into(emulator: &Emulator, url: &str, inbox: &mut Inbox) {
+/// A received message that is left on the queue stays invisible for the queue's
+/// visibility timeout, so repeated calls accumulate rather than re-read; a case
+/// that goes on to assert nothing FURTHER arrived removes what it read instead, so
+/// its second look is a statement about the publishes rather than about that
+/// timeout.
+pub(crate) async fn drain_into(emulator: &Emulator, url: &str, inbox: &mut Inbox, remove: bool) {
     let received = sqs(
         emulator,
         "ReceiveMessage",
@@ -163,11 +171,20 @@ async fn drain_into(emulator: &Emulator, url: &str, inbox: &mut Inbox) {
             Ok(document) if document.is_object() => inbox.documents.push(document),
             _ => inbox.plain.push(notification),
         }
+        if let (true, Some(handle)) = (remove, message["ReceiptHandle"].as_str()) {
+            sqs(
+                emulator,
+                "DeleteMessage",
+                json!({"QueueUrl": url, "ReceiptHandle": handle}),
+            )
+            .await;
+        }
     }
 }
 
 /// Poll the queue at `url` until it holds at least `documents` JSON notifications
-/// and `plain` notifications that are not, answering everything it received.
+/// and `plain` notifications that are not, answering everything it received and
+/// leaving it on the queue.
 async fn awaited_inbox(
     emulator: &Emulator,
     case: &str,
@@ -175,10 +192,35 @@ async fn awaited_inbox(
     documents: usize,
     plain: usize,
 ) -> Inbox {
+    awaited(emulator, case, url, documents, plain, false).await
+}
+
+/// [`awaited_inbox`], REMOVING from the queue everything it answers; see
+/// [`drain_into`].
+pub(crate) async fn awaited_taken_inbox(
+    emulator: &Emulator,
+    case: &str,
+    url: &str,
+    documents: usize,
+    plain: usize,
+) -> Inbox {
+    awaited(emulator, case, url, documents, plain, true).await
+}
+
+/// The one poll loop behind both: look again until the queue has delivered what
+/// the case waits for, or the deadline passes.
+async fn awaited(
+    emulator: &Emulator,
+    case: &str,
+    url: &str,
+    documents: usize,
+    plain: usize,
+    remove: bool,
+) -> Inbox {
     let deadline = Instant::now() + DELIVERY_DEADLINE;
     let mut inbox = Inbox::default();
     loop {
-        drain_into(emulator, url, &mut inbox).await;
+        drain_into(emulator, url, &mut inbox, remove).await;
         if inbox.documents.len() >= documents && inbox.plain.len() >= plain {
             return inbox;
         }
@@ -212,25 +254,25 @@ fn reported(inbox: &Inbox) -> Vec<(String, String, String)> {
 
 /// One text member of a notification document, or `<missing>` so a failed
 /// assertion names what was there instead.
-fn text(document: &Value, member: &str) -> String {
+pub(crate) fn text(document: &Value, member: &str) -> String {
     document[member].as_str().unwrap_or("<missing>").to_string()
 }
 
 /// One trigger configuration a row carries: its name, the topic it names (a key
 /// into the row's topics, or a literal ARN for the case that names no topic) and
 /// the events it selects.
-struct Trigger {
-    name: &'static str,
+pub(crate) struct Trigger {
+    pub(crate) name: &'static str,
     /// `Some(key)` names one of the row's two topics; `None` carries `arn` as the
     /// `triggerTargetArn` verbatim.
-    topic: Option<&'static str>,
-    arn: &'static str,
-    events: &'static [&'static str],
+    pub(crate) topic: Option<&'static str>,
+    pub(crate) arn: &'static str,
+    pub(crate) events: &'static [&'static str],
 }
 
 /// Create the application and the deployment group of a row, with its triggers
 /// resolved against the topics the case created.
-async fn given_group(
+pub(crate) async fn given_group(
     emulator: &Emulator,
     application: &str,
     platform: &str,
@@ -275,7 +317,7 @@ async fn given_group(
 }
 
 /// Create a deployment of the row's group, answering its id.
-async fn create_deployment(emulator: &Emulator, application: &str) -> String {
+pub(crate) async fn create_deployment(emulator: &Emulator, application: &str) -> String {
     emulator
         .ok(
             "CreateDeployment",
