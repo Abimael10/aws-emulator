@@ -2,6 +2,19 @@
 
 //! @op ListAdminAccountsForOrganization
 //!
+//! The organization's Firewall Manager administrators, page by page: the ONE
+//! default administrator `AssociateAdminAccount` associated and every account
+//! `PutAdminAccount` onboarded
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::admin_account_summaries`]).
+//!
+//! The model documents the call as the management account's: "This operation can
+//! be called only from the organization's management account." Until the
+//! organization is onboarded to Firewall Manager by `AssociateAdminAccount` it
+//! has no Firewall Manager administration for any account to enumerate, and the
+//! call is refused as one only the organization's management account can perform
+//! — the modelled `InvalidOperationException` this service words in ONE place
+//! ([`crate::state::management_account_only_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,6 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Every administrator this enumeration reports comes from the store and
+        // the clock; nothing of the request's metadata decides it.
+        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListAdminAccountsForOrganizationErrorModeled::InternalErrorException(
@@ -173,12 +189,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that reading made due, and `SystemTime` is not monotonic, so a second
         // reading could straddle a settle boundary.
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The authorization gate, BEFORE the pagination token is examined: this
-        // call is organisation-scoped, so a caller that is not entitled to it
-        // cannot learn anything about what the organization holds.
-        crate::state::require_administrator_at(&store, &region, now)?;
+        // The gate, BEFORE the pagination token is examined: this enumeration is
+        // the organization's Firewall Manager administration, which only the
+        // organization's management account can perform, and the organization
+        // holds none of it until it is onboarded to Firewall Manager. The
+        // refusal is built with the store guard released, because it reads the
+        // organization's management account from the Organizations service's own
+        // store.
+        if crate::state::management_account_administration_at(&store, now).is_none() {
+            drop(store);
+            return Err(
+                ListAdminAccountsForOrganizationErrorModeled::InvalidOperationException(
+                    crate::state::management_account_only_refusal(&*self.engine),
+                )
+                .into(),
+            );
+        }
 
         // A token this service did not mint, or one minted for ANOTHER
         // account-keyed collection of this service, names no boundary in the

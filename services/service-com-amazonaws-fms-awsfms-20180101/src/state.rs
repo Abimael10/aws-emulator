@@ -13,6 +13,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
+/// The refusal of a call only the organization's management account can perform,
+/// and the organization's management account itself: one concern of this store's
+/// own, in its own file, re-exported so a handler reaches it as
+/// `crate::state::…` like everything else here.
+mod management_account;
+pub use management_account::*;
+
 use crate::ops::types::{
     AccountScope, AdminAccountSummary, AdminScope, AppsListData, AppsListDataSummary,
     ComplianceViolator,
@@ -2793,6 +2800,13 @@ fn out_of_admin_scope_refusal(
 /// Firewall Manager administrator: HTTP 400 `AccessDeniedException`, naming the
 /// calling account and the Region the request was signed for.
 ///
+/// It is NOT the refusal of an operation only the organization's management
+/// account can perform (`GetAdminScope`, `ListAdminAccountsForOrganization`,
+/// `PutAdminAccount`): those declare `AccessDeniedException` in none of their
+/// modelled error unions and state this refusal as the modelled
+/// `InvalidOperationException` instead ([`management_account_only_refusal`]), so
+/// the gate's refusal class depends on what the operation models for it.
+///
 /// Separate from the gate so an operation that resolves the association itself —
 /// one that must hold it MUTABLY to change it, and so cannot take the gate's
 /// shared borrow — states the SAME refusal instead of wording its own.
@@ -2817,7 +2831,10 @@ pub fn no_administrator_refusal<E>(region: &str) -> crate::scaffolded::Scaffolde
 /// operations are not among them: they name their target by the model's generic
 /// `ResourceArn` and nothing else, declare no authorization error in their error
 /// unions, and are answered from that ARN alone — its form, then its resolution
-/// — so they do not call this.
+/// — so they do not call this. Neither are the operations only the
+/// organization's management account can perform, which take the same admission
+/// test through [`management_account_administration_at`] and state the refusal
+/// their own models declare.
 pub fn require_administrator_at<'store, E>(
     store: &'store ComAmazonawsFmsAwsfms20180101State,
     region: &str,

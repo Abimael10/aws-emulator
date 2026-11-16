@@ -931,10 +931,12 @@ async fn the_number_of_administrator_accounts_is_bounded() {
     );
 }
 
-/// Both operations are organisation-scoped, so with no Firewall Manager
-/// administrator association they are refused with HTTP 400
-/// `AccessDeniedException` — whatever their payload and whichever Region the
-/// request is signed for — before anything is read or written.
+/// Both operations administer the organisation's Firewall Manager
+/// administrators, which only the organization's management account can do, so
+/// with no Firewall Manager administrator association they are refused with the
+/// modelled HTTP 400 `InvalidOperationException` naming the calling account and
+/// the organization's management account — whatever their payload and whichever
+/// Region the request is signed for — before anything is read or written.
 #[tokio::test]
 async fn both_operations_are_refused_without_an_administrator_association() {
     let payloads = vec![
@@ -978,9 +980,9 @@ async fn both_operations_are_refused_without_an_administrator_association() {
             let code = error_code(&answered);
             assert_eq!(
                 (status, code.as_str()),
-                (400, "AccessDeniedException"),
+                (400, "InvalidOperationException"),
                 "case {case:?} in {region}: with no administrator association expected 400 \
-                 AccessDeniedException, got {status} / {code:?} with {answered:?}"
+                 InvalidOperationException, got {status} / {code:?} with {answered:?}"
             );
             let message = answered
                 .get("message")
@@ -989,9 +991,10 @@ async fn both_operations_are_refused_without_an_administrator_association() {
                 .unwrap_or_default()
                 .to_string();
             assert!(
-                message.contains(ACCOUNT) && message.contains(region),
-                "case {case:?} in {region}: the refusal's message is built from the request, so \
-                 it must name the account and Region, got {message:?}"
+                message.contains(ACCOUNT),
+                "case {case:?} in {region}: the refusal's message is built from state, so it must \
+                 name the calling account and the organization's management account, got \
+                 {message:?}"
             );
         }
 

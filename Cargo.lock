@@ -14189,6 +14189,7 @@ dependencies = [
  "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-com-amazonaws-networkfirewall-networkfirewall-20201112",
+ "service-com-amazonaws-organizations-awsorganizationsv20161128",
  "sha2 0.10.9",
  "tokio",
  "tracing",

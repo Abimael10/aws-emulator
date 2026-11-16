@@ -41,6 +41,31 @@ use crate::policy_lifecycle::{call, emulator_with_engine, error_code, ACCOUNT, R
 /// association is active at the instant it decides from.
 const ACCESS_DENIED: &str = "AccessDeniedException";
 
+/// The code the operations only the organization's management account can
+/// perform answer instead: their models declare no `AccessDeniedException`, so
+/// the same admission test states its refusal as the modelled
+/// `InvalidOperationException` for them.
+const INVALID_OPERATION: &str = "InvalidOperationException";
+
+/// The operations whose refusal is that modelled `InvalidOperationException`:
+/// the organization's Firewall Manager administration, which the model documents
+/// as the management account's alone.
+const MANAGEMENT_ACCOUNT_ONLY: &[&str] = &[
+    "ListAdminAccountsForOrganization",
+    "GetAdminScope",
+    "PutAdminAccount",
+];
+
+/// The code `operation` is refused with when no administrator association is
+/// active at the instant the request decides from.
+fn refusal_code(operation: &str) -> &'static str {
+    if MANAGEMENT_ACCOUNT_ONLY.contains(&operation) {
+        INVALID_OPERATION
+    } else {
+        ACCESS_DENIED
+    }
+}
+
 /// An account id that is not the caller, for the gated writes below. The model
 /// constrains `AWSAccountId` to `^[0-9]+$`, length 1..1024.
 const OTHER_ACCOUNT: &str = "123456789012";
@@ -372,11 +397,12 @@ fn gated_calls() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Over the wire: a gated call is refused with `AccessDeniedException` exactly
-/// when the association is no longer an administrator at the instant the request
-/// decides from, and while it still is, every gated operation is answered from
-/// its own lookup instead — and the enumeration reports the administrator the
-/// gate admitted, with the status that holds at that instant.
+/// Over the wire: a gated call is refused — with the code its own model
+/// declares for the refusal ([`refusal_code`]) — exactly when the association is
+/// no longer an administrator at the instant the request decides from, and while
+/// it still is, every gated operation is answered from its own lookup instead —
+/// and the enumeration reports the administrator the gate admitted, with the
+/// status that holds at that instant.
 #[tokio::test]
 async fn a_gated_call_is_refused_exactly_when_the_association_is_no_longer_an_administrator() {
     for case in association_cases() {
@@ -397,16 +423,17 @@ async fn a_gated_call_is_refused_exactly_when_the_association_is_no_longer_an_ad
         for (operation, request) in gated_calls() {
             let (status, body) = call(&router, operation, &request).await;
             let code = error_code(&body);
+            let refused_with = refusal_code(operation);
             if case.still_an_administrator {
                 assert_ne!(
-                    code, ACCESS_DENIED,
+                    code, refused_with,
                     "case {name:?} / {operation}: an administrator that is still associated at \
                      the request's instant must not be refused, got {status} with {body}"
                 );
             } else {
                 assert_eq!(
                     (status, code.as_str()),
-                    (400, ACCESS_DENIED),
+                    (400, refused_with),
                     "case {name:?} / {operation}: an administrator already removed at the \
                      request's instant must be refused, got {status} with {body}"
                 );
@@ -446,7 +473,7 @@ async fn a_gated_call_is_refused_exactly_when_the_association_is_no_longer_an_ad
         } else {
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (400, ACCESS_DENIED),
+                (400, refusal_code("ListAdminAccountsForOrganization")),
                 "case {name:?}: the enumeration must be refused, got {status} with {body}"
             );
             assert!(

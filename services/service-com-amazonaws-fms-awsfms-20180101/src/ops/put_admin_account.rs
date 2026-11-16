@@ -49,6 +49,15 @@
 //! it is not checked here; the onboarded account IS recorded as one of the
 //! organization's member accounts from then on.
 //!
+//! "Only the organization's management account can create an Firewall Manager
+//! administrator account", and the account must be "a member of the
+//! organization that was onboarded to Firewall Manager by
+//! `AssociateAdminAccount`" — so until the organization is onboarded there is no
+//! Firewall Manager administration for this call to write, and it is refused as
+//! one only the organization's management account can perform: the modelled
+//! `InvalidOperationException` this service words in ONE place
+//! ([`crate::state::management_account_only_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -230,6 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // What this call writes is the payload's, and the refusal below names
+        // the organization's management account: nothing of the request's
+        // metadata decides either.
+        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutAdminAccountErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -240,15 +253,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The authorization gate, BEFORE any member of the payload is examined:
-        // the organization must have been onboarded to Firewall Manager by
-        // `AssociateAdminAccount` for there to be an organization to onboard an
-        // administrator into.
-        let default_admin = crate::state::require_administrator_at(&store, &region, now)?
-            .account_id
-            .clone();
+        // The gate, BEFORE any member of the payload is examined: the model
+        // documents that "only the organization's management account can create
+        // an Firewall Manager administrator account", and the organization must
+        // have been onboarded to Firewall Manager by `AssociateAdminAccount` for
+        // there to be an organization to onboard an administrator into. The
+        // refusal is built with the store guard released, because it reads the
+        // organization's management account from the Organizations service's own
+        // store.
+        let Some(default_admin) = crate::state::management_account_administration_at(&store, now)
+        else {
+            drop(store);
+            return Err(PutAdminAccountErrorModeled::InvalidOperationException(
+                crate::state::management_account_only_refusal(&*self.engine),
+            )
+            .into());
+        };
+        let default_admin = default_admin.account_id;
 
         // The default administrator's scope is the whole organization, and this
         // operation is the only way a scope is configured — so there is nothing

@@ -38,6 +38,12 @@ service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { worksp
 service-com-amazonaws-cloudfront-cloudfront2020-05-31 = { workspace = true }
 service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 service-com-amazonaws-networkfirewall-networkfirewall-20201112 = { workspace = true }
+# The organization's own records: the management account a Firewall Manager call
+# that only the organization's management account can perform is refused against
+# (`state::organization_management_account`) is read from the AWS Organizations
+# service's store through the shared engine, so it is the account that service
+# reports as `Organization$MasterAccountId` rather than a second copy here.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 
 [dev-dependencies]
 # Percent-encodes the form values the ec2Query / awsQuery test calls carry,

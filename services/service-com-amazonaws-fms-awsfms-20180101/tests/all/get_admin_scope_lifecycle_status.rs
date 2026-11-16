@@ -208,13 +208,14 @@ async fn get_admin_scope_reports_the_lifecycle_phase_the_clock_has_reached() {
     );
     expect_phase(&offboarding, "a default administrator being removed", &rows).await;
 
-    // Once the tear-down has completed the organization holds no administrator
-    // association, so this organisation-scoped call is refused for every
-    // account alike — including the one that is no administrator, which the
-    // refusal must not distinguish.
+    // Once the tear-down has completed the organization holds no Firewall
+    // Manager administration for this read to report, so the call — which only
+    // the organization's management account can make — is refused with the
+    // modelled `InvalidOperationException` for every account alike, including
+    // the one that is no administrator, which the refusal must not distinguish.
     wait_out_the_disassociation();
     for row in rows.iter_mut() {
-        row.1 = Expectation::Refused("AccessDeniedException");
+        row.1 = Expectation::Refused("InvalidOperationException");
     }
     expect_phase(&offboarding, "no administrator association left", &rows).await;
 }

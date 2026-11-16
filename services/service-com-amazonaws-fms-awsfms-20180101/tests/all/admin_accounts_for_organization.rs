@@ -193,9 +193,11 @@ fn own_token(account: &str) -> String {
     state::encode_account_page_token(state::ADMIN_ACCOUNTS_FOR_ORGANIZATION_PAGE, account)
 }
 
-/// With no administrator association the call is organisation-scoped and
-/// refused — in either Region, and whatever page parameters it carries — so it
-/// reports nothing about the organization.
+/// With no administrator association the organization has no Firewall Manager
+/// administration to enumerate, so the call — which only the organization's
+/// management account can make — is refused with the modelled
+/// `InvalidOperationException`, in either Region and whatever page parameters it
+/// carries, and reports nothing about the organization.
 #[tokio::test]
 async fn with_no_administrator_association_the_enumeration_is_refused() {
     let requests = [
@@ -210,7 +212,7 @@ async fn with_no_administrator_association_the_enumeration_is_refused() {
             let (status, code, reported, token) = list_admins(&router, request, region).await;
             assert_eq!(
                 (status, code.as_str()),
-                (400, "AccessDeniedException"),
+                (400, "InvalidOperationException"),
                 "case {case:?} in {region}: with no administrator association the call must be \
                  refused, got {status} / {code:?}"
             );
@@ -544,7 +546,7 @@ async fn a_pending_disassociation_is_reported_as_offboarding() {
         list_admins(&router, &json!({}), REGION).await;
     assert_eq!(
         (status, code.as_str()),
-        (400, "AccessDeniedException"),
+        (400, "InvalidOperationException"),
         "once the tear-down has completed no administrator association is left, so the \
          organisation-scoped call must be refused, got {status} / {code:?} with {reported:?}"
     );
