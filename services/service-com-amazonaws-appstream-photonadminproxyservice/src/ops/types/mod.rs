@@ -99,6 +99,10 @@ pub mod stop_app_block_builder_types;
 pub mod stop_fleet_types;
 pub mod stop_image_builder_types;
 pub mod tag_resource_types;
+// The theme every reader of a stack's custom branding reports, whose wire form carries six
+// members the on-disk model does not declare — so its schema and codec are written out
+// rather than derived. See that module's own note.
+pub mod theme_wire;
 pub mod untag_resource_types;
 pub mod update_app_block_builder_types;
 pub mod update_application_types;
@@ -273,6 +277,8 @@ pub use stop_fleet_types::*;
 pub use stop_image_builder_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use tag_resource_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use theme_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use untag_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

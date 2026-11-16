@@ -107,12 +107,14 @@
 mod access_endpoints;
 mod images;
 mod stack_defaults;
+mod theme_branding;
 mod vpc_access_endpoints;
 mod wire_refusals;
 
 pub use access_endpoints::*;
 pub use images::*;
 pub use stack_defaults::*;
+pub use theme_branding::*;
 pub use vpc_access_endpoints::*;
 pub use wire_refusals::*;
 
@@ -791,23 +793,13 @@ impl StackRecord {
     }
 }
 
-/// The URL a theme reports for one of its branding assets: the virtual-hosted-style URL
-/// of the S3 object the request named.
-///
-/// A theme's logo and favicon are given as an `S3Location` (a bucket and a key) and
-/// reported back as URLs, so the URL is DERIVED from that location: the bucket's
-/// regional endpoint followed by the object key. Nothing is copied or fetched — the
-/// object belongs to S3 and keeps its own lifecycle — so what this addresses is exactly
-/// the object the caller pointed at, and a later read reports the same URL. `region` is
-/// the request's own ([`request_region`]), the Region whose endpoint addresses a bucket.
-pub fn theme_asset_url(region: &str, location: &S3Location) -> String {
-    let bucket = &location.s3_bucket;
-    let key = location.s3_key.as_deref().unwrap_or_default();
-    format!("https://{bucket}.s3.{region}.amazonaws.com/{key}")
-}
-
 /// A persisted AppStream custom branding theme — one stack's catalog-page branding,
 /// written by `CreateThemeForStack` and rendered back by `DescribeThemeForStack`.
+///
+/// The branding assets are held as the `S3Location` the request named rather than as the
+/// URL a reader reports for each: that URL is a time-limited address signed per render
+/// ([`theme_asset_url`]), so what the theme HOLDS is the object, and the address of it is
+/// minted by the call that reports it.
 #[derive(Debug, Clone)]
 pub struct ThemeRecord {
     pub stack_name: String,
@@ -815,14 +807,21 @@ pub struct ThemeRecord {
     pub title_text: String,
     pub styling: String,
     pub footer_links: Vec<ThemeFooterLink>,
-    pub organization_logo_url: String,
-    pub favicon_url: String,
+    pub organization_logo_s3_location: S3Location,
+    pub favicon_s3_location: S3Location,
     pub created_time: ::aws_smithy_types::DateTime,
 }
 
 impl ThemeRecord {
-    /// Render the stored record as the modelled `Theme` every reader returns.
-    pub fn to_theme(&self) -> Theme {
+    /// Render the stored record as the `Theme` every reader returns.
+    ///
+    /// Beside the modelled members, a theme reports the branding record's own name, its
+    /// title, the name and the colour map of the colour theme it applies, and an address
+    /// per asset — each DERIVED from what the record holds (`state/theme_branding.rs`), so
+    /// the create, the update and the read of one theme report the same branding.
+    pub fn to_theme(&self, signer: &::smithy_server_runtime::UrlSigner) -> Theme {
+        let organization_logo_url = theme_asset_url(signer, &self.organization_logo_s3_location);
+        let favicon_url = theme_asset_url(signer, &self.favicon_s3_location);
         Theme {
             stack_name: Some(self.stack_name.clone()),
             state: Some(self.state.clone()),
@@ -832,9 +831,15 @@ impl ThemeRecord {
             // is ABSENT rather than present-and-empty — the same representation the
             // stack's own collections use.
             theme_footer_links: reported(&self.footer_links),
-            theme_organization_logo_url: Some(self.organization_logo_url.clone()),
-            theme_favicon_url: Some(self.favicon_url.clone()),
+            theme_organization_logo_url: organization_logo_url.clone(),
+            theme_favicon_url: favicon_url.clone(),
             created_time: Some(self.created_time),
+            theme_name: Some(theme_name(&self.stack_name)),
+            title_text: Some(self.title_text.clone()),
+            styling_name: theme_styling_name(&self.styling),
+            styling_property: theme_styling_property(&self.styling),
+            organization_logo_url,
+            favicon_url,
         }
     }
 }
@@ -1287,14 +1292,34 @@ fn icon_url(
     location: &S3Location,
 ) -> Option<String> {
     let key = location.s3_key.as_deref().filter(|key| !key.is_empty())?;
-    let path = format!("/{}/{key}", location.s3_bucket);
+    signed_s3_object_url(
+        signer,
+        &format!("/{}/{key}", location.s3_bucket),
+        ICON_URL_VALIDITY,
+    )
+}
+
+/// The time-limited URL an S3 object this service reports an address for is fetched from,
+/// signed so that it leads back to this emulator's own S3 front door.
+///
+/// `path` is the object's path under that front door, as the resource reporting it lays
+/// that out from the `S3Location` it holds: what differs between those resources is which
+/// locations they report an address for and how long it stays valid, not how the address
+/// is signed, so the signing is written once here. `None` when the URL cannot be signed at
+/// all, which is what makes the member reporting it absent rather than an address that
+/// leads nowhere.
+fn signed_s3_object_url(
+    signer: &::smithy_server_runtime::UrlSigner,
+    path: &str,
+    validity: ::std::time::Duration,
+) -> Option<String> {
     let request = ::smithy_server_runtime::SignedUrlRequest::new(
         ::http::Method::GET,
         S3_SIGNING_NAME,
-        &path,
+        path,
     );
     signer
-        .sign(request, ICON_URL_VALIDITY)
+        .sign(request, validity)
         .ok()
         .map(|url| url.as_str().to_string())
 }

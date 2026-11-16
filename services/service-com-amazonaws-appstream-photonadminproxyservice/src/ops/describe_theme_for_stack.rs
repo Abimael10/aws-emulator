@@ -131,7 +131,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // See `create_stack.rs` for why an engine without this service's store answers
         // "not written for that engine" rather than a fabricated success.
@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(DescribeThemeForStackOutput {
-            theme: Some(record.to_theme()),
+            theme: Some(record.to_theme(&ctx.url_signer())),
         })
     }
 }

@@ -57,6 +57,8 @@ mod state_roundtrip;
 mod streaming_session_resolution;
 #[path = "all/streaming_url.rs"]
 mod streaming_url;
+#[path = "all/theme_projection.rs"]
+mod theme_projection;
 #[path = "all/update_application.rs"]
 mod update_application;
 #[path = "all/update_stack.rs"]

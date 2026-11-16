@@ -2,8 +2,10 @@
 
 //! @op CreateThemeForStack
 //! IMPLEMENTED: persists a [`crate::state::ThemeRecord`] for the named stack and returns
-//! the modelled `Theme` rendered FROM that record, so a later `DescribeThemeForStack`
-//! answers with the same branding, asset URLs and `CreatedTime`. Branding exists only for
+//! the `Theme` rendered FROM that record, so a later `DescribeThemeForStack` answers with
+//! the same branding and `CreatedTime` — the asset URLs are time-limited addresses of the
+//! S3 objects the request named, signed afresh by every call that renders the record.
+//! Branding exists only for
 //! a stack that exists (`ResourceNotFoundException`, HTTP 400), and a stack has one theme,
 //! so a second create for the same stack answers `ResourceAlreadyExistsException`
 //! (HTTP 400).
@@ -165,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "not written for that engine" rather than a fabricated success.
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateThemeForStack"))?;
-        let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
 
         // The branding belongs to a stack: there is nothing to brand until the stack
@@ -203,16 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             styling: input.theme_styling,
             footer_links: input.footer_links.unwrap_or_default(),
             // The request names the branding assets by their S3 location; the resource
-            // reports the URL that addresses each of those objects.
-            organization_logo_url: crate::state::theme_asset_url(
-                &region,
-                &input.organization_logo_s3_location,
-            ),
-            favicon_url: crate::state::theme_asset_url(&region, &input.favicon_s3_location),
+            // reports a time-limited address of each of those objects, signed by the call
+            // that reports it.
+            organization_logo_s3_location: input.organization_logo_s3_location,
+            favicon_s3_location: input.favicon_s3_location,
             created_time: crate::state::now(),
         };
 
-        let theme = record.to_theme();
+        let theme = record.to_theme(&ctx.url_signer());
         state.themes.insert(record.stack_name.clone(), record);
         Ok(CreateThemeForStackOutput {
             theme: Some(theme),

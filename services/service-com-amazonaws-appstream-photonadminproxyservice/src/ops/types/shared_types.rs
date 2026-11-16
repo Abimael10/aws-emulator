@@ -532,18 +532,9 @@ pub struct ThemeFooterLink {
     pub footer_link_url: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appstream#Theme")]
-#[derive(Debug, Clone, Default)]
-pub struct Theme {
-    pub stack_name: Option<String>,
-    pub state: Option<String>,
-    pub theme_title_text: Option<String>,
-    pub theme_styling: Option<String>,
-    pub theme_footer_links: Option<Vec<ThemeFooterLink>>,
-    pub theme_organization_logo_url: Option<String>,
-    pub theme_favicon_url: Option<String>,
-    pub created_time: Option<::aws_smithy_types::DateTime>,
-}
+// `Theme` is declared in `types/theme_wire.rs`, not here: AppStream reports six members on
+// it that the on-disk model does not declare, so its schema and codec cannot come from the
+// derive. See that module's own note.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.appstream#ResourceInUseException")]
 #[derive(Debug, Clone, Default)]

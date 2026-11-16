@@ -168,7 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "not written for that engine" rather than a fabricated success.
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("UpdateThemeForStack"))?;
-        let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
 
         let attributes_to_delete = input.attributes_to_delete.clone().unwrap_or_default();
@@ -216,10 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.footer_links = footer_links;
         }
         if let Some(location) = &input.organization_logo_s3_location {
-            record.organization_logo_url = crate::state::theme_asset_url(&region, location);
+            record.organization_logo_s3_location = location.clone();
         }
         if let Some(location) = &input.favicon_s3_location {
-            record.favicon_url = crate::state::theme_asset_url(&region, location);
+            record.favicon_s3_location = location.clone();
         }
         // `State` is what enables or disables the branding for the stack.
         if let Some(state) = input.state {
@@ -230,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(UpdateThemeForStackOutput {
-            theme: Some(record.to_theme()),
+            theme: Some(record.to_theme(&ctx.url_signer())),
         })
     }
 }

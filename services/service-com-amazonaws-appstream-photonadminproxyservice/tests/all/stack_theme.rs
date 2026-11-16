@@ -11,8 +11,11 @@
 //!
 //! * `CreateThemeForStack` persists the branding and reports it back from the stored
 //!   record, so a later `DescribeThemeForStack` answers identically;
-//! * the logo and favicon URLs a theme reports are DERIVED from the S3 location the
-//!   request named and the Region the request was signed for;
+//! * the logo and favicon URLs a theme reports are time-limited addresses of the S3 object
+//!   the request named, signed so that they lead back to this emulator for the Region the
+//!   request was signed for, and signed afresh by every call that renders the record;
+//! * the branding members AppStream reports beside the modelled ones travel with the
+//!   record — the projection itself is asserted in `tests/all/theme_projection.rs`;
 //! * a theme belongs to a stack that exists, and a stack has exactly one theme;
 //! * every member an `UpdateThemeForStack` request carries replaces the stored field, a
 //!   member it omits leaves that field alone, and a `ThemeAttribute` in
@@ -22,8 +25,11 @@
 
 use serde_json::{json, Value};
 
+use smithy_server_runtime::UNSERVED_URL_BASE;
+
 use crate::refusal_messages::{already_exists_sentence, not_found_sentence, refusal};
 use crate::stack_fleet_lifecycle::Emulator;
+use crate::streaming_url::query_field;
 
 /// The account every refusal names: the single account this emulator presents.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -42,15 +48,86 @@ fn theme_not_found_sentence(stack: &str) -> String {
     format!("The {THEME_KIND} {stack} for account {ACCOUNT}  does not exist.")
 }
 
-/// The URL a theme reports for one of its branding assets: the virtual-hosted-style URL
+/// How long a theme's asset URL stays valid, as the crate states it.
+const ASSET_URL_VALIDITY_SECONDS: u64 =
+    service_com_amazonaws_appstream_photonadminproxyservice::state::THEME_ASSET_URL_VALIDITY
+        .as_secs();
+
+/// The members whose text is signed per render, so two renders of ONE stored theme differ
+/// in them: they are asserted with [`assert_asset_url`] rather than by equality. Each
+/// asset is reported twice, under the modelled member and under the one AppStream reports
+/// beside it.
+pub(crate) const ASSET_URL_MEMBERS: [(&str, &str); 4] = [
+    ("ThemeOrganizationLogoURL", "OrganizationLogoS3Location"),
+    ("organizationLogoURL", "OrganizationLogoS3Location"),
+    ("ThemeFaviconURL", "FaviconS3Location"),
+    ("faviconURL", "FaviconS3Location"),
+];
+
+/// `theme` without the members signed per render, so what two renders of one record hold
+/// in common can be compared by equality.
+pub(crate) fn without_asset_urls(theme: &Value) -> Value {
+    let mut theme = theme.clone();
+    if let Some(object) = theme.as_object_mut() {
+        for (member, _) in ASSET_URL_MEMBERS {
+            object.remove(member);
+        }
+    }
+    theme
+}
+
+/// The address a theme's asset URL leads to: this emulator's own base followed by the path
 /// of the S3 object the request named.
 ///
 /// `location` is an `S3Location` as the request carries it (`S3Bucket`, optional
-/// `S3Key` — `smithy_query(query="shape", shape="S3Location")`).
-fn asset_url(region: &str, location: &Value) -> String {
+/// `S3Key` — `smithy_query(query="shape", shape="S3Location")`); a location carrying no
+/// key addresses its bucket.
+fn asset_address(location: &Value) -> String {
     let bucket = location["S3Bucket"].as_str().expect("a bucket");
-    let key = location["S3Key"].as_str().unwrap_or_default();
-    format!("https://{bucket}.s3.{region}.amazonaws.com/{key}")
+    match location["S3Key"].as_str().filter(|key| !key.is_empty()) {
+        Some(key) => format!("{UNSERVED_URL_BASE}/{bucket}/{key}"),
+        None => format!("{UNSERVED_URL_BASE}/{bucket}"),
+    }
+}
+
+/// `text` with its `%XX` escapes decoded, so a signed path can be compared with the bucket
+/// and key the theme was created with.
+fn percent_decoded(text: &str) -> String {
+    percent_encoding::percent_decode_str(text)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// Assert the URL a theme reports under `member` is a signed, time-limited address of the
+/// S3 object `location` names: the rule that holds of EVERY render of the stored record.
+pub(crate) fn assert_asset_url(case: &str, member: &str, theme: &Value, location: &Value) {
+    let url = theme[member]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a {member}, got {theme}"))
+        .to_string();
+    let (address, _) = url
+        .split_once('?')
+        .unwrap_or_else(|| panic!("case {case:?}: {member} must be signed, got {url:?}"));
+
+    let expected = asset_address(location);
+    assert_eq!(
+        percent_decoded(address),
+        expected,
+        "case {case:?}: {member} must address the stored object of this emulator, expected \
+         {expected:?}, got {url:?}"
+    );
+    for field in ["X-Amz-Credential", "X-Amz-Date", "X-Amz-Signature"] {
+        assert!(
+            query_field(&url, field).is_some_and(|value| !value.is_empty()),
+            "case {case:?}: {member} must carry a {field} so it leads back to this emulator, \
+             got {url:?}"
+        );
+    }
+    assert_eq!(
+        query_field(&url, "X-Amz-Expires"),
+        Some(ASSET_URL_VALIDITY_SECONDS.to_string()),
+        "case {case:?}: {member} must be time-limited to the span the crate states, got {url:?}"
+    );
 }
 
 /// `CreateThemeForStack` requests spanning the input class, without their `StackName`.
@@ -64,7 +141,7 @@ fn asset_url(region: &str, location: &Value) -> String {
 /// `smithy_query(query="operation", operation="CreateThemeForStack")` and the
 /// `THEME_STYLING_VALUES` constant in `src/ops/types/shared_types.rs`
 /// (BLUE | LIGHT_BLUE | PINK | RED).
-fn theme_rows() -> Vec<(&'static str, Value)> {
+pub(crate) fn theme_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             // `ThemeTitleText` is @length 1..300, so a single character is the shortest
@@ -141,18 +218,28 @@ fn theme_rows() -> Vec<(&'static str, Value)> {
 /// The theme the request must report back: every member derived from that request, with
 /// the branding state a create leaves the theme in.
 ///
-/// `CreatedTime` is server-generated, so it is taken from `actual` — its presence and
-/// stability are asserted separately.
-fn expected_theme(stack: &str, region: &str, request: &Value, actual: &Value) -> Value {
+/// `CreatedTime` is server-generated and the asset URLs are signed per render, so they are
+/// taken from `actual` — their own rules are asserted separately. `stylingName` and
+/// `stylingProperty` follow the colour theme rather than the request, and are asserted in
+/// `tests/all/theme_projection.rs`.
+fn expected_theme(stack: &str, request: &Value, actual: &Value) -> Value {
     let mut theme = json!({
         "StackName": stack,
         // Creating the branding is what turns it on for the stack.
         "State": "ENABLED",
         "ThemeTitleText": request["TitleText"],
         "ThemeStyling": request["ThemeStyling"],
-        "ThemeOrganizationLogoURL": asset_url(region, &request["OrganizationLogoS3Location"]),
-        "ThemeFaviconURL": asset_url(region, &request["FaviconS3Location"]),
+        "ThemeOrganizationLogoURL": actual["ThemeOrganizationLogoURL"],
+        "ThemeFaviconURL": actual["ThemeFaviconURL"],
         "CreatedTime": actual["CreatedTime"],
+        // The branding record is named after the stack it brands, and the title is
+        // reported beside the modelled member that carries it.
+        "themeName": format!("theme_{stack}"),
+        "titleText": request["TitleText"],
+        "stylingName": actual["stylingName"],
+        "stylingProperty": actual["stylingProperty"],
+        "organizationLogoURL": actual["organizationLogoURL"],
+        "faviconURL": actual["faviconURL"],
     });
     // A theme with no footer links displays none, so the member is absent rather than
     // present-and-empty.
@@ -164,7 +251,7 @@ fn expected_theme(stack: &str, region: &str, request: &Value, actual: &Value) ->
 }
 
 /// Create `stack` and return the emulator holding it.
-async fn emulator_with_stack(region: &str, stack: &str) -> Emulator {
+pub(crate) async fn emulator_with_stack(region: &str, stack: &str) -> Emulator {
     let emulator = Emulator::in_region(region);
     emulator
         .ok("setup", "CreateStack", json!({ "Name": stack }))
@@ -173,7 +260,7 @@ async fn emulator_with_stack(region: &str, stack: &str) -> Emulator {
 }
 
 /// The request that brands `stack`, as the update tests leave it before updating.
-fn base_theme_request(stack: &str) -> Value {
+pub(crate) fn base_theme_request(stack: &str) -> Value {
     json!({
         "StackName": stack,
         "TitleText": "Acme Apps",
@@ -203,29 +290,38 @@ async fn create_theme_persists_the_branding_a_later_describe_reports() {
             theme["CreatedTime"].is_number(),
             "case {case:?}: the theme must report when it was created, got {theme}"
         );
-        let expected = expected_theme(stack, region, &request, &theme);
+        let expected = expected_theme(stack, &request, &theme);
         assert_eq!(
             theme, expected,
             "case {case:?}: expected theme {expected}, got {theme}"
         );
+        for (member, location) in ASSET_URL_MEMBERS {
+            assert_asset_url(case, member, &theme, &request[location]);
+        }
 
         // The reader answers from the stored record, so it reports the same theme —
-        // `CreatedTime` included.
+        // `CreatedTime` included. The asset URLs are signed per render, so what they
+        // address is asserted instead of their text.
         let described = emulator
             .ok(case, "DescribeThemeForStack", json!({ "StackName": stack }))
             .await;
         assert_eq!(
-            described["Theme"], theme,
+            without_asset_urls(&described["Theme"]),
+            without_asset_urls(&theme),
             "case {case:?}: DescribeThemeForStack must report the created theme {theme}, \
              got {described}"
         );
+        for (member, location) in ASSET_URL_MEMBERS {
+            assert_asset_url(case, member, &described["Theme"], &request[location]);
+        }
     }
 }
 
 #[tokio::test]
-async fn theme_asset_urls_address_the_named_object_in_the_requests_region() {
-    // Rows: the Region the request is signed for. The URL a theme reports is built from
-    // the bucket, the key and that Region, so it changes with each of the three.
+async fn theme_asset_urls_are_signed_addresses_of_the_named_objects() {
+    // Rows: the Region the request is signed for. The URL a theme reports addresses the
+    // object the request named and is signed for that Region, so it changes with the
+    // bucket, the key and the Region.
     for region in ["us-east-1", "eu-west-2", "ap-southeast-1"] {
         for (case, body) in theme_rows() {
             let stack = "regional";
@@ -239,16 +335,16 @@ async fn theme_asset_urls_address_the_named_object_in_the_requests_region() {
                 .await;
             let theme = &created["Theme"];
 
-            for (member, location) in [
-                ("ThemeOrganizationLogoURL", "OrganizationLogoS3Location"),
-                ("ThemeFaviconURL", "FaviconS3Location"),
-            ] {
-                let expected = asset_url(region, &request[location]);
-                assert_eq!(
-                    theme[member].as_str().unwrap_or_default(),
-                    expected,
-                    "case {case:?}: {member} must address the object {location} names, \
-                     expected {expected:?}, got {theme}"
+            for (member, location) in ASSET_URL_MEMBERS {
+                assert_asset_url(&case, member, theme, &request[location]);
+                // The signature is scoped to the Region the request was signed for, which
+                // is the Region the object is addressed in.
+                let url = theme[member].as_str().unwrap_or_default();
+                let credential = query_field(url, "X-Amz-Credential").unwrap_or_default();
+                let scope = format!("/{region}/s3/aws4_request");
+                assert!(
+                    percent_decoded(&credential).contains(&scope),
+                    "case {case:?}: {member} must be signed for {scope:?}, got {credential:?}"
                 );
             }
         }
@@ -268,12 +364,15 @@ struct UpdateRow {
 /// how many entries a list carries, and along whether the request carries anything to
 /// change at all. The styling rows walk every value `ThemeStyling` models except the one
 /// the base theme already has.
-fn update_rows(region: &str) -> Vec<UpdateRow> {
+fn update_rows() -> Vec<UpdateRow> {
     let mut rows = vec![
         UpdateRow {
             case: "title replaced".to_string(),
             update: json!({ "TitleText": "Acme Portal #2" }),
-            expect: vec![("ThemeTitleText", json!("Acme Portal #2"))],
+            expect: vec![
+                ("ThemeTitleText", json!("Acme Portal #2")),
+                ("titleText", json!("Acme Portal #2")),
+            ],
         },
         UpdateRow {
             case: "footer links replaced and grown".to_string(),
@@ -317,19 +416,9 @@ fn update_rows(region: &str) -> Vec<UpdateRow> {
                 },
                 "FaviconS3Location": { "S3Bucket": "brand.assets-02" },
             }),
-            expect: vec![
-                (
-                    "ThemeOrganizationLogoURL",
-                    json!(asset_url(
-                        region,
-                        &json!({ "S3Bucket": "brand.assets-02", "S3Key": "v2/logo.svg" })
-                    )),
-                ),
-                (
-                    "ThemeFaviconURL",
-                    json!(asset_url(region, &json!({ "S3Bucket": "brand.assets-02" }))),
-                ),
-            ],
+            // The asset URLs are signed per render, so what they address is asserted by
+            // the locations the theme holds afterwards rather than by their text.
+            expect: Vec::new(),
         },
         UpdateRow {
             case: "every member at once".to_string(),
@@ -341,29 +430,21 @@ fn update_rows(region: &str) -> Vec<UpdateRow> {
                 "OrganizationLogoS3Location": { "S3Bucket": "all-assets", "S3Key": "logo.png" },
                 "FaviconS3Location": { "S3Bucket": "all-assets", "S3Key": "icon.png" },
             }),
-            expect: vec![
-                ("ThemeTitleText", json!("Everything")),
-                ("ThemeStyling", json!("RED")),
-                ("State", json!("DISABLED")),
-                (
-                    "ThemeFooterLinks",
-                    json!([{ "DisplayName": "One", "FooterLinkURL": "https://one.example.invalid" }]),
-                ),
-                (
-                    "ThemeOrganizationLogoURL",
-                    json!(asset_url(
-                        region,
-                        &json!({ "S3Bucket": "all-assets", "S3Key": "logo.png" })
-                    )),
-                ),
-                (
-                    "ThemeFaviconURL",
-                    json!(asset_url(
-                        region,
-                        &json!({ "S3Bucket": "all-assets", "S3Key": "icon.png" })
-                    )),
-                ),
-            ],
+            expect: {
+                let mut expect = vec![
+                    ("ThemeTitleText", json!("Everything")),
+                    ("titleText", json!("Everything")),
+                    ("ThemeStyling", json!("RED")),
+                    ("State", json!("DISABLED")),
+                    (
+                        "ThemeFooterLinks",
+                        json!([{ "DisplayName": "One", "FooterLinkURL": "https://one.example.invalid" }]),
+                    ),
+                ];
+                // The colour theme changed, so the branding members it decides follow it.
+                expect.extend(styling_members("RED"));
+                expect
+            },
         },
         UpdateRow {
             case: "nothing but the stack name".to_string(),
@@ -373,13 +454,34 @@ fn update_rows(region: &str) -> Vec<UpdateRow> {
     ];
     // The base theme is BLUE, so every other colour `ThemeStyling` models is a change.
     for styling in ["LIGHT_BLUE", "PINK", "RED"] {
+        let mut expect = vec![("ThemeStyling", json!(styling))];
+        expect.extend(styling_members(styling));
         rows.push(UpdateRow {
             case: format!("styling replaced with {styling}"),
             update: json!({ "ThemeStyling": styling }),
-            expect: vec![("ThemeStyling", json!(styling))],
+            expect,
         });
     }
     rows
+}
+
+/// The branding members the colour theme `styling` decides, as this service's own catalog
+/// states them. Their VALUES are pinned in `tests/all/theme_projection.rs`; what this
+/// table asserts is that an update which changes the colour theme carries them along.
+fn styling_members(styling: &str) -> Vec<(&'static str, Value)> {
+    let name = service_com_amazonaws_appstream_photonadminproxyservice::state::theme_styling_name(
+        styling,
+    )
+    .expect("a modelled styling has a palette");
+    let property =
+        service_com_amazonaws_appstream_photonadminproxyservice::state::theme_styling_property(
+            styling,
+        )
+        .expect("a modelled styling has a palette");
+    vec![
+        ("stylingName", json!(name)),
+        ("stylingProperty", json!(property)),
+    ]
 }
 
 #[tokio::test]
@@ -387,7 +489,7 @@ async fn update_theme_writes_the_members_it_carries_and_leaves_the_rest() {
     let region = "us-east-1";
     let stack = "updated";
 
-    for row in update_rows(region) {
+    for row in update_rows() {
         let case = &row.case;
         let emulator = emulator_with_stack(region, stack).await;
         let created = emulator
@@ -413,16 +515,29 @@ async fn update_theme_writes_the_members_it_carries_and_leaves_the_rest() {
         update["StackName"] = json!(stack);
         let updated = emulator.ok(case, "UpdateThemeForStack", update).await;
         assert_eq!(
-            updated["Theme"], expected,
+            without_asset_urls(&updated["Theme"]),
+            without_asset_urls(&expected),
             "case {case:?}: expected theme {expected}, got {updated}"
         );
+
+        // Each asset URL addresses the object the theme now holds: the one this update
+        // re-pointed it at, or the one the create named when it did not.
+        for (member, location) in ASSET_URL_MEMBERS {
+            let named = row
+                .update
+                .get(location)
+                .cloned()
+                .unwrap_or_else(|| base_theme_request(stack)[location].clone());
+            assert_asset_url(case, member, &updated["Theme"], &named);
+        }
 
         // The update was persisted, not just reported.
         let described = emulator
             .ok(case, "DescribeThemeForStack", json!({ "StackName": stack }))
             .await;
         assert_eq!(
-            described["Theme"], expected,
+            without_asset_urls(&described["Theme"]),
+            without_asset_urls(&expected),
             "case {case:?}: DescribeThemeForStack must report the updated theme \
              {expected}, got {described}"
         );
@@ -467,7 +582,8 @@ async fn update_theme_clears_the_attributes_it_deletes() {
             .expect("a theme object")
             .remove("ThemeFooterLinks");
         assert_eq!(
-            updated["Theme"], expected,
+            without_asset_urls(&updated["Theme"]),
+            without_asset_urls(&expected),
             "case {case:?}: expected theme {expected}, got {updated}"
         );
 
@@ -538,7 +654,8 @@ async fn update_theme_refuses_setting_and_deleting_the_same_attribute() {
             .ok(case, "DescribeThemeForStack", json!({ "StackName": stack }))
             .await;
         assert_eq!(
-            described["Theme"], created["Theme"],
+            without_asset_urls(&described["Theme"]),
+            without_asset_urls(&created["Theme"]),
             "case {case:?}: the refused update must leave the theme {} alone, got {described}",
             created["Theme"]
         );
