@@ -35,7 +35,7 @@ use crate::ops::types::{
     ApplicationDescription, ApplicationMetrics, ApplicationResourceLifecycleConfig,
     ApplicationVersionDescription,
     ApplicationVersionLifecycleConfig, ConfigurationOptionDescription, ConfigurationOptionSetting,
-    CustomAmi, Deployment, EnvironmentInfoDescription, EnvironmentTier,
+    CustomAmi, Deployment, EnvironmentInfoDescription, EnvironmentLink, EnvironmentTier,
     ACTION_HISTORY_STATUS_VALUES, ACTION_STATUS_VALUES, ACTION_TYPE_VALUES,
     CONFIGURATION_DEPLOYMENT_STATUS_VALUES, CONFIGURATION_OPTION_VALUE_TYPE_VALUES,
     EventDescription, InstanceHealthSummary, ManagedAction, ManagedActionHistoryItem, MaxAgeRule,
@@ -49,25 +49,33 @@ use crate::ops::types::{
 };
 pub mod application_runtime;
 pub mod caller_archive;
+pub mod composed_environments;
 pub mod configuration_option_catalog;
 pub mod configuration_option_descriptions;
 pub mod configuration_setting_validation;
 pub mod deployed_application;
 pub mod environment_health;
+pub mod environment_launch;
 pub mod environment_plane_endpoint;
 pub mod event_notifications;
 pub mod managed_action_schedule;
 pub mod platform_build;
 pub mod platform_catalog;
+/// Declared but not glob-re-exported: this module adds only methods to the
+/// store (an inherent `impl`), which every caller already reaches through the
+/// store itself, so there is no name to re-export.
+pub mod running_environment;
 pub mod version_processing;
 
 pub use application_runtime::*;
 pub use caller_archive::*;
+pub use composed_environments::*;
 pub use configuration_option_catalog::*;
 pub use configuration_option_descriptions::*;
 pub use configuration_setting_validation::*;
 pub use deployed_application::*;
 pub use environment_health::*;
+pub use environment_launch::*;
 pub use environment_plane_endpoint::*;
 pub use event_notifications::*;
 pub use managed_action_schedule::*;
@@ -2719,6 +2727,11 @@ pub struct Environment {
     pub reserved_cname: String,
     pub endpoint_url: Option<String>,
     pub tier: Option<EnvironmentTier>,
+    /// "A list of links to other environments in the same group", which an
+    /// environment composed from a manifest declaring links carries and every
+    /// other environment has none of: a link is "defined in the environment's
+    /// manifest" (`EnvironmentLink`), so only `ComposeEnvironments` writes any.
+    pub environment_links: Vec<EnvironmentLink>,
     pub option_settings: Vec<ConfigurationOptionSetting>,
     /// The DRAFT configuration this environment carries, if any: the
     /// configuration an update is deploying (`pending`), or one a cancelled
@@ -3272,11 +3285,14 @@ macro_rules! environment_description {
             // emulator serves no traffic on and so reports no `EndpointURL` for
             // either; the resources the environment is MADE of are what
             // `DescribeEnvironmentResources` reports, from the inventory on this
-            // same record. Nothing links environments here, so there are no
-            // environment links to report.
+            // same record.
             resources: None,
             tier: env.tier.clone(),
-            environment_links: None,
+            // "A list of links to other environments in the same group" — the
+            // links the manifest this environment was composed from declared,
+            // and absent for an environment with none.
+            environment_links: (!env.environment_links.is_empty())
+                .then(|| env.environment_links.clone()),
             environment_arn: Some(env.arn.clone()),
             operations_role: env.operations_role.clone(),
         }

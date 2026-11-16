@@ -52,25 +52,32 @@ impl Bundle {
     pub(crate) fn bytes(self) -> Vec<u8> {
         match self {
             Bundle::Raw(bytes) => bytes.to_vec(),
-            Bundle::Zip(entries) => {
-                let mut buffer = std::io::Cursor::new(Vec::new());
-                {
-                    let mut writer = zip::ZipWriter::new(&mut buffer);
-                    for (path, content) in entries {
-                        let options: zip::write::FileOptions<'_, '_, ()> =
-                            zip::write::FileOptions::default();
-                        writer
-                            .start_file(*path, options)
-                            .expect("the archive entry starts");
-                        std::io::Write::write_all(&mut writer, content)
-                            .expect("the archive entry's bytes");
-                    }
-                    writer.finish().expect("a finished archive");
-                }
-                buffer.into_inner()
-            }
+            Bundle::Zip(entries) => zip_of(entries),
         }
     }
+}
+
+/// The bytes of a `.zip` carrying `entries` as `(path, content)` — what a client
+/// uploads a source bundle as.
+///
+/// `pub(crate)` and taking a borrowed slice: a suite whose entries are built at
+/// RUN time (a manifest naming a solution stack read off the service's own
+/// catalogue) writes its archive with this one writer too, so no suite of this
+/// target keeps a second archive writer.
+pub(crate) fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        for (path, content) in entries {
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            writer
+                .start_file(*path, options)
+                .expect("the archive entry starts");
+            std::io::Write::write_all(&mut writer, content).expect("the archive entry's bytes");
+        }
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
 }
 
 /// One source bundle a create asks to have pre-processed, and the terminal
@@ -182,6 +189,121 @@ const ROWS: &[Row] = &[
         terminal: eb::state::VERSION_STATUS_FAILED,
     },
 ];
+
+/// One file of a source bundle that is past the bounds this emulator parses
+/// caller content within: which of the two pre-processed files it is, and the
+/// text it carries.
+struct DeepFile<'a> {
+    case: &'a str,
+    path: &'a str,
+    text: &'a [u8],
+}
+
+/// A file of the bundle that is past those bounds leaves the version in the
+/// status nothing validated — and leaves the emulator serving.
+///
+/// Both bounds are taken BEFORE a tree is built from the text, because by then
+/// the work is already done: a YAML parser costs a level of recursion per
+/// nested collection (and a level costs as little as one byte), and a loader
+/// resolves an ALIAS by copying the anchored node, so a small shallow document
+/// can expand into orders of magnitude more nodes. A file past either bound is
+/// never loaded, so there is no verdict about it (`Unprocessed`, "Application
+/// version wasn't pre-processed or validated") rather than a validation failure
+/// the reading never reached. The rows differ along WHICH of the two
+/// pre-processed files carries it and along the form it takes: nesting in flow
+/// collections, nesting in block sequence entries, and alias amplification.
+#[tokio::test]
+async fn a_bundle_file_past_the_parse_bounds_leaves_the_version_unvalidated() {
+    let unprocessed = eb::state::version_status_on_the_wire(eb::state::VERSION_STATUS_UNPROCESSED);
+    // One level past the bound in each form the shared pre-parse scan counts:
+    // flow collections, and block sequence entries.
+    let flow = format!(
+        "option_settings: {}",
+        "[".repeat(eb::state::MAX_VALIDATED_NESTING + 1)
+    );
+    let block: String = (0..=eb::state::MAX_VALIDATED_NESTING)
+        .map(|level| format!("{}- x\n", " ".repeat(level)))
+        .collect();
+    // A kilobyte of ALIAS amplification: each level names the one below it twice,
+    // so a loader that expanded the aliases would build a tree doubling with
+    // every level while the text itself stays small and shallow.
+    let mut aliases = String::from("a0: &a0 [x, x]\n");
+    for level in 1..24 {
+        aliases.push_str(&format!(
+            "a{level}: &a{level} [*a{}, *a{}]\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    let rows: [DeepFile<'_>; 5] = [
+        DeepFile {
+            case: "an env.yaml of nested flow collections",
+            path: "env.yaml",
+            text: flow.as_bytes(),
+        },
+        DeepFile {
+            case: "a configuration file of nested flow collections",
+            path: ".ebextensions/deep.config",
+            text: flow.as_bytes(),
+        },
+        DeepFile {
+            case: "a configuration file of nested block sequence entries",
+            path: ".ebextensions/deep.config",
+            text: block.as_bytes(),
+        },
+        DeepFile {
+            case: "an env.yaml whose aliases would expand exponentially",
+            path: "env.yaml",
+            text: aliases.as_bytes(),
+        },
+        DeepFile {
+            case: "a configuration file whose aliases would expand exponentially",
+            path: ".ebextensions/aliases.config",
+            text: aliases.as_bytes(),
+        },
+    ];
+    for DeepFile { case, path, text } in rows {
+        let files = [(path, text)];
+        let emulator = Emulator::with_object_storage();
+        emulator
+            .put_object(BUNDLE_BUCKET, BUNDLE_KEY, &zip_of(&files))
+            .await;
+        given_application(&emulator, "deep-app").await;
+
+        let created = emulator
+            .call(
+                "CreateApplicationVersion",
+                &[
+                    ("ApplicationName", "deep-app"),
+                    ("VersionLabel", "v1"),
+                    ("SourceBundle.S3Bucket", BUNDLE_BUCKET),
+                    ("SourceBundle.S3Key", BUNDLE_KEY),
+                    ("Process", "true"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200 from CreateApplicationVersion, got {} and body {}",
+            created.status, created.body
+        );
+        assert_eq!(
+            created.value("ApplicationVersion/Status"),
+            Some(unprocessed.as_str()),
+            "case {case:?}: a file nothing parsed leaves the version {unprocessed}, got body {}",
+            created.body
+        );
+        // And the emulator is still serving: the next call is answered from the
+        // same process.
+        let (settled, answer) = described_status(&emulator, "deep-app", "v1").await;
+        assert_eq!(
+            settled, unprocessed,
+            "case {case:?}: expected {unprocessed} from the reader too, got {settled:?} and body \
+             {}",
+            answer.body
+        );
+    }
+}
 
 /// The status `DescribeApplicationVersions` reports for `label` under
 /// `application`, with the answer it was read from for a failing assertion.

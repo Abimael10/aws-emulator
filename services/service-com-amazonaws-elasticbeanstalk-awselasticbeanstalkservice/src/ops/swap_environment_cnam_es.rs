@@ -273,12 +273,22 @@ struct Selector<'a> {
 /// The wording is the service's shared environment not-found template, told
 /// which role the missing environment played, so this operation cannot disagree
 /// with the ones that name a single environment.
+///
+/// An environment whose termination has COMPLETED is ABSENT to a swap, as it is
+/// to every call that acts on a running environment (see
+/// `crate::state::running_environment`): it holds no address to hand over.
 fn resolve(
     store: &crate::state::ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
     selector: &Selector<'_>,
 ) -> Result<String, SwapEnvironmentCNAMEsError> {
     store
         .resolve_environment_id(selector.environment_id, selector.environment_name)
+        .filter(|environment_id| {
+            store
+                .environments
+                .get(environment_id)
+                .is_some_and(|environment| !environment.is_terminated())
+        })
         .ok_or_else(|| {
             SwapEnvironmentCNAMEsError::invalid_parameter_value(
                 crate::state::missing_environment_in_account_message(

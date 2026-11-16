@@ -23,6 +23,8 @@ mod application_version_updates;
 mod application_versions;
 #[path = "all/cname_reservation.rs"]
 mod cname_reservation;
+#[path = "all/composed_environments.rs"]
+mod composed_environments;
 #[path = "all/configuration_options.rs"]
 mod configuration_options;
 #[path = "all/configuration_resolution.rs"]
@@ -139,6 +141,8 @@ mod swap_environment_cnames;
 mod tag_batch_conflicts;
 #[path = "all/tag_refusal_messages.rs"]
 mod tag_refusal_messages;
+#[path = "all/terminated_environment_is_absent.rs"]
+mod terminated_environment_is_absent;
 #[path = "all/update_application.rs"]
 mod update_application;
 #[path = "all/update_application_lifecycle_projection.rs"]

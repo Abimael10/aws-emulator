@@ -51,7 +51,11 @@ pub const VERSION_STATUS_FAILED: &str = "Failed";
 
 /// The environment manifest pre-processing validates, at the root of the source
 /// bundle: `env.yaml`, as `CreateApplicationVersion$Process` names it.
-const ENVIRONMENT_MANIFEST: &str = "env.yaml";
+///
+/// The same file `ComposeEnvironments` composes an environment from
+/// ([`super::composed_environments`]), named once here so the validation and
+/// the composition cannot look for two different files.
+pub const ENVIRONMENT_MANIFEST: &str = "env.yaml";
 
 /// The folder in the source bundle whose configuration files pre-processing
 /// validates, as `CreateApplicationVersion$Process` names it: the `.ebextensions`
@@ -283,14 +287,40 @@ fn validate_source_bundle(bytes: &[u8]) -> BundleProcessing {
                 return BundleProcessing::Failed;
             }
         };
-        if let Err(failure) = ::yaml_rust2::YamlLoader::load_from_str(&text) {
-            ::tracing::debug!(
-                entry = %name,
-                detail = %failure,
-                "a file an application version's source bundle is pre-processed on did not \
-                 parse, so its pre-processing failed",
-            );
-            return BundleProcessing::Failed;
+        // The document the file carries, inside the nesting bound this emulator
+        // parses caller content within: the depth is counted BEFORE the parse,
+        // because a parser costs a level of recursion per nested collection and
+        // the text is a caller's. A file past that bound is one NOTHING parsed,
+        // which is the same answer the byte budget above gives — there is no
+        // verdict about a file that was never read — rather than a validation
+        // failure the reading never reached.
+        match read_bounded_yaml(&text) {
+            BoundedYaml::Documents(_) => {}
+            BoundedYaml::NotYaml => {
+                ::tracing::debug!(
+                    entry = %name,
+                    "a file an application version's source bundle is pre-processed on did not \
+                     parse, so its pre-processing failed",
+                );
+                return BundleProcessing::Failed;
+            }
+            BoundedYaml::PastNestingBound => {
+                ::tracing::warn!(
+                    entry = %name,
+                    "a file an application version's source bundle is pre-processed on nests \
+                     deeper than this emulator parses, so nothing pre-processed the version",
+                );
+                return BundleProcessing::NotProcessed;
+            }
+            BoundedYaml::Aliased => {
+                ::tracing::warn!(
+                    entry = %name,
+                    "a file an application version's source bundle is pre-processed on uses a \
+                     YAML alias, which this emulator does not expand, so nothing pre-processed \
+                     the version",
+                );
+                return BundleProcessing::NotProcessed;
+            }
         }
     }
     BundleProcessing::Processed

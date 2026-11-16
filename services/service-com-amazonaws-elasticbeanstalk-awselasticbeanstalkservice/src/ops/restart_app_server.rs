@@ -152,8 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due_transitions();
 
+        // An environment whose termination has COMPLETED is ABSENT to a call
+        // that acts on a running one, which is what this resolution adds to the
+        // shared one; see `crate::state::running_environment`.
         let environment_id = store
-            .environment_id_for(
+            .running_environment_id_for(
                 input.environment_id.as_deref(),
                 input.environment_name.as_deref(),
             )

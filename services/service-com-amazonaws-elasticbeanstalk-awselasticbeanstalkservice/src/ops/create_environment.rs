@@ -8,7 +8,9 @@
 //! and that absent-parameter check runs before any resource the request names is looked
 //! up. A CNAME prefix the caller supplies has to be one a host name
 //! label can carry and must not already be held by a live environment — the same rule
-//! `CheckDNSAvailability` reports on. This is the ONLY file to touch for this operation.
+//! `CheckDNSAvailability` reports on. A request that names no `EnvironmentName` takes it
+//! from the environment manifest (`env.yaml`) in the source bundle of the version it
+//! deploys, completed by `GroupName`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -271,15 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `GroupName` names an environment through an environment manifest
-        // (env.yaml) in the source bundle, which this emulator never reads, so an
-        // environment it cannot name is refused rather than invented.
-        let Some(environment_name) = input.environment_name.clone() else {
-            return Err(CreateEnvironmentError::missing_required_parameter(
-                "Must specify an EnvironmentName.",
-            ));
-        };
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateEnvironmentError::internal_failure("the Elastic Beanstalk store is unavailable")
         })?;
@@ -296,6 +289,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.application_name
             )));
         }
+
+        // `EnvironmentName` is how a request names the environment to launch,
+        // and a request that names none names it through the environment
+        // manifest (`env.yaml`) in the source bundle of the version it deploys
+        // — the manifest `GroupName` belongs to, "specified in an environment
+        // manifest and not with the environment name parameter". It is the same
+        // manifest `ComposeEnvironments` composes an environment from, read the
+        // same way, with the group name completing a name that ends in the
+        // group placeholder. A request that carries neither names no
+        // environment at all, which is refused rather than invented.
+        let environment_name = match input.environment_name.clone() {
+            Some(environment_name) => environment_name,
+            None => {
+                let manifest_name = input
+                    .version_label
+                    .as_ref()
+                    .and_then(|version_label| {
+                        store
+                            .application_versions
+                            .get(&(input.application_name.clone(), version_label.clone()))
+                    })
+                    .and_then(|version| version.bundle.as_ref())
+                    .and_then(crate::state::environment_manifest)
+                    .and_then(|manifest| manifest.environment_name);
+                let Some(manifest_name) = manifest_name else {
+                    return Err(CreateEnvironmentError::missing_required_parameter(
+                        "Must specify an EnvironmentName.",
+                    ));
+                };
+                crate::state::composed_environment_name(
+                    &manifest_name,
+                    input.group_name.as_deref(),
+                )
+            }
+        };
 
         // "This name must be unique within a region in your account. If the
         // specified name already exists in the region, Elastic Beanstalk returns
@@ -430,16 +458,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Creation order, so every report of this environment beside another one
         // is ordered by when they were created rather than by their opaque ids.
         let sequence = store.next_counter();
-        // "If not specified, the CNAME is generated automatically by appending a
-        // random alphanumeric string to the environment name" — the appended
-        // string is this environment's own unique id body, so every environment
-        // gets a distinct CNAME.
-        let cname_prefix = input.cname_prefix.clone().unwrap_or_else(|| {
-            format!(
-                "{environment_name}-{}",
-                environment_id.trim_start_matches("e-")
-            )
-        });
         // A platform version is named by its ARN or by its solution stack name,
         // and an environment reports BOTH for the version it runs: the one the
         // request did not use is resolved from the service's published catalog,
@@ -505,39 +523,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(CreateEnvironmentError::configuration_validation(message));
         }
-        let created = crate::state::now();
-        let mut environment = crate::state::Environment {
-            environment_id: environment_id.clone(),
-            environment_name: environment_name.clone(),
-            arn: crate::state::environment_arn(
-                &region,
-                &input.application_name,
-                &environment_name,
-            ),
-            region: region.clone(),
-            application_name: input.application_name.clone(),
+        // The record itself is the one every launch of this service produces
+        // ([`crate::state::EnvironmentLaunch`]), built from what this request
+        // resolved: the status and health a new environment starts in, the
+        // address it publishes, the resources provisioned for it and the move
+        // to `Ready` the clock owes it are the launch's, shared with the
+        // composition `ComposeEnvironments` launches an environment by.
+        let environment = crate::state::Environment::launching(crate::state::EnvironmentLaunch {
+            environment_id,
+            environment_name,
+            sequence,
+            region: &region,
+            plane_authority: &plane_authority,
+            // "If not specified, the CNAME is generated automatically by
+            // appending a random alphanumeric string to the environment name",
+            // which the launch derives from the environment's own id.
+            cname_prefix: input.cname_prefix.clone(),
+            application_name: &input.application_name,
             version_label: input.version_label.clone(),
             solution_stack_name,
             platform_arn,
             template_name: input.template_name.clone(),
             description: input.description.clone(),
-            cname: crate::state::environment_cname(&plane_authority, &region, &cname_prefix),
-            // The launch RESERVES the name the prefix forms, which is what
-            // `CheckDNSAvailability` reports a prefix as taken for until this
-            // environment stops carrying it.
-            reserved_cname: crate::state::environment_cname(
-                &plane_authority,
-                &region,
-                &cname_prefix,
-            ),
-            // `EndpointURL` is "the URL to the LoadBalancer" or "the IP address
-            // of the instance" — the address the environment's traffic goes to,
-            // which is the one address this environment answers at.
-            endpoint_url: Some(crate::state::environment_cname(
-                &plane_authority,
-                &region,
-                &cname_prefix,
-            )),
             // The tier the request named, with every member it left out filled
             // in from the defaults the model documents: a Standard-mode
             // EC2-based web server at the latest compatible tier version.
@@ -545,64 +552,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.tier.as_ref(),
             )),
             option_settings,
-            // A launch deploys the configuration the request carries, so there
-            // is no configuration waiting to be deployed beside it: a DRAFT
-            // configuration is what an UPDATE of a running environment creates.
-            draft_configuration: None,
             operations_role: input.operations_role.clone(),
-            // "Launching: Environment is in the process of initial deployment."
-            status: crate::state::STATUS_LAUNCHING.to_string(),
-            // "Grey: Default health for a new environment."
-            health: crate::state::HEALTH_GREY.to_string(),
-            health_status: Some(crate::state::HEALTH_STATUS_PENDING.to_string()),
-            abortable_operation_in_progress: false,
-            date_created: created,
-            date_updated: created,
-            date_terminated: None,
             tags: input.tags.clone().unwrap_or_default(),
-            sequence,
-            // The launch provisions the instances below, which is when the week
-            // until a managed replacement of them is due starts; the field is
-            // dated with the launch so the record never carries no date at all.
-            instances_replaced_at: created,
-            // "This number increases by one each time that you deploy source
-            // code or change instance configuration settings": the launch is
-            // this environment's first deployment, which is what its instances
-            // report running.
-            deployment_id: 1,
-            // Provisioned below, from the tier and the options this record now
-            // carries, so the inventory is derived from the stored environment
-            // rather than from the request a second time.
-            resources: None,
-            // The launch the clock owes: `Launching` -> `Ready`.
-            pending_status: Some(crate::state::PendingStatus::launch_completion(
-                &request_id,
-                &environment_name,
-            )),
-        };
-        // "Launches an environment for the specified application using the
-        // specified configuration": the launch provisions the environment's own
-        // Amazon Web Services resources — its Auto Scaling group, the launch
-        // template it launches instances from, those instances, and the load
-        // balancer or the worker queue its tier and its options call for — which
-        // is what `DescribeEnvironmentResources` then reports.
-        environment.provision_resources();
+            // "A list of links to other environments in the same group" — a
+            // link is "defined in the environment's manifest", which this
+            // launch reads none of.
+            environment_links: Vec::new(),
+            request_id: &request_id,
+        });
 
         let output = crate::state::environment_description!(CreateEnvironmentOutput, &environment);
-        let subject = environment.event_subject();
-        store
-            .environment_name_index
-            .insert(environment_name, environment_id.clone());
-        store.environments.insert(environment_id, environment);
-
         // The launch has STARTED here; the event for its completion is recorded
         // when the clock makes that completion due.
-        store.record_event(
-            &request_id,
-            crate::state::SEVERITY_INFO,
-            "createEnvironment is starting.",
-            subject,
-        );
+        store.store_launched_environment(environment, &request_id, "createEnvironment");
 
         Ok(output)
     }

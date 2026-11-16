@@ -161,9 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // action belongs to ONE environment, so the service needs exactly one of
         // the pair to name it. This operation's model documents no code for the
         // absence, and the recorded refusal is the generic query
-        // `MissingParameter`.
+        // `MissingParameter`. A managed action is maintenance the service
+        // performs ON a live environment, so an environment whose termination
+        // has COMPLETED — its instances and the rest of its resources gone,
+        // with no maintenance left to schedule for it — is ABSENT to this call:
+        // it is refused exactly as one naming no environment at all is, with
+        // the shared not-found wording naming the member the caller used. An
+        // environment still TERMINATING is a different class and deliberately
+        // not refused: it exists, and `DescribeEnvironments` reports it without
+        // being asked for deleted records. See
+        // `crate::state::running_environment`.
         let environment_id = store
-            .environment_id_for(
+            .running_environment_id_for(
                 input.environment_id.as_deref(),
                 input.environment_name.as_deref(),
             )
@@ -182,27 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::missing_environment_message(Some(environment_id.as_str()), None),
             )
         })?;
-        // A managed action is maintenance the service performs ON a live
-        // environment, so an environment whose termination has COMPLETED — its
-        // instances and the rest of its resources gone, with no maintenance left
-        // to schedule for it — is no environment this operation can act on: the
-        // request is refused exactly as one naming no environment at all is,
-        // with the shared not-found wording naming the member the caller used.
-        // The store keeps a terminated record so the lifecycle reads can report
-        // it; this operation does not act on one, the way every other call that
-        // acts on a live environment does not. An environment still TERMINATING
-        // is a different class and deliberately not refused here: it exists,
-        // `DescribeEnvironments` reports it without being asked for deleted
-        // records, so a not-found refusal would deny a resource the service is
-        // still reporting.
-        if environment.is_terminated() {
-            return Err(ApplyEnvironmentManagedActionError::invalid_parameter_value(
-                crate::state::missing_environment_message(
-                    input.environment_id.as_deref(),
-                    input.environment_name.as_deref(),
-                ),
-            ));
-        }
         let subject = environment.event_subject();
 
         // "Applies a scheduled managed action immediately. A managed action can

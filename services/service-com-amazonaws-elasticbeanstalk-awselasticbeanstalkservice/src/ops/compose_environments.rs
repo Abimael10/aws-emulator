@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ComposeEnvironments
-//! Implemented as a refusal, which is what this operation's own contract leaves reachable
-//! here: it names each environment it creates from an `env.yaml` manifest INSIDE the
-//! source bundle of each version label ("The name of each environment and other required
-//! information must be included in the source bundles in an environment manifest named
-//! env.yaml"). This emulator stores a source bundle as the S3 reference the caller passed
-//! and never retains its content, so no version label resolves to an application version
-//! this call can compose from, and the request is refused with the service's
-//! `MissingParameter` and its fixed sentence for that class instead of composing an
-//! environment whose name was invented. The application the request names is resolved
-//! FIRST, so a name no application exists under is reported as that rather than as a
-//! version that cannot be composed. This is the ONLY
-//! file to touch for this operation.
+//! Implemented: resolves each version label to the application version it names, reads
+//! the environment manifest (`env.yaml`) out of that version's source bundle, and
+//! launches one environment per manifest — or deploys the version to the environment
+//! the group already runs under that name, since this operation "creates or updates a
+//! group of environments". Each composed environment carries the manifest's name
+//! (completed by `GroupName`), solution stack, tier, option settings and links to the
+//! other environments of the group, starts `Launching` and reaches `Ready` the way every
+//! other launch does, and is answered as an `EnvironmentDescription`. A label that
+//! resolves to no version, or to a bundle with no readable manifest, describes no
+//! environment, so the request is refused with the service's `MissingParameter` and its
+//! fixed sentence for that class instead of composing an environment whose name was
+//! invented. The application the request names is resolved FIRST, so a name no
+//! application exists under is reported as that rather than as a version that cannot be
+//! composed. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,7 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
+        // The socket every environment's published address is served on, opened
+        // on the first call that needs one: an environment this composition
+        // launches publishes an address a client can dial, and binding it
+        // reaches the core — which cannot happen while the store is held.
+        let plane_authority = crate::state::environment_plane_authority(&*self.engine, ctx).await;
 
         // "Takes a list of version labels that specify application source
         // bundles for each of the environments to create or update." Without one
@@ -174,51 +181,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "ApplicationName: The name of the application to which the specified
         // source bundles belong." That application is the PARENT of everything
         // this call then resolves — the versions the labels name, the group's
-        // environments — so a name no application exists under is refused here,
-        // before any precondition that depends on what those children carry. A
-        // caller told about a manifest defect would go looking in a source bundle
-        // of an application it never created.
-        //
-        // The member is OPTIONAL in the model: the environment manifest in the
-        // source bundle can name the application itself. A request that supplies
-        // none therefore names no application to resolve, and the refusal below —
-        // that the manifest this emulator cannot read is where that name would
-        // have come from — is the accurate statement for it.
-        if let Some(application_name) = input.application_name.as_ref() {
-            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-                ComposeEnvironmentsError::internal_failure(
-                    "the Elastic Beanstalk store is unavailable",
-                )
-            })?;
-            let store = state.lock();
-            if !store.applications.contains_key(application_name) {
-                // The code is the one the service's recorded refusal of this
-                // precondition carries — the same generic query code this
-                // operation answers its other unsatisfiable preconditions with —
-                // rather than one inferred from the sentence.
-                return Err(ComposeEnvironmentsError::missing_parameter(
-                    "Application could not be found",
-                ));
-            }
+        // environments — so a request that names no application names no
+        // version to resolve a manifest out of, and one naming an application
+        // that does not exist is refused here, before any precondition that
+        // depends on what those children carry.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ComposeEnvironmentsError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // Every event this call records belongs to this one request's activity.
+        let request_id = crate::state::new_request_id();
+        // A name freed by an environment whose termination the clock has
+        // already completed is available again, and an application whose
+        // deletion it has completed is gone, so settle those first.
+        store.materialize_due_transitions();
+
+        let Some(application_name) = input.application_name.clone() else {
+            return Err(ComposeEnvironmentsError::missing_parameter(
+                NO_VALID_APPLICATION_VERSION_MESSAGE,
+            ));
+        };
+        if !store.applications.contains_key(&application_name) {
+            // The code is the one the service's recorded refusal of this
+            // precondition carries — the same generic query code this
+            // operation answers its other unsatisfiable preconditions with —
+            // rather than one inferred from the sentence.
+            return Err(ComposeEnvironmentsError::missing_parameter(
+                "Application could not be found",
+            ));
+        }
+
+        // "TooManyEnvironmentsException: The specified account has reached its
+        // limit of environments." A composition names one environment per
+        // version label, so a request naming more labels than the account may
+        // hold environments cannot be composed whatever those labels resolve to
+        // — which is also what bounds the work the resolution below does.
+        if version_labels.len() > crate::state::MAX_ENVIRONMENTS {
+            return Err(ComposeEnvironmentsErrorModeled::TooManyEnvironmentsException(
+                TooManyEnvironmentsException {
+                    message: Some(format!(
+                        "The number of environments in this account has reached the limit of {}.",
+                        crate::state::MAX_ENVIRONMENTS
+                    )),
+                },
+            )
+            .into());
         }
 
         // "Each source bundle must include an environment manifest that
         // specifies the name of the environment and the name of the solution
-        // stack to use, and optionally can specify environment links to create."
-        //
-        // The manifest lives in the bundle, and a bundle is only ever an S3
-        // reference in this emulator (`CreateApplicationVersion` stores
-        // `SourceBundle` as the `S3Location` the caller passed; nothing retains
-        // the object's content). So no version label this request names yields
-        // an application version that can be composed for the application, and
-        // every validation that comes after resolving one — which environments
-        // the group already has, the environment quota — is unreachable.
-        // Composing would have to invent an environment name, and reporting an
-        // environment nothing created would be worse than the refusal.
-        Err(ComposeEnvironmentsError::missing_parameter(
-            NO_VALID_APPLICATION_VERSION_MESSAGE,
-        ))
+        // stack to use, and optionally can specify environment links to
+        // create": every label is resolved to that manifest FIRST, so a
+        // request one of whose labels describes no environment composes none of
+        // them rather than half the group.
+        let mut composing: Vec<ComposedManifest> = Vec::new();
+        for version_label in &version_labels {
+            let manifest = store
+                .application_versions
+                .get(&(application_name.clone(), version_label.clone()))
+                .and_then(|version| version.bundle.as_ref())
+                .and_then(crate::state::environment_manifest);
+            // A label this application has no version for, a version whose
+            // source bundle this emulator holds no files of, a bundle with no
+            // readable environment manifest, and a manifest that names no
+            // environment all leave this call with no environment to compose
+            // for that label.
+            let manifest_name = manifest
+                .as_ref()
+                .and_then(|manifest| manifest.environment_name.clone());
+            let (Some(manifest), Some(manifest_name)) = (manifest, manifest_name) else {
+                return Err(ComposeEnvironmentsError::missing_parameter(
+                    NO_VALID_APPLICATION_VERSION_MESSAGE,
+                ));
+            };
+            let environment_name = crate::state::composed_environment_name(
+                &manifest_name,
+                input.group_name.as_deref(),
+            );
+            // An environment of that name belonging to ANOTHER application is
+            // not one this composition may deploy to: "this name must be unique
+            // within a region in your account", which is what every launch is
+            // refused for a name already taken with.
+            let taken_elsewhere = store
+                .environment_name_index
+                .get(&environment_name)
+                .and_then(|id| store.environments.get(id))
+                .is_some_and(|existing| {
+                    !existing.is_terminated() && existing.application_name != application_name
+                });
+            if taken_elsewhere {
+                return Err(ComposeEnvironmentsError::invalid_parameter_value(format!(
+                    "Environment {environment_name} already exists."
+                )));
+            }
+            composing.push(ComposedManifest {
+                version_label: version_label.clone(),
+                environment_name,
+                manifest,
+            });
+        }
+
+        // "TooManyEnvironmentsException: The specified account has reached its
+        // limit of environments." A label whose manifest names an environment
+        // the group already runs UPDATES it, so only the ones this composition
+        // would launch count against the quota — and each NAME counts once,
+        // however many of this request's labels resolve to it, since composing
+        // a name the request has already composed updates that one environment
+        // rather than launching a second.
+        let mut launching: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for composed in &composing {
+            let already_running = store
+                .environment_name_index
+                .get(&composed.environment_name)
+                .and_then(|id| store.environments.get(id))
+                .is_some_and(|existing| !existing.is_terminated());
+            if !already_running {
+                launching.insert(composed.environment_name.as_str());
+            }
+        }
+        if store.running_environment_count() + launching.len() > crate::state::MAX_ENVIRONMENTS {
+            return Err(ComposeEnvironmentsErrorModeled::TooManyEnvironmentsException(
+                TooManyEnvironmentsException {
+                    message: Some(format!(
+                        "The number of environments in this account has reached the limit of {}.",
+                        crate::state::MAX_ENVIRONMENTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The model binds one `EnvironmentDescription` shape here; the scaffold
+        // emits a per-operation struct for it, and this is the name that shape
+        // carries in this crate.
+        type EnvironmentDescription = CreateEnvironmentOutput;
+        let mut environments = Vec::new();
+        for composed in &composing {
+            // "Links provide connection information in system properties that
+            // can be used to connect to another environment in the same group":
+            // a link's target is named the way the manifests name environments,
+            // so it is completed by the same group name the environments
+            // themselves are.
+            let environment_links = composed
+                .manifest
+                .links
+                .iter()
+                .map(|(link_name, target)| EnvironmentLink {
+                    link_name: Some(link_name.clone()),
+                    environment_name: Some(crate::state::composed_environment_name(
+                        target,
+                        input.group_name.as_deref(),
+                    )),
+                })
+                .collect();
+            let environment = store.compose_environment(crate::state::ComposedEnvironment {
+                region: &region,
+                plane_authority: &plane_authority,
+                application_name: &application_name,
+                version_label: &composed.version_label,
+                environment_name: &composed.environment_name,
+                manifest: &composed.manifest,
+                environment_links,
+                request_id: &request_id,
+            });
+            environments.push(crate::state::environment_description!(
+                EnvironmentDescription,
+                &environment
+            ));
+        }
+
+        Ok(ComposeEnvironmentsOutput {
+            environments: Some(environments),
+            // Every environment this call composed is reported, so there is no
+            // page left for a continuation token to name.
+            next_token: None,
+        })
     }
+}
+
+/// One environment this call is composing: the version label whose source
+/// bundle carried the manifest, the manifest itself, and the name the group
+/// completed for it.
+///
+/// Every label is resolved to one of these BEFORE the first environment is
+/// touched, so a request with a label that resolves to no manifest leaves the
+/// group exactly as it was.
+struct ComposedManifest {
+    version_label: String,
+    environment_name: String,
+    manifest: crate::state::EnvironmentManifest,
 }
 
 /// The message this operation refuses a request whose version labels resolve to

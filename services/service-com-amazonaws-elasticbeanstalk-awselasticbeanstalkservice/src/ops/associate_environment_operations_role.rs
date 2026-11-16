@@ -163,9 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `EnvironmentName` is @required, so the boundary validator has already
         // refused a request without one: only a name no environment answers to
-        // can reach here.
+        // can reach here. An environment whose termination has COMPLETED is
+        // ABSENT to this call — a role is associated with a RUNNING environment
+        // — so it is refused exactly as one naming an environment that was never
+        // created is, with the shared not-found wording naming the member the
+        // caller used; see `crate::state::running_environment`.
+        // `DisassociateEnvironmentOperationsRole` resolves the same name the
+        // same way, so the pair agrees about which environments it can see.
         let environment_id = store
-            .environment_id_for(None, Some(input.environment_name.as_str()))
+            .running_environment_id_for(None, Some(input.environment_name.as_str()))
             .map_err(|refusal| match refusal {
                 crate::state::EnvironmentRefusal::NoIdentifier => {
                     AssociateEnvironmentOperationsRoleError::missing_required_parameter(
@@ -182,24 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::missing_environment_message(Some(environment_id.as_str()), None),
             )
         })?;
-        // A termination that has COMPLETED leaves nothing for this call to act
-        // on: the record stays so the lifecycle reads can still report it, but
-        // the name no longer names an environment a role can be associated
-        // with, so the request is refused exactly as one naming an environment
-        // that was never created is — with the shared not-found wording, naming
-        // the member the caller used. `DisassociateEnvironmentOperationsRole`
-        // resolves the same name the same way, so the pair agrees about which
-        // environments it can see.
-        if environment.is_terminated() {
-            return Err(
-                AssociateEnvironmentOperationsRoleError::invalid_parameter_value(
-                    crate::state::missing_environment_message(
-                        None,
-                        Some(input.environment_name.as_str()),
-                    ),
-                ),
-            );
-        }
         // One still shutting down DOES exist — the reads report it, and
         // `DescribeEnvironments` lists it — but it is not in the status an
         // action on a running environment requires, which is the service's

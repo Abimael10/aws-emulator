@@ -36,6 +36,102 @@ pub const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 /// small archive cannot expand into this process.
 pub const MAX_VALIDATED_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
+/// How deeply a YAML document out of a caller-named archive may NEST.
+///
+/// The third bound on caller content, and the one a byte bound cannot give: a
+/// YAML parser costs a level of RECURSION per nested collection, and a level of
+/// nesting costs as little as one byte, so a few kilobytes of nested
+/// collections would otherwise walk the parser past this process's stack —
+/// which is no catchable failure. Generous for the files an Elastic Beanstalk
+/// source bundle really carries (an environment manifest, a configuration
+/// file), and far below the depth a parse could not survive.
+pub const MAX_VALIDATED_NESTING: usize = 256;
+
+/// What reading one YAML document out of a caller-named archive produced.
+#[derive(Debug)]
+pub enum BoundedYaml {
+    /// The documents the text parsed to.
+    Documents(Vec<::yaml_rust2::Yaml>),
+    /// The text is not a YAML document: the parser said so.
+    NotYaml,
+    /// The text nests deeper than [`MAX_VALIDATED_NESTING`], so NOTHING parsed
+    /// it — the bound is taken BEFORE the parse, because a bound a parse has
+    /// already walked past is not a bound.
+    PastNestingBound,
+    /// The text uses a YAML ALIAS, so nothing parsed it either: a loader
+    /// resolves an alias by COPYING the anchored node, so a small, shallow
+    /// document can expand into orders of magnitude more nodes while it is
+    /// being loaded — an expansion neither a byte bound nor a nesting bound
+    /// says anything about. Nothing an Elastic Beanstalk source bundle's
+    /// manifest or configuration file expresses needs one.
+    Aliased,
+}
+
+/// Read the YAML documents `text` carries, inside the bounds this emulator
+/// parses caller content within.
+///
+/// `text` is a file of a caller-named archive — an environment manifest, a
+/// configuration file — so three things are decided BEFORE a tree is built from
+/// it, because by the time there is a tree the work is already done:
+///
+/// * how deeply it NESTS, by the ONE scan this workspace states that bound in
+///   ([`::service_common::yaml_nesting::nesting_depth_bound`], which parses
+///   nothing and allocates nothing per level);
+/// * whether it uses an ALIAS, read off the parser's own EVENT STREAM, which
+///   copies nothing and builds no tree — the same way the other readers of a
+///   caller's YAML in this workspace refuse one;
+/// * and then, only for text that passed both, whether it parses at all.
+///
+/// Shared by the readers of that content, so neither parses an unbounded
+/// document.
+pub fn read_bounded_yaml(text: &str) -> BoundedYaml {
+    if ::service_common::yaml_nesting::nesting_depth_bound(text, MAX_VALIDATED_NESTING)
+        > MAX_VALIDATED_NESTING
+    {
+        return BoundedYaml::PastNestingBound;
+    }
+    if uses_alias(text) {
+        return BoundedYaml::Aliased;
+    }
+    match ::yaml_rust2::YamlLoader::load_from_str(text) {
+        Ok(documents) => BoundedYaml::Documents(documents),
+        Err(failure) => {
+            ::tracing::debug!(
+                detail = %failure,
+                "a file of a caller-named archive is not a YAML document",
+            );
+            BoundedYaml::NotYaml
+        }
+    }
+}
+
+/// Whether `text` uses a YAML alias, read off the parser's own event stream.
+///
+/// The stream reports an alias as an EVENT, so the question is answered without
+/// a node being copied and without a tree being built: the receiver below holds
+/// one flag and keeps nothing. Text the parser cannot read at all is not
+/// aliased — whether it parses is the next question, asked by the caller.
+fn uses_alias(text: &str) -> bool {
+    #[derive(Default)]
+    struct Guard {
+        /// Whether an alias was reported, whose expansion copies a node.
+        saw_alias: bool,
+    }
+    impl ::yaml_rust2::parser::EventReceiver for Guard {
+        fn on_event(&mut self, event: ::yaml_rust2::parser::Event) {
+            if matches!(event, ::yaml_rust2::parser::Event::Alias(_)) {
+                self.saw_alias = true;
+            }
+        }
+    }
+
+    let mut guard = Guard::default();
+    // The event walk itself is bounded by the text, which this module's byte
+    // budget already holds, and by the nesting bound the caller checked above.
+    let _ = ::yaml_rust2::parser::Parser::new_from_str(text).load(&mut guard, true);
+    guard.saw_alias
+}
+
 /// What a read of a caller-named archive handed back.
 #[derive(Debug)]
 pub enum DownloadedArchive {

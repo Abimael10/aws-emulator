@@ -289,13 +289,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists, Elastic Beanstalk returns an InvalidParameterValue error. …
         // You must specify either this or an EnvironmentName, or both. If you do
         // not specify either, Elastic Beanstalk returns MissingRequiredParameter
-        // error." `GroupName` names an environment through an env.yaml manifest
-        // this emulator never reads, so a request carrying only that names none.
+        // error." A request that names neither names the environment through the
+        // environment manifest (`env.yaml`) in the source bundle of the version
+        // it deploys — the manifest `GroupName` belongs to — read the way
+        // `CreateEnvironment` and `ComposeEnvironments` read it.
+        let manifest_name = match (&input.environment_id, &input.environment_name) {
+            (None, None) => input
+                .version_label
+                .as_ref()
+                .and_then(|version_label| {
+                    store
+                        .application_versions
+                        .get(&(input.application_name.clone().unwrap_or_default(), version_label.clone()))
+                })
+                .and_then(|version| version.bundle.as_ref())
+                .and_then(crate::state::environment_manifest)
+                .and_then(|manifest| manifest.environment_name)
+                .map(|manifest_name| {
+                    crate::state::composed_environment_name(
+                        &manifest_name,
+                        input.group_name.as_deref(),
+                    )
+                }),
+            _ => None,
+        };
+        let environment_name = input.environment_name.clone().or(manifest_name);
+        // An environment whose termination has COMPLETED is ABSENT to a call
+        // that acts on a running one, which is what this resolution adds to the
+        // shared one; see `crate::state::running_environment`.
         let environment_id = store
-            .environment_id_for(
-                input.environment_id.as_deref(),
-                input.environment_name.as_deref(),
-            )
+            .running_environment_id_for(input.environment_id.as_deref(), environment_name.as_deref())
             .map_err(|refusal| match refusal {
                 crate::state::EnvironmentRefusal::NoIdentifier => {
                     UpdateEnvironmentError::missing_required_parameter(
