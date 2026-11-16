@@ -77,6 +77,15 @@
 //! rewrite the rendered body as this module does. They are to be MIGRATED onto
 //! [`with_renamed_detail_member_always_present`] for the same reason, and a seventh copy
 //! should not be written.
+//!
+//! # A member only the SERVICE knows
+//!
+//! [`with_error_body_members`] is the other direction: a member the rendering layer had no
+//! value for at all — the refusal CLASS a client branches on, which the framework's
+//! pre-handler renderer does not know and its synthetic shape has no member for. It owns the
+//! same response-level rewrite as the renames above (the same bodies left alone, the same
+//! `content-length` correction), so a service states only which members its wire carries and
+//! what class they hold.
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use aws_smithy_types::body::SdkBody;
@@ -227,6 +236,57 @@ pub fn with_renamed_detail_member_always_present(
 ) -> RtResponse {
     with_rewritten_body(resp, |body| {
         renamed_detail_member_always_present(body, modelled_shapes, from, to)
+    })
+}
+
+/// `body` with each member of `members` WRITTEN where the body carries none of that name, or
+/// `None` when there is nothing to write: the body is not a JSON object, its `__type` names no
+/// shape in `modelled_shapes`, or it already carries every one of them.
+///
+/// For a service whose error bodies carry a member the layer that rendered one could not
+/// write: the refusal CLASS a client branches on, which the framework's own pre-handler
+/// renderer does not know and its synthetic shape has no member for, while a modelled error a
+/// handler serialized already states it. `members` is `(member name, value)` pairs, each
+/// written as a JSON string.
+///
+/// Idempotent and non-destructive, per member: a member the body already carries keeps the
+/// value IT holds — so a body a handler serialized keeps the class that handler stated, two
+/// names of one class cannot end up disagreeing because one of them was already there, and
+/// writing twice writes once.
+pub fn error_body_with_members(
+    body: &[u8],
+    modelled_shapes: &[&str],
+    members: &[(&str, &str)],
+) -> Option<Vec<u8>> {
+    let mut document = modelled_error_document(body, modelled_shapes)?;
+    let object: &mut Map<String, Value> = document.as_object_mut()?;
+    let mut written = false;
+    for (member, value) in members {
+        if !object.contains_key(*member) {
+            object.insert((*member).to_string(), Value::String((*value).to_string()));
+            written = true;
+        }
+    }
+    if !written {
+        return None;
+    }
+    serde_json::to_vec(&document).ok()
+}
+
+/// `resp` with each member of `members` present on its error body
+/// ([`error_body_with_members`]).
+///
+/// The same responses are left untouched, byte for byte, as by the renames above: a success, a
+/// streamed body, a body whose `__type` names no shape of the serving service's model, and one
+/// that already carries every member named.
+#[must_use]
+pub fn with_error_body_members(
+    resp: RtResponse,
+    modelled_shapes: &[&str],
+    members: &[(&str, &str)],
+) -> RtResponse {
+    with_rewritten_body(resp, |body| {
+        error_body_with_members(body, modelled_shapes, members)
     })
 }
 
@@ -498,6 +558,72 @@ mod tests {
             Some(bytes.len().to_string().as_str()),
             "the advertised length must describe the rewritten body, got {:?}",
             answered.headers().get("content-length")
+        );
+    }
+
+    /// RULE: one row per shape a body can be in when the service writes a member only it
+    /// knows — neither member present, one present, both present, and a shape the model does
+    /// not declare — so the write is per MEMBER and non-destructive.
+    #[test]
+    fn a_member_only_the_service_knows_is_written_where_the_body_carries_none() {
+        const CLASS: &str = "INVALID_INPUT";
+        let members = [("Code", CLASS), ("ErrorCode", CLASS)];
+        // (case, the body, what the answer carries under each member)
+        for (case, body, expected) in [
+            (
+                "neither member present",
+                r#"{"__type":"BadRequestException","Message":"no"}"#,
+                [Some(CLASS), Some(CLASS)],
+            ),
+            (
+                "one member already stated by the renderer",
+                r#"{"__type":"BadRequestException","Code":"OTHER","Message":"no"}"#,
+                [Some("OTHER"), Some(CLASS)],
+            ),
+        ] {
+            let rewritten = error_body_with_members(body.as_bytes(), &SHAPES, &members)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a rewrite"));
+            let object = decoded(rewritten);
+            for (member, expected) in members.iter().map(|(member, _)| *member).zip(expected) {
+                assert_eq!(
+                    object.get(member).and_then(Value::as_str),
+                    expected,
+                    "case {case:?}: expected {expected:?} under {member:?}, got {object:?}"
+                );
+            }
+        }
+
+        for (case, body) in [
+            (
+                "every member already present",
+                r#"{"__type":"BadRequestException","Code":"INVALID_INPUT","ErrorCode":"INVALID_INPUT"}"#,
+            ),
+            (
+                "a shape the model does not declare",
+                r#"{"__type":"NotImplemented","Message":"no"}"#,
+            ),
+            ("not JSON", "<Error/>"),
+        ] {
+            assert!(
+                error_body_with_members(body.as_bytes(), &SHAPES, &members).is_none(),
+                "case {case:?}: expected no rewrite"
+            );
+        }
+    }
+
+    /// A success is not an error body, so no member is written into it.
+    #[test]
+    fn a_success_gains_no_member_only_the_service_knows() {
+        let body = r#"{"__type":"BadRequestException"}"#;
+        let resp = RtResponse::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(200u16).expect("200"),
+            SdkBody::from(body),
+        );
+        let answered = with_error_body_members(resp, &SHAPES, &[("Code", "INVALID_INPUT")]);
+        assert_eq!(
+            answered.body().bytes().expect("bytes"),
+            body.as_bytes(),
+            "a success body must be byte-identical"
         );
     }
 

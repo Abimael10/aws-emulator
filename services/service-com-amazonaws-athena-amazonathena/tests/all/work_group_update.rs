@@ -705,7 +705,8 @@ async fn an_update_of_a_work_group_the_registry_does_not_hold_is_refused() {
 async fn a_refused_update_leaves_the_stored_work_group_exactly_as_it_was() {
     // One row per way an update is refused: a state outside the model's enum, which the
     // request walk refuses before the handler runs, and a configuration past the byte
-    // bound this emulator holds a workgroup to, which the handler refuses itself. The
+    // bound this emulator holds a workgroup to, which the handler refuses itself. Both are
+    // wrong INPUT, so both are refused in the one shape this service states that in. The
     // bound is reached with two properties because the model caps one property's value
     // well below it.
     let half: String = "s".repeat(MAX_WORK_GROUP_CONFIGURATION_BYTES / 2);
@@ -713,7 +714,7 @@ async fn a_refused_update_leaves_the_stored_work_group_exactly_as_it_was() {
         (
             "a state the model does not declare",
             json!({ "State": "SUSPENDED" }),
-            "ValidationException",
+            "InvalidRequestException",
         ),
         (
             "an open collection past the byte bound",

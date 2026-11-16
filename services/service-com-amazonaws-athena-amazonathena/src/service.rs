@@ -39,6 +39,15 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are wired here, and both to the ONE rule in
+//! [`input_validation`]: a request that breaks a modelled input constraint is refused as
+//! this service's own `InvalidRequestException`. `override_refusal` chooses that code and
+//! AWS's validation sentence, and `override_operation` hands back the wrapper that completes
+//! the body the framework renders from them — the seam that sees a whole rendered response,
+//! which is the only one that can.
+
+pub mod input_validation;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -87,26 +96,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // Every request the generated routing table can serve is claimed for the
+        // wrapper that completes a refusal body ([`input_validation::REFUSAL_BODY`]):
+        // it serves the very operation that table names, so the framework keeps the
+        // whole deserialize -> validate -> handle -> serialize walk and every status and
+        // code it answers with, and only the BODY of a refusal the framework rendered is
+        // completed afterwards. A request the table cannot serve is declined here, so
+        // the router answers it as the unroutable request it is.
+        if service_common::restated_refusal::routes(self.definition(), req) {
+            return Some(&input_validation::REFUSAL_BODY);
+        }
         None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. A request that breaks a modelled input constraint is
+        // refused the way THIS service refuses a bad request — code and sentence
+        // together, since a client branches on the code — which
+        // [`input_validation`] states; every other class keeps the framework's own
+        // wording.
+        input_validation::stated_refusal(refusal)
     }
 
     fn override_routing_error(

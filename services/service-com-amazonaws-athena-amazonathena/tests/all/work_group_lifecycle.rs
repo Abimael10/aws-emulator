@@ -603,7 +603,8 @@ async fn a_tag_key_repeated_in_one_request_is_refused_and_nothing_is_persisted()
 async fn a_tag_that_carries_no_key_is_refused_on_its_own_terms() {
     // `Tag$Key` is 1 to 128 characters; the member is optional in the model, so a tag
     // with no key reaches the handler and is refused there, while a present-but-empty
-    // key fails the modelled length at the boundary.
+    // key fails the modelled length at the boundary. Both are wrong INPUT, so both are
+    // refused in the one shape this service states that in.
     let (engine, router) = engine_and_router();
 
     // (case, the tag list sent, the wire error code expected)
@@ -626,7 +627,7 @@ async fn a_tag_that_carries_no_key_is_refused_on_its_own_terms() {
         (
             "a present but empty key, which the modelled TagKey length refuses",
             json!([{ "Key": "", "Value": "prod" }]),
-            "ValidationException",
+            "InvalidRequestException",
         ),
     ];
 
