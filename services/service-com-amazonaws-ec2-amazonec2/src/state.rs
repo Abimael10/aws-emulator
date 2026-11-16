@@ -371,6 +371,14 @@
 //! ([`ComAmazonawsEc2Amazonec2State::resync_verified_access_trust_provider_attachments`]), so
 //! no instance is left reporting an id the account holds no trust provider for.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::modify_verified_access_trust_provider`] is the one way a
+//! stored trust provider CHANGES: it applies the members a
+//! `ModifyVerifiedAccessTrustProvider` request carried — member by member, so a modify that
+//! names one endpoint of an options block does not take the others away — leaves the members it
+//! did not carry alone, stamps the trust provider's `LastUpdatedTime`, and brings every
+//! instance that has it attached back in step with it, so the modify and a later describe
+//! cannot report one trust provider differently.
+//!
 //! Which trust providers an instance has attached is the instance's own
 //! `VerifiedAccessTrustProviders` set, so there is one place an attachment is read from — the
 //! set `DescribeVerifiedAccessInstances` reports —
@@ -2802,6 +2810,13 @@ mod export_image_tasks;
 /// is re-exported below, so a handler reaches it as
 /// `crate::state::verified_access_trust_provider_condensed` like any helper of this module.
 mod verified_access_trust_provider_attachments;
+/// What one `ModifyVerifiedAccessTrustProvider` request changes about a stored trust provider:
+/// the record of that request its idempotency token is kept under, the one definition of what
+/// applying it leaves behind, and the one writer that applies it — in a file of its own rather
+/// than as more lines here. Everything it declares is re-exported below, so a handler reaches
+/// it as `crate::state::VerifiedAccessTrustProviderModification` like any primitive of this
+/// module.
+mod verified_access_trust_provider_modifications;
 mod verified_access_endpoint_deletion;
 mod volumes;
 /// Whether the KMS key an encrypted volume is to be created under will produce that
@@ -2866,6 +2881,7 @@ pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;
 pub use export_image_tasks::*;
 pub use verified_access_trust_provider_attachments::*;
+pub use verified_access_trust_provider_modifications::*;
 pub use verified_access_endpoint_deletion::*;
 pub use images_and_zone_facts::*;
 pub use security_group_rules_and_page_tokens::*;

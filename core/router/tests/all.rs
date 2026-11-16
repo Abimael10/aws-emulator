@@ -1559,3 +1559,25 @@ mod opensearch_vpc_security_group_membership;
 // `all/appended_prose.rs` keep what the notes landings had appended to this file.
 // declarations compiles no suite of this target at all — which is what the re-typed copies of
 // this header that kept arriving in its tail had done. With none anywhere below this block, no
+// `mod <name>;` pair into the list below, in the one place its name sorts to. Past this header
+// the file holds those pairs and no other line: no prose between them, no blank line, and
+// nothing at all after the last one — so two branches landing at once insert two lines in two
+// places and have nothing here to duplicate, re-word or mistype.
+// This header is ONE block, written once, for that same reason: re-typed copies of it are what
+// had grown both in the tail of this file and inside the header itself, and
+// `all/appended_prose.rs` keep what those copies had said. What a suite covers, and why it
+// drives the assembled router rather than one service crate, belongs in that suite's OWN
+// module header, where it is read beside the test it explains.
+// Every comment here is an ordinary one, this block included: a doc comment of the enclosing
+// module, like an inner attribute, is legal only ahead of the first item, so a copy left among
+// or below the declarations compiles no suite of this target at all rather than failing one
+// test. A suite file no declaration names is compiled nowhere and its tests never run; a name
+// declared twice compiles neither copy; and a suite left at the top level of `tests/` fails the
+// build. Some of the files declared below are shared harnesses or probes rather than suites,
+// and each is declared for that reason.
+// This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of it under
+// `tests/`, which the layout check refuses: the `#[path]` above each declaration is what points
+// it into `tests/all/`. The suites `all/all_rs_carries_no_inner_doc_comment.rs`,
+// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item is
+// a note rather than a build failure. An inner attribute is legal only ahead of the first item,
+// so it stands with this header.

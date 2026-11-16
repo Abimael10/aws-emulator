@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVerifiedAccessTrustProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVerifiedAccessTrustProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVerifiedAccessTrustProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the configuration of one stored Verified Access trust provider: the members the
+//! request carries replace the stored ones, member by member and at any depth, and the ones it
+//! does not carry are left as they were — the record this answers is the one
+//! `DescribeVerifiedAccessTrustProviders` reports afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVerifiedAccessTrustProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVerifiedAccessTrustProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVerifiedAccessTrustProvider"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            idempotent_parameter_mismatch, invalid_verified_access_trust_provider_id_not_found,
+            require_service_state, verified_access_trust_provider_limit_exceeded,
+            verified_access_trust_provider_modification_payload_bytes,
+            verified_access_trust_provider_payload_bytes,
+            VerifiedAccessTrustProviderModification, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+            TRUST_PROVIDER_TYPE_USER,
+        };
+
+        // `ctx` carries request metadata only, and nothing this record holds names a Region:
+        // the modelled `VerifiedAccessTrustProvider` carries no ARN and no zone, so there is
+        // nothing on it to read off the request.
+        let _ = ctx;
+
+        // "A unique, case-sensitive token that you provide to ensure idempotency of your
+        // modification request" (`$ClientToken`): the token is retained for the process's
+        // lifetime, so its length is held to the bound every client token in this crate is.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // The modification this request asks for: the trust provider it names and the members
+        // it carries. A member it does not carry is absent here too, so applying this leaves
+        // that member of the trust provider as it was.
+        let modification = VerifiedAccessTrustProviderModification {
+            verified_access_trust_provider_id: input.verified_access_trust_provider_id.clone(),
+            description: input.description.clone(),
+            oidc_options: input.oidc_options.clone(),
+            device_options: input.device_options.clone(),
+            native_application_oidc_options: input.native_application_oidc_options.clone(),
+            sse_specification: input.sse_specification.clone(),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "Modifies the configuration of the specified Amazon Web Services Verified Access
+        // trust provider": an id that names no trust provider of the account modifies nothing
+        // and is refused, whatever the id looks like.
+        let Some(current) = store
+            .verified_access_trust_providers
+            .get(&modification.verified_access_trust_provider_id)
+            .cloned()
+        else {
+            return Err(invalid_verified_access_trust_provider_id_not_found(
+                &modification.verified_access_trust_provider_id,
+            ));
+        };
+
+        // Each kind of trust provider takes its OWN options and only those — the rule the
+        // create of a trust provider reads its options by, applied here to the kind the STORED
+        // record already has, because a modify carries no `TrustProviderType` to name one. So
+        // a member this kind does not take is refused rather than accepted and dropped, which
+        // would answer a modification the store never made.
+        let is_user =
+            current.trust_provider_type.as_deref() == Some(TRUST_PROVIDER_TYPE_USER);
+        if is_user && modification.device_options.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "deviceOptions may not be specified when trustProviderType is user",
+            ));
+        }
+        if !is_user
+            && (modification.oidc_options.is_some()
+                || modification.native_application_oidc_options.is_some())
+        {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "oidcOptions may be specified only for a {TRUST_PROVIDER_TYPE_USER} trust \
+                 provider"
+            )));
+        }
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request" (`$ClientToken`) — a repeat of one request applies
+        // nothing further and reports the trust provider as it stands, while the same token
+        // carrying a DIFFERENT request is the mismatch EC2 refuses rather than a second
+        // modification. Read here, answered below the DryRun check, because a replay writes
+        // nothing and so passes the budget a fresh modification has to clear.
+        let replayed = match input.client_token.as_deref() {
+            None => false,
+            Some(token) => {
+                match store.verified_access_trust_provider_modification_for_token(token) {
+                    None => false,
+                    Some(recorded) if recorded == &modification => true,
+                    Some(_) => return Err(idempotent_parameter_mismatch()),
+                }
+            }
+        };
+
+        // The budget is asked about the NET change only on the path that writes: this call
+        // stores no further trust provider, so the record ceiling cannot bound it, and the
+        // members it sets are caller-chosen text — replacing a short endpoint with a long one
+        // grows the store by the difference, and the token it is recorded under is retained
+        // too.
+        if !replayed {
+            let refund = verified_access_trust_provider_payload_bytes(&current, None);
+            // What this call would leave behind, computed by the store's ONE definition of
+            // what a modification does to a trust provider, so the figure checked here is
+            // exactly the one the write charges.
+            let charge = verified_access_trust_provider_payload_bytes(
+                &modification.applied_to(&current),
+                None,
+            )
+            .saturating_add(input.client_token.as_deref().map_or(0, |token| {
+                verified_access_trust_provider_modification_payload_bytes(&modification, token)
+            }));
+            if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+                return Err(verified_access_trust_provider_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store this modification's {charge} \
+                     bytes",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the trust provider
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD have
+        // worked, so one that would have been refused is refused with that reason instead, and
+        // one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A replay applies nothing — not even a second `LastUpdatedTime` — and reports the
+        // trust provider as it stands, which is what the first call left behind.
+        let verified_access_trust_provider = if replayed {
+            current
+        } else {
+            // Written through the store's ONE writer of a modification, so what this answers
+            // is the stored record a later describe of the same trust provider reports.
+            store
+                .modify_verified_access_trust_provider(
+                    &modification,
+                    input.client_token.as_deref(),
+                    ::std::time::SystemTime::now(),
+                )
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the Verified Access trust provider '{}' could not be read back after \
+                         its modification",
+                        modification.verified_access_trust_provider_id
+                    ))
+                })?
+        };
+
+        Ok(ModifyVerifiedAccessTrustProviderOutput {
+            verified_access_trust_provider: Some(verified_access_trust_provider),
+        })
     }
 }

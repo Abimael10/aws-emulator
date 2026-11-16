@@ -2479,6 +2479,16 @@ mod delete_vpc_endpoint_service_configurations;
 // refused as unresolvable. Declared beside the delete above, whose round trip it closes.
 #[path = "all/modify_vpc_endpoint_service_configuration.rs"]
 mod modify_vpc_endpoint_service_configuration;
+// What `ModifyVerifiedAccessTrustProvider` applies to one stored trust provider: the members
+// the request carries, member by member and at every depth of the options blocks it names,
+// while the ones it does not carry — the kinds, the policy reference name, the tenant, the
+// creation time — stay as the create left them; read back through
+// `DescribeVerifiedAccessTrustProviders` and through the instance that has it attached, with
+// the kind rules, the unresolvable ids, the one-token-one-modification bound and the dry run it
+// refuses without writing. Declared at the tail of this file, which is where every new ec2
+// suite inserts its lines.
+#[path = "all/modify_verified_access_trust_provider.rs"]
+mod modify_verified_access_trust_provider;
 // How `DescribeVpcEndpointServiceConfigurations` selects and pages the account's own endpoint
 // services: the values of one filter joined with an OR and matched with wildcards, several
 // filters joined with an AND, `ServiceIds` naming a service once however often it is repeated,

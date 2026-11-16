@@ -1995,6 +1995,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// carrying the token some create was given is an attach, not a replay of that create.
     pub verified_access_trust_provider_attachment_client_tokens:
         HashMap<String, VerifiedAccessTrustProviderAttachmentRequest>,
+    /// A `ModifyVerifiedAccessTrustProvider` `ClientToken` and the modification it made, so a
+    /// repeat of the same request applies nothing further and the same token carrying a
+    /// different request is refused instead of modifying the trust provider twice. Separate
+    /// from [`Self::verified_access_trust_provider_client_tokens`] for the reason the modify of
+    /// an instance keeps its own map: a token names the request it was given with, so a
+    /// modification carrying the token some create was given is a modification, not a replay of
+    /// that create.
+    pub verified_access_trust_provider_modification_client_tokens:
+        HashMap<String, VerifiedAccessTrustProviderModification>,
     /// Every Verified Access instance the account holds, by `VerifiedAccessInstanceId`, as
     /// the modelled [`crate::ops::types::VerifiedAccessInstance`] shape itself — see the
     /// module docs. Ordered by id, the order a describe of the instances reports and pages
@@ -3632,6 +3641,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_trust_provider_client_tokens: HashMap::new(),
             verified_access_trust_provider_deletions: VecDeque::new(),
             verified_access_trust_provider_attachment_client_tokens: HashMap::new(),
+            verified_access_trust_provider_modification_client_tokens: HashMap::new(),
             // A fresh account has created no Verified Access instance, no group on one and
             // no endpoint on a group.
             verified_access_instances: BTreeMap::new(),
