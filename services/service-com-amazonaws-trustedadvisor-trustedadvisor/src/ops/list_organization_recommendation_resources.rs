@@ -245,7 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The three filters the account-level view of these same resources cuts
         // on, selected with that ONE shared predicate
         // ([`crate::state::ResourceFilters`]), and this operation's own
-        // `affectedAccountId` test layered on top of it: the account that owns a
+        // `affectedAccountId` test layered on top of it, made through the ONE
+        // predicate both organization-level lists share
+        // ([`crate::state::affected_account_keeps`]): the account that owns a
         // resource is the account segment of its own ARN
         // ([`crate::state::arn_account_id`]), which is what this list reports as
         // `accountId` beside it.
@@ -260,9 +262,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flat_map(|member_arn| state.resources_of(member_arn))
             .filter(|(_, resource)| {
                 filters.keeps(resource)
-                    && input.affected_account_id.as_deref().is_none_or(|account| {
-                        crate::state::arn_account_id(&resource.arn).as_deref() == Some(account)
-                    })
+                    && crate::state::affected_account_keeps(
+                        &resource.arn,
+                        input.affected_account_id.as_deref(),
+                    )
             })
             .map(|(arn, resource)| {
                 (

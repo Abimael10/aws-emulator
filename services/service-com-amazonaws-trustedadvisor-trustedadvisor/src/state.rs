@@ -2257,6 +2257,26 @@ pub fn arn_account_id(arn: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether an organization-level list's modelled `affectedAccountId` filter
+/// reports the stored row whose own ARN is `arn`: a request that named no
+/// account (`None`) reports every row, and one that named an account reports
+/// only the rows THAT account owns — the owner being the one
+/// [`arn_account_id`] derives, so a row whose ARN names no account at all is
+/// owned by no named account.
+///
+/// The ONE test both organization-level lists make for that member
+/// (`affectedAccountId`, modelled identically on the two operations), so the
+/// rows a list keeps and the `accountId` it reports beside each of them can
+/// never disagree about who owns one stored row:
+///
+/// * `ListOrganizationRecommendationAccounts` tests each member account
+///   recommendation's own ARN;
+/// * `ListOrganizationRecommendationResources` tests each member resource's own
+///   ARN.
+pub fn affected_account_keeps(arn: &str, affected_account_id: Option<&str>) -> bool {
+    affected_account_id.is_none_or(|account| arn_account_id(arn).as_deref() == Some(account))
+}
+
 /// Whether `arn` names a resource owned by an account OTHER than the calling
 /// one: the account segment of the resource's OWN ARN ([`arn_account_id`])
 /// differs from the account the request is made from. An ARN that names no

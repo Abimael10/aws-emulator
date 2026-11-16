@@ -254,14 +254,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which hands back that set ONCE per member recommendation and in ARN
         // order — one row per member, in the stable sequence a cursor can point
         // into, as in every other list of this service.
+        //
+        // `affectedAccountId` selects over them with the ONE predicate both
+        // organization-level lists make that test through
+        // ([`crate::state::affected_account_keeps`]), which derives a row's
+        // owning account exactly as the `accountId` reported beside it is
+        // derived — so the rows this list keeps and the account it reports for
+        // each of them cannot disagree.
         let matching: Vec<(String, AccountRecommendationLifecycleSummary)> = state
             .member_recommendations_of(identifier)
             .into_iter()
             .filter(|member_arn| {
-                input
-                    .affected_account_id
-                    .as_deref()
-                    .is_none_or(|account| crate::state::arn_account(member_arn) == Some(account))
+                crate::state::affected_account_keeps(
+                    member_arn,
+                    input.affected_account_id.as_deref(),
+                )
             })
             .filter_map(|member_arn| {
                 let member = state.recommendations.get(member_arn)?;
