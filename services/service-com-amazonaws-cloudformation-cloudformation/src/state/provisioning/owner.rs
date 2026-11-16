@@ -526,7 +526,9 @@ impl Owner {
                 // Boxed for the reason [`Self::create`]'s arm records.
                 Box::pin(provisioner.removal(ctx, region, physical_resource_id)).await
             }
-            Self::DynamodbTable => Ok(dynamodb_table::removal()),
+            Self::DynamodbTable => {
+                dynamodb_table::removal(ctx, region, physical_resource_id).await
+            }
             // `Delete<entity>Policy` takes the embedded document away, so there is nothing
             // to wait for.
             Self::IamPolicy(_) => Ok(Removal::Gone),

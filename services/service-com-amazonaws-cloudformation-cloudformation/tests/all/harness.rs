@@ -95,6 +95,16 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // Amazon DynamoDB Streams, which OWNS the stream a table's `StreamSpecification` enables:
+    // the registry a declared stream is minted in, and the records the table's writes publish
+    // to it, live in that service's own store, so a suite that deploys a streamed table —
+    // and the event source mapping the same template wires to it — needs it mounted for the
+    // stream to carry anything.
+    router.register_service(
+        service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // Amazon Cognito Identity, for the `AWS::Cognito::IdentityPool` and the
     // `AWS::Cognito::IdentityPoolRoleAttachment` a stack really creates there, so a suite
     // that deploys one reads the pool and its roles back through that service's own wire.

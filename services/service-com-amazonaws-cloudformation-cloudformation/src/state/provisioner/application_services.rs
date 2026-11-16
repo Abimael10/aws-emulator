@@ -100,9 +100,14 @@ pub(super) async fn retag_iam_user(
 
 /// Delete the user a stack created. "You must delete the items attached to the user
 /// manually, or the deletion fails" (`DeleteUser`) — the console password, the inline
-/// policies, the attached managed policies and the group memberships the template declared
+/// policies, the attached managed policies and the group memberships the user STILL HOLDS
 /// each go first, in the order that operation's own documentation lists them. A user, a
 /// policy or a membership IAM no longer has is already in the state the delete asks for.
+///
+/// What goes is what IAM itself reports the user carrying ([`held_user_attachments`]), not
+/// what the template declared: a document embedded in the user, a managed policy attached to
+/// it or a group it was put in by anything other than this declaration blocks `DeleteUser`
+/// exactly as a declared one does, and the user is this stack's to take away either way.
 pub(super) async fn delete_iam_user(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -120,10 +125,8 @@ pub(super) async fn delete_iam_user(
             tolerated_absence(&error)?;
         }
     }
-    for policy in inline_policies(&resource.properties) {
-        let Some(name) = policy.get("PolicyName").and_then(scalar_text) else {
-            continue;
-        };
+    let (embedded, attached, groups) = held_user_attachments(&client, resource).await;
+    for name in embedded {
         if let Err(error) = client
             .delete_user_policy()
             .user_name(user_name)
@@ -134,7 +137,7 @@ pub(super) async fn delete_iam_user(
             tolerated_absence(&error)?;
         }
     }
-    for policy_arn in managed_policy_arns(&resource.properties) {
+    for policy_arn in attached {
         if let Err(error) = client
             .detach_user_policy()
             .user_name(user_name)
@@ -145,7 +148,7 @@ pub(super) async fn delete_iam_user(
             tolerated_absence(&error)?;
         }
     }
-    for group in declared_groups(&resource.properties) {
+    for group in groups {
         if let Err(error) = client
             .remove_user_from_group()
             .user_name(user_name)
@@ -166,6 +169,74 @@ pub(super) async fn delete_iam_user(
             Err(refusal)
         }
     }
+}
+
+/// What the user a resource records STILL HOLDS, which `DeleteUser` requires to be gone
+/// first: the names of the documents embedded in it (`ListUserPolicies`), the ARNs of the
+/// managed policies attached to it (`ListAttachedUserPolicies`) and the groups it is in
+/// (`ListGroupsForUser`).
+///
+/// The declared sets are merged in, and a read IAM refuses leaves the delete exactly as
+/// capable as it was before — the same reading [`super::iam_identities`] gives a role's own
+/// policies, for the reason it records there.
+async fn held_user_attachments(
+    client: &::aws_sdk_iam::Client,
+    resource: &StoredResource,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let user_name = &resource.physical_resource_id;
+    let mut embedded: Vec<String> = match client
+        .list_user_policies()
+        .user_name(user_name)
+        .send()
+        .await
+    {
+        Ok(answer) => answer.policy_names().to_vec(),
+        Err(_) => Vec::new(),
+    };
+    for policy in inline_policies(&resource.properties) {
+        if let Some(name) = policy.get("PolicyName").and_then(scalar_text) {
+            if !embedded.contains(&name) {
+                embedded.push(name);
+            }
+        }
+    }
+    let mut attached: Vec<String> = match client
+        .list_attached_user_policies()
+        .user_name(user_name)
+        .send()
+        .await
+    {
+        Ok(answer) => answer
+            .attached_policies()
+            .iter()
+            .filter_map(|policy| policy.policy_arn().map(str::to_string))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    for policy_arn in managed_policy_arns(&resource.properties) {
+        if !attached.contains(&policy_arn) {
+            attached.push(policy_arn);
+        }
+    }
+    let mut groups: Vec<String> = match client
+        .list_groups_for_user()
+        .user_name(user_name)
+        .send()
+        .await
+    {
+        Ok(answer) => answer
+            .groups()
+            .iter()
+            .map(|group| group.group_name().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    for group in declared_groups(&resource.properties) {
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    (embedded, attached, groups)
 }
 
 /// The refusal of a delete step that the resource is already PAST: IAM no longer has the

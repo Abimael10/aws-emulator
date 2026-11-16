@@ -135,6 +135,11 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # the one an `AWS::Serverless::SimpleTable` becomes — so a suite that deploys one reads the
 # table, and the stream its specification enabled, back through DynamoDB's own wire.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# Amazon DynamoDB Streams, which OWNS the stream a declared table's specification enables:
+# the registry the stream is minted in, and the records the table's writes publish to it,
+# live in that service's store, so the suite that drives a declared stream end to end — to
+# the event source mapping the same template wires to it — needs it mounted beside DynamoDB.
+service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
 # Amazon Cognito Identity, for the `AWS::Cognito::IdentityPool` and its
 # `AWS::Cognito::IdentityPoolRoleAttachment` a stack really creates there
 # (`state::provisioning::cognito_identity_pool`): a suite that deploys one must have its

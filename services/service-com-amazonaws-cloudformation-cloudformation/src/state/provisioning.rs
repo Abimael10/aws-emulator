@@ -4638,7 +4638,6 @@ fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal, identifier: &
     )
 }
 
-
 /// CLOUDFORMATION's own reason for a create the owning service refused because the name is
 /// already in use AND a live stack of this Region is what manages the resource holding it, or
 /// `None` where the refusal is not that.

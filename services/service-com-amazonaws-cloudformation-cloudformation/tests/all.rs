@@ -673,6 +673,8 @@ mod stack_tag_propagation;
 mod stack_teardown_events;
 #[path = "all/stack_unique_id_identifiers.rs"]
 mod stack_unique_id_identifiers;
+#[path = "all/stream_consumer_stack_teardown.rs"]
+mod stream_consumer_stack_teardown;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/step_functions_state_machine_replacement.rs"]

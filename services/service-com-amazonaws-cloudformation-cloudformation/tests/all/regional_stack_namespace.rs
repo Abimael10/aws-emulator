@@ -85,6 +85,28 @@ async fn describe_stack_in(
     .await
 }
 
+/// Read `name` in `region` until this service stops reporting a stack under it, and answer
+/// the last read.
+///
+/// A deletion is not finished while a service that owns one of the stack's resources still
+/// holds it — Amazon DynamoDB takes a deleted table away after the `DELETING` window its own
+/// `DeleteTable` opens — so what a caller waits for is the CONDITION (the name no longer
+/// resolving), under a budget far longer than those windows.
+async fn deleted_stack_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+) -> (u16, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (status, body) = describe_stack_in(router, region, name).await;
+        if status != 200 || std::time::Instant::now() >= deadline {
+            return (status, body);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_same_stack_name_in_a_second_region_is_a_second_stack() {
     let rows: &[RegionPair<'_>] = &[
@@ -297,7 +319,7 @@ async fn the_same_stack_name_in_a_second_region_is_a_second_stack() {
             row.case, row.first
         );
         wait_for_the_transition().await;
-        let (status, gone) = describe_stack_in(&router, row.first, row.stack_name).await;
+        let (status, gone) = deleted_stack_in(&router, row.first, row.stack_name).await;
         assert_eq!(
             status, 400,
             "case {:?}: the deleted stack must be unaddressable by name in {}, got \

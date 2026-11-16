@@ -491,14 +491,41 @@ async fn delete_table(
 
 /// Whether DynamoDB has finished removing the table a stack deleted.
 ///
-/// Nothing is asked, and nothing waits: `DeleteTable` takes the table away as it answers —
-/// "DynamoDB immediately returns a response with a TableStatus of DELETING", and from that
-/// moment the table takes no further call and the name is free again, so the stack's
-/// resource is already gone. That is the OPPOSITE of the `CREATING` window [`readiness`]
-/// holds a create open on: there the table exists and serves nothing yet, here it serves
-/// nothing and is no longer there to wait for.
-pub(super) fn removal() -> Removal {
-    Removal::Gone
+/// `DeleteTable` is accepted, not carried out: "DynamoDB immediately returns a response with
+/// a `TableStatus` of `DELETING`", and until that service has taken the table away every
+/// `DescribeTable` still answers for it — so the removal is READ from DynamoDB rather than
+/// assumed, exactly as the create's own window is ([`readiness`]). `Removal::Gone` is the
+/// table that service no longer holds, judged on the CODE and never on a message
+/// ([`holds_no_table`]); a table it still reports is one still being removed, reported in the
+/// status it reports it in. CloudFormation does not report a resource `DELETE_COMPLETE` while
+/// the service that owns it still holds it, so a client that reads the table straight after
+/// the stack's deletion is refused by DynamoDB rather than served a table the stack said was
+/// gone.
+pub(super) async fn removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    let request = addressed(physical_resource_id);
+    match call_json_rpc(
+        ctx,
+        DYNAMODB_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{DYNAMODB_TARGET_PREFIX}.DescribeTable"),
+        &request,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Removal::Pending(
+            value_at(&answered, &[TABLE_MEMBER, TABLE_STATUS_MEMBER])
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        Err(refusal) if holds_no_table(&refusal) => Ok(Removal::Gone),
+        Err(refusal) => Err(refusal),
+    }
 }
 
 /// The error codes DynamoDB answers for a table it NO LONGER HOLDS: the control-plane code

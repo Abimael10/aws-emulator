@@ -11305,6 +11305,7 @@ dependencies = [
  "service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice",
  "service-com-amazonaws-customerprofiles-customerprofiles-20200815",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
+ "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",

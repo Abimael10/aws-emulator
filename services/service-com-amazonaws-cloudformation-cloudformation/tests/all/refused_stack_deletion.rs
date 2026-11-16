@@ -21,7 +21,7 @@
 //! The rows here extend the class that suite spans (Amazon RDS refusing a protected DB
 //! instance, Amazon S3 refusing a bucket that still holds an object) along the two
 //! dimensions it leaves open: a THIRD owning service with a refusal of its own (IAM, which
-//! will not delete a role an inline policy still holds), and a resource the refused one
+//! will not delete a role an INSTANCE PROFILE still holds), and a resource the refused one
 //! DEPENDS ON, which must still report the status its create left and must still be there in
 //! the service that owns it. Each row reads the owning services back, so a
 //! `DELETE_COMPLETE` record means the resource really went and an untouched record means it
@@ -74,9 +74,15 @@ fn topic(name: &str) -> Value {
 enum Given {
     /// Nothing: the declaration itself is what the owning service will not delete.
     Nothing,
-    /// An inline policy put on this role out of band, which is what IAM refuses to delete a
-    /// role while it holds.
-    AnInlinePolicyOn(&'static str),
+    /// An instance profile created out of band that HOLDS this role, which is what IAM
+    /// refuses to delete a role while it is in ("Cannot delete entity, must remove roles from
+    /// instance profile first.").
+    ///
+    /// A dependency of the role's the stack knows nothing about: the role's own delete
+    /// removes the POLICIES the role holds, whatever embedded or attached them, so an
+    /// out-of-band policy is no longer what holds a role — the binding a profile of this
+    /// account keeps is.
+    AnInstanceProfileHolding(&'static str),
 }
 
 /// One row: a stack whose deletion one owning service refuses, and what every view of it
@@ -167,7 +173,7 @@ fn refused_rows() -> Vec<Refused> {
             untouched_topic: Some("refused-delete-needed-topic"),
         },
         Refused {
-            case: "a role IAM will not delete while an inline policy holds it",
+            case: "a role IAM will not delete while an instance profile holds it",
             stack: "refused-delete-role",
             template: json!({
                 "Resources": {
@@ -182,7 +188,7 @@ fn refused_rows() -> Vec<Refused> {
                 }
             })
             .to_string(),
-            given: Given::AnInlinePolicyOn("refused-delete-role-name"),
+            given: Given::AnInstanceProfileHolding("refused-delete-role-name"),
             refused: "Role",
             // IAM's own wording for an entity subordinate entities still hold.
             diagnosis: "Cannot delete entity",
@@ -201,29 +207,28 @@ fn refused_rows() -> Vec<Refused> {
 async fn given(router: &MultiServiceRouter, case: &str, given: &Given) {
     match given {
         Given::Nothing => {}
-        Given::AnInlinePolicyOn(role) => {
-            let document = json!({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Action": "s3:ListAllMyBuckets",
-                    "Resource": "*"
-                }]
-            })
-            .to_string();
+        Given::AnInstanceProfileHolding(role) => {
+            let profile = "refused-delete-role-profile";
             let (code, body) = iam(
                 router,
-                "PutRolePolicy",
-                &[
-                    ("RoleName", role),
-                    ("PolicyName", "holds-the-role"),
-                    ("PolicyDocument", &document),
-                ],
+                "CreateInstanceProfile",
+                &[("InstanceProfileName", profile)],
             )
             .await;
             assert_eq!(
                 code, 200,
-                "case {case:?}: the setup PutRolePolicy must succeed, got {code} {body}"
+                "case {case:?}: the setup CreateInstanceProfile must succeed, got {code} {body}"
+            );
+            let (code, body) = iam(
+                router,
+                "AddRoleToInstanceProfile",
+                &[("InstanceProfileName", profile), ("RoleName", role)],
+            )
+            .await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: the setup AddRoleToInstanceProfile must succeed, got {code} \
+                 {body}"
             );
         }
     }

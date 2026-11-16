@@ -460,8 +460,15 @@ pub(super) fn changed_properties(held: &Value, declared: &Value) -> Vec<String> 
 
 /// Delete the role a stack created. "You must delete the policies that are associated
 /// with the role" first — an attached managed policy is DETACHED and an inline policy
-/// deleted — so each one the template declared goes before the role does; a policy or a
+/// deleted — so each one the role STILL HOLDS goes before the role does; a policy or a
 /// role IAM no longer has is already in the state the delete asks for.
+///
+/// What goes is what IAM itself reports the role carrying ([`held_role_policies`]), not what
+/// the template declared: a document embedded in the role, or a managed policy attached to
+/// it, by anything other than this declaration — a client's own `PutRolePolicy`, a grant
+/// another stack made — blocks `DeleteRole` exactly as a declared one does ("Cannot delete
+/// entity, must delete policies first."), and the role is this stack's to take away either
+/// way.
 pub(super) async fn delete_role(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -469,7 +476,8 @@ pub(super) async fn delete_role(
 ) -> Result<(), Refusal> {
     let client = iam_client(ctx, region);
     let role_name = &resource.physical_resource_id;
-    for policy_arn in managed_policy_arns(&resource.properties) {
+    let (embedded, attached) = held_role_policies(&client, resource).await;
+    for policy_arn in attached {
         if let Err(error) = client
             .detach_role_policy()
             .role_name(role_name)
@@ -483,10 +491,7 @@ pub(super) async fn delete_role(
             }
         }
     }
-    for policy in inline_policies(&resource.properties) {
-        let Some(name) = policy.get("PolicyName").and_then(scalar_text) else {
-            continue;
-        };
+    for name in embedded {
         if let Err(error) = client
             .delete_role_policy()
             .role_name(role_name)
@@ -510,6 +515,59 @@ pub(super) async fn delete_role(
             Err(refusal)
         }
     }
+}
+
+/// The policies the role a resource records STILL HOLDS: the names of the documents embedded
+/// in it (`ListRolePolicies`) and the ARNs of the managed policies attached to it
+/// (`ListAttachedRolePolicies`), which is what `DeleteRole` requires to be gone first.
+///
+/// The declared sets are merged in, so a declaration's own policy is removed even where that
+/// read answers nothing — a read IAM refuses leaves the delete exactly as capable as it was
+/// before, and the delete itself is what reports a policy that is still there.
+///
+/// One page of each is every policy a role can carry: the documented default quotas are 10
+/// inline policies and 10 attached managed policies per role, well inside the page those
+/// reads answer.
+async fn held_role_policies(
+    client: &::aws_sdk_iam::Client,
+    resource: &StoredResource,
+) -> (Vec<String>, Vec<String>) {
+    let role_name = &resource.physical_resource_id;
+    let mut embedded: Vec<String> = match client
+        .list_role_policies()
+        .role_name(role_name)
+        .send()
+        .await
+    {
+        Ok(answer) => answer.policy_names().to_vec(),
+        Err(_) => Vec::new(),
+    };
+    for policy in inline_policies(&resource.properties) {
+        if let Some(name) = policy.get("PolicyName").and_then(scalar_text) {
+            if !embedded.contains(&name) {
+                embedded.push(name);
+            }
+        }
+    }
+    let mut attached: Vec<String> = match client
+        .list_attached_role_policies()
+        .role_name(role_name)
+        .send()
+        .await
+    {
+        Ok(answer) => answer
+            .attached_policies()
+            .iter()
+            .filter_map(|policy| policy.policy_arn().map(str::to_string))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    for policy_arn in managed_policy_arns(&resource.properties) {
+        if !attached.contains(&policy_arn) {
+            attached.push(policy_arn);
+        }
+    }
+    (embedded, attached)
 }
 
 /// The role's configuration as IAM reports it, for drift detection.
