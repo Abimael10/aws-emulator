@@ -99,6 +99,8 @@ mod payment_request_selector_resolution;
 mod payment_requests;
 #[path = "all/permitting_actions.rs"]
 mod permitting_actions;
+#[path = "all/policy_document_sets.rs"]
+mod policy_document_sets;
 #[path = "all/purchase_order_agreement_ids.rs"]
 mod purchase_order_agreement_ids;
 #[path = "all/purchase_order_associations.rs"]

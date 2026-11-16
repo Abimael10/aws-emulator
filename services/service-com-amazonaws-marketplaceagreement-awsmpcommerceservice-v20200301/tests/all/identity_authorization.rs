@@ -213,14 +213,78 @@ impl Emulator {
     /// Write (or rewrite) the one inline policy of `role_name`, under the same policy name
     /// every time, so a put REPLACES what the role carried — what `iam:PutRolePolicy` does.
     pub(crate) async fn put_role_policy(&self, role_name: &str, policy: &Value) {
+        self.put_named_role_policy(role_name, POLICY_NAME, policy)
+            .await;
+    }
+
+    /// Write one inline policy of `role_name` under the policy NAME given, so a role can
+    /// carry SEVERAL identity-based documents at once — which is what `iam:PutRolePolicy`
+    /// does: a put replaces the document of that policy name and leaves every other
+    /// document the role carries in force.
+    pub(crate) async fn put_named_role_policy(
+        &self,
+        role_name: &str,
+        policy_name: &str,
+        policy: &Value,
+    ) {
         self.query(
             "iam",
             "2010-05-08",
             "PutRolePolicy",
             &[
                 ("RoleName", role_name.to_string()),
-                ("PolicyName", POLICY_NAME.to_string()),
+                ("PolicyName", policy_name.to_string()),
                 ("PolicyDocument", policy.to_string()),
+            ],
+        )
+        .await;
+    }
+
+    /// Take the inline policy `policy_name` off `role_name`, leaving the role's other
+    /// documents in force — what `iam:DeleteRolePolicy` does.
+    pub(crate) async fn delete_named_role_policy(&self, role_name: &str, policy_name: &str) {
+        self.query(
+            "iam",
+            "2010-05-08",
+            "DeleteRolePolicy",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("PolicyName", policy_name.to_string()),
+            ],
+        )
+        .await;
+    }
+
+    /// Create a customer-managed policy carrying `policy` and attach it to `role_name` —
+    /// `iam:CreatePolicy` followed by `iam:AttachRolePolicy`, the other way a document is
+    /// put in force on a principal. The ARN the attach names is the one the create
+    /// answered, so the document this service reads is the one IAM stored.
+    pub(crate) async fn attach_managed_policy(
+        &self,
+        role_name: &str,
+        policy_name: &str,
+        policy: &Value,
+    ) {
+        let created = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "CreatePolicy",
+                &[
+                    ("PolicyName", policy_name.to_string()),
+                    ("PolicyDocument", policy.to_string()),
+                ],
+            )
+            .await;
+        let policy_arn = xml_element(&created, "Arn")
+            .unwrap_or_else(|| panic!("CreatePolicy answers the policy's Arn, got {created}"));
+        self.query(
+            "iam",
+            "2010-05-08",
+            "AttachRolePolicy",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("PolicyArn", policy_arn),
             ],
         )
         .await;
@@ -228,16 +292,7 @@ impl Emulator {
 
     /// Take that inline policy off the role again — what `iam:DeleteRolePolicy` does.
     pub(crate) async fn delete_role_policy(&self, role_name: &str) {
-        self.query(
-            "iam",
-            "2010-05-08",
-            "DeleteRolePolicy",
-            &[
-                ("RoleName", role_name.to_string()),
-                ("PolicyName", POLICY_NAME.to_string()),
-            ],
-        )
-        .await;
+        self.delete_named_role_policy(role_name, POLICY_NAME).await;
     }
 
     /// Create and accept one agreement with the account's own credential, answering its
@@ -295,6 +350,16 @@ pub(crate) fn allow(actions: Value) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
+    })
+}
+
+/// A policy denying `actions` on every resource, with no grant of its own — the shape a
+/// scope-down written as its OWN document carries, put in force beside a grant rather than
+/// replacing it.
+pub(crate) fn deny(actions: Value) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Deny", "Action": actions, "Resource": "*"}],
     })
 }
 

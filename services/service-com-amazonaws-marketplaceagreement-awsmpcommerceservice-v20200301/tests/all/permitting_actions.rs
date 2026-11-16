@@ -38,7 +38,7 @@ use crate::identity_authorization::{
 /// The message is entirely fixed text; the STATUS such a refusal carries is this service's
 /// own and is pinned by the suites that own it (`crate::state::NOT_FOUND_STATUS`), so it is
 /// not restated here.
-const NOT_FOUND: (&str, &str) = (
+pub(crate) const NOT_FOUND: (&str, &str) = (
     "ResourceNotFoundException",
     "Provided agreement does not exist.",
 );
@@ -175,7 +175,7 @@ fn documents() -> Vec<Document> {
 }
 
 /// The coarse action in full: this service's prefix and the action's own name.
-fn coarse_action() -> String {
+pub(crate) fn coarse_action() -> String {
     format!("{SIGNING_NAME}:{VIEW_SUBSCRIPTIONS}")
 }
 
