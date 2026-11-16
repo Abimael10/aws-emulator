@@ -23,8 +23,9 @@
 //! 4. A refusal whose class has no variable part states AWS's fixed sentence whatever the
 //!    request carried ([`a_refusal_with_no_variable_part_states_the_same_sentence`]).
 //! 5. `SetRulePriorities` tells three failures apart by CODE: a priority the request
-//!    repeated, a priority a rule outside the request holds — each naming that priority —
-//!    and a pair naming a rule it does not hold, which is about the SET it was asked to place
+//!    REPEATED is the request to fix, naming that priority, while a priority a rule outside
+//!    the request holds and a pair naming a rule it does not hold are the modelled failures,
+//!    each about the SET it was asked to place
 //!    ([`set_rule_priorities_tells_a_repeated_priority_from_one_in_use_and_from_a_missing_rule`]).
 //! 6. A target id not written the way a target of the group's TYPE is written names no
 //!    target of any account, so it is the request to fix
@@ -764,11 +765,12 @@ async fn set_priorities(router: &MultiServiceRouter, pairs: &[(&str, i32)]) -> R
     call(router, &form).await
 }
 
-/// Rule 5: `SetRulePriorities` answers three failures under two codes — a priority it
-/// cannot place, whether the request repeated it or a rule outside the request holds it,
-/// and a pair naming no rule — each worded about the SET of priorities it was asked to
-/// place, because the request carries one pair per rule and any of them may be the one to
-/// change.
+/// Rule 5: `SetRulePriorities` tells three failures apart — a priority the request itself
+/// repeated, which is the request to fix and names the repeated value; a priority a rule
+/// OUTSIDE the request holds, which is the modelled conflict; and a pair naming no rule,
+/// which is the modelled not-found. The two modelled ones are worded about the SET of
+/// priorities it was asked to place, because the request carries one pair per rule and any
+/// of them may be the one to change.
 ///
 /// The rows vary the priority the request repeats, the rule the collision is with, and the
 /// shape of the ARN that names no rule — so each code is driven by several inputs rather
@@ -821,9 +823,9 @@ async fn set_rule_priorities_tells_a_repeated_priority_from_one_in_use_and_from_
     )
     .await;
 
-    // A priority the REQUEST repeats says nothing about which rule evaluates there, so it
-    // is a priority this request cannot place — the modelled conflict, worded about the
-    // set of priorities it asked for.
+    // A priority the REQUEST repeats says nothing about which rule evaluates there, and no
+    // change to what is stored can make it placeable: the request itself is what is wrong,
+    // so it is the generic input refusal, naming the value the list repeated.
     for priority in [7, 30, 50_000] {
         let reply = set_priorities(
             &router,
@@ -833,8 +835,8 @@ async fn set_rule_priorities_tells_a_repeated_priority_from_one_in_use_and_from_
         assert_refused(
             &format!("two rules of one request onto the priority {priority}"),
             &reply,
-            PRIORITY_IN_USE,
-            ABOUT_THE_SET,
+            VALIDATION_ERROR,
+            &format!("Priority '{priority}' was provided multiple times"),
         );
     }
 

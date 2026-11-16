@@ -12,14 +12,21 @@
 //! of every rule the request names, together with the current priority of every rule of
 //! that listener it does not. That is what lets two rules swap priorities in one call,
 //! and why the same number already in use on ANOTHER listener is no conflict at all.
-//! A priority the request cannot place — one a rule OUTSIDE the request holds, or one the
-//! request's own LIST asks two rules to evaluate at — is the modelled
-//! `PriorityInUseException`. This operation addresses a LIST, so every refusal about the
-//! priorities it was asked to place is worded about that SET
-//! (`crate::state::rule_priorities_refusal_message`): it names neither the priority, nor
-//! the rule, nor the listener, because any of the pairs may be the one to change. The
-//! operation that places ONE rule at ONE priority (`CreateRule`) states that priority
-//! instead — there is only one value a caller could change there.
+//! A priority a rule OUTSIDE the request holds is the modelled `PriorityInUseException` —
+//! a conflict with stored state, which freeing that priority makes placeable. A value the
+//! request's own LIST carries TWICE is a different failure: a list that asks two rules to
+//! evaluate at one priority, or that names one rule twice, says nothing about which of them
+//! the caller meant, and no change to what is stored can make it placeable. It is therefore
+//! refused where the rest of this operation's request-shape errors are — at input
+//! validation, under this API's generic input-refusal code — naming the value the list
+//! repeated, the one thing the caller has to change
+//! (`crate::state::provided_multiple_times_message`).
+//!
+//! The state conflict, by contrast, is decided over the whole LIST, so it is worded about
+//! that SET (`crate::state::rule_priorities_refusal_message`): it names neither the
+//! priority, nor the rule, nor the listener, because any of the pairs may be the one to
+//! change. The operation that places ONE rule at ONE priority (`CreateRule`) states that
+//! priority instead — there is only one value a caller could change there.
 //!
 //! The rules are read and written on their listener's record, the one rule store
 //! `DescribeRules` walks, so a priority this operation persists is the priority that read
@@ -197,16 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             if asked.iter().any(|(named, _)| named == &rule_arn) {
-                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "RulePriorities names rule '{rule_arn}' more than once"
-                )));
+                return Err(repeated_in_the_request("Rule", &rule_arn));
             }
             // One call cannot ask for two rules at one priority: the list would not say
-            // which of them evaluates there, so the priority the second pair names is one
-            // this request cannot place — the modelled conflict, worded about the SET of
-            // priorities the request asked for like every other refusal of this member.
+            // which of them evaluates there. That is unsatisfiable by construction rather
+            // than a conflict with what is stored — no priority a rule outside the request
+            // could free would make this list placeable — so it is refused as the
+            // request-shape error it is, naming the priority the list repeated, and NOT as
+            // the modelled conflict a client may resolve and retry.
             if asked.iter().any(|(_, held)| *held == priority) {
-                return Err(priority_in_use());
+                return Err(repeated_in_the_request("Priority", &priority.to_string()));
             }
             asked.push((rule_arn, priority));
         }
@@ -329,8 +336,23 @@ fn rule_not_found() -> SetRulePrioritiesError {
     .into()
 }
 
-/// The refusal for a priority this request cannot place: one a rule outside the request
-/// holds, or one the request's own list asks two rules to evaluate at.
+/// The refusal for a value the request's own `RulePriorities` list carries TWICE — one
+/// priority asked for by two pairs, or one rule named by two pairs.
+///
+/// A repeat inside ONE request is a request-shape error: the list does not say which pair
+/// the caller meant, and no change to stored state can make it placeable, so it is answered
+/// under this API's generic input-refusal code rather than as a modelled conflict a client
+/// could resolve and retry. The repeated value IS the one thing the caller has to change,
+/// so unlike the state-dependent refusals below this one states it
+/// ([`crate::state::provided_multiple_times_message`]).
+fn repeated_in_the_request(member: &str, value: &str) -> SetRulePrioritiesError {
+    crate::scaffolded::Scaffolded::validation_error(crate::state::provided_multiple_times_message(
+        member, value,
+    ))
+}
+
+/// The refusal for a priority this request cannot place because a rule OUTSIDE the request
+/// already evaluates at it.
 ///
 /// Worded about the SET this operation addresses ([`crate::state::rule_priorities_refusal_message`])
 /// and naming no value, for the same reason the not-found above does: the request carries

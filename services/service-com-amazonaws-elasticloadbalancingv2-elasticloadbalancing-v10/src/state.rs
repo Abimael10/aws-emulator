@@ -828,6 +828,21 @@ pub fn priority_in_use_message(priority: i32) -> String {
     format!("Priority '{priority}' is currently in use")
 }
 
+/// The message Elastic Load Balancing refuses a request whose own LIST carries one value
+/// TWICE with: the member that value belongs to, as the request spells it, and the value
+/// the list repeated.
+///
+/// A repeat inside ONE request is a request-shape error rather than a conflict with what is
+/// stored — the list does not say which of the two entries the caller meant, and no change
+/// to stored state can make it satisfiable — so it is answered under this API's generic
+/// input-refusal code (`crate::scaffolded::VALIDATION_ERROR`) and not under a modelled
+/// error a client may resolve and retry. The refusal states the repeated value because that
+/// is the one thing the caller has to change, where a refusal about a state conflict over a
+/// LIST names no value at all ([`rule_priorities_refusal_message`]).
+pub fn provided_multiple_times_message(member: &str, value: &str) -> String {
+    format!("{member} '{value}' was provided multiple times")
+}
+
 /// The message a request that asks to DELETE a listener's default rule is refused with,
 /// naming the rule from the request.
 ///

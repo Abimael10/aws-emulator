@@ -67,10 +67,11 @@ const TOO_MANY_CERTIFICATES: &str = "TooManyCertificates";
 const VALIDATION_ERROR: &str = "ValidationError";
 
 /// The sentence `SetRulePriorities` refuses a request it cannot place the priorities of
-/// with — a pair naming no rule, a priority a rule outside the request holds, a priority
-/// the list repeats: that operation addresses a LIST, so the refusal is about the set of
-/// priorities it asked for rather than about one value, and the error code tells the three
-/// apart.
+/// with — a pair naming no rule, a priority a rule outside the request holds: that
+/// operation addresses a LIST, so a refusal about what is STORED is about the set of
+/// priorities it asked for rather than about one value, and the error code tells the two
+/// apart. A value the list itself repeats is the request to fix instead, and names that
+/// value (`all/in_request_duplicate_rule_priorities.rs`).
 const SET_PRIORITIES_REFUSAL: &str = "One or more priorities not found";
 
 /// How many certificate ARNs one request may carry, from the documentation of the

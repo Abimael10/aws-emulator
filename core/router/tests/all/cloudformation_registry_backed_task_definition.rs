@@ -276,15 +276,6 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// The registry URI AWS publishes for the repository `repository`, which is what a
-/// declaration of the same template resolves the repository's `RepositoryUri` attribute to.
-///
-/// Source: the reference form the Amazon ECR User Guide gives for a pull,
-/// `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`.
-fn registry_uri(repository: &str) -> String {
-    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{repository}")
-}
-
 /// `<registry endpoint>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
 /// the ADDRESS a container client pushes and pulls it at (`Repository$repositoryUri`: "You
 /// can use this URI for container image `push` and `pull` operations"). This suite's router is
@@ -615,9 +606,10 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             row.case
         );
         // However the declaration composed it, the image the revision carries names this
-        // repository through the registry URI AWS publishes for it — the value a declaration
-        // of the same template resolves the repository's attribute to — with the declared tag.
-        let expected_image = format!("{}:{}", registry_uri(&repository), row.tag);
+        // repository through the URI the OWNING service reports for it — the same value the
+        // read above pinned, which is what `${Registry.RepositoryUri}` resolves to — with the
+        // declared tag.
+        let expected_image = format!("{}:{}", published_repository_uri(&repository), row.tag);
         // Addressed by the FAMILY alone, which is "the latest ACTIVE revision in that
         // family" — the read that answered `ClientException` while nothing was registered.
         for (addressed, handle) in [

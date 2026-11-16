@@ -178,3 +178,8 @@ mod target_security_group_health_check;
 // own internet gateway decides about an internet-facing placement.
 #[path = "all/internet_facing_placement.rs"]
 mod internet_facing_placement;
+// Declared after the sorted list for the same reason the suites above are. What
+// `SetRulePriorities` answers a list that carries one value twice, told apart from what it
+// answers a conflict with what is stored.
+#[path = "all/in_request_duplicate_rule_priorities.rs"]
+mod in_request_duplicate_rule_priorities;

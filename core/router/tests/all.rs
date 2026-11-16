@@ -4,21 +4,6 @@
 // end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
 // `tests/all/`, sorted by name, and no other line.
 //
-// Single integration-test target for the router: this header, then one
-// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
-// name, and no other line — no prose between the pairs, no blank line, and nothing after the
-// last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
-// sorts to, so two branches landing at once insert two lines in two places and have no prose
-// to duplicate, re-word or mistype, which is what had gone wrong here: both this header and
-// the tail of the list had grown hundreds of re-typed copies of these paragraphs.
-//
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
-// place its name sorts to. That list holds those pairs and nothing else: no prose between
-// them, no blank line, and nothing at all after the last one.
-// Single integration-test target for the router: this header, the one inner attribute below
-// it, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
-// `tests/all/`, sorted by name, and no other line.
-//
 // Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the one
 // place its name sorts to. The list holds those pairs and nothing else — no prose between
 // them, no blank line, and nothing at all after the last one — so two branches landing at once
@@ -51,94 +36,18 @@
 // `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
 // service crate's own `tests/all.rs`, so check there rather than leaving a note here.
 //
-// The lint allowed below is for the suite files this root compiles: a module header that wraps
-// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
-// is a note rather than a build failure. An inner attribute is legal only ahead of the first
-// item, so it stands with this header.
-// Single integration-test target for the router: this header, the one inner attribute at its
-// end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
-// `tests/all/`, sorted by name, and no other line — no prose between the pairs, no blank line,
-// and nothing after the last pair.
-//
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the one
-// place its name sorts to. Two branches landing at once then insert two lines in two places
-// and have no prose to duplicate, re-word or mistype, which is what had gone wrong here: this
-// header and the tail of the list had each grown hundreds of re-typed copies of these
-// paragraphs, and no suite of this target ran.
-//
-// A suite's own module header is where what it covers belongs, beside the test it explains,
-// and a remark about THIS root belongs in one of the comment-only files declared below
-// (`all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs`,
-// `all/appended_prose.rs`), which hold what earlier landings had appended here.
-//
-// Every comment of this root is an ordinary one, this block included, since a module doc is
-// legal only ahead of the first item and a copy of one below the list would compile no suite
-// at all. A file under `tests/all/` that no declaration names is compiled nowhere, a name
-// declared twice compiles neither copy, and a file left directly under `tests/` fails the
-// build; some of the files declared below are shared harnesses or probes, and each is
-// declared for that reason. A bare `mod` in a test-target crate root would resolve beside
-// this file, which is why every declaration carries the `#[path]` above it.
-//
-// The `all/all_rs_*` and `all/declaration_roots_*` suites, with
-// `all/every_suite_file_is_declared.rs`, read all of that back — here and in every service
-// crate's own root — so no rule above needs restating anywhere else. The attribute below
-// allows one lint for the suites this root compiles, and being an inner attribute it stands
-// ahead of the first declaration.
-// EVERY comment in this file is an ordinary `//` one, this header included. A doc comment of
-// the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
-// copy left among or below the declarations compiles no suite of this target at all. A suite
-// file no declaration names is compiled nowhere and its tests never run, a second declaration
-// of one name compiles neither copy, and a suite left at the top level of `tests/` fails the
-// build. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
-// it under `tests/`, which the layout check refuses: the `#[path]` above each declaration is
-// what points it into `tests/all/`. Some of the files declared below are shared harnesses or
-// probes rather than suites, and each is declared for that reason.
-// copy left among or below the declarations compiles no suite of this target at all; with
-// none anywhere in the file, no appended, re-typed or merged copy of one of these lines can
-// be one. A suite file no declaration names is compiled nowhere and its tests never run, a
-// second declaration of one name compiles neither copy, and a suite left at the top level of
-// `tests/` fails the build. This file is a test-target CRATE ROOT, so a bare `mod` would
-// resolve to a sibling of it under `tests/`, which the layout check refuses: the `#[path]`
-// above each declaration is what points it into `tests/all/`. Some of the files declared
-// below are shared harnesses or probes rather than suites, and each is declared for that
-// reason.
-//
-// The `all/all_rs_*.rs` suites, `all/declaration_roots_*.rs` and
-// `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
-// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
-//
-// The lint allowed below is for the suite files this root compiles: a module header wrapping
-// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
-// is a note rather than a build failure. An inner attribute is legal only ahead of the first
-// item, so it stands with this block.
-// place its name sorts to. Past this block the file holds those pairs and nothing else: no
-// prose between them, no blank line, and nothing at all after the last of them — so two
-// branches landing at once insert two lines in two places and have nothing here to duplicate,
-// re-word or mistype. That is what had gone wrong: successive landings re-typed this block's
-// paragraphs into the header and appended copies of them past the list, until no suite of
-// this target ran at all.
+// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
+// place its name sorts to. That list holds those pairs and nothing else: no prose between
+// them, no blank line, and nothing at all after the last one. Two branches landing at once
+// then insert two lines in two places and have no prose to duplicate, re-word or mistype,
+// which is what had gone wrong here — this header and the tail of the list had each grown
+// hundreds of re-typed copies of these paragraphs, and no suite of this target ran.
 //
 // What a suite covers, and why it drives the assembled router rather than one service crate,
 // belongs in that suite's OWN module header, where it is read beside the test it explains. A
 // note about THIS file belongs in `all/appended_header_notes.rs`, `all/appended_notes.rs`,
 // `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which keep what earlier landings
 // had appended here and are declared below like any other file.
-//
-// EVERY comment in this file is an ordinary `//` one, this header included. A doc comment of
-// the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
-// copy left among or below the declarations compiles no suite of this target at all; with
-// none anywhere in the file, no appended, re-typed or merged copy of one of these lines can
-// be one. A suite file no declaration names is compiled nowhere and its tests never run, a
-// second declaration of one name compiles neither copy, and a suite left at the top level of
-// `tests/` fails the build. This file is a test-target CRATE ROOT, so a bare `mod` would
-// resolve to a sibling of it under `tests/`, which the layout check refuses: the `#[path]`
-// above each declaration is what points it into `tests/all/`. Some of the files declared
-// below are shared harnesses or probes rather than suites, and each is declared for that
-// reason.
-//
-// The `all/all_rs_*.rs` suites, `all/declaration_roots_*.rs` and
-// `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
-// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
 //
 // The suite headers this root compiles wrap a paragraph without the indentation
 // `clippy::doc_lazy_continuation` asks of a doc list item, so that lint is allowed for the

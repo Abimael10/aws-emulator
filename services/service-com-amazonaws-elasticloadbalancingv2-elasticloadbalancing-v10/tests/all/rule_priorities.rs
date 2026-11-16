@@ -371,11 +371,13 @@ async fn a_refused_reordering_moves_nothing() {
         ),
         (
             // One call cannot ask for two rules at one priority, whatever listeners they
-            // belong to: the list does not say which of them evaluates there, so the
-            // priority is one this request cannot place.
+            // belong to: the list does not say which of them evaluates there, and no
+            // change to what is stored can make it placeable — so the REQUEST is what is
+            // refused, as the sibling repeat of one rule below is. The words that refusal
+            // carries are tabled in `all/in_request_duplicate_rule_priorities.rs`.
             "two rules of one listener onto one priority",
             vec![(first.as_str(), "40"), (second.as_str(), "40")],
-            PRIORITY_IN_USE,
+            VALIDATION_ERROR,
         ),
         (
             "one rule named twice",
