@@ -50,6 +50,9 @@ aws-sdk-sqs = { version = "1", default-features = false }
 # because a delivery is asserted where a client sees it: on the queue the
 # subscriber's target names.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# Decodes the rpcv2Cbor error envelope the refusal suite reads a refusal's error
+# code and whole `Message` out of, rather than scanning the body as text.
+aws-smithy-cbor = "0.62.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

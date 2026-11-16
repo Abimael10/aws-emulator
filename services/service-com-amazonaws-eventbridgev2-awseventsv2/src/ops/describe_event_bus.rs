@@ -183,8 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_lifecycles(now);
 
         let Some(bus) = state.bus(&input.event_bus_arn) else {
+            // A read resolves the whole ARN, identifier segment included: an
+            // identifier this service minted names a bus that is not there, and
+            // one it never handed out names no resource of this service at all.
             return Err(DescribeEventBusErrorModeled::ResourceNotFoundException(
-                crate::state::event_bus_not_found(&input.event_bus_arn),
+                state.bus_read_refusal(&input.event_bus_arn),
             )
             .into());
         };

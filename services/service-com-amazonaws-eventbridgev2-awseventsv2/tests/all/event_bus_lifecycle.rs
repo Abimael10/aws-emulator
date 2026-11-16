@@ -348,6 +348,8 @@ async fn the_event_bus_workflow_runs_over_the_wire() {
         storage_configuration: Some(StorageConfiguration {
             retention_period_in_days: Some(7),
         }),
+        // The idempotency token this service requires of every create.
+        client_token: Some("a-wire-demo-token".to_string()),
         ..Default::default()
     };
     let created = wire.ok::<CreateEventBus<InMemoryEngine>>(&create, "create").await;
@@ -403,7 +405,29 @@ async fn the_event_bus_workflow_runs_over_the_wire() {
         "case \"put while CREATING\": PutEvents must answer 409 InvalidStateException, got {status}"
     );
 
-    tokio::time::sleep(past_the_lifecycle_span()).await;
+    // Provisioning is asynchronous, so the suite polls for the CONDITION — the bus
+    // reporting ACTIVE — rather than waiting a fixed time, under a deadline far above
+    // the span that transition takes.
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let reported = wire
+            .ok::<DescribeEventBus<InMemoryEngine>>(
+                &DescribeEventBusInput {
+                    event_bus_arn: arn.clone(),
+                },
+                "describe while provisioning",
+            )
+            .await
+            .state;
+        if reported.as_deref() == Some("ACTIVE") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"describe\": the bus never reported ACTIVE, last reported {reported:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     let described = wire
         .ok::<DescribeEventBus<InMemoryEngine>>(
@@ -558,17 +582,25 @@ async fn the_event_bus_workflow_runs_over_the_wire() {
         deleting.state
     );
 
-    tokio::time::sleep(past_the_lifecycle_span()).await;
-
-    let (status, _) = wire
-        .call::<DescribeEventBus<InMemoryEngine>>(&DescribeEventBusInput {
-            event_bus_arn: arn.clone(),
-        })
-        .await;
-    assert_eq!(
-        status, 404,
-        "case \"describe after delete\": DescribeEventBus must answer 404, got {status}"
-    );
+    // Deletion is asynchronous too: poll for the CONDITION — the ARN no longer
+    // resolving — rather than waiting a fixed time.
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, _) = wire
+            .call::<DescribeEventBus<InMemoryEngine>>(&DescribeEventBusInput {
+                event_bus_arn: arn.clone(),
+            })
+            .await;
+        if status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"describe after delete\": the deleted bus never stopped resolving, last \
+             answer {status}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     let after = wire
         .ok::<ListEventBuses<InMemoryEngine>>(

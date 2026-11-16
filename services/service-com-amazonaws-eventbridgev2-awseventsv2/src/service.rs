@@ -21,11 +21,15 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. THIS SERVICE TAKES IT: every modelled operation is served through its
+//!   input-validation front door ([`validation`]), so a request refused before any
+//!   handler ran is stated in this service's own modelled `InvalidInputException`; a
+//!   request that passes is delegated to the generated routing table, which stays the
+//!   only thing that serves it.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. THIS SERVICE TAKES IT, for the one refusal the front door
+//!   above cannot reach (a request that named no modelled operation at all): the same
+//!   error code and the same envelope, from the same shared helper.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +44,15 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod validation;
+
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use validation::INVALID_INPUT_EXCEPTION;
 
 /// This service's own `awsService.endpointPrefix`, the second key a request may
 /// resolve to.
@@ -105,6 +114,12 @@ fn claims_route_key_and_path(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One input-validation front door per modelled operation, keyed by the routing
+    /// key the model names that operation by ([`validation::refusal_table`]). Built
+    /// once here, never per request; each entry holds the operation's TYPE only, so
+    /// this is a table of names, not a second set of operations and not a second
+    /// store.
+    refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -113,6 +128,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            refusals: validation::refusal_table::<Eng>(),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -141,26 +157,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve every modelled operation through its input-validation front door
+        // ([`validation::ModelledInputRefusal`]), so a request this service refuses
+        // before the handler runs is stated in its own modelled
+        // `InvalidInputException` — whose `Message` member is what puts `$.Message`
+        // in the body — instead of the framework's synthetic envelope. The wrapper
+        // delegates a request that passes to the generated operation in the routing
+        // table, which stays the only thing that serves it.
+        //
+        // A request that names no modelled operation has nothing to validate: the
+        // routing failure is the answer it gets.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The FALLBACK path. A refusal of a request that named a modelled operation
+        // is answered by the front door above, in the modelled shape; what still
+        // arrives here is a refusal with no modelled operation to read the request
+        // against. Both are worded from the same violations through the same helper,
+        // so the two paths cannot disagree, and the code travels with the message:
+        // this service answers a bad request with the error its model declares for
+        // one.
+        let mut refused = ::service_common::validation_message::aws_validation_refusal(refusal)?;
+        refused.code = INVALID_INPUT_EXCEPTION.to_string();
+        Some(refused)
     }
 
     fn override_routing_error(

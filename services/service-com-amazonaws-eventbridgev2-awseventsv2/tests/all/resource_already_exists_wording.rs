@@ -468,6 +468,8 @@ async fn the_collision_wording_is_what_the_wire_body_carries() {
         &router,
         &CreateEventBusInput {
             name: name.to_string(),
+            // The idempotency token this service requires of every create.
+            client_token: Some("a-first-token".to_string()),
             ..Default::default()
         },
     )

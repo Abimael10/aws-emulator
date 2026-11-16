@@ -1105,6 +1105,8 @@ async fn the_wire_answer_carries_the_created_subscriber() {
         &router,
         &CreateEventBusInput {
             name: "wire-contract-bus".to_string(),
+            // The idempotency token this service requires of every create.
+            client_token: Some("a-wire-bus-token".to_string()),
             ..Default::default()
         },
         "the wire create of the bus",
@@ -1143,6 +1145,8 @@ async fn the_wire_answer_carries_the_created_subscriber() {
             event_bus_arn: created_bus.clone(),
             invoke_configuration: invoke(TARGET_ARN),
             filter_configuration: Some(filters(&[(DATA_PATTERN, "DATA")])),
+            // The idempotency token this service requires of every create.
+            client_token: Some("a-wire-subscriber-token".to_string()),
             ..Default::default()
         },
     )

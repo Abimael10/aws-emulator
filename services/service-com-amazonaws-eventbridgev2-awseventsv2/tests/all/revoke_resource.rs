@@ -591,6 +591,8 @@ async fn the_wire_answer_reports_a_revoked_event_source() {
         &router,
         &CreateEventBusInput {
             name: "revoke-wire-bus".to_string(),
+            // The idempotency token this service requires of every create.
+            client_token: Some("a-wire-bus-token".to_string()),
             ..Default::default()
         },
         "the wire revocation",
@@ -630,7 +632,7 @@ async fn the_wire_answer_reports_a_revoked_event_source() {
             configuration: aws_service_configuration("aws.ec2"),
             description: None,
             tags: None,
-            client_token: None,
+            client_token: Some("a-wire-source-token".to_string()),
         },
         "the wire revocation",
     )

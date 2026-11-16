@@ -25,10 +25,11 @@ use service_com_amazonaws_eventbridgev2_awseventsv2 as eventsv2;
 use eventsv2::ops::create_event_bus::CreateEventBus;
 use eventsv2::ops::create_event_source::CreateEventSource;
 use eventsv2::ops::delete_event_bus::DeleteEventBus;
+use eventsv2::ops::describe_event_bus::DescribeEventBus;
 use eventsv2::ops::describe_event_source::DescribeEventSource;
 use eventsv2::ops::types::{
     AwsServiceEventsSourceConfiguration, CreateEventBusInput, CreateEventSourceInput,
-    CreateEventSourceOutput, DeleteEventBusInput, DescribeEventSourceInput,
+    CreateEventSourceOutput, DeleteEventBusInput, DescribeEventBusInput, DescribeEventSourceInput,
     DescribeEventSourceOutput, EventSourceConfiguration, OnFailureConfiguration,
     PartnerEventsSourceConfiguration,
 };
@@ -44,6 +45,13 @@ const REGION: &str = "us-west-2";
 fn past_the_lifecycle_span() -> Duration {
     eventsv2::state::LIFECYCLE_SPAN + Duration::from_millis(250)
 }
+
+/// How long a poll waits for a condition the emulator owes: far above the
+/// provisioning span a bus takes, so a loaded host has ample room.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one pass of a poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A SigV4 `Authorization` header naming `region` and this service's signing
 /// name, which is how a request names both.
@@ -918,6 +926,8 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         .ok::<CreateEventBus<InMemoryEngine>>(
             &CreateEventBusInput {
                 name: "wire-bus".to_string(),
+                // The idempotency token this service requires of every create.
+                client_token: Some("a-wire-bus-token".to_string()),
                 ..Default::default()
             },
             "create bus",
@@ -933,7 +943,7 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         configuration: aws_service_configuration("aws.s3", None, None),
         description: None,
         tags: None,
-        client_token: None,
+        client_token: Some("an-early-wire-token".to_string()),
     };
     let (status, _) = wire.call::<CreateEventSource<InMemoryEngine>>(&early).await;
     assert_eq!(
@@ -941,7 +951,29 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         "case \"create while the bus is CREATING\": expected HTTP 409, got {status}"
     );
 
-    tokio::time::sleep(past_the_lifecycle_span()).await;
+    // Provisioning is asynchronous, so the suite polls for the CONDITION — the bus
+    // reporting ACTIVE — rather than waiting a fixed time, under a deadline far above
+    // the span that transition takes.
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let reported = wire
+            .ok::<DescribeEventBus<InMemoryEngine>>(
+                &DescribeEventBusInput {
+                    event_bus_arn: bus.clone(),
+                },
+                "describe the bus while it provisions",
+            )
+            .await
+            .state;
+        if reported.as_deref() == Some("ACTIVE") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"create source\": the bus never reported ACTIVE, last reported {reported:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     let create = CreateEventSourceInput {
         name: "wire-source".to_string(),
@@ -1014,7 +1046,7 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         configuration: aws_service_configuration("aws.s3", None, None),
         description: None,
         tags: None,
-        client_token: None,
+        client_token: Some("an-orphan-wire-token".to_string()),
     };
     let (status, _) = wire.call::<CreateEventSource<InMemoryEngine>>(&absent).await;
     assert_eq!(

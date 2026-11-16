@@ -21,6 +21,8 @@ mod event_bus_lifecycle;
 mod event_bus_read_projection;
 #[path = "all/event_source_lifecycle.rs"]
 mod event_source_lifecycle;
+#[path = "all/modelled_input_refusal.rs"]
+mod modelled_input_refusal;
 #[path = "all/put_events_entry_results.rs"]
 mod put_events_entry_results;
 #[path = "all/resource_already_exists_wording.rs"]

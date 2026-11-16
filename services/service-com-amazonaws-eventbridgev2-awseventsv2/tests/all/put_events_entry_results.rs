@@ -664,10 +664,16 @@ fn assert_not_found<E: OperationError>(case: &str, operation: &str, error: &E) {
     );
 }
 
-/// RULE: an operation addressed at an `EventBusArn` the store holds no bus for
+/// RULE: an operation that resolves an event bus BY NAME and finds none there
 /// answers `ResourceNotFoundException` (404) whose `Message` is the fixed
 /// sentence plus ONE variable part — the NAME of the bus the request addressed,
 /// and nothing else of the ARN.
+///
+/// The one operation that resolves the WHOLE ARN instead, `DescribeEventBus`,
+/// answers the fixed text of the class for an identifier this service never
+/// minted; that rule is asserted in `tests/all/modelled_input_refusal.rs`, and
+/// the rows below assert it too, so one of these two answers is given for every
+/// bus-addressed operation and never the other.
 #[tokio::test]
 async fn a_bus_that_is_not_there_is_reported_by_name() {
     let harness = Harness::new();
@@ -689,8 +695,17 @@ async fn a_bus_that_is_not_there_is_reported_by_name() {
 
     for (name, bus_id) in names {
         let arn = missing_bus_arn(name, bus_id);
-        let expected = format!("Event bus not found: {name}");
+        let named = format!("Event bus not found: {name}");
         for (operation, message) in not_found_messages(&harness, name, &arn).await {
+            // `DescribeEventBus` resolves the whole ARN, identifier segment
+            // included: no bus of this identifier was ever minted here, so the
+            // ARN addresses no resource of this service and the refusal is the
+            // fixed text of the class.
+            let expected = if operation == "DescribeEventBus" {
+                eventsv2::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()
+            } else {
+                named.clone()
+            };
             assert_eq!(
                 message, expected,
                 "case {name:?}: {operation} must report {expected:?}, got {message:?}"

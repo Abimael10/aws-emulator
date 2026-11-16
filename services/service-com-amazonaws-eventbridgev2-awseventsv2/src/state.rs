@@ -20,7 +20,7 @@ mod subscribers;
 pub use event_sources::*;
 pub use subscribers::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -112,6 +112,26 @@ pub const MAX_STORED_EVENTS_PER_BUS: usize = 10_000;
 /// an error. It is named once here because every handler that refuses a
 /// collision must word it the same way.
 pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "Resource already exists";
+
+/// The whole `Message` of the `ResourceNotFoundException` answered for a value
+/// that addresses no resource of this service at all.
+///
+/// FIXED text of that error class: it names neither the value submitted nor any
+/// resource, because there is no resource to name — the request named nothing
+/// this service ever handed out. A refusal that DID resolve to a resource of
+/// this service and found it gone names that resource instead (see
+/// [`event_bus_not_found`]).
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource does not exist";
+
+/// How many retired bus ARNs one store remembers (see
+/// [`ComAmazonawsEventbridgev2Awseventsv2State::retired_bus_arns`]).
+///
+/// The EMULATOR's own memory bound, not an AWS rule: the live registry is
+/// bounded by [`MAX_EVENT_BUSES_PER_EMULATOR`], but a caller that creates and
+/// deletes buses in a loop retires an unbounded number of them, so the record of
+/// what this store once minted is kept to the same order of magnitude as the
+/// registry itself and the oldest entry is forgotten first.
+pub const MAX_RETIRED_BUS_ARNS: usize = MAX_EVENT_BUSES_PER_EMULATOR;
 
 /// Lifecycle state of a stored event bus, as the `BusState` enum words it on the
 /// wire. Only the states this slice can produce are modelled here; the failure
@@ -321,6 +341,16 @@ pub struct ComAmazonawsEventbridgev2Awseventsv2State {
     /// Subscribers keyed by `SubscriberArn`, so an ARN-addressed read is
     /// O(log n) and enumeration is in a stable order.
     pub subscribers: BTreeMap<String, Subscriber>,
+    /// The ARNs of buses this store MINTED and has since retired, oldest first
+    /// and bounded by [`MAX_RETIRED_BUS_ARNS`].
+    ///
+    /// An `EventBusArn` carries the identifier segment the service minted with
+    /// the bus, so an ARN naming an identifier this store never handed out
+    /// addresses no resource of this service — which is a different refusal from
+    /// one addressed at a bus that is gone. This is what tells the two apart
+    /// after the bus itself has been forgotten; see
+    /// [`Self::bus_read_refusal`].
+    pub retired_bus_arns: VecDeque<String>,
     /// How many service-assigned identifiers this store has handed out.
     ///
     /// This is what makes every minted id UNIQUE: [`Self::next_id_seed`] hands
@@ -366,6 +396,10 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         }
         for arn in completed_deletions {
             self.event_buses.remove(&arn);
+            // The bus is gone, but this store minted its identifier: remember
+            // the ARN so a later read of it is refused as the bus that is not
+            // there rather than as a value naming no resource at all.
+            self.retire_bus_arn(arn.clone());
             // An EventSource forwards onto one bus, so it goes with the bus.
             self.forget_event_sources_of_bus(&arn);
             // A subscriber is created on one bus, so it goes with the bus too.
@@ -376,6 +410,42 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
     /// The bus with this ARN, or `None` when no such bus exists.
     pub fn bus(&self, arn: &str) -> Option<&EventBus> {
         self.event_buses.get(arn)
+    }
+
+    /// Remember `arn` as a bus this store minted and has retired, forgetting the
+    /// oldest such ARN once [`MAX_RETIRED_BUS_ARNS`] are held.
+    fn retire_bus_arn(&mut self, arn: String) {
+        if self.retired_bus_arns.iter().any(|retired| *retired == arn) {
+            return;
+        }
+        while self.retired_bus_arns.len() >= MAX_RETIRED_BUS_ARNS {
+            self.retired_bus_arns.pop_front();
+        }
+        self.retired_bus_arns.push_back(arn);
+    }
+
+    /// Whether `arn` names an identifier this store handed out: the ARN of a bus
+    /// it holds, or of one it minted and has since retired.
+    pub fn minted_bus_arn(&self, arn: &str) -> bool {
+        self.event_buses.contains_key(arn)
+            || self.retired_bus_arns.iter().any(|retired| retired == arn)
+    }
+
+    /// The `ResourceNotFoundException` a READ addressed at the whole
+    /// `EventBusArn` answers when the store holds no bus there.
+    ///
+    /// A read resolves the ARN it is given, identifier segment included: an ARN
+    /// whose identifier this service minted names a bus that is simply not there
+    /// and is refused as that bus ([`event_bus_not_found`]), while an ARN naming
+    /// an identifier the service never handed out addresses no resource of this
+    /// service and takes the fixed text of the class
+    /// ([`RESOURCE_NOT_FOUND_MESSAGE`]).
+    pub fn bus_read_refusal(&self, arn: &str) -> ResourceNotFoundException {
+        if self.minted_bus_arn(arn) {
+            event_bus_not_found(arn)
+        } else {
+            resource_not_found()
+        }
     }
 
     /// The bus carrying this name in this region. An event-bus name is unique
@@ -503,8 +573,19 @@ pub fn bus_name_of_arn(event_bus_arn: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// The `ResourceNotFoundException` every bus-addressed operation answers with
-/// when the store holds no bus at the requested ARN.
+/// The `ResourceNotFoundException` answered for a value that addresses no
+/// resource of this service at all: the fixed text of that error class
+/// ([`RESOURCE_NOT_FOUND_MESSAGE`]), naming nothing of the request.
+///
+/// ONE construction, so no two operations word that refusal differently.
+pub fn resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` a bus-addressed operation that resolves a bus
+/// BY NAME answers with when the store holds no such bus.
 ///
 /// ONE construction, so no two operations word the same refusal differently: a
 /// fixed sentence plus a single variable part, the bus NAME the request

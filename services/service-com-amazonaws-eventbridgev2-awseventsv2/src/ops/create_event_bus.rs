@@ -213,6 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model names. The token is read off the stored bus, so a bus that
         // is gone replays nothing and its name is free again. The lookup is per
         // region, because a bus belongs to the region its create named.
+        //
+        // That the token is PRESENT at all is required of the request, which is
+        // input validation and so lives at this service's front door
+        // (`crate::service`'s validation module) alongside the model's own
+        // constraints, ahead of everything below.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(bus) = state.bus_by_client_token(&region, token) {
                 if !matches_stored(bus, &input) {
