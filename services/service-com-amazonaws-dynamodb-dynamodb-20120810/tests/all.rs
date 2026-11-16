@@ -153,6 +153,8 @@ mod kinesis_streaming_destinations;
 mod kms_key_state_refusals;
 #[path = "all/legacy_conditional_operator_refusals.rs"]
 mod legacy_conditional_operator_refusals;
+#[path = "all/legacy_operand_lists_and_function_operands.rs"]
+mod legacy_operand_lists_and_function_operands;
 #[path = "all/legacy_parameter_argument_rules.rs"]
 mod legacy_parameter_argument_rules;
 #[path = "all/limit_reached_page_stop_keys.rs"]
@@ -207,6 +209,14 @@ mod point_in_time_item_history;
 mod point_in_time_window_catches_up;
 #[path = "all/probe.rs"]
 mod probe;
+#[path = "all/probe_exotic.rs"]
+mod probe_exotic;
+#[path = "all/probe_filter_forms.rs"]
+mod probe_filter_forms;
+#[path = "all/probe_filter_values.rs"]
+mod probe_filter_values;
+#[path = "all/probe_scan_shapes.rs"]
+mod probe_scan_shapes;
 #[path = "all/provisioned_capacity_metrics.rs"]
 mod provisioned_capacity_metrics;
 #[path = "all/provisioned_read_capacity.rs"]

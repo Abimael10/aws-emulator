@@ -102,6 +102,17 @@ impl<'a> ReadFilter<'a> {
                     }),
                 )?;
                 check_legacy_conditions(conditions, conditional_operator)?;
+                // Each entry's operand LIST is held to the rules that bind it as a whole
+                // — one `AttributeValue` type across its members, and a `BETWEEN` range
+                // the way round the comparator reads it — which are facts of the request
+                // like the rules above.
+                for condition in conditions.values() {
+                    crate::state::check_legacy_operand_list(
+                        legacy_member,
+                        condition.comparison_operator.as_str(),
+                        crate::state::legacy_operands(condition),
+                    )?;
+                }
                 Ok(Self::Legacy {
                     member: legacy_member,
                     conditions,

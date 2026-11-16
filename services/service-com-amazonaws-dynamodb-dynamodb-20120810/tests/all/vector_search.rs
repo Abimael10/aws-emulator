@@ -464,8 +464,9 @@ async fn a_search_condition_filters_by_the_index_search_schema() {
     // refused rather than filtered. Rows differ along HOW it is wrong — a `HASH` element
     // left unpinned (no condition at all, and a condition that only filters), a schema
     // element read by a comparison, a range, a function, a negation or a path into it, in
-    // each ROLE the schema can give it (which decides the sentence), and an attribute the
-    // schema does not name at all.
+    // each ROLE the schema can give it, and an attribute the schema does not name at all.
+    // A comparator the condition may not use earns one sentence whichever role the element
+    // has: the refusal is about the comparator.
     let refusals: [(Value, Value, &str); 10] = [
         (
             Value::Null,
@@ -480,30 +481,30 @@ async fn a_search_condition_filters_by_the_index_search_schema() {
         (
             json!("tenant < :t"),
             json!({":t": {"S": "t2"}}),
-            "Only the equality operator (=) is supported for HASH attributes",
+            "Invalid comparator used in SearchConditionExpression",
         ),
         (
             json!("tenant BETWEEN :low AND :high"),
             json!({":low": {"S": "t0"}, ":high": {"S": "t9"}}),
-            "Only the equality operator (=) is supported for HASH attributes",
+            "Invalid comparator used in SearchConditionExpression",
         ),
         (
             json!("attribute_exists(tenant)"),
             Value::Null,
-            "Only the equality operator (=) is supported for HASH attributes",
+            "Invalid comparator used in SearchConditionExpression",
         ),
         (
             json!("begins_with(tenant, :t)"),
             json!({":t": {"S": "t"}}),
-            "Only the equality operator (=) is supported for HASH attributes",
+            "Invalid comparator used in SearchConditionExpression",
         ),
         (
             json!("NOT tenant <> :t"),
             json!({":t": {"S": "t1"}}),
-            "Only the equality operator (=) is supported for HASH attributes",
+            "Invalid comparator used in SearchConditionExpression",
         ),
         // The INLINE_FILTER element is held to the same one operator, and refused with the
-        // sentence the service states for that role.
+        // same sentence.
         (
             json!("tenant = :t AND price > :p"),
             json!({":t": {"S": "t1"}, ":p": {"N": "15"}}),
@@ -627,7 +628,8 @@ async fn a_request_that_addresses_no_searchable_index_is_refused() {
                 "TopK": 3,
             }),
             "ValidationException",
-            "32-bit IEEE-754",
+            "Search vector contains invalid values. All values in the search vector must be a \
+             32-bit floating-point number attribute",
         ),
     ];
     for (case, body, expected_code, expected_message) in cases {

@@ -311,19 +311,19 @@ fn call_shape_rows() -> Vec<Row> {
             expected: clause("FilterExpression", &operand_count("contains", 3)),
         },
         Row {
-            case: "a filter asking contains to search for another attribute",
-            operation: "Scan",
-            request: json!({"TableName": TABLE, "FilterExpression": "contains(s, peer)"}),
-            expected: clause("FilterExpression", &operand_type("contains", "PATH")),
-        },
-        Row {
-            case: "a write's condition asking contains to search for another attribute",
+            // "The path and the operand must be distinct; for example, contains (a, a)
+            // returns an error" (the `ConditionExpression` function reference) — the one
+            // rule about `contains`'s operands beyond the kind each position takes, so a
+            // call comparing a location with ITSELF is the request's defect while one
+            // comparing two different locations is evaluated (the control suite below).
+            case: "a write's condition asking contains to search what it searches in",
             operation: "PutItem",
             request: json!({"TableName": TABLE, "Item": key(),
                             "ConditionExpression": "contains(tags, tags)"}),
             expected: enveloped(&clause(
                 "ConditionExpression",
-                &operand_type("contains", "PATH"),
+                "The first operand must be distinct from the remaining operands for this \
+                 operator or function; operator: contains, first operand: [tags]",
             )),
         },
         Row {
@@ -332,12 +332,6 @@ fn call_shape_rows() -> Vec<Row> {
             request: json!({"TableName": TABLE, "FilterExpression": "begins_with(s, :v)",
                             "ExpressionAttributeValues": {":v": {"N": "1"}}}),
             expected: clause("FilterExpression", &operand_type("begins_with", "N")),
-        },
-        Row {
-            case: "a filter whose begins_with prefix is another attribute",
-            operation: "Scan",
-            request: json!({"TableName": TABLE, "FilterExpression": "begins_with(s, peer)"}),
-            expected: clause("FilterExpression", &operand_type("begins_with", "PATH")),
         },
         Row {
             case: "a filter naming a type attribute_type does not have",
@@ -678,19 +672,32 @@ async fn the_same_shapes_with_operands_their_operator_takes_are_evaluated() {
             "contains(tags, :m)",
             json!({":m": {"S": "red"}}),
         ),
+        // The operand positions the reference calls OPERANDS read a location as readily as
+        // a literal — "contains (path, operand)", "begins_with (path, substr)" — so a call
+        // whose second operand is a document path is evaluated against the item: the
+        // seeded item holds `s` and `peer` both as "beta".
+        (
+            "a substring search for what another attribute holds",
+            "contains(s, peer)",
+            Value::Null,
+        ),
+        (
+            "a prefix read from another attribute",
+            "begins_with(s, peer)",
+            Value::Null,
+        ),
         (
             "a size comparison",
             "size(s) = :n",
             json!({":n": {"N": "4"}}),
         ),
     ] {
-        let answered = ok(
-            &router,
-            "Scan",
-            json!({"TableName": TABLE, "FilterExpression": filter,
-                   "ExpressionAttributeValues": values}),
-        )
-        .await;
+        let mut request = json!({"TableName": TABLE, "FilterExpression": filter});
+        // A filter that binds no `:placeholder` carries no substitution table at all.
+        if !values.is_null() {
+            request["ExpressionAttributeValues"] = values;
+        }
+        let answered = ok(&router, "Scan", request).await;
         assert_eq!(
             answered["Count"],
             json!(1),

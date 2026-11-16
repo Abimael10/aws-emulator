@@ -44,6 +44,14 @@ pub(super) enum OperandKind {
 /// ([`requires_document_path`]) and a path where a value belongs
 /// ([`incorrect_operand_type`]) — are decided by the signature and not by where a
 /// recursive-descent parser happened to stop.
+///
+/// A position the references call an OPERAND takes either: a value the request carried, or
+/// a path the value is read from. "contains (path, operand) ... The path and the operand
+/// must be distinct; for example, contains (a, a) returns an error" and
+/// "begins_with (path, substr)" read the second operand off the item exactly as the first
+/// is read, so what it holds is known only once an item is read. The one position that
+/// needs a literal is `attribute_type (path, type)`'s type code, which names a member of a
+/// closed set ([`check_attribute_type_name`]).
 pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
     const PATH: &[OperandKind] = &[OperandKind::Path];
     const PATH_VALUE: &[OperandKind] = &[OperandKind::Path, OperandKind::Value];
@@ -51,8 +59,8 @@ pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
     const EITHER_EITHER: &[OperandKind] = &[OperandKind::Either, OperandKind::Either];
     match name {
         "attribute_exists" | "attribute_not_exists" | "size" => Some(PATH),
-        "attribute_type" | "begins_with" | "contains" => Some(PATH_VALUE),
-        "if_not_exists" => Some(PATH_EITHER),
+        "attribute_type" => Some(PATH_VALUE),
+        "begins_with" | "contains" | "if_not_exists" => Some(PATH_EITHER),
         "list_append" => Some(EITHER_EITHER),
         _ => None,
     }
@@ -102,6 +110,35 @@ pub(super) fn check_operand_kind(
         (OperandKind::Path, Operand::Value(_)) => Err(requires_document_path(member, function)),
         _ => Ok(()),
     }
+}
+
+/// Hold `contains` to the one rule the reference states about its operands beyond the kind
+/// each position takes: "contains (path, operand) ... The path and the operand must be
+/// distinct; for example, contains (a, a) returns an error" (the `ConditionExpression`
+/// function reference).
+///
+/// A call whose operand reads the very location the first operand searches asks whether a
+/// value holds itself, which selects every item carrying the attribute whatever it holds,
+/// so the doc makes it the caller's mistake rather than a condition. AWS states the rule
+/// over the OPERATOR and the first operand, rendered as the token list its refusals print a
+/// document path as ([`DocumentPath::render_tokens`]). Two DIFFERENT locations are compared,
+/// so that call is read against the item like any other.
+pub(super) fn check_contains_operands(
+    member: &str,
+    path: &DocumentPath,
+    operand: &Operand,
+) -> Result<(), RequestError> {
+    if matches!(operand, Operand::Path(other) if other == path) {
+        return Err(invalid_expression_member(
+            member,
+            &format!(
+                "The first operand must be distinct from the remaining operands for this \
+                 operator or function; operator: contains, first operand: {}",
+                path.render_tokens()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Hold one operand of an ORDERING comparison to the types DynamoDB orders, where the

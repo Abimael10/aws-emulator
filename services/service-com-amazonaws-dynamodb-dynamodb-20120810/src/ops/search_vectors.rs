@@ -342,32 +342,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::ParsedCondition::attribute_reads)
             .unwrap_or_default();
         for (attribute, kinds) in &reads {
-            let Some(element) = index
+            if !index
                 .search_schema
                 .iter()
-                .find(|element| &element.attribute_name == attribute)
-            else {
+                .any(|element| &element.attribute_name == attribute)
+            {
                 return Err(lift(crate::state::RequestError::Validation(
                     SEARCH_SCHEMA_ATTRIBUTE_MESSAGE.to_string(),
                 )));
-            };
+            }
             if kinds
                 .iter()
                 .any(|kind| *kind != crate::state::AttributeRead::Equality)
             {
-                // The element's ROLE decides how the refusal is worded: the model states a
-                // sentence of its own for a `HASH` attribute read by anything but `=`, and
-                // the recorded refusal of a comparator over an `INLINE_FILTER` attribute is
-                // what the service states for that one.
-                let message = if element.search_schema_element_type
-                    == crate::state::SEARCH_SCHEMA_PARTITION_KEY
-                {
-                    PARTITION_KEY_EQUALITY_MESSAGE
-                } else {
-                    INLINE_FILTER_COMPARATOR_MESSAGE
-                };
+                // One sentence whatever ROLE the schema gave the element: the refusal is
+                // about the COMPARATOR the condition used ([`INVALID_COMPARATOR_MESSAGE`]).
                 return Err(lift(crate::state::RequestError::Validation(
-                    message.to_string(),
+                    INVALID_COMPARATOR_MESSAGE.to_string(),
                 )));
             }
         }
@@ -492,21 +483,17 @@ const SEARCH_SCHEMA_ATTRIBUTE_MESSAGE: &str =
     "Only top-level attributes from the vector index search schema can be referenced in a \
      SearchConditionExpression";
 
-/// How a condition that reads a `HASH` search-schema element any other way than by pinning
-/// it with `=` is refused: the rule the model states for that element, in its own terms
-/// ("Only the equality operator (=) is supported for HASH attributes" —
-/// `SearchVectors$SearchConditionExpression`).
-const PARTITION_KEY_EQUALITY_MESSAGE: &str =
-    "Only the equality operator (=) is supported for HASH attributes in a \
-     SearchConditionExpression";
-
-/// How the same read of an `INLINE_FILTER` element is refused.
+/// How a condition that reads a search-schema element any other way than by pinning it
+/// with `=` is refused, whichever ROLE the schema gave that element.
 ///
-/// The model says comparison and range operators are supported for those attributes, and
-/// the recorded service refuses them: a range comparator over an inline filter is answered
-/// this sentence, recorded verbatim, so it is what the emulator states for an element the
-/// schema gave that role.
-const INLINE_FILTER_COMPARATOR_MESSAGE: &str =
+/// The refusal is about the COMPARATOR the condition used, not about the element it was
+/// used on: the recorded service answers this one sentence both for a range comparator over
+/// an `INLINE_FILTER` element and for a `HASH` element read by anything but `=`, so neither
+/// role has a sentence of its own. The model's words for the rule ("Only the equality
+/// operator (=) is supported for HASH attributes" —
+/// `SearchVectors$SearchConditionExpression`) are its documentation of it, not the sentence
+/// the wire carries, which names the member and the comparator.
+const INVALID_COMPARATOR_MESSAGE: &str =
     "Invalid SearchConditionExpression: Invalid comparator used in SearchConditionExpression";
 
 /// How a search of an index that partitions by a `HASH` search-schema element is refused
@@ -557,15 +544,22 @@ fn read_search_vector(values: &[AttributeValue]) -> Result<Vec<f32>, crate::stat
         .ok_or_else(invalid_search_vector)
 }
 
-/// How an element of `SearchVector` that is not a 32-bit float is refused, inside the
-/// validation envelope this service words every member refusal in.
+/// How an element of `SearchVector` that is not a 32-bit float is refused.
+///
+/// The element TYPE is a rule the service enforces rather than one the model declares —
+/// `SearchVectors$SearchVector` targets a list of `AttributeValue` with a `@length` of 1 to
+/// 4096 and nothing about what each element holds
+/// (`smithy_query(query="shape", shape="SearchVectorList")`) — so AWS states it as its own
+/// fixed sentence about the search vector, outside the
+/// `<N> validation error(s) detected: ` envelope that reports a violated input CONSTRAINT.
 fn invalid_search_vector() -> crate::state::RequestError {
-    crate::state::invalid_member(
-        "searchVector",
-        None,
-        "Member must hold only numbers, each a 32-bit IEEE-754 floating point value",
-    )
+    crate::state::RequestError::Validation(INVALID_SEARCH_VECTOR_MESSAGE.to_string())
 }
+
+/// That refusal's text: AWS's fixed sentence for a search vector carrying anything other
+/// than 32-bit floating-point numbers, with no variable part.
+const INVALID_SEARCH_VECTOR_MESSAGE: &str = "Search vector contains invalid values. All \
+     values in the search vector must be a 32-bit floating-point number attribute";
 
 /// The vector one stored item is found by in an index of `dimensions` dimensions, or
 /// `None` when the item holds no such vector.

@@ -3200,10 +3200,13 @@ impl<'a> ExprParser<'a> {
             }
             // The closed set above holds nothing else.
             _ => {
-                let haystack = Operand::Path(self.function_path(name)?);
+                let path = self.function_path(name)?;
                 self.expect(&ExprToken::Comma)?;
                 let needle = self.function_operand(name, signature, 1)?;
-                ConditionNode::Contains(haystack, needle)
+                // The one rule beyond the operand kinds: the two operands address
+                // different locations ([`check_contains_operands`]).
+                check_contains_operands(self.member, &path, &needle)?;
+                ConditionNode::Contains(Operand::Path(path), needle)
             }
         };
         self.expect(&ExprToken::Close)?;
@@ -3651,6 +3654,97 @@ pub fn check_conditional_operator_companion(
     ))
 }
 
+/// The clause a legacy `AttributeValueList` whose members are not all of one
+/// `AttributeValue` type earns.
+///
+/// "AttributeValueList must contain two AttributeValue elements of the same type, either
+/// String, Number, or Binary" (`BETWEEN` in the `ComparisonOperator` doc) and
+/// "AttributeValueList can contain one or more AttributeValue elements of type String,
+/// Number, or Binary" (`IN`): the list holds the operands of ONE comparison, so members of
+/// two different types state a comparison the service makes against no single value,
+/// whatever the addressed item holds. AWS's sentence is fixed and names neither the
+/// attribute, the operator nor the types.
+const MIXED_OPERAND_TYPES_CLAUSE: &str =
+    "AttributeValues inside AttributeValueList must be of same type";
+
+/// The clause a legacy `BETWEEN` whose two bounds the request stated the wrong way round
+/// earns.
+///
+/// "BETWEEN : Greater than or equal to the first value, and less than or equal to the
+/// second value" (`ComparisonOperator`): a lower bound above the upper one selects nothing
+/// whatever the item holds, so the RANGE is malformed and the condition is never evaluated
+/// — the request's own mistake rather than an unmet condition. The expression spelling of
+/// the same comparator states the rule in its own member's words
+/// ([`check_between_bounds`]); this is the legacy members' sentence, which echoes neither
+/// bound.
+const REVERSED_BETWEEN_CLAUSE: &str = "The BETWEEN condition was provided a range where \
+     the lower bound is greater than the upper bound";
+
+/// Hold the `AttributeValueList` of ONE legacy condition entry to the rules that bind the
+/// list AS A WHOLE: its members share one `AttributeValue` type
+/// ([`MIXED_OPERAND_TYPES_CLAUSE`]), each is of a type the comparison compares
+/// ([`check_legacy_operand_types`]), and a `BETWEEN` states its two bounds in the order the
+/// comparator reads them ([`REVERSED_BETWEEN_CLAUSE`]).
+///
+/// No rule here depends on a stored item, so a legacy condition breaking one is refused as
+/// the invalid parameter value it is BEFORE anything is read, rather than evaluated into a
+/// condition that can hold for nothing. All three hold for every member a legacy condition
+/// arrives in — `Expected`, the legacy filters, `KeyConditions` — and `member` decides only
+/// whether the sentence is stated inside the validation envelope
+/// ([`ENVELOPED_LEGACY_MEMBERS`]).
+///
+/// An entry naming NO comparison carries no operands of one, which is a defect of the
+/// entry itself ([`attribute_value_list_without_comparator`]) rather than of its list, so
+/// every caller here has a comparison to hold the list to.
+pub fn check_legacy_operand_list(
+    member: &str,
+    operator: &str,
+    operands: &[AttributeValue],
+) -> Result<(), RequestError> {
+    let enveloped = ENVELOPED_LEGACY_MEMBERS.contains(&member);
+    let refusal = |clause: &str| {
+        expression_refusal(enveloped, format!("{INVALID_PARAMETER_CLAUSE}: {clause}"))
+    };
+    if let Some((first, rest)) = operands.split_first() {
+        let one_type = attribute_value_type(first);
+        if rest
+            .iter()
+            .any(|operand| attribute_value_type(operand) != one_type)
+        {
+            return Err(refusal(MIXED_OPERAND_TYPES_CLAUSE));
+        }
+    }
+    // The operand types this comparison compares at all, which is a rule of the operator
+    // over each member of the list.
+    if let Err(clause) = check_legacy_operand_types(operator, operands) {
+        return Err(expression_refusal(enveloped, clause));
+    }
+    if operator == BETWEEN_OPERATOR {
+        if let [low, high] = operands {
+            if compare_values(low, high) == Some(Ordering::Greater) {
+                return Err(refusal(REVERSED_BETWEEN_CLAUSE));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How an `Expected` entry carrying an `AttributeValueList` and no `ComparisonOperator` is
+/// refused.
+///
+/// "Use AttributeValueList to specify one or more values to compare against an attribute.
+/// Use ComparisonOperator to specify how you want to perform the comparison" (the
+/// `ExpectedAttributeValue` doc): the list is the operands of a comparison, so an entry
+/// stating one without naming a comparison states values nothing is compared against. AWS
+/// names the attribute whose entry carried it, like every other refusal about one entry of
+/// this map.
+fn attribute_value_list_without_comparator(name: &str) -> RequestError {
+    refused(format!(
+        "{INVALID_PARAMETER_CLAUSE}: AttributeValueList can only be used with a \
+         ComparisonOperator for Attribute: {name}"
+    ))
+}
+
 /// Hold every VALUE one legacy condition map compares against to the documented value
 /// rules, exactly as a value a write stores or an expression binds is held to them.
 ///
@@ -3867,6 +3961,12 @@ fn expected_entry_satisfied(
              together for Attribute: {name}"
         )));
     }
+    // An entry carrying the operands of a comparison and naming no comparison to make with
+    // them states nothing this service can check
+    // ([`attribute_value_list_without_comparator`]).
+    if comparison.is_none() && operands.is_some() {
+        return Err(attribute_value_list_without_comparator(name));
+    }
     if let Some(operator) = comparison {
         // An operator that compares a value needs one to compare, and an `Expected`
         // entry can carry it in either of two members: AWS names both as what the
@@ -3880,6 +3980,15 @@ fn expected_entry_satisfied(
                  ComparisonOperator: {operator} for Attribute: {name}"
             )));
         }
+        // The operands are held to what the OPERATOR takes before the list is held to
+        // what the list states as a whole: how many operands the comparison takes is the
+        // operator's rule ([`check_legacy_comparison`]) and their types and order are the
+        // list's ([`check_legacy_operand_list`], which states them behind the member this
+        // entry arrived in), and a request breaking both earns the count. The comparison
+        // below settles the count again for every item it reads, which is where a reader
+        // that never ran this pass gets it.
+        check_legacy_comparison(operator, operands)?;
+        check_legacy_operand_list(EXPECTED_MEMBER, operator, operands)?;
         return legacy_comparison_matches(operator, held, operands);
     }
     match (condition.value.as_ref(), condition.exists) {
@@ -4021,33 +4130,59 @@ pub fn check_legacy_comparison(
     if required == usize::MAX && operands.len() > MAX_IN_OPERANDS {
         return Err(RequestError::Validation(invalid_argument_count(operator)));
     }
-    check_legacy_operand_types(operator, operands)?;
+    // Whether each operand is of a type the operator compares is a rule of the LIST this
+    // entry carried, stated behind the member that carried it
+    // ([`check_legacy_operand_list`]).
     Ok(())
 }
 
-/// Hold a legacy comparison's operands to the TYPES that comparison can compare.
+/// Hold a legacy comparison's operands to the TYPES that comparison can compare, as the
+/// `ComparisonOperator` doc states them per operator:
 ///
-/// "BEGINS_WITH : Checks for a prefix. ... AttributeValueList can contain only one
-/// AttributeValue of type String or Binary (not a Number or a set type)"
-/// (`ComparisonOperator`): only those two types have a prefix, so an operand of any
-/// other type is refused as the request defect it is — before anything is read, like
-/// every other fact of the request. The ordering comparisons are not held here: they
-/// compare whatever two values DynamoDB documents an order between, and a type that has
-/// none simply does not match.
+/// * "BEGINS_WITH : Checks for a prefix. ... AttributeValueList can contain only one
+///   AttributeValue of type String or Binary (not a Number or a set type)" — only those two
+///   types have a prefix;
+/// * the ordering comparisons, the two subsequence tests and the two multi-value
+///   comparisons take "only one AttributeValue element of type String, Number, or Binary
+///   (not a set type)" (`LE`, `LT`, `GE`, `GT`, `CONTAINS`, `NOT_CONTAINS`), "one or more
+///   AttributeValue elements of type String, Number, or Binary" (`IN`) and "two
+///   AttributeValue elements of the same type, either String, Number, or Binary (not a set
+///   type)" (`BETWEEN`);
+/// * `EQ` and `NE` are "supported for all data types, including lists and maps", so they
+///   compare whatever a request carries;
+/// * the two existence tests compare no value at all (their operand count is 0).
+///
+/// An operand outside its comparison's set can match nothing whatever the addressed item
+/// holds, so it is the caller's mistake and refused before anything is read. `None` for an
+/// operator this service does not serve, which [`check_legacy_comparison`] answers for.
+fn legacy_operand_types(operator: &str) -> Option<&'static [&'static str]> {
+    const TEXT_NUMBER_BINARY: &[&str] = &["S", "N", "B"];
+    const TEXT_BINARY: &[&str] = &["S", "B"];
+    match operator {
+        "EQ" | "NE" | "NULL" | "NOT_NULL" => None,
+        "BEGINS_WITH" => Some(TEXT_BINARY),
+        _ => Some(TEXT_NUMBER_BINARY),
+    }
+}
+
+/// Hold a legacy comparison's operands to the types [`legacy_operand_types`] states for it.
+///
+/// AWS names the comparison and the `AttributeValue` type of the operand it does not take,
+/// both read off the request.
 fn check_legacy_operand_types(
     operator: &str,
     operands: &[AttributeValue],
-) -> Result<(), RequestError> {
-    if operator != "BEGINS_WITH" {
+) -> Result<(), String> {
+    let Some(allowed) = legacy_operand_types(operator) else {
         return Ok(());
-    }
+    };
     for operand in operands {
-        if !matches!(operand, AttributeValue::S(_) | AttributeValue::B(_)) {
-            return Err(RequestError::Validation(format!(
-                "{INVALID_PARAMETER_CLAUSE}: ComparisonOperator {operator} is not valid for {} \
-                 AttributeValue type",
-                attribute_value_type(operand)
-            )));
+        let datatype = attribute_value_type(operand);
+        if !allowed.contains(&datatype) {
+            return Err(format!(
+                "{INVALID_PARAMETER_CLAUSE}: ComparisonOperator {operator} is not valid for \
+                 {datatype} AttributeValue type"
+            ));
         }
     }
     Ok(())

@@ -1572,6 +1572,16 @@ fn legacy_comparison(
             return Err(not_an_indexable_operation())
         }
     };
+    // Only once the entry states a comparison a key can be read through is its operand
+    // LIST held to the rules that bind the list as a whole — one `AttributeValue` type
+    // across its members, and a `BETWEEN` range the way round the comparator reads it —
+    // the one statement of those rules every legacy condition map of this service meets
+    // ([`crate::state::check_legacy_operand_list`]).
+    crate::state::check_legacy_operand_list(
+        KEY_CONDITIONS_MEMBER,
+        condition.comparison_operator.as_str(),
+        &operands,
+    )?;
     Ok(Comparison {
         attribute: attribute.to_string(),
         operator,
@@ -1753,6 +1763,11 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
 
 /// The input member a key condition travels in, which is what its refusals name.
 const KEY_CONDITION_MEMBER: &str = "KeyConditionExpression";
+
+/// The LEGACY member a key condition travels in, which a refusal about one of its entries
+/// names — and which states its refusals on their own, like every other member a READ
+/// narrows its result with.
+const KEY_CONDITIONS_MEMBER: &str = "KeyConditions";
 
 /// One key-condition token as the expression wrote it, which is what a syntax-error
 /// refusal quotes.
