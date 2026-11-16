@@ -103,6 +103,13 @@ mod stage_execution_log_bounded_header_line;
 // once.
 #[path = "all/stage_access_log_request_path.rs"]
 mod stage_access_log_request_path;
+// And what that record carries for a stage whose methods are RUN by an `AWS_PROXY` Lambda
+// integration: one record per served request, every `$context` reference resolved from that
+// request, with the status the run itself returned. Declared beside the suites above for the
+// reason the entry at the top of this file records: it spans API Gateway, AWS Lambda and Amazon
+// CloudWatch Logs at once.
+#[path = "all/stage_proxy_access_log_context.rs"]
+mod stage_proxy_access_log_context;
 #[path = "all/stage_proxy_run_logs.rs"]
 mod stage_proxy_run_logs;
 #[path = "all/stage_trace_context.rs"]
