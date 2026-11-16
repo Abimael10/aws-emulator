@@ -125,7 +125,24 @@ pub fn reached_endpoint_host(
 ) -> String {
     addressed_host(uri, host_header)
         .filter(|host| is_host_shaped(host))
-        .unwrap_or_else(|| format!("{endpoint_prefix}.{region}.amazonaws.com"))
+        .unwrap_or_else(|| service_endpoint_host(endpoint_prefix, region))
+}
+
+/// The DNS name of a service's REGIONAL endpoint: the service's own `endpointPrefix`, the
+/// region, and the zone AWS publishes its endpoints in (`AWS_ENDPOINT_DNS_SUFFIXES`' first
+/// entry, the commercial partition's `dnsSuffix` — the partition every ARN this emulator
+/// mints names).
+///
+/// The ENDPOINT IDENTITY of a service in a region, which is what a service states when it
+/// names the endpoint a request addressed (a health report about that endpoint) or
+/// advertises the endpoint of a region to a client that discovers it: both carry the
+/// service and the region, which is what lets a caller tell one region's endpoint from
+/// another's. It is NOT a reading of where this emulator is reached — that is
+/// [`emulator_endpoint_authority`] and [`reached_endpoint_host`], and an address a caller
+/// must dial is built from those.
+#[must_use]
+pub fn service_endpoint_host(endpoint_prefix: &str, region: &str) -> String {
+    format!("{endpoint_prefix}.{region}.amazonaws.com")
 }
 
 /// The `host:port` a URL addresses one of the EMULATOR'S OWN listeners by — the address
@@ -167,6 +184,48 @@ pub fn emulator_endpoint_authority(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> String {
     url_authority(ctx.endpoint().as_str()).to_string()
+}
+
+/// The DNS zone a resolver answers with the LOOPBACK interface — the interface the core
+/// binds its listeners on unless the operator names another address — which RFC 6761
+/// reserves `localhost` and every name under it for.
+///
+/// The zone a service names an endpoint of its own in when the address this emulator is
+/// reached at names no zone ([`announced_zone_of_authority`]).
+pub const LOOPBACK_ZONE: &str = "localhost";
+
+/// The DNS zone this emulator may ANNOUNCE a name of its own in, read off the `host[:port]`
+/// it is reached at: that host's own name, or [`LOOPBACK_ZONE`] when the host is an IP
+/// ADDRESS (which names no zone, and names the interface that zone resolves to), names no
+/// labels at all, or is a host AWS publishes its OWN endpoints at
+/// ([`addresses_an_aws_endpoint`]) — which is not this emulator's zone to announce in.
+///
+/// A name a service hands a client is a name the client RESOLVES and then dials, so it has
+/// to lead back to this emulator: a name in a zone AWS serves resolves nowhere near this
+/// process or, worse, to genuine AWS infrastructure, so announcing one sends the client out
+/// of the emulated environment carrying the credentials it is holding.
+///
+/// Services still carrying their own copy of this reading, to be MIGRATED onto this function
+/// (it postdates them):
+/// `services/service-com-amazonaws-vpclattice-mercurycontrolplane/src/state/announced_dns.rs`.
+/// Nothing new inlines it again — call this module.
+#[must_use]
+pub fn announced_zone_of_authority(authority: &str) -> String {
+    let host = host_only(authority)
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        // An IPv6 host may carry a zone id, which is part of no DNS name.
+        .split('%')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || addresses_an_aws_endpoint(&host)
+    {
+        return LOOPBACK_ZONE.to_string();
+    }
+    host
 }
 
 /// The `host[:port]` this emulator is SERVED at, read off the base URL
@@ -612,6 +671,71 @@ mod tests {
                 authority.as_deref(),
                 *expected,
                 "case {base:?}: expected {expected:?}, got {authority:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_services_regional_endpoint_names_the_service_and_the_region() {
+        // The rows span what the reading generalises over: the endpoint prefixes of
+        // services whose prefix is their name, one that is not (`logs`), one carrying a
+        // hyphen, and the regions of several partitions — the name is the service's own
+        // prefix, the region, and the zone AWS publishes its endpoints in.
+        let cases: &[(&str, &str, &str)] = &[
+            ("dynamodb", "us-west-2", "dynamodb.us-west-2.amazonaws.com"),
+            ("dynamodb", "us-east-1", "dynamodb.us-east-1.amazonaws.com"),
+            ("logs", "eu-central-1", "logs.eu-central-1.amazonaws.com"),
+            (
+                "elasticbeanstalk",
+                "ap-southeast-2",
+                "elasticbeanstalk.ap-southeast-2.amazonaws.com",
+            ),
+            (
+                "api.ecr",
+                "us-gov-west-1",
+                "api.ecr.us-gov-west-1.amazonaws.com",
+            ),
+        ];
+        for (prefix, region, expected) in cases {
+            let host = service_endpoint_host(prefix, region);
+            assert_eq!(
+                host, *expected,
+                "case ({prefix:?}, {region:?}): expected {expected:?}, got {host:?}"
+            );
+            assert!(
+                addresses_an_aws_endpoint(&host),
+                "case ({prefix:?}, {region:?}): a regional endpoint name sits in a zone AWS \
+                 publishes endpoints in, got {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_announced_zone_is_one_this_emulator_answers_in() {
+        // The rows span what the reading generalises over: the addresses this emulator is
+        // reached at (an IPv4 literal with and without a port, an IPv6 literal, bracketed
+        // and carrying a zone id, the loopback name), the names an operator serves it at
+        // (one label and several, in either case), a host AWS publishes its own endpoints
+        // at — which is never this emulator's zone — and an authority naming no host.
+        let cases: &[(&str, &str)] = &[
+            ("127.0.0.1:9297", "localhost"),
+            ("127.0.0.1", "localhost"),
+            ("[::1]:9297", "localhost"),
+            ("[fe80::1%eth0]:9297", "localhost"),
+            ("localhost:9297", "localhost"),
+            ("emulator.internal:8443", "emulator.internal"),
+            ("Emulator.Internal", "emulator.internal"),
+            ("emulator", "emulator"),
+            ("dynamodb.us-west-2.amazonaws.com", "localhost"),
+            ("s3.cn-north-1.amazonaws.com.cn:443", "localhost"),
+            ("lambda.us-east-1.api.aws", "localhost"),
+            ("", "localhost"),
+        ];
+        for (authority, expected) in cases {
+            let zone = announced_zone_of_authority(authority);
+            assert_eq!(
+                zone, *expected,
+                "case {authority:?}: expected the zone {expected:?}, got {zone:?}"
             );
         }
     }

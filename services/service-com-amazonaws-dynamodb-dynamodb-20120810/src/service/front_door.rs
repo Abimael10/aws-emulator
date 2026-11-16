@@ -96,15 +96,6 @@ const HEALTH_PREFIX: &str = "healthy: ";
 /// The space that closes the report, after the endpoint's name.
 const HEALTH_SUFFIX: &str = " ";
 
-/// The first label of every endpoint host this service is served on: its `aws.api#service`
-/// `endpointPrefix` (`smithy_query(query="service_info")` on this crate's model —
-/// `endpointPrefix: "dynamodb"`), which is also the SigV4 signing name a request addresses
-/// it by and the prefix `DescribeEndpoints` lays its own addresses out under.
-const ENDPOINT_PREFIX: &str = "dynamodb";
-
-/// What follows the region label in the name of every regional endpoint of this partition.
-const ENDPOINT_SUFFIX: &str = "amazonaws.com";
-
 /// The media type the health report is written in: it is a plain-text sentence for a
 /// human or a probe to read, not a document of this API.
 const HEALTH_MEDIA_TYPE: &str = "text/plain";
@@ -216,9 +207,10 @@ pub fn announced(req: &RtRequest, mut resp: RtResponse) -> RtResponse {
 /// [`::service_common::data_plane_addressing::reached_endpoint_host`]: that one answers the
 /// other question (a URL a caller must be able to reach back) and so prefers the host the
 /// request arrived at, which would make this report name the loopback address a client
-/// reaches this emulator at rather than the endpoint it addressed. `DescribeEndpoints` is
-/// where this service answers an address a client should send its next request to, and that
-/// one does resolve to this emulator.
+/// reaches this emulator at rather than the endpoint it addressed. It is the same name
+/// `DescribeEndpoints` labels its own advertised address after
+/// ([`crate::state::regional_endpoint_host`]), which is why both read it from one place;
+/// that one, being an address a client DIALS, names it in the zone this emulator answers in.
 fn health_response(parts: &::http::request::Parts) -> RtResponse {
     let endpoint = addressed_endpoint(parts);
     let mut resp = RtResponse::new(
@@ -231,8 +223,7 @@ fn health_response(parts: &::http::request::Parts) -> RtResponse {
 
 /// The DNS name of the regional endpoint `parts` addresses.
 fn addressed_endpoint(parts: &::http::request::Parts) -> String {
-    let region = crate::state::request_region(parts);
-    format!("{ENDPOINT_PREFIX}.{region}.{ENDPOINT_SUFFIX}")
+    crate::state::regional_endpoint_host(&crate::state::request_region(parts))
 }
 
 /// What this endpoint answers a method, path and media type it binds NO route for: the 404

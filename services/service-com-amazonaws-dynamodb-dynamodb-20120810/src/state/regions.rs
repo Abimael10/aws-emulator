@@ -94,6 +94,27 @@ pub(super) fn is_region_shaped(region: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+/// The first label of every endpoint host this service is served on: its `aws.api#service`
+/// `endpointPrefix` (`smithy_query(query="service_info")` on this crate's model —
+/// `endpointPrefix: "dynamodb"`), which is also the SigV4 signing name a request addresses
+/// it by.
+pub const ENDPOINT_PREFIX: &str = "dynamodb";
+
+/// The name of this service's REGIONAL endpoint in `region`: its endpoint prefix, the
+/// region and the zone AWS publishes its endpoints in, read through the tree's one
+/// statement of that name
+/// ([`::service_common::data_plane_addressing::service_endpoint_host`]).
+///
+/// The name of an endpoint of AWS's, which is what an answer that NAMES the endpoint a
+/// request addressed states — the endpoint a health probe of this endpoint's root is told
+/// it reached. It is not an address for a caller to send anything to: an address this
+/// service ADVERTISES carries the same service and region labels, but in the zone this
+/// emulator answers in, because a client dials that one
+/// (`crate::ops::describe_endpoints`).
+pub fn regional_endpoint_host(region: &str) -> String {
+    ::service_common::data_plane_addressing::service_endpoint_host(ENDPOINT_PREFIX, region)
+}
+
 /// The region of the endpoint host the request was sent to:
 /// `dynamodb.<region>.amazonaws.com`, `dynamodb-fips.<region>.amazonaws.com` and
 /// `dynamodb.<region>.api.aws` all name their region in a LABEL of the host, which is
