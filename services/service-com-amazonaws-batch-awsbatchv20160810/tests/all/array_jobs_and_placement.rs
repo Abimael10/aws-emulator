@@ -165,29 +165,37 @@ async fn submit_ok(fixture: &Fixture, name: &str, extra: Value) -> String {
         .to_string()
 }
 
-/// Assert that `detail` reports a job whose container nothing RAN: no `startedAt`, no
-/// `stoppedAt` and no exit code — neither on the job nor on any attempt a placement
-/// recorded for it. The attempt record itself belongs to the PLACEMENT, not to a run, and
-/// what a placed job's attempt carries is pinned in `job_attempt_records.rs`.
+/// Assert that `detail` reports a job whose container nothing RAN: no `startedAt` and no
+/// exit code — neither on the job nor on any attempt a placement recorded for it. The attempt
+/// record itself belongs to the PLACEMENT, not to a run, and what a placed job's attempt
+/// carries is pinned in `job_attempt_records.rs`.
+///
+/// `stoppedAt` is NOT one of them: it is when the job's work stopped, which a job the
+/// scheduler placed has — the task it ran as — whatever that task's container got to, so a
+/// placed job reports one and a job no placement took reports none.
 fn assert_nothing_ran(case: &str, detail: &Value) {
-    for member in ["startedAt", "stoppedAt"] {
-        assert_eq!(
-            detail[member],
-            Value::Null,
-            "case {case}: a job nothing ran reports no {member}, got {detail}"
-        );
-    }
+    assert_eq!(
+        detail["startedAt"],
+        Value::Null,
+        "case {case}: a job nothing ran reports no startedAt, got {detail}"
+    );
+    let placed = detail["attempts"]
+        .as_array()
+        .is_some_and(|attempts| !attempts.is_empty());
+    assert_eq!(
+        detail["stoppedAt"].is_null(),
+        !placed,
+        "case {case}: stoppedAt belongs to a job a placement took and to no other, got {detail}"
+    );
     assert!(
         detail["container"]["exitCode"].is_null(),
         "case {case}: no exit code is invented, got {detail}"
     );
     for attempt in detail["attempts"].as_array().into_iter().flatten() {
-        for member in ["startedAt", "stoppedAt"] {
-            assert!(
-                attempt[member].is_null(),
-                "case {case}: an attempt nothing ran reports no {member}, got {attempt}"
-            );
-        }
+        assert!(
+            attempt["startedAt"].is_null(),
+            "case {case}: an attempt nothing ran reports no startedAt, got {attempt}"
+        );
         assert!(
             attempt["container"]["exitCode"].is_null(),
             "case {case}: no attempt exit code is invented, got {attempt}"

@@ -1449,6 +1449,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ecs"
+version = "1.159.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecd8f39cf3e41848314347fc3b5242cbf14291258c9b8f4f61156735627726bf"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-eks"
 version = "1.162.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10356,6 +10379,7 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-cloudwatchlogs",
+ "aws-sdk-ecs",
  "aws-sdk-eventbridge",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -10365,6 +10389,9 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
+ "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
+ "service-com-amazonaws-ecrpublic-spencerfrontendservice",
+ "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sagemaker-sagemaker",

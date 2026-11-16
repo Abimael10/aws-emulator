@@ -36,10 +36,13 @@
 //! where only a caller ends it (`CancelJob`, `TerminateJob`, or the deletion of its
 //! queue), while a queue whose MANAGED environment can hold it PLACES it one span later
 //! and the placement RECORDS the job attempt it starts — one [`JobAttempt`] carrying the
-//! ARN of the task the job was placed as — and then ends in the modelled failure state with
-//! [`NO_CONTAINER_RUNTIME_REASON`], which is what that attempt ends with too. Either way no
-//! `startedAt`, `stoppedAt` or `exitCode` is invented for a container nothing
-//! ran, and no job is ever advanced to `STARTING` or `RUNNING`.
+//! ARN of the task the job was placed as — and reports the job in `STARTING`, where "the
+//! relevant container initiation operations are underway": the task's logger is initialised
+//! and the image its container runs is FETCHED ([`image_pull`]). One span later that
+//! initiation comes to its end — the fetch failure, or [`NO_CONTAINER_RUNTIME_REASON`] for an
+//! image a registry served — which is what that attempt ends with too. Either way no
+//! `startedAt` or `exitCode` is invented for a container nothing
+//! ran, and no job is ever advanced to `RUNNING`.
 //! Everything around it — accepting, resolving, scheduling, placing, listing, cancelling,
 //! terminating — is real.
 //!
@@ -77,7 +80,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
 mod described_collections;
+mod ecs_cluster;
 mod fargate;
+mod image_pull;
 mod input_rules;
 mod job_definition_projection;
 mod job_logs;
@@ -87,7 +92,9 @@ mod service_job_dispatch;
 
 pub use array_jobs::*;
 pub use described_collections::*;
+pub use ecs_cluster::*;
 pub use fargate::*;
+pub use image_pull::*;
 pub use input_rules::*;
 pub use job_definition_projection::*;
 pub use job_logs::*;
@@ -1491,6 +1498,15 @@ pub struct ComputeEnvironment {
     pub status_due_at: Option<i64>,
     /// The environment's unique identifier, minted once at creation.
     pub uuid: String,
+    /// The Amazon ECS cluster BACKING this environment, as that service keys one, or `None`
+    /// for an environment this service does not orchestrate with Amazon ECS
+    /// ([`ecs_cluster`]).
+    pub ecs_cluster_name: Option<String>,
+    /// `ComputeEnvironmentDetail$ecsClusterArn` — "the Amazon Resource Name (ARN) of the
+    /// underlying Amazon ECS cluster that the compute environment uses" — as the service that
+    /// HOLDS that cluster answered it, and `None` until a cluster is held for this
+    /// environment.
+    pub ecs_cluster_arn: Option<String>,
     pub unmanagedv_cpus: Option<i32>,
     pub compute_resources: Option<ComputeResource>,
     /// The infrastructure update policy the last `UpdateComputeEnvironment` set, which
@@ -1618,9 +1634,10 @@ pub struct Job {
     /// projection, rather than carrying an instant nothing ran at.
     pub started_at: Option<i64>,
     /// `stoppedAt`: "when the job transitioned from the `RUNNING` state to a terminal
-    /// state" (`JobDetail$stoppedAt`). A job that never ran never made that transition, so
-    /// it reports none even once it is terminal; [`Self::ended_at`] is what records WHEN
-    /// it became terminal.
+    /// state" (`JobDetail$stoppedAt`) — the instant the job's WORK stopped, which AWS is
+    /// recorded to report for every job the scheduler placed, whatever the container of that
+    /// placement got to. A job no placement ever took had no work to stop, so it reports
+    /// none; [`Self::ended_at`] is what records WHEN it became terminal either way.
     pub stopped_at: Option<i64>,
     /// When this job reached a terminal `JobStatus`, in epoch milliseconds, whatever took
     /// it there.
@@ -1696,6 +1713,13 @@ pub struct Job {
     /// so that instant is read off the records the summary counts instead of being taken
     /// from the clock when somebody reads it.
     pub status_since: i64,
+    /// What the fetch of this job's container image answered, or `None` while nothing has
+    /// attempted it ([`image_pull`]).
+    ///
+    /// Internal bookkeeping, not a modelled member: it is what the placement of this job
+    /// materialises — a job whose image could not be fetched ends with the fetch failure and
+    /// has no container, and so no container output, at all.
+    pub image_fetch: Option<ImageFetch>,
 }
 
 /// A consumable resource, exactly as `CreateConsumableResource` stored it.
@@ -2581,6 +2605,14 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     /// [`Self::take_pending_log_streams`] and [`job_logs`]). A ring bounded by
     /// [`MAX_PENDING_LOG_STREAMS`].
     pending_log_streams: VecDeque<JobLogStream>,
+    /// The calls this store owes Amazon ECS for the clusters backing its compute
+    /// environments, oldest first.
+    ///
+    /// Queued where the environment is created and where its removal falls due — under this
+    /// store's lock, with no in-process request — and drained by the operation that caused it
+    /// once the lock is released (see
+    /// [`Self::take_pending_ecs_clusters`] and [`ecs_cluster`]).
+    pending_ecs_clusters: VecDeque<PendingClusterCall>,
     /// Whether a clock pump ([`drive_job_clock`]) is already waiting on this store's
     /// due instants, so a second submit does not start a second one.
     clock_pump_running: bool,
@@ -2988,6 +3020,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         for name in deleted_environments {
             if let Some(removed) = self.compute_environments.remove(&name) {
                 self.compute_environments_by_arn.remove(&removed.arn);
+                // "When you delete a compute environment, the underlying Amazon ECS cluster
+                // is deleted as well": the removal of the environment is when that falls due,
+                // and the call is made where every cross-service delivery of this store is
+                // made — by the caller, once this lock is released ([`ecs_cluster`]).
+                self.queue_backing_cluster_deletion(&removed);
             }
         }
         if let Some(at) = capacity_at {
@@ -3375,19 +3412,46 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     }
                     // A job resting in `RUNNABLE` owes nothing unless its queue's compute
                     // capacity placed it, which is what this due instant says happened.
+                    // A job resting in `RUNNABLE` owes nothing unless its queue's compute
+                    // capacity placed it, which is what this due instant says happened.
                     JOB_RUNNABLE => {
-                        if self.place_job(id) {
-                            // Placed, so the attempt that placement started is recorded
-                            // with the task it was placed as — and nothing here can RUN
-                            // that task's container, so the placed job ends in the modelled
-                            // failure state saying exactly that, which is what the attempt
-                            // ends with too (see [`NO_CONTAINER_RUNTIME_REASON`]).
-                            self.finish_job(id, JOB_FAILED, Some(NO_CONTAINER_RUNTIME_REASON), due);
-                            Some(Advanced::Terminal)
-                        } else {
+                        if !self.job_is_placeable(id) {
                             self.set_job_due(id, None);
                             None
+                        } else if self.image_fetch_of(id).is_some() {
+                            if self.place_job(id) {
+                                // Placed: the attempt that placement started is recorded with
+                                // the task it was placed as, and the job is reported in
+                                // `STARTING` — where "the relevant container initiation
+                                // operations are underway" — until what that initiation comes
+                                // to falls due, one span later ([`start_placed_job`]).
+                                self.start_placed_job(id, due);
+                                Some(Advanced::Moved)
+                            } else {
+                                self.set_job_due(id, None);
+                                None
+                            }
+                        } else {
+                            // The fetch of this job's container image has not been answered
+                            // yet ([`settle_job_image_fetches`]): the placement stays due, so
+                            // the job is placed once the registry has answered and never with
+                            // a verdict nothing took.
+                            None
                         }
+                    }
+                    // The container initiation a placement started comes to ONE end here:
+                    // the failure of the image fetch it begins with, or the modelled failure
+                    // state saying nothing in this emulator can run the container that fetch
+                    // served ([`placement_end_reason`]).
+                    JOB_STARTING => {
+                        let reason = self
+                            .image_fetch_of(id)
+                            .map_or_else(
+                                || NO_CONTAINER_RUNTIME_REASON.to_string(),
+                                |fetch| placement_end_reason(&fetch),
+                            );
+                        self.finish_job(id, JOB_FAILED, Some(&reason), due);
+                        Some(Advanced::Terminal)
                     }
                     _ => None,
                 }
@@ -3496,7 +3560,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// owed another wake-up (`now`, i.e. as soon as the pump's minimum tick allows)
     /// rather than the next call.
     pub fn next_job_due_or_release_pump(&mut self, now: i64, generation: u64) -> Option<i64> {
-        if !self.pending_events.is_empty() || self.has_pending_log_streams() {
+        if !self.pending_events.is_empty()
+            || self.has_pending_log_streams()
+            || self.has_pending_ecs_clusters()
+            || self.has_pending_image_fetches()
+        {
             return Some(now);
         }
         match self.next_job_due_at() {
@@ -3862,7 +3930,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             job.status_reason = reason.map(str::to_string);
             job.ended_at = Some(ended_at);
             job.at_position_since = None;
-            if job.started_at.is_some() {
+            // `stoppedAt` is when the job's WORK stopped, and a job the scheduler PLACED has
+            // work to stop: it ran as a task, and the task it was placed as stopped at this
+            // instant, which is what AWS is recorded to report for a placement even when the
+            // container of it never started. A job no placement ever took — one a caller
+            // ended while it waited in its queue — had nothing to stop, so it reports none.
+            if job.started_at.is_some() || !job.attempts.is_empty() {
                 job.stopped_at = Some(ended_at);
             }
             if let Some(container) = job.container.as_mut() {
@@ -4709,6 +4782,14 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
+    // The image fetch a job waiting to be placed needs, answered by the registry that holds
+    // the image, with this store's lock released (see [`image_pull`]). It runs before the
+    // streams and the events below, because the verdict it records is what the placement
+    // ahead of it materialises.
+    settle_job_image_fetches(engine);
+    // The clusters backing this store's compute environments, created and deleted where
+    // Amazon ECS holds them, over the same callback (see [`ecs_cluster`]).
+    settle_backing_clusters(callback, &state).await;
     // The other side effect a job transition leaves for this drain: the CloudWatch Logs
     // stream a placement named is created where that service holds it, over the same
     // callback and with this store's lock released (see [`job_logs`]).

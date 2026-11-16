@@ -43,6 +43,24 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # so the placement creates it there (`state::job_logs`) rather than keeping a second copy
 # of the log store in this crate.
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# The AWS SDK for Amazon ECS, driven over the same in-process callback: the compute
+# environment Batch orchestrates with Amazon ECS is backed by a cluster of THAT service,
+# so the cluster whose ARN `DescribeComputeEnvironments` reports is created — and deleted
+# with the environment — through Amazon ECS's own API (`state::ecs_cluster`) rather than
+# being a name only this crate believes in.
+aws-sdk-ecs = { version = "1", default-features = false }
+# The Amazon ECR service, which SERVES the image pull a placed job's container needs:
+# whether this account's registry holds the image the reference names, which decides
+# whether the container can be started at all (`state::image_pull`). The repositories and
+# images are that service's own resources, held in its own store in the shared engine, so
+# the pull is answered by the service that owns them rather than by a copy kept here. No
+# cycle: that crate does not depend on this one.
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# The Amazon ECR Public service, which serves the same pull for a reference into the public
+# gallery it holds (`state::image_pull`). Its repositories, aliases and images are that
+# service's own resources, read out of its own store in the shared engine. No cycle: that
+# crate does not depend on this one.
+service-com-amazonaws-ecrpublic-spencerfrontendservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -64,6 +82,11 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # its model artifact in the service that OWNS objects.
 service-com-amazonaws-sagemaker-sagemaker = { workspace = true }
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Amazon ECS is mounted beside Batch on that same engine in the tests that drive an
+# ECS-orchestrated compute environment, because the cluster backing one is created in THAT
+# service (`state::ecs_cluster`) and the suite reads it back through its own
+# `DescribeClusters`.
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
 
 [lints]
 workspace = true

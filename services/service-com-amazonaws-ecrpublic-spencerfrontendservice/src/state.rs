@@ -38,6 +38,10 @@ pub mod logo_asset;
 /// The repository policy document in the form this service reports it.
 pub mod policy_document;
 
+/// The PULL a container runtime makes against this gallery: which repository and image a
+/// reference names, and whether this registry holds it.
+pub mod gallery_pull;
+
 pub use logo_asset::{logo_asset_route, logo_url, StoredLogo};
 pub use policy_document::canonical_policy_document;
 

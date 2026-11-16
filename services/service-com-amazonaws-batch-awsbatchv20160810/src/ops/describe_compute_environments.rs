@@ -7,7 +7,11 @@
 //! reports every environment, by name. Paginated through `maxResults`/`nextToken`.
 //!
 //! It is a REPORTING operation: it materialises only the `CREATING` -> `VALID` move the
-//! clock already owed, so two reads at one instant answer identically.
+//! clock already owed, so two reads at one instant answer identically. The Amazon ECS cluster
+//! an environment whose removal has fallen due leaves behind is deleted where that service
+//! holds it, which is the delivery of a change the clock had already made due
+//! (`state::ecs_cluster`), and the ARN this reader reports for a live environment is the one
+//! that service answered with when the cluster was created.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -162,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(DescribeComputeEnvironmentsErrorModeled::ServerException(
                 batch::unreachable_state(),
@@ -170,87 +173,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's guard lives in this block alone: the cluster a removal that has already
+        // fallen due leaves behind is deleted where Amazon ECS holds it, which is an
+        // in-process request and so is made with no lock held (`state::ecs_cluster`).
+        let answer = {
+            let mut state = state.lock();
+            state.materialize_due(now);
 
-        let requested = input.compute_environments.unwrap_or_default();
-        let mut seen = ::std::collections::HashSet::new();
-        let selected: Vec<batch::ComputeEnvironment> = if requested.is_empty() {
-            let mut names: Vec<&String> = state.compute_environments.keys().collect();
-            names.sort();
-            names
+            let requested = input.compute_environments.unwrap_or_default();
+            let mut seen = ::std::collections::HashSet::new();
+            let selected: Vec<batch::ComputeEnvironment> = if requested.is_empty() {
+                let mut names: Vec<&String> = state.compute_environments.keys().collect();
+                names.sort();
+                names
+                    .into_iter()
+                    .filter_map(|name| state.compute_environments.get(name))
+                    .cloned()
+                    .collect()
+            } else {
+                requested
+                    .iter()
+                    .filter_map(|reference| state.compute_environment(reference))
+                    .filter(|environment| seen.insert(environment.arn.clone()))
+                    .cloned()
+                    .collect()
+            };
+
+            let (page, next_token) =
+                batch::paginate(selected, input.max_results, input.next_token.as_deref()).map_err(
+                    |message| {
+                        DescribeComputeEnvironmentsError::from(
+                            DescribeComputeEnvironmentsErrorModeled::ClientException(
+                                batch::client_exception(message),
+                            ),
+                        )
+                    },
+                )?;
+
+            let details = page
                 .into_iter()
-                .filter_map(|name| state.compute_environments.get(name))
-                .cloned()
-                .collect()
-        } else {
-            requested
-                .iter()
-                .filter_map(|reference| state.compute_environment(reference))
-                .filter(|environment| seen.insert(environment.arn.clone()))
-                .cloned()
-                .collect()
+                .map(|environment| ComputeEnvironmentDetail {
+                    compute_environment_name: environment.name,
+                    compute_environment_arn: environment.arn,
+                    unmanagedv_cpus: environment.unmanagedv_cpus,
+                    // The Amazon ECS cluster this environment's jobs run as tasks of, as the
+                    // service that HOLDS that cluster answered it (`state::ecs_cluster`);
+                    // absent for an environment orchestrated with Amazon EKS, whose cluster
+                    // its `eksConfiguration` names instead.
+                    ecs_cluster_arn: environment.ecs_cluster_arn,
+                    // Always materialised: an environment created with no tags is described
+                    // with an EMPTY map, never with the member missing.
+                    tags: batch::materialized_tags(&environment.tags),
+                    r#type: Some(environment.ce_type),
+                    state: Some(environment.state),
+                    status: Some(environment.status),
+                    status_reason: environment.status_reason,
+                    // Always materialised: the modelled collections of the compute resources
+                    // are reported present and EMPTY where the environment holds nothing in
+                    // them — a Fargate environment's EC2-only lists, for one — never with the
+                    // member missing ([`batch::described_compute_resource`]).
+                    compute_resources: environment
+                        .compute_resources
+                        .as_ref()
+                        .map(batch::described_compute_resource),
+                    service_role: environment.service_role,
+                    // The infrastructure update policy the last `UpdateComputeEnvironment`
+                    // set, which AWS Batch reports back here; `None` until one sets it.
+                    update_policy: environment.update_policy,
+                    // `OrchestrationType`: EKS when the environment was created with an
+                    // `eksConfiguration`, else ECS.
+                    container_orchestration_type: Some(
+                        if environment.eks_configuration.is_some() {
+                            "EKS"
+                        } else {
+                            "ECS"
+                        }
+                        .to_string(),
+                    ),
+                    eks_configuration: environment.eks_configuration,
+                    uuid: Some(environment.uuid),
+                    context: environment.context,
+                    ecs_settings: environment.ecs_settings,
+                })
+                .collect();
+
+            DescribeComputeEnvironmentsOutput {
+                compute_environments: Some(details),
+                next_token,
+            }
         };
+        batch::settle_compute_environment_clusters(ctx, &*self.engine).await;
 
-        let (page, next_token) =
-            batch::paginate(selected, input.max_results, input.next_token.as_deref()).map_err(
-                |message| {
-                    DescribeComputeEnvironmentsError::from(
-                        DescribeComputeEnvironmentsErrorModeled::ClientException(
-                            batch::client_exception(message),
-                        ),
-                    )
-                },
-            )?;
-
-        let details = page
-            .into_iter()
-            .map(|environment| ComputeEnvironmentDetail {
-                compute_environment_name: environment.name,
-                compute_environment_arn: environment.arn,
-                unmanagedv_cpus: environment.unmanagedv_cpus,
-                // No Amazon ECS cluster is created for an emulated environment, so
-                // there is no cluster ARN to report.
-                ecs_cluster_arn: None,
-                // Always materialised: an environment created with no tags is described
-                // with an EMPTY map, never with the member missing.
-                tags: batch::materialized_tags(&environment.tags),
-                r#type: Some(environment.ce_type),
-                state: Some(environment.state),
-                status: Some(environment.status),
-                status_reason: environment.status_reason,
-                // Always materialised: the modelled collections of the compute resources
-                // are reported present and EMPTY where the environment holds nothing in
-                // them — a Fargate environment's EC2-only lists, for one — never with the
-                // member missing ([`batch::described_compute_resource`]).
-                compute_resources: environment
-                    .compute_resources
-                    .as_ref()
-                    .map(batch::described_compute_resource),
-                service_role: environment.service_role,
-                // The infrastructure update policy the last `UpdateComputeEnvironment`
-                // set, which AWS Batch reports back here; `None` until one sets it.
-                update_policy: environment.update_policy,
-                // `OrchestrationType`: EKS when the environment was created with an
-                // `eksConfiguration`, else ECS.
-                container_orchestration_type: Some(
-                    if environment.eks_configuration.is_some() {
-                        "EKS"
-                    } else {
-                        "ECS"
-                    }
-                    .to_string(),
-                ),
-                eks_configuration: environment.eks_configuration,
-                uuid: Some(environment.uuid),
-                context: environment.context,
-                ecs_settings: environment.ecs_settings,
-            })
-            .collect();
-
-        Ok(DescribeComputeEnvironmentsOutput {
-            compute_environments: Some(details),
-            next_token,
-        })
+        Ok(answer)
     }
 }

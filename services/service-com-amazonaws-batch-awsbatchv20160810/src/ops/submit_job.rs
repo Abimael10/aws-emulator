@@ -436,6 +436,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // No placement has started an attempt for this job yet: the scheduler
                 // records one when it places the job (`state::place_job`).
                 attempts: Vec::new(),
+                // Nothing has fetched this job's container image yet: the fetch is attempted
+                // while the job waits in `RUNNABLE` for capacity (`state::image_pull`).
+                image_fetch: None,
                 node_properties: definition.node_properties.clone(),
                 retry_strategy: input.retry_strategy.or(definition.retry_strategy),
                 timeout: input.timeout.or(definition.timeout),

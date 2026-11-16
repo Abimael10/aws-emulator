@@ -27,9 +27,10 @@
 //! What a placed job can report of the RUN is where the engine contract binds
 //! (`vendor/engine/src/lib.rs`): containers are not available in-process, so the attempt a
 //! placement starts never gets a container, and the job ends in the modelled failure state
-//! saying so. The attempt therefore carries the reason it ended and nothing a run would
-//! have produced: no `exitCode` ("the exit code for the job attempt"), no `startedAt` (the
-//! `STARTING` -> `RUNNING` transition) and no `stoppedAt` (the `RUNNING` -> terminal one).
+//! saying so — unless the fetch of its container image already ended it ([`image_pull`]).
+//! The attempt therefore carries the reason it ended, the instant the task it was made for
+//! stopped, and nothing a run would have produced: no `exitCode` ("the exit code for the job
+//! attempt") and no `startedAt` (the `STARTING` -> `RUNNING` transition).
 //! It does carry the log stream its container's output would have gone to, which the
 //! placement already decides ([`job_log_stream_name`]) — and that stream is MATERIALISED
 //! where CloudWatch Logs holds it, so a client can list, read or delete it
@@ -42,10 +43,22 @@ use super::*;
 /// A placed job's work is a container image, which this emulator has no runtime for and
 /// the engine contract (`vendor/engine/src/lib.rs`) forbids pretending to run: so the run
 /// the caller asked for ends in the modelled failure state saying exactly that, and no
-/// `startedAt`, `stoppedAt` or `exitCode` is invented for it. It names the condition that
+/// `startedAt` or `exitCode` is invented for it. It names the condition that
 /// stopped the run and nothing from the job.
 pub const NO_CONTAINER_RUNTIME_REASON: &str =
     "This emulator does not run containers, so the job's container was never started";
+
+/// What the container initiation a placement started comes to, as the job's `statusReason`:
+/// the failure of the image fetch that initiation begins with ([`image_pull`]), or — for an
+/// image a registry served — [`NO_CONTAINER_RUNTIME_REASON`], the one end a container of this
+/// emulator can reach. ONE reading, so the reason the job ends with and the reason its attempt
+/// ends with cannot disagree.
+pub fn placement_end_reason(fetch: &ImageFetch) -> String {
+    match fetch {
+        ImageFetch::Served => NO_CONTAINER_RUNTIME_REASON.to_string(),
+        ImageFetch::Refused(reason) => reason.clone(),
+    }
+}
 
 /// ONE job attempt: what the scheduler placing a job's container started, and what the
 /// attempt is known to have produced.
@@ -64,8 +77,9 @@ pub struct JobAttempt {
     /// attempt whose container never ran.
     pub started_at: Option<i64>,
     /// `AttemptDetail$stoppedAt`: "when the attempt was stopped (when the attempt
-    /// transitioned from the `RUNNING` state to a terminal state)". `None` for an attempt
-    /// that never reached `RUNNING`.
+    /// transitioned from the `RUNNING` state to a terminal state)" — the instant the task this
+    /// attempt was made for stopped, written when the attempt ends ([`end_open_attempt`]) and
+    /// `None` while it is still open.
     pub stopped_at: Option<i64>,
     /// `AttemptContainerDetail$exitCode`: "the exit code for the job attempt. A non-zero
     /// exit code is considered failed". `None` until a container of this attempt exits.
@@ -126,7 +140,7 @@ pub fn ecs_task_arn(region: &str, cluster: &str, task_id: &str) -> String {
 }
 
 /// The region field of an ARN this service minted, or `None` when `value` carries none.
-fn arn_region(value: &str) -> Option<&str> {
+pub(super) fn arn_region(value: &str) -> Option<&str> {
     value
         .starts_with("arn:")
         .then(|| value.split(':').nth(3))
@@ -139,19 +153,19 @@ fn arn_region(value: &str) -> Option<&str> {
 const LOG_STREAM_CONTAINER_NAME: &str = "default";
 
 /// The CloudWatch Logs stream a placed job's container writes to:
-/// `<job definition name>/default/<ECS task id>`, in the log group `/aws/batch/job` ("the
-/// log group for Batch jobs is `/aws/batch/job`", `AttemptContainerDetail$logStreamName`).
+/// `<stream prefix>/default/<ECS task id>`, in the log group the driver delivers to
+/// ([`job_logs`], whose default is `/aws/batch/job` — "the log group for Batch jobs is
+/// `/aws/batch/job`", `AttemptContainerDetail$logStreamName`).
 ///
-/// The name says WHERE the output would go, and the placement already decides both halves
-/// of it: the job definition the job resolved to and the task it was placed as. AWS is
-/// recorded to report the name for an attempt whose container never ran — it comes with the
-/// task, not with the run — so it is written at the placement. The output itself is another
+/// The three segments are the `awslogs` driver's own naming: the `awslogs-stream-prefix` the
+/// container's log configuration carries ([`job_log_stream_prefix`], which for a Batch job
+/// that configures none is the job definition's name), the name of the container the output
+/// belongs to, and the id of the task it ran as. The placement decides every one of them, and
+/// AWS is recorded to report the name for an attempt whose container never ran — it comes with
+/// the task, not with the run — so it is written at the placement. The output itself is another
 /// matter: a container nothing ran wrote none, so no event exists in that stream.
-pub fn job_log_stream_name(job_definition_reference: &str, task_id: &str) -> String {
-    format!(
-        "{}/{LOG_STREAM_CONTAINER_NAME}/{task_id}",
-        job_definition_reference_name(job_definition_reference)
-    )
+pub fn job_log_stream_name(stream_prefix: &str, task_id: &str) -> String {
+    format!("{stream_prefix}/{LOG_STREAM_CONTAINER_NAME}/{task_id}")
 }
 
 /// End the attempt `job` still has open, if any, at `at` with `reason`.
@@ -171,11 +185,10 @@ pub(super) fn end_open_attempt(job: &mut Job, reason: Option<&str>, at: i64) {
     };
     attempt.ended_at = Some(at);
     attempt.status_reason = reason.map(str::to_string);
-    // `stoppedAt` is the `RUNNING` -> terminal transition: an attempt that never reached
-    // `RUNNING` ([`JobAttempt::started_at`]) never made it, so it reports none.
-    if attempt.started_at.is_some() {
-        attempt.stopped_at = Some(at);
-    }
+    // The attempt exists because a task was made for it, and that task stopped at this
+    // instant, so the attempt reports its stop whatever its container got to — the same
+    // reading the job's own `stoppedAt` takes.
+    attempt.stopped_at = Some(at);
 }
 
 /// The `detail` rendering of one attempt for a `Batch Job State Change` event, in the
@@ -259,22 +272,32 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     ///
     /// A placement is what makes a task: the attempt is recorded carrying the ARN of the
     /// task this job was placed as ("each container attempt receives a task ARN when they
-    /// reach the `STARTING` status"), named under the compute environment that took it, and
-    /// the log stream that task's container writes to ([`job_log_stream_name`], created
-    /// where CloudWatch Logs holds it by [`job_logs`]); the job's
-    /// own container reports the same two — `ContainerDetail$taskArn` is "the Amazon Resource Name (ARN)
-    /// of the Amazon ECS task that's associated with the container job". Nothing about the RUN is
-    /// recorded here: the attempt has no exit code and no start instant until its container
-    /// reaches those statuses, which is what [`NO_CONTAINER_RUNTIME_REASON`] says never
-    /// happens.
+    /// reach the `STARTING` status"), named under the Amazon ECS cluster backing the compute
+    /// environment that took it ([`ecs_cluster`]), and the log stream that task's container
+    /// writes to ([`job_log_stream_name`], created where CloudWatch Logs holds it by
+    /// [`job_logs`]); the job's own container reports the same two — `ContainerDetail$taskArn`
+    /// is "the Amazon Resource Name (ARN) of the Amazon ECS task that's associated with the
+    /// container job".
+    ///
+    /// What that placement then runs into is the answer the registry gave for the container's
+    /// image, which the job already carries by the time it is placed ([`image_pull`]): an
+    /// image the registry would not serve stops the initiation before any container is
+    /// created, while one that is there to be fetched gets the container that
+    /// [`NO_CONTAINER_RUNTIME_REASON`] says nothing here can run ([`placement_end_reason`]).
+    /// Either way the task was made, so the stream its container's output would have gone to
+    /// is named and held — empty, because nothing ran — and nothing about a RUN is recorded:
+    /// the attempt has no exit code and no start instant, because nothing reached those
+    /// statuses.
     ///
     /// A queue with no capacity places nothing, so a job resting in `RUNNABLE` records no
     /// attempt — there has been none.
     pub(super) fn place_job(&mut self, id: &str) -> bool {
-        let Some(cluster) = self
-            .placement_environment(id)
-            .map(|environment| environment.name.clone())
-        else {
+        let Some(cluster) = self.placement_environment(id).map(|environment| {
+            environment
+                .ecs_cluster_name
+                .clone()
+                .unwrap_or_else(|| environment.name.clone())
+        }) else {
             return false;
         };
         // Every ARN this service mints carries the region of the request that created the
@@ -292,7 +315,6 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .unwrap_or_default();
         let task_id = self.new_uuid().replace('-', "");
         let task_arn = ecs_task_arn(&region, &cluster, &task_id);
-        let log_stream_name = job_log_stream_name(&definition, &task_id);
         // WHERE that stream is — and whether there is a CloudWatch Logs stream for this
         // container at all — is decided by the log driver the job's container configures
         // ([`job_log_target`]), so a container whose output goes to another driver reports
@@ -302,6 +324,10 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .get(id)
             .and_then(|job| job.container.as_ref())
             .and_then(|container| container.log_configuration.clone());
+        let log_stream_name = job_log_stream_name(
+            &job_log_stream_prefix(configuration.as_ref(), &definition),
+            &task_id,
+        );
         let target = job_log_target(configuration.as_ref(), &log_stream_name, &region);
         let reported_stream = target.as_ref().map(|target| target.log_stream.clone());
         if let Some(job) = self.jobs.get_mut(id) {
@@ -321,11 +347,33 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         // Naming the stream is not holding it: the stream this placement named is created
         // where CloudWatch Logs holds it, by the caller that drains this queue once the
-        // store's lock is released ([`job_logs`]).
+        // store's lock is released ([`job_logs`]). It is opened for the TASK, so it exists
+        // whatever the container then did — including a container the image fetch stopped
+        // from being created, which AWS is recorded to leave exactly this one empty stream
+        // behind. What it holds is another matter: nothing ran, so no event is in it.
         if let Some(target) = target {
             self.queue_log_stream(target);
         }
         true
+    }
+
+    /// Move the job the placement just took out of its queue and into `STARTING` at `at`,
+    /// owing its end one span later.
+    ///
+    /// `JobStatus$STARTING` is where "these jobs have been scheduled to a host and the
+    /// relevant container initiation operations are underway", which is exactly what a
+    /// placement has started: the task exists, the logger its container's output goes to is
+    /// initialised, and the image the container runs is fetched. So a placed job is reported
+    /// there — never in `RUNNABLE`, which it has left: it is out of its queue's ordering, and
+    /// the jobs behind it move forward at this instant — until the end that initiation comes
+    /// to falls due, one span later like every other transition this service owes.
+    pub(super) fn start_placed_job(&mut self, id: &str, at: i64) {
+        self.advance_queue_positions(id, at);
+        if let Some(job) = self.jobs.get_mut(id) {
+            job.at_position_since = None;
+        }
+        self.set_job_status(id, JOB_STARTING, at);
+        self.set_job_due(id, Some(at + JOB_PHASE_MILLIS));
     }
 
     /// Owe `id` its placement one span after `at`, or nothing at all when its queue has no

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/array_jobs_and_placement.rs"]
 mod array_jobs_and_placement;
+#[path = "all/batch_ecs_orchestration.rs"]
+mod batch_ecs_orchestration;
 #[path = "all/bounds.rs"]
 mod bounds;
 #[path = "all/cancel_job.rs"]

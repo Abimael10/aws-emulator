@@ -1,20 +1,5 @@
 // SPDX-License-Identifier: CC0-1.0
 
-// Single integration-test target for the router: this header, then one
-// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
-// name, and no other line — no prose between the pairs, no blank line, and nothing after the
-// last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
-// sorts to, so two branches landing at once insert two lines in two places and have no prose
-// to duplicate, re-word or mistype, which is what had gone wrong here: both this header and
-// the tail of the list had grown hundreds of re-typed copies of these paragraphs.
-//
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
-// place its name sorts to. That list holds those pairs and nothing else: no prose between
-// them, no blank line, and nothing at all after the last one.
-// Single integration-test target for the router: this header block, the one inner attribute
-// below it, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
-// Single integration-test target for the router: one `#[path = "all/<name>.rs"]` /
-// `mod <name>;` pair per file under `tests/all/`, sorted by name, and no other line.
 // Single integration-test target for the router: this header, the one inner attribute at its
 // end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
 // `tests/all/`, sorted by name, and no other line — no prose between the pairs, no blank line,
@@ -40,13 +25,6 @@
 //
 // EVERY comment in this file is an ordinary `//` one, this header included. A doc comment of
 // the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
-// copy left among or below the declarations compiles no suite of this target at all. A suite
-// file no declaration names is compiled nowhere and its tests never run, a second declaration
-// of one name compiles neither copy, and a suite left at the top level of `tests/` fails the
-// build. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling of
-// it under `tests/`, which the layout check refuses: the `#[path]` above each declaration is
-// what points it into `tests/all/`. Some of the files declared below are shared harnesses or
-// probes rather than suites, and each is declared for that reason.
 // copy left among or below the declarations compiles no suite of this target at all; with
 // none anywhere in the file, no appended, re-typed or merged copy of one of these lines can
 // be one. A suite file no declaration names is compiled nowhere and its tests never run, a

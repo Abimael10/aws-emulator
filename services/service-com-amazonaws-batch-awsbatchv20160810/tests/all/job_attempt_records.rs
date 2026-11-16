@@ -30,9 +30,27 @@ use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::array_jobs_and_placement::managed_compute_environment;
 use crate::job_lifecycle::{
-    compute_environment, container_properties, describe_job, job_definition, job_queue,
-    until_status, Batch, REGION,
+    compute_environment, container_properties, describe_compute_environment, describe_job,
+    job_definition, job_queue, until_status, Batch, REGION,
 };
+
+/// How AWS Batch names the Amazon ECS cluster backing a compute environment:
+/// `AWSBatch-<compute environment name>-<the environment's own id>`. Spelled out here rather
+/// than imported, so a wrong name in the implementation cannot make a test pass. The two
+/// variable parts are read back off the environment itself
+/// (`ComputeEnvironmentDetail$computeEnvironmentName` and `ComputeEnvironmentDetail$uuid`),
+/// which is how a client learns them.
+async fn backing_cluster(fixture: &Fixture) -> String {
+    let described =
+        describe_compute_environment(&fixture.batch, &fixture.environment_name).await;
+    let name = described["computeEnvironmentName"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case backing cluster: expected a name, got {described}"));
+    let uuid = described["uuid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case backing cluster: expected a uuid, got {described}"));
+    format!("AWSBatch-{name}-{uuid}")
+}
 
 /// What the compute environment behind a queue offers the scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,9 +146,9 @@ fn attempts(detail: &Value) -> Option<Vec<Value>> {
         })
 }
 
-/// Assert that `task_arn` is the ARN of an ECS task placed on the compute environment
-/// `cluster`: `arn:aws:ecs:<region>:<account>:task/<cluster>/<task id>`, whose id is the 32
-/// lowercase hex characters an ECS task id is.
+/// Assert that `task_arn` is the ARN of an ECS task placed in the Amazon ECS `cluster`
+/// backing the job's compute environment: `arn:aws:ecs:<region>:<account>:task/<cluster>/<task
+/// id>`, whose id is the 32 lowercase hex characters an ECS task id is.
 fn assert_task_arn(case: &str, cluster: &str, task_arn: &str) {
     let prefix = format!(
         "arn:aws:ecs:{REGION}:{}:task/{cluster}/",
@@ -201,14 +219,16 @@ fn assert_placement_attempt(
         "case {case}: the attempt's container reports why it ended, got {attempt}"
     );
     // Nothing ran, so nothing a run produces is reported — for the attempt or its
-    // container.
-    for member in ["startedAt", "stoppedAt"] {
-        assert!(
-            attempt[member].is_null(),
-            "case {case}: an attempt whose container never ran reports no {member}, got \
-             {attempt}"
-        );
-    }
+    // container. The attempt's `stoppedAt` is not one of those: the task this attempt was
+    // made for stopped when the attempt ended, whatever its container got to.
+    assert!(
+        attempt["startedAt"].is_null(),
+        "case {case}: an attempt whose container never ran reports no startedAt, got {attempt}"
+    );
+    assert!(
+        attempt["stoppedAt"].as_i64().is_some(),
+        "case {case}: an attempt that has ended reports when its task stopped, got {attempt}"
+    );
     for member in ["exitCode", "containerInstanceArn"] {
         assert!(
             attempt["container"][member].is_null(),
@@ -358,7 +378,7 @@ async fn a_job_reports_one_attempt_per_placement_and_none_without_one() {
             );
             assert_placement_attempt(
                 case,
-                &fixture.environment_name,
+                &backing_cluster(&fixture).await,
                 &fixture.definition_name,
                 &detail,
                 &listed[0],
@@ -388,7 +408,7 @@ async fn each_placement_names_its_own_task_and_a_read_records_none() {
         );
         assert_placement_attempt(
             &case,
-            &fixture.environment_name,
+            &backing_cluster(&fixture).await,
             &fixture.definition_name,
             &detail,
             &listed[0],
@@ -451,7 +471,7 @@ async fn array_children_report_their_own_attempts_and_the_parent_reports_none() 
         );
         assert_placement_attempt(
             &case,
-            &fixture.environment_name,
+            &backing_cluster(&fixture).await,
             &fixture.definition_name,
             &child,
             &listed[0],

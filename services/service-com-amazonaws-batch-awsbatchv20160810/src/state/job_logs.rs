@@ -67,6 +67,13 @@ const OPTION_LOG_GROUP: &str = "awslogs-group";
 /// the configuration names none.
 const OPTION_LOG_REGION: &str = "awslogs-region";
 
+/// The option naming the PREFIX of the stream the driver writes a container's output to:
+/// "`awslogs-stream-prefix` ... the `awslogs-stream-prefix` option allows you to associate a
+/// log stream with the specified prefix, the container name, and the ID of the Amazon ECS task
+/// that the container belongs to" (`LogConfiguration$options`, the `awslogs` driver's
+/// documentation).
+const OPTION_STREAM_PREFIX: &str = "awslogs-stream-prefix";
+
 /// The option that has the driver create the log group as well as the stream.
 const OPTION_CREATE_GROUP: &str = "awslogs-create-group";
 
@@ -119,6 +126,29 @@ pub struct JobLogStream {
     /// the service's to hold, and a group the configuration names is created only when it
     /// asked for that ([`OPTION_CREATE_GROUP`]).
     pub create_group: bool,
+}
+
+/// The PREFIX the `awslogs` driver names a job container's log stream with: the
+/// [`OPTION_STREAM_PREFIX`] option the container's configuration carries, and the name of the
+/// job definition the job resolved to when it carries none — the default AWS Batch's own log
+/// stream naming uses (`AttemptContainerDetail$logStreamName`).
+///
+/// An option present but EMPTY names no prefix, so the default stands rather than a stream
+/// name beginning with a separator.
+pub fn job_log_stream_prefix(
+    configuration: Option<&LogConfiguration>,
+    job_definition_reference: &str,
+) -> String {
+    configuration
+        .filter(|configuration| configuration.log_driver == LOG_DRIVER_AWSLOGS)
+        .and_then(|configuration| configuration.options.as_ref())
+        .and_then(|options| options.get(OPTION_STREAM_PREFIX))
+        .map(String::as_str)
+        .filter(|prefix| !prefix.is_empty())
+        .map_or_else(
+            || job_definition_reference_name(job_definition_reference).to_string(),
+            str::to_string,
+        )
 }
 
 /// Where the container `configuration` describes delivers the stream `log_stream`, or

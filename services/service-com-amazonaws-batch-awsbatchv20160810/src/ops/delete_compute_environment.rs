@@ -20,6 +20,11 @@
 //! ([`crate::state::JOB_PHASE_MILLIS`] later), so a caller that describes straight after
 //! the delete still sees `DELETING` the way AWS Batch reports it.
 //!
+//! That removal takes the environment's backing Amazon ECS cluster with it — "when you delete
+//! a compute environment, the underlying Amazon ECS cluster is deleted as well" — which is a
+//! call to the service that HOLDS the cluster, made once this store's lock is released
+//! (`state::ecs_cluster`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(DeleteComputeEnvironmentErrorModeled::ServerException(
                 batch::unreachable_state(),
@@ -160,54 +164,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's guard lives in this block alone: the cluster a removal that has already
+        // fallen due leaves behind is deleted where Amazon ECS holds it, which is an
+        // in-process request and so is made with no lock held (`state::ecs_cluster`).
+        {
+            let mut state = state.lock();
+            state.materialize_due(now);
 
-        let Some(name) = state.compute_environment_name(&input.compute_environment) else {
-            // A removal of something that is not there is ALREADY DONE: this operation's
-            // post-state ("the environment is gone") already holds, so it answers its
-            // empty success body and changes nothing. The not-found refusal belongs to
-            // the calls that must read or reconfigure the resource.
-            return Ok(DeleteComputeEnvironmentOutput {});
-        };
-        let Some(environment) = state.compute_environments.get(&name) else {
-            return Err(DeleteComputeEnvironmentErrorModeled::ServerException(
-                batch::unreachable_state(),
-            )
-            .into());
-        };
-        // A delete already accepted is in flight: repeating it asks for a removal the
-        // clock already owes, so it is the same success and changes nothing.
-        if environment.status == batch::STATUS_DELETING {
-            return Ok(DeleteComputeEnvironmentOutput {});
-        }
-        if environment.state != batch::STATE_DISABLED {
-            // The rule's own sentence, which names the KIND of resource and the state to
-            // set first and nothing from the request
-            // ([`batch::delete_enabled_message`]).
-            return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(batch::delete_enabled_message("compute environment")),
-            )
-            .into());
-        }
-        let attached = state.queues_using_compute_environment(&environment.arn);
-        if !attached.is_empty() {
-            // The relationship rule's own CLOSED sentence, naming no queue: the refusal is
-            // that a `JobQueue` relationship exists, and AWS keeps which queue opaque
-            // ([`batch::job_queue_relationship_message`]).
-            return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(batch::job_queue_relationship_message()),
-            )
-            .into());
-        }
+            let Some(name) = state.compute_environment_name(&input.compute_environment) else {
+                // A removal of something that is not there is ALREADY DONE: this operation's
+                // post-state ("the environment is gone") already holds, so it answers its
+                // empty success body and changes nothing. The not-found refusal belongs to
+                // the calls that must read or reconfigure the resource.
+                return Ok(DeleteComputeEnvironmentOutput {});
+            };
+            let Some(environment) = state.compute_environments.get(&name) else {
+                return Err(DeleteComputeEnvironmentErrorModeled::ServerException(
+                    batch::unreachable_state(),
+                )
+                .into());
+            };
+            // A delete already accepted is in flight: repeating it asks for a removal the
+            // clock already owes, so it is the same success and changes nothing.
+            if environment.status == batch::STATUS_DELETING {
+                return Ok(DeleteComputeEnvironmentOutput {});
+            }
+            if environment.state != batch::STATE_DISABLED {
+                // The rule's own sentence, which names the KIND of resource and the state to
+                // set first and nothing from the request
+                // ([`batch::delete_enabled_message`]).
+                return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
+                    batch::client_exception(batch::delete_enabled_message("compute environment")),
+                )
+                .into());
+            }
+            let attached = state.queues_using_compute_environment(&environment.arn);
+            if !attached.is_empty() {
+                // The relationship rule's own CLOSED sentence, naming no queue: the refusal is
+                // that a `JobQueue` relationship exists, and AWS keeps which queue opaque
+                // ([`batch::job_queue_relationship_message`]).
+                return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
+                    batch::client_exception(batch::job_queue_relationship_message()),
+                )
+                .into());
+            }
 
-        // Accepted: the environment enters DELETING now and stops existing when that
-        // move falls due (`state::materialize_due`).
-        if let Some(environment) = state.compute_environments.get_mut(&name) {
-            environment.status = batch::STATUS_DELETING.to_string();
-            environment.status_reason = None;
-            environment.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+            // Accepted: the environment enters DELETING now and stops existing when that
+            // move falls due (`state::materialize_due`).
+            if let Some(environment) = state.compute_environments.get_mut(&name) {
+                environment.status = batch::STATUS_DELETING.to_string();
+                environment.status_reason = None;
+                environment.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+            }
         }
+        // The cluster of an environment whose removal has already fallen due is deleted where
+        // Amazon ECS holds it, with this store's lock released (`state::ecs_cluster`).
+        batch::settle_compute_environment_clusters(ctx, &*self.engine).await;
 
         Ok(DeleteComputeEnvironmentOutput {})
     }

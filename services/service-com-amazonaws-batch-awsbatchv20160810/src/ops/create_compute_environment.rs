@@ -9,6 +9,11 @@
 //! member), and the environment is returned in the non-terminal `CREATING` status, which
 //! the clock moves to `VALID`.
 //!
+//! An environment this service orchestrates with Amazon ECS — managed or unmanaged — is
+//! backed by a cluster of THAT service, so the create provisions one there and records the ARN
+//! Amazon ECS answered with, which is what `DescribeComputeEnvironments` reports as
+//! `ecsClusterArn` (`state::ecs_cluster`).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -219,93 +224,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = batch::request_region(ctx);
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's guard lives in this block alone: the cluster this creation provisions
+        // is created where Amazon ECS holds it, which is an in-process request and so is made
+        // with no lock held (see `state::ecs_cluster`).
+        let created = {
+            let mut store = state.lock();
+            store.materialize_due(now);
 
-        if state
-            .compute_environments
-            .contains_key(&input.compute_environment_name)
-        {
-            // The bare detail AWS is recorded to state for a duplicate name: it names the
-            // collision, not the object (`state::OBJECT_ALREADY_EXISTS`). A collision is a
-            // CONFLICT, so it is answered with the status AWS answers
-            // (`state::CONFLICT_STATUS`) rather than the model's `httpError`.
-            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
-                CreateComputeEnvironmentErrorModeled::ClientException(batch::client_exception(
-                    batch::OBJECT_ALREADY_EXISTS,
-                )),
-                batch::CONFLICT_STATUS,
-            ));
-        }
-        if state.compute_environments.len() >= batch::limits::MAX_COMPUTE_ENVIRONMENTS {
-            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(batch::quota_message(
-                    "compute environments",
-                    batch::limits::MAX_COMPUTE_ENVIRONMENTS,
-                )),
-            )
-            .into());
-        }
-        if input.r#type == batch::CE_TYPE_MANAGED && input.compute_resources.is_none() {
-            // The one Batch refusal recorded INSIDE the frontend envelope for this
-            // operation, detail verbatim: `computeResources` is "required for a managed
-            // compute environment" (the member's own doc), and the envelope names the id
-            // of the call being refused ([`batch::client_exception_enveloped`]).
-            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception_enveloped(
-                    "computeResources must be provided for a MANAGED compute environment",
-                ),
-            )
-            .into());
-        }
-        // The other half of the same rule: `computeResources` describes the resources
-        // Batch MANAGES, and Fargate capacity only exists where Batch manages it, so an
-        // UNMANAGED environment cannot be created over Fargate compute resources
-        // ([`batch::UNMANAGED_FARGATE_NOT_CREATABLE`]).
-        if input.r#type != batch::CE_TYPE_MANAGED
-            && input
-                .compute_resources
-                .as_ref()
-                .is_some_and(|resources| batch::is_fargate_compute_type(&resources.r#type))
-        {
-            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::UNMANAGED_FARGATE_NOT_CREATABLE),
-            )
-            .into());
-        }
+            if store
+                .compute_environments
+                .contains_key(&input.compute_environment_name)
+            {
+                // The bare detail AWS is recorded to state for a duplicate name: it names the
+                // collision, not the object (`state::OBJECT_ALREADY_EXISTS`). A collision is a
+                // CONFLICT, so it is answered with the status AWS answers
+                // (`state::CONFLICT_STATUS`) rather than the model's `httpError`.
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    CreateComputeEnvironmentErrorModeled::ClientException(batch::client_exception(
+                        batch::OBJECT_ALREADY_EXISTS,
+                    )),
+                    batch::CONFLICT_STATUS,
+                ));
+            }
+            if store.compute_environments.len() >= batch::limits::MAX_COMPUTE_ENVIRONMENTS {
+                return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                    batch::client_exception(batch::quota_message(
+                        "compute environments",
+                        batch::limits::MAX_COMPUTE_ENVIRONMENTS,
+                    )),
+                )
+                .into());
+            }
+            if input.r#type == batch::CE_TYPE_MANAGED && input.compute_resources.is_none() {
+                // The one Batch refusal recorded INSIDE the frontend envelope for this
+                // operation, detail verbatim: `computeResources` is "required for a managed
+                // compute environment" (the member's own doc), and the envelope names the id
+                // of the call being refused ([`batch::client_exception_enveloped`]).
+                return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                    batch::client_exception_enveloped(
+                        "computeResources must be provided for a MANAGED compute environment",
+                    ),
+                )
+                .into());
+            }
+            // The other half of the same rule: `computeResources` describes the resources
+            // Batch MANAGES, and Fargate capacity only exists where Batch manages it, so an
+            // UNMANAGED environment cannot be created over Fargate compute resources
+            // ([`batch::UNMANAGED_FARGATE_NOT_CREATABLE`]).
+            if input.r#type != batch::CE_TYPE_MANAGED
+                && input
+                    .compute_resources
+                    .as_ref()
+                    .is_some_and(|resources| batch::is_fargate_compute_type(&resources.r#type))
+            {
+                return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                    batch::client_exception_enveloped(batch::UNMANAGED_FARGATE_NOT_CREATABLE),
+                )
+                .into());
+            }
 
-        let name = input.compute_environment_name.clone();
-        let arn = batch::compute_environment_arn(&region, &name);
-        let environment = batch::ComputeEnvironment {
-            name: name.clone(),
-            arn: arn.clone(),
-            ce_type: input.r#type,
-            state: input
-                .state
-                .unwrap_or_else(|| batch::STATE_ENABLED.to_string()),
-            status: batch::STATUS_CREATING.to_string(),
-            status_reason: None,
-            status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
-            uuid: state.new_uuid(),
-            unmanagedv_cpus: input.unmanagedv_cpus,
-            compute_resources: input.compute_resources,
-            // `CreateComputeEnvironment` models no `updatePolicy`; only
-            // `UpdateComputeEnvironment` sets one.
-            update_policy: None,
-            service_role: input.service_role,
-            eks_configuration: input.eks_configuration,
-            ecs_settings: input.ecs_settings,
-            context: input.context,
-            tags: input.tags,
+            let name = input.compute_environment_name.clone();
+            let arn = batch::compute_environment_arn(&region, &name);
+            let uuid = store.new_uuid();
+            let mut environment = batch::ComputeEnvironment {
+                name: name.clone(),
+                arn: arn.clone(),
+                ce_type: input.r#type,
+                state: input
+                    .state
+                    .unwrap_or_else(|| batch::STATE_ENABLED.to_string()),
+                status: batch::STATUS_CREATING.to_string(),
+                status_reason: None,
+                status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+                uuid: uuid.clone(),
+                // The cluster this environment is backed by, for an environment Batch
+                // orchestrates with Amazon ECS: it is named here and CREATED where that
+                // service holds it, which is where the ARN reported for it comes from
+                // (`state::ecs_cluster`).
+                ecs_cluster_name: None,
+                ecs_cluster_arn: None,
+                unmanagedv_cpus: input.unmanagedv_cpus,
+                compute_resources: input.compute_resources,
+                // `CreateComputeEnvironment` models no `updatePolicy`; only
+                // `UpdateComputeEnvironment` sets one.
+                update_policy: None,
+                service_role: input.service_role,
+                eks_configuration: input.eks_configuration,
+                ecs_settings: input.ecs_settings,
+                context: input.context,
+                tags: input.tags,
+            };
+            if environment.orchestrated_with_ecs() {
+                environment.ecs_cluster_name =
+                    Some(store.queue_backing_cluster(&name, &uuid, &region));
+            }
+            store
+                .compute_environments_by_arn
+                .insert(arn.clone(), name.clone());
+            store.compute_environments.insert(name.clone(), environment);
+            (name, arn)
         };
-        state
-            .compute_environments_by_arn
-            .insert(arn.clone(), name.clone());
-        state.compute_environments.insert(name.clone(), environment);
+        // The cluster the creation queued is created in Amazon ECS now, with the lock
+        // released, so the environment reports the ARN that service answered with from the
+        // moment it exists.
+        batch::settle_compute_environment_clusters(ctx, &*self.engine).await;
 
         Ok(CreateComputeEnvironmentOutput {
-            compute_environment_name: Some(name),
-            compute_environment_arn: Some(arn),
+            compute_environment_name: Some(created.0),
+            compute_environment_arn: Some(created.1),
         })
     }
 }
