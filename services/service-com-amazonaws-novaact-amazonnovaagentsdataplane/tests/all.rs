@@ -15,6 +15,8 @@
 mod act_listing;
 #[path = "all/act_status_enum_refusal.rs"]
 mod act_status_enum_refusal;
+#[path = "all/act_status_transition_refusal.rs"]
+mod act_status_transition_refusal;
 #[path = "all/act_status_update.rs"]
 mod act_status_update;
 #[path = "all/create_preconditions.rs"]

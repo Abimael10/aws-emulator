@@ -7,11 +7,13 @@
 //! session id or act id answers `ResourceNotFoundException` (404) naming whichever link
 //! was missing.
 //!
-//! A status that FINISHES an act (`SUCCEEDED`, `FAILED`, `TIMED_OUT`) is the last one it
-//! takes: a request that would move a finished act to a different status names a status the
-//! act's current one does not admit, which is a `ValidationException` (400) with reason
-//! `InvalidStatus`. Re-sending the status the act already holds changes nothing and
-//! succeeds, which is what this `@idempotent` operation promises a retry.
+//! A status that FINISHES an act (`SUCCEEDED`, `FAILED`, `TIMED_OUT`) ends its execution,
+//! so a finished act admits only the outcomes a caller reports for one (`SUCCEEDED`,
+//! `FAILED`) and the status it already holds: a request naming any other status names one
+//! the act's current status does not admit, which is a `ValidationException` (400) with
+//! reason `InvalidStatus` whose message names the set the act does admit. Re-sending the
+//! status the act already holds changes nothing and succeeds, which is what this
+//! `@idempotent` operation promises a retry.
 //!
 //! ## Shape of an operation
 //!
@@ -86,12 +88,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-/// How this service states a status an act's current status does not admit: the act is in a
-/// state this update did not expect. Fixed text with nothing interpolated, so the refusal
-/// reads the same whichever act and whichever status a caller named. Private: the sentence
-/// belongs to this operation, and the wire cases spell it out themselves.
-const ACT_IN_UNEXPECTED_STATE: &str = "Act in unexpected state";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -225,18 +221,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(not_found)?;
 
-        // A finished act has no execution left for a further status to describe, so the
-        // status asked for is not one it can take. Re-sending the status it already holds
-        // is the retry an `@idempotent` operation must answer, and changes nothing.
-        if act.status.is_terminal() && act.status != requested {
-            return Err(UpdateActErrorModeled::ValidationException(ValidationException {
-                message: ACT_IN_UNEXPECTED_STATE.to_string(),
-                // `ValidationExceptionReason` declares `InvalidStatus` for exactly this:
-                // the request is well formed, but the status it names is not one the
-                // resource's current status admits.
-                reason: "InvalidStatus".to_string(),
-                field_list: None,
-            })
+        // Which statuses the act can still take is a property of the status it holds
+        // (`crate::state::ActStatus::admits`): a finished act has no execution left for a
+        // status that puts it back under way to describe, so it admits only the outcomes a
+        // caller reports for a finished act and the status it already holds — the retry an
+        // `@idempotent` operation must answer, which changes nothing. A status outside that
+        // set is refused with the set itself, read off the act's current status, so a
+        // caller learns which statuses the update would have taken.
+        let current = act.status;
+        if !current.admits(requested) {
+            let admitted: Vec<&str> = current
+                .admitted()
+                .into_iter()
+                .map(crate::state::ActStatus::as_wire)
+                .collect();
+            return Err(UpdateActErrorModeled::ValidationException(
+                crate::state::status_transition::invalid_status(&admitted),
+            )
             .into());
         }
 

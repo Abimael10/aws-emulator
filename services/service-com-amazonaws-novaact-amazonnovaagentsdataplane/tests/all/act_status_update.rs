@@ -6,12 +6,13 @@
 //! The rule these cases assert is not "this one request answers these bytes": the update
 //! resolves the act by walking the chain the path names (definition -> run -> session ->
 //! act) and refusing the first link the store does not hold with 404, moves the act to
-//! whichever status the model's enum declares, keeps `endedAt` in step with that status
-//! (reported exactly when the act has reached a status that finishes it, absent otherwise),
-//! records the error information the request carries, and refuses with 400 `InvalidStatus`
-//! a request that would move an act out of a status it has already finished in — while
+//! whichever status the act's current status admits, keeps `endedAt` in step with that
+//! status (reported exactly when the act has reached a status that finishes it, absent
+//! otherwise), records the error information the request carries, and refuses with 400
+//! `InvalidStatus` a request naming a status the act's current one does not admit — while
 //! re-sending the status the act already holds changes nothing, as an `@idempotent`
-//! operation's retry must.
+//! operation's retry must. The SENTENCE that refusal carries is asserted by the sibling
+//! suite `act_status_transition_refusal.rs`, which drives the same harness.
 //!
 //! So the tables below vary what that rule generalises over: which of the six statuses
 //! `ActStatus` declares is asked for, whether it is a finishing one, the status the act
@@ -23,11 +24,6 @@ use serde_json::{json, Value};
 use service_com_amazonaws_novaact_amazonnovaagentsdataplane::ops::types::ACT_STATUS_VALUES;
 
 use crate::workflow_lifecycle::{text, Emulator};
-
-/// The sentence this service states for an act whose current status does not admit the one
-/// a request named, spelled out here rather than taken from the crate so a rewording of the
-/// handler's constant cannot change both sides of the comparison at once.
-const ACT_IN_UNEXPECTED_STATE: &str = "Act in unexpected state";
 
 /// The definition each case builds its chain under.
 const DEFINITION: &str = "act-status-update";
@@ -41,7 +37,13 @@ const ABSENT_UUID: &str = "00000000-0000-4000-8000-000000000000";
 /// out of time. An act in one of them reports an `endedAt`; the other three
 /// (`RUNNING`, `PENDING_CLIENT_ACTION`, `PENDING_HUMAN_ACTION`) each describe an act still
 /// under way.
-const FINISHED_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "TIMED_OUT"];
+pub(crate) const FINISHED_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "TIMED_OUT"];
+
+/// The values of `ActStatus` that are an OUTCOME a caller reports for an act it ran — the
+/// set a finished act still admits, as the service's refusal for a finished act names it.
+/// `TIMED_OUT` is not one of them: it is the verdict reached when an act runs out of time,
+/// not an outcome submitted for an act that has already finished.
+pub(crate) const REPORTED_OUTCOMES: [&str; 2] = ["SUCCEEDED", "FAILED"];
 
 /// Whether `status` is one the act has finished in.
 fn finishes(status: &str) -> bool {
@@ -49,15 +51,18 @@ fn finishes(status: &str) -> bool {
 }
 
 /// Where in the chain the acts of one case live.
+///
+/// `pub(crate)` with the helpers below so the sibling suite that asserts the refusal's
+/// sentence drives the same chain rather than carrying a copy of this harness.
 #[derive(Debug, Clone)]
-struct Chain {
-    definition: String,
-    run_id: String,
-    session_id: String,
+pub(crate) struct Chain {
+    pub(crate) definition: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
 }
 
 /// A fresh definition -> run -> session chain to create acts under.
-async fn chain(emulator: &Emulator, definition: &str) -> Chain {
+pub(crate) async fn chain(emulator: &Emulator, definition: &str) -> Chain {
     let (status, body) = emulator.create_definition(definition).await;
     assert_eq!(
         status, 201,
@@ -80,7 +85,7 @@ async fn chain(emulator: &Emulator, definition: &str) -> Chain {
 }
 
 /// One new act under `chain`, created `RUNNING` as `CreateAct` reports it.
-async fn new_act(emulator: &Emulator, chain: &Chain, task: &str) -> String {
+pub(crate) async fn new_act(emulator: &Emulator, chain: &Chain, task: &str) -> String {
     let (status, body) = emulator
         .create_act(&chain.definition, &chain.run_id, &chain.session_id, task)
         .await;
@@ -98,7 +103,12 @@ fn update_path(definition: &str, run_id: &str, session_id: &str, act_id: &str) -
 }
 
 /// One `UpdateAct` call carrying `body`.
-async fn update_act(emulator: &Emulator, chain: &Chain, act_id: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn update_act(
+    emulator: &Emulator,
+    chain: &Chain,
+    act_id: &str,
+    body: Value,
+) -> (u16, Value) {
     emulator
         .call(
             "PUT",
@@ -109,13 +119,18 @@ async fn update_act(emulator: &Emulator, chain: &Chain, act_id: &str, body: Valu
 }
 
 /// One `UpdateAct` call that only moves the act's status.
-async fn move_to(emulator: &Emulator, chain: &Chain, act_id: &str, status: &str) -> (u16, Value) {
+pub(crate) async fn move_to(
+    emulator: &Emulator,
+    chain: &Chain,
+    act_id: &str,
+    status: &str,
+) -> (u16, Value) {
     update_act(emulator, chain, act_id, json!({ "status": status })).await
 }
 
 /// The stored act read back through `ListActs` — the implemented reader of an act — so
 /// nothing below can pass on what the update itself answered.
-async fn summary(emulator: &Emulator, chain: &Chain, act_id: &str) -> Value {
+pub(crate) async fn summary(emulator: &Emulator, chain: &Chain, act_id: &str) -> Value {
     let (status, body) = emulator
         .call(
             "POST",
@@ -238,15 +253,19 @@ async fn an_act_still_under_way_moves_between_unfinished_statuses() {
     }
 }
 
-/// An act that has finished keeps the status and the instant it finished with: a request
-/// naming any OTHER status names a status its current one does not admit.
+/// An act that has finished admits only an outcome a caller reports for it and the status
+/// it already holds: a request naming any other status is refused, and the act keeps the
+/// status and the instant it finished with.
 #[tokio::test]
-async fn a_finished_act_refuses_a_move_to_another_status() {
+async fn a_finished_act_refuses_a_status_it_does_not_admit() {
     let emulator = Emulator::new("us-east-1");
     let chain = chain(&emulator, DEFINITION).await;
 
     for finished in FINISHED_STATUSES {
-        for requested in ACT_STATUS_VALUES.iter().filter(|value| **value != finished) {
+        for requested in ACT_STATUS_VALUES
+            .iter()
+            .filter(|value| **value != finished && !REPORTED_OUTCOMES.contains(&**value))
+        {
             let label = format!("{finished} then {requested}");
             let act_id = new_act(&emulator, &chain, &label).await;
             let (status, answer) = move_to(&emulator, &chain, &act_id, finished).await;
@@ -272,17 +291,47 @@ async fn a_finished_act_refuses_a_move_to_another_status() {
                 answer["reason"], "InvalidStatus",
                 "case {label:?}: expected reason \"InvalidStatus\", got {answer}"
             );
-            let message = text(&answer, "message");
-            assert_eq!(
-                message, ACT_IN_UNEXPECTED_STATE,
-                "case {label:?}: expected message {ACT_IN_UNEXPECTED_STATE:?}, got {message:?}"
-            );
 
             // The refusal left the act exactly as it was, instants included.
             let after = summary(&emulator, &chain, &act_id).await;
             assert_eq!(
                 after, finished_summary,
                 "case {label:?}: the refused update must change nothing, got {after}"
+            );
+        }
+    }
+}
+
+/// The statuses a finished act DOES admit are taken: whichever outcome a caller reports
+/// for an act is stored, and the act stays finished.
+#[tokio::test]
+async fn a_finished_act_takes_an_outcome_it_admits() {
+    let emulator = Emulator::new("eu-central-1");
+    let chain = chain(&emulator, DEFINITION).await;
+
+    for finished in FINISHED_STATUSES {
+        for requested in REPORTED_OUTCOMES {
+            let label = format!("{finished} then {requested}");
+            let act_id = new_act(&emulator, &chain, &label).await;
+            let (status, answer) = move_to(&emulator, &chain, &act_id, finished).await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: the act must finish first, got {status} {answer}"
+            );
+
+            let (status, answer) = move_to(&emulator, &chain, &act_id, requested).await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: an admitted status must be taken, got {status} {answer}"
+            );
+            let stored = summary(&emulator, &chain, &act_id).await;
+            assert_eq!(
+                stored["status"], requested,
+                "case {label:?}: expected the listing to report {requested:?}, got {stored}"
+            );
+            assert!(
+                !stored["endedAt"].is_null(),
+                "case {label:?}: a finished act reports endedAt, got {stored}"
             );
         }
     }

@@ -44,6 +44,10 @@ pub mod paging;
 /// that carries one is stored.
 pub mod export_config;
 
+/// Refusing a status a resource's current status does not admit, which every status write
+/// of this service states the same way.
+pub mod status_transition;
+
 /// The region an ARN carries when the request's SigV4 credential scope does not name a
 /// usable one (an unsigned in-process call, say). The `@pattern` on every ARN shape in
 /// this model requires a non-empty `[a-z0-9-]+` region segment, so there is no "no
@@ -321,9 +325,14 @@ pub enum ActStatus {
 impl ActStatus {
     /// Every status the model declares, in the ORDER it declares them
     /// (`smithy_query(query="shape",shape="ActStatus")`). It is the one list
-    /// [`Self::from_wire`] reads and the order a refusal lists the set in; the integration
-    /// suites check its length against the value list generated from the model, so a model
-    /// that grows a value does not leave it behind.
+    /// [`Self::from_wire`] reads, and the set every refusal that names the admissible
+    /// statuses is drawn FROM — each of those refusals states it in its own order, and
+    /// neither is this one: the refusal of a value outside the enumerated type's set states
+    /// it in the order the workspace's shared table of an enum's values is walked, and the
+    /// refusal of a status the act's current status does not admit states the subset
+    /// [`Self::admitted`] computes, in ascending order of the wire spelling. The integration
+    /// suites check this list's length against the value list generated from the model, so a
+    /// model that grows a value does not leave it behind.
     pub const ALL: [Self; 6] = [
         Self::Running,
         Self::PendingClientAction,
@@ -355,10 +364,46 @@ impl ActStatus {
     }
 
     /// Whether the act has FINISHED: it ran to the end, it failed, or it ran out of time.
-    /// Only an act in one of those statuses has an `endedAt`, and it is the last status
-    /// the act takes.
+    /// Only an act in one of those statuses has an `endedAt`.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::TimedOut)
+    }
+
+    /// Whether this status is an OUTCOME a caller reports for an act it ran: the act ran
+    /// to the end, or it failed. `TIMED_OUT` is not one — it is the verdict reached when
+    /// an act runs out of time, not an outcome a caller submits for one that has already
+    /// finished.
+    pub fn is_reported_outcome(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+
+    /// Whether an act whose current status is this one admits a move to `requested`.
+    ///
+    /// An act still under way admits every status the model declares: it can keep running,
+    /// wait on an action, finish, fail or run out of time. An act that has FINISHED has no
+    /// execution left for a status that puts it back under way to describe, so it admits
+    /// only the outcomes a caller reports for a finished act — and the status it already
+    /// holds, which an `@idempotent` retry re-sends and which moves nothing.
+    ///
+    /// The model states no transition rule for the member, so which statuses a finished act
+    /// admits is read off the refusal AWS answers for one it does not: that refusal names
+    /// the two reported outcomes. Keeping the held status in the set is what the operation's
+    /// `@idempotent` contract already requires of a retry.
+    pub fn admits(self, requested: Self) -> bool {
+        requested == self || !self.is_terminal() || requested.is_reported_outcome()
+    }
+
+    /// Every status an act whose current status is this one admits ([`Self::admits`]), in
+    /// ascending order of the wire spelling — the order AWS's refusal states the set in, and
+    /// the set that refusal names, so the sentence lists exactly what the update would have
+    /// taken.
+    pub fn admitted(self) -> Vec<Self> {
+        let mut admitted: Vec<Self> = Self::ALL
+            .into_iter()
+            .filter(|status| self.admits(*status))
+            .collect();
+        admitted.sort_by_key(|status| status.as_wire());
+        admitted
     }
 }
 
