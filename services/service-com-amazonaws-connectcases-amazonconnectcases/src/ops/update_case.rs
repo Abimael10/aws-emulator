@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // depends on the CASE, and is made once the case is resolved below.
         let deleted = domain.deleted_field_ids(input.fields.iter().map(|f| f.id.as_str()));
         let mismatched =
-            domain.mismatched_field_values(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
+            domain.mismatched_field_value(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
         let Some(case) = domain.cases.get_mut(&input.case_id) else {
             return Err(UpdateCaseErrorModeled::ResourceNotFoundException(
                 crate::state::not_found_worded(
@@ -226,11 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if !mismatched.is_empty() {
-            return Err(UpdateCaseErrorModeled::ValidationException(ValidationException {
-                message: format!("fields: {}", crate::state::name_ids(&mismatched)),
-            })
-            .into());
+        if let Some(refusal) = mismatched {
+            return Err(UpdateCaseErrorModeled::ValidationException(refusal).into());
         }
 
         // The edit this call makes, as the case's audit history records it:

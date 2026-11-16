@@ -370,21 +370,14 @@ fn content_refusal(
                     crate::state::unknown_fields(&unknown),
                 ));
             }
-            let mismatched = domain.mismatched_field_values(
+            let mismatched = domain.mismatched_field_value(
                 custom
                     .fields
                     .iter()
                     .map(|field| (field.id.as_str(), &field.value)),
             );
-            if !mismatched.is_empty() {
-                return Err(CreateRelatedItemErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "content.custom.fields: {}",
-                            crate::state::name_ids(&mismatched)
-                        ),
-                    },
-                ));
+            if let Some(refusal) = mismatched {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(refusal));
             }
         }
         // An SLA of the one modelled `SlaType`, `CaseField`, tracks one field of
@@ -402,16 +395,9 @@ fn content_refusal(
             }
             let targets = sla.target_field_values.as_deref().unwrap_or_default();
             let mismatched =
-                domain.mismatched_field_values(targets.iter().map(|value| (field_id, value)));
-            if !mismatched.is_empty() {
-                return Err(CreateRelatedItemErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "content.sla.slaInputConfiguration.targetFieldValues: {}",
-                            crate::state::name_ids(&mismatched)
-                        ),
-                    },
-                ));
+                domain.mismatched_field_value(targets.iter().map(|value| (field_id, value)));
+            if let Some(refusal) = mismatched {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(refusal));
             }
         }
         RelatedItemInputContent::Comment(_)

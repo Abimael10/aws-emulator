@@ -21,6 +21,8 @@ mod case_lifecycle;
 mod case_not_found;
 #[path = "all/case_search.rs"]
 mod case_search;
+#[path = "all/conflict_and_field_value_refusal_wording.rs"]
+mod conflict_and_field_value_refusal_wording;
 #[path = "all/domain_deletion.rs"]
 mod domain_deletion;
 #[path = "all/domain_listing.rs"]

@@ -281,12 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let mismatched =
-            domain.mismatched_field_values(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
-        if !mismatched.is_empty() {
-            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
-                message: format!("fields: {}", crate::state::name_ids(&mismatched)),
-            })
-            .into());
+            domain.mismatched_field_value(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
+        if let Some(refusal) = mismatched {
+            return Err(CreateCaseErrorModeled::ValidationException(refusal).into());
         }
 
         // The template's `requiredFields` is the "List of fields that must have

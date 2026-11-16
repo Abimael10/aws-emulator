@@ -875,33 +875,27 @@ impl Domain {
         selected
     }
 
-    /// The ids among `values` whose union variant is not a value of the
-    /// declared `FieldType` of the field it is written against, each reported
-    /// once in first-seen order with the type and the variant named. An id the
-    /// domain holds no record for at all is left to
+    /// The modelled 400 for the FIRST of `values` whose union variant is not
+    /// the one the declared `FieldType` of the field it is written against
+    /// takes, worded by [`field_value_type_mismatch`]; `None` when every value
+    /// fits its field. An id the domain holds no record for at all is left to
     /// [`Self::unrecorded_field_ids`]. A DELETED field still declares its type,
     /// and a value may still be written against it, so a value written against
     /// a tombstone is type-checked like any other. Linear in the number of
     /// values.
-    pub fn mismatched_field_values<'a, I>(&self, values: I) -> Vec<String>
+    ///
+    /// One value per refusal: the service's sentence for this rule is about one
+    /// field, so the values are checked in the order the request lists them and
+    /// the first one that does not fit is the one reported.
+    pub fn mismatched_field_value<'a, I>(&self, values: I) -> Option<ValidationException>
     where
         I: IntoIterator<Item = (&'a str, &'a FieldValueUnion)>,
     {
-        let mut reported: HashSet<&str> = HashSet::new();
-        let mut mismatched: Vec<String> = Vec::new();
-        for (id, value) in values {
-            let Some(field) = self.field_record(id) else {
-                continue;
-            };
-            if !value_fits_field_type(&field.field_type, value) && reported.insert(id) {
-                mismatched.push(format!(
-                    "{id} is a {} field and cannot hold {}",
-                    field.field_type,
-                    variant_name(value)
-                ));
-            }
-        }
-        mismatched
+        values.into_iter().find_map(|(id, value)| {
+            let field = self.field_record(id)?;
+            (!value_fits_field_type(&field.field_type, value))
+                .then(|| field_value_type_mismatch(id, &field.field_type))
+        })
     }
 }
 
@@ -1091,25 +1085,54 @@ pub fn variant_name(value: &FieldValueUnion) -> &'static str {
     }
 }
 
-/// Whether `value`'s union variant is a value OF `field_type`.
+/// The `FieldValueUnion` variant a value of `field_type` is written in: the one
+/// binding between the model's `FieldType` and its `FieldValueUnion`, which both
+/// the type check and the refusal it raises read.
 ///
 /// A case field's value has the field's own declared type, so the variant and
-/// the `FieldType` have to agree: a `Boolean` field holds `booleanValue`, a
+/// the `FieldType` have to agree: a `Boolean` field takes `booleanValue`, a
 /// `Number` field `doubleValue`, a `User` field `userArnValue`, and the
-/// string-valued types (`DateTime`, `SingleSelect`, `Text`, `Url`) hold
-/// `stringValue`. `emptyValue` is the absent value and clears a field of any
-/// type. `field_type` is one of `FIELD_TYPE_VALUES`; an unrecognised one
-/// matches nothing, because a value cannot be checked against a type this code
-/// does not know.
+/// string-valued types (`DateTime`, `SingleSelect`, `Text`, `Url`) take
+/// `stringValue`. `field_type` is one of `FIELD_TYPE_VALUES`; an unrecognised
+/// one takes no variant at all, because a value cannot be checked against a type
+/// this code does not know.
+pub fn variant_of_field_type(field_type: &str) -> Option<&'static str> {
+    match field_type {
+        "Boolean" => Some("booleanValue"),
+        "Number" => Some("doubleValue"),
+        "User" => Some("userArnValue"),
+        "DateTime" | "SingleSelect" | "Text" | "Url" => Some("stringValue"),
+        _ => None,
+    }
+}
+
+/// The variant that is a value of EVERY `FieldType`: "An empty value"
+/// (`smithy_query(query="shape",shape="FieldValueUnion")`), which clears a field
+/// of any type and is therefore the only variant a field whose type declares no
+/// variant of its own can hold.
+pub const ABSENT_FIELD_VALUE_VARIANT: &str = "emptyValue";
+
+/// Whether `value`'s union variant is a value OF `field_type`: the variant the
+/// type takes ([`variant_of_field_type`]), or the absent value, which clears a
+/// field of any type.
 pub fn value_fits_field_type(field_type: &str, value: &FieldValueUnion) -> bool {
-    match value {
-        FieldValueUnion::emptyValue(_) => true,
-        FieldValueUnion::booleanValue(_) => field_type == "Boolean",
-        FieldValueUnion::doubleValue(_) => field_type == "Number",
-        FieldValueUnion::userArnValue(_) => field_type == "User",
-        FieldValueUnion::stringValue(_) => {
-            matches!(field_type, "DateTime" | "SingleSelect" | "Text" | "Url")
-        }
+    matches!(value, FieldValueUnion::emptyValue(_))
+        || variant_of_field_type(field_type) == Some(variant_name(value))
+}
+
+/// The modelled 400 for a value written against a field whose declared type
+/// takes another union variant.
+///
+/// The sentence names the field the value was written against and the variant
+/// that field's STORED type takes — what the caller has to send to repair the
+/// call — and neither the type itself nor the variant that was supplied. The
+/// field id comes from the request; the variant is read off the field's declared
+/// type, so a field whose type takes no variant of its own can hold only the
+/// absent value and the sentence names that.
+pub fn field_value_type_mismatch(field_id: &str, field_type: &str) -> ValidationException {
+    let expected = variant_of_field_type(field_type).unwrap_or(ABSENT_FIELD_VALUE_VARIANT);
+    ValidationException {
+        message: format!("Field '{field_id}' value should be a {expected}"),
     }
 }
 
@@ -1810,6 +1833,35 @@ impl ResourceKind {
     pub fn resource_type(self) -> &'static str {
         self.words().1
     }
+
+    /// The sentence a 409 about the taken name `name` carries for this kind:
+    /// what [`name_conflict`] renders.
+    ///
+    /// A kind held in a CONTAINER (a field, a template, a layout, a case) is
+    /// named uniquely within the domain the request already addresses, so its
+    /// sentence quotes the name the request asked for. A DOMAIN is named
+    /// uniquely within the Amazon Web Services account — "It must be unique for
+    /// your Amazon Web Services account"
+    /// (`smithy_query(query="operation",operation="CreateDomain")`, member
+    /// `name`) — and the service reports the scope the name is already taken in
+    /// rather than the name: the account the call was made for, and no domain
+    /// name at all.
+    fn name_conflict_sentence(self, name: &str) -> String {
+        match self {
+            Self::Domain => {
+                format!(
+                    "Domain name already exists for account: {}",
+                    ::engine::emulator_account_id()
+                )
+            }
+            _ => {
+                let (leading, inline) = self.words();
+                format!(
+                    "{leading} creation failed: {inline} resource with the name {name} already exists!"
+                )
+            }
+        }
+    }
 }
 
 /// Which sentence a [`not_found`] refusal carries.
@@ -1857,24 +1909,23 @@ impl NotFoundWording {
 /// The modelled 409 for a create or a rename refused because a live resource of
 /// the same kind in the same container already holds the requested name.
 ///
-/// The message is rendered from the REQUEST's own name with the service's fixed
-/// template — `<Kind> creation failed: <kind> resource with the name <name>
-/// already exists!` — so a client that matches on it reads back only what it
-/// sent, never a server-minted id of the resource that won the name (which the
-/// loser never saw and cannot match on).
+/// The sentence is the one the KIND is refused with
+/// ([`ResourceKind::name_conflict_sentence`]): a kind named uniquely within the
+/// domain the request addresses reads back the name the request sent — never a
+/// server-minted id of the resource that won the name, which the loser never saw
+/// and cannot match on — while a domain, whose name is unique per account,
+/// reports that account instead.
 ///
-/// `CreateField`'s rendering is the one the recorded traffic pins; the other
-/// kinds are the same rule applied to the other creates that refuse on a taken
-/// name, so the refusals read alike instead of each inventing a sentence. A
-/// RENAME reuses the same sentence deliberately: it is the same rule, about the
-/// same clash, and nothing records a second wording for it — should a recording
-/// show the verb tracking the caller, that is the one place to change.
+/// `CreateField`'s rendering is the one the recorded traffic pins for the
+/// container-scoped kinds; the other kinds are the same rule applied to the
+/// other creates that refuse on a taken name, so the refusals read alike instead
+/// of each inventing a sentence. A RENAME reuses the same sentence deliberately:
+/// it is the same rule, about the same clash, and nothing records a second
+/// wording for it — should a recording show the verb tracking the caller, that is
+/// the one place to change.
 pub fn name_conflict(resource_kind: ResourceKind, name: &str) -> ConflictException {
-    let (leading, inline) = resource_kind.words();
     ConflictException {
-        message: format!(
-            "{leading} creation failed: {inline} resource with the name {name} already exists!"
-        ),
+        message: resource_kind.name_conflict_sentence(name),
     }
 }
 

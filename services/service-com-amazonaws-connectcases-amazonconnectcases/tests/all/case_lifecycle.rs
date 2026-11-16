@@ -1064,7 +1064,12 @@ async fn a_field_value_must_be_a_value_of_its_field_s_declared_type() {
         );
 
         // A variant of another type is refused, on the create and on the update,
-        // and the refusal names the field and its type.
+        // and the refusal names the field and the variant its stored type takes
+        // — the variant the accepted value above is written in.
+        let expected_variant = accepted
+            .as_object()
+            .and_then(|value| value.keys().next().cloned())
+            .unwrap_or_else(|| panic!("the accepted {field_type} value names no variant"));
         for (operation, method, path) in [
             (
                 "CreateCase",
@@ -1090,9 +1095,11 @@ async fn a_field_value_must_be_a_value_of_its_field_s_declared_type() {
                 (400, "ValidationException"),
                 "case {case:?}: expected 400 ValidationException, got {status} {code}: {message}"
             );
-            assert!(
-                message.contains(field_type) && message.contains(&field_id),
-                "case {case:?}: the refusal must name the field and its type, got {message:?}"
+            assert_eq!(
+                message,
+                format!("Field '{field_id}' value should be a {expected_variant}"),
+                "case {case:?}: the refusal must name the field and the variant its type \
+                 takes, got {message:?}"
             );
         }
 

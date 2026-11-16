@@ -293,11 +293,22 @@ async fn a_case_is_written_and_read_through_the_reserved_system_fields() {
     );
 
     // The reserved field's own declared type is enforced, so a value that is
-    // not a value of that type is refused rather than stored.
-    for (field_id, field_type, bad_value) in [
-        ("title", "Text", json!({ "booleanValue": true })),
-        ("assigned_user", "User", json!({ "stringValue": "not a user arn" })),
-        ("case_reason", "SingleSelect", json!({ "doubleValue": 1.5 })),
+    // not a value of that type is refused rather than stored — and the refusal
+    // names the reserved field and the union variant its type takes.
+    for (field_id, field_type, expected_variant, bad_value) in [
+        ("title", "Text", "stringValue", json!({ "booleanValue": true })),
+        (
+            "assigned_user",
+            "User",
+            "userArnValue",
+            json!({ "stringValue": "not a user arn" }),
+        ),
+        (
+            "case_reason",
+            "SingleSelect",
+            "stringValue",
+            json!({ "doubleValue": 1.5 }),
+        ),
     ] {
         let case = format!("UpdateCase {field_id} with a non-{field_type} value");
         let (status, code, message) = emulator
@@ -313,9 +324,11 @@ async fn a_case_is_written_and_read_through_the_reserved_system_fields() {
             (400, "ValidationException"),
             "case {case:?}: expected 400 ValidationException, got {status} {code}: {message}"
         );
-        assert!(
-            message.contains(field_id) && message.contains(field_type),
-            "case {case:?}: the refusal must name the field and its type, got {message:?}"
+        assert_eq!(
+            message,
+            format!("Field '{field_id}' value should be a {expected_variant}"),
+            "case {case:?}: the refusal must name the field and the variant its type takes, \
+             got {message:?}"
         );
     }
 }
@@ -624,9 +637,10 @@ async fn a_layout_may_not_place_a_reserved_field_that_is_not_configurable() {
 }
 
 #[tokio::test]
-async fn a_name_conflict_renders_the_same_template_for_every_container() {
-    // One rule, one template: the kind of resource is the only thing that
-    // differs between a domain, a field and a template refused on a taken name.
+async fn a_name_conflict_is_worded_by_the_scope_the_name_is_unique_in() {
+    // One rule per scope: a kind named uniquely inside the domain the request
+    // addresses reads the requested name back, while a domain — unique per
+    // account — is refused with the account the name is already taken in.
     let emulator = Emulator::new();
     let domain_id = domain(&emulator, "conflict-template-domain").await;
 
@@ -635,8 +649,9 @@ async fn a_name_conflict_renders_the_same_template_for_every_container() {
             "domain",
             "/domains".to_string(),
             json!({ "name": "conflict-template-domain" }),
-            "Domain creation failed: domain resource with the name conflict-template-domain \
-             already exists!",
+            // The one account a generated emulator serves, which every ARN it
+            // mints carries too (`engine::emulator_account_id`).
+            "Domain name already exists for account: 000000000000",
         ),
         (
             "field",
