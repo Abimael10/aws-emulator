@@ -37,6 +37,8 @@ mod metric_alarm_provisioning;
 mod native_queue_lifecycle;
 #[path = "all/native_resource_resolution.rs"]
 mod native_resource_resolution;
+#[path = "all/native_tag_plane.rs"]
+mod native_tag_plane;
 #[path = "all/not_found_refusal_status.rs"]
 mod not_found_refusal_status;
 #[path = "all/owning_service_delete_refusal.rs"]
