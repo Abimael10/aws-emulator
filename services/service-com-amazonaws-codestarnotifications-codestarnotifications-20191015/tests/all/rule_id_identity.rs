@@ -49,7 +49,10 @@ impl SeededRule {
 }
 
 /// The resource segment of a notification-rule ARN, after `notificationrule/`.
-fn id_of_arn<'a>(case: &str, arn: &'a str) -> &'a str {
+///
+/// `pub(crate)` so the sibling suites assert the id/ARN pair through this ONE reading of
+/// an ARN rather than each splitting the value their own way.
+pub(crate) fn id_of_arn<'a>(case: &str, arn: &'a str) -> &'a str {
     arn.split_once(":notificationrule/")
         .map(|(_, id)| id)
         .unwrap_or_else(|| {
@@ -59,7 +62,10 @@ fn id_of_arn<'a>(case: &str, arn: &'a str) -> &'a str {
 
 /// A minted rule id is a version-4 UUID in its canonical hyphenated lowercase form, and
 /// fits the member's modelled length.
-fn assert_canonical_rule_id(case: &str, id: &str) {
+///
+/// `pub(crate)` for the same reason as [`id_of_arn`]: one statement of the id form, read
+/// by every suite that asserts it.
+pub(crate) fn assert_canonical_rule_id(case: &str, id: &str) {
     assert!(
         ID_LENGTH_BOUNDS.contains(&id.len()),
         "case {case:?}: NotificationRuleId is length 1..40, got {} for {id:?}",

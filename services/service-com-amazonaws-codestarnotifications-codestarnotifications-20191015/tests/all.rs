@@ -33,6 +33,8 @@ mod list_targets;
 mod notification_rule_lifecycle;
 #[path = "all/rule_arn_authorization.rs"]
 mod rule_arn_authorization;
+#[path = "all/rule_id_correlation.rs"]
+mod rule_id_correlation;
 #[path = "all/rule_id_identity.rs"]
 mod rule_id_identity;
 #[path = "all/state_roundtrip.rs"]

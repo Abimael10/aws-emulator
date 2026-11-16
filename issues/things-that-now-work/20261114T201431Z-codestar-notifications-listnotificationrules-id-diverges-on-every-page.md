@@ -12,6 +12,37 @@ Issue-Commit: 7bfda40add59a57de4c47a21257187f7eb42eb8e
 
 # codestar-notifications ListNotificationRules Id diverges on every page after the id-minting rewrite
 
+## Resolution (all three causes declined: a per-run generated resource id)
+
+The emulator's behaviour is correct and all THREE causes are DECLINED, not implemented.
+They are one difference on one member: `NotificationRuleSummary.Id` carries the id the
+service drew for that rule in THIS run, while the recording holds the id AWS drew in the
+recording run. `crate::state::new_rule_id` already draws a canonical hyphenated lowercase
+version-4 UUID (inside `NotificationRuleId`'s `@length` 1..40 — the only constraint the
+model places on it), `crate::state::notification_rule_arn` embeds that exact value as the
+ARN's `notificationrule/<id>` segment, and `src/ops/list_notification_rules.rs` reports the
+stored id verbatim beside the stored ARN on every page, filtered or not. The two values
+therefore differ only in their draw: same modelled type, same length, same form, same
+provenance.
+
+Do NOT implement the remedy the report implies (serve the recording's uuid, or derive the
+id from the request): a rule id is minted once per rule and recurs in no later run, and an
+id taken from the recording would also have to differ from the resource segment of the ARN
+the emulator minted — which this very report requires to stay byte-for-byte identical. The
+replay keys `codestar-notifications|ListNotificationRules|2xx->2xx|$.NotificationRules[Arn=
+"...notificationrule/<uuid>"].Id` therefore stay failing by construction, and each new
+replay reports them under that run's own uuids.
+
+What the resolution added instead is the test that pins the rule:
+`tests/all/rule_id_correlation.rs` asserts, over a table of rules spanning region, resource
+type, detail type, event-type count and target count, that the identifier is DRAWN (two
+independent stores answering the same create sequence share no id, and no id is a value its
+own request carried), that the `Id` a listing reports — at the modelled minimum page size
+and with no `MaxResults` — rebuilds exactly that rule's ARN and that the rebuilt ARN
+addresses the rule through describe, subscribe, tag, list-tags, update and delete, and that
+an id names a rule only in its own region. `tests/all/rule_id_identity.rs` keeps the id
+form and the id's stability across reads, updates and re-creations.
+
 > _Note: this issue was identified against the code base at commit `7bfda40add59a57de4c47a21257187f7eb42eb8e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
