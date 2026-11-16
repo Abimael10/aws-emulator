@@ -13,6 +13,8 @@
 mod boundary_validation_refusal;
 #[path = "all/capacity_reservation_lifecycle.rs"]
 mod capacity_reservation_lifecycle;
+#[path = "all/capacity_reservation_listing.rs"]
+mod capacity_reservation_listing;
 #[path = "all/catalog_statements.rs"]
 mod catalog_statements;
 #[path = "all/data_catalog_delete.rs"]

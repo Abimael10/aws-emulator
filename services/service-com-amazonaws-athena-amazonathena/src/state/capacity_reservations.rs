@@ -305,6 +305,22 @@ impl CapacityReservationRegistry {
             .filter(|record| !record.is_retired_at(now))
     }
 
+    /// Every reservation this account holds at `now`, as the modelled
+    /// `CapacityReservation` entries a listing reports, in name order.
+    ///
+    /// Answered through the SAME filter a read by name applies ([`Self::reservation`]), so
+    /// a reservation whose cancelled retention elapsed is absent from the listing exactly
+    /// as it is to a read of it, and through the same rendering
+    /// ([`CapacityReservationRecord::to_capacity_reservation`]), so the entry a listing
+    /// carries cannot drift from the one a read of that reservation answers with.
+    pub fn reservations_at(&self, now: SystemTime) -> Vec<CapacityReservation> {
+        self.reservations
+            .values()
+            .filter(|record| !record.is_retired_at(now))
+            .map(|record| record.to_capacity_reservation(now))
+            .collect()
+    }
+
     /// How many reservations the account holds at `now`, the count
     /// [`MAX_CAPACITY_RESERVATIONS`] bounds.
     pub fn len_at(&self, now: SystemTime) -> usize {
@@ -338,6 +354,28 @@ impl CapacityReservationRegistry {
     pub fn retire_cancelled(&mut self, now: SystemTime) {
         self.reservations
             .retain(|_, record| !record.is_retired_at(now));
+    }
+}
+
+/// The cursor a `ListCapacityReservations` page hands back: the scope it walked — the
+/// whole account, since the operation models no member that narrows it, and
+/// `ListCapacityReservations` "Lists the capacity reservations for the current account" —
+/// and the position to resume at.
+fn capacity_reservations_cursor(position: usize) -> String {
+    format!("capacityreservations{CURSOR_SEPARATOR}{ACCOUNT_SCOPE}{CURSOR_SEPARATOR}{position}")
+}
+
+impl ComAmazonawsAthenaAmazonathenaState {
+    /// The `NextToken` a `ListCapacityReservations` page resumed at `position` hands back.
+    pub fn capacity_reservations_page_token(&self, position: usize) -> String {
+        ::hex::encode(self.page_token_key.mint(&capacity_reservations_cursor(position)))
+    }
+
+    /// The position `token` resumes a capacity-reservation listing at, or `None` for a
+    /// token this store did not mint for THAT listing.
+    pub fn capacity_reservations_page_position(&self, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "capacityreservations", ACCOUNT_SCOPE)
     }
 }
 
