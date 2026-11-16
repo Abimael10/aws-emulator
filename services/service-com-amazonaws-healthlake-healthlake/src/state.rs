@@ -70,6 +70,9 @@ use std::time::{Duration, Instant, SystemTime};
 mod agent_conversation;
 pub use agent_conversation::*;
 
+mod data_access_role;
+pub use data_access_role::*;
+
 mod import_run;
 pub use import_run::*;
 
@@ -353,6 +356,22 @@ pub fn transformation_job_not_found_message(job_id: &str) -> String {
     format!("Transformation job not found: {job_id}")
 }
 
+/// The sentence this service's `ResourceNotFoundException` carries when a data
+/// transformation JOB call names a data transformation profile no record holds.
+///
+/// The job surface words a resource it cannot find as the resource KIND followed
+/// by the identifier the request named — the template
+/// [`transformation_job_not_found_message`] states for a missing job — so a client
+/// starting a job tells a missing profile from a missing job by the kind the
+/// sentence names rather than by which call it made. The profile surface words its
+/// own refusals its own way ([`profile_not_found_message`]), because the wording
+/// belongs to the operation that answers it. The identifier is taken from the
+/// request and is bounded by the modelled `ProfileIdString` (32 characters,
+/// `^[a-f0-9]{32}$`) the boundary validator has already enforced.
+pub fn transformation_profile_not_found_message(profile_id: &str) -> String {
+    format!("Data transformation profile not found: {profile_id}")
+}
+
 /// The `SourceFormat` value set this service's refusal of a value outside the enum
 /// REPORTS, in the order it lists them.
 ///
@@ -551,6 +570,18 @@ pub const DRAFT_PROFILE_VERSION: i32 = 0;
 /// modelled `ProfileVersion` range (0..99): the DRAFT is 0, so at most 99
 /// published versions exist.
 pub const MAX_PROFILE_VERSION: i32 = 99;
+
+/// The sentence `PublishDataTransformationProfile`'s
+/// `ServiceQuotaExceededException` carries when a profile has run out of version
+/// numbers.
+///
+/// A template whose one variable part is the ceiling itself
+/// ([`MAX_PROFILE_VERSION`]), which is what the quota IS: the publish that would
+/// pass the bound is the one refused, so the sentence states how many published
+/// versions a profile may hold and quotes nothing from the request.
+pub fn published_version_quota_message() -> String {
+    format!("Maximum of {MAX_PROFILE_VERSION} published versions exceeded")
+}
 
 /// The most mapping entries one profile version holds, from the modelled
 /// `ProfileMapping` map's own length bound (1..500) — the shape

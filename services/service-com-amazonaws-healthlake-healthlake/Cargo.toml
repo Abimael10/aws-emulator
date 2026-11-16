@@ -55,6 +55,13 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # creating the objects and arrays the path passes through, so this crate does not
 # hand-roll that traversal.
 json_dotpath = "1.1"
+# Resolves the principal a request's credential speaks for, so the refusal of a
+# `DataAccessRoleArn` this service may not be passed blames the identity
+# `sts:GetCallerIdentity` reports for that same credential
+# (`src/state/data_access_role.rs`). The token service's own resolution is called
+# rather than reproduced, over the SAME shared engine this service's store lives in:
+# no network client and no second copy of the account's identities.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -72,6 +79,11 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # Decodes the `application/vnd.amazon.eventstream` frames the agent suite reads back,
 # so what is asserted is the wire an SDK's event-stream decoder sees.
 aws-smithy-eventstream = "0.60"
+# The data-access-role suite mounts IAM beside this service on ONE engine, exactly
+# as the assembled router mounts them, and creates each role under test through
+# IAM's OWN `CreateRole` — so the trust policy the start resolves is the record IAM
+# really holds. DEV-ONLY: the shipped crate asks IAM over the in-process callback.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,7 +9,9 @@
 //! minted `JobId` with the `SUBMITTED` status that record holds.
 //!
 //! A `ProfileId` the service holds no profile for is the modelled
-//! `ResourceNotFoundException`. The profile's NAME and the VERSION the job runs
+//! `ResourceNotFoundException`, in this surface's own wording
+//! ([`crate::state::transformation_profile_not_found_message`]). The profile's
+//! NAME and the VERSION the job runs
 //! against are resolved here and stored on the job, so a later read reports
 //! what the job was started with rather than re-deriving it from a profile that
 //! may since have changed. The start call carries no version, so the version is
@@ -26,6 +28,14 @@
 //! second job, changes nothing on the job the token started, and answers out of
 //! that job's stored record, whatever the rest of the request says and whether
 //! or not it repeats the first one. Nothing about the repeat is refused.
+//!
+//! The `DataAccessRoleArn` the request carries is the role this service would
+//! assume to reach the Amazon S3 locations, so handing it over is a PASS of that
+//! role to this service: a role the account's IAM holds whose trust policy does
+//! not let this service assume it is refused with the modelled
+//! `AccessDeniedException` BEFORE any record is minted, in the wording
+//! [`crate::state::data_access_role`] states. Nothing is refused on evidence this
+//! emulator does not have — that module says which answers show nothing.
 //!
 //! RUNNING THE TRANSFORMATION means reading the source files from the input
 //! Amazon S3 location and writing the converted output to the destination
@@ -198,23 +208,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_server(
                 "the HealthLake data transformation job registry is unavailable",
             ));
         };
 
+        // A call under a token already seen is IGNORED and answered out of the
+        // job that token started — see the module docs — so one token starts
+        // one job however the rest of the request is spelled, and nothing the
+        // repeat carries is looked at, validated or authorized past the
+        // boundary. Asked before anything else, and again below once the role
+        // has been resolved, because the token may have started a job while it
+        // was.
+        if let Some(started) = started_under(&state, &input.client_token) {
+            return Ok(started);
+        }
+
+        // The role the conversion would run as. Handing it over is a PASS of the
+        // role to this service, so a role the account's IAM holds and whose trust
+        // policy does not let this service assume it is refused BEFORE any record
+        // is minted — see [`crate::state::data_access_role`]. The question goes to
+        // IAM, so it is asked with nothing locked.
+        let region = crate::state::request_region(ctx.parts());
+        if crate::state::data_access_role_is_unpassable(ctx, &region, &input.data_access_role_arn)
+            .await
+        {
+            return Err(access_denied(crate::state::pass_role_denied_message(
+                &crate::state::caller_principal_arn(&*self.engine, ctx),
+                &input.data_access_role_arn,
+            )));
+        }
+
         let mut store = state.lock();
         // The job records must have caught up with the clock before any of them
         // is read: an earlier job whose transition is already due would
         // otherwise be answered under the status it has left.
         store.settle_transformation_jobs();
-
-        // A call under a token already seen is IGNORED and answered out of the
-        // job that token started — see the module docs — so one token starts
-        // one job however the rest of the request is spelled, and nothing the
-        // repeat carries is looked at or validated past the boundary.
         if let Some(started) = store.transformation_job_for_client_token(&input.client_token) {
             // Answered out of the STORED record, so a repeat cannot report a
             // status the job has already left.
@@ -226,13 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The profile the conversion runs against, with the name and the
         // version resolved as they stand NOW and stored on the job — see the
-        // module docs. A profile no record holds is refused with the template
-        // every profile not-found path in this crate states, naming the
-        // requested profile.
+        // module docs. A profile no record holds is refused in this surface's
+        // own wording, naming the kind of resource it could not find and the
+        // identifier the request asked for.
         let Some(profile) = store.profiles.get(&input.profile_id) else {
-            return Err(not_found(crate::state::profile_not_found_message(
-                &input.profile_id,
-            )));
+            return Err(not_found(
+                crate::state::transformation_profile_not_found_message(&input.profile_id),
+            ));
         };
         let profile_name = profile.name.clone();
         let profile_version = profile
@@ -305,10 +335,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The job a `ClientToken` has ALREADY started, answered out of that job's stored
+/// record, or `None` when this service has not seen the token.
+///
+/// The clock is settled first, so a repeat cannot report a status the job it names
+/// has already left; that write is one the clock owed at this instant whether or
+/// not anybody called. Held here rather than inline because the handler asks the
+/// question twice: once before the role is resolved, and once under the lock it
+/// then takes.
+fn started_under(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsHealthlakeHealthlakeState>,
+    client_token: &str,
+) -> Option<StartDataTransformationJobOutput> {
+    let mut store = state.lock();
+    store.settle_transformation_jobs();
+    store
+        .transformation_job_for_client_token(client_token)
+        .map(|started| StartDataTransformationJobOutput {
+            job_id: started.id.clone(),
+            job_status: started.status.as_wire().to_string(),
+        })
+}
+
 /// This operation's 404, stating which resource the service does not hold — the
-/// wording every not-found path in this crate uses.
+/// wording this surface words a missing resource in.
 fn not_found(message: String) -> StartDataTransformationJobError {
     StartDataTransformationJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's 403, for a request that may not hand this service the role it
+/// named.
+fn access_denied(message: String) -> StartDataTransformationJobError {
+    StartDataTransformationJobErrorModeled::AccessDeniedException(AccessDeniedException {
         message: Some(message),
     })
     .into()

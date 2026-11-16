@@ -256,10 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(crate::state::DRAFT_PROFILE_VERSION, |latest| latest.version)
             + 1;
         if version > crate::state::MAX_PROFILE_VERSION {
-            return Err(quota_exceeded(format!(
-                "The profile already holds the maximum number of published versions ({})",
-                crate::state::MAX_PROFILE_VERSION
-            )));
+            return Err(quota_exceeded(
+                crate::state::published_version_quota_message(),
+            ));
         }
 
         // A published version is retained ALONGSIDE every other version of its

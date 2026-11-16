@@ -18,7 +18,8 @@
 //!    service's own `Message` saying why, `EndTime` stamped once, and no
 //!    `JobProgressReport` at all, because no file was scanned;
 //! 4. a `ProfileId` no profile record holds is `ResourceNotFoundException` in
-//!    this service's fixed not-found sentence, and a refused start mints
+//!    this surface's own not-found sentence — the kind of resource it could not
+//!    find and the identifier the request named — and a refused start mints
 //!    nothing;
 //! 5. one `ClientToken` starts one job: a call carrying a token already seen
 //!    is IGNORED and answered out of the job that token started — whatever
@@ -36,8 +37,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::state::{
-    ComAmazonawsHealthlakeHealthlakeState, ProfileVersionRecord, profile_not_found_message,
-    TRANSFORMATION_NOT_PERFORMED_MESSAGE,
+    ComAmazonawsHealthlakeHealthlakeState, ProfileVersionRecord,
+    transformation_profile_not_found_message, TRANSFORMATION_NOT_PERFORMED_MESSAGE,
 };
 
 use crate::fhir_datastore_lifecycle::{error_code, error_message, string_at, HealthLake,
@@ -486,7 +487,7 @@ async fn a_profile_id_no_record_holds_is_refused_and_mints_nothing() {
             "ResourceNotFoundException",
             "case {case:?}: the refusal must be ResourceNotFoundException, got {payload}"
         );
-        let expected = profile_not_found_message(profile_id);
+        let expected = transformation_profile_not_found_message(profile_id);
         assert_eq!(
             error_message(&payload),
             expected,

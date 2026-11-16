@@ -213,19 +213,22 @@ pub(crate) fn validation_envelope(violations: &[Violation]) -> String {
 
 /// One violation as this service states it.
 ///
-/// Two classes state the member and the requirement ALONE, with no echo of what the
-/// caller sent:
+/// Three classes state the member and the requirement ALONE, with no echo of what
+/// the caller sent:
 ///
 /// * a value outside an enumerated type's value set — an unknown enum name never
 ///   becomes a value of the modelled type, so there is no value for the refusal to
-///   quote, and what the caller needs is the permitted set; and
+///   quote, and what the caller needs is the permitted set;
 /// * a value outside a member's `@pattern` — the value is the thing the pattern
 ///   rejected, and what the caller needs is the pattern, stated as the member
 ///   declares it but WITHOUT the `^`/`$` anchors, which say where the pattern is
-///   applied rather than what it admits.
+///   applied rather than what it admits; and
+/// * a COLLECTION outside its `@length` — a list or a map is not rendered as a
+///   value at all ([`is_collection_size`]), so what the caller needs is the member
+///   and the bound.
 ///
-/// Every other class (length, range, uniqueness, absence) keeps the framework's own
-/// clause, which quotes the offending value as AWS does.
+/// Every other class (a scalar's length, range, uniqueness, absence) keeps the
+/// framework's own clause, which quotes the offending value as AWS does.
 fn clause_for(violation: &Violation) -> String {
     match &violation.kind {
         ViolationKind::EnumValue(allowed) => format!(
@@ -239,10 +242,62 @@ fn clause_for(violation: &Violation) -> String {
             violation.path,
             unanchored(pattern)
         ),
+        _ if is_collection_size(violation) => format!(
+            "Value at '{}' failed to satisfy constraint: {}",
+            violation.path,
+            length_requirement(&violation.kind)
+        ),
         // `ViolationKind` is `#[non_exhaustive]`: anything else — including a
         // class added later — keeps the framework's wording rather than being
         // dropped or reworded on no evidence.
         _ => violation.message(),
+    }
+}
+
+/// Whether this violation's value is the framework's stand-in for a COLLECTION's
+/// SIZE rather than anything the caller sent.
+///
+/// A `@length` failure on a list or a map carries `"<n> items"` / `"<n> entries"`
+/// as its value, because the collection itself is never rendered. That phrase is in
+/// no request, so a clause states the member and the bound without it rather than
+/// quoting a value the caller never submitted — which is also what keeps a
+/// `@sensitive` collection's size out of the response. Only a `@length` failure can
+/// carry such a stand-in, so no other violation's value is second-guessed.
+fn is_collection_size(violation: &Violation) -> bool {
+    if length_requirement(&violation.kind).is_empty() {
+        return false;
+    }
+    let Some(value) = violation.value.as_deref() else {
+        // A length violation this crate's own non-RPC surfaces raise for a
+        // collection carries no value at all, for the reason they say: a
+        // collection is as long as the caller chose, so echoing it would amplify
+        // the request. A `@sensitive` member is not this case — the framework
+        // already words that one without a value.
+        return !violation.sensitive;
+    };
+    let Some((count, unit)) = value.split_once(' ') else {
+        return false;
+    };
+    matches!(unit, "items" | "entries")
+        && !count.is_empty()
+        && count.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The requirement a `@length` violation states, or `""` for a violation of any
+/// other class.
+///
+/// The bound is the one the framework recorded on the violation, worded as the
+/// framework words it, so a length clause this file states and one it leaves to
+/// [`Violation::message`] cannot drift apart.
+fn length_requirement(kind: &ViolationKind) -> String {
+    match kind {
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        _ => String::new(),
     }
 }
 

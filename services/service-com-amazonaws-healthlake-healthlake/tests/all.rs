@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/control_plane_error_semantics.rs"]
 mod control_plane_error_semantics;
+#[path = "all/data_access_role_pass_role.rs"]
+mod data_access_role_pass_role;
 #[path = "all/data_transformation_endpoint_host.rs"]
 mod data_transformation_endpoint_host;
 #[path = "all/data_transformation_job.rs"]
@@ -109,6 +111,8 @@ mod tag_mutation_requires_a_live_resource;
 mod timestamp_cutoff_filters;
 #[path = "all/transform_data.rs"]
 mod transform_data;
+#[path = "all/transformation_refusal_values.rs"]
+mod transformation_refusal_values;
 #[path = "all/update_data_transformation_profile.rs"]
 mod update_data_transformation_profile;
 #[path = "all/update_fhir_datastore.rs"]
