@@ -502,8 +502,8 @@ async fn a_stage_refuses_a_pointer_it_has_no_member_for_as_a_method_setting_path
     //
     // A two-token method path whose resource half simply LEAVES its leading separator to the
     // pointer (`/pets/GET/…`) is not one of them: that is the spelling
-    // `MethodSetting$ResourcePath` states a path in, so it names the method `pets/GET` and is
-    // applied — see `a_method_settings_key_is_the_method_path_its_pointer_names`.
+    // `MethodSetting$ResourcePath` states a path in, so it names the method `~1pets/GET` and
+    // is applied — see `a_method_settings_key_is_the_method_path_its_pointer_names`.
     let paths = [
         "/sim2realNoSuchField",
         "/stageName",
@@ -584,9 +584,10 @@ async fn a_stage_refuses_a_pointer_it_has_no_member_for_as_a_method_setting_path
     );
 }
 
-/// The `methodSettings` key a patch writes is the method path its pointer names — as the
-/// pointer spelled it where the method took two reference tokens, decoded where it took one
-/// — so a client reading the stage finds the setting it just wrote under that key.
+/// The `methodSettings` key a patch writes is the method its pointer names — the one key
+/// `Stage$methodSettings` documents for that method, whichever of the spellings a pointer may
+/// address it by was used — so a client reading the stage finds the setting it just wrote
+/// under that key.
 #[tokio::test]
 async fn a_method_settings_key_is_the_method_path_its_pointer_names() {
     let gateway = Gateway::new();
@@ -596,13 +597,14 @@ async fn a_method_settings_key_is_the_method_path_its_pointer_names() {
 
     // Rows span the method paths a client spells: a child resource, a nested one, the root
     // resource, the wildcard form, and the whole method path inside ONE token — which the
-    // service has to decode to read the method out of it, so that key carries no escape.
+    // service has to decode to read the method out of it, and which is then keyed exactly as
+    // the two-token spelling of that method is.
     let rows: [(&str, &str); 5] = [
         ("/~1pets/GET/metrics/enabled", "~1pets/GET"),
         ("/~1pets~1{petId}/DELETE/metrics/enabled", "~1pets~1{petId}/DELETE"),
         ("/~1/GET/metrics/enabled", "~1/GET"),
         ("/*/*/metrics/enabled", "*/*"),
-        ("/~1pets~1POST/metricsEnabled", "/pets/POST"),
+        ("/~1pets~1POST/metricsEnabled", "~1pets/POST"),
     ];
 
     let mut expected: Vec<String> = Vec::new();

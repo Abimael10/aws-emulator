@@ -14,9 +14,9 @@
 //! The rule under test: a method-setting path spells the method either in TWO reference
 //! tokens (`/~1pets/GET/…`) or in one (`/~1pets~1GET/…`), and the setting may be addressed
 //! by its published name or by its modelled member name — both write the SAME member of
-//! the entry the method is keyed by, which is the method path as the pointer spelled it
-//! where it took two tokens and the decoded path where it took one. A path that leaves no
-//! setting beyond the method, or whose tail names none, is refused and changes nothing.
+//! the entry the method is keyed by, which is the one key `Stage$methodSettings` documents
+//! for that method whichever spelling addressed it. A path that leaves no setting beyond
+//! the method, or whose tail names none, is refused and changes nothing.
 //!
 //! Asserted over a TABLE rather than one recorded call: every setting of the
 //! `MethodSetting` shape in both spellings, each with a value that differs from the one a
@@ -163,8 +163,8 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
 
     for (published, member, value, expected) in setting_catalog() {
         // One method path per spelling, so each row proves which setting the spelling
-        // wrote rather than merely that something changed. The key is the method path as
-        // the pointer spelled it.
+        // wrote rather than merely that something changed. The key is the method the
+        // pointer addressed.
         let published_key = format!("~1{member}-published/GET");
         let member_key = format!("~1{member}-member/GET");
         for (spelling, path, key) in [
@@ -205,8 +205,9 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
 async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_it_names() {
     // Rows differ along how a client spells the method path: a child resource and a nested
     // one with the resource path's slashes escaped and the method in its own token, the
-    // root resource, the whole method path inside ONE token (which is keyed decoded), and
-    // the `*/*` wildcard `Stage$methodSettings` documents for every method of the stage.
+    // root resource, the whole method path inside ONE token (which names the same method as
+    // the two-token spelling, so it is keyed the same way), and the `*/*` wildcard
+    // `Stage$methodSettings` documents for every method of the stage.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("a child resource", "/~1pets/GET/metricsEnabled", "~1pets/GET"),
         ("the root resource", "/~1/GET/metricsEnabled", "~1/GET"),
@@ -218,7 +219,7 @@ async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_it_names(
         (
             "the whole method path in one token",
             "/~1pets~1POST/metricsEnabled",
-            "/pets/POST",
+            "~1pets/POST",
         ),
         ("every method", "/*/*/metricsEnabled", "*/*"),
     ];

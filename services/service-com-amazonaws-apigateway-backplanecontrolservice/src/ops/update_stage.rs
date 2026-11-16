@@ -33,10 +33,11 @@
 //!   documents — so a `/` inside the resource path is escaped `~1` in the PATH while the
 //!   separator before the HTTP method is a real one, the path's own LEADING separator is
 //!   either escaped too or left to the pointer's (`/pets/GET/…`, the spelling
-//!   `MethodSetting$ResourcePath` states a path in), the KEY carries the method path as the
-//!   pointer spelled it, and a pointer that escapes the separator before the method too
-//!   names the method in ONE token instead — see [`apply_method_setting_patch`],
-//!   [`METHOD_PATH_TOKENS`] and [`method_settings_key`].
+//!   `MethodSetting$ResourcePath` states a path in), and a pointer that escapes the
+//!   separator before the method too names the method in ONE token instead. Every one of
+//!   those spellings addresses the one method, so every one is keyed under the one
+//!   documented key — see [`apply_method_setting_patch`], [`METHOD_PATH_TOKENS`] and
+//!   [`crate::state::method_settings_key`].
 //! * a pointer that is no member of the `Stage` shape is read as such a method path, so
 //!   it is refused as one — see [`STAGE_INVALID_PATCH_PATH`].
 //! * `accessLogSettings` and `canarySettings`, structures whose own members are
@@ -134,10 +135,10 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::state::{
-    patch_enum_string, patch_enum_string_refused_with, patch_f64_checked, patch_f64_refused_with,
-    patch_i32_refused_with,
+    method_settings_key, patch_enum_string, patch_enum_string_refused_with, patch_f64_checked,
+    patch_f64_refused_with, patch_i32_refused_with,
     patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind, StageEntry,
-    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    EVERY_RESOURCE, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
 // The `path` values `UpdateStage` accepts are the ones `apply_patch` below has an arm
@@ -966,14 +967,14 @@ const METHOD_PATH_TOKENS: usize = 2;
 ///   before the method is a real one and every separator INSIDE the resource path is
 ///   escaped, its leading one either escaped too (`/~1pets/GET/…`) or left to the pointer's
 ///   own leading separator (`/pets/GET/…`, the spelling `MethodSetting$ResourcePath` states
-///   a path in) — and then the setting, in either spelling [`METHOD_SETTING_NAMES`] lists.
-///   The method is keyed as the pointer spelled it (`~1pets/GET`, `pets/GET`), escapes
-///   included;
+///   a path in) — and then the setting, in either spelling [`METHOD_SETTING_NAMES`] lists;
 /// * as ONE token carrying the whole method path, `/{escaped_method_path}/{setting}`, and
 ///   then the setting's own member name. That token has to be decoded for the method to be
-///   read out of it at all, so the method is keyed decoded (`/pets/GET`) — which is why the
-///   two spellings of one method are two entries of the map rather than one, as a recorded
-///   stage patched both ways shows.
+///   read out of it at all.
+///
+/// Whichever spelling addressed it, the method is keyed under the ONE key
+/// `Stage$methodSettings` documents for it ([`crate::state::method_settings_key`]), so a
+/// stage holds one entry per method rather than one per spelling.
 ///
 /// A pointer that is neither — a one-token method path followed by a GROUPED setting name,
 /// a tail that names no setting, a path that stops at the method — names no setting of a
@@ -991,7 +992,7 @@ fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
         .filter(|tail| !tail.is_empty())
     {
         if let Some(setting) = named_setting(&tail.join("/")) {
-            return Some((spelled_method_path(patch)?, setting));
+            return Some((addressed_method_path(patch)?, setting));
         }
     }
     let [method_path, setting] = patch.tokens.as_slice() else {
@@ -1003,11 +1004,14 @@ fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
     let setting = named_setting(setting)?;
     // Decoded, that one token has to BE a method path: a resource path, and then the HTTP
     // method after the `/` the escape stood for.
-    let (resource_path, _) = method_path.rsplit_once('/')?;
+    let (resource_path, http_method) = method_path.rsplit_once('/')?;
     if !names_a_resource(resource_path) {
         return None;
     }
-    Some((method_path.clone(), setting))
+    Some((
+        method_settings_key(resource_path, http_method),
+        setting,
+    ))
 }
 
 /// Whether `resource_path` is the resource half of a method path spelled WHOLE inside one
@@ -1023,10 +1027,6 @@ fn names_a_resource(resource_path: &str) -> bool {
     resource_path.starts_with('/') || resource_path == EVERY_RESOURCE
 }
 
-/// The method-path token that stands for EVERY resource, and for every method, of the
-/// stage: `Stage$methodSettings` documents the whole-stage key as `/*/*`.
-const EVERY_RESOURCE: &str = "*";
-
 /// The PUBLISHED name of the setting `tail` spells, in either spelling, or `None` when it
 /// names no setting.
 fn named_setting(tail: &str) -> Option<&'static str> {
@@ -1041,18 +1041,16 @@ fn named_setting(tail: &str) -> Option<&'static str> {
     }
 }
 
-/// The `methodSettings` key the two leading SEGMENTS of this patch's path name: the method
-/// path exactly as the request spelled it, escapes included, because that is the method
-/// path the patch addressed. `None` for a path that names no method.
-fn spelled_method_path(patch: &Patch) -> Option<String> {
-    let raw: Vec<&str> = patch
-        .path
-        .strip_prefix('/')
-        .unwrap_or(&patch.path)
-        .split('/')
-        .collect();
-    raw.get(..METHOD_PATH_TOKENS)
-        .map(|segments| segments.join("/"))
+/// The `methodSettings` key the two leading reference TOKENS of this patch's path name: the
+/// resource path they spell and the HTTP method after it, keyed the one documented way
+/// ([`crate::state::method_settings_key`]) — so a resource path whose leading separator the
+/// pointer ate, and one that escaped it, name the same entry. `None` for a path carrying
+/// fewer tokens than a method path needs.
+fn addressed_method_path(patch: &Patch) -> Option<String> {
+    let [resource_path, http_method] = patch.tokens.get(..METHOD_PATH_TOKENS)? else {
+        return None;
+    };
+    Some(method_settings_key(resource_path, http_method))
 }
 
 /// The `BadRequestException` message API Gateway refuses a `remove` of a method setting
@@ -1087,18 +1085,17 @@ fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), Pa
         ))
     };
     let Some((key, setting)) = method_setting(patch) else {
-        // The path names the method and nothing beyond it, so the whole entry goes — under
-        // either spelling of the method path, because either is a key the stage may hold.
-        // A path that names neither a setting of a method nor a method alone takes nothing
-        // away.
+        // The path names the method and nothing beyond it, so the whole entry goes —
+        // whichever spelling it addressed that method by, since every spelling resolves to
+        // the one key the stage holds it under. A path that names neither a setting of a
+        // method nor a method alone takes nothing away.
         if patch.tokens.len() != METHOD_PATH_TOKENS {
             return Err(refuse());
         }
-        let spelled = spelled_method_path(patch).ok_or_else(refuse)?;
-        let decoded = patch.tokens.join("/");
-        return [spelled, decoded]
-            .iter()
-            .find_map(|key| entry.method_settings.remove(key))
+        let key = addressed_method_path(patch).ok_or_else(refuse)?;
+        return entry
+            .method_settings
+            .remove(&key)
             .map(|_| ())
             .ok_or_else(refuse);
     };

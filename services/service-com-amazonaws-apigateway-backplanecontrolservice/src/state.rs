@@ -707,9 +707,10 @@ pub struct StageEntry {
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::client_certificates`].
     pub client_certificate_id: Option<String>,
     pub tracing_enabled: bool,
-    /// The per-method settings `UpdateStage` writes, keyed by the method path the patch
+    /// The per-method settings `UpdateStage` writes, keyed by the method each patch
     /// addressed — `{resource_path}/{http_method}`, or `*/*` for every method of the
-    /// stage; empty until a patch sets one, which is the empty `methodSettings` map a
+    /// stage, as [`method_settings_key`] derives it from whichever spelling the patch
+    /// used; empty until a patch sets one, which is the empty `methodSettings` map a
     /// freshly created stage reports.
     pub method_settings: BTreeMap<String, MethodSetting>,
     /// The INTEGRATION responses this stage's cache cluster is HOLDING, keyed by the cache
@@ -4796,3 +4797,9 @@ pub mod identifier;
 /// re-exported whole, so a handler still reaches each name as `crate::state::…`.
 mod stringified_policy;
 pub use stringified_policy::*;
+
+/// The KEY one entry of a stage's `methodSettings` map is held under — the one the control
+/// plane writes and the data plane reads; re-exported whole, so a handler still reaches each
+/// name as `crate::state::…`.
+mod method_settings;
+pub use method_settings::*;

@@ -1438,14 +1438,15 @@ fn stage_patches(
     Ok(patches)
 }
 
-/// The `methodSettings` key one setting is written on, which is also the path `UpdateStage`
-/// addresses that setting by: the method path `{resource_path}/{http_method}`
-/// (`Stage$methodSettings`), with the pointer's own leading separator standing for the
-/// resource path's — the way `MethodSetting$ResourcePath` states one, which "must include a
-/// forward slash" and spells every separator INSIDE the path as the JSON Pointer escape
-/// (`/~1resource~1subresource` for `/resource/subresource`). A declaration that spells an
-/// inner separator plainly is encoded here rather than refused, so either spelling of one
-/// path names one method. The stage-wide path stands where the entry names neither half.
+/// The method-setting PATH `UpdateStage` addresses one setting by: the method path
+/// `{resource_path}/{http_method}` (`Stage$methodSettings`), with the pointer's own leading
+/// separator standing for the resource path's — the way `MethodSetting$ResourcePath` states
+/// one, which "must include a forward slash" and spells every separator INSIDE the path as the
+/// JSON Pointer escape (`/~1resource~1subresource` for `/resource/subresource`). A declaration
+/// that spells an inner separator plainly is encoded here rather than refused, so either
+/// spelling of one path names one method; API Gateway then keys the setting by that method,
+/// under the one key it documents for it, whichever of these spellings addressed it. The
+/// stage-wide path stands where the entry names neither half.
 fn method_setting_path(resource_path: &str, http_method: &str) -> String {
     if resource_path.is_empty() || http_method.is_empty() {
         return EVERY_METHOD.to_string();

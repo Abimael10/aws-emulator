@@ -7,17 +7,18 @@
 //! RULE under test: **a `MethodSettings` entry configures the method its `ResourcePath` and
 //! `HttpMethod` name, and `Stage$methodSettings` keys what it configured by that method path
 //! — "method paths defined as {resource_path}/{http_method} for an individual method
-//! override, or /\*/\* for overriding all methods in the stage". `MethodSetting$ResourcePath`
-//! states the resource path ALREADY pointer-encoded, its initial slash included and every
-//! separator inside it written `~1`, so the provisioner addresses the setting on that path as
-//! stated rather than escaping it again — and the key API Gateway then reports is the method
-//! path, not the JSON Pointer a patch of it would carry.**
+//! override, or /\*/\* for overriding all methods in the stage". The separator before the HTTP
+//! method is a real one and every separator of the RESOURCE path is written as the JSON
+//! Pointer escape `~1`, so the key is the one API Gateway reports for that method whichever
+//! way the declaration stated the path: `MethodSetting$ResourcePath` may state it already
+//! pointer-encoded, its initial slash included, or with its separators plain, and both state
+//! the one method.**
 //!
 //! Why it matters: a client reading per-method cache or logging settings off a
-//! CloudFormation-provisioned stage looks the method path up. A key carrying the patch
-//! path's own escape resolves to nothing, so the client concludes the setting it declared is
-//! unconfigured — and so does the stage's data plane, which resolves a method's settings by
-//! the same path.
+//! CloudFormation-provisioned stage looks the method up. A stage that keyed the entry by the
+//! spelling the declaration happened to use answers nothing under the documented key, so the
+//! client concludes the setting it declared is unconfigured — and so does the stage's data
+//! plane, which resolves a method's settings by the same key.
 //!
 //! The rows differ along what the rule generalises over: the DEPTH of the resource path (the
 //! root, a child, a nested one), whether the declaration states its inner separators plainly
@@ -50,13 +51,13 @@ const ROWS: &[Row] = &[
         case: "a child resource",
         resource_path: "/cached",
         http_method: "GET",
-        key: "cached/GET",
+        key: "~1cached/GET",
     },
     Row {
         case: "a nested resource path, stated plainly",
         resource_path: "/items/{id}",
         http_method: "PUT",
-        key: "items~1{id}/PUT",
+        key: "~1items~1{id}/PUT",
     },
     Row {
         case: "a nested resource path, stated encoded as the type documents",
@@ -68,7 +69,7 @@ const ROWS: &[Row] = &[
         case: "the root resource",
         resource_path: "/",
         http_method: "HEAD",
-        key: "/HEAD",
+        key: "~1/HEAD",
     },
     Row {
         case: "every method of the stage",
@@ -218,9 +219,8 @@ async fn a_declared_method_setting_is_reported_under_its_method_path() {
         );
     }
 
-    // And the stage carries exactly those entries: a key spelled any other way — the JSON
-    // Pointer a patch of the same setting would address, escapes and all — is a key the
-    // method path resolves to nothing under.
+    // And the stage carries exactly those entries: two declarations of one method are one
+    // entry, and no key is the spelling a declaration happened to state the path in.
     let mut reported: Vec<String> = settings
         .as_object()
         .map(|map| map.keys().cloned().collect())
