@@ -189,6 +189,8 @@ mod rule_lifecycle;
 mod rule_match_metrics;
 #[path = "all/rule_metric_dimension_sets.rs"]
 mod rule_metric_dimension_sets;
+#[path = "all/rule_read_authorization.rs"]
+mod rule_read_authorization;
 #[path = "all/rule_state_control.rs"]
 mod rule_state_control;
 #[path = "all/rule_tag_scoped_authorization.rs"]

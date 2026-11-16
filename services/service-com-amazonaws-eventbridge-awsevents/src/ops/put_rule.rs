@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no rule under carries no tag yet, so a create is decided against the ARN such
         // a rule would carry and an empty tag set
         // (`crate::state::rule_authorization`).
-        if let Some(message) = crate::state::rule_authorization::rule_mutation_denial(
+        if let Some(message) = crate::state::rule_authorization::rule_call_denial(
             &store,
             &caller,
             Self::NAME,

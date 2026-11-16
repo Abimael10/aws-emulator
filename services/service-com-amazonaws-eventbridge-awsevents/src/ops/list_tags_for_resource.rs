@@ -8,6 +8,16 @@
 //! the stored set, creating nothing and changing nothing — so a resource that carries
 //! no tags reports an EMPTY list rather than coming into being.
 //!
+//! A read that addresses a RULE is AUTHORIZED first: it is the action
+//! `events:ListTagsForResource` on that rule's ARN, so the identity-based policies in
+//! force on the calling principal decide it — evaluated with the addressed rule's own
+//! tags ([`crate::state::rule_authorization::tagged_rule_denial`], the one gate every
+//! call of this service that addresses a rule takes) — and a caller no document grants
+//! is answered `AccessDeniedException` instead of the tag set. A read that addresses an
+//! event BUS is left to that resource's own decision, which a bus's resource policy
+//! takes part in as well ([`crate::state::authorization`]) and which no gate of this
+//! service makes for a tag read yet.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -61,6 +71,9 @@
 //!
 //! ## Errors
 //!
+//! * `AccessDeniedException` (HTTP 400) — You do not have the necessary permissions for this
+//!   action. Widened in through `extra_errors` (see below): the refusal a read the caller's
+//!   identity-based policies do not permit answers with.
 //! * `InternalException` (HTTP 500) — This exception occurs due to unexpected causes.
 //! * `ResourceNotFoundException` (HTTP 400) — An entity that you specified does not exist.
 
@@ -78,9 +91,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridge-awsevents.j
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridge#ListTagsForResource")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: this SERVICE models the
+// shape ("You do not have the necessary permissions for this action", HTTP 400) while
+// this OPERATION's own `errors` list does not name it, and it is the refusal a read the
+// caller's identity-based policies do not permit answers with (see the authorization
+// pass in the handler below).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridge#ListTagsForResource",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalException(InternalException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -152,7 +175,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = crate::state::parse_tagged_resource(&input.resource_arn, &region)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // WHO this request speaks for, and the documents in force on that principal,
+        // resolved BEFORE this service's store is locked: the IAM store is never
+        // reached while this one's guard is held.
+        let caller = crate::state::authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
+        // Reading the tags of a RULE is the action `events:ListTagsForResource` on that
+        // rule, so the policies in force on the caller decide it BEFORE the stored set
+        // is read — evaluated with the addressed rule's own tags
+        // (`crate::state::rule_authorization`).
+        if let Some(message) = crate::state::rule_authorization::tagged_rule_denial(
+            &store,
+            &caller,
+            Self::NAME,
+            &resource,
+        ) {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let Some(stored) = store.tags_of(&resource) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

@@ -205,11 +205,16 @@ fn refused(case: &str, status: u16, body: &Value) -> String {
     entry["ErrorCode"].as_str().unwrap_or_default().to_string()
 }
 
+/// The row value standing for "the ARN of the custom bus": the ARN carries the
+/// account id this emulator serves, which is read from the engine rather than
+/// spelled in a table.
+const BUS_BY_ARN: &str = "<the custom bus's ARN>";
+
 /// A per-entry failure reports a defect of the ENTRY. An entry's destination is
 /// not one: an entry naming a bus this account does not hold is INGESTED, with
 /// its own `EventId` and no failure, and the event is simply routed nowhere. The
-/// rows differ along the form of the bus name and whether a bus of that name
-/// exists.
+/// rows differ along the form of the bus name — a bare name, an ARN — and whether
+/// a bus of that name exists.
 #[tokio::test]
 async fn an_entry_naming_an_absent_bus_is_ingested_and_routed_nowhere() {
     let emulator = emulator();
@@ -225,6 +230,11 @@ async fn an_entry_naming_an_absent_bus_is_ingested_and_routed_nowhere() {
         ("the implicit default bus", None, Some("default")),
         ("the default bus, named explicitly", Some("default"), Some("default")),
         ("a custom bus that exists", Some("orders-bus"), Some("orders-bus")),
+        (
+            "that custom bus addressed by ARN",
+            Some(BUS_BY_ARN),
+            Some("orders-bus"),
+        ),
         ("a bus that was never created", Some("never-created"), None),
         ("an absent name in dotted form", Some("ghost.bus.dotted"), None),
         ("an absent name in underscored form", Some("ghost_bus"), None),
@@ -240,7 +250,19 @@ async fn an_entry_naming_an_absent_bus_is_ingested_and_routed_nowhere() {
             "DetailType": DETAIL_TYPE,
             "Detail": r#"{"amount":1}"#,
         });
-        if let Some(bus) = named_bus {
+        // The one row that addresses the bus by ARN builds it from the account
+        // this emulator serves, so nothing spells an account id here.
+        let named_bus = named_bus.map(|bus| {
+            if bus == BUS_BY_ARN {
+                format!(
+                    "arn:aws:events:{REGION}:{}:event-bus/orders-bus",
+                    engine::emulator_account_id()
+                )
+            } else {
+                bus.to_string()
+            }
+        });
+        if let Some(bus) = &named_bus {
             entry["EventBusName"] = json!(bus);
         }
         let (status, body) = call(&emulator, "PutEvents", &json!({ "Entries": [entry] })).await;

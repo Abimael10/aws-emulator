@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // evaluated with the target rule's own tags, which is what scopes a grant
         // written against `aws:ResourceTag/<key>` to the rules carrying that tag
         // (`crate::state::rule_authorization`).
-        if let Some(message) = crate::state::rule_authorization::rule_mutation_denial(
+        if let Some(message) = crate::state::rule_authorization::rule_call_denial(
             &store,
             &caller,
             Self::NAME,

@@ -3346,13 +3346,14 @@ pub fn caller_principal() -> String {
 /// is [`publication_refusal`].
 pub mod authorization;
 
-/// Whether the policies in force let the calling principal CHANGE a rule: a rule
-/// mutator is the action `events:<OperationName>` on the rule's own ARN, decided
+/// Whether the policies in force let the calling principal make a call that
+/// ADDRESSES a rule — a read of one as much as a write: such a call is the action
+/// `events:<OperationName>` on the rule's own ARN, decided
 /// against the caller's identity-based policies with the TARGET rule's tags
 /// published as `aws:ResourceTag/<key>` and the request keys the CALL itself
 /// carries beside them — the ARN of each target a target-attaching call attaches,
 /// as `events:TargetArn`
-/// ([`rule_authorization::rule_mutation_denial`],
+/// ([`rule_authorization::rule_call_denial`],
 /// [`rule_authorization::target_attachment_denial`]).
 pub mod rule_authorization;
 

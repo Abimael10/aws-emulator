@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether the policies in force let the calling principal CHANGE a rule — the
-//! authorization pass every rule mutator of this service takes before it writes anything.
+//! Whether the policies in force let the calling principal make a call that ADDRESSES a rule
+//! — the authorization pass every operation of this service that names one takes, whether it
+//! reads the rule or writes it, before it reports or changes anything.
 //!
-//! Changing a rule is the action `events:<OperationName>` on that rule's own ARN
+//! A call on a rule is the action `events:<OperationName>` on that rule's own ARN
 //! ([`rule_action`], built on this service's `arnNamespace`), so AWS decides it the way it
 //! decides any call on a resource: against the identity-based policies in force on the
-//! principal the request's credential speaks for, at the instant of the call. A rule carries
-//! no resource-based policy of its own — `PutPermission` installs one on an event BUS
+//! principal the request's credential speaks for, at the instant of the call. Reading a rule
+//! is such a call as much as writing one is — `events:DescribeRule` and
+//! `events:ListTargetsByRule` are actions of this service like `events:PutRule`, and IAM
+//! decides them all before the service looks at the resource — so a caller holding no grant
+//! learns nothing about the rule rather than reading it back. A rule carries no
+//! resource-based policy of its own — `PutPermission` installs one on an event BUS
 //! ([`super::BusPolicy`]) and on nothing else — so the identity half is the whole decision
 //! here.
 //!
@@ -48,7 +53,7 @@
 //! others. A call that attaches targets to a rule carries the ARN of each target it attaches,
 //! so it publishes [`TARGET_ARN_CONDITION_KEY`], one value per entry
 //! ([`target_attachment_denial`]); a call that carries no target ARN publishes none of them
-//! ([`rule_mutation_denial`]), which is every other rule mutator of this service — the
+//! ([`rule_call_denial`]), which is every other call on a rule of this service — the
 //! removal operation names the targets to remove by `Id` and so carries no ARN at all.
 //!
 //! ## The condition keys this gate does not publish yet
@@ -160,7 +165,7 @@ pub fn rule_condition_context(tags: &[Tag]) -> Vec<(String, String)> {
 /// service's store is locked ([`super::authorization::request_caller`]), and everything
 /// below is a pure evaluation of the documents it carries.
 #[must_use]
-pub fn rule_mutation_denial(
+pub fn rule_call_denial(
     store: &ComAmazonawsEventbridgeAwseventsState,
     caller: &Caller,
     operation: &str,
@@ -179,7 +184,7 @@ pub fn rule_mutation_denial(
     )
 }
 
-/// [`rule_mutation_denial`] for a call that ATTACHES targets to the rule, which publishes
+/// [`rule_call_denial`] for a call that ATTACHES targets to the rule, which publishes
 /// the ARN of each target it attaches as [`TARGET_ARN_CONDITION_KEY`] — so a statement scoped
 /// by that key grants the calls whose targets satisfy it and refuses only the others.
 ///
@@ -226,7 +231,7 @@ fn rule_denial(
     action_denial(caller, &rule_action(operation), &rule_arn, tags, request)
 }
 
-/// [`rule_mutation_denial`] for a call that addressed its rule by ARN rather than by name:
+/// [`rule_call_denial`] for a call that addressed its rule by ARN rather than by name:
 /// the rule the tagging operations resolved ([`parse_tagged_resource`]).
 ///
 /// A call that addressed an event BUS is outside this gate — a bus is authorized against its
@@ -247,7 +252,7 @@ pub fn tagged_rule_denial(
     else {
         return None;
     };
-    rule_mutation_denial(store, caller, operation, region, event_bus_name, name)
+    rule_call_denial(store, caller, operation, region, event_bus_name, name)
 }
 
 /// The refusal the identity-based documents in force on `caller` state against `action` on
