@@ -271,6 +271,9 @@ mod subscription_filter_policy_delivery;
 #[path = "all/subscription_filter_policy_matching.rs"]
 mod subscription_filter_policy_matching;
 
+#[path = "all/subscription_lookup_miss_sentence.rs"]
+mod subscription_lookup_miss_sentence;
+
 #[path = "all/subscription_pending_confirmation.rs"]
 mod subscription_pending_confirmation;
 
