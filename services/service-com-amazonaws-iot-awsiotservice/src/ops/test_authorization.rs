@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     allowed: Some(Allowed {
                         policies: Some(reported_policies(decided.allowed.clone())),
                     }),
-                    denied: denied(&decided),
+                    denied: Some(denied(&decided)),
                     auth_decision: Some(decided.decision.to_string()),
                     missing_context_values: Some(decided.missing_context_values),
                 }
@@ -321,28 +321,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `Denied` of a decision: the branch that denied it, and nothing else.
+/// The `Denied` of a decision: both deny branches, whatever the decision was.
 ///
-/// `Denied` carries `implicitDeny` ("Information that implicitly denies the authorization.
-/// When a policy doesn't explicitly deny or allow an action on a resource it is considered
-/// an implicit deny") and `explicitDeny` ("Information that explicitly denies the
-/// authorization"), which are the two deny decisions — so an ALLOWED decision carries no
-/// `denied` at all, and a denied one carries only the branch its decision names.
-fn denied(decided: &crate::state::AuthorizationDecision) -> Option<Denied> {
-    match decided.decision {
-        crate::state::AUTH_DECISION_EXPLICIT_DENY => Some(Denied {
-            implicit_deny: None,
-            explicit_deny: Some(ExplicitDeny {
-                policies: Some(reported_policies(decided.explicit_deny.clone())),
-            }),
+/// `Denied` is "the policies and statements that denied the specified action", carrying
+/// `implicitDeny` ("Information that implicitly denies the authorization. When a policy
+/// doesn't explicitly deny or allow an action on a resource it is considered an implicit
+/// deny") and `explicitDeny` ("Information that explicitly denies the authorization"). Both
+/// branches, each with its `policies` list, are the COMPOSITION of one evaluated result —
+/// not a report that something was denied — so both are present on every result and an
+/// EMPTY list is how a branch says nothing was denied that way. A reader asking whether a
+/// refusal is explicit (a `Deny` statement, which no further grant overrides) or implicit
+/// (no matching statement, which a grant fixes) therefore reads a list rather than
+/// dereferencing an absent structure.
+fn denied(decided: &crate::state::AuthorizationDecision) -> Denied {
+    Denied {
+        implicit_deny: Some(ImplicitDeny {
+            policies: Some(reported_policies(decided.implicit_deny.clone())),
         }),
-        crate::state::AUTH_DECISION_IMPLICIT_DENY => Some(Denied {
-            implicit_deny: Some(ImplicitDeny {
-                policies: Some(reported_policies(decided.implicit_deny.clone())),
-            }),
-            explicit_deny: None,
+        explicit_deny: Some(ExplicitDeny {
+            policies: Some(reported_policies(decided.explicit_deny.clone())),
         }),
-        _ => None,
     }
 }
 

@@ -15,6 +15,8 @@ mod account_audit_configuration;
 mod already_exists_wording;
 #[path = "all/authorization_decision.rs"]
 mod authorization_decision;
+#[path = "all/authorization_deny_projection.rs"]
+mod authorization_deny_projection;
 #[path = "all/authorizer_registry.rs"]
 mod authorizer_registry;
 #[path = "all/authorizer_teardown.rs"]
