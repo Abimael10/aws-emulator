@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/activation_id_filter_values.rs"]
 mod activation_id_filter_values;
+#[path = "all/association_batch_creation.rs"]
+mod association_batch_creation;
 #[path = "all/association_dispatch_options.rs"]
 mod association_dispatch_options;
 #[path = "all/association_listing.rs"]

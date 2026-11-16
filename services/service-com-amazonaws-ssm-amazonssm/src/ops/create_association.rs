@@ -338,137 +338,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::node_registration::settle_registrations(&*self.engine, &region);
         let mut store = state.lock();
 
-        // "You can specify Amazon Web Services-predefined documents, documents you
-        // created, or a document that is shared with you from another Amazon Web Services
-        // account… you must specify the complete SSM document ARN" (`Name`), so either
-        // spelling names the same document. The resolve also materialises what the clock
-        // already owes before anything resolves against the store.
-        let Some(document) = store.resolve_document_for_request(&input.name, &region, now) else {
-            return Err(
-                CreateAssociationErrorModeled::InvalidDocument(InvalidDocument {
-                    message: Some(format!("Document {} doesn't exist", input.name)),
-                })
-                .into(),
-            );
-        };
-        // "The document version you want to associate with the targets. Can be a specific
-        // version or the default version" (`DocumentVersion`): each names one of the
-        // versions the document holds, and a number it does not hold names none. A request
-        // that names none associates the document's default version.
-        let requested_version = non_empty(input.document_version.as_deref())
-            .unwrap_or(crate::state::DOCUMENT_VERSION_DEFAULT);
-        let Some(version) = document.select(requested_version) else {
-            return Err(CreateAssociationErrorModeled::InvalidDocumentVersion(
-                InvalidDocumentVersion {
-                    message: Some(format!(
-                        "Document {} has no version '{requested_version}'",
-                        document.name
-                    )),
-                },
-            )
-            .into());
-        };
-
-        // "You must specify values for all required parameters in the Amazon Web Services
-        // Systems Manager document (SSM document). You can only supply values to
-        // parameters defined in the SSM document" (`InvalidParameters`) — the one reading
-        // of a document's parameters this service has.
-        let parameters: ::std::collections::BTreeMap<String, Vec<String>> = input
-            .parameters
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        if let Some(why) = crate::state::commands::parameter_rejection(
-            &document.name,
-            &version.parsed.parameters,
-            &parameters,
-        ) {
-            return Err(
-                CreateAssociationErrorModeled::InvalidParameters(InvalidParameters {
-                    message: Some(why),
-                })
-                .into(),
-            );
-        }
-
-        // "A cron expression when the association will be applied to the targets"
-        // (`ScheduleExpression`): a value in neither of the two forms such an expression is
-        // written in names no schedule at all.
-        if let Some(expression) = non_empty(input.schedule_expression.as_deref()) {
-            if let Some(why) = crate::state::associations::schedule_rejection(expression) {
-                return Err(CreateAssociationErrorModeled::InvalidSchedule(InvalidSchedule {
-                    message: Some(why.to_string()),
-                })
-                .into());
-            }
-        }
-        // "An Amazon Simple Storage Service (Amazon S3) bucket where you want to store the
-        // output details of the request" (`OutputLocation`): a location that names no
-        // bucket is no output location. The modelled error carries no message member, so
-        // the refusal is the error code alone.
-        if crate::state::associations::names_no_output_bucket(input.output_location.as_ref()) {
-            return Err(CreateAssociationErrorModeled::InvalidOutputLocation(
-                InvalidOutputLocation {},
-            )
-            .into());
-        }
-        // "Both Targets and TargetMaps can't be specified together" (`TargetMaps`).
-        let targets: Vec<Target> = input.targets.clone().unwrap_or_default();
-        let target_maps = input.target_maps.clone().unwrap_or_default();
-        if !targets.is_empty() && !target_maps.is_empty() {
-            return Err(CreateAssociationErrorModeled::InvalidTargetMaps(
-                InvalidTargetMaps {
-                    message: Some(
-                        crate::state::associations::TARGETS_AND_TARGET_MAPS.to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // "The specified association already exists" (`AssociationAlreadyExists`): a node
-        // named through the deprecated `InstanceId` member carries the association of one
-        // document once, so a second create of the same pair names the association that is
-        // already there. The modelled error carries no message member, so the refusal is
-        // the error code alone.
-        if let Some(instance_id) = non_empty(input.instance_id.as_deref()) {
-            if store
-                .association_of_node(&region, &document.name, instance_id)
-                .is_some()
-            {
-                return Err(CreateAssociationErrorModeled::AssociationAlreadyExists(
-                    AssociationAlreadyExists {},
-                )
-                .into());
-            }
-        }
-        // "You can have at most 2,000 active associations" (`AssociationLimitExceeded`),
-        // measured over the Region the request was signed for. That error carries no
-        // message member either.
-        if store.associations_in_region_count(&region)
-            >= crate::state::associations::MAX_ASSOCIATIONS_PER_REGION
-        {
-            return Err(CreateAssociationErrorModeled::AssociationLimitExceeded(
-                AssociationLimitExceeded {},
-            )
-            .into());
-        }
-        // What keeps this process finite past that per-Region limit: the store's own total
-        // guard, because the Region comes from the request's credential scope.
-        if !store.can_hold_another_association() {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "This emulator holds at most {} associations across every Region",
-                crate::state::associations::MAX_ASSOCIATIONS_TOTAL
-            )));
-        }
-
+        // The association's FIRST version holds everything this call set
+        // (`crate::state::associations::AssociationVersionRecord`), which is what the
+        // create resolves against the store and what a later read reports back.
         let first = crate::state::associations::AssociationVersionRecord {
             version: crate::state::associations::FIRST_ASSOCIATION_VERSION,
             created_at: now,
             document_version: input.document_version.clone(),
-            parameters,
-            targets,
+            parameters: input
+                .parameters
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            targets: input.targets.clone().unwrap_or_default(),
             schedule_expression: input.schedule_expression.clone(),
             output_location: input.output_location.clone(),
             association_name: input.association_name.clone(),
@@ -482,39 +365,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target_locations: input.target_locations.clone().unwrap_or_default(),
             schedule_offset: input.schedule_offset,
             duration: input.duration,
-            target_maps,
+            target_maps: input.target_maps.clone().unwrap_or_default(),
             alarm_configuration: input.alarm_configuration.clone(),
             association_dispatch_assume_role: input.association_dispatch_assume_role.clone(),
         };
-        let mut record = crate::state::associations::AssociationRecord::new(
-            crate::state::new_uuid(),
-            region,
-            // `AssociationDescription$Name` is "the name of the SSM document", so the name
-            // the document is held under is reported whichever spelling named it.
-            document.name.clone(),
-            non_empty(input.instance_id.as_deref()).map(str::to_string),
-            now,
-            first,
-            crate::state::to_btree_map(input.tags),
-        );
-        // "State Manager … applies the configuration when the association is created": the
-        // association is dispatched to the managed nodes its targets select right away, and
-        // its run finishes on the clock
-        // (`crate::state::associations::ASSOCIATION_EXECUTION_DELAY`) rather than on this
-        // call. An association that selects no registered node reaches none, which is why
-        // the nodes are resolved here rather than assumed.
-        let nodes = store.association_run_nodes(&record);
-        record.start_run(nodes, now);
-        let description = record.latest_description(now);
-        store.insert_association(record);
+        // Which document, which version, which parameters and which schedule the request
+        // resolves to — and the association the create persists and dispatches — is the
+        // one reading every operation that creates an association shares
+        // (`crate::state::association_create`). What is this operation's own is that a
+        // refusal travels as the modelled error ([`refusal`]). The capacity this create is
+        // gated against is counted once, here.
+        let mut capacity = store.association_capacity(&region);
+        let description = store
+            .create_one_association(
+                crate::state::association_create::AssociationCreate {
+                    name: &input.name,
+                    instance_id: input.instance_id.as_deref(),
+                    tags: crate::state::to_btree_map(input.tags.clone()),
+                    version: first,
+                },
+                &mut capacity,
+                &region,
+                now,
+            )
+            .map_err(refusal)?;
 
         Ok(CreateAssociationOutput {
-            association_description: description,
+            association_description: Some(description),
         })
     }
 }
 
-// `non_empty` reads an optional member the request set to nothing the same way as one it
-// omitted: an EMPTY `DocumentVersion`, `ScheduleExpression` or `InstanceId` names no
-// version, no schedule and no node. The one reading of that lives in `crate::state`.
-use crate::state::non_empty;
+/// How THIS operation reports a refusal of the create: as the modelled error of that
+/// class, carrying the refusal's description where the model gives that error a message
+/// member and the error code alone where it gives it none.
+fn refusal(rejection: AssociationCreateRejection) -> CreateAssociationError {
+    let message = Some(rejection.message());
+    match rejection {
+        AssociationCreateRejection::InvalidDocument { .. } => {
+            CreateAssociationErrorModeled::InvalidDocument(InvalidDocument { message }).into()
+        }
+        AssociationCreateRejection::InvalidDocumentVersion { .. } => {
+            CreateAssociationErrorModeled::InvalidDocumentVersion(InvalidDocumentVersion {
+                message,
+            })
+            .into()
+        }
+        AssociationCreateRejection::InvalidParameters { .. } => {
+            CreateAssociationErrorModeled::InvalidParameters(InvalidParameters { message }).into()
+        }
+        AssociationCreateRejection::InvalidSchedule { .. } => {
+            CreateAssociationErrorModeled::InvalidSchedule(InvalidSchedule { message }).into()
+        }
+        AssociationCreateRejection::InvalidOutputLocation => {
+            CreateAssociationErrorModeled::InvalidOutputLocation(InvalidOutputLocation {}).into()
+        }
+        AssociationCreateRejection::InvalidTargetMaps => {
+            CreateAssociationErrorModeled::InvalidTargetMaps(InvalidTargetMaps { message }).into()
+        }
+        AssociationCreateRejection::AssociationAlreadyExists => {
+            CreateAssociationErrorModeled::AssociationAlreadyExists(AssociationAlreadyExists {})
+                .into()
+        }
+        AssociationCreateRejection::AssociationLimitExceeded => {
+            CreateAssociationErrorModeled::AssociationLimitExceeded(AssociationLimitExceeded {})
+                .into()
+        }
+        // The store's own total guard is no modelled failure of the service, so it is
+        // refused as a bad request rather than as one of the modelled errors.
+        AssociationCreateRejection::StoreFull => {
+            crate::scaffolded::Scaffolded::validation(rejection.message())
+        }
+    }
+}
+
+use crate::state::association_create::AssociationCreateRejection;

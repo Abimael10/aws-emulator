@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssociationBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssociationBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssociationBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates State Manager associations in a batch: "One or more associations" (`Entries`),
+//! each of them the document an account wants applied to a set of managed nodes, with the
+//! schedule and the parameters it is applied with. Every entry creates exactly what
+//! `CreateAssociation` creates — the one reading of that lives in
+//! [`crate::state::association_create`] — and the associations are persisted in this
+//! service's store, keyed by the Region the request was signed for and the id each create
+//! minted, so `DescribeAssociation` and `ListAssociations` report what the batch persisted.
+//!
+//! What is this operation's own is how a refusal is REPORTED. An entry this service cannot
+//! create is reported in `Failed` ("Information about the associations that failed") beside
+//! the entries it did create in `Successful`, carrying the entry as it was sent, a
+//! description of the failure and "the source of the failure" (`Fault`) — which is why
+//! `AssociationAlreadyExists`, modelled for the single create, is not one of this
+//! operation's errors. Both lists are reported even when one of them is empty.
+//!
+//! The two refusals that are properties of the REQUEST rather than of one entry are
+//! answered as modelled errors instead, before anything is persisted: a managed node named
+//! by more than one entry ("You can't specify a managed node ID in more than one
+//! association", `DuplicateInstanceId`) and a Region that already holds the documented
+//! maximum, so that no entry of the batch could be created ("You can have at most 2,000
+//! active associations", `AssociationLimitExceeded`).
+//!
+//! `Entries` is modelled with a minimum and no maximum, so how many associations one call
+//! asks this process to make is bounded here rather than by the model
+//! ([`crate::state::association_create::MAX_BATCH_ENTRIES`]), and the limits every create
+//! is gated against are counted once for the whole request
+//! ([`crate::state::association_create::AssociationCapacity`]) rather than once per entry.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +205,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssociationBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssociationBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssociationBatch"))
+        // Every entry member's pattern and range, the list lengths and `Entries`'s own
+        // 1.. length are MODELLED constraints, so the centralized walk has already refused
+        // anything outside them and every entry reaching here is well formed. What is read
+        // here is what the model cannot say: which document, which version, which
+        // parameters and which schedule each entry resolves to.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssociationBatchErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association store is unavailable".to_string()),
+            })
+        })?;
+
+        // `Entries` is modelled `len 1..` — a minimum with no maximum — so the walk above
+        // caps how many associations one call asks for at nothing. This emulator's own
+        // ceiling is what bounds the work of this handler, and it is checked before the
+        // store is read or locked: past it no entry could be created anyway
+        // (`crate::state::association_create::MAX_BATCH_ENTRIES`). The model declares no
+        // error for it, so it is refused as a bad request.
+        if input.entries.len() > crate::state::association_create::MAX_BATCH_ENTRIES {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::association_create::batch_entry_limit_exceeded(),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // State Manager applies an association to its targets as soon as it is created, so
+        // the nodes each entry is dispatched to are resolved below — which means the
+        // registrations the clock already owed are materialised first, with no guard of the
+        // store held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        let mut store = state.lock();
+
+        // "You can't specify a managed node ID in more than one association"
+        // (`DuplicateInstanceId`): a node named through the deprecated `InstanceId` member
+        // of more than one entry of ONE request is named more than once, which is a fault
+        // of the request rather than of either entry, so nothing is created. The modelled
+        // error carries no message member, so the refusal is the error code alone.
+        let mut nodes_named: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        for entry in &input.entries {
+            if let Some(instance_id) = crate::state::non_empty(entry.instance_id.as_deref()) {
+                if !nodes_named.insert(instance_id) {
+                    return Err(CreateAssociationBatchErrorModeled::DuplicateInstanceId(
+                        DuplicateInstanceId {},
+                    )
+                    .into());
+                }
+            }
+        }
+        // How many associations this Region and this store can still take, counted ONCE
+        // for the whole request: the capacity below gates every entry's create, and each
+        // create reports what it added, so a batch costs one walk of the store for the
+        // limits rather than one per entry.
+        let mut capacity = store.association_capacity(&region);
+        match capacity.rejection() {
+            // "You can have at most 2,000 active associations" (`AssociationLimitExceeded`),
+            // measured over the Region the request was signed for: a Region already holding
+            // that many can take NO association, so no entry of this batch could be created
+            // and the request is refused rather than every entry of it reported failed. An
+            // entry that runs into the limit because EARLIER entries of the same batch
+            // filled it is reported in `Failed` below, like any other entry this service
+            // could not create. That error carries no message member, so the refusal is the
+            // error code alone.
+            Some(crate::state::association_create::AssociationCreateRejection::AssociationLimitExceeded) => {
+                return Err(
+                    CreateAssociationBatchErrorModeled::AssociationLimitExceeded(
+                        AssociationLimitExceeded {},
+                    )
+                    .into(),
+                );
+            }
+            // The store's own total guard, which keeps this process finite past that
+            // per-Region limit because the Region comes from the request's credential
+            // scope. The model declares no error for it either.
+            Some(rejection) => {
+                return Err(crate::scaffolded::Scaffolded::validation(rejection.message()));
+            }
+            None => {}
+        }
+
+        let mut successful: Vec<AssociationDescription> = Vec::new();
+        let mut failed: Vec<FailedCreateAssociation> = Vec::new();
+        for entry in &input.entries {
+            // The association's FIRST version holds everything this entry set. The role
+            // "association will … assume … when dispatching configurations to nodes" is
+            // the REQUEST's (`CreateAssociationBatchRequest$AssociationDispatchAssumeRole`),
+            // so every association the batch creates dispatches under it.
+            let first = crate::state::associations::AssociationVersionRecord {
+                version: crate::state::associations::FIRST_ASSOCIATION_VERSION,
+                created_at: now,
+                document_version: entry.document_version.clone(),
+                parameters: entry
+                    .parameters
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                targets: entry.targets.clone().unwrap_or_default(),
+                schedule_expression: entry.schedule_expression.clone(),
+                output_location: entry.output_location.clone(),
+                association_name: entry.association_name.clone(),
+                automation_target_parameter_name: entry.automation_target_parameter_name.clone(),
+                max_errors: entry.max_errors.clone(),
+                max_concurrency: entry.max_concurrency.clone(),
+                compliance_severity: entry.compliance_severity.clone(),
+                sync_compliance: entry.sync_compliance.clone(),
+                apply_only_at_cron_interval: entry.apply_only_at_cron_interval,
+                calendar_names: entry.calendar_names.clone().unwrap_or_default(),
+                target_locations: entry.target_locations.clone().unwrap_or_default(),
+                schedule_offset: entry.schedule_offset,
+                duration: entry.duration,
+                target_maps: entry.target_maps.clone().unwrap_or_default(),
+                alarm_configuration: entry.alarm_configuration.clone(),
+                association_dispatch_assume_role: input.association_dispatch_assume_role.clone(),
+            };
+            // An entry carries no tag set: `Tags` is a member of the single create only, so
+            // an association this batch creates starts with none.
+            match store.create_one_association(
+                crate::state::association_create::AssociationCreate {
+                    name: &entry.name,
+                    instance_id: entry.instance_id.as_deref(),
+                    tags: ::std::collections::BTreeMap::new(),
+                    version: first,
+                },
+                &mut capacity,
+                &region,
+                now,
+            ) {
+                // The description of what was persisted, which is what `Successful` reports
+                // ("Information about the associations that succeeded").
+                Ok(description) => successful.push(description),
+                // An entry this service could not create is reported rather than refusing
+                // the request: the entry as it was sent, "a description of the failure" and
+                // "the source of the failure". The entries beside it are unaffected,
+                // because a refused create persists nothing.
+                Err(rejection) => failed.push(FailedCreateAssociation {
+                    entry: Some(entry.clone()),
+                    message: Some(rejection.message()),
+                    fault: Some(rejection.fault().to_string()),
+                }),
+            }
+        }
+
+        Ok(CreateAssociationBatchOutput {
+            // Both lists are reported even when empty, the way this service's other batch
+            // operations report theirs: the response says what became of every entry.
+            successful: Some(successful),
+            failed: Some(failed),
+        })
     }
 }

@@ -220,6 +220,10 @@ pub mod execution_previews;
 /// its updates wrote.
 pub mod associations;
 
+/// What creating ONE association resolves, refuses and persists — shared by the operation
+/// that creates one and the one that creates a batch of them.
+pub mod association_create;
+
 /// The resource policies attached to this account's Systems Manager resources, and the
 /// hash that keeps two writers from overwriting each other's.
 pub mod resource_policies;
