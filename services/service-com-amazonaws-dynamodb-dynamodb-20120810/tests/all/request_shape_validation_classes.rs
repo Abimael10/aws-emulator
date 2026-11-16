@@ -724,31 +724,6 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
                    "ExpressionAttributeValues": {":v": {"S": "active"}}}),
             only_with_expressions_bare("ExpressionAttributeValues"),
         ),
-        (
-            "names, on one entry of a batched read",
-            "BatchGetItem",
-            json!({"RequestItems": {SUBSTITUTED: {
-                "Keys": [key.clone()],
-                "ExpressionAttributeNames": {"#s": "status"}}}}),
-            only_with_expressions_bare("ExpressionAttributeNames"),
-        ),
-        (
-            "names, on one element of a transactional read",
-            "TransactGetItems",
-            json!({"TransactItems": [{"Get": {
-                "TableName": SUBSTITUTED, "Key": key.clone(),
-                "ExpressionAttributeNames": {"#s": "status"}}}]}),
-            only_with_expressions_bare("ExpressionAttributeNames"),
-        ),
-        (
-            "values, on one element of a transactional write",
-            "TransactWriteItems",
-            json!({"TransactItems": [{"Put": {
-                "TableName": SUBSTITUTED,
-                "Item": {"pk": {"S": "item-3"}},
-                "ExpressionAttributeValues": {":v": {"S": "paused"}}}}]}),
-            only_with_expressions_bare("ExpressionAttributeValues"),
-        ),
     ];
 
     for (case, operation, request, expected) in rows {
@@ -763,6 +738,42 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
         assert_eq!(
             said, expected,
             "case {case:?} ({operation}): expected {expected:?}, got {said:?}"
+        );
+    }
+
+    // The BOUNDARY: this rule is the REQUEST's. The substitution tables of ONE ELEMENT of
+    // a multi-item call are members of that element, held to the element's OWN
+    // expressions — so an element that states no expression has none to hold them to and
+    // the call is SERVED.
+    for (case, operation, request) in [
+        (
+            "names, on one entry of a batched read",
+            "BatchGetItem",
+            json!({"RequestItems": {SUBSTITUTED: {
+                "Keys": [key.clone()],
+                "ExpressionAttributeNames": {"#s": "status"}}}}),
+        ),
+        (
+            "names, on one element of a transactional read",
+            "TransactGetItems",
+            json!({"TransactItems": [{"Get": {
+                "TableName": SUBSTITUTED, "Key": key.clone(),
+                "ExpressionAttributeNames": {"#s": "status"}}}]}),
+        ),
+        (
+            "values, on one element of a transactional write",
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Delete": {
+                "TableName": SUBSTITUTED,
+                "Key": {"pk": {"S": "item-3"}},
+                "ExpressionAttributeValues": {":v": {"S": "paused"}}}}]}),
+        ),
+    ] {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} ({operation}): an element's tables are held to the element's own \
+             expressions, so this is served, got {status} with {body}"
         );
     }
 

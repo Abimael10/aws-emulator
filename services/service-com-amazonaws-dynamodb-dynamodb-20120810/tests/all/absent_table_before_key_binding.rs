@@ -48,6 +48,11 @@ fn incorrect_operand(operator: &str, datatype: &str) -> String {
     )
 }
 
+/// AWS's fixed sentence for an operand whose type is not the one the SCHEMA declares for
+/// the key attribute it is compared with — which only the table can settle.
+const SCHEMA_TYPE: &str = "One or more parameter values were invalid: Condition parameter \
+                          type does not match schema type";
+
 /// Create [`TABLE`] and wait out the documented `CREATING` -> `ACTIVE` transition.
 async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
     let router = emulator();
@@ -122,11 +127,14 @@ fn rows() -> Vec<Row> {
                 .to_string(),
         },
         Row {
-            case: "an operand of a type no comparison orders",
+            // Equality compares ONE value, so what its operand's type is held to is the
+            // type the SCHEMA declares for the key — a binding defect, which the table
+            // has to be there to settle.
+            case: "an equality operand of a type the schema does not declare",
             condition: "pk = :p",
             values: json!({":p": {"BOOL": true}}),
-            before_the_lookup: Some(incorrect_operand("=", "BOOL")),
-            against_the_table: incorrect_operand("=", "BOOL"),
+            before_the_lookup: None,
+            against_the_table: SCHEMA_TYPE.to_string(),
         },
         Row {
             case: "a number where begins_with needs a prefix",
@@ -155,10 +163,10 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "an operand written before its operator, of a type no comparison orders",
-            condition: ":p = pk",
+            condition: ":p >= pk",
             values: json!({":p": {"NULL": true}}),
-            before_the_lookup: Some(incorrect_operand("=", "NULL")),
-            against_the_table: incorrect_operand("=", "NULL"),
+            before_the_lookup: Some(incorrect_operand(">=", "NULL")),
+            against_the_table: incorrect_operand(">=", "NULL"),
         },
     ]
 }
@@ -248,10 +256,19 @@ async fn an_absent_table_answers_before_an_index_key_schema_binds() {
     // the request-settled defect, or the table's own refusal.
     for (case, condition, values, expected) in [
         (
-            "a wrong-typed operand on an index read",
+            // An operand a comparison cannot ORDER is the request's own defect; an
+            // equality operand is held to the schema's type instead, so that one needs
+            // the schema ([`Operator::compares`]'s two rules).
+            "an operand no comparison orders on an index read",
+            "gpk >= :p",
+            json!({":p": {"BOOL": false}}),
+            ("ValidationException", incorrect_operand(">=", "BOOL")),
+        ),
+        (
+            "an equality operand of another type on an index read",
             "gpk = :p",
             json!({":p": {"BOOL": false}}),
-            ("ValidationException", incorrect_operand("=", "BOOL")),
+            ("ResourceNotFoundException", NOT_FOUND.to_string()),
         ),
         (
             "a third clause on an index read",

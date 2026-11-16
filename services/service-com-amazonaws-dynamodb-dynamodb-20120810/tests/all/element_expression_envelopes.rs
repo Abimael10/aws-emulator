@@ -37,12 +37,6 @@ const TABLE: &str = "ElementExpressionEnvelopes";
 /// The envelope a refusal about a REQUEST's own members is stated inside, over one clause.
 const ENVELOPE: &str = "1 validation error detected: ";
 
-/// The sentence a substitution table offered with NO expression to substitute into earns:
-/// the member itself is the mistake, so the refusal names it rather than one of its
-/// entries, and it is an element's own sentence like every other refusal about an element.
-const SUBSTITUTION_WITHOUT_EXPRESSION: &str =
-    "ExpressionAttributeNames can only be specified when using expressions";
-
 /// The key of the first seeded item, which most rows address so no row is refused for its
 /// key instead of for its substitution tables.
 fn key() -> Value {
@@ -178,16 +172,6 @@ fn element_rows() -> Vec<Row> {
             enveloped: false,
         },
         Row {
-            case: "a name a transacted put offers with no expression at all",
-            operation: "TransactWriteItems",
-            request: json!({"TransactItems": [{"Put": {
-                "TableName": TABLE,
-                "Item": {"pk": {"S": "item-3"}, "status": {"S": "paused"}},
-                "ExpressionAttributeNames": {"#unused": "labels"}}}]}),
-            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
-            enveloped: false,
-        },
-        Row {
             case: "a token a transacted put's condition dereferences and nothing defines",
             operation: "TransactWriteItems",
             request: json!({"TransactItems": [{"Put": {
@@ -213,35 +197,6 @@ fn element_rows() -> Vec<Row> {
                 "UpdateExpression",
                 &undefined_value_clause(":missing"),
             ),
-            enveloped: false,
-        },
-        Row {
-            case: "a name one transacted read offers with no projection",
-            operation: "TransactGetItems",
-            request: json!({"TransactItems": [{"Get": {
-                "TableName": TABLE,
-                "Key": key(),
-                "ExpressionAttributeNames": {"#unused": "status"}}}]}),
-            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
-            enveloped: false,
-        },
-        Row {
-            case: "a name the SECOND transacted read offers, behind a sound one",
-            operation: "TransactGetItems",
-            request: json!({"TransactItems": [
-                {"Get": {"TableName": TABLE, "Key": key()}},
-                {"Get": {"TableName": TABLE, "Key": other_key(),
-                         "ExpressionAttributeNames": {"#unused": "status"}}}]}),
-            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
-            enveloped: false,
-        },
-        Row {
-            case: "two names one batch-read table entry offers with no projection",
-            operation: "BatchGetItem",
-            request: json!({"RequestItems": {TABLE: {
-                "Keys": [key()],
-                "ExpressionAttributeNames": {"#a": "status", "#b": "category"}}}}),
-            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
             enveloped: false,
         },
     ]

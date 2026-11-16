@@ -366,8 +366,10 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
     let table = "SubstitutionWithoutExpression";
     seeded(&router, table).await;
 
-    // Rows differ along the operation that accepts the member (an item read, a batch
-    // read, a transactional read, a query and a scan) and along which table was sent.
+    // Rows differ along the operation that accepts the member (an item read, a query and
+    // a scan) and along which table was sent. The rule is the REQUEST's, so a call's own
+    // members are what it holds: the tables of ONE ELEMENT of a multi-item call are held
+    // to that element's own expressions instead, which the BOUNDARY below states.
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "an item read",
@@ -388,23 +390,8 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
             json!({"TableName": table, "ExpressionAttributeNames": {"#l": "label"}}),
             "ExpressionAttributeNames",
         ),
-        (
-            "a batch read",
-            json!({"RequestItems": {table: {
-                "Keys": [{"pk": {"S": "p1"}, "sk": {"N": "1"}}],
-                "ExpressionAttributeNames": {"#l": "label"}}}}),
-            "ExpressionAttributeNames",
-        ),
-        (
-            "a transactional read",
-            json!({"TransactItems": [{"Get": {
-                "TableName": table,
-                "Key": {"pk": {"S": "p1"}, "sk": {"N": "1"}},
-                "ExpressionAttributeNames": {"#l": "label"}}}]}),
-            "ExpressionAttributeNames",
-        ),
     ];
-    let operations = ["GetItem", "Query", "Scan", "BatchGetItem", "TransactGetItems"];
+    let operations = ["GetItem", "Query", "Scan"];
 
     for (operation, (case, request, member)) in operations.iter().zip(rows) {
         let (status, answered) = call(&router, operation, request).await;
@@ -418,6 +405,33 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
             format!("{member} can only be specified when using expressions"),
             "case {case:?}: the refusal names the member, got {}",
             message(&answered)
+        );
+    }
+
+    // The BOUNDARY: an ELEMENT's tables are held to the element's OWN expressions, so an
+    // element that states none is served rather than told to add one.
+    for (case, operation, request) in [
+        (
+            "a batch read",
+            "BatchGetItem",
+            json!({"RequestItems": {table: {
+                "Keys": [{"pk": {"S": "p1"}, "sk": {"N": "1"}}],
+                "ExpressionAttributeNames": {"#l": "label"}}}}),
+        ),
+        (
+            "a transactional read",
+            "TransactGetItems",
+            json!({"TransactItems": [{"Get": {
+                "TableName": table,
+                "Key": {"pk": {"S": "p1"}, "sk": {"N": "1"}},
+                "ExpressionAttributeNames": {"#l": "label"}}}]}),
+        ),
+    ] {
+        let (status, answered) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an element states its own expressions, so this is served, got \
+             {status} with {answered}"
         );
     }
 

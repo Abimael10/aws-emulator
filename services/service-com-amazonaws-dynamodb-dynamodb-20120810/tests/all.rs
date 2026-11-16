@@ -121,6 +121,8 @@ mod index_write_capacity_changes;
 mod item_write_expressions;
 #[path = "all/item_write_vocabularies.rs"]
 mod item_write_vocabularies;
+#[path = "all/key_condition_defect_classes.rs"]
+mod key_condition_defect_classes;
 #[path = "all/key_condition_defect_order.rs"]
 mod key_condition_defect_order;
 #[path = "all/key_condition_operands_and_legacy_conditions.rs"]
@@ -293,6 +295,8 @@ mod select_rules_and_policy_resources;
 mod result_filter_expressions;
 #[path = "all/restore_table_to_point_in_time.rs"]
 mod restore_table_to_point_in_time;
+#[path = "all/size_and_range_refusal_classes.rs"]
+mod size_and_range_refusal_classes;
 #[path = "all/start_key_boundary_refusals.rs"]
 mod start_key_boundary_refusals;
 #[path = "all/start_key_missing_key_element.rs"]
@@ -371,6 +375,8 @@ mod update_contributor_insights_writes;
 mod update_operand_type_sets;
 #[path = "all/update_table_transient_status.rs"]
 mod update_table_transient_status;
+#[path = "all/validation_before_table_lookup.rs"]
+mod validation_before_table_lookup;
 #[path = "all/validation_message_fidelity.rs"]
 mod validation_message_fidelity;
 #[path = "all/validation_message_wording.rs"]

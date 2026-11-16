@@ -380,16 +380,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value a condition compares against, or a value the update writes, is held
         // to the same limits a stored value is: the documented nesting depth, and this
         // emulator's own ceiling on the members one set may carry. Both bound the work
-        // this request can ask for, and both come from the request.
+        // this request can ask for, and both come from the request. A value past the
+        // documented item ceiling is worded as the UPDATE path words that quota
+        // ([`crate::state::stated_for_an_update`]).
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
-            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+            crate::state::check_attribute_value(placeholder, value)
+                .map_err(crate::state::stated_for_an_update)
+                .map_err(lift)?;
         }
         for (attribute, value) in &input.key {
             crate::state::check_attribute_value(attribute, value).map_err(lift)?;
         }
         for update in input.attribute_updates.iter().flatten() {
             if let Some(value) = update.1.value.as_ref() {
-                crate::state::check_attribute_value(update.0, value).map_err(lift)?;
+                crate::state::check_attribute_value(update.0, value)
+                    .map_err(crate::state::stated_for_an_update)
+                    .map_err(lift)?;
             }
         }
         // The legacy `Expected` map carries values the same way, so it is bounded here
@@ -535,18 +541,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The result is held to the same bounds a `PutItem` of it would be: the
         // documented 32 levels of nesting, this emulator's collection-member ceiling
-        // and the documented 400 KB item size. Its numbers are canonicalized here too,
-        // before the item is sized or reported, so what `ReturnValues` echoes is the
-        // item as STORED rather than the lexemes the request spelled; the store
-        // canonicalizes again at its write site, which is idempotent.
+        // and the documented 400 KB item size — the last of them worded as the UPDATE
+        // path states that quota, because the item that crossed it is the one this
+        // change would leave behind rather than one the request carried
+        // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]). Its numbers are
+        // canonicalized here too, before the item is sized or reported, so what
+        // `ReturnValues` echoes is the item as STORED rather than the lexemes the
+        // request spelled; the store canonicalizes again at its write site, which is
+        // idempotent.
         for (attribute, value) in &item {
-            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+            crate::state::check_attribute_value(attribute, value)
+                .map_err(crate::state::stated_for_an_update)
+                .map_err(lift)?;
         }
         crate::state::canonicalize_item(&mut item).map_err(lift)?;
         let size = crate::state::item_size(&item);
         if size > crate::state::MAX_ITEM_SIZE_BYTES {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
             ));
         }
         // The item the update leaves is held to the declared type and the documented

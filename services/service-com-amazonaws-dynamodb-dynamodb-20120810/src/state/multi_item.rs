@@ -730,19 +730,23 @@ impl Substitutions<'_> {
     /// token its expressions dereference defined, every entry it defines referenced — and
     /// state what is wrong with them as a refusal about an element is stated.
     ///
-    /// The CHECK is the request-level one ([`Substitutions::check_all_referenced`]), because
-    /// the rule is the same wherever the members sit and stating it twice would let the two
-    /// drift. What differs is the ENVELOPE: `<N> validation error(s) detected: ` reports
-    /// violations of the REQUEST's own members, which is what the request validator is handed,
-    /// and the expression members of one `TransactItems` action or one `RequestItems` entry
-    /// are members of that element — so the sentence an element earns is stated on its own,
+    /// The CHECK is the request-level one
+    /// ([`Substitutions::check_referenced_within_element`]), because the rule is the same
+    /// wherever the members sit and stating it twice would let the two drift. What differs
+    /// is the ENVELOPE: `<N> validation error(s) detected: ` reports violations of the
+    /// REQUEST's own members, which is what the request validator is handed, and the
+    /// expression members of one `TransactItems` action or one `RequestItems` entry are
+    /// members of that element — so the sentence an element earns is stated on its own,
     /// like every other refusal this service raises about an element
-    /// ([`DUPLICATE_TRANSACT_ITEM_MESSAGE`], [`too_many_batch_items`]).
+    /// ([`DUPLICATE_TRANSACT_ITEM_MESSAGE`], [`too_many_batch_items`]). What else differs
+    /// is the one rule that is the REQUEST's: a table an element sends with no expression
+    /// of its own is admitted, because it is the request validator that holds a call's own
+    /// expression members to the tables beside them.
     pub fn check_all_referenced_in_element(
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
-        self.check_all_referenced(expressions)
+        self.check_referenced_within_element(expressions)
             .map_err(stated_outside_the_envelope)
     }
 }

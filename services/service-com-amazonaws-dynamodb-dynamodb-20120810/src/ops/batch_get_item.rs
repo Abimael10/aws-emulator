@@ -320,6 +320,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(projected) = read {
                 projections.insert(table_name, projected);
             }
+            // "Provided list of item keys contains duplicates": one entry asking for the
+            // same key twice is a defect of the LIST it sent, which the request settles on
+            // its own — two identical key maps are one key whichever schema they are read
+            // against — so it is answered before any table is looked up. Two keys that are
+            // spelled differently and denote the SAME key of a schema are the same defect
+            // and can only be seen against that schema, which is where the walk below sees
+            // them.
+            let mut written: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for key_map in &keys.keys {
+                if !written.insert(crate::state::canonical_item_text(key_map)) {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::DUPLICATE_BATCH_KEYS_MESSAGE,
+                    ));
+                }
+            }
         }
 
         // WHO this request speaks for, resolved before this service's store is locked

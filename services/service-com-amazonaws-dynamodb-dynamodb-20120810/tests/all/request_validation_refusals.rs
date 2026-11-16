@@ -628,6 +628,19 @@ async fn a_substitution_table_defines_something() {
         ),
     ];
 
+    // Whether the sentence carries the `<N> validation error(s) detected: ` envelope
+    // follows the expression member the operation states its intent through: the members a
+    // WRITE states its condition and its update in carry it, and the members a READ
+    // narrows its result with are stated on their own.
+    let empty_member = |operation: &str, member: &str| {
+        let clause = format!("{member} must not be empty");
+        if matches!(operation, "PutItem" | "DeleteItem" | "UpdateItem") {
+            format!("1 validation error detected: {clause}")
+        } else {
+            clause
+        }
+    };
+
     for (operation, base) in &operations {
         // An empty VALUES table, except where the operation needs that member to state
         // its key condition.
@@ -638,7 +651,7 @@ async fn a_substitution_table_defines_something() {
             let stated = refusal(&router, &case, operation, request).await;
             assert_eq!(
                 stated,
-                "1 validation error detected: ExpressionAttributeValues must not be empty",
+                empty_member(operation, "ExpressionAttributeValues"),
                 "case {case:?}: expected the empty-member sentence, got {stated:?}"
             );
         }
@@ -650,7 +663,7 @@ async fn a_substitution_table_defines_something() {
         let stated = refusal(&router, &case, operation, request).await;
         assert_eq!(
             stated,
-            "1 validation error detected: ExpressionAttributeNames must not be empty",
+            empty_member(operation, "ExpressionAttributeNames"),
             "case {case:?}: expected the empty-member sentence, got {stated:?}"
         );
     }

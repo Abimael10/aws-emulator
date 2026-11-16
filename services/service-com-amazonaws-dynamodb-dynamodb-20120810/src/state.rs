@@ -95,6 +95,40 @@ pub const MAX_PAGE_BYTES: i64 = 1024 * 1024;
 /// internal to the check; the caller is told which quota it crossed.
 pub const ITEM_SIZE_EXCEEDED_MESSAGE: &str = "Item size has exceeded the maximum allowed size";
 
+/// How a write that GROWS a stored item past [`MAX_ITEM_SIZE_BYTES`] is refused.
+///
+/// An update states what to CHANGE rather than the whole item, so the item that crosses
+/// the quota is the one the change would leave behind — "Item size to update has
+/// exceeded the maximum allowed size", the sentence for that quota on the update path,
+/// fixed text with neither the ceiling nor the resulting size appended. The sentence
+/// above is for a request that CARRIED an oversized item.
+///
+/// Every surface that applies an update to the stored item states it: `UpdateItem`, the
+/// `Update` action of a transaction, and a PartiQL `UPDATE`.
+pub const ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE: &str =
+    "Item size to update has exceeded the maximum allowed size";
+
+/// The most data the items of ONE transaction may add up to, 4 MB ("Service, Account,
+/// and Table Quotas": "The aggregate size of the items in the transaction cannot exceed
+/// 4 MB").
+///
+/// A transaction is applied as one unit, so the ceiling is on the whole call rather than
+/// on any one of its actions: a hundred actions each inside the 400 KB item limit can
+/// still ask for more than one transaction may carry.
+pub const MAX_TRANSACTION_SIZE_BYTES: i64 = 4 * 1024 * 1024;
+
+/// How a transaction past [`MAX_TRANSACTION_SIZE_BYTES`] is refused.
+///
+/// The sentence is this service's own, in the same fixed form the item ceiling states
+/// ([`ITEM_SIZE_EXCEEDED_MESSAGE`]) and with neither the ceiling nor the offending total
+/// appended: the quota is the whole CALL's, so it names neither an action nor a table. What
+/// the CONTRACT settles is the class — a top-level `ValidationException` refusing the
+/// request rather than a cancellation, because no action of it was applicable to begin with
+/// — and this wording has not been read back from a recording of the sentence AWS sends for
+/// it.
+pub const TRANSACTION_SIZE_EXCEEDED_MESSAGE: &str =
+    "Transaction size has exceeded the maximum allowed size";
+
 /// How a `Key` member that is not the table's primary key is refused: AWS's
 /// FIXED sentence for that mismatch, with nothing about WHICH element differs
 /// appended — a caller learns its key does not match without the refusal
@@ -789,12 +823,35 @@ pub fn return_values_must_be_old_or_none() -> RequestError {
 /// The refusal for an item whose attributes nest deeper than
 /// [`MAX_ATTRIBUTE_DEPTH`]: AWS's fixed clause for that quota, inside the same
 /// envelope, naming the quota and nothing of which attribute reached it.
+///
+/// Like every other refusal about a value a request carried, the clause an ELEMENT of a
+/// multi-item call earns is stated on its own: the envelope reports violations of the
+/// members the request validator was handed, and the item of one `RequestItems` or
+/// `TransactItems` entry is a member of that entry ([`unenveloped`] is where each of
+/// those readers states it).
 pub fn nesting_levels_exceeded() -> RequestError {
     refused(
         "Nesting Levels have exceeded supported limits: Attributes in the item have nested \
          levels beyond supported limit"
             .to_string(),
     )
+}
+
+/// How a write path states a refusal about a value a change would leave in the STORED
+/// item: the documented item ceiling is worded as the UPDATE path words it
+/// ([`ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]) rather than as a request that CARRIED an
+/// oversized item is refused.
+///
+/// The value rules themselves are the same wherever a value arrives
+/// ([`check_attribute_value`]); only the sentence for that one quota follows the path, so
+/// it is restated here rather than threaded through every caller of those rules.
+pub fn stated_for_an_update(error: RequestError) -> RequestError {
+    match error {
+        RequestError::Validation(message) if message == ITEM_SIZE_EXCEEDED_MESSAGE => {
+            RequestError::Validation(ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string())
+        }
+        other => other,
+    }
 }
 
 /// How a `Query` that states neither of the two members a key condition can be

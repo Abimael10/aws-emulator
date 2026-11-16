@@ -796,14 +796,18 @@ fn update_item(
     }
     // The item the statement leaves is held to exactly what a `PutItem` of it would
     // be: the documented nesting, the 400 KB item size, and the key limits of every
-    // index it is projected into.
+    // index it is projected into. A statement that UPDATES states what to change, so
+    // the size refusal is the one the update path states
+    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]).
     for (attribute, value) in &item {
-        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+        crate::state::check_attribute_value(attribute, value)
+            .map_err(crate::state::stated_for_an_update)
+            .map_err(lift)?;
     }
     crate::state::canonicalize_item(&mut item).map_err(lift)?;
     if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
         return Err(crate::scaffolded::Scaffolded::validation(
-            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
         ));
     }
     store

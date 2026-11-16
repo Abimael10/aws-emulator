@@ -200,14 +200,16 @@ async fn a_key_condition_operand_is_held_to_the_types_its_operator_compares() {
                 "KeyConditionExpression": format!("pk = :p AND {comparison}"),
                 "ExpressionAttributeValues": {":p": {"S": "p"}, ":v": value},
             });
-            // The three key types a comparison orders, and the two a prefix is
-            // meaningful for, are what each operator accepts; everything else is the
-            // operand-type defect, named with the operator as written.
+            // The three key types a comparison ORDERS, and the two a prefix is
+            // meaningful for, are what those operators accept; equality compares ONE
+            // value, so every single-valued type passes the request-level rule and is
+            // then held to the schema's own type. Everything else is the operand-type
+            // defect, named with the operator as written.
             let ordered = matches!(*datatype, "S" | "N" | "B");
-            let compared = if *operator == "begins_with" {
-                matches!(*datatype, "S" | "B")
-            } else {
-                ordered
+            let compared = match *operator {
+                "begins_with" => matches!(*datatype, "S" | "B"),
+                "=" => ordered || matches!(*datatype, "NULL" | "BOOL"),
+                _ => ordered,
             };
             if !compared {
                 let stated = refusal(&router, &case, "Query", request).await;
@@ -237,8 +239,8 @@ async fn a_key_condition_operand_is_held_to_the_types_its_operator_compares() {
         }
     }
 
-    // The partition key's operand is held to the same rule, and a refusal names the
-    // operator the expression wrote there too.
+    // The partition key's operand is held to the same rule: equality compares one
+    // value, so a `BOOL` operand is held to the type the schema declares for the key.
     let case = "a BOOL operand on the partition key";
     let stated = refusal(
         &router,
@@ -252,9 +254,8 @@ async fn a_key_condition_operand_is_held_to_the_types_its_operator_compares() {
     )
     .await;
     assert_eq!(
-        stated,
-        incorrect_operand("=", "BOOL"),
-        "case {case:?}: expected the operand-type refusal, got {stated:?}"
+        stated, SCHEMA_TYPE,
+        "case {case:?}: expected the schema-type refusal, got {stated:?}"
     );
 }
 

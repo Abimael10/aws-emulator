@@ -961,17 +961,31 @@ impl Operator {
         }
     }
 
-    /// Whether this comparison can be made against a value of `datatype` at all.
+    /// Whether this comparison or function can be made against a value of `datatype` at
+    /// all — the part of what an operand may BE that the REQUEST settles, before any
+    /// schema is known.
     ///
-    /// A comparison orders two values, and DynamoDB orders only the three scalar key
-    /// types — "the following types are allowed for the attributes of a key: String,
-    /// Number, Binary" — so an operand of any other `AttributeValue` type is no operand
-    /// for one. `begins_with` is narrower still: a prefix is only meaningful for the two
-    /// types that HAVE one, "String or Binary (not a Number or a set type)"
-    /// (`ComparisonOperator`'s `BEGINS_WITH`).
+    /// Three rules, each a fact of the comparison's own text:
+    ///
+    /// * a key condition compares ONE value against a key attribute, so a collection —
+    ///   a set, a list or a map — is no operand for any of them;
+    /// * a comparison that ORDERS its two sides is held to the types DynamoDB orders,
+    ///   "For type Number, value comparisons are numeric. String value comparisons ...
+    ///   are based on ASCII character code values. For Binary, DynamoDB treats each byte
+    ///   ... as unsigned" (the `AttributeValueList` doc) and nothing for the others;
+    /// * `begins_with` takes a PREFIX, which only the two types that have one can be,
+    ///   "String or Binary (not a Number or a set type)" (`ComparisonOperator`'s
+    ///   `BEGINS_WITH`).
+    ///
+    /// What EQUALITY's operand may be beyond being a single value is the type the schema
+    /// declares for the key attribute it is compared with, which is known only once the
+    /// condition BINDS to a schema — so an operand of another type is refused there, as
+    /// the condition parameter whose type does not match the schema's
+    /// ([`crate::state::Table::key_condition_value`]), and not here.
     fn compares(self, datatype: &str) -> bool {
         match self {
             Self::BeginsWith => matches!(datatype, "S" | "B"),
+            Self::Equal => matches!(datatype, "S" | "N" | "B" | "BOOL" | "NULL"),
             _ => matches!(datatype, "S" | "N" | "B"),
         }
     }
@@ -1055,11 +1069,11 @@ impl OperandDefect {
 ///
 /// Both defects an operand can carry are read in this one walk, so a key condition carrying
 /// two of them is refused for the one its TEXT states first rather than for whichever check
-/// happened to run: "the following types are allowed for the attributes of a key: String,
-/// Number, Binary" — so an operand of any other `AttributeValue` type is no operand for a
-/// comparison on a key at all, and `begins_with` takes only the two types that have a prefix
-/// ([`Operator::compares`]) — and a placeholder the request never defined stands for no
-/// value.
+/// happened to run: a placeholder the request never defined stands for no value, and an
+/// operand its comparison or function cannot be made against at all is no operand for it
+/// ([`Operator::compares`]). What EQUALITY's operand may be beyond being a single value is
+/// the type the schema declares for the key it binds to, so that is settled where it binds
+/// and not here.
 fn first_operand_defect(comparisons: &[Comparison]) -> Option<OperandDefect> {
     for comparison in comparisons {
         for operand in &comparison.operands {
@@ -1155,13 +1169,25 @@ impl KeyCondition {
         if let Some(defect) = first_operand_defect(&comparisons) {
             return Err(defect.refusal());
         }
+        // ONE attribute carries ONE clause, whichever half of the key it is and however
+        // many clauses the condition states in all ([`one_condition_per_key`]): a
+        // condition that states two about one attribute is refused for THAT, because
+        // that is the rule it broke — the count below would otherwise report a shape
+        // defect for a condition whose real mistake is the doubled key.
+        if comparisons.iter().enumerate().any(|(at, comparison)| {
+            comparisons[..at]
+                .iter()
+                .any(|earlier| earlier.attribute == comparison.attribute)
+        }) {
+            return Err(one_condition_per_key());
+        }
         // A key condition binds its comparisons to the key attributes of the schema it
         // reads — "You must provide the name of the partition key attribute and a single
         // value for that attribute ... Optionally, you can provide a sort key attribute"
         // (`Query$KeyConditionExpression`) — so a condition stating more comparisons
         // than that schema declares key attributes cannot bind, whichever attributes
-        // they name. Counted first, because that is a fact of the condition's SHAPE
-        // rather than of which element any one comparison stood in for.
+        // they name. Counted once no attribute is doubled, because that is a fact of the
+        // condition's SHAPE rather than of which element any one comparison stood in for.
         if comparisons.len() > schema.len() {
             return Err(too_many_query_conditions(comparisons.len(), schema.len()));
         }
@@ -1699,6 +1725,19 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> 
                 tokens.push(Token::Compare(operator));
                 at += if followed_by_equals { 2 } else { 1 };
             }
+            // A `.` or a `[` after a NAME reaches inside that attribute, which is a
+            // document path and not the key attribute a key condition compares: refused
+            // as the key-condition rule it breaks rather than as a character the grammar
+            // cannot read ([`nested_attribute_key_condition`]). A name that is one of
+            // DynamoDB's RESERVED words is refused for that first: the expression has to
+            // reach that attribute through `ExpressionAttributeNames` whatever it then
+            // writes after it.
+            '.' | '[' if matches!(tokens.last(), Some(Token::Name(_))) => {
+                if let Some(Token::Name(name)) = tokens.last() {
+                    crate::state::check_reserved_attribute_name(KEY_CONDITION_MEMBER, name)?;
+                }
+                return Err(nested_attribute_key_condition());
+            }
             ':' | '#' => {
                 let start = at;
                 at += 1;
@@ -1816,6 +1855,23 @@ const NON_KEY_CONDITION_OPERATORS: [&str; 7] = [
     "attribute_type",
 ];
 
+/// The refusal for a key condition that states a condition on a DOCUMENT PATH rather
+/// than on a key attribute.
+///
+/// A key condition compares the key ATTRIBUTES of the schema it reads
+/// (`Query$KeyConditionExpression` spells each of its forms over an attribute name), and
+/// a key attribute is a top-level attribute of the item — so a path that reaches inside
+/// one addresses nothing a key condition can be stated about. AWS's sentence is FIXED: it
+/// names the member's rule and neither the path nor the attribute, so a client matching it
+/// recognises the defect whichever nested path the condition wrote.
+fn nested_attribute_key_condition() -> crate::state::RequestError {
+    crate::state::RequestError::Validation(
+        "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on \
+         nested attributes"
+            .to_string(),
+    )
+}
+
 /// The refusal for a key condition that constrains no comparison for one of the key
 /// schema elements it has to cover: AWS names the element the condition missed.
 fn missed_key_schema_element(element: &str) -> crate::state::RequestError {
@@ -1902,7 +1958,7 @@ fn parse_key_condition_expression(
     // this condition could dereference, so that defect is settled before the condition
     // that would dereference one is read
     // ([`crate::state::Substitutions::check_keys_are_tokens`]).
-    crate::state::Substitutions::new(names, values).check_keys_are_tokens()?;
+    crate::state::Substitutions::new(names, values).check_keys_are_tokens(&[KEY_CONDITION_MEMBER])?;
     let tokens = tokenize(expression)?;
     let mut parser = Parser {
         tokens: &tokens,

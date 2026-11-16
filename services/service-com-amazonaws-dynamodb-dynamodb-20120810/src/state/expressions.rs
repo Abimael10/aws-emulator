@@ -335,10 +335,42 @@ fn between_bounds_out_of_order(
     )
 }
 
-/// Hold one `BETWEEN`'s bounds to that order, where the request stated both of them as
-/// LITERALS — a bound read from the item is known only once the item is read.
+/// The refusal for a `BETWEEN` whose two bounds the request stated in DIFFERENT types.
 ///
-/// The one statement of that rule, for every member a `BETWEEN` can be written in: the
+/// "BETWEEN — ... true if a is greater than or equal to b, and less than or equal to c"
+/// (the `ConditionExpression` comparator reference): the two bounds draw one range, and
+/// DynamoDB orders values only WITHIN a type ("For type Number, value comparisons are
+/// numeric. String value comparisons ... are based on ASCII character code values" — the
+/// `AttributeValueList` doc), so bounds of two types draw no range at all. That is the
+/// request's mistake and not an unmet condition, and AWS echoes both bounds as the
+/// operands they are, exactly as the refusal for two bounds the wrong way round does
+/// ([`between_bounds_out_of_order`]).
+fn between_bounds_of_different_types(
+    member: &str,
+    low: &AttributeValue,
+    high: &AttributeValue,
+) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "The BETWEEN operator requires same data type for lower and upper bounds; lower \
+             bound operand: {}, upper bound operand: {}",
+            rendered_operand(low),
+            rendered_operand(high)
+        ),
+    )
+}
+
+/// Hold one `BETWEEN`'s bounds to the comparator's two rules, where the request stated
+/// both of them as LITERALS — a bound read from the item is known only once the item is
+/// read.
+///
+/// The bounds must be of ONE type, because a range is drawn inside a type
+/// ([`between_bounds_of_different_types`]), and the lower one must not sit above the
+/// upper one ([`between_bounds_out_of_order`]). The type rule is asked first: two bounds
+/// of different types are not in any order to begin with.
+///
+/// The one statement of both rules, for every member a `BETWEEN` can be written in: the
 /// condition and filter grammars this module parses, and the `KeyConditionExpression`
 /// grammar the `Query` handler parses.
 pub fn check_between_bounds(
@@ -346,6 +378,9 @@ pub fn check_between_bounds(
     low: &AttributeValue,
     high: &AttributeValue,
 ) -> Result<(), RequestError> {
+    if attribute_value_type(low) != attribute_value_type(high) {
+        return Err(between_bounds_of_different_types(member, low, high));
+    }
     if compare_values(low, high) == Some(Ordering::Greater) {
         return Err(between_bounds_out_of_order(member, low, high));
     }
@@ -810,9 +845,46 @@ impl<'a> Substitutions<'a> {
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
-        self.check_table_keys()?;
+        let enveloped = declares_enveloped_expression(expressions);
+        self.check_table_keys(enveloped)?;
         self.check_an_expression_was_sent(expressions)?;
-        self.check_tables_not_empty()?;
+        self.check_tables_not_empty(enveloped)?;
+        self.check_tokens_referenced(expressions)
+    }
+
+    /// The same rules over the expressions of ONE ELEMENT of a multi-item request.
+    ///
+    /// What each table SAYS is held to the same rules wherever the member sits: its keys
+    /// are substitution tokens, it is not empty, and every token it defines is one the
+    /// expressions beside it reference. What differs is the one rule that is the
+    /// REQUEST's — that a table was sent with an expression to be substituted into at all
+    /// ([`Substitutions::check_an_expression_was_sent`]): it is the request validator
+    /// that holds a CALL's expression members to the tables beside them, and the tables of
+    /// one `TransactItems` action or one `RequestItems` entry are members of that element.
+    /// So an element's tables are held to the element's OWN expressions, and an element
+    /// that states no expression has none to hold them to: its tables are admitted rather
+    /// than refused for the expression the element did not state or for the entries that
+    /// expression would not have referenced.
+    pub(super) fn check_referenced_within_element(
+        &self,
+        expressions: &[(&str, Option<&str>)],
+    ) -> Result<(), RequestError> {
+        let enveloped = declares_enveloped_expression(expressions);
+        self.check_table_keys(enveloped)?;
+        self.check_tables_not_empty(enveloped)?;
+        if !names_an_expression(expressions, |_| true) {
+            return Ok(());
+        }
+        self.check_tokens_referenced(expressions)
+    }
+
+    /// Every token either side names must be one the other has: an `#alias` or
+    /// `:placeholder` an expression dereferences defined by the table it reads, and an
+    /// entry a table defines referenced by one of the expressions.
+    fn check_tokens_referenced(
+        &self,
+        expressions: &[(&str, Option<&str>)],
+    ) -> Result<(), RequestError> {
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut values: BTreeSet<String> = BTreeSet::new();
         for (member, expression) in expressions {
@@ -882,17 +954,16 @@ impl<'a> Substitutions<'a> {
     /// refusal about this request's expressions follows ([`envelopes_expression_refusals`]):
     /// the members a WRITE states its intent through carry it and the members a READ narrows
     /// its result with do not — read off the members the OPERATION declares, since none of
-    /// them was sent. The refusal of one ELEMENT's tables is then stated outside the envelope
-    /// like every other refusal about an element
-    /// ([`Substitutions::check_all_referenced_in_element`]). The NAMES table is reported
-    /// first, which is the order the two tables are checked in throughout.
+    /// them was sent. The NAMES table is reported first, which is the order the two tables
+    /// are checked in throughout.
+    ///
+    /// This rule is the REQUEST's own and is not asked of one ELEMENT of a multi-item
+    /// request ([`Substitutions::check_referenced_within_element`]).
     fn check_an_expression_was_sent(
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
-        let enveloped = expressions
-            .iter()
-            .any(|(member, _)| envelopes_expression_refusals(member));
+        let enveloped = declares_enveloped_expression(expressions);
         if defines_a_token(self.names) && !names_an_expression(expressions, |_| true) {
             return Err(only_with_expressions(enveloped, "ExpressionAttributeNames"));
         }
@@ -918,17 +989,21 @@ impl<'a> Substitutions<'a> {
     /// a key that is no token names nothing whichever expressions the request carried. The
     /// NAMES table is reported first, which is the order the two tables are checked in
     /// throughout.
-    fn check_table_keys(&self) -> Result<(), RequestError> {
-        self.check_keys_are_tokens()
+    fn check_table_keys(&self, enveloped: bool) -> Result<(), RequestError> {
+        check_substitution_keys(NAMES_MEMBER, self.names, NAME_TOKEN_PREFIX, enveloped)?;
+        check_substitution_keys(VALUES_MEMBER, self.values, VALUE_TOKEN_PREFIX, enveloped)
     }
 
     /// The same check, for a reader that reads an expression BEFORE it holds the request's
     /// tables to its expressions ([`Substitutions::check_all_referenced`]): a key that is
     /// no token defines nothing, so it is settled before the expression that would
     /// dereference one is read.
-    pub fn check_keys_are_tokens(&self) -> Result<(), RequestError> {
-        check_substitution_keys(NAMES_MEMBER, self.names, NAME_TOKEN_PREFIX)?;
-        check_substitution_keys(VALUES_MEMBER, self.values, VALUE_TOKEN_PREFIX)
+    ///
+    /// `members` are the expression members that reader reads, which is what decides
+    /// whether the refusal carries the validation envelope
+    /// ([`envelopes_expression_refusals`]).
+    pub fn check_keys_are_tokens(&self, members: &[&str]) -> Result<(), RequestError> {
+        self.check_table_keys(members.iter().copied().any(envelopes_expression_refusals))
     }
 
     /// A substitution table the request SENT must define something, and every name it
@@ -943,12 +1018,18 @@ impl<'a> Substitutions<'a> {
     /// An entry of the NAMES table whose value is empty names no attribute at all, so
     /// the token could resolve to nothing: the table carries an invalid value, and the
     /// refusal says which key it sits under.
-    fn check_tables_not_empty(&self) -> Result<(), RequestError> {
+    ///
+    /// Both sentences carry the validation envelope exactly where every other refusal
+    /// about this request's expressions does ([`envelopes_expression_refusals`]).
+    fn check_tables_not_empty(&self, enveloped: bool) -> Result<(), RequestError> {
         if self.names.is_some_and(HashMap::is_empty) {
-            return Err(empty_substitution_table("ExpressionAttributeNames"));
+            return Err(empty_substitution_table(enveloped, "ExpressionAttributeNames"));
         }
         if self.values.is_some_and(HashMap::is_empty) {
-            return Err(empty_substitution_table("ExpressionAttributeValues"));
+            return Err(empty_substitution_table(
+                enveloped,
+                "ExpressionAttributeValues",
+            ));
         }
         // One stable order over a map, so the same request earns the same message.
         let mut empty: Vec<&str> = self
@@ -960,13 +1041,26 @@ impl<'a> Substitutions<'a> {
             .collect();
         empty.sort_unstable();
         if let Some(alias) = empty.first() {
-            return Err(RequestError::Validation(format!(
-                "ExpressionAttributeNames contains invalid value: Empty attribute name for key \
-                 {alias}"
-            )));
+            return Err(expression_refusal(
+                enveloped,
+                format!(
+                    "ExpressionAttributeNames contains invalid value: Empty attribute name for \
+                     key {alias}"
+                ),
+            ));
         }
         Ok(())
     }
+}
+
+/// Whether the expression members a request DECLARES carry the
+/// `<N> validation error(s) detected: ` envelope — read off the members the operation
+/// declares rather than off the ones it sent, because the refusals below are about a
+/// request that sent none of them ([`envelopes_expression_refusals`] is the rule).
+fn declares_enveloped_expression(expressions: &[(&str, Option<&str>)]) -> bool {
+    expressions
+        .iter()
+        .any(|(member, _)| envelopes_expression_refusals(member))
 }
 
 /// The refusal for a substitution table sent with no expression to substitute into: AWS's
@@ -996,6 +1090,7 @@ fn check_substitution_keys<V>(
     member: &str,
     table: Option<&HashMap<String, V>>,
     prefix: char,
+    enveloped: bool,
 ) -> Result<(), RequestError> {
     let mut invalid: Vec<&str> = table
         .into_iter()
@@ -1005,9 +1100,10 @@ fn check_substitution_keys<V>(
         .collect();
     invalid.sort_unstable();
     match invalid.first() {
-        Some(key) => Err(RequestError::Validation(format!(
-            "{member} contains invalid key: Syntax error; key: \"{key}\""
-        ))),
+        Some(key) => Err(expression_refusal(
+            enveloped,
+            format!("{member} contains invalid key: Syntax error; key: \"{key}\""),
+        )),
         None => Ok(()),
     }
 }
@@ -1053,10 +1149,11 @@ fn substitutes_values(member: &str) -> bool {
 /// The expression member that names attributes to report rather than values to compare.
 const PROJECTION_EXPRESSION_MEMBER: &str = "ProjectionExpression";
 
-/// The refusal for a substitution table sent with no entries: AWS's own clause, naming
-/// the member, inside the validation envelope every refusal of a member's VALUE carries.
-pub(super) fn empty_substitution_table(member: &str) -> RequestError {
-    refused(format!("{member} must not be empty"))
+/// The refusal for a substitution table sent with no entries: AWS's own sentence, naming
+/// the member, inside the validation envelope where the operation's expression members
+/// carry one ([`expression_refusal`]).
+pub(super) fn empty_substitution_table(enveloped: bool, member: &str) -> RequestError {
+    expression_refusal(enveloped, format!("{member} must not be empty"))
 }
 
 /// Refuse one substitution table that defines a key no expression referenced.
@@ -1624,9 +1721,7 @@ fn incorrect_operand_type(
 /// refused whether the value arrived in an item, in `ExpressionAttributeValues`, in a
 /// statement's `Parameters` or in a key.
 pub fn check_attribute_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
-    if attribute_depth_exceeds(value, MAX_ATTRIBUTE_DEPTH) {
-        return Err(nesting_levels_exceeded());
-    }
+    check_value_within_the_item_limits(name, value)?;
     // No ONE value can be larger than the item that would have to hold it, so this is
     // also the bound on the bytes a single substitution can carry into the store: the
     // check PRECEDES every clone of it.
@@ -1634,6 +1729,18 @@ pub fn check_attribute_value(name: &str, value: &AttributeValue) -> Result<(), R
         return Err(RequestError::Validation(
             ITEM_SIZE_EXCEEDED_MESSAGE.to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Every one of those limits EXCEPT the item ceiling: the documented nesting depth,
+/// [`MAX_COLLECTION_MEMBERS`], and the rules for the value's own type.
+fn check_value_within_the_item_limits(
+    name: &str,
+    value: &AttributeValue,
+) -> Result<(), RequestError> {
+    if attribute_depth_exceeds(value, MAX_ATTRIBUTE_DEPTH) {
+        return Err(nesting_levels_exceeded());
     }
     if value_members(value) > MAX_COLLECTION_MEMBERS {
         return Err(too_many_members(name, value_members(value)));
@@ -1656,16 +1763,19 @@ pub fn check_bare_attribute_value(name: &str, value: &AttributeValue) -> Result<
 
 /// The same limits for a value a STATEMENT carries — a `?` parameter or a literal the
 /// statement spells — stated as its own sentence rather than inside the validation
-/// envelope.
+/// envelope, and WITHOUT the item ceiling.
 ///
-/// The rules are the same ([`check_attribute_value`]); what differs is the FORM the
-/// service states them in, which follows the surface the value arrived through: the
-/// item API validates its members and reports clauses inside the
-/// `<N> validation error(s) detected: ` envelope, while the statement surface answers
-/// the clause on its own, the way it answers every other refusal about a statement, and
-/// states no separator for a value it has nothing to echo after it.
+/// A value a statement carries is not an item: whether it FITS one is decided where the
+/// item it would be written into is sized, which is also what decides how that refusal is
+/// worded — an `INSERT` states the ceiling the way a request carrying an oversized item is
+/// refused, and an `UPDATE` the way a change that would grow the stored item past it is
+/// ([`ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]). A `SELECT` writes no item at all, so a value
+/// it compares against is bounded by what it IS and not by what an item could hold. Every
+/// other rule is the same ([`check_attribute_value`]), and so is the FORM: the statement
+/// surface answers the clause on its own, the way it answers every other refusal about a
+/// statement, and states no separator for a value it has nothing to echo after it.
 pub fn check_statement_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
-    check_attribute_value(name, value)
+    check_value_within_the_item_limits(name, value)
         .map_err(without_envelope)
         .map_err(without_empty_echo)
 }
@@ -1741,6 +1851,10 @@ fn check_members_written(
 /// Whether `item` has room for `value` at `path` — the clamp that PRECEDES the write,
 /// so the item an update builds cannot grow past the documented 400 KB even while it is
 /// being built, however many actions the update states.
+///
+/// Reached only while an update is APPLIED, so the refusal is the one the update path
+/// states for that quota ([`ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]): the item that crossed
+/// it is the one the change would leave behind.
 fn check_room_for(
     item: &Item,
     path: &DocumentPath,
@@ -1752,7 +1866,7 @@ fn check_room_for(
         .saturating_add(attribute_value_size(value));
     if projected > MAX_ITEM_SIZE_BYTES {
         return Err(RequestError::Validation(
-            ITEM_SIZE_EXCEEDED_MESSAGE.to_string(),
+            ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
         ));
     }
     Ok(())
@@ -2087,7 +2201,7 @@ impl ParsedCondition {
         // A key of either substitution table that is no substitution TOKEN defines nothing
         // this condition could dereference, so that defect is settled before the condition
         // that would dereference one is read ([`Substitutions::check_keys_are_tokens`]).
-        substitutions.check_keys_are_tokens()?;
+        substitutions.check_keys_are_tokens(&[member])?;
         let read = tokenize_expression_spanned(member, expression)?;
         let mut parser = ExprParser::over(member, &read, substitutions);
         let node = parser.disjunction()?;
@@ -2504,7 +2618,10 @@ impl ParsedUpdate {
     /// written, exactly as one a request sent does, and the item is clamped AS IT
     /// GROWS — the room check and the running member count both precede each write —
     /// so a many-action update cannot multiply a per-value bound into an unbounded item
-    /// while it is being built, however many actions the expression states.
+    /// while it is being built, however many actions the expression states. A value past
+    /// the documented item ceiling is worded as the UPDATE path words that quota
+    /// ([`stated_for_an_update`]): the item that crossed it is the one this change would
+    /// leave behind.
     pub fn apply(&self, item: &mut Item) -> Result<UpdateOutcome, RequestError> {
         let before = item.clone();
         let mut changed: Vec<DocumentPath> = Vec::new();
@@ -2515,7 +2632,8 @@ impl ParsedUpdate {
             match action {
                 UpdateAction::Set(path, value) => {
                     let value = evaluate_set_value(self.member, value, &before)?;
-                    check_attribute_value(path.attribute(), &value)?;
+                    check_attribute_value(path.attribute(), &value)
+                        .map_err(stated_for_an_update)?;
                     members_written =
                         check_members_written(members_written, path.attribute(), &value)?;
                     check_room_for(item, path, &value)?;
@@ -2525,7 +2643,8 @@ impl ParsedUpdate {
                 UpdateAction::Remove(path) => removals.push(path),
                 UpdateAction::Add(_, value) => {
                     let added = apply_add(self.member, path, value, &before)?;
-                    check_attribute_value(path.attribute(), &added)?;
+                    check_attribute_value(path.attribute(), &added)
+                        .map_err(stated_for_an_update)?;
                     members_written =
                         check_members_written(members_written, path.attribute(), &added)?;
                     check_room_for(item, path, &added)?;
@@ -2741,7 +2860,7 @@ fn evaluate_set_operand(
                     let appended = AttributeValue::L(head);
                     if attribute_value_size(&appended) > MAX_ITEM_SIZE_BYTES {
                         return Err(RequestError::Validation(
-                            ITEM_SIZE_EXCEEDED_MESSAGE.to_string(),
+                            ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
                         ));
                     }
                     Ok(appended)
@@ -2884,34 +3003,58 @@ impl<'a> ExprParser<'a> {
         Ok(())
     }
 
+    /// The refusal the position the parse stopped at earns.
+    ///
+    /// Where the parse stopped at a `(` the grammar has no place for, and the expression
+    /// never CLOSES that group, the refusal is stated at the END of the expression
+    /// instead: a group-opener standing where no group can start is one token the
+    /// expression should not carry, and with it out of the way the expression runs out of
+    /// text — which is what is wrong with it. `attribute_exists((` is the syntax error at
+    /// its end, while `attribute_exists(pk AND` stops at the `AND` it does carry, because
+    /// that token is not a stray opener. A group the expression does close is read as the
+    /// group it is, so the parse reports it where it stands.
     pub(crate) fn syntax(&self) -> RequestError {
-        expression_syntax_error_at(self.member, &self.stopped_token(), &self.near_text())
+        let at = if self.stopped_at_a_stray_group_opener() {
+            self.tokens.len()
+        } else {
+            self.at
+        };
+        expression_syntax_error_at(self.member, &self.stopped_token(at), &self.near_text_at(at))
     }
 
-    /// The token the parse stopped at, as the expression wrote it, or the end-of-input
-    /// marker when it ran out of tokens.
-    fn stopped_token(&self) -> String {
+    /// Whether the parse stopped at a `(` that opens a group the expression never closes.
+    fn stopped_at_a_stray_group_opener(&self) -> bool {
+        if !matches!(self.tokens.get(self.at), Some(ExprToken::Open)) {
+            return false;
+        }
+        let count = |wanted: &ExprToken| self.tokens.iter().filter(|token| *token == wanted).count();
+        count(&ExprToken::Open) > count(&ExprToken::Close)
+    }
+
+    /// The token at `at`, as the expression wrote it, or the end-of-input marker when it
+    /// is past the last token.
+    fn stopped_token(&self, at: usize) -> String {
         self.tokens
-            .get(self.at)
+            .get(at)
             .map_or_else(|| END_OF_EXPRESSION_TOKEN.to_string(), token_text)
     }
 
-    /// The expression text around that token: the token before it, the token itself
-    /// (there is none past the end) and the token after.
+    /// The expression text around the position the parse stopped at: the token before it,
+    /// the token itself (there is none past the end) and the token after.
     ///
     /// Quoted from the expression's OWN TEXT where the caller kept it, so the spacing
     /// is the request's: `a == :v` reads back as `== :v` rather than as the two `=`
     /// tokens re-rendered with a space between them. Without the text the window is
     /// rendered from the tokens ([`token_window`]).
-    pub(super) fn near_text(&self) -> String {
+    fn near_text_at(&self, at: usize) -> String {
         let Some(ExpressionSource { characters, spans }) = self.source else {
-            return token_window(self.tokens, self.at);
+            return token_window(self.tokens, at);
         };
         let Some(last_token) = spans.len().checked_sub(1) else {
             return String::new();
         };
-        let first = self.at.saturating_sub(1).min(last_token);
-        let last = (self.at + 1).min(last_token);
+        let first = at.saturating_sub(1).min(last_token);
+        let last = (at + 1).min(last_token);
         let start = spans.get(first).map_or(0, |span| span.0);
         let end = spans.get(last).map_or(start, |span| span.1);
         characters
@@ -3215,9 +3358,17 @@ impl<'a> ExprParser<'a> {
 
     /// Hold the call the parse has just entered to the number of operands its function
     /// takes.
+    ///
+    /// A call that carries NO operand at all is not held to this: there is nothing there
+    /// to be the wrong number OF. An expression that ends inside a call
+    /// (`attribute_exists(`), or that closes one straight away (`attribute_exists()`), is
+    /// text the grammar cannot complete — so it is the syntax error the parse stops at,
+    /// naming the position the expression ran out, which is what the parse below reports
+    /// once the operand position is read. The arity sentence is for a call whose operands
+    /// are THERE and are too many or too few.
     fn check_operand_count(&self, function: &str, takes: usize) -> Result<(), RequestError> {
         let supplied = self.operands_in_call();
-        if supplied == takes {
+        if supplied == takes || supplied == 0 {
             return Ok(());
         }
         Err(incorrect_operand_count(self.member, function, supplied))

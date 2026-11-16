@@ -296,10 +296,47 @@ fn call_shape_rows() -> Vec<Row> {
             expected: clause("FilterExpression", &operand_count("attribute_exists", 2)),
         },
         Row {
+            // A call with NO operand at all is text the grammar cannot complete, so it is
+            // the syntax error the parse stops at rather than a call of the wrong arity:
+            // there is nothing there to be the wrong number of.
             case: "a filter giving attribute_not_exists no operand",
             operation: "Scan",
             request: json!({"TableName": TABLE, "FilterExpression": "attribute_not_exists()"}),
-            expected: clause("FilterExpression", &operand_count("attribute_not_exists", 0)),
+            expected: clause(
+                "FilterExpression",
+                "Syntax error; token: \")\", near: \"()\"",
+            ),
+        },
+        Row {
+            case: "a filter whose expression ends inside a call",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": "attribute_not_exists("}),
+            expected: clause(
+                "FilterExpression",
+                "Syntax error; token: \"<EOF>\", near: \"(\"",
+            ),
+        },
+        Row {
+            // A `(` standing where no group can start is one token the expression should
+            // not carry; with it out of the way the expression runs out of text, which is
+            // what the refusal names.
+            case: "a filter carrying a stray group opener it never closes",
+            operation: "Scan",
+            request: json!({"TableName": TABLE, "FilterExpression": "attribute_not_exists(("}),
+            expected: clause(
+                "FilterExpression",
+                "Syntax error; token: \"<EOF>\", near: \"(\"",
+            ),
+        },
+        Row {
+            case: "a filter that leaves a group open after a whole clause",
+            operation: "Scan",
+            request: json!({"TableName": TABLE,
+                            "FilterExpression": "(attribute_not_exists(n)"}),
+            expected: clause(
+                "FilterExpression",
+                "Syntax error; token: \"<EOF>\", near: \")\"",
+            ),
         },
         Row {
             case: "a filter giving contains three operands",
@@ -471,6 +508,10 @@ fn key_condition_rows() -> Vec<Row> {
             ),
         },
         Row {
+            // A key condition compares the key ATTRIBUTES of the schema it reads, and a
+            // key attribute is a top-level attribute, so a path reaching inside one is
+            // refused as the rule it breaks rather than as a character the grammar
+            // cannot read.
             case: "a document path where a key attribute belongs",
             operation: "Query",
             request: json!({"TableName": TABLE,
@@ -478,7 +519,7 @@ fn key_condition_rows() -> Vec<Row> {
                             "ExpressionAttributeValues": {":p": {"S": "item-1"}}}),
             expected: clause(
                 "KeyConditionExpression",
-                "Syntax error; token: \".\", near: \"pk.x\"",
+                "KeyConditionExpressions cannot have conditions on nested attributes",
             ),
         },
         Row {
@@ -508,7 +549,8 @@ fn key_condition_rows() -> Vec<Row> {
 }
 
 /// The rows about a substitution table's KEYS: a key that is not spelled as the token an
-/// expression writes for it is that member's own defect.
+/// expression writes for it is that member's own defect, stated inside the envelope
+/// exactly where the expression member the call states its intent through carries one.
 fn substitution_key_rows() -> Vec<Row> {
     let invalid = |member: &str, key: &str| {
         format!("{member} contains invalid key: Syntax error; key: \"{key}\"")
@@ -520,7 +562,7 @@ fn substitution_key_rows() -> Vec<Row> {
             request: json!({"TableName": TABLE, "Item": key(),
                             "ConditionExpression": "attribute_not_exists(#a)",
                             "ExpressionAttributeNames": {"a": "n"}}),
-            expected: invalid("ExpressionAttributeNames", "a"),
+            expected: enveloped(&invalid("ExpressionAttributeNames", "a")),
         },
         Row {
             case: "a name key that is nothing but its #",

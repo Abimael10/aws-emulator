@@ -306,6 +306,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(lift(refusal));
         }
 
+        // The tables are walked in name order, so which refusal a bad batch earns does
+        // not depend on the request map's iteration order.
+        let mut addressed: Vec<(&String, &Vec<WriteRequest>)> =
+            input.request_items.iter().collect();
+        addressed.sort_by(|left, right| left.0.cmp(right.0));
+
+        // Every value the items of this batch carry is held to the documented value
+        // rules (the nesting depth, this emulator's collection ceilings, the numeric
+        // domain) and every item a put stores to the documented 400 KB ceiling, over the
+        // WHOLE request and before any table is looked up: none of those rules depends on
+        // a table, so a batch that cannot be served however the store looks is refused as
+        // the malformed request it is rather than reported as whichever table one of its
+        // entries named and this account has none of.
+        //
+        // The documented NESTING ceiling is asked ahead of the other rules for each put,
+        // and its clause is stated on its own: the item of one `RequestItems` entry is a
+        // member of that entry rather than of the request the validator was handed, which
+        // is how every refusal about an element of a multi-item call is stated
+        // ([`crate::state::unenveloped`]).
+        for (_, requests) in &addressed {
+            for request in requests.iter() {
+                let Some(put) = request.put_request.as_ref() else {
+                    continue;
+                };
+                for value in put.item.values() {
+                    if crate::state::attribute_depth_exceeds(
+                        value,
+                        crate::state::MAX_ATTRIBUTE_DEPTH,
+                    ) {
+                        return Err(lift(crate::state::unenveloped(
+                            crate::state::nesting_levels_exceeded(),
+                        )));
+                    }
+                }
+                let mut item = put.item.clone();
+                for (attribute, value) in &item {
+                    crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                }
+                crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                    ));
+                }
+            }
+        }
+
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
         let caller = crate::state::request_caller(&*self.engine, ctx);
@@ -313,11 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
 
         // Pass one resolves and validates the whole request without writing anything,
-        // so a batch refused for any reason leaves the store exactly as it was. The
-        // tables are walked in name order, so which refusal a bad batch earns does not
-        // depend on the request map's iteration order.
-        let mut addressed: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
-        addressed.sort_by(|left, right| left.0.cmp(right.0));
+        // so a batch refused for any reason leaves the store exactly as it was.
         let mut pending: Vec<(String, PendingWrite, WriteRequest)> = Vec::new();
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
@@ -371,16 +414,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for request in requests {
                 let write = match (&request.put_request, &request.delete_request) {
                     (Some(put), None) => {
+                        // The item's own values and its size were settled with the rest
+                        // of the request above; canonicalizing is idempotent, so what is
+                        // stored below is the item in the one form the store keeps.
                         let mut item = put.item.clone();
-                        for (attribute, value) in &item {
-                            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
-                        }
                         crate::state::canonicalize_item(&mut item).map_err(lift)?;
-                        if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
-                            return Err(crate::scaffolded::Scaffolded::validation(
-                                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
-                            ));
-                        }
                         let table = store.active_table(&region, &name, now).map_err(lift)?;
                         table.check_index_keys(&item).map_err(lift)?;
                         PendingWrite::Put {

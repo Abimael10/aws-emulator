@@ -328,6 +328,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(at, action)| check_element_shape(at, action, &region))
             .collect::<Result<_, _>>()?;
 
+        // "The aggregate size of the items in the transaction cannot exceed 4 MB"
+        // ([`crate::state::MAX_TRANSACTION_SIZE_BYTES`]): a transaction is applied as one
+        // unit, so the ceiling is on the whole call and not on any one action — a hundred
+        // actions each inside the item limit can still ask for more than one transaction
+        // may carry. What each action contributes is the data it carries: the item or
+        // `Key` map it addresses, plus the values its expressions substitute, which is
+        // where an `Update` action's payload sits. It is a fact of the REQUEST, so it is
+        // settled with every other one above, before any table is looked up, and it
+        // refuses the call rather than cancelling it: nothing of the transaction was
+        // applicable to begin with.
+        let aggregate: i64 = actions
+            .iter()
+            .map(|action| {
+                crate::state::item_size(action.addressed())
+                    + action
+                        .expression_attribute_values()
+                        .map_or(0, crate::state::item_size)
+            })
+            .sum();
+        if aggregate > crate::state::MAX_TRANSACTION_SIZE_BYTES {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TRANSACTION_SIZE_EXCEEDED_MESSAGE,
+            ));
+        }
+
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
         let caller = crate::state::request_caller(&*self.engine, ctx);
@@ -504,12 +529,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                     }
                     for (attribute, value) in &item {
-                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                        crate::state::check_attribute_value(attribute, value)
+                            .map_err(crate::state::stated_for_an_update)
+                            .map_err(lift)?;
                     }
                     crate::state::canonicalize_item(&mut item).map_err(lift)?;
                     if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
                         return Err(crate::scaffolded::Scaffolded::validation(
-                            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                         ));
                     }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
@@ -969,9 +996,24 @@ fn check_element_shape(
         .map_err(lift)?;
     // A value a condition compares against, or one an update writes, is held to the
     // same limits a stored value is: the documented nesting depth and this emulator's
-    // ceiling on a collection's members.
+    // ceiling on a collection's members. The values are this ELEMENT's members, so what
+    // they are refused for is stated on its own, like every other refusal about one
+    // element's own members ([`crate::state::unenveloped`]) — and for an `Update` the
+    // documented item ceiling is worded as the UPDATE path words it, because a value it
+    // substitutes is one this change would leave in the stored item
+    // ([`crate::state::stated_for_an_update`]).
+    let updates = matches!(action, Requested::Update(_));
     for (placeholder, value) in action.expression_attribute_values().into_iter().flatten() {
-        crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+        crate::state::check_attribute_value(placeholder, value)
+            .map_err(|error| {
+                if updates {
+                    crate::state::stated_for_an_update(error)
+                } else {
+                    error
+                }
+            })
+            .map_err(crate::state::unenveloped)
+            .map_err(lift)?;
     }
     // "For ReturnValuesOnConditionCheckFailure, the valid values are: NONE and ALL_OLD."
     if !matches!(

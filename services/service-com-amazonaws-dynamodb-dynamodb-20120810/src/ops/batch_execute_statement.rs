@@ -745,14 +745,17 @@ fn update_item(
             )));
         }
     }
-    // The item the statement leaves is held to exactly what a `PutItem` of it would be.
+    // The item the statement leaves is held to exactly what a `PutItem` of it would be,
+    // with the size refusal the UPDATE path states
+    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]).
     for (attribute, value) in &item {
-        crate::state::check_attribute_value(attribute, value)?;
+        crate::state::check_attribute_value(attribute, value)
+            .map_err(crate::state::stated_for_an_update)?;
     }
     crate::state::canonicalize_item(&mut item)?;
     if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
         return Err(SlotFailure::validation(
-            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
         ));
     }
     store

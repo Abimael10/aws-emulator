@@ -420,19 +420,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Numbers are canonicalized BEFORE the item is sized, keyed or stored, so
         // every figure reported below — the capacity billed, the item-collection key
         // echoed — is computed from the item as STORED rather than from the lexemes
-        // the request spelled. Like the depth check above and the size check below it
-        // is request validation, so it precedes the table lookup; the store
-        // canonicalizes again at its write site, which is idempotent, so no other
-        // write path can land a non-canonical number.
+        // the request spelled. Like the depth check above it is request validation, so
+        // it precedes the table lookup; the store canonicalizes again at its write site,
+        // which is idempotent, so no other write path can land a non-canonical number.
         let mut item = input.item;
         crate::state::canonicalize_item(&mut item).map_err(lift)?;
-
-        let size = crate::state::item_size(&item);
-        if size > crate::state::MAX_ITEM_SIZE_BYTES {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
-            ));
-        }
 
         // Every value the item carries is held to the documented rules for its type as
         // it is canonicalized above (set emptiness and duplicate members, numeric
@@ -460,6 +452,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // The documented 400 KB item ceiling is a quota on what this TABLE can hold,
+            // so it is asked of a table that is there: a write of an oversized item to a
+            // table this account has none of is the missing table, which is what
+            // `active_table` above has just answered. The rules that bound the REQUEST
+            // itself — the nesting depth, the collection ceilings, the condition's own
+            // grammar — are asked before the lookup, because none of them depends on the
+            // table.
+            let size = crate::state::item_size(&item);
+            if size > crate::state::MAX_ITEM_SIZE_BYTES {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                ));
+            }
             // A table the policies in force do not let this caller write is not written
             // to at all: authorization is decided before the item is keyed, against the
             // partition the item this put addresses belongs to and the attributes it
