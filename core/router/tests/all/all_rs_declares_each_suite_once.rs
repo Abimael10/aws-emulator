@@ -226,7 +226,7 @@ pub(crate) fn workspace_root() -> PathBuf {
 /// Every integration-test declaration root in the workspace: one `tests/all.rs` per
 /// service crate that has one, plus this crate's own.
 ///
-/// The rule the tests above pin belongs to the single-target layout rather than to this
+/// The rule the test below pins belongs to the single-target layout rather than to any one
 /// crate, and the crate that breaks it cannot pin it itself: a repeated `mod` makes that
 /// crate's own `all` target fail to compile, so no suite inside it is ever run to report
 /// the repetition. This target is the one that links every service crate, so it is where
@@ -325,8 +325,8 @@ fn every_crate_holding_suites_has_one_of_the_two_roots_that_compile_them() {
 /// These are the files, beside the root itself, that the crate's `all` target compiles, so a
 /// sibling suite checking a rule about what such a file may contain reads them from here
 /// rather than walking `tests/all/` — a file no root declares is compiled nowhere, and
-/// [`every_declaration_names_a_suite_file_that_exists`] is what reports a declaration whose
-/// file is absent, so one is skipped here instead of panicking.
+/// [`every_declaration_names_a_suite_file_that_exists`] is what reports a declaration
+/// whose file is absent, so one is skipped here instead of panicking.
 pub(crate) fn declared_suite_files(declaration_root: &Path) -> Vec<PathBuf> {
     let source = fs::read_to_string(declaration_root)
         .unwrap_or_else(|error| panic!("read {}: {error}", declaration_root.display()));

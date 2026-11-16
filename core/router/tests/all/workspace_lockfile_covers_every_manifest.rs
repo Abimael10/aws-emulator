@@ -416,6 +416,34 @@ pub(crate) fn locked_crate_name(dependency: &str, resolved: &Declared) -> String
         .unwrap_or_else(|| dependency.to_string())
 }
 
+/// One report per way the committed lock fails to cover the crate `resolved` requires under
+/// the name `dependency`: no `[[package]]` carries that crate, or none of the versions it does
+/// carry is one the requirement accepts. Either stops a `--locked` resolve.
+///
+/// This is the ONE reading of lock coverage in this target. A sibling pairing a narrower set of
+/// declarations with the lock — `router_suites_are_declared_by_automod`, for the dependency a
+/// test layout brings with it — reads it through here rather than through a second copy of the
+/// rule that could drift from this one.
+pub(crate) fn lock_coverage_reports(
+    dependency: &str,
+    resolved: &Declared,
+    locked: &Locked,
+) -> Vec<String> {
+    let crate_name = locked_crate_name(dependency, resolved);
+    let Some(versions) = locked.get(&crate_name) else {
+        return vec![format!(
+            "expected Cargo.lock to carry the crate {crate_name:?}, got no [[package]] with \
+             that name"
+        )];
+    };
+    match &resolved.req {
+        Some(req) if !versions.iter().any(|version| accepts(req, version)) => vec![format!(
+            "expected a locked version of {crate_name:?} that {req:?} accepts, got {versions:?}"
+        )],
+        _ => Vec::new(),
+    }
+}
+
 /// How many dependencies `manifest` declares, and one report per dependency the lock does
 /// not carry at a version the manifest's requirement accepts.
 fn unlocked_dependencies(
@@ -435,21 +463,10 @@ fn unlocked_dependencies(
             ));
             continue;
         };
-        let crate_name = locked_crate_name(dependency, &resolved);
-        let Some(versions) = locked.get(&crate_name) else {
+        for report in lock_coverage_reports(dependency, &resolved, locked) {
             reports.push(format!(
-                "case {manifest_path:?} {table} -> {dependency:?}: expected Cargo.lock to \
-                 carry the crate {crate_name:?}, got no [[package]] with that name"
+                "case {manifest_path:?} {table} -> {dependency:?}: {report}"
             ));
-            continue;
-        };
-        if let Some(req) = &resolved.req {
-            if !versions.iter().any(|version| accepts(req, version)) {
-                reports.push(format!(
-                    "case {manifest_path:?} {table} -> {dependency:?}: expected a locked \
-                     version of {crate_name:?} that {req:?} accepts, got {versions:?}"
-                ));
-            }
         }
     }
     (declared.len(), reports)
