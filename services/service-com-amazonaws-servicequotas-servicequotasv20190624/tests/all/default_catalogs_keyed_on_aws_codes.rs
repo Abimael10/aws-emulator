@@ -112,7 +112,7 @@ const CATALOGS: &[Catalog] = &[
     },
     Catalog {
         service_code: "elasticfilesystem",
-        service_name: "Amazon Elastic File System (Amazon EFS)",
+        service_name: "Amazon Elastic File System (EFS)",
         quota_count: 23,
         withdrawn: &["FileSystemsPerAccount", "AccessPointsPerFileSystem"],
     },

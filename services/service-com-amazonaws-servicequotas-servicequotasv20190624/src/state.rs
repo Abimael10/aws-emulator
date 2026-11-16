@@ -3499,7 +3499,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         ),
         service(
             "elasticfilesystem",
-            "Amazon Elastic File System (Amazon EFS)",
+            "Amazon Elastic File System (EFS)",
             elasticfilesystem_quotas(),
         ),
         service(
@@ -3901,7 +3901,11 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Concurrently executing automations per account", 100.0),
             ],
         ),
-        service("sso", "AWS IAM Identity Center", sso_quotas()),
+        service(
+            "sso",
+            "AWS IAM Identity Center (successor to AWS Single Sign-On)",
+            sso_quotas(),
+        ),
         service(
             "states",
             "AWS Step Functions",
@@ -3934,7 +3938,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Virtual Private Cloud (Amazon VPC)",
             vpc_quotas(),
         ),
-        service("vpc-lattice", "Amazon VPC Lattice", vpc_lattice_quotas()),
+        service("vpc-lattice", "VPC Lattice", vpc_lattice_quotas()),
         service("wafv2", "AWS WAF", wafv2_quotas()),
         service(
             "workmail",
@@ -4256,7 +4260,10 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("elastic-inference", "Amazon Elastic Inference"),
     ("elasticache", "Amazon ElastiCache"),
     ("elasticbeanstalk", "AWS Elastic Beanstalk"),
-    ("elasticfilesystem", "Amazon Elastic File System (Amazon EFS)"),
+    // The parenthesised short name the inventory carries on this code is the bare
+    // abbreviation, without the prefix the product's own full name carries — the string
+    // the recorded default-quota listing of this code reports on every one of its rows.
+    ("elasticfilesystem", "Amazon Elastic File System (EFS)"),
     ("elasticloadbalancing", "Elastic Load Balancing (ELB)"),
     ("elasticmapreduce", "Amazon EMR"),
     ("elastictranscoder", "Amazon Elastic Transcoder"),
@@ -4437,9 +4444,10 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("ses", "Amazon Simple Email Service(Amazon SES)"),
     ("shield", "AWS Shield Advanced"),
     ("signer", "AWS Signer"),
-    // Two codes of AWS's inventory report the same display name, the way `es` and
-    // `opensearch` above do: the sign-in plane's quotas are published under the
-    // product name its recorded default-quota listing carries.
+    // The sign-in plane's quotas are published under the product name its own recorded
+    // default-quota listing carries, which is the product name alone — NOT the longer
+    // string the `sso` code below carries, even though both planes belong to one
+    // product: a code's display name is the one the inventory registers for THAT code.
     ("signin", "AWS IAM Identity Center"),
     ("simspaceweaver", "AWS SimSpace Weaver"),
     ("sms", "AWS Server Migration Service"),
@@ -4457,7 +4465,13 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("ssm-incidents", "AWS Systems Manager Incident Manager"),
     ("ssm-quicksetup", "AWS Systems Manager Quick Setup"),
     ("ssm-sap", "AWS Systems Manager for SAP"),
-    ("sso", "AWS IAM Identity Center"),
+    // The inventory still carries this product's former name after its current one, the
+    // way it does on `events`; the clause is reproduced as registered rather than
+    // shortened to the product name.
+    (
+        "sso",
+        "AWS IAM Identity Center (successor to AWS Single Sign-On)",
+    ),
     ("states", "AWS Step Functions"),
     ("storagegateway", "AWS Storage Gateway"),
     ("sts", "AWS Security Token Service (AWS STS)"),
@@ -4478,7 +4492,9 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("vmimportexport", "VM Import/Export"),
     ("voiceid", "Amazon Connect Voice ID"),
     ("vpc", "Amazon Virtual Private Cloud (Amazon VPC)"),
-    ("vpc-lattice", "Amazon VPC Lattice"),
+    // Another code the inventory names WITHOUT the product's `Amazon` prefix, the way
+    // `route53resolver` and `b2bi` are named.
+    ("vpc-lattice", "VPC Lattice"),
     ("waf", "AWS WAF Classic"),
     ("waf-regional", "AWS WAF Classic Regional"),
     ("wafv2", "AWS WAF"),

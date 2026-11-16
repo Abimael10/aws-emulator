@@ -117,6 +117,8 @@ mod recorded_rows_events_through_imagebuilder;
 mod refusal_message_contract;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/registered_display_name_forms.rs"]
+mod registered_display_name_forms;
 #[path = "all/report_token_before_status.rs"]
 mod report_token_before_status;
 #[path = "all/request_id_resolution_scope.rs"]

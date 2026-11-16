@@ -9,7 +9,7 @@ Issue-Shape-Id: com.amazonaws.servicequotas#ServiceQuotasV20190624
 Issue-Key: service-quotas|ListServices|2xx->2xx|$.Services[*]
 Issue-Commit: 41f2e9525c7487ad1fe04cb3242a50ad61bb0d09
 
-# ListServices catalog omits service codes and re-words ServiceName, shifting the whole listing
+# ListServices catalog omits service codes and re-words ServiceName, shifting the whole listing (PARTIAL CLOSE: every registered pair this report and the checkout's other service-quotas reports QUOTE is now served, and `$.Services[0]`..`$.Services[105]` replay clean; the entries whose recorded strings the corpus withholds are filed as `issues/things-that-do-not-work/20261116T120000Z-service-quotas-listservices-residual-inventory-entries-the-recording-withholds.md`)
 
 > _Note: this issue was identified against the code base at commit `41f2e9525c7487ad1fe04cb3242a50ad61bb0d09`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
@@ -17,6 +17,21 @@ Issue-Commit: 41f2e9525c7487ad1fe04cb3242a50ad61bb0d09
 ListServices
 
 ## Description
+PARTIAL CLOSE (added by the fixer). Of the twelve registered `(ServiceCode, ServiceName)`
+pairs this report QUOTES, eleven were already served exactly by the time of the fix
+(`deadline`, `dms`, `drs`, `ec2-ipam`, `ec2fastlaunch`, `eks-mcp`, `elemental-inference`,
+`finspace`, `fis`, `geo` and the `health-*` code the catalog holds), and the twelfth,
+`elasticfilesystem` / 'Amazon Elastic File System (EFS)', was served as 'Amazon Elastic
+File System (Amazon EFS)' and is corrected. The fix applies the same rule to the two
+further registered names the checkout's other service-quotas reports quote recorded values
+for (`sso`, `vpc-lattice`). `$.Services[0]` through `$.Services[105]` now replay clean.
+The positions that still diverge are the inventory entries no report here quotes a
+recorded value for; they are filed, position by position, as
+`issues/things-that-do-not-work/20261116T120000Z-service-quotas-listservices-residual-inventory-entries-the-recording-withholds.md`,
+which records what closing them needs (the recorded `ListServices` pairs — the corpus
+withholds them and no source in the checkout states them). Read the `Issue-Key` above as
+the key of the ORIGINAL sweep, not as a key that now matches in full.
+
 ONE root cause.
 
 Cause 1 of 1: `ListServices` serves a service catalog that is missing many of AWS's `ServiceCode` entries, and re-words the `ServiceName` of some entries it does serve. Because the listing is a positional array, every omission shifts all later entries, so 113 array positions diverge from one missing-entry fault.

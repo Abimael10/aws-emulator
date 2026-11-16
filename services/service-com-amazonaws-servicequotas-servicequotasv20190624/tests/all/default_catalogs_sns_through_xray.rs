@@ -86,7 +86,7 @@ const CATALOGS: &[Catalog] = &[
     },
     Catalog {
         service_code: "sso",
-        service_name: "AWS IAM Identity Center",
+        service_name: "AWS IAM Identity Center (successor to AWS Single Sign-On)",
         quota_count: 8,
         withdrawn: &["PermissionSets"],
     },
@@ -116,7 +116,7 @@ const CATALOGS: &[Catalog] = &[
     },
     Catalog {
         service_code: "vpc-lattice",
-        service_name: "Amazon VPC Lattice",
+        service_name: "VPC Lattice",
         quota_count: 17,
         withdrawn: &["ServiceNetworksPerAccount"],
     },
