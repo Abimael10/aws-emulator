@@ -69,6 +69,8 @@ mod immutable_configuration_members;
 mod ingestion_index;
 #[path = "all/ingestion_crawl.rs"]
 mod ingestion_crawl;
+#[path = "all/ingestion_crawl_whichever_store_the_knowledge_base_names.rs"]
+mod ingestion_crawl_whichever_store_the_knowledge_base_names;
 #[path = "all/ingestion_job_lifecycle.rs"]
 mod ingestion_job_lifecycle;
 #[path = "all/ingestion_job_listing.rs"]
