@@ -3883,12 +3883,27 @@ pub use ec2_subnets::SUBNETS_NOT_IN_ONE_VPC_MESSAGE;
 /// costs.
 pub use ec2_subnets::MAX_SUBNET_IDS_RESOLVED;
 
-/// Refuse a VPC link `Name` outside the documented bound of the shape it targets: at
-/// least one character and at most [`MAX_VPC_LINK_NAME_LEN`].
+/// The sentence a VPC link `Name` that carries nothing is refused with.
 ///
-/// `Ok(())` or the message for the operation's `BadRequestException`: it names the member
-/// and the bound it broke.
+/// A name the request supplies as null or empty is not reported as a length-bound
+/// violation of the member: API Gateway answers its own sentence for a VPC link whose
+/// name carries nothing, which names neither the member, nor the window, nor the length
+/// observed. The whole sentence is FIXED text — there is no request- or state-derived
+/// part to substitute.
+pub const VPC_LINK_NAME_NULL_OR_EMPTY_MESSAGE: &str = "Vpc link name should not be null or empty.";
+
+/// Refuse a VPC link `Name` the request supplies as empty, or one outside the documented
+/// bound of the shape it targets: at least one character and at most
+/// [`MAX_VPC_LINK_NAME_LEN`].
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: a name carrying
+/// nothing takes [`VPC_LINK_NAME_NULL_OR_EMPTY_MESSAGE`], the sentence for that refusal
+/// class, while a name that is present but too long takes the member/length-window
+/// sentence this service words its own constraint rejections with.
 pub fn validate_vpc_link_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(VPC_LINK_NAME_NULL_OR_EMPTY_MESSAGE.to_string());
+    }
     validate_member_length("Name", name, API_NAME_LEN)
 }
 

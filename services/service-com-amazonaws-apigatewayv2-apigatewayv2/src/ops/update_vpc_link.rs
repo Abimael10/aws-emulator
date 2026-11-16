@@ -155,8 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `Name` targets `StringWithLengthBetween1And128`, a bound the shape documents
         // but declares no trait for, so it is this handler's to enforce — the same check
-        // `CreateVpcLink` makes of the name it stores. Checked BEFORE anything is
-        // written, so a refused patch leaves the link exactly as it was.
+        // `CreateVpcLink` makes of the name it stores, so a name carrying nothing is
+        // refused in API Gateway's own words for that class and only an over-long one is
+        // worded as the length-window violation it is
+        // (`crate::state::validate_vpc_link_name`). Checked BEFORE anything is written,
+        // so a refused patch leaves the link exactly as it was.
         if let Some(message) = input
             .name
             .as_deref()
