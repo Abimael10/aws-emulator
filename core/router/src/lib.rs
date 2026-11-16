@@ -6,8 +6,9 @@
 //!
 //! # Writing integration tests
 //!
-//! Tests live in `router/tests/all/<name>.rs`, each declared in `router/tests/all.rs`.
-//! Every router test target links all services, so the router has exactly one; a file
+//! Tests live in `router/tests/all/<name>.rs`, each a suite of the `all` target that
+//! `router/tests/all/main.rs` roots, so nothing is declared by hand. Every router test
+//! target links all services, so the router has exactly one; a file
 //! directly under `router/tests/` fails the build. `build_router(engine)` returns the
 //! `MultiServiceRouter` the production entrypoint serves; drive requests through
 //! `router.dispatch(req)` and assert on the response. The framework handles

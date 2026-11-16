@@ -35,8 +35,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_LISTENER_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// Resolve the interface the resource listeners bind. This is the SAME
-/// operator control the main emulator port uses ([`crate::bind_address_from_env`]
-/// — `EMULATOR_BIND_ADDRESS`, defaulting to `127.0.0.1`), so a resource port and
+/// operator control the main emulator port uses ([`crate::bind_address`] — `-b`,
+/// else `EMULATOR_BIND_ADDRESS`, defaulting to `127.0.0.1`), so a resource port and
 /// the API share one exposure decision instead of the listeners being pinned to
 /// loopback. The default keeps every listener host-only; binding a routable or
 /// wildcard interface is the operator's explicit declaration (needed in a
@@ -44,7 +44,7 @@ const HTTP_LISTENER_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 /// browser-safety checks on the HTTP path (CORS, cross-site origin, WebSocket
 /// refusal, TLS-only) apply on every interface regardless.
 fn bind_ip_from_env() -> Result<IpAddr, SurfaceError> {
-    crate::bind_address_from_env().map_err(|e| SurfaceError::Bind(e.to_string()))
+    crate::bind_address().map_err(|e| SurfaceError::Bind(e.to_string()))
 }
 
 /// Resolve [`LISTENER_PORT_RANGE_ENV`] into a [`PortRange`], refusing a value

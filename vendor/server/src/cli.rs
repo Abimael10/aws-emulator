@@ -186,7 +186,8 @@ impl IdleClock {
 static LISTEN_OVERRIDES: OnceLock<(Option<IpAddr>, Option<u16>)> = OnceLock::new();
 
 /// `-b` / `-p` for the production serve path, overriding `EMULATOR_BIND_ADDRESS` and
-/// `EMULATOR_DATA_PORT`; call before serving.
+/// `EMULATOR_DATA_PORT`; call before serving. `-b` applies to every listener (the data
+/// port and each resource listener); `-p` only to the data port.
 pub fn listen_on(bind_address: Option<IpAddr>, port: Option<u16>) {
     let _ = LISTEN_OVERRIDES.set((bind_address, port));
 }

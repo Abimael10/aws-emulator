@@ -18,16 +18,13 @@ Install the `aws-emulator` skill, then ask your agent to set up the emulator. Th
 aws agent-toolkit add-skill --skill-name aws-emulator --region us-east-1
 ```
 
-### Server mode (CLI and any SDK)
+### Local process
 
-- **Linux:** install the RPM or Debian package and run `aws-emulator`. See [Getting started on Linux](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html).
-- **Windows / macOS:** run the emulator in a container built from a short Dockerfile. See [Getting started with Docker](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-docker.html).
+To start the emulator as a local process, see [Getting started](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started.html). Point your SDK at a running emulator by setting environment variables. See [Pointing your AWS SDK at AWS Emulator](https://docs.aws.amazon.com/emulator/latest/userguide/point-sdk-to-emulator.html).
 
-Point your SDK at a running emulator by setting environment variables. See [Pointing your AWS SDK at AWS Emulator](https://docs.aws.amazon.com/emulator/latest/userguide/point-sdk-to-emulator.html).
+### Embedded mode
 
-### Embedded mode (Rust tests)
-
-Add the emulator as a dev-dependency and run it in-process, one isolated instance per test. There is no endpoint URL, certificate, or environment variable to set. Your test wires the emulator's HTTP client straight into the SDK client. See [Getting started with embedded mode](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-embedded.html), and [Building from source](#building-from-source) below for its build cost.
+Add the emulator as a dev-dependency and run it in-process, one isolated instance per test. There is no endpoint URL, certificate, or environment variable to set. Your test wires the emulator's HTTP client straight into the SDK client. See [Getting started with embedded mode](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-embedded.html), and [Building from source](#building-from-source) below.
 
 ## Known issues
 
@@ -37,7 +34,7 @@ Individual gaps are tracked in the repository's `issues/` directory. APIs and be
 
 ## Building from source
 
-You need this if you are modifying the emulator, running it from a checkout, or using embedded mode. Embedded mode compiles the emulator into your test binary, so the prerequisites and build-cost guidance below apply to it too. Most other users install a prebuilt package instead (see [Quick start](#quick-start)). Building from source is supported on **Linux (x86_64 and aarch64)**; on Windows and macOS, use the Docker path above.
+You need this if you are modifying the emulator, running it from a checkout, or using embedded mode. Embedded mode compiles the emulator into your test binary, so the prerequisites and build guidance below apply to it too. Most other users install a prebuilt package instead (see [Quick start](#quick-start)). Building from source is supported on **Linux (x86_64 and aarch64)**; on Windows and macOS, use Docker (see [Getting started with Docker](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-docker.html)).
 
 ### Prerequisites
 
@@ -55,7 +52,7 @@ cargo run   -p aws-emulator-router
 
 The emulator serves HTTPS on `127.0.0.1:9297` (self-signed certificate).
 
-### Embedded mode build cost
+### Embedded mode build
 
 Embedded mode compiles the emulator into your test binary, so your project's first `cargo test` builds the emulator's service crates alongside your own code. Budget a first build and `target/` on the same order as building from source above, then fast incremental builds. Recommendation: reuse one `CARGO_TARGET_DIR` across projects, cache `target/` (or use sccache) in CI, and pin the emulator to a release commit so it isn't rebuilt on every change.
 
@@ -133,7 +130,7 @@ You might build a tool that includes the emulator, such as a test framework that
 
 ## Reporting issues and contributing
 
-Report bugs and fidelity gaps in [GitHub Issues](https://github.com/aws/aws-emulator/issues). The most useful report names the service, the operation, your SDK and version, the request you sent, and how the response differed from real AWS. This repository does not take PRs.
+We don't accept pull requests: AI agents keep the emulator up to date with AWS, with regular updates. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for details.
 
 ## License
 

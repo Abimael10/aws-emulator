@@ -34,6 +34,8 @@ operation.
 another). Single-service tests belong in that service's own crate, where they
 run without rebuilding the rest of the workspace.
 
-Put a router suite at `router/tests/all/<name>.rs` and declare it in
-`router/tests/all.rs`. That is the router's only test target: every target links
-all services, so a file directly under `router/tests/` fails the build.
+Put a router suite at `router/tests/all/<name>.rs` and nothing else: every `.rs` file
+in that directory is a suite of the `all` target, so there is nothing to declare, and
+its root `router/tests/all/main.rs` is not editable. That is the router's only test
+target: every target links all services, so a file directly under `router/tests/` fails
+the build.

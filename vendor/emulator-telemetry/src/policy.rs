@@ -1301,24 +1301,24 @@ pub fn startup_notice_line(
         }
         NoticeState::DisabledBySwitch { source } => match source {
             SwitchSource::Env => {
-                format!("{subject}: disabled (via {switch_env}={off}) — {how_to_reenable}")
+                format!("{subject}: disabled (via {switch_env}={off}); {how_to_reenable}")
             }
             SwitchSource::ConfigFile => {
-                format!("{subject}: disabled (via {config_path}) — {how_to_reenable}")
+                format!("{subject}: disabled (via {config_path}); {how_to_reenable}")
             }
             SwitchSource::Api => {
-                format!("{subject}: disabled (via the embedding configuration) — {how_to_reenable}")
+                format!("{subject}: disabled (via the embedding configuration); {how_to_reenable}")
             }
-            SwitchSource::Default => format!("{subject}: disabled (default) — {how_to_enable}"),
+            SwitchSource::Default => format!("{subject}: disabled (default); {how_to_enable}"),
             SwitchSource::InvalidEnv | SwitchSource::InvalidFile => format!(
                 "{subject}: disabled (invalid {switch_env} value or {config_path}; \
-                 failing safe to off) — {how_to_reenable}"
+                 failing safe to off); {how_to_reenable}"
             ),
         },
         NoticeState::NoEndpoint => {
             format!(
                 "{subject}: inactive (enabled but the scaffold injected no stage \
-                 endpoint) — {how_to_disable}"
+                 endpoint); {how_to_disable}"
             )
         }
         NoticeState::InitFailed => {
@@ -1531,6 +1531,9 @@ mod tests {
                 !line.contains("only"),
                 "the notice must not narrow what is collected: {line}"
             );
+            // The notice is printed at startup, and the Windows console decodes stdout with
+            // its OEM code page, so any non-ASCII character in it prints as mojibake there.
+            assert!(line.is_ascii(), "the notice must be plain ASCII: {line}");
         }
     }
 

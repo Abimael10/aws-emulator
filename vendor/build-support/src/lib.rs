@@ -16,18 +16,62 @@ use std::path::{Path, PathBuf};
 /// statically links this crate together with its whole dependency closure — the
 /// smithy runtime, the HTTP connector, the engine and tokio. The suite's own source
 /// is a rounding error beside that closure, so N suites cost N copies of it. A crate
-/// that keeps its suites as modules of a single `tests/all.rs` target pays the
-/// closure once.
+/// that keeps its suites as modules of a single `all` target pays the closure once.
 ///
 /// This check is what stops that shape from decaying back, because the decay is
 /// invisible: adding `tests/foo.rs` works, passes, and simply costs another copy.
 ///
-/// **Inert until the crate has a `tests/all.rs`.** A crate that has not adopted the
-/// layout is not diagnosed at all, so this can land before any crate migrates.
+/// The rules depend on how the crate roots its `all` target, see
+/// [`service_test_layout_violations`]. A crate with neither root is not diagnosed at
+/// all, so a crate can adopt a layout at its own pace.
 ///
 /// Args:
 ///     manifest_dir: The crate root — `CARGO_MANIFEST_DIR`.
-/// The declaration a suite under `tests/all/` needs.
+fn check_test_layout(manifest_dir: &Path) {
+    let tests_dir = manifest_dir.join("tests");
+
+    // Re-run when a file is added to or removed from either directory (that moves the
+    // directory's mtime) and when `all.rs` itself is edited (which does not). Both are
+    // needed: the first catches a new suite, the second catches a DELETED `mod` line,
+    // and watching only the directories would let the orphan rule go quietly stale.
+    println!("cargo::rerun-if-changed={}", tests_dir.display());
+    println!(
+        "cargo::rerun-if-changed={}",
+        tests_dir.join("all.rs").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        tests_dir.join("all").display()
+    );
+
+    for violation in service_test_layout_violations(&tests_dir) {
+        let lines: Vec<&str> = violation.iter().map(String::as_str).collect();
+        emit_layout_error(&lines);
+    }
+}
+
+/// Every violation of a service crate's test layout under `tests_dir`, each as the
+/// lines of one error message.
+///
+/// The crate chooses its layout by where it roots the one `all` target:
+/// - `tests/all/main.rs` and no `tests/all.rs`: the automod layout, see
+///   [`automod_layout_violations`], with no extra test target allowed;
+/// - `tests/all.rs` and no `tests/all/main.rs`: the hand-declared layout, see
+///   [`hand_declared_layout_violations`];
+/// - both: the automod layout is applied, and it refuses `tests/all.rs`, because cargo
+///   rejects two targets named `all`;
+/// - neither: no violations.
+fn service_test_layout_violations(tests_dir: &Path) -> Vec<Vec<String>> {
+    let has_main_rs = tests_dir.join("all").join("main.rs").is_file();
+    let has_all_rs = tests_dir.join("all.rs").is_file();
+    match (has_main_rs, has_all_rs) {
+        (true, _) => automod_layout_violations(tests_dir, &[]),
+        (false, true) => hand_declared_layout_violations(tests_dir),
+        (false, false) => Vec::new(),
+    }
+}
+
+/// The declaration a suite under `tests/all/` needs in a hand-declared `tests/all.rs`.
 ///
 /// `tests/all.rs` is a test target's crate root, so a bare `mod <stem>;` resolves to
 /// `tests/<stem>.rs` — which rule 1 refuses — and fails with `E0583`. Hence `#[path]`.
@@ -41,63 +85,55 @@ fn module_declaration(stem: &str) -> [String; 2] {
     ]
 }
 
-fn check_test_layout(manifest_dir: &Path) {
-    let tests_dir = manifest_dir.join("tests");
+/// Every violation of the hand-declared layout, where `tests/all.rs` declares each suite
+/// under `tests/all/` as a `mod` item.
+///
+/// Rule 1: no top-level `tests/*.rs` other than `all.rs`.
+/// Rule 2: every suite under `tests/all/` is declared in `tests/all.rs`, or it compiles
+/// nowhere.
+fn hand_declared_layout_violations(tests_dir: &Path) -> Vec<Vec<String>> {
     let all_rs = tests_dir.join("all.rs");
-
-    // Re-run when a file is added to or removed from either directory (that moves the
-    // directory's mtime) and when `all.rs` itself is edited (which does not). Both are
-    // needed: the first catches a new suite, the second catches a DELETED `mod` line,
-    // and watching only the directories would let the orphan rule go quietly stale.
-    println!("cargo::rerun-if-changed={}", tests_dir.display());
-    println!("cargo::rerun-if-changed={}", all_rs.display());
-    println!(
-        "cargo::rerun-if-changed={}",
-        tests_dir.join("all").display()
-    );
-
-    if !all_rs.is_file() {
-        return;
-    }
-
     let declared = declared_modules(&fs::read_to_string(&all_rs).unwrap_or_default());
+    let mut violations: Vec<Vec<String>> = Vec::new();
 
-    // Rule 1: no OTHER top-level test target may exist beside `all.rs`.
-    for stem in stray_top_level_suites(&tests_dir) {
+    for stem in stray_top_level_suites(tests_dir) {
         let declaration = module_declaration(&stem);
-        emit_layout_error(&[
-            &format!(
+        violations.push(vec![
+            format!(
                 "tests/{stem}.rs is a top-level integration test, but this crate has already \
                  adopted the single-target layout (tests/all.rs exists)."
             ),
             "Cargo builds one binary per top-level tests/*.rs, and each statically links this \
-             crate plus its entire dependency closure. Suites under tests/all/ share one binary.",
+             crate plus its entire dependency closure. Suites under tests/all/ share one binary."
+                .to_string(),
             "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
-             edit the test. Move the file and declare it:",
-            &format!("    git mv tests/{stem}.rs tests/all/{stem}.rs"),
-            "    # then add to tests/all.rs, keeping the list sorted:",
-            &declaration[0],
-            &declaration[1],
+             edit the test. Move the file and declare it:"
+                .to_string(),
+            format!("    git mv tests/{stem}.rs tests/all/{stem}.rs"),
+            "    # then add to tests/all.rs, keeping the list sorted:".to_string(),
+            declaration[0].clone(),
+            declaration[1].clone(),
         ]);
     }
 
-    // Rule 2: every suite under `tests/all/` must be declared, or it compiles nowhere.
     for stem in suites_under_all(&tests_dir.join("all")) {
         if !declared.contains(&stem) {
             let declaration = module_declaration(&stem);
-            emit_layout_error(&[
-                &format!(
+            violations.push(vec![
+                format!(
                     "the suite `{stem}` under tests/all/ is not declared in tests/all.rs, so it \
                      is compiled nowhere and its tests NEVER RUN."
                 ),
                 "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do \
-                 not edit the test. Add the declaration:",
-                "    # in tests/all.rs, keeping the list sorted:",
-                &declaration[0],
-                &declaration[1],
+                 not edit the test. Add the declaration:"
+                    .to_string(),
+                "    # in tests/all.rs, keeping the list sorted:".to_string(),
+                declaration[0].clone(),
+                declaration[1].clone(),
             ]);
         }
     }
+    violations
 }
 
 /// Emit one `cargo::error=` per line.
@@ -178,24 +214,331 @@ fn suites_under_all(all_dir: &Path) -> Vec<String> {
     out
 }
 
-/// Enforce the single-target integration-test layout on a crate that generates nothing.
+/// Enforce the router's integration-test layout, see [`automod_layout_violations`]. The
+/// vendored `tests/emulator_core/` target is allowed beside `tests/all/`.
 ///
-/// The service crates get this check from [`generate`]. The router has no model to
-/// generate from, so its `build.rs` calls this instead. The router needs it more than
-/// any service crate does: it depends on every service, so each of its test targets
-/// links the whole emulator.
+/// Refuses, with one `cargo::error` per line, every violation `automod_layout_violations`
+/// reports.
+///
+/// The build script reruns when a file is added to or removed from `tests/` or
+/// `tests/all/`. That rerun is also what makes cargo recompile the target, and so
+/// re-expand `automod::dir!`, when only the set of suite files changed.
 ///
 /// Called from `core/router/build.rs`:
 /// ```ignore
 /// fn main() {
-///     emulator_core_build_support::check_integration_test_layout();
+///     emulator_core_build_support::check_router_test_layout();
 /// }
 /// ```
-pub fn check_integration_test_layout() {
+pub fn check_router_test_layout() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    check_test_layout(&manifest_dir);
+    let tests_dir = manifest_dir.join("tests");
+    println!("cargo::rerun-if-changed={}", tests_dir.display());
+    println!(
+        "cargo::rerun-if-changed={}",
+        tests_dir.join("all").display()
+    );
     // The vendored suite skips some checks unless this is set, as the core library sets it.
     println!("cargo::rustc-check-cfg=cfg(emulator_full_security_suite)");
+
+    for violation in automod_layout_violations(&tests_dir, &[VENDORED_ROUTER_TEST_TARGET]) {
+        let lines: Vec<&str> = violation.iter().map(String::as_str).collect();
+        emit_layout_error(&lines);
+    }
+}
+
+/// The entries of `dir`, sorted by file name. Panics, naming `dir`, when it cannot be read.
+fn read_dir_sorted(dir: &Path) -> Vec<fs::DirEntry> {
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .map(|entry| entry.unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display())))
+        .collect();
+    entries.sort_by_key(fs::DirEntry::file_name);
+    entries
+}
+
+/// The router's vendored test target beside `tests/all/`: `tests/emulator_core/`, whose
+/// suites exercise the emulator core and are re-vendored rather than edited.
+const VENDORED_ROUTER_TEST_TARGET: &str = "emulator_core";
+
+/// Words that cannot name a module. `automod` would declare a suite file named after one
+/// under a different name, or fail with an error that does not mention the file.
+const RESERVED_WORDS: &[&str] = &[
+    "Self", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
+    "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if",
+    "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "try", "type", "typeof",
+    "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+];
+
+/// Whether `stem` is a plain module name, `[A-Za-z_][A-Za-z0-9_]*`, that is not a keyword
+/// and not the lone `_`. `automod` declares such a file under exactly its stem.
+fn is_module_identifier(stem: &str) -> bool {
+    let mut chars = stem.chars();
+    let starts_well = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    starts_well
+        && stem != "_"
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !RESERVED_WORDS.contains(&stem)
+}
+
+/// The snake_case module name to rename a suite stem to, or a placeholder when the
+/// stem has no mechanical one (a leading digit, a keyword, nothing alphanumeric).
+fn snake_case_suggestion(stem: &str) -> String {
+    let snake: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if is_module_identifier(&snake) {
+        snake
+    } else {
+        "<snake_case_name>".to_string()
+    }
+}
+
+/// Every `.rs` file beneath `dir`, at any depth, sorted by path. Panics, naming the
+/// directory, when one cannot be read.
+fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in read_dir_sorted(dir) {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_files_under(&path));
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Every violation of the automod test layout under `tests_dir`, each as the lines of
+/// one error message: one `all` test target rooted at `tests/all/main.rs`, whose suites
+/// are every `tests/all/<name>.rs`.
+///
+/// Each of a crate's test targets links its whole dependency closure, so the crate keeps
+/// one. `tests/all/main.rs` holds `automod::dir!("tests/all")`, which declares one module
+/// per `*.rs` file in that directory when the target compiles, so a new suite is a new
+/// file and nothing lists it.
+///
+/// `allowed_extra_targets` names the directories under `tests/` that may hold their own
+/// `main.rs`. The router allows its vendored `emulator_core` target; a service crate
+/// allows none.
+///
+/// Refuses:
+/// - any top-level `tests/*.rs`, `tests/all.rs` included: each is its own cargo target,
+///   and `tests/all.rs` beside `tests/all/main.rs` is a second target named `all`, which
+///   cargo rejects;
+/// - a directory `tests/<dir>/` holding a `main.rs`, other than `tests/all/` and the
+///   allowed extra targets: cargo builds each as another test binary that links the
+///   whole dependency closure;
+/// - a missing `tests/all/main.rs`, without which the suites compile nowhere;
+/// - a directory `tests/all/<name>/` with a `.rs` file anywhere beneath it and no
+///   sibling `tests/all/<name>.rs`. `automod` declares files, not directories, so its
+///   suites compile nowhere. Suites are grouped by a `tests/all/<name>.rs` holding
+///   `automod::dir!("tests/all/<name>");`. A directory without `.rs` files is data;
+/// - a directory `tests/all/<name>/` holding a `mod.rs` beside a `tests/all/<name>.rs`:
+///   the module has two source files (E0761);
+/// - a `.rs` file anywhere under `tests/all/` (other than `tests/all/main.rs` and any
+///   `mod.rs` or `lib.rs`) whose stem is not a plain identifier. `automod` renames such
+///   a module, so its test names would not match its file name.
+///
+/// Panics, naming the path, when `tests/` or a directory beneath `tests/all/` cannot be
+/// read.
+fn automod_layout_violations(tests_dir: &Path, allowed_extra_targets: &[&str]) -> Vec<Vec<String>> {
+    let all_dir = tests_dir.join("all");
+    let mut violations: Vec<Vec<String>> = Vec::new();
+
+    for entry in read_dir_sorted(tests_dir) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if path.is_dir() {
+            if name != "all"
+                && !allowed_extra_targets.contains(&name.as_str())
+                && path.join("main.rs").is_file()
+            {
+                violations.push(extra_test_target_violation(&name));
+            }
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let remedy = if stem == "all" {
+            "    git rm tests/all.rs   # its suites under tests/all/ need no declaration"
+                .to_string()
+        } else {
+            format!("    git mv tests/{stem}.rs tests/all/{stem}.rs   # it needs no declaration")
+        };
+        let two_roots = if stem == "all" && all_dir.join("main.rs").is_file() {
+            "tests/all.rs and tests/all/main.rs would be two targets named `all`, which cargo \
+             rejects. "
+        } else {
+            ""
+        };
+        violations.push(vec![
+            format!(
+                "tests/{stem}.rs is a top-level integration test, but this crate's tests are \
+                 one cargo target, `all`, rooted at tests/all/main.rs."
+            ),
+            format!(
+                "{two_roots}Cargo builds one binary per top-level tests/*.rs, and each \
+                 statically links this crate and its whole dependency closure. Every \
+                 tests/all/<name>.rs is a suite of the one `all` binary."
+            ),
+            "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
+             edit the test. Remove the top-level file:"
+                .to_string(),
+            remedy,
+        ]);
+    }
+
+    if !all_dir.join("main.rs").is_file() {
+        violations.push(vec![
+            "tests/all/main.rs is missing. It is the root of this crate's `all` test target, \
+             so without it no suite under tests/all/ compiles."
+                .to_string(),
+            "This is a FILE LAYOUT rule. Restore the file from version control:".to_string(),
+            "    git checkout HEAD -- tests/all/main.rs".to_string(),
+        ]);
+    }
+    if !all_dir.is_dir() {
+        return violations;
+    }
+
+    for entry in read_dir_sorted(&all_dir) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let has_root = all_dir.join(format!("{name}.rs")).is_file();
+        let has_mod_rs = path.join("mod.rs").is_file();
+        if has_root && has_mod_rs {
+            violations.push(vec![
+                format!(
+                    "the suite `{name}` exists as both tests/all/{name}.rs and \
+                     tests/all/{name}/mod.rs, and a module has one source file (E0761)."
+                ),
+                format!(
+                    "This is a FILE LAYOUT rule. Keep tests/all/{name}.rs as the suite: move what \
+                     tests/all/{name}/mod.rs holds into it, then delete the mod.rs:"
+                ),
+                format!("    git rm tests/all/{name}/mod.rs"),
+            ]);
+        } else if !has_root && !rust_files_under(&path).is_empty() {
+            violations.push(uncompiled_directory_violation(&name, has_mod_rs));
+        }
+    }
+
+    for file in rust_files_under(&all_dir) {
+        let relative = file
+            .strip_prefix(&all_dir)
+            .expect("rust_files_under returns paths beneath the directory it walked");
+        let file_name = relative
+            .file_name()
+            .expect("a walked file has a name")
+            .to_string_lossy()
+            .to_string();
+        if relative == Path::new("main.rs") || file_name == "mod.rs" || file_name == "lib.rs" {
+            continue;
+        }
+        let stem = file_name
+            .strip_suffix(".rs")
+            .expect("rust_files_under returns only .rs files");
+        if !is_module_identifier(stem) {
+            violations.push(non_identifier_suite_violation(relative, stem));
+        }
+    }
+    violations
+}
+
+/// The error for a `tests/<dir>/main.rs` that makes `tests/<dir>/` another test target.
+fn extra_test_target_violation(dir: &str) -> Vec<String> {
+    vec![
+        format!(
+            "tests/{dir}/main.rs makes tests/{dir}/ another integration-test target, but this \
+             crate's tests are one cargo target, `all`, rooted at tests/all/main.rs."
+        ),
+        "Cargo builds one binary per tests/<dir>/main.rs, and each statically links this crate \
+         and its whole dependency closure. Every tests/all/<name>.rs is a suite of the one \
+         `all` binary."
+            .to_string(),
+        format!(
+            "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
+             edit the test. Move each suite under tests/all/, then remove tests/{dir}/main.rs:"
+        ),
+        format!("    git mv tests/{dir}/<suite>.rs tests/all/<suite>.rs   # once per suite"),
+        format!("    git rm tests/{dir}/main.rs"),
+        format!(
+            "To keep the suites grouped, move them to tests/all/{dir}/ instead and add \
+             tests/all/{dir}.rs containing exactly: automod::dir!(\"tests/all/{dir}\");"
+        ),
+    ]
+}
+
+/// The error for a directory under `tests/all/` whose `.rs` files no module declares.
+fn uncompiled_directory_violation(name: &str, has_mod_rs: bool) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "the directory tests/all/{name}/ holds Rust files but there is no \
+             tests/all/{name}.rs, so it is compiled nowhere and its tests NEVER RUN."
+        ),
+        "tests/all/main.rs declares one module per tests/all/*.rs file and none for a \
+         directory."
+            .to_string(),
+    ];
+    if has_mod_rs {
+        lines.push(
+            "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
+             edit the test. Move the module root beside the directory:"
+                .to_string(),
+        );
+        lines.push(format!(
+            "    git mv tests/all/{name}/mod.rs tests/all/{name}.rs"
+        ));
+    } else {
+        lines.push(format!(
+            "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
+             edit the test. Create tests/all/{name}.rs containing exactly this line:"
+        ));
+        lines.push(format!("    automod::dir!(\"tests/all/{name}\");"));
+    }
+    lines
+}
+
+/// The error for a suite file under `tests/all/` whose stem is not a plain identifier.
+fn non_identifier_suite_violation(relative: &Path, stem: &str) -> Vec<String> {
+    let parent = relative
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty())
+        .map_or(String::new(), |p| format!("{p}/"));
+    let relative = relative.to_string_lossy();
+    let suggestion = snake_case_suggestion(stem);
+    vec![
+        format!(
+            "tests/all/{relative} is named `{stem}`, which is not a plain Rust identifier \
+             (ASCII letters, digits and `_`, not starting with a digit, not a keyword)."
+        ),
+        "automod::dir! declares such a file under a different module name, so its test \
+         names would not match the file name."
+            .to_string(),
+        "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
+         edit the test. Rename the file to a snake_case identifier:"
+            .to_string(),
+        format!("    git mv tests/all/{relative} tests/all/{parent}{suggestion}.rs"),
+    ]
 }
 
 /// Generate the `#[smithy_service]` decl and ops module for one service crate.
@@ -1442,5 +1785,417 @@ mod tests {
     fn an_empty_all_rs_declares_nothing_and_a_missing_one_reads_as_empty() {
         assert!(declared_modules("").is_empty());
         assert!(declared_modules("//! only a doc comment\n").is_empty());
+    }
+
+    // --- router test layout -----------------------------------------------------
+
+    #[test]
+    fn the_router_layout_accepts_main_rs_suite_files_and_other_test_targets() {
+        let root = crate_with_tests(
+            "router-clean",
+            &[
+                "all/main.rs",
+                "all/one.rs",
+                "all/two.rs",
+                "all/two/helper.rs",
+                "all/fixtures/data.json",
+                "emulator_core/main.rs",
+            ],
+        );
+        assert_eq!(
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]),
+            Vec::<Vec<String>>::new(),
+            "a suite file with its submodule directory, a data directory without mod.rs and \
+             a directory test target beside tests/all/ are all allowed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_router_layout_refuses_every_top_level_test_file_including_all_rs() {
+        let root = crate_with_tests(
+            "router-stray",
+            &["all.rs", "stray.rs", "all/main.rs", "all/one.rs"],
+        );
+        let violations =
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0][0].starts_with("tests/all.rs is a top-level integration test"));
+        assert!(violations[0][0].contains("tests/all/main.rs"));
+        assert!(violations[0][3].contains("git rm tests/all.rs"));
+        assert!(violations[1][0].starts_with("tests/stray.rs is a top-level integration test"));
+        assert!(violations[1][3].contains("git mv tests/stray.rs tests/all/stray.rs"));
+        assert!(
+            violations
+                .iter()
+                .flatten()
+                .all(|line| !line.contains('\n') && !line.contains("mod stray")),
+            "one cargo::error per line, and no declaration is prescribed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_router_layout_refuses_a_missing_main_rs() {
+        let root = crate_with_tests("router-no-main", &["all/one.rs"]);
+        let violations =
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0][0].starts_with("tests/all/main.rs is missing"));
+
+        let no_all_dir = crate_with_tests("router-no-all-dir", &["emulator_core/main.rs"]);
+        let violations =
+            automod_layout_violations(&no_all_dir.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0][0].starts_with("tests/all/main.rs is missing"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&no_all_dir);
+    }
+
+    #[test]
+    fn the_router_layout_refuses_every_mod_rs_directory_suite() {
+        let root = crate_with_tests(
+            "router-mod-rs",
+            &["all/main.rs", "all/orphan/", "all/paired/", "all/paired.rs"],
+        );
+        let violations =
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0][0].starts_with("the directory tests/all/orphan/ holds Rust files"));
+        assert!(violations[0][0].contains("NEVER RUN"));
+        assert!(violations[0][3].contains("git mv tests/all/orphan/mod.rs tests/all/orphan.rs"));
+        assert!(violations[1][0].contains("`paired` exists as both"));
+        assert!(violations[1][1].contains("Keep tests/all/paired.rs"));
+        assert!(violations[1][2].contains("git rm tests/all/paired/mod.rs"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_router_layout_accepts_a_suite_group_rooted_by_a_sibling_file() {
+        let root = crate_with_tests(
+            "router-grouped",
+            &[
+                "all/main.rs",
+                "all/directory.rs",
+                "all/directory/first.rs",
+                "all/directory/second.rs",
+                "all/directory/nested/deep.rs",
+                "all/fixtures/data.json",
+                "all/fixtures/more/data.txt",
+            ],
+        );
+        assert_eq!(
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]),
+            Vec::<Vec<String>>::new(),
+            "tests/all/directory.rs roots the group, and a directory without .rs files is data"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_router_layout_refuses_a_directory_of_suites_without_a_sibling_file() {
+        let root = crate_with_tests(
+            "router-ungrouped",
+            &[
+                "all/main.rs",
+                "all/alpha/one.rs",
+                "all/beta/main.rs",
+                "all/gamma/deep/two.rs",
+                "all/gamma/data.json",
+            ],
+        );
+        let violations =
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        assert_eq!(violations.len(), 3, "{violations:?}");
+        for (violation, name) in violations.iter().zip(["alpha", "beta", "gamma"]) {
+            assert_eq!(
+                violation[0],
+                format!(
+                    "the directory tests/all/{name}/ holds Rust files but there is no \
+                     tests/all/{name}.rs, so it is compiled nowhere and its tests NEVER RUN."
+                )
+            );
+            assert!(violation[2].contains(&format!("Create tests/all/{name}.rs")));
+            assert_eq!(
+                violation[3],
+                format!("    automod::dir!(\"tests/all/{name}\");")
+            );
+        }
+        assert!(
+            violations.iter().flatten().all(|line| !line.contains('\n')),
+            "one cargo::error per line"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_router_layout_refuses_every_extra_test_target_directory() {
+        let root = crate_with_tests(
+            "router-extra-target",
+            &[
+                "all/main.rs",
+                "emulator_core/main.rs",
+                "extra/main.rs",
+                "extra/suite.rs",
+                "fixtures/data.json",
+                "other/main.rs",
+            ],
+        );
+        let violations =
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        for (violation, dir) in violations.iter().zip(["extra", "other"]) {
+            assert!(
+                violation[0].starts_with(&format!(
+                    "tests/{dir}/main.rs makes tests/{dir}/ another integration-test target"
+                )),
+                "{violation:?}"
+            );
+            assert!(violation[3].contains(&format!("git mv tests/{dir}/<suite>.rs tests/all/")));
+            assert!(violation[4].contains(&format!("git rm tests/{dir}/main.rs")));
+            assert!(violation[5].contains(&format!("automod::dir!(\"tests/all/{dir}\");")));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_router_layout_refuses_every_suite_file_name_that_automod_would_rename() {
+        let root = crate_with_tests(
+            "router-names",
+            &[
+                "all/main.rs",
+                "all/fine_name.rs",
+                "all/_leading_underscore.rs",
+                "all/My-Test.rs",
+                "all/2fa.rs",
+                "all/type.rs",
+                "all/group.rs",
+                "all/group/bad.name.rs",
+                "all/group/mod_ok.rs",
+                "all/group/sub/",
+                "all/group/sub/lib.rs",
+            ],
+        );
+        let violations =
+            automod_layout_violations(&root.join("tests"), &[VENDORED_ROUTER_TEST_TARGET]);
+        let named: Vec<&str> = violations.iter().map(|v| v[0].as_str()).collect();
+        assert_eq!(violations.len(), 4, "{named:?}");
+        assert!(named[0].starts_with("tests/all/2fa.rs is named `2fa`"));
+        assert!(named[1].starts_with("tests/all/My-Test.rs is named `My-Test`"));
+        assert!(named[2].starts_with("tests/all/group/bad.name.rs is named `bad.name`"));
+        assert!(named[3].starts_with("tests/all/type.rs is named `type`"));
+        assert_eq!(
+            violations[0][3],
+            "    git mv tests/all/2fa.rs tests/all/<snake_case_name>.rs"
+        );
+        assert_eq!(
+            violations[1][3],
+            "    git mv tests/all/My-Test.rs tests/all/my_test.rs"
+        );
+        assert_eq!(
+            violations[2][3],
+            "    git mv tests/all/group/bad.name.rs tests/all/group/bad_name.rs"
+        );
+        assert_eq!(
+            violations[3][3],
+            "    git mv tests/all/type.rs tests/all/<snake_case_name>.rs"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_module_identifier_is_ascii_not_a_keyword_and_not_a_lone_underscore() {
+        for valid in ["a", "snake_case", "_private", "Mixed9", "r2d2"] {
+            assert!(is_module_identifier(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "_",
+            "9lives",
+            "kebab-case",
+            "dot.name",
+            "type",
+            "self",
+            "naïve",
+        ] {
+            assert!(!is_module_identifier(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn the_router_layout_panics_naming_an_unreadable_tests_directory() {
+        let missing = std::env::temp_dir().join(format!("mfbs-router-none-{}", std::process::id()));
+        let panic = std::panic::catch_unwind(|| {
+            automod_layout_violations(&missing, &[VENDORED_ROUTER_TEST_TARGET])
+        })
+        .expect_err("an unreadable tests/ must not read as an empty one");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "{message}"
+        );
+    }
+
+    // --- service test layout ----------------------------------------------------
+
+    #[test]
+    fn the_service_layout_accepts_the_scaffolded_main_rs_tree() {
+        let root = crate_with_tests(
+            "service-scaffolded",
+            &["all/main.rs", "all/state_roundtrip.rs"],
+        );
+        assert_eq!(
+            service_test_layout_violations(&root.join("tests")),
+            Vec::<Vec<String>>::new()
+        );
+
+        let grouped = crate_with_tests(
+            "service-grouped",
+            &[
+                "all/main.rs",
+                "all/state_roundtrip.rs",
+                "all/group.rs",
+                "all/group/first.rs",
+                "all/fixtures/data.json",
+            ],
+        );
+        assert_eq!(
+            service_test_layout_violations(&grouped.join("tests")),
+            Vec::<Vec<String>>::new(),
+            "a suite group rooted by a sibling file and a data directory are allowed"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&grouped);
+    }
+
+    #[test]
+    fn a_service_crate_with_neither_root_is_not_diagnosed() {
+        let root = crate_with_tests("service-neither", &["one.rs", "two.rs", "all/stray.rs"]);
+        assert_eq!(
+            service_test_layout_violations(&root.join("tests")),
+            Vec::<Vec<String>>::new(),
+            "with neither tests/all.rs nor tests/all/main.rs the crate has not adopted a layout"
+        );
+        let missing =
+            std::env::temp_dir().join(format!("mfbs-service-none-{}", std::process::id()));
+        assert_eq!(
+            service_test_layout_violations(&missing),
+            Vec::<Vec<String>>::new(),
+            "a crate with no tests/ at all is inert rather than unreadable"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_service_crate_with_both_roots_is_refused_with_the_remedy_of_deleting_all_rs() {
+        let root = crate_with_tests("service-both", &["all.rs", "all/main.rs", "all/one.rs"]);
+        let violations = service_test_layout_violations(&root.join("tests"));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0][0].starts_with("tests/all.rs is a top-level integration test"));
+        assert!(
+            violations[0][1]
+                .starts_with("tests/all.rs and tests/all/main.rs would be two targets named `all`"),
+            "{violations:?}"
+        );
+        assert!(violations[0][3].contains("git rm tests/all.rs"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_service_layout_refuses_stray_top_level_files_and_every_extra_target() {
+        let root = crate_with_tests(
+            "service-extra",
+            &[
+                "all/main.rs",
+                "stray.rs",
+                "emulator_core/main.rs",
+                "extra/main.rs",
+                "fixtures/data.json",
+            ],
+        );
+        let violations = service_test_layout_violations(&root.join("tests"));
+        let firsts: Vec<&str> = violations.iter().map(|v| v[0].as_str()).collect();
+        assert_eq!(violations.len(), 3, "{firsts:?}");
+        assert!(
+            firsts[0].starts_with(
+                "tests/emulator_core/main.rs makes tests/emulator_core/ another integration-test target"
+            ),
+            "a service crate allows no extra target, the router's vendored one included: {firsts:?}"
+        );
+        assert!(firsts[1].starts_with("tests/extra/main.rs makes tests/extra/"));
+        assert!(firsts[2].starts_with("tests/stray.rs is a top-level integration test"));
+        assert!(violations[2][3].contains("git mv tests/stray.rs tests/all/stray.rs"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_service_layout_refuses_ungrouped_directories_duplicate_roots_and_renamed_suites() {
+        let root = crate_with_tests(
+            "service-suites",
+            &[
+                "all/main.rs",
+                "all/alpha/one.rs",
+                "all/paired/",
+                "all/paired.rs",
+                "all/Bad-Name.rs",
+            ],
+        );
+        let violations = service_test_layout_violations(&root.join("tests"));
+        let firsts: Vec<&str> = violations.iter().map(|v| v[0].as_str()).collect();
+        assert_eq!(violations.len(), 3, "{firsts:?}");
+        assert!(firsts[0].starts_with("the directory tests/all/alpha/ holds Rust files"));
+        assert_eq!(violations[0][3], "    automod::dir!(\"tests/all/alpha\");");
+        assert!(firsts[1].contains("`paired` exists as both"));
+        assert!(firsts[2].starts_with("tests/all/Bad-Name.rs is named `Bad-Name`"));
+        assert!(
+            violations.iter().flatten().all(|line| !line.contains('\n')),
+            "one cargo::error per line"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hand_declared_service_crate_keeps_the_declaration_rules() {
+        let root = crate_with_tests(
+            "service-hand-declared",
+            &["all.rs", "stray.rs", "all/declared.rs", "all/forgotten.rs"],
+        );
+        fs::write(root.join("tests").join("all.rs"), "mod declared;\n").unwrap();
+        let violations = service_test_layout_violations(&root.join("tests"));
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0][0].starts_with(
+            "tests/stray.rs is a top-level integration test, but this crate has already adopted \
+             the single-target layout (tests/all.rs exists)."
+        ));
+        assert_eq!(
+            violations[0][3],
+            "    git mv tests/stray.rs tests/all/stray.rs"
+        );
+        assert_eq!(violations[0][5], "    #[path = \"all/stray.rs\"]");
+        assert_eq!(violations[0][6], "    mod stray;");
+        assert_eq!(
+            violations[1][0],
+            "the suite `forgotten` under tests/all/ is not declared in tests/all.rs, so it is \
+             compiled nowhere and its tests NEVER RUN."
+        );
+        assert_eq!(violations[1][4], "    mod forgotten;");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hand_declared_service_crate_that_declares_everything_is_accepted() {
+        let root = crate_with_tests("service-declared", &["all.rs", "all/one.rs", "all/two/"]);
+        fs::write(
+            root.join("tests").join("all.rs"),
+            "mod one;\npub mod two;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            service_test_layout_violations(&root.join("tests")),
+            Vec::<Vec<String>>::new()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

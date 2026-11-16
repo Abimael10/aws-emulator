@@ -462,6 +462,8 @@ tracing-subscriber = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }

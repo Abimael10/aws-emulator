@@ -944,3 +944,4 @@ rustls-webpki = "0.103"
 aws-sigv4 = { version = "1", features = ["http1"] }
 aws-credential-types = "1"
 nix = { version = "0.31", features = ["signal"] }
+automod = "1.0.17"

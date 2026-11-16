@@ -47,8 +47,8 @@ aws-emulator/
 | Implement an operation | `services/service-<name>/src/ops/<operation>.rs` |
 | Change which requests a service claims, or override its routing or refusal wording | `services/service-<name>/src/service.rs` |
 | Add state for a service | `services/service-<name>/src/state.rs` |
-| Add a service-level test | `services/service-<name>/tests/all/<name>.rs`, declared in that crate's `tests/all.rs` |
-| Add a cross-service test | `core/router/tests/all/<name>.rs`, declared in `core/router/tests/all.rs` |
+| Add a service-level test | `services/service-<name>/tests/all/<name>.rs` (nothing to declare; `tests/all/main.rs` picks it up) |
+| Add a cross-service test | `core/router/tests/all/<name>.rs` (nothing to declare; `core/router/tests/all/main.rs` is not editable) |
 | Add a dependency | `services/service-<name>/Cargo.toml` (the root `Cargo.toml` is not editable) |
 
 When `.emulator/license-header` exists, every new `.rs` file starts with its

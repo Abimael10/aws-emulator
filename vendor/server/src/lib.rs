@@ -1081,6 +1081,20 @@ pub fn bind_address_from_env() -> Result<IpAddr, ServeError> {
     parse_bind_address(raw.as_deref())
 }
 
+/// The interface every production listener binds: the data port and each resource
+/// listener opened through [`Listeners`]. `-b` ([`cli::listen_on`]) when the command line
+/// gave one, otherwise [`bind_address_from_env`].
+///
+/// Every listener reads this one function, so the data port and the resource ports
+/// cannot bind different interfaces and the exposure warning, which names the data
+/// port's bind, also covers the resource ports.
+pub(crate) fn bind_address() -> Result<IpAddr, ServeError> {
+    match cli::listen_overrides().0 {
+        Some(bind_address) => Ok(bind_address),
+        None => bind_address_from_env(),
+    }
+}
+
 /// Pure parsing core of [`bind_address_from_env`], split out so it is
 /// unit-testable without mutating (and racing on) process-global environment
 /// variables.
@@ -1168,12 +1182,8 @@ fn bind_production_listener(
 /// Delegates to [`serve_production_on_address`]; callers that must pin explicit
 /// ports (e.g. tests) can call [`serve_production_on`] directly.
 pub async fn serve_production<S: EmulatorService>(service: S) -> Result<(), ServeError> {
-    let (bind_override, port_override) = cli::listen_overrides();
-    let bind_address = match bind_override {
-        Some(bind_address) => bind_address,
-        None => bind_address_from_env()?,
-    };
-    let data_port = port_override.unwrap_or_else(data_port_from_env);
+    let bind_address = bind_address()?;
+    let data_port = cli::listen_overrides().1.unwrap_or_else(data_port_from_env);
     serve_production_on_address(service, bind_address, data_port).await
 }
 
@@ -1346,8 +1356,10 @@ fn exposure_warnings(bind_address: IpAddr, port: u16, authentication: bool) -> V
 
 fn reachable_bind_warning(bind_address: IpAddr, port: u16) -> String {
     format!(
-        "the emulator listens on {bind_address}, not loopback: other machines that can \
-         reach port {port} can call it; bind 127.0.0.1 (-b 127.0.0.1) unless that is intended"
+        "the emulator listens on {bind_address}, port {port}, so other machines on your \
+         network can reach it, and the ports it opens for resource endpoints, which check \
+         no request signature. This is expected in a container. Otherwise, bind 127.0.0.1 \
+         (-b 127.0.0.1) unless other machines should reach it"
     )
 }
 
@@ -2808,7 +2820,7 @@ mod tests {
     fn every_non_loopback_bind_warns_who_can_reach_the_emulator() {
         for bind in ["0.0.0.0", "::", "10.0.0.5"] {
             let warnings = exposure_warnings(bind.parse().unwrap(), 9297, true);
-            let expected = format!("the emulator listens on {bind}, not loopback");
+            let expected = format!("the emulator listens on {bind}, port 9297, so other machines");
             check!(
                 warnings.len() == 1 && warnings[0].starts_with(&expected),
                 "{bind}"

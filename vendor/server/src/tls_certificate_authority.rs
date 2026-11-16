@@ -36,7 +36,8 @@ impl TlsCertificateAuthority {
     }
 
     /// The certificate of this process, made on first use for `localhost`, `127.0.0.1`, `::1`,
-    /// the `EMULATOR_BIND_ADDRESS` interface and `client_host` when they name one address.
+    /// the bound interface (`-b`, else `EMULATOR_BIND_ADDRESS`) and `client_host` when they
+    /// name one address.
     ///
     /// The first call decides the names, so a `client_host` the certificate was not made for is
     /// not added later: check [`Self::covers`].
@@ -45,7 +46,7 @@ impl TlsCertificateAuthority {
             return Ok(made);
         }
         let mut names: Vec<String> = ["localhost", "127.0.0.1", "::1"].map(String::from).into();
-        let bound = crate::bind_address_from_env().ok();
+        let bound = crate::bind_address().ok();
         for ip in [bound, client_host].into_iter().flatten() {
             let name = ip.to_string();
             if !ip.is_unspecified() && !names.contains(&name) {
