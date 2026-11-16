@@ -33,6 +33,8 @@ mod channel_configuration_updates;
 mod channel_cursor_refusal;
 #[path = "all/channel_dependents.rs"]
 mod channel_dependents;
+#[path = "all/channel_destination_validation.rs"]
+mod channel_destination_validation;
 #[path = "all/channel_key_authorization.rs"]
 mod channel_key_authorization;
 #[path = "all/channel_lifecycle.rs"]

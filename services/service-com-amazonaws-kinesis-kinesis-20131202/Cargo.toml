@@ -39,6 +39,19 @@ sha2 = { workspace = true }
 # Resolves the `KeyId` a `StartStreamEncryption` request names against KMS, over the
 # emulator's own in-process transport, before the stream is reported as encrypted under it.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: a channel with a
+# general purpose bucket destination writes the objects it delivers through Amazon S3's own
+# data plane, which is the one object store in this emulator
+# (`crate::state::channel_delivery`).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The UTC calendar fields the key of a delivered object carries, read from a maintained date
+# library rather than computed here.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The `GZIP` compression a destination's `CompressionType` can ask a delivered object for.
+flate2 = "1"
+# The `ZSTD` compression it can ask for. Pure Rust, like `flate2`: the emulator links no
+# native compression library.
+ruzstd = "0.9"
 # The one place this tree states the Region LABEL grammar, for the caller-supplied region
 # that ends up in the authority of the KMS endpoint the lookup above is routed on.
 service-common = { path = "../common" }

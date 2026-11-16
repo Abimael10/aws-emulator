@@ -339,17 +339,32 @@ fn s3_tables_description(
 ///
 /// That is a rule about the REQUEST, so it is carried by the error the service answers for
 /// an input it validates before it provisions anything ([`validation`]), with the fixed
-/// sentence it states for the rule.
+/// sentence it states for the rule. So is the `OutputKeyTemplate` a general purpose bucket
+/// destination may carry: the template "is used to construct the Amazon S3 object key for
+/// delivered objects" (`S3StorageConfiguration$OutputKeyTemplate`), so one that renders no
+/// such key — consecutive periods, a period-only segment, a leading separator — is refused
+/// before any channel is written, with the sentence the one reading of that template states
+/// ([`crate::state::channel_delivery::output_key_template_refusal`]).
 fn destination(input: &CreateChannelInput) -> Result<Destination, CreateChannelError> {
     match (
         input.s3_destination_configuration.as_ref(),
         input.s3_tables_destination_configuration.as_ref(),
     ) {
-        (Some(s3), None) => Ok(Destination {
-            kind: crate::state::CHANNEL_DESTINATION_S3,
-            s3: Some(s3_description(s3)),
-            s3_tables: None,
-        }),
+        (Some(s3), None) => {
+            if let Some(refusal) = s3
+                .storage_configuration
+                .output_key_template
+                .as_deref()
+                .and_then(crate::state::channel_delivery::output_key_template_refusal)
+            {
+                return Err(validation(refusal));
+            }
+            Ok(Destination {
+                kind: crate::state::CHANNEL_DESTINATION_S3,
+                s3: Some(s3_description(s3)),
+                s3_tables: None,
+            })
+        }
         (None, Some(tables)) => Ok(Destination {
             kind: crate::state::CHANNEL_DESTINATION_S3_TABLES,
             s3: None,
@@ -456,7 +471,7 @@ fn channel_streams(
         }
         if stream.stream_mode != crate::state::STREAM_MODE_ON_DEMAND {
             return Err(validation(crate::state::stream_not_on_demand_message(
-                stream_arn,
+                &stream.name,
                 &stream.stream_mode,
             )));
         }
@@ -580,6 +595,11 @@ fn create_channel<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // A resource-based policy is `PutResourcePolicy`'s to attach, so a channel this call
         // has just minted carries none.
         policy: None,
+        // A channel this call has just minted has delivered nothing yet, so its delivery
+        // starts at the records that arrive from now on and owes no back-off
+        // ([`crate::state::channel_delivery`]).
+        delivered: ::std::collections::BTreeMap::new(),
+        delivery_retry_at: None,
     };
 
     let description = channel.to_description(now);
@@ -693,6 +713,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match created {
             Ok(channel_description) => {
                 audit(&akid, &region, "created");
+                // A channel "reads records from the specified stream and writes them to"
+                // its destination (`CreateChannel`), which nothing a client calls does: the
+                // delivery runs on a task of this process, started here with the store's
+                // lock already released and the channel already stored, so the task's first
+                // wake-up sees it ([`crate::state::channel_delivery`]).
+                crate::state::channel_delivery::drive_delivery_clock(
+                    &self.engine,
+                    ctx.callback(),
+                );
                 // "Upon receiving the request, Amazon Kinesis Data Streams returns
                 // immediately with the channel in the CREATING state" (`CreateChannel`).
                 Ok(CreateChannelOutput {

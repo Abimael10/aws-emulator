@@ -303,7 +303,7 @@ async fn a_created_channel_is_what_a_describe_reports() {
                         "ExpectedBucketOwner": engine::EMULATOR_ACCOUNT_ID,
                         "CompressionType": "ZSTD",
                         "StorageClass": "GLACIER_IR",
-                        "OutputKeyTemplate": "records/{timestamp}",
+                        "OutputKeyTemplate": "records/!{yyyy}/!{MM}/!{dd}",
                     },
                 },
                 // Logging that names no group or stream takes the documented defaults.
@@ -318,7 +318,7 @@ async fn a_created_channel_is_what_a_describe_reports() {
                     "ExpectedBucketOwner": engine::EMULATOR_ACCOUNT_ID,
                     "CompressionType": "ZSTD",
                     "StorageClass": "GLACIER_IR",
-                    "OutputKeyTemplate": "records/{timestamp}",
+                    "OutputKeyTemplate": "records/!{yyyy}/!{MM}/!{dd}",
                 },
             }),
             logging: Value::Null,
@@ -866,9 +866,9 @@ async fn a_refused_create_stores_nothing() {
             ),
             "ValidationException",
             format!(
-                "stream {} is in {STREAM_MODE_PROVISIONED} mode; a channel is only \
-                 supported for data streams with the {STREAM_MODE_ON_DEMAND} capacity mode",
-                stream_arn(REGION, provisioned)
+                "Request is invalid. Stream {provisioned} under account {} is in Provisioned \
+                 mode. Please enable On-demand mode to use this feature.",
+                engine::EMULATOR_ACCOUNT_ID
             ),
         ),
         (
