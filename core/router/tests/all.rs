@@ -553,6 +553,8 @@ mod cloudformation_role_trusted_by_the_s3_service;
 mod cloudformation_rollback_deletes_the_buckets_it_created;
 #[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
 mod cloudformation_rollback_triggers_revert_the_operation;
+#[path = "all/cloudformation_rotation_grant_forms_admit_the_rotation.rs"]
+mod cloudformation_rotation_grant_forms_admit_the_rotation;
 #[path = "all/cloudformation_rotation_schedule_rotates_its_secret.rs"]
 mod cloudformation_rotation_schedule_rotates_its_secret;
 #[path = "all/cloudformation_route53_record_set_contract.rs"]
