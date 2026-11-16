@@ -95,6 +95,8 @@ mod secret_rotation_span;
 mod secret_rotation_staging_ladder;
 #[path = "all/secret_rotation_state_presence.rs"]
 mod secret_rotation_state_presence;
+#[path = "all/secret_rotation_token_reattempt.rs"]
+mod secret_rotation_token_reattempt;
 #[path = "all/secret_service_owned_writes.rs"]
 mod secret_service_owned_writes;
 #[path = "all/secret_service_set_tag_keys.rs"]

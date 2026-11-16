@@ -474,17 +474,15 @@ fn plan(
     if secret.rotation_in_progress() {
         return Err(invalid_request(crate::state::ROTATION_IN_PROGRESS_MESSAGE));
     }
-    // `ClientRequestToken` is "a unique identifier for the NEW version of the
-    // secret", and a version id names one version of a secret for as long as
-    // that version is stored — so a token that already names a stored version
-    // cannot be the id of the version this rotation creates, and the call is
-    // refused rather than answered with a version id it did not stake.
-    if secret.version(&version_id).is_some() {
-        return Err(invalid_request(format!(
-            "The ClientRequestToken {version_id} already identifies a version of this \
-             secret, so it can't identify the new version this rotation creates."
-        )));
-    }
+    // A `ClientRequestToken` this secret already has a version under is NOT refused:
+    // "This value helps ensure idempotency. Secrets Manager uses this value to prevent
+    // the accidental creation of duplicate versions if there are failures and retries
+    // during a rotation" (`RotateSecretRequest$ClientRequestToken`, this service's
+    // Smithy model) — so a rotation retried under the token a previous attempt staked
+    // is THAT rotation again, staked on the version that attempt left behind, rather
+    // than a request the service rejects for the token's sake. The model's causes of
+    // `InvalidRequestException` for this operation are the state ones checked above,
+    // and a token naming a stored version is not among them.
 
     Ok(Planned {
         arn: secret.arn.clone(),

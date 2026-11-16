@@ -2748,11 +2748,31 @@ impl Secret {
     /// that starts where the previous one left `AWSPENDING` on the `AWSCURRENT`
     /// version (the documented "rotation succeeded" shape) still leaves the
     /// label naming one version.
+    ///
+    /// The id may already name a version of the secret: the rotation token
+    /// "helps ensure idempotency ... to prevent the accidental creation of
+    /// duplicate versions if there are failures and retries during a rotation"
+    /// (`RotateSecretRequest$ClientRequestToken`, this service's Smithy model),
+    /// so a rotation reattempted under the token an earlier attempt staked is
+    /// that same rotation, working on the version that attempt left behind. The
+    /// label then goes ON that version, exactly as it does once a rotation
+    /// function creates the version the label was reserved for: the reservation
+    /// stands only while the id names a version this store does not hold.
     pub fn start_rotation(&mut self, version_id: String, at: SystemTime) {
         for existing in &mut self.versions {
             existing.version_stages.retain(|held| held != STAGE_PENDING);
         }
-        self.pending_rotation_version_id = Some(version_id);
+        match self
+            .versions
+            .iter_mut()
+            .find(|existing| existing.version_id == version_id)
+        {
+            Some(existing) => {
+                existing.version_stages.push(STAGE_PENDING.to_string());
+                self.pending_rotation_version_id = None;
+            }
+            None => self.pending_rotation_version_id = Some(version_id),
+        }
         self.last_changed_date = at;
     }
 

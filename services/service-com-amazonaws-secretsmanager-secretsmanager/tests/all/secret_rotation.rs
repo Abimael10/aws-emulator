@@ -1094,63 +1094,10 @@ async fn rotate_secret_refusals() {
         "case {case:?}: expected InvalidRequestException for a deleted secret, got {code}"
     );
 
-    // `ClientRequestToken` is the id of the NEW version, so a token that already
-    // identifies a stored version of the secret cannot be it — whichever version
-    // it names.
-    for (case, stage) in [
-        ("a token that is already the current version's id", "AWSCURRENT"),
-        (
-            "a token that is already a deprecated version's id",
-            "AWSPREVIOUS",
-        ),
-    ] {
-        let name = "token-collision";
-        if stage == "AWSCURRENT" {
-            create_secret(&router, name, "the-first-value", case).await;
-            // A second value demotes the first to AWSPREVIOUS, so both rows have
-            // a stored version to collide with.
-            ok(
-                &router,
-                "PutSecretValue",
-                json!({"SecretId": name, "SecretString": "the-second-value"}),
-                case,
-            )
-            .await;
-        }
-        let existing = ok(
-            &router,
-            "GetSecretValue",
-            json!({"SecretId": name, "VersionStage": stage}),
-            case,
-        )
-        .await;
-        let existing = text(&existing, "VersionId", case);
-        let code = err(
-            &router,
-            "RotateSecret",
-            json!({
-                "SecretId": name,
-                "RotationLambdaARN": LAMBDA_ARN,
-                "ClientRequestToken": &existing,
-            }),
-            case,
-        )
-        .await;
-        assert_eq!(
-            code, "InvalidRequestException",
-            "case {case:?}: expected InvalidRequestException for the existing version id \
-             {existing}, got {code}"
-        );
-        let described = describe(&router, name, case).await;
-        assert!(
-            ids_with_stage(&described, "VersionIdsToStages", "AWSPENDING").is_empty(),
-            "case {case:?}: expected the refused call to stage nothing, got {described}"
-        );
-        assert_eq!(
-            described.get("RotationEnabled"),
-            None,
-            "case {case:?}: expected the refused call to enable nothing, so a secret rotation \
-             was never decided for reports no RotationEnabled, got {described}"
-        );
-    }
+    // A `ClientRequestToken` that already identifies a stored version of the
+    // secret is NOT among the requests this operation refuses: it is an
+    // idempotency token, and a rotation reattempted under one is that rotation
+    // again rather than a duplicate version being minted for it
+    // (`RotateSecretRequest$ClientRequestToken`, this service's Smithy model).
+    // That rule is driven in `secret_rotation_token_reattempt`.
 }
