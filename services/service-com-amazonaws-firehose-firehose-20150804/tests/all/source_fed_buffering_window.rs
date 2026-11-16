@@ -39,11 +39,11 @@ use crate::buffering_hints::{LONG_INTERVAL, SHORT_INTERVAL};
 use crate::delivery_stream_lifecycle::ROLE_ARN;
 use crate::destination_delivery::{carries_time_prefix, Emulator};
 // The source-ingestion suite's harness, reused rather than stood up a second time: the same
-// wait for a Firehose stream to be ACTIVE, the same producer put, the same destination reads
-// and the same exactly-once watcher.
+// source create and wait, the same wait for a Firehose stream to be ACTIVE, the same producer
+// put, the same destination reads and the same exactly-once watcher.
 use crate::kinesis_source_ingestion::{
-    await_active_source_fed_stream, concatenated, occurrences, put_to_source, stays_delivered,
-    DELIVERY_DEADLINE, KINESIS_SERVICE, KINESIS_TARGET, POLL_INTERVAL,
+    await_active_source_fed_stream, await_source_active, concatenated, create_source, occurrences,
+    put_to_source, stays_delivered, DELIVERY_DEADLINE, POLL_INTERVAL,
 };
 
 /// How many times the producer writes its payload to the source: once, and then the same bytes
@@ -167,7 +167,7 @@ async fn a_consumed_record_is_delivered_on_its_destinations_own_buffering_window
         });
     }
     for leg in &mut legs {
-        leg.source_arn = await_source_arn(&emulator, leg.case, &leg.source).await;
+        leg.source_arn = await_source_active(&emulator, leg.case, &leg.source).await;
     }
 
     // And every Firehose stream likewise: created first, awaited after.
@@ -231,53 +231,6 @@ async fn a_consumed_record_is_delivered_on_its_destinations_own_buffering_window
             &[(leg.payload.as_slice(), ROUNDS)],
         )
         .await;
-    }
-}
-
-/// Create the source Kinesis data stream `name` with `shards` shards, without waiting for it.
-async fn create_source(emulator: &Emulator, name: &str, shards: u32) {
-    let (status, answered) = emulator
-        .json_rpc(
-            KINESIS_SERVICE,
-            KINESIS_TARGET,
-            "CreateStream",
-            json!({ "StreamName": name, "ShardCount": shards }),
-        )
-        .await;
-    assert_eq!(status, 200, "create source stream {name}: got {answered:?}");
-}
-
-/// Wait for the source stream `name` to report `ACTIVE` and answer the `StreamARN` it reports.
-///
-/// A poll loop on the STATUS rather than a wait for the clock-owed span, so how fast the host
-/// runs cannot decide the case.
-async fn await_source_arn(emulator: &Emulator, case: &str, name: &str) -> String {
-    let deadline = Instant::now() + DELIVERY_DEADLINE;
-    loop {
-        let (status, answered) = emulator
-            .json_rpc(
-                KINESIS_SERVICE,
-                KINESIS_TARGET,
-                "DescribeStreamSummary",
-                json!({ "StreamName": name }),
-            )
-            .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: describe source stream {name}: got {answered:?}"
-        );
-        let summary = &answered["StreamDescriptionSummary"];
-        if summary["StreamStatus"] == json!("ACTIVE") {
-            let arn = summary["StreamARN"].as_str().unwrap_or_else(|| {
-                panic!("case {case:?}: the source stream reports its ARN, got {answered:?}")
-            });
-            return arn.to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the source stream {name} must reach ACTIVE, got {answered:?}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 

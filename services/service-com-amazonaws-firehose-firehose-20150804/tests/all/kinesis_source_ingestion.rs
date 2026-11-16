@@ -280,6 +280,13 @@ async fn a_source_fed_stream_takes_no_direct_put() {
 /// Create the source Kinesis data stream `name` with `shards` shards and answer its
 /// `StreamARN`, once the stream reports `ACTIVE`.
 pub(crate) async fn create_source_stream(emulator: &Emulator, name: &str, shards: u32) -> String {
+    create_source(emulator, name, shards).await;
+    await_source_active(emulator, name, name).await
+}
+
+/// Create the source Kinesis data stream `name` with `shards` shards, WITHOUT waiting for it to
+/// serve its shards — what a client that chains its creates does.
+pub(crate) async fn create_source(emulator: &Emulator, name: &str, shards: u32) {
     let (status, answered) = emulator
         .json_rpc(
             KINESIS_SERVICE,
@@ -289,28 +296,55 @@ pub(crate) async fn create_source_stream(emulator: &Emulator, name: &str, shards
         )
         .await;
     assert_eq!(status, 200, "create source stream {name}: got {answered:?}");
+}
 
+/// `DescribeStreamSummary` on the source stream `name`, whatever lifecycle status it is in.
+pub(crate) async fn describe_source(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+) -> ::serde_json::Value {
+    let (status, answered) = emulator
+        .json_rpc(
+            KINESIS_SERVICE,
+            KINESIS_TARGET,
+            "DescribeStreamSummary",
+            json!({ "StreamName": name }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: describe source stream {name}: got {answered:?}"
+    );
+    answered
+}
+
+/// The `StreamARN` the source stream `name` reports right now, whatever lifecycle status it is
+/// in — which is what a client binds a Firehose stream to.
+pub(crate) async fn source_stream_arn(emulator: &Emulator, case: &str, name: &str) -> String {
+    let answered = describe_source(emulator, case, name).await;
+    answered["StreamDescriptionSummary"]["StreamARN"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the source stream reports its ARN, got {answered:?}")
+        })
+        .to_string()
+}
+
+/// Wait for the source stream `name` to report `ACTIVE` and answer the `StreamARN` it reports.
+///
+/// A poll loop on the STATUS rather than a wait for the clock-owed span, so how fast the host
+/// runs cannot decide a case.
+pub(crate) async fn await_source_active(emulator: &Emulator, case: &str, name: &str) -> String {
     let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
-        let (status, answered) = emulator
-            .json_rpc(
-                KINESIS_SERVICE,
-                KINESIS_TARGET,
-                "DescribeStreamSummary",
-                json!({ "StreamName": name }),
-            )
-            .await;
-        assert_eq!(status, 200, "describe source stream {name}: got {answered:?}");
-        let summary = &answered["StreamDescriptionSummary"];
-        if summary["StreamStatus"] == json!("ACTIVE") {
-            return summary["StreamARN"]
-                .as_str()
-                .unwrap_or_else(|| panic!("the source stream reports its ARN, got {answered:?}"))
-                .to_string();
+        let answered = describe_source(emulator, case, name).await;
+        if answered["StreamDescriptionSummary"]["StreamStatus"] == json!("ACTIVE") {
+            return source_stream_arn(emulator, case, name).await;
         }
         assert!(
             Instant::now() < deadline,
-            "the source stream {name} must reach ACTIVE, got {answered:?}"
+            "case {case:?}: the source stream {name} must reach ACTIVE, got {answered:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
