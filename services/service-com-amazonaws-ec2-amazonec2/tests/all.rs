@@ -20,13 +20,15 @@
 // tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/aws_managed_prefix_list_name_scopes.rs"]
 mod aws_managed_prefix_list_name_scopes;
-// The `AWS/EC2` series a RUNNING instance publishes about itself: every metric of the published
-// catalog, dimensioned on that instance and in its own unit, once per period of the cadence its
-// monitoring state selects, stopping and resuming with the instance. Declared beside
-// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail of
-// this file are where every new ec2 suite inserts its lines.
-#[path = "all/instance_metric_publication.rs"]
-mod instance_metric_publication;
+// Reading the whole Amazon-published AMI catalog with no name pattern: the two documented ways
+// of naming the `amazon` owner — in `Owners` and by the `owner-alias` filter — report the same
+// set, which is the catalog's own current builds, and a pattern no published family carries
+// reports an empty one. Shares the variant table and the response reading with
+// `all/published_amazon_linux_catalog.rs`. Declared beside
+// `aws_managed_prefix_list_name_scopes` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/amazon_published_image_discovery.rs"]
+mod amazon_published_image_discovery;
 // The DOCUMENTS a management-event record of a served call carries: the parameters it was
 // dispatched with and what it answered, in the form EC2's own API documents take, beside the
 // resources it acted on. Declared beside `aws_managed_prefix_list_name_scopes` for the reason
@@ -39,6 +41,10 @@ mod audited_call_documents;
 // it reached and, for one that failed, why. Declared beside `prefix_lists` for the reason the
 // note above gives: the sorted neighbourhood and the tail of this file are where every new ec2
 // suite inserts its lines.
+#[path = "all/capacity_manager_monitored_tag_key_repeats.rs"]
+mod capacity_manager_monitored_tag_key_repeats;
+#[path = "all/instance_metric_publication.rs"]
+mod instance_metric_publication;
 #[path = "all/volume_create_notifications.rs"]
 mod volume_create_notifications;
 // The OPTIONAL members a read of an AMI and a read of an instance carry: every Amazon EBS
@@ -2197,8 +2203,6 @@ mod delete_local_gateway_route_table;
 // `UpdateCapacityManagerMonitoredTagKeys` activates and deactivates, the statuses the clock
 // carries a key through, and what `GetCapacityManagerMonitoredTagKeys` reports and pages over
 // — declared at the tail of this file, which is where every new ec2 suite lands.
-#[path = "all/capacity_manager_monitored_tag_key_repeats.rs"]
-mod capacity_manager_monitored_tag_key_repeats;
 #[path = "all/capacity_manager_monitored_tag_keys.rs"]
 mod capacity_manager_monitored_tag_keys;
 // `DescribeLaunchTemplates` for a template that is GONE: a key this service itself resolved
