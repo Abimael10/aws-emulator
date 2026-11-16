@@ -35,7 +35,7 @@ use crate::identity_based_authorization::{
 
 /// The ARN of a role of this account the session is NOT a session of, so a clause naming it
 /// names another principal.
-fn other_role_arn() -> String {
+pub(crate) fn other_role_arn() -> String {
     format!(
         "arn:aws:iam::{}:role/another-reader",
         ::engine::emulator_account_id()
@@ -44,7 +44,7 @@ fn other_role_arn() -> String {
 
 /// A wildcard over every role of this account, which is the form a clause scoped to the
 /// account's roles rather than to one of them takes.
-fn any_role_of_this_account() -> String {
+pub(crate) fn any_role_of_this_account() -> String {
     format!("arn:aws:iam::{}:role/*", ::engine::emulator_account_id())
 }
 
@@ -72,7 +72,7 @@ fn allow_everything() -> Value {
 
 /// A resource-based policy stating `effect` on `action` for every principal, qualified by
 /// `condition`.
-fn resource_policy_if(effect: &str, action: &str, condition: Value) -> String {
+pub(crate) fn resource_policy_if(effect: &str, action: &str, condition: Value) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{

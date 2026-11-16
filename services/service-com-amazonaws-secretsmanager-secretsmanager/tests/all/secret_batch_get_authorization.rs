@@ -43,7 +43,7 @@ use crate::identity_based_authorization::{
 const SECRETS: [&str; 3] = ["batch-first", "batch-middle", "batch-last"];
 
 /// The `SecretValues` of a batched read, as (ARN, SecretString) pairs in the order answered.
-fn values_of(answer: &Value, case: &str) -> Vec<(String, String)> {
+pub(crate) fn values_of(answer: &Value, case: &str) -> Vec<(String, String)> {
     answer
         .get("SecretValues")
         .and_then(Value::as_array)

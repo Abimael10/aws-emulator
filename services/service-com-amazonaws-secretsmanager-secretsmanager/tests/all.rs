@@ -25,6 +25,8 @@ mod secret_batch_get;
 mod secret_batch_get_authorization;
 #[path = "all/secret_batch_get_entry_agreement.rs"]
 mod secret_batch_get_entry_agreement;
+#[path = "all/secret_batch_get_principal_conditions.rs"]
+mod secret_batch_get_principal_conditions;
 #[path = "all/secret_client_request_token.rs"]
 mod secret_client_request_token;
 #[path = "all/secret_conditioned_wildcard_attach.rs"]
