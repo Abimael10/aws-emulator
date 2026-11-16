@@ -8,9 +8,9 @@
 //! * `PricingBucket` is the tier the OPERATION's queries are charged in: one value per
 //!   operation, the same for every request that operation serves;
 //! * a position READ OFF the road network is reported at the network's own coordinate
-//!   precision, while a position the CALLER supplied is echoed exactly as submitted;
-//! * `SnapToRoads` scores a match on the match itself — how far the point moved and
-//!   whether a second road was as good a candidate — and never on the `SnapRadius` the
+//!   precision, while a position the CALLER supplied is reported as submitted;
+//! * `SnapToRoads` scores a match on the match itself — how far the point had to move to
+//!   reach its road — and never on the `SnapRadius` the
 //!   caller allowed;
 //! * `SnappedGeometry` runs ALONG the roads the trace matched onto, so every vertex is on
 //!   a road and every segment follows one;
@@ -366,15 +366,15 @@ async fn confidence_of(
 }
 
 /// `Confidence` ("Confidence value for the correctness of this point match", `@range 0..1`)
-/// is scored on the MATCH: a point nearer its road is matched more certainly than one
-/// further off, and a point lying as near a second road the traveller may use could be on
-/// either of them, so that match is less certain than one with no other road near. The
+/// is scored on the MATCH, and on one thing about it: how far the point had to move to
+/// reach its road. A point already on a road was observed where the road is, so its match
+/// is certain and scores the range's maximum; a point as far from every road as a position
+/// on this network can be barely has that road as an explanation at all, so it scores near
+/// the range's minimum; and of two points the one further off always scores less. The
 /// radius the request allowed says which points may be matched at all, so it cannot move
 /// the score of a match that was made.
 ///
-/// Rows span the offset from the matched road, at every radius the service accepts; the
-/// comparison below spans the other thing the score is read from, how near the next
-/// candidate road is.
+/// Rows span the offset from the matched road, at every radius the service accepts.
 #[tokio::test]
 async fn a_match_is_scored_on_the_match_and_not_on_the_requested_radius() {
     let router = routes_service();
@@ -428,19 +428,31 @@ async fn a_match_is_scored_on_the_match_and_not_on_the_requested_radius() {
         );
     }
 
+    // A point ON a road was observed where the road is, so nothing about the match is in
+    // doubt and it scores the top of the modeled range; the point as far off as one can be
+    // scores near the bottom of it, which is what makes the value worth thresholding on.
+    let (on_the_road, certain) = by_offset[0];
+    assert!(
+        certain >= 0.999,
+        "case {on_the_road:?}: a point on a road was observed where the road is, so its match is \
+         certain, got {certain}"
+    );
+    let (furthest, poorest) = by_offset[by_offset.len() - 1];
+    assert!(
+        poorest < 0.2,
+        "case {furthest:?}: a point as far from every road as this network allows is a poor \
+         match, so it scores near the bottom of the 0..1 range, got {poorest}"
+    );
+
     // Longitude -123.0945 carries a meridian street, so a point a metre east of it sits at
-    // a crossing of two roads a car may travel and could be on either: the same offset
-    // from its road as the first row above, but an ambiguous match.
+    // a crossing of two roads a car may travel. WHICH of the two carried it is not what
+    // this value reports: the point lies on the network either way, so the match is as
+    // certain as any other on-road match.
     let at_a_crossing = confidence_of(&router, "at a crossing", [-123.094_49, 49.28], 300).await;
     assert!(
-        at_a_crossing < by_offset[0].1,
-        "a point at a crossing of two roads is matched less certainly than one with no other \
-         road near it, got {at_a_crossing} against {}",
-        by_offset[0].1
-    );
-    assert!(
-        at_a_crossing > 0.0,
-        "a point at a crossing is still matched, so it carries some confidence, got {at_a_crossing}"
+        at_a_crossing > 0.9,
+        "a point at a crossing of two roads lies on the network whichever of them carried it, so \
+         its match is certain, got {at_a_crossing} against {certain} for a point on one road"
     );
 }
 

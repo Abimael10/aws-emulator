@@ -12,11 +12,12 @@
 //! * a route travels ALONG roads, and the roads of this network run north-south or
 //!   east-west, so no route is shorter than the rectilinear journey between its endpoints
 //!   — strictly longer than the straight line for any pair that is not axis-aligned;
-//! * a route's duration is the sum of its stretches at the posted speed of the road each
-//!   one runs on, held down to the travel mode's own top speed — so the speed a journey
-//!   implies is a speed of the network's roads, it is higher on the roads that are posted
-//!   higher, and a journey long enough to be worth reaching the fast classes for implies
-//!   more of a speed than a short one that cannot.
+//! * a route's duration is the sum of its stretches at the pace of the road each one runs
+//!   on — its posted speed, held down to the travel mode's own top speed, less what is
+//!   given up at the junctions the grid puts every road spacing along it — so the speed a
+//!   journey implies is a pace of the network's roads, it is higher on the roads that are
+//!   posted higher and lose less at a crossing, and a journey long enough to be worth
+//!   reaching the fast classes for implies more of a speed than a short one that cannot.
 //!
 //! The tables span what the rule generalises over: separation (hundreds of metres to
 //! hundreds of kilometres), bearing (east-west, north-south, diagonal), hemisphere, the
@@ -29,43 +30,81 @@ use crate::routing::{great_circle_m, int, post, routes_service, MATRIX, ROUTES};
 /// The grid's road spacing in degrees, as `src/state.rs` holds it (`ROAD_SPACING_DEG`): a
 /// submitted position is matched onto a road at most half of it away in each axis, which is
 /// the only part of a reported distance that is not travel along the roads.
-const ROAD_SPACING_DEG: f64 = 0.000_5;
+///
+/// This module owns the copies of `src/state.rs`'s network parameters that the suites of this
+/// target read, so a sibling suite reads them from here rather than keeping a second copy that
+/// can drift from the source on its own.
+pub(crate) const ROAD_SPACING_DEG: f64 = 0.000_5;
 
 /// Posted speeds of the classes of road the network carries, in km/h, as `src/state.rs`
 /// holds them (`MOTORWAY_SPEED_KPH`, `TRUNK_SPEED_KPH`, `STREET_SPEED_KPH`,
 /// `FOOTPATH_SPEED_KPH`).
 const MOTORWAY_SPEED_KPH: f64 = 110.0;
 const TRUNK_SPEED_KPH: f64 = 85.0;
-const STREET_SPEED_KPH: f64 = 50.0;
+pub(crate) const STREET_SPEED_KPH: f64 = 50.0;
 const FOOTPATH_SPEED_KPH: f64 = 5.0;
 
 /// Metres per second in one km/h.
-const KPH_TO_MPS: f64 = 1_000.0 / 3_600.0;
+pub(crate) const KPH_TO_MPS: f64 = 1_000.0 / 3_600.0;
 
-/// The fastest and the slowest road `mode` may travel, in metres per second, held down to
-/// the mode's own top speed (`ComAmazonawsGeoroutesRoutesserviceState::travel_mode_speeds`
-/// in `src/state.rs`): a pedestrian walks at the footpath pace on any road, a scooter and
-/// an intermodal journey are held to 45 km/h, a truck to 90 and a transit vehicle to 80,
-/// and a car keeps up with any road of the network.
-fn speed_bounds_mps(mode: &str) -> (f64, f64) {
-    let top_kph = match mode {
+/// Decimal digits of a coordinate a response carries, as `src/state.rs` holds it
+/// (`POSITION_PRECISION`): this API expresses a `Position` to a ten-millionth of a degree.
+pub(crate) const POSITION_PRECISION: i32 = 7;
+
+/// Seconds given up at one at-grade junction of a road of each class, as `src/state.rs`
+/// holds them (`MOTORWAY_JUNCTION_DELAY_S`, `TRUNK_JUNCTION_DELAY_S`,
+/// `STREET_JUNCTION_DELAY_S`): a motorway's crossings are grade-separated, a trunk road has
+/// priority at its own, and a local street gives way at every block. A pedestrian queues at
+/// none of them.
+const MOTORWAY_JUNCTION_DELAY_S: f64 = 0.0;
+const TRUNK_JUNCTION_DELAY_S: f64 = 1.5;
+const STREET_JUNCTION_DELAY_S: f64 = 6.0;
+
+/// The top speed of `mode` itself, in km/h
+/// (`ComAmazonawsGeoroutesRoutesserviceState::travel_mode_speeds` in `src/state.rs`): a
+/// pedestrian walks at the footpath pace on any road, a scooter and an intermodal journey
+/// are held to 45 km/h, a truck to 90 and a transit vehicle to 80, and a car keeps up with
+/// any road of the network.
+fn top_speed_kph(mode: &str) -> f64 {
+    match mode {
         "Pedestrian" => FOOTPATH_SPEED_KPH,
         "Scooter" | "Intermodal" => 45.0,
         "Transit" => 80.0,
         "Truck" => 90.0,
         _ => MOTORWAY_SPEED_KPH,
-    };
-    // A pedestrian may use the streets and the footpaths, every other mode the streets and
-    // the numbered roads; whichever it is, no stretch is travelled slower than the slowest
-    // road the mode may use or faster than the fastest.
-    let slowest_kph = if mode == "Pedestrian" {
-        FOOTPATH_SPEED_KPH
-    } else {
-        STREET_SPEED_KPH
-    };
+    }
+}
+
+/// The pace, in metres per second, that travel of `mode` makes along a road posted at
+/// `posted_kph` whose junctions cost `delay_s` each, on an EAST-WEST run at `latitude` —
+/// where the grid's crossings are closest together and so the pace is at its lowest.
+fn pace_mps(posted_kph: f64, delay_s: f64, mode: &str, latitude: f64) -> f64 {
+    let free_flow = (posted_kph * KPH_TO_MPS).min(top_speed_kph(mode) * KPH_TO_MPS);
+    let block_m = block_m(latitude);
+    block_m / (block_m / free_flow + delay_s)
+}
+
+/// Metres between two neighbouring crossings of an east-west road at `latitude`.
+fn block_m(latitude: f64) -> f64 {
+    ROAD_SPACING_DEG * 111_320.0 * latitude.to_radians().cos()
+}
+
+/// The slowest and the fastest pace, in metres per second, travel of `mode` can make on
+/// this network at `latitude`.
+///
+/// A pedestrian may use the streets and the footpaths and queues at no junction, so it
+/// walks at its own pace whatever road it is on; every other mode may use the streets and
+/// the numbered roads, so its slowest pace is a street's — posted at
+/// [`STREET_SPEED_KPH`] and giving way at every block — and its fastest a motorway's,
+/// which loses nothing at a crossing.
+fn speed_bounds_mps(mode: &str, latitude: f64) -> (f64, f64) {
+    let top = top_speed_kph(mode) * KPH_TO_MPS;
+    if mode == "Pedestrian" {
+        return (top, top);
+    }
     (
-        slowest_kph.min(top_kph) * KPH_TO_MPS,
-        MOTORWAY_SPEED_KPH.min(top_kph) * KPH_TO_MPS,
+        pace_mps(STREET_SPEED_KPH, STREET_JUNCTION_DELAY_S, mode, latitude),
+        (MOTORWAY_SPEED_KPH * KPH_TO_MPS).min(top),
     )
 }
 
@@ -122,29 +161,29 @@ async fn every_cell_is_a_path_of_the_road_graph_and_the_time_it_takes_on_it() {
                     "case {case:?}: travelling {distance} m takes time, got {duration}"
                 );
                 let implied = distance as f64 / duration as f64;
-                let (slowest, fastest) = speed_bounds_mps(mode);
+                let (slowest, fastest) =
+                    speed_bounds_mps(mode, origin[1].abs().max(destination[1].abs()));
                 assert!(
                     implied >= slowest - 0.5 && implied <= fastest + 0.5,
                     "case {case:?}: {distance} m in {duration} s implies {implied:.2} m/s, outside \
-                     the {slowest:.2}..{fastest:.2} m/s the roads this mode may travel are posted at"
+                     the {slowest:.2}..{fastest:.2} m/s the roads this mode may travel carry it at"
                 );
             }
         }
     }
 }
 
-/// The hierarchy reaches the answer: for a mode that can go faster than a local street, a
-/// journey long enough to be worth joining the fast classes for implies more of a speed
-/// than a short one that spends its length on the local roads. For a mode held slower than
-/// every road of the network, the mode's own top speed is what every journey implies,
-/// however long it is.
+/// The hierarchy reaches the answer: for a mode that can travel a road faster than a local
+/// street carries it, a journey long enough to be worth joining the fast classes for
+/// implies more of a speed than a short one that spends its length on the local roads. For
+/// a mode held slower than every road of the network, the mode's own top speed is what
+/// every journey implies, however long it is.
 #[tokio::test]
 async fn a_journey_worth_taking_the_fast_roads_implies_more_of_a_speed_than_a_local_one() {
     let router = routes_service();
-    let street = STREET_SPEED_KPH * KPH_TO_MPS;
 
     for mode in ["Car", "Truck", "Scooter", "Pedestrian"] {
-        let (_, top) = speed_bounds_mps(mode);
+        let (slowest, top) = speed_bounds_mps(mode, 49.3);
         let mut speeds: Vec<(&str, f64)> = Vec::new();
         for (pair, origin, destination) in [PAIRS[0], PAIRS[3], PAIRS[4]] {
             let case = format!("{mode}, {pair}");
@@ -152,14 +191,15 @@ async fn a_journey_worth_taking_the_fast_roads_implies_more_of_a_speed_than_a_lo
             let (distance, duration) = (int(&cell, "Distance", &case), int(&cell, "Duration", &case));
             speeds.push((pair, distance as f64 / duration as f64));
         }
-        if top <= street {
-            // Every road of the network is posted above this mode's own top speed, so the
-            // mode is what the journey is paced by, whatever roads it travels.
+        if mode == "Pedestrian" {
+            // Every road of the network is posted above a walker's own top speed and a
+            // walker queues at no junction, so the mode is what paces any journey it
+            // makes, whatever roads it travels.
             for (pair, speed) in &speeds {
                 let case = format!("{mode}, {pair}");
                 assert!(
                     (speed - top).abs() <= 0.2,
-                    "case {case:?}: every road is posted above this mode's {top:.2} m/s, so that \
+                    "case {case:?}: every road carries this mode at its own {top:.2} m/s, so that \
                      is the pace of any journey it makes, got {speed:.2} m/s"
                 );
             }
@@ -174,39 +214,41 @@ async fn a_journey_worth_taking_the_fast_roads_implies_more_of_a_speed_than_a_lo
             );
         }
         // And a journey of hundreds of kilometres is not priced at a local-street pace,
-        // which is the lowest speed any road this mode may use is posted at.
+        // which is the lowest pace any road this mode may use carries it at.
         let (long_pair, long) = speeds[speeds.len() - 1];
         assert!(
-            long > street,
+            long > slowest,
             "case {mode:?}: {long_pair:?} runs on the fast classes, so it must imply more than \
-             the {street:.2} m/s a street is posted at, got {long:.2} m/s"
+             the {slowest:.2} m/s a street carries travel at, got {long:.2} m/s"
         );
     }
 }
 
-/// The POSTED SPEED of the road travelled is what turns a distance into a duration: three
-/// runs of the same length along a motorway, a trunk road and a street take times in the
-/// order of those three speeds, and the same run on foot takes the footpath pace.
+/// The road travelled is what turns a distance into a duration: three runs of the same
+/// length along a motorway, a trunk road and a street take times in the order of those
+/// three roads' paces — each road's posted speed less what its own junctions cost — and the
+/// same run on foot takes the footpath pace.
 ///
 /// Each row is a run straight along one parallel road of the grid, taken as the shortest
 /// route so that the path is that road: latitude 49.4 is a multiple of 400 grid steps,
 /// where the network puts a motorway, 49.45 is a multiple of 100, where it puts a trunk
 /// road, and 49.4505 is neither, so it carries a street (`class_of` in `src/state.rs`).
 #[tokio::test]
-async fn the_duration_of_a_run_is_its_length_at_the_posted_speed_of_the_road_it_runs_on() {
+async fn the_duration_of_a_run_is_its_length_at_the_pace_of_the_road_it_runs_on() {
     let router = routes_service();
-    // name, the latitude the run follows, the speed the road is posted at.
-    let runs: [(&str, f64, f64); 3] = [
-        ("along a motorway", 49.4, MOTORWAY_SPEED_KPH),
-        ("along a trunk road", 49.45, TRUNK_SPEED_KPH),
-        ("along a street", 49.4505, STREET_SPEED_KPH),
+    // name, the latitude the run follows, the speed the road is posted at, what one of its
+    // junctions costs.
+    let runs: [(&str, f64, f64, f64); 3] = [
+        ("along a motorway", 49.4, MOTORWAY_SPEED_KPH, MOTORWAY_JUNCTION_DELAY_S),
+        ("along a trunk road", 49.45, TRUNK_SPEED_KPH, TRUNK_JUNCTION_DELAY_S),
+        ("along a street", 49.4505, STREET_SPEED_KPH, STREET_JUNCTION_DELAY_S),
     ];
     // A longitude between two meridian roads, so the run's endpoints match onto the
     // parallel road they sit on rather than onto a meridian crossing it.
     let (west, east) = (-123.097_23, -123.067_23);
 
     let mut measured: Vec<(&str, i64, i64, f64)> = Vec::new();
-    for (case, latitude, posted_kph) in runs {
+    for (case, latitude, posted_kph, delay_s) in runs {
         let cell = cell(
             &router,
             [west, latitude],
@@ -218,10 +260,12 @@ async fn the_duration_of_a_run_is_its_length_at_the_posted_speed_of_the_road_it_
         .await;
         let (distance, duration) = (int(&cell, "Distance", case), int(&cell, "Duration", case));
         let implied = distance as f64 / duration as f64;
+        let pace = pace_mps(posted_kph, delay_s, "Car", latitude);
         assert!(
-            (implied - posted_kph * KPH_TO_MPS).abs() <= 1.0,
-            "case {case:?}: a run along this road is travelled at the {posted_kph} km/h it is \
-             posted at, got {distance} m in {duration} s, i.e. {implied:.2} m/s"
+            (implied - pace).abs() <= 1.0,
+            "case {case:?}: a run along this road is travelled at the {pace:.2} m/s it carries \
+             travel at — {posted_kph} km/h less {delay_s} s at each of its junctions — got \
+             {distance} m in {duration} s, i.e. {implied:.2} m/s"
         );
         measured.push((case, distance, duration, implied));
     }
@@ -246,7 +290,7 @@ async fn the_duration_of_a_run_is_its_length_at_the_posted_speed_of_the_road_it_
 
     // The travel mode holds the speed down where the mode is the slower of the two: on foot
     // the same run takes the footpath pace whatever the road is posted at.
-    for (case, latitude, _) in runs {
+    for (case, latitude, _, _) in runs {
         let case = &format!("{case} on foot");
         let cell = cell(
             &router,

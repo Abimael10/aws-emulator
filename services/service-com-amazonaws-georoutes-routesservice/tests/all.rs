@@ -29,6 +29,8 @@ mod reported_time_offsets;
 mod response_detail;
 #[path = "all/road_graph_metrics.rs"]
 mod road_graph_metrics;
+#[path = "all/road_network_fidelity.rs"]
+mod road_network_fidelity;
 #[path = "all/route_matrix_boundary.rs"]
 mod route_matrix_boundary;
 #[path = "all/route_matrix_metrics.rs"]

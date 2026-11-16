@@ -7,7 +7,8 @@
 //! submitted trace point, at the same index, with the submitted position echoed as
 //! `OriginalPosition`, the point on the road as `SnappedPosition` and a `Confidence` read
 //! off the match itself ([`match_confidence`]): how far the point had to move to reach its
-//! road, and how much nearer that road is than the next candidate road. A point whose
+//! road, so a point already on a road matches with the range's own maximum and one as far
+//! from every road as a position can be scores near its minimum. A point whose
 //! nearest usable road is further away than `SnapRadius` is not matched: it keeps its
 //! submitted position, scores zero confidence, and its index is listed under a
 //! `TracePointsNotMatched` notice. So is a point the network holds no road anywhere near —
@@ -381,36 +382,27 @@ const MAX_NOTICE_INDEXES: usize = 1_000;
 /// `Confidence` ("Confidence value for the correctness of this point match", a
 /// `@range 0..1` double) reports it.
 ///
-/// It is read off the MATCH and nothing else. Two things make a map match uncertain, and
-/// the score is their product:
-///
-/// * how far the point had to move to reach the road, over the scale on which a position
-///   inside this network's coverage is ambiguous ([`state::snap_ambiguity_m`]) — a point
-///   sitting on the road was observed where the road is, one as far from it as a point
-///   can be was not;
-/// * how much nearer the matched road is than the nearest other road the traveller may
-///   use — a point as near a second road could be on either, so the match is a guess
-///   between them, while a point with no other road near it can only be on this one.
+/// It is read off ONE thing: how far the point had to move to reach the road it was matched
+/// onto. A point already on a road was observed where the road is, so its match is certain
+/// and scores the range's own maximum; a point as far from every road as a position inside
+/// this network's coverage can be ([`state::snap_ambiguity_m`]) was not observed on the
+/// road it was matched onto, so its match is barely an explanation of it at all and scores
+/// near the range's minimum. In between the score falls off smoothly with the offset, which
+/// is what lets a client threshold on it: two points with the same offset score the same,
+/// and of two points the one further from its road always scores less.
 ///
 /// The radius the request allowed is deliberately NOT part of it: `SnapRadius` says which
 /// points may be matched at all, so scoring against it would report the same match as
 /// confident or not depending on how much slack the caller left, and would never signal a
 /// poor match at a generous radius.
 fn match_confidence(position: Position, candidate: &state::SnappedPosition) -> f64 {
-    let ambiguity = state::snap_ambiguity_m(position[1]);
-    // A Gaussian error model on the distance from the observed point to a road: the
-    // relative likelihood that the point was observed on it. Strictly positive, so a
-    // matched point always carries some confidence.
-    let likelihood = |offset_m: f64| (-(offset_m / ambiguity).powi(2)).exp();
-    let matched = likelihood(candidate.offset_m);
-    let runner_up = candidate.runner_up_offset_m.map_or(0.0, likelihood);
-    let share = if matched + runner_up > 0.0 {
-        matched / (matched + runner_up)
-    } else {
-        // Both likelihoods underflowed, which leaves no ground to prefer either road.
-        0.5
-    };
-    (matched * share).clamp(0.0, 1.0)
+    // A Gaussian error model on the distance from the observed point to the road: the
+    // likelihood that a point this far off was travelling on it. Its scale is half the
+    // farthest a position in this network can lie from a road, so a match at that farthest
+    // offset is two scales out — an explanation the model has all but ruled out — while a
+    // point on the road scores 1.
+    let scale = (state::snap_ambiguity_m(position[1]) / 2.0).max(f64::MIN_POSITIVE);
+    (-(candidate.offset_m / scale).powi(2)).exp().clamp(0.0, 1.0)
 }
 
 /// The geometry of the snapped route: the roads the trace was matched onto, from the first

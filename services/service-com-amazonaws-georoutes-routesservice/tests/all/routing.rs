@@ -1495,8 +1495,8 @@ async fn snap_to_roads_answers_one_point_per_trace_point_within_the_radius() {
 
 /// Confidence is a property of the MATCH and not of the request: the same trace point
 /// matched onto the same road is reported with the same confidence however much slack
-/// `SnapRadius` left around it, and a point the matcher had to move further, or that lies
-/// as near a second road, is reported with less of it.
+/// `SnapRadius` left around it, and a point the matcher had to move further is reported
+/// with less of it.
 #[tokio::test]
 async fn the_confidence_of_a_match_does_not_follow_the_snap_radius() {
     let router = routes_service();

@@ -398,15 +398,12 @@ impl Narration {
     }
 }
 
-/// The language tag this emulator reports when it renders the narration in its own
-/// regional default rather than in a language the request asked for: US English, the
-/// regional default of the region this emulator serves. A request that asked for a
-/// language the catalog HOLDS is answered under the tag it asked with instead.
-///
-/// The region subtag is lower-case because that is how the service's own fallback answers
-/// it; a requested tag is reported back as the caller spelled it, so the two forms sitting
-/// side by side in one answer is correct and not a normalisation to tidy up.
-const DEFAULT_LANGUAGE_TAG: &str = "en-us";
+/// The language tag this emulator reports when it renders the narration and the road text
+/// in its own default rather than in a language the request asked for: English, which is
+/// the language this network's road names and route numbers are held in. A request that
+/// asked for a language the catalog HOLDS is answered under the tag it asked with instead,
+/// so a regional tag a caller sent is reported back as the caller spelled it.
+const DEFAULT_LANGUAGE_TAG: &str = "en";
 
 /// The narration of the regional default language, which a request resolving to none of
 /// the catalog's languages is answered in.

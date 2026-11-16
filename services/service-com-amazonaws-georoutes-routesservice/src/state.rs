@@ -166,6 +166,23 @@ const TRUNK_SPEED_KPH: f64 = 85.0;
 const STREET_SPEED_KPH: f64 = 50.0;
 const FOOTPATH_SPEED_KPH: f64 = 5.0;
 
+/// Seconds a traveller loses at ONE at-grade junction of a road of each class — the second
+/// half of what travelling a road takes, beside its posted speed ([`junction_delay_of`]).
+///
+/// The values are parameters of this emulator's network, like the posted speeds above them,
+/// and they are applied in one place ([`road_graph`]) so every operation that reports a
+/// duration reports the same pace.
+///
+/// A motorway's crossings are grade-separated, so nothing is given up at one and a motorway
+/// run is travelled at its posted speed.
+const MOTORWAY_JUNCTION_DELAY_S: f64 = 0.0;
+/// A trunk road is the priority road at its crossings, so it gives up a little at each.
+const TRUNK_JUNCTION_DELAY_S: f64 = 1.5;
+/// A local street gives way at every block, which is what makes travel across a town slower
+/// than any street is posted at — the delay, not the limit, is most of what a short journey
+/// takes.
+const STREET_JUNCTION_DELAY_S: f64 = 6.0;
+
 /// Metres per second in one km/h: posted speeds are held in km/h, as a road carries them,
 /// and travel is costed in metres per second.
 pub const KPH_TO_MPS: f64 = 1_000.0 / 3_600.0;
@@ -225,6 +242,15 @@ pub const PRICING_BUCKET_ADVANCED: &str = "Advanced";
 /// `aws-geospatial/polyline` library the model's `LegGeometryFormat` documentation points
 /// at.
 pub const POLYLINE_PRECISION: u32 = 6;
+
+/// Decimal digits of a coordinate a response CARRIES, in degrees: this API expresses a
+/// `Position` to a ten-millionth of a degree — ~1 cm of ground — and reports every one of
+/// them, the position a caller supplied included, at that precision.
+///
+/// It is the grid the service's coordinates live on, so a caller that round-trips a
+/// reported position back into a request gets the same place again, and a position read off
+/// the network cannot be reported with the artefacts of the arithmetic that located it.
+pub const POSITION_PRECISION: u32 = 7;
 
 /// Version of the Flexible Polyline format this service emits, carried as the first value
 /// of the header: the format defines `FORMAT_VERSION = 1`.
@@ -780,16 +806,11 @@ pub struct SnappedPosition {
     /// the network's geometry carries ([`round_to_network_precision`]).
     pub position: Position,
     /// Distance from the submitted position to [`SnappedPosition::position`], in metres.
+    /// It is the whole of what makes the match a good one or a poor one: a position on the
+    /// road was observed where the road is, one far from every road was not.
     pub offset_m: f64,
     /// The road snapped to.
     pub road: TravelledRoad,
-    /// Distance from the submitted position to the nearest point of the nearest OTHER
-    /// road of the network, in metres, where there is one the same traveller may use.
-    ///
-    /// It is what makes a match CERTAIN or ambiguous: a position far nearer its matched
-    /// road than any other lies on that road, while one as near a second road could be on
-    /// either, and no offset alone tells the two cases apart.
-    pub runner_up_offset_m: Option<f64>,
 }
 
 /// Per-service state for com-amazonaws-georoutes-routesservice. A handler reaches it through [`service_state`].
@@ -957,27 +978,10 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                     position: round_to_network_precision(position),
                     offset_m,
                     road: segment.travelled(),
-                    runner_up_offset_m: None,
                 });
             }
         }
-        let mut best = best?;
-        // The nearest road that is not the matched one, which is the candidate the match
-        // was chosen OVER. A second run of the very same road is not another candidate:
-        // one road carries one match however many cells of it were materialised.
-        for &index in self.road_cells.get(&cell).into_iter().flatten() {
-            let Some(segment) = self.road_network.get(index) else {
-                continue;
-            };
-            if !segment.allows(mode) || segment.travelled().is_same_road(&best.road) {
-                continue;
-            }
-            let (_, offset_m) = nearest_point_on_polyline(pos, &segment.polyline);
-            if best.runner_up_offset_m.is_none_or(|current| offset_m < current) {
-                best.runner_up_offset_m = Some(offset_m);
-            }
-        }
-        Some(best)
+        best
     }
 
     /// The route from `positions[0]` through every following position, costed by this
@@ -1217,6 +1221,32 @@ fn inherit_endpoint_roads(path: &mut [PathVertex]) {
     }
 }
 
+/// What a traveller of `mode` gives up at one at-grade junction of a road of `class`, in
+/// seconds.
+///
+/// A road does not carry travel at its posted speed from end to end: the grid puts a
+/// crossing road every [`ROAD_SPACING_DEG`], and a vehicle gives way at each of them it is
+/// not grade-separated from. So the pace a journey makes is a property of the CLASS of road
+/// it runs on and not of its speed limit alone — see [`MOTORWAY_JUNCTION_DELAY_S`],
+/// [`TRUNK_JUNCTION_DELAY_S`] and [`STREET_JUNCTION_DELAY_S`].
+///
+/// A journey ON FOOT gives up nothing at any of them: a walker crosses a road of this
+/// network when the traffic on it allows rather than queueing for its turn, so what paces a
+/// walk is the walking itself.
+fn junction_delay_of(class: RoadClass, mode: TravelMode) -> f64 {
+    if mode == TravelMode::Pedestrian {
+        return 0.0;
+    }
+    match class {
+        RoadClass::Motorway => MOTORWAY_JUNCTION_DELAY_S,
+        RoadClass::Trunk => TRUNK_JUNCTION_DELAY_S,
+        RoadClass::Street => STREET_JUNCTION_DELAY_S,
+        // A footpath has no junction with the carriageway a vehicle travels, and no
+        // vehicle of this network may use one.
+        RoadClass::Footpath => 0.0,
+    }
+}
+
 /// Posted speed of a road class, in km/h.
 fn speed_of(class: RoadClass) -> f64 {
     match class {
@@ -1427,10 +1457,16 @@ fn nearest_point_on_segment(pos: Position, a: Position, b: Position) -> Position
 /// A position READ OFF the network is located by projecting into metres and back, so the
 /// arithmetic leaves digits far below that precision on it. They are not part of the
 /// network: the same road vertex reached two ways would otherwise be reported as two
-/// places. A position the CALLER supplied is never put through this — it is echoed as it
-/// was sent.
+/// places. A position the CALLER supplied is never put through this — it is carried as it
+/// was sent, down to the precision this API expresses a coordinate in
+/// ([`position_to_vec`]).
 pub fn round_to_network_precision(position: Position) -> Position {
-    let Ok(digits) = i32::try_from(POLYLINE_PRECISION) else {
+    round_to_digits(position, POLYLINE_PRECISION)
+}
+
+/// `position` with each coordinate rounded to `digits` decimal places.
+fn round_to_digits(position: Position, digits: u32) -> Position {
+    let Ok(digits) = i32::try_from(digits) else {
         return position;
     };
     let scale = 10_f64.powi(digits);
@@ -1440,12 +1476,12 @@ pub fn round_to_network_precision(position: Position) -> Position {
     ]
 }
 
-/// The scale, in metres at `latitude`, on which a match onto this network is uncertain:
-/// half the spacing between neighbouring roads, which is the farthest a position inside
-/// the network's coverage can be from the nearest road along one axis.
+/// The farthest, in metres at `latitude`, a position inside the network's coverage can lie
+/// from the nearest road: half the spacing between neighbouring roads, on the axis where
+/// that spacing is the tighter of the two.
 ///
-/// A match whose offset is this much is as far from its road as a position can be, and a
-/// second road no further away than this is as good a candidate as the matched one.
+/// It is the scale a snap offset means anything on — a match that moved a position this far
+/// moved it as far as a match ever has to.
 pub fn snap_ambiguity_m(latitude: f64) -> f64 {
     let (metres_per_lon, metres_per_lat) = metres_per_degree(latitude);
     (ROAD_SPACING_DEG * metres_per_lon.min(metres_per_lat) / 2.0).max(f64::MIN_POSITIVE)
@@ -1968,8 +2004,14 @@ fn encode_unsigned_varint(mut value: u64, out: &mut String) {
     out.push(char::from(POLYLINE_ALPHABET[value as usize]));
 }
 
-/// A position as the generated members carry it.
+/// A position as the generated members carry it, at the coordinate precision this API
+/// expresses a position in ([`POSITION_PRECISION`]).
+///
+/// Every position a response reports goes through here — the point read off the network and
+/// the one the caller supplied alike — so a response carries no coordinate finer than the
+/// grid the service's own positions live on.
 pub fn position_to_vec(position: Position) -> Vec<f64> {
+    let position = round_to_digits(position, POSITION_PRECISION);
     vec![position[0], position[1]]
 }
 

@@ -12,7 +12,8 @@
 //!   its endpoints, which no road of the network follows;
 //! * its DURATION is each stretch's length at the posted speed of the road THAT stretch
 //!   runs on, held down to the travel mode's own top speed wherever the mode cannot keep up
-//!   with the road.
+//!   with the road, PLUS what the stretch gives up at the junctions it crosses — which is
+//!   most of what a short journey on the local streets takes.
 //!
 //! That is why the two hang together the way a road answer does: a leg long enough to be
 //! worth reaching the fast classes for travels most of its length near their posted speed,
@@ -47,7 +48,8 @@ pub struct Stretch {
     /// Its length in metres, by the same geodesic the reported geometry's length is
     /// measured with.
     pub length_m: f64,
-    /// What travelling it takes, in seconds: its length at [`GridRoad::pace`].
+    /// What travelling it takes, in seconds: its length at [`GridRoad::pace`], plus what
+    /// the junctions it crosses cost ([`GridRoad::travel_seconds`]).
     pub seconds: f64,
 }
 
@@ -90,6 +92,34 @@ impl GridRoad {
         (speed_of(self.class()) * KPH_TO_MPS)
             .min(top_speed_mps)
             .max(f64::MIN_POSITIVE)
+    }
+
+    /// How many roads of the crossing orientation a run of this road from `from` to `to`
+    /// passes through: the grid puts one every [`ROAD_SPACING_DEG`] along the axis this
+    /// road runs on, so a run meets that many junctions.
+    fn crossings(self, from: Position, to: Position) -> f64 {
+        let axis = self.orientation.axis();
+        ((to[axis] - from[axis]).abs() / ROAD_SPACING_DEG).max(0.0)
+    }
+
+    /// What travelling this road from `from` to `to` takes, in seconds: the `length_m` of
+    /// the run at this road's own pace, plus what travel of `mode` gives up at each
+    /// junction the run crosses ([`junction_delay_of`]).
+    ///
+    /// The delay is why a journey's pace is not its roads' posted speeds: a short journey
+    /// on the local streets gives way every block and so travels well below the limit,
+    /// while a long one on the grade-separated class gives up nothing and keeps its posted
+    /// speed.
+    fn travel_seconds(
+        self,
+        from: Position,
+        to: Position,
+        length_m: f64,
+        mode: TravelMode,
+        top_speed_mps: f64,
+    ) -> f64 {
+        length_m / self.pace(top_speed_mps)
+            + self.crossings(from, to) * junction_delay_of(self.class(), mode)
     }
 
     /// The coordinate this road sits at, in degrees: its longitude where it runs
@@ -179,7 +209,7 @@ pub fn traverse(
 
     let mut ways: Vec<Way> = Vec::with_capacity(crossing.len() * along.len());
     let mut weigh = |roads: [GridRoad; MAX_ROADS], roads_len: usize| {
-        let (length_m, seconds) = cost_of(&roads[..roads_len], from, to, top_speed_mps);
+        let (length_m, seconds) = cost_of(&roads[..roads_len], from, to, mode, top_speed_mps);
         ways.push(Way {
             roads,
             roads_len,
@@ -245,7 +275,7 @@ pub fn traverse(
         }
     }
     chosen
-        .map(|way| stretches_of(&way, from, to, top_speed_mps))
+        .map(|way| stretches_of(&way, from, to, mode, top_speed_mps))
         .unwrap_or_default()
 }
 
@@ -282,7 +312,13 @@ fn other_cost(way: &Way, objective: RoutingObjective) -> f64 {
 /// never quicker than the roads travelled allow — and because it is the measure the
 /// response reports, the way this picks as the shortest is the one that reports the
 /// shortest distance.
-fn cost_of(roads: &[GridRoad], from: Position, to: Position, top_speed_mps: f64) -> (f64, f64) {
+fn cost_of(
+    roads: &[GridRoad],
+    from: Position,
+    to: Position,
+    mode: TravelMode,
+    top_speed_mps: f64,
+) -> (f64, f64) {
     let (mut length_m, mut seconds) = (0.0, 0.0);
     let mut at = from;
     for (index, road) in roads.iter().enumerate() {
@@ -292,7 +328,7 @@ fn cost_of(roads: &[GridRoad], from: Position, to: Position, top_speed_mps: f64)
         };
         let metres = haversine_m(at, next);
         length_m += metres;
-        seconds += metres / road.pace(top_speed_mps);
+        seconds += road.travel_seconds(at, next, metres, mode, top_speed_mps);
         at = next;
     }
     (length_m, seconds)
@@ -304,7 +340,13 @@ fn cost_of(roads: &[GridRoad], from: Position, to: Position, top_speed_mps: f64)
 /// A stretch of no length at all is where two roads of the way cross in one point rather
 /// than travel the traveller makes, so it is not reported: the stretches that remain still
 /// run end to end, because each starts where the one before it ended.
-fn stretches_of(way: &Way, from: Position, to: Position, top_speed_mps: f64) -> Vec<Stretch> {
+fn stretches_of(
+    way: &Way,
+    from: Position,
+    to: Position,
+    mode: TravelMode,
+    top_speed_mps: f64,
+) -> Vec<Stretch> {
     let roads = way.roads();
     let mut stretches = Vec::with_capacity(roads.len());
     let mut at = from;
@@ -320,7 +362,7 @@ fn stretches_of(way: &Way, from: Position, to: Position, top_speed_mps: f64) -> 
                 from: at,
                 to: next,
                 length_m,
-                seconds: length_m / road.pace(top_speed_mps),
+                seconds: road.travel_seconds(at, next, length_m, mode, top_speed_mps),
             });
         }
         at = next;

@@ -425,7 +425,7 @@ async fn the_fallback_notice_is_reported_only_when_no_requested_language_resolve
     // fallback notice must be reported.
     type LanguageCase = (&'static str, Vec<&'static str>, &'static str, bool);
     let cases: [LanguageCase; 11] = [
-        ("none asked for", vec![], "en-us", false),
+        ("none asked for", vec![], "en", false),
         ("the default language", vec!["en"], "en", false),
         ("a regional variant of it", vec!["en-AU"], "en-AU", false),
         ("Spanish", vec!["es-ES"], "es-ES", false),
@@ -434,7 +434,7 @@ async fn the_fallback_notice_is_reported_only_when_no_requested_language_resolve
         ("German", vec!["de-AT"], "de-AT", false),
         ("Italian", vec!["it"], "it", false),
         ("Portuguese", vec!["pt-BR"], "pt-BR", false),
-        ("a language the catalog does not hold", vec!["ja-JP"], "en-us", true),
+        ("a language the catalog does not hold", vec!["ja-JP"], "en", true),
         ("the first held language of several", vec!["ja", "fr", "es"], "fr", false),
     ];
 
