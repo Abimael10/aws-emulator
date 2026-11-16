@@ -23,6 +23,8 @@ mod data_catalog_update;
 mod database_statements;
 #[path = "all/engine_run_bound.rs"]
 mod engine_run_bound;
+#[path = "all/engine_version_listing.rs"]
+mod engine_version_listing;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/hive_location_recording.rs"]

@@ -66,6 +66,12 @@
 //! allocated amount from that instant ([`CapacityReservationRecord::status_at`]), so a
 //! caller reading one straight back still sees it PENDING and the reservation reaches
 //! ACTIVE whether or not anybody polls it.
+//!
+//! The ENGINE VERSIONS a request may select are the service's own catalog rather than
+//! anything a request wrote ([`SELECTABLE_ENGINE_VERSIONS`]): `ListEngineVersions`
+//! reports them and [`resolved_engine_version`] decides what each one means, so the
+//! effective version the listing publishes for a selection is the one a workgroup making
+//! that selection is created with.
 
 /// The SQL engine a query execution runs on, and the result set it produces.
 pub mod query_engine;
@@ -105,6 +111,10 @@ pub use named_queries::*;
 /// What a workgroup holds, and what deleting the workgroup removes with it.
 mod work_group_deletion;
 pub use work_group_deletion::*;
+
+/// The engine versions a request may select, and the version each one resolves to.
+mod engine_versions;
+pub use engine_versions::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
