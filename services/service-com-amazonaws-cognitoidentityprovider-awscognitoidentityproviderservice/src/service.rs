@@ -22,14 +22,17 @@
 //!   Edit it for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — EDITED HERE: the key and the handler stay the generated
-//!   table's, but each operation is served through [`WithSubmittedValues`], so a request
-//!   refused before the handler runs states the COLLECTION the caller submitted, which
-//!   the framework's walk can only summarise as `<n> items` — and through
+//!   table's, but each operation is served AUDITED, so every call it serves is recorded in
+//!   the account's event history where CloudTrail's `LookupEvents` reports it (see
+//!   [`management_events`]) — and, inside that, through [`WithSubmittedValues`], so a
+//!   request refused before the handler runs states the COLLECTION the caller submitted,
+//!   which the framework's walk can only summarise as `<n> items` — and through
 //!   [`BehindWebAcl`], so a request to a pool with a WAFv2 web ACL associated is decided
 //!   by that web ACL before the operation serves it — and through
 //!   [`iam_authorization::IamAuthorized`], so an operation the model requires a signature
 //!   for is served only to a caller IAM allows to perform it — and, outermost, through
-//!   [`RequestIdReportingOperation::header`], so every response an operation produced names
+//!   [`service_common::query_error_envelope::RequestIdReportingOperation::header`], so every
+//!   response an operation produced names
 //!   the request it answers (see "Naming the request a response answers").
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
@@ -74,7 +77,8 @@
 //! alone — `awsJson1_1` has no envelope element for the id) and wires it at the two layers
 //! every response of this service passes through:
 //!
-//! * [`RequestIdReportingOperation::header`], the outermost wrapper of each row of the
+//! * [`service_common::query_error_envelope::RequestIdReportingOperation::header`], the
+//!   outermost wrapper of each row of the
 //!   table `override_operation` serves from, which covers a success, a modelled error, the
 //!   web ACL's and the IAM gate's own refusals, and a constraint refusal raised while that
 //!   operation was being served;
@@ -92,9 +96,7 @@ use aws_smithy_schema_server::ProtocolError;
 // The shared naming of the two documents every OIDC issuer this emulator serves publishes,
 // which this service's own well-known routes answer with.
 use service_common::openid_discovery::WellKnownDocument;
-use service_common::query_error_envelope::{
-    RequestIdEnvelopeDefinition, RequestIdReportingOperation,
-};
+use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use service_common::validation::{
     refusing_violations_with_declared_echoes_quoting_up_to, unanchored, SubmittedEcho,
 };
@@ -122,6 +124,11 @@ mod web_acl;
 /// every operation the model requires a SigV4 signature for
 /// ([`iam_authorization::IamAuthorized`]).
 pub mod iam_authorization;
+
+/// This front door's AUDIT leg: every call it serves is a management event of this service,
+/// recorded in the account's event history where CloudTrail's `LookupEvents` reads it. The
+/// table every request is served from is built there ([`management_events::audited_table`]).
+pub mod management_events;
 
 /// The error code Amazon Cognito answers a bad parameter with, and the code this service
 /// gives a refusal the framework made before any handler ran. Restated beside the message
@@ -218,11 +225,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// service's stored state. Operations reach the engine through the entry
     /// that constructed them, not through this field.
     engine: Arc<Eng>,
-    /// The same modelled operations the generated table holds, each wrapped in
-    /// [`WithSubmittedValues`]. Keyed by the routing key the protocol resolves — the key
-    /// the generated table uses — and built from the SAME shared engine, so a wrapped
-    /// operation reads and writes the one store.
-    with_submitted_values: OperationRoutingTable,
+    /// The same modelled operations the generated table holds, each served AUDITED — the
+    /// call is recorded in the account's event history ([`management_events`]) — and inside
+    /// that, wrapped in the layers this service decides a request through. Keyed by the
+    /// routing key the protocol resolves — the key the generated table uses — and built from
+    /// the SAME shared engine, so a wrapped operation reads and writes the one store and no
+    /// served call goes unrecorded.
+    audited: OperationRoutingTable,
     /// This service's wire protocol, built ONCE here because `override_protocol` hands
     /// out a borrow of it rather than a new one per request. It is the `awsJson1_1` the
     /// model declares, answering an error the way this endpoint is recorded answering one
@@ -230,181 +239,21 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     protocol: error_wire::ErrorWireProtocol,
 }
 
-/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`WithSubmittedValues`], in [`iam_authorization::IamAuthorized`], in
-/// [`BehindWebAcl`] and — outermost, so every response an operation produced names the
-/// request it answers — in [`RequestIdReportingOperation::header`], and keyed by its
-/// operation shape name — the routing key `ServerHttpProtocol::routing_key` resolves and
-/// the generated table is keyed by.
-macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
-        $(
-            $table.add_operation(
-                stringify!($operation),
-                ::std::boxed::Box::new(RequestIdReportingOperation::header(BehindWebAcl::new(
-                    stringify!($operation),
-                    ::std::sync::Arc::clone(&$engine),
-                    ::std::boxed::Box::new(iam_authorization::IamAuthorized::new(
-                        stringify!($operation),
-                        ::std::sync::Arc::clone(&$engine),
-                        ::std::boxed::Box::new(WithSubmittedValues::new(
-                            crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                        )) as ::std::boxed::Box<dyn ErasedOperation>,
-                    )) as ::std::boxed::Box<dyn ErasedOperation>,
-                ))) as ::std::boxed::Box<dyn ErasedOperation>,
-            );
-        )+
-    };
-}
-
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut with_submitted_values = OperationRoutingTable::new();
-        wrap_operations!(
-            with_submitted_values,
-            engine,
-            add_custom_attributes::AddCustomAttributes,
-            add_user_pool_client_secret::AddUserPoolClientSecret,
-            admin_add_user_to_group::AdminAddUserToGroup,
-            admin_confirm_sign_up::AdminConfirmSignUp,
-            admin_create_user::AdminCreateUser,
-            admin_delete_software_token::AdminDeleteSoftwareToken,
-            admin_delete_user::AdminDeleteUser,
-            admin_delete_user_attributes::AdminDeleteUserAttributes,
-            admin_disable_provider_for_user::AdminDisableProviderForUser,
-            admin_disable_user::AdminDisableUser,
-            admin_enable_user::AdminEnableUser,
-            admin_forget_device::AdminForgetDevice,
-            admin_get_device::AdminGetDevice,
-            admin_get_user::AdminGetUser,
-            admin_get_user_auth_factors::AdminGetUserAuthFactors,
-            admin_initiate_auth::AdminInitiateAuth,
-            admin_link_provider_for_user::AdminLinkProviderForUser,
-            admin_list_devices::AdminListDevices,
-            admin_list_groups_for_user::AdminListGroupsForUser,
-            admin_list_user_auth_events::AdminListUserAuthEvents,
-            admin_remove_user_from_group::AdminRemoveUserFromGroup,
-            admin_reset_user_password::AdminResetUserPassword,
-            admin_respond_to_auth_challenge::AdminRespondToAuthChallenge,
-            admin_set_user_mfa_preference::AdminSetUserMFAPreference,
-            admin_set_user_password::AdminSetUserPassword,
-            admin_set_user_settings::AdminSetUserSettings,
-            admin_update_auth_event_feedback::AdminUpdateAuthEventFeedback,
-            admin_update_device_status::AdminUpdateDeviceStatus,
-            admin_update_user_attributes::AdminUpdateUserAttributes,
-            admin_user_global_sign_out::AdminUserGlobalSignOut,
-            associate_software_token::AssociateSoftwareToken,
-            change_password::ChangePassword,
-            complete_web_authn_registration::CompleteWebAuthnRegistration,
-            confirm_device::ConfirmDevice,
-            confirm_forgot_password::ConfirmForgotPassword,
-            confirm_sign_up::ConfirmSignUp,
-            create_group::CreateGroup,
-            create_identity_provider::CreateIdentityProvider,
-            create_managed_login_branding::CreateManagedLoginBranding,
-            create_resource_server::CreateResourceServer,
-            create_terms::CreateTerms,
-            create_user_import_job::CreateUserImportJob,
-            create_user_pool::CreateUserPool,
-            create_user_pool_client::CreateUserPoolClient,
-            create_user_pool_domain::CreateUserPoolDomain,
-            create_user_pool_replica::CreateUserPoolReplica,
-            delete_group::DeleteGroup,
-            delete_identity_provider::DeleteIdentityProvider,
-            delete_managed_login_branding::DeleteManagedLoginBranding,
-            delete_resource_server::DeleteResourceServer,
-            delete_terms::DeleteTerms,
-            delete_user::DeleteUser,
-            delete_user_attributes::DeleteUserAttributes,
-            delete_user_pool::DeleteUserPool,
-            delete_user_pool_client::DeleteUserPoolClient,
-            delete_user_pool_client_secret::DeleteUserPoolClientSecret,
-            delete_user_pool_domain::DeleteUserPoolDomain,
-            delete_user_pool_replica::DeleteUserPoolReplica,
-            delete_web_authn_credential::DeleteWebAuthnCredential,
-            describe_identity_provider::DescribeIdentityProvider,
-            describe_managed_login_branding::DescribeManagedLoginBranding,
-            describe_managed_login_branding_by_client::DescribeManagedLoginBrandingByClient,
-            describe_resource_server::DescribeResourceServer,
-            describe_risk_configuration::DescribeRiskConfiguration,
-            describe_terms::DescribeTerms,
-            describe_terms_by_client::DescribeTermsByClient,
-            describe_user_import_job::DescribeUserImportJob,
-            describe_user_pool::DescribeUserPool,
-            describe_user_pool_client::DescribeUserPoolClient,
-            describe_user_pool_domain::DescribeUserPoolDomain,
-            forget_device::ForgetDevice,
-            forgot_password::ForgotPassword,
-            get_client_token::GetClientToken,
-            get_csv_header::GetCSVHeader,
-            get_device::GetDevice,
-            get_group::GetGroup,
-            get_identity_provider_by_identifier::GetIdentityProviderByIdentifier,
-            get_log_delivery_configuration::GetLogDeliveryConfiguration,
-            get_provisioned_limit::GetProvisionedLimit,
-            get_signing_certificate::GetSigningCertificate,
-            get_tokens_from_refresh_token::GetTokensFromRefreshToken,
-            get_ui_customization::GetUICustomization,
-            get_user::GetUser,
-            get_user_attribute_verification_code::GetUserAttributeVerificationCode,
-            get_user_auth_factors::GetUserAuthFactors,
-            get_user_pool_mfa_config::GetUserPoolMfaConfig,
-            global_sign_out::GlobalSignOut,
-            initiate_auth::InitiateAuth,
-            list_devices::ListDevices,
-            list_groups::ListGroups,
-            list_identity_providers::ListIdentityProviders,
-            list_resource_servers::ListResourceServers,
-            list_tags_for_resource::ListTagsForResource,
-            list_terms::ListTerms,
-            list_user_import_jobs::ListUserImportJobs,
-            list_user_pool_client_secrets::ListUserPoolClientSecrets,
-            list_user_pool_clients::ListUserPoolClients,
-            list_user_pool_replicas::ListUserPoolReplicas,
-            list_user_pools::ListUserPools,
-            list_users::ListUsers,
-            list_users_in_group::ListUsersInGroup,
-            list_web_authn_credentials::ListWebAuthnCredentials,
-            resend_confirmation_code::ResendConfirmationCode,
-            respond_to_auth_challenge::RespondToAuthChallenge,
-            revoke_token::RevokeToken,
-            set_log_delivery_configuration::SetLogDeliveryConfiguration,
-            set_risk_configuration::SetRiskConfiguration,
-            set_ui_customization::SetUICustomization,
-            set_user_mfa_preference::SetUserMFAPreference,
-            set_user_pool_mfa_config::SetUserPoolMfaConfig,
-            set_user_settings::SetUserSettings,
-            sign_up::SignUp,
-            start_user_import_job::StartUserImportJob,
-            start_web_authn_registration::StartWebAuthnRegistration,
-            stop_user_import_job::StopUserImportJob,
-            tag_resource::TagResource,
-            untag_resource::UntagResource,
-            update_auth_event_feedback::UpdateAuthEventFeedback,
-            update_device_status::UpdateDeviceStatus,
-            update_group::UpdateGroup,
-            update_identity_provider::UpdateIdentityProvider,
-            update_managed_login_branding::UpdateManagedLoginBranding,
-            update_provisioned_limit::UpdateProvisionedLimit,
-            update_resource_server::UpdateResourceServer,
-            update_terms::UpdateTerms,
-            update_user_attributes::UpdateUserAttributes,
-            update_user_pool::UpdateUserPool,
-            update_user_pool_client::UpdateUserPoolClient,
-            update_user_pool_domain::UpdateUserPoolDomain,
-            update_user_pool_replica::UpdateUserPoolReplica,
-            verify_software_token::VerifySoftwareToken,
-            verify_user_attribute::VerifyUserAttribute,
-        );
+        // Every modelled operation, each served AUDITED and inside that behind the layers
+        // this service decides a request through — the table, the wrapping order and the
+        // read/write kind of each call are stated once, in [`management_events`].
+        let audited = management_events::audited_table(&engine);
         Self {
             entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
                 Arc::clone(&engine),
             )),
             engine,
-            with_submitted_values,
+            audited,
             protocol: error_wire::ErrorWireProtocol::new(),
         }
     }
@@ -1016,7 +865,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol resolves,
-        // and the operation it names is the one served — wrapped in
+        // and the operation it names is the one served — recorded as a management event of
+        // this service ([`management_events`]) and, inside that, wrapped in
         // [`WithSubmittedValues`] so a constraint refusal states the value the caller
         // submitted rather than the framework's summary of it, in
         // [`iam_authorization::IamAuthorized`] so a caller IAM does not allow is refused
@@ -1028,7 +878,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // non-modelled GET routes below are among them), so the router's routing-error
         // path is unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.with_submitted_values.get(key)
+        self.audited.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -1439,16 +1289,16 @@ mod tests {
     );
 
     /// RULE applied to the whole surface: every operation the model declares is served
-    /// behind [`super::WithSubmittedValues`], under the same key the generated routing
-    /// table is keyed by.
+    /// AUDITED and behind [`super::WithSubmittedValues`], under the same key the generated
+    /// routing table is keyed by.
     ///
     /// The names come from the MODEL rather than from a second hand list, so an operation
-    /// added to the model and not to `wrap_operations!` fails here instead of silently
-    /// stating a summarised value in a refusal — and a key spelled differently from the
-    /// generated table's fails here instead of silently never being reached by
-    /// `override_operation`.
+    /// added to the model and not to the audited table fails here instead of silently
+    /// going unrecorded and stating a summarised value in a refusal — and a key spelled
+    /// differently from the generated table's fails here instead of silently never being
+    /// reached by `override_operation`.
     #[test]
-    fn every_modelled_operation_is_served_with_its_submitted_values() {
+    fn every_modelled_operation_is_served_audited_with_its_submitted_values() {
         let model = std::fs::read_to_string(MODEL_PATH)
             .expect("the model that generated this crate ships beside it");
         let model: serde_json::Value =
@@ -1475,11 +1325,11 @@ mod tests {
                  this one resolved to nothing, so the wrapper's key spelling is wrong"
             );
             assert!(
-                service.with_submitted_values.get(operation).is_some(),
-                "case {operation}: every modelled operation is served behind \
-                 WithSubmittedValues; this one is missing from wrap_operations!, so a \
-                 constraint refusal of it states the framework's summary of a value instead \
-                 of the value the caller submitted"
+                service.audited.get(operation).is_some(),
+                "case {operation}: every modelled operation is served audited and behind \
+                 WithSubmittedValues; this one is missing from the audited table, so a call \
+                 to it is recorded nowhere and a constraint refusal of it states the \
+                 framework's summary of a value instead of the value the caller submitted"
             );
         }
     }

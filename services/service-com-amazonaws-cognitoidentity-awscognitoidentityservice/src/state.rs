@@ -3732,6 +3732,9 @@ pub fn record_vended_assume<Eng: Send + Sync + 'static>(
                 "audience": assume.identity_pool_id,
                 "subjectFromWebIdentityToken": assume.identity_id,
             })),
+            // Nothing beside the parameters: this record reports the role it assumed
+            // through the event's own `Resources`.
+            additional_event_data: None,
             error_code: None,
             error_message: None,
         },
@@ -3887,6 +3890,9 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
                 stopped_at_authorization,
             ),
             response_elements: call.response_elements.clone(),
+            // Nothing beside the parameters: this service's records report the pool a call
+            // addressed through the event's own `Resources`.
+            additional_event_data: None,
             error_code,
             error_message,
         },

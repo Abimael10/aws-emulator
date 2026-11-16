@@ -153,6 +153,9 @@ pub fn hold_data_event<T, E>(
                 stopped_at_authorization,
             ),
             response_elements: call.response_elements.clone(),
+            // Nothing beside the parameters: this service's records report the pool a call
+            // addressed through the event's own `Resources`.
+            additional_event_data: None,
             error_code,
             error_message,
         },

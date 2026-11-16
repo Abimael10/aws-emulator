@@ -83,6 +83,15 @@
 //! tokens against), so a dependency back on STS is a cycle Cargo refuses. The directory is
 //! the one place in this tree where the facts about a session live for every service that
 //! serves a call made with it, which is exactly the position this gate is in.
+//!
+//! ## The refused call is still a call
+//!
+//! A call this gate refuses is an API call this account answered, so it is recorded in the
+//! account's event history like every other call of this service — with the code and the
+//! message the caller was answered with, and with no `requestParameters`, because the call
+//! was never dispatched with any. The record is written here rather than by the shared
+//! audit wrapper for one reason: that wrapper hangs off the typed call, and a call this
+//! gate refuses reaches no handler at all (see [`super::management_events`]).
 
 use std::sync::Arc;
 
@@ -93,6 +102,7 @@ use aws_smithy_schema_server::protocol::ServerProtocol;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+use ::service_common::audited_operation::CallKind;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 /// The wire error code of an identity-based authorization refusal, as the AWS "Common
@@ -168,16 +178,26 @@ pub struct IamAuthorized<Eng> {
     /// The shared engine, so the principal's policies are read from the one store every
     /// service of this emulator shares.
     engine: Arc<Eng>,
+    /// What the wrapped operation's own semantics make of a call to it, which is the
+    /// `readOnly` the record of a call this gate REFUSES carries: a refused read is
+    /// recorded as a read, exactly as the read itself would have been.
+    kind: CallKind,
     /// The operation this one wraps, served for every request IAM allows.
     operation: Box<dyn ErasedOperation>,
 }
 
 impl<Eng> IamAuthorized<Eng> {
     /// Put `operation`, already constructed from the shared engine, behind the IAM decision.
-    pub fn new(name: &'static str, engine: Arc<Eng>, operation: Box<dyn ErasedOperation>) -> Self {
+    pub fn new(
+        name: &'static str,
+        engine: Arc<Eng>,
+        kind: CallKind,
+        operation: Box<dyn ErasedOperation>,
+    ) -> Self {
         Self {
             name,
             engine,
+            kind,
             operation,
         }
     }
@@ -201,8 +221,22 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for IamAuthorized<Eng> {
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             if self.signed() {
-                if let Some(refused) = refusal(&*self.engine, ctx, self.name, req) {
-                    return refused;
+                if let Some(message) = refusal_message(&*self.engine, ctx, self.name, req) {
+                    // The refused call is a management event of this service too: event
+                    // history holds the calls this account's API answered, and a client
+                    // alarming on denied attempts reads exactly these. Recorded here
+                    // because the call reaches no handler, so the shared wrapper around
+                    // the operation never sees it (see [`super::management_events`]), and
+                    // as the LAST thing before the answer is rendered, with nothing
+                    // awaited in between.
+                    super::management_events::record_refused_at_authorization(
+                        &*self.engine,
+                        ctx,
+                        self.name,
+                        self.kind,
+                        &message,
+                    );
+                    return denied_response(&message);
                 }
             }
             self.operation.run(svc, req, ctx).await
@@ -242,15 +276,20 @@ pub fn any_user_pool_arn(region: &str) -> String {
     user_pool_arn(region, "*")
 }
 
-/// The response a request IAM does not allow is answered with, or `None` when the caller may
-/// perform the action — which includes every caller this gate does not bound (see the module
-/// docs).
-pub fn refusal<Eng: Send + Sync + 'static>(
+/// The MESSAGE of the refusal a request IAM does not allow is answered with, or `None` when
+/// the caller may perform the action — which includes every caller this gate does not bound
+/// (see the module docs).
+///
+/// The message rather than the response, because the refusal has two readers: the caller,
+/// answered with it rendered in this endpoint's envelope ([`denied_response`]), and the
+/// account's event history, whose record of the refused call carries the same text as its
+/// `errorMessage`. One statement of it, so the two cannot differ.
+pub fn refusal_message<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
     operation: &str,
     req: &RtRequest,
-) -> Option<RtResponse> {
+) -> Option<String> {
     let caller = caller(engine, ctx);
     // Nothing this gate can read bears on the request: there is no document that could deny
     // it, no boundary that could cap it, and the credential is one the gate does not bound.
@@ -297,7 +336,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
         resource = %resource,
         "iam does not allow this caller to perform this action"
     );
-    Some(denied_response(&message))
+    Some(message)
 }
 
 /// The refusal IAM states an authorization failure with: who was refused, which action, on

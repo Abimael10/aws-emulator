@@ -1080,6 +1080,15 @@ pub struct ServedApiCall {
     /// The response's values, as the event's `responseElements`; `None` for a call that
     /// failed or that returns nothing.
     pub response_elements: Option<serde_json::Value>,
+    /// The facts the SERVING service reports about the call beside its parameters, as the
+    /// event's `additionalEventData` — what CloudTrail carries there for the services that
+    /// report one, and `None` for a call whose service reports none, which leaves the member
+    /// out of the record altogether.
+    ///
+    /// It is the serving API's own, not this crate's: a service whose records name the
+    /// resource a call addressed by an identifier the call itself did not carry reports it
+    /// here ([`crate::audited_operation::report_additional_event_data`]).
+    pub additional_event_data: Option<serde_json::Value>,
     /// The wire error code the call answered with, for a call that failed.
     pub error_code: Option<String>,
     /// The message that went with [`ServedApiCall::error_code`].
@@ -1314,6 +1323,15 @@ impl ManagementEvent {
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
         );
+        // What the serving service reports about the call beside its parameters. Written
+        // only when there is some: a record of a call whose service reports none carries no
+        // such member at all, which is how CloudTrail reports one.
+        if let Some(additional_event_data) = &call.additional_event_data {
+            event.insert(
+                "additionalEventData".to_string(),
+                additional_event_data.clone(),
+            );
+        }
         event.insert(
             "requestID".to_string(),
             serde_json::Value::String(self.request_id.clone()),
@@ -1799,6 +1817,7 @@ mod tests {
             resources: vec![AuditedResource::new("AWS::CloudTrail::Trail", "demo")],
             request_parameters: serde_json::json!({"name": "demo"}),
             response_elements: None,
+            additional_event_data: None,
             error_code: None,
             error_message: None,
         }

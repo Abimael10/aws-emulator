@@ -185,6 +185,8 @@ mod list_web_authn_credentials;
 mod managed_login_branding;
 #[path = "all/managed_login_branding_updates.rs"]
 mod managed_login_branding_updates;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/log_delivery_configuration.rs"]
 mod log_delivery_configuration;
 #[path = "all/log_delivery_destinations.rs"]

@@ -375,6 +375,7 @@ fn served_elsewhere(source: &str, region: &str, access_key_id: &str) -> ServedAp
         resources: Vec::new(),
         request_parameters: serde_json::Value::Null,
         response_elements: None,
+        additional_event_data: None,
         error_code: None,
         error_message: None,
     }

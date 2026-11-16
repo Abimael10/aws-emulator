@@ -112,6 +112,9 @@ pub fn record_on_behalf_of<Eng: Send + Sync + 'static>(
         resources: Vec::new(),
         request_parameters: call.request_parameters,
         response_elements: call.response_elements,
+        // A service making a call for a caller reports nothing beside the parameters it
+        // made it with.
+        additional_event_data: None,
         // A call that failed is not recorded here: the service that makes one of these calls
         // relays the failure to its own caller, and the record of the failed call belongs to
         // the service that refused it.

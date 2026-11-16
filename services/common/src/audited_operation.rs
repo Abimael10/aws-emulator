@@ -23,6 +23,9 @@
 //!   stored — and a call STOPPED AT AUTHORIZATION records neither, because the parameters
 //!   report what a call that was authorized and dispatched carried
 //!   ([`crate::management_events::recorded_request_parameters`]);
+//! * `additionalEventData` is what the serving service reported about the call beside its
+//!   parameters, from inside the typed call ([`report_additional_event_data`]) — nothing
+//!   for a service that reports none, which is most of them;
 //! * `errorCode` / `errorMessage` come from the error channel the caller was answered
 //!   through ([`crate::management_events::recorded_failure`]), so a failed call records
 //!   the fault SHAPE's name;
@@ -124,6 +127,41 @@ thread_local! {
     /// recorded for the call — an operation the scaffold refused, or a request the framework
     /// answered before any handler ran.
     static PENDING_RECORD: RefCell<Option<ServedApiCall>> = const { RefCell::new(None) };
+
+    /// What the service serving this call reports about it beside its parameters — the
+    /// record's `additionalEventData` ([`report_additional_event_data`]).
+    ///
+    /// A slot of its own rather than a field written on the record, because the two are
+    /// known at different moments: this is reported from INSIDE the typed call, where the
+    /// request the service reads it off still exists, and the record is built when that
+    /// call returns. The same one-poll invariant [`PENDING_RECORD`] rests on holds for it,
+    /// and the same fail-safe: it is TAKEN with the record it belongs to, and the run about
+    /// to serve a call clears it first, so what one call reported can never be written onto
+    /// another's record.
+    static PENDING_ADDITIONAL_DATA: RefCell<Option<serde_json::Value>> =
+        const { RefCell::new(None) };
+}
+
+/// What the serving service reported about the call this thread is serving, taken out of
+/// the slot so it is read once.
+fn taken_additional_data() -> Option<serde_json::Value> {
+    PENDING_ADDITIONAL_DATA.with(|slot| slot.borrow_mut().take())
+}
+
+/// Report the facts the SERVING service carries in the record of the call this thread is
+/// serving, beside the parameters that call was dispatched with — the event's
+/// `additionalEventData`.
+///
+/// What it is for: a service whose records name the resource a call addressed by an
+/// identifier the request itself did not carry — because the identifier the request DID
+/// carry is a value its records withhold. Reported from inside the typed call, where that
+/// request can still be read, and written onto the record the audited wrapper builds when
+/// the call returns.
+///
+/// Called with nothing awaited between it and the handler's own return, for the reason
+/// `PENDING_ADDITIONAL_DATA` states.
+pub fn report_additional_event_data(data: serde_json::Value) {
+    PENDING_ADDITIONAL_DATA.with(|slot| *slot.borrow_mut() = Some(data));
 }
 
 /// The record this thread is holding, taken out of the slot so it is read once.
@@ -141,6 +179,7 @@ fn taken_record() -> Option<ServedApiCall> {
 /// record is the honest one.
 fn forget_any_unanswered() {
     drop(taken_record());
+    drop(taken_additional_data());
 }
 
 /// Hold `call` until the response that answers it exists.
@@ -415,7 +454,13 @@ impl<O: Operation, S: AuditedService> Operation for AuditedOperation<O, S> {
         // the document is what the request carried, which is what a record reports.
         let request_parameters = recorded_shape(&input, O::INPUT_SCHEMA, self.withheld());
         let outcome = self.operation.handle(input, ctx).await;
-        if let Some(call) = self.served_call(&request_parameters, ctx, &outcome) {
+        // What the handler reported about the call beside its parameters, taken here — in
+        // the same breath as the handler's return — so it is written onto the record of the
+        // call that reported it and onto no other.
+        let additional_event_data = taken_additional_data();
+        if let Some(call) =
+            self.served_call(&request_parameters, additional_event_data, ctx, &outcome)
+        {
             // Held, not written: the record names the request by the id the caller is
             // answered under, and the response that states it does not exist yet. This is
             // the LAST thing this handler does, with nothing awaited after it, which is
@@ -444,9 +489,14 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
 
     /// The record of the call just served, or `None` when it was refused as not
     /// implemented (so nothing was served at all).
+    ///
+    /// `additional_event_data` is what the handler reported about the call beside its
+    /// parameters ([`report_additional_event_data`]), for the services whose records carry
+    /// one.
     fn served_call(
         &self,
         request_parameters: &serde_json::Value,
+        additional_event_data: Option<serde_json::Value>,
         ctx: &OperationContext<'_>,
         outcome: &Result<O::Output, O::Error>,
     ) -> Option<ServedApiCall> {
@@ -522,6 +572,7 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
                 stopped_at_authorization,
             ),
             response_elements,
+            additional_event_data,
             error_code,
             error_message,
         })

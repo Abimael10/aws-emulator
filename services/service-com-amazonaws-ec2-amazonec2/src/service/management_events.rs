@@ -484,6 +484,9 @@ fn served_api_call<Eng: Send + Sync + 'static>(
         aws_region: region,
         request_parameters,
         response_elements,
+        // Nothing beside the parameters: this service's records report the resources a call
+        // acted on through the event's own `Resources`.
+        additional_event_data: None,
         error_code,
         error_message,
     }

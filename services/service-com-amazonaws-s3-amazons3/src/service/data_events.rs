@@ -933,6 +933,7 @@ mod tests {
                 resources: Vec::new(),
                 request_parameters: rendered,
                 response_elements: None,
+                additional_event_data: None,
                 error_code: code.map(ToString::to_string),
                 error_message: message.map(ToString::to_string),
             });

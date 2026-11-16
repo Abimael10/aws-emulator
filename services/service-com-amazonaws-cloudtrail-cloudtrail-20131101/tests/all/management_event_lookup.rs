@@ -150,6 +150,7 @@ fn served(event_name: &str, region: &str) -> ServedApiCall {
         )],
         request_parameters: json!({"name": format!("{event_name}-trail")}),
         response_elements: None,
+        additional_event_data: None,
         error_code: None,
         error_message: None,
     }
