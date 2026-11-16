@@ -344,16 +344,17 @@ const SCHEDULED_EVALUATION_SECS: f64 = 10.0;
 /// still report the state it forced, and the state is nevertheless taken back with no further
 /// call.
 ///
-/// What takes it back is the alarm's next SCHEDULED evaluation, the same span an alarm over a
-/// metric nothing writes has always waited ([`SCHEDULED_EVALUATION_SECS`]) — whatever the
-/// series the alarm watches holds. A forced state has to outlive more than the next datapoint:
-/// it is an input to every alarm whose rule READS this one ("The alarms specified in a
-/// composite alarm's rule expression can include metric alarms", `PutCompositeAlarm`), and each
-/// of those parents is owed its own evaluation a span after the force
-/// ([`super::COMPOSITE_EVALUATION_DELAY_SECS`]) — so a force an arriving datapoint could
-/// reclaim at once would be a state nothing could ever read: neither the caller that forced it
-/// nor the rule that is evaluated over it.
-const FORCED_STATE_SECS: f64 = SCHEDULED_EVALUATION_SECS;
+/// What takes it back is the alarm's own next evaluation, brought forward of that alarm's
+/// period the way every transient state of this emulator is: the span is SECONDS, long enough
+/// that it outlives more than the next datapoint — a forced state is an input to every alarm
+/// whose rule READS this one ("The alarms specified in a composite alarm's rule expression can
+/// include metric alarms", `PutCompositeAlarm`), and each of those parents is owed its own
+/// evaluation a span after the force ([`super::COMPOSITE_EVALUATION_DELAY_SECS`]), so a force
+/// an arriving datapoint could reclaim at once would be a state nothing could ever read —
+/// and short enough that a client WAITING for the alarm to come back to its actual state, so
+/// that the transition it asks for next is a transition at all, gets there inside one session
+/// rather than after a scheduled pass of its own ([`SCHEDULED_EVALUATION_SECS`]).
+const FORCED_STATE_SECS: f64 = 3.0;
 
 /// How one evaluated window's datapoint stands against the alarm's threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

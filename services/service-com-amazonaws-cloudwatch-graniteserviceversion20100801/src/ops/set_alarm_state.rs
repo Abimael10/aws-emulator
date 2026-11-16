@@ -313,6 +313,10 @@ fn force_state(
         .into());
     };
 
+    // Whether this write MOVED the alarm: the one question both the span armed below and the
+    // history item recorded further down turn on, so the two cannot read it differently.
+    let moved = previous.state_value.as_deref() != Some(input.state_value.as_str());
+
     // "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms returns
     // to their actual state quickly, often within seconds" — the thing that takes a METRIC
     // alarm back is its next evaluation against the stored metric data, which this arms at the
@@ -321,7 +325,17 @@ fn force_state(
     // into a state the evaluation has since taken the alarm out of is a state change of its own,
     // and invokes that state's actions again. A composite alarm is not armed by a span but by
     // its children's states, which the snapshot above holds.
-    store.arm_forced_state(&input.alarm_name, now);
+    //
+    // A write that moved the alarm NOWHERE arms nothing. It is not a transition — it fires no
+    // action, publishes no state-change event and leaves `StateTransitionedTimestamp` where the
+    // last real transition left it — so it has no span of its own to stand for and cannot
+    // postpone an evaluation already owed. Otherwise a caller that re-forces the state it has
+    // just forced — what a client retrying a transition does — would hold the alarm in that
+    // state for as long as it kept asking, and the evaluation that takes the state back, with
+    // the transition the next force would then be, would never come due.
+    if moved {
+        store.arm_forced_state(&input.alarm_name, now);
+    }
 
     // "A summary of the alarm history, in text format."
     // (`AlarmHistoryItem$HistorySummary`) — which state the alarm moved from and which
@@ -342,7 +356,7 @@ fn force_state(
     // the alarm nowhere, which is also why it fires no action. The state update itself still
     // stamps `StateUpdatedTimestamp` above, while `StateTransitionedTimestamp` stays where the
     // last real transition left it.
-    if previous.state_value.as_deref() != Some(input.state_value.as_str()) {
+    if moved {
         store.record_history(
             &input.alarm_name,
             now,

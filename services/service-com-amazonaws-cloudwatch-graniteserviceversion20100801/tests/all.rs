@@ -69,6 +69,8 @@ mod alarm_rule_parse_diagnosis;
 mod alarm_state_change_event_chain;
 #[path = "all/alarm_state_change_events.rs"]
 mod alarm_state_change_events;
+#[path = "all/alarm_state_change_reaches_its_rule_target.rs"]
+mod alarm_state_change_reaches_its_rule_target;
 #[path = "all/alarm_update_regrades.rs"]
 mod alarm_update_regrades;
 #[path = "all/alarm_value_set_refusals.rs"]

@@ -867,6 +867,8 @@ mod eks_service_cidr_vpc_overlap;
 mod eks_wire;
 #[path = "all/eks_wrapped_peer_refusals.rs"]
 mod eks_wrapped_peer_refusals;
+#[path = "all/elb_alarm_transition_reaches_its_rule_queue.rs"]
+mod elb_alarm_transition_reaches_its_rule_queue;
 #[path = "all/elb_classic_and_v2_signing_name_routing.rs"]
 mod elb_classic_and_v2_signing_name_routing;
 #[path = "all/elb_classic_network_resources_resolve_in_ec2.rs"]
