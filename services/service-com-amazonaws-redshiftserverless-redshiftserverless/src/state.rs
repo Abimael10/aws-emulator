@@ -19,7 +19,14 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::ops::types::{Namespace, Snapshot, Tag, UsageLimit, Workgroup};
+use crate::ops::types::{
+    Endpoint, Namespace, PerformanceTarget, Snapshot, Tag, UsageLimit, VpcEndpoint, Workgroup,
+};
+
+/// The managed VPC endpoint a workgroup is reached through, which lives in the service that
+/// owns VPC endpoints and network interfaces rather than in this store — so the derivation
+/// that asks it, and nothing else about it, lives in its own module beside this one.
+pub mod managed_vpc_endpoint;
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
 /// (`smithy_query(query="service_info")` -> `awsService.arnNamespace`). Also its SigV4
@@ -65,10 +72,58 @@ pub const DEFAULT_PORT: i32 = 5439;
 /// [`DEFAULT_PORT`]: 5431-5455 and 8191-8215, both inclusive.
 pub const PORT_RANGES: [(i32, i32); 2] = [(5431, 5455), (8191, 8215)];
 
-/// The single Redshift Serverless version this emulator serves, reported as a workgroup's
-/// `workgroupVersion`. One emulator build is one release, so the value is a property of
-/// the build and not of any request.
-pub const WORKGROUP_VERSION: &str = "1.0";
+/// The single Redshift Serverless RELEASE this emulator serves, reported as a workgroup's
+/// `workgroupVersion` ("the Amazon Redshift Serverless version of your workgroup").
+///
+/// A release version is `<major>.<minor>.<build>`: the version line plus the BUILD segment of
+/// the release the workgroup is actually running, which is what a client parses to decide
+/// whether a workgroup runs a release carrying a feature. One emulator build is one release,
+/// so the whole value — the build segment included — is a property of the build and not of
+/// any request; the build segment is this emulator's own and names no particular AWS release.
+pub const WORKGROUP_VERSION: &str = "1.0.100100";
+
+/// The PATCH level of the release [`WORKGROUP_VERSION`] names, reported as a workgroup's
+/// `patchVersion` ("the patch version of your Amazon Redshift Serverless workgroup").
+///
+/// Release and patch are the pair a client gates on, so a workgroup reports both; numeric
+/// text, the form the service reports a patch level in, and a property of the build for the
+/// same reason the release is.
+pub const WORKGROUP_PATCH_VERSION: &str = "1";
+
+/// The track a workgroup is assigned to when the create names none.
+///
+/// `CreateWorkgroup`'s own `trackName` documentation states the rule: "An optional parameter
+/// for the name of the track for the workgroup. If you don't provide a track name, the
+/// workgroup is assigned to the current track." Amazon Redshift Serverless offers the release
+/// tracks `current` and `trailing`, and `current` is the name of the current one — so this is
+/// the track every workgroup created without one follows.
+pub const CURRENT_TRACK: &str = "current";
+
+/// The `PerformanceTargetStatus` values a workgroup's `pricePerformanceTarget` reports
+/// (`smithy_query(query="shape", shape="PerformanceTargetStatus")` -> ENABLED, DISABLED).
+///
+/// The feature's off-state is reported EXPLICITLY rather than by omitting the member, so a
+/// client reading the target can tell "the target is off" from "this API reports no target",
+/// and can round-trip the object back into `UpdateWorkgroup`. See
+/// [`reported_price_performance_target`].
+pub const PERFORMANCE_TARGET_DISABLED: &str = "DISABLED";
+/// See [`PERFORMANCE_TARGET_DISABLED`].
+pub const PERFORMANCE_TARGET_ENABLED: &str = "ENABLED";
+
+/// The price-performance target a workgroup reports, given the one its create `requested`.
+///
+/// `PerformanceTarget$status` is "whether the price performance target is enabled for the
+/// workgroup" and `CreateWorkgroup`'s `pricePerformanceTarget` is optional, so a workgroup
+/// created without one has the feature OFF — which is the modelled off value and no `level`,
+/// not an absent member. A requested target is reported as the request set it.
+pub fn reported_price_performance_target(requested: Option<PerformanceTarget>) -> PerformanceTarget {
+    requested.unwrap_or_else(|| PerformanceTarget {
+        status: Some(PERFORMANCE_TARGET_DISABLED.to_string()),
+        // "The target price performance level for the workgroup": a workgroup whose target is
+        // off is at no level.
+        level: None,
+    })
+}
 
 /// The page bound a list applies when the caller names none: `maxResults`'
 /// `@range(min: 1, max: 100)` on `ListNamespaces` / `ListWorkgroups` / `ListSnapshots` /
@@ -336,6 +391,49 @@ pub fn endpoint_address(workgroup_name: &str, region: &str) -> String {
         "{workgroup_name}.{}.{region}.{ARN_NAMESPACE}.amazonaws.com",
         ::engine::emulator_account_id()
     )
+}
+
+/// The whole endpoint a workgroup reports — `Workgroup$endpoint`, "the endpoint that is
+/// created from the workgroup" — which is DERIVED rather than supplied.
+///
+/// Three parts: the DNS address of the workgroup's own name ([`endpoint_address`]), the port
+/// the workgroup listens on, and "an array of `VpcEndpoint` objects" (`Endpoint$vpcEndpoints`)
+/// — the managed VPC endpoint the service created for the workgroup in the VPC its subnets
+/// belong to, which is asked for through [`managed_vpc_endpoint`]. The list is EMPTY for a
+/// workgroup no such endpoint stands behind, which is what a workgroup created with no subnet
+/// has.
+pub fn workgroup_endpoint(
+    workgroup_name: &str,
+    region: &str,
+    port: i32,
+    managed: Option<VpcEndpoint>,
+) -> Endpoint {
+    Endpoint {
+        address: Some(endpoint_address(workgroup_name, region)),
+        port: Some(port),
+        vpc_endpoints: Some(reported_vpc_endpoints(managed)),
+    }
+}
+
+/// "An array of `VpcEndpoint` objects" (`Endpoint$vpcEndpoints`) for the one managed endpoint
+/// a workgroup stands behind: the endpoint that was created for it, or no entry at all when
+/// none was. The one place this list is built, so a create and a later change of the subnets
+/// it is placed in report it identically.
+pub fn reported_vpc_endpoints(managed: Option<VpcEndpoint>) -> Vec<VpcEndpoint> {
+    managed.map(|endpoint| vec![endpoint]).unwrap_or_default()
+}
+
+/// The id of the managed VPC endpoint a stored workgroup holds, when one stands behind it.
+///
+/// The record holds what the create derived, so this is how a later write finds the endpoint
+/// to give back ([`managed_vpc_endpoint::remove`]) rather than re-deriving it.
+pub fn held_vpc_endpoint_id(workgroup: &Workgroup) -> Option<&str> {
+    workgroup
+        .endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.vpc_endpoints.as_ref())
+        .and_then(|endpoints| endpoints.first())
+        .and_then(|endpoint| endpoint.vpc_endpoint_id.as_deref())
 }
 
 /// A server-minted resource id (`namespaceId` / `workgroupId`): a v4 UUID, the form AWS

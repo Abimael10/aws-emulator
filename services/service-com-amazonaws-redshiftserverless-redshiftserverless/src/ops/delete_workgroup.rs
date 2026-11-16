@@ -5,6 +5,10 @@
 //! in `DELETING` status — so a following `GetWorkgroup` is a 404 and `ListWorkgroups` no
 //! longer carries it. An unknown name is a 404 `ResourceNotFoundException`.
 //!
+//! The managed VPC endpoint the workgroup was reached through goes with it: its endpoint
+//! network interfaces carried that workgroup's traffic, so they do not outlive it and the
+//! addresses they held go back to their subnets ([`crate::state::managed_vpc_endpoint`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -137,7 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteWorkgroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -146,9 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
 
-        let Some(mut record) = state.workgroups.remove(&input.workgroup_name) else {
+        let removed = {
+            let mut state = state.lock();
+            state.workgroups.remove(&input.workgroup_name)
+        };
+        let Some(mut record) = removed else {
             // The name resolves to nothing: the modelled `ResourceNotFoundException`,
             // answered with the status this service answers a resource-name refusal with.
             // See [`crate::state::workgroup_not_found`].
@@ -160,6 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             ));
         };
+
+        // The managed VPC endpoint and its interfaces carried this workgroup's traffic, so
+        // they do not outlive it: the endpoint is given back to the service that created it,
+        // with no store guard held. See [`crate::state::managed_vpc_endpoint`].
+        if let Some(vpc_endpoint_id) = crate::state::held_vpc_endpoint_id(&record.workgroup) {
+            let region = crate::state::request_region(ctx);
+            let vpc_endpoint_id = vpc_endpoint_id.to_string();
+            crate::state::managed_vpc_endpoint::remove(ctx, &region, &vpc_endpoint_id).await;
+        }
 
         record.workgroup.status = Some(crate::state::WORKGROUP_DELETING.to_string());
         Ok(DeleteWorkgroupOutput {

@@ -17,6 +17,18 @@
 //! ([`crate::state::MAX_WORKGROUPS`]); past it the create is refused rather than growing
 //! the store without limit.
 //!
+//! What the record carries beyond the request is DERIVED here, because the service owns those
+//! facts rather than the caller: the id and the ARN, the endpoint address and port, the
+//! release the workgroup runs and its patch level ([`crate::state::WORKGROUP_VERSION`],
+//! [`crate::state::WORKGROUP_PATCH_VERSION`]), the track it is assigned to when the request
+//! names none ([`crate::state::CURRENT_TRACK`]), the price-performance target's explicit
+//! off-state when the request asks for no target
+//! ([`crate::state::reported_price_performance_target`]), and the managed VPC endpoint the
+//! workgroup is reached through — one VPC endpoint with an endpoint network interface in each
+//! subnet the workgroup carries, created in the service that owns those resources
+//! ([`crate::state::managed_vpc_endpoint`]). Every one of them is stored, so each is reported
+//! by the create, by `GetWorkgroup` and by `ListWorkgroups` alike.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -225,31 +237,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.settle_due_transitions();
-        // The store grows one record per create, so the account's quota bounds it. Read
-        // before the `entry` below takes the borrow; it bounds only a NEW record.
-        let stored_workgroups = state.workgroups.len();
 
-        // A workgroup holds the compute for an existing namespace's database. A
-        // `namespaceName` that resolves to nothing is the modelled
-        // `ResourceNotFoundException` answered with the status this service answers any
-        // namespace-name refusal with; see [`crate::state::namespace_not_found`].
-        if !state.namespaces.contains_key(&input.namespace_name) {
-            return Err(crate::scaffolded::Scaffolded::restated(
-                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
-                CreateWorkgroupErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::namespace_not_found(&input.namespace_name),
-                        resource_name: Some(input.namespace_name.clone()),
-                    },
-                ),
-            ));
+        // A workgroup holds the compute for an existing namespace's database, the name is the
+        // workgroup's identity and the store grows one record per create, so the namespace,
+        // the name and the account's quota are all read FIRST — under the guard, and before
+        // the managed endpoint below is asked for, so a create that is going to be refused
+        // never stands an endpoint up.
+        let refusal = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+            admission(&state, &input.namespace_name, &input.workgroup_name)
+        };
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
 
         let region = crate::state::request_region(ctx);
         let workgroup_id = crate::state::new_resource_id();
         let port = input.port.unwrap_or(crate::state::DEFAULT_PORT);
+        let subnet_ids = input.subnet_ids.unwrap_or_default();
+        // The managed VPC endpoint the workgroup is reached through is a resource of the
+        // service that owns VPC endpoints and network interfaces, so it is created THERE and
+        // reported from what that service answered; see
+        // [`crate::state::managed_vpc_endpoint`]. Asked for with NO store guard held, so one
+        // create serialises nothing else, and before the insert, so what the create stores is
+        // what every later read reports.
+        let managed_endpoint =
+            crate::state::managed_vpc_endpoint::create(ctx, &region, &subnet_ids).await;
         let workgroup = Workgroup {
             workgroup_arn: Some(crate::state::workgroup_arn(&region, &workgroup_id)),
             workgroup_id: Some(workgroup_id),
@@ -266,23 +280,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enhanced_vpc_routing: Some(input.enhanced_vpc_routing.unwrap_or(false)),
             config_parameters: Some(input.config_parameters.unwrap_or_default()),
             security_group_ids: Some(input.security_group_ids.unwrap_or_default()),
-            subnet_ids: Some(input.subnet_ids.unwrap_or_default()),
-            // The endpoint is DERIVED from the workgroup's name and port, not supplied.
-            endpoint: Some(Endpoint {
-                address: Some(crate::state::endpoint_address(
-                    &input.workgroup_name,
-                    &region,
-                )),
-                port: Some(port),
-                vpc_endpoints: Some(Vec::new()),
-            }),
+            subnet_ids: Some(subnet_ids),
+            // The endpoint is DERIVED from the workgroup's name and port and from the managed
+            // VPC endpoint above, not supplied.
+            endpoint: Some(crate::state::workgroup_endpoint(
+                &input.workgroup_name,
+                &region,
+                port,
+                managed_endpoint,
+            )),
             creation_date: Some(crate::state::now_timestamp()),
+            // The release the workgroup runs and its patch level are the serving service's
+            // own facts, so both are reported for every workgroup.
             workgroup_version: Some(crate::state::WORKGROUP_VERSION.to_string()),
+            patch_version: Some(crate::state::WORKGROUP_PATCH_VERSION.to_string()),
             // `IpAddressType`'s pattern admits exactly `ipv4` and `dualstack`; a
             // workgroup created without the member is the plain IPv4 one.
             ip_address_type: Some(input.ip_address_type.unwrap_or_else(|| "ipv4".to_string())),
-            price_performance_target: input.price_performance_target,
-            track_name: input.track_name,
+            // The feature's off-state is REPORTED for a create that named no target, rather
+            // than left to the member's absence.
+            price_performance_target: Some(crate::state::reported_price_performance_target(
+                input.price_performance_target,
+            )),
+            // "If you don't provide a track name, the workgroup is assigned to the current
+            // track": a workgroup always follows one.
+            track_name: Some(
+                input
+                    .track_name
+                    .unwrap_or_else(|| crate::state::CURRENT_TRACK.to_string()),
+            ),
             extra_compute_for_automatic_optimization: Some(
                 input
                     .extra_compute_for_automatic_optimization
@@ -300,34 +326,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::WORKGROUP_CREATING,
             crate::state::WORKGROUP_AVAILABLE,
         );
+        // Kept beside the record so a refused insert can give the endpoint back: it was
+        // created for THIS workgroup, so it does not outlive a workgroup that never existed.
+        let endpoint_to_give_back = crate::state::held_vpc_endpoint_id(&record.workgroup)
+            .map(str::to_string);
 
-        // One lookup decides both the conflict and the insert: the name is the
-        // workgroup's identity, so an occupied slot IS the conflict. The answer comes out
-        // of the STORED record, so what the caller reads is what a later GetWorkgroup
-        // reads.
-        match state.workgroups.entry(input.workgroup_name) {
-            ::std::collections::btree_map::Entry::Occupied(occupied) => {
-                Err(CreateWorkgroupErrorModeled::ConflictException(ConflictException {
-                    message: format!("a workgroup named {} already exists", occupied.key()),
-                })
-                .into())
-            }
-            ::std::collections::btree_map::Entry::Vacant(slot) => {
-                if stored_workgroups >= crate::state::MAX_WORKGROUPS {
-                    return Err(CreateWorkgroupErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "this account has reached its quota of {} workgroups in this Region",
-                                crate::state::MAX_WORKGROUPS
-                            ),
-                        },
-                    )
-                    .into());
+        // The insert, under the guard again: the admission above was read before the endpoint
+        // was asked for, so the name and the quota are read once more here — an occupied slot
+        // IS the conflict. The answer comes out of the STORED record, so what the caller reads
+        // is what a later GetWorkgroup reads.
+        let inserted = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+            // Read before the `entry` below takes the borrow; it bounds only a NEW record.
+            let stored_workgroups = state.workgroups.len();
+            match state.workgroups.entry(input.workgroup_name) {
+                ::std::collections::btree_map::Entry::Occupied(occupied) => {
+                    Err(name_already_taken(occupied.key()))
                 }
-                Ok(CreateWorkgroupOutput {
-                    workgroup: Some(slot.insert(record).workgroup.clone()),
-                })
+                ::std::collections::btree_map::Entry::Vacant(slot) => {
+                    if stored_workgroups >= crate::state::MAX_WORKGROUPS {
+                        Err(quota_reached())
+                    } else {
+                        Ok(slot.insert(record).workgroup.clone())
+                    }
+                }
+            }
+        };
+
+        match inserted {
+            Ok(workgroup) => Ok(CreateWorkgroupOutput {
+                workgroup: Some(workgroup),
+            }),
+            Err(refusal) => {
+                if let Some(vpc_endpoint_id) = endpoint_to_give_back {
+                    crate::state::managed_vpc_endpoint::remove(ctx, &region, &vpc_endpoint_id)
+                        .await;
+                }
+                Err(refusal)
             }
         }
     }
+}
+
+/// Why this create cannot be served, read off the store before anything is written: a
+/// `namespaceName` that resolves to nothing, a `workgroupName` already taken, or an account
+/// already holding its quota of workgroups.
+///
+/// Read FIRST so the managed VPC endpoint of a workgroup that will not exist is never created;
+/// the name and the quota are read again when the record is inserted, which is what decides
+/// them.
+fn admission(
+    state: &crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState,
+    namespace_name: &str,
+    workgroup_name: &str,
+) -> Option<CreateWorkgroupError> {
+    if !state.namespaces.contains_key(namespace_name) {
+        // The namespace name resolves to nothing: the modelled `ResourceNotFoundException`,
+        // answered with the status this service answers any namespace-name refusal with; see
+        // [`crate::state::namespace_not_found`].
+        return Some(crate::scaffolded::Scaffolded::restated(
+            crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+            CreateWorkgroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::namespace_not_found(namespace_name),
+                resource_name: Some(namespace_name.to_string()),
+            }),
+        ));
+    }
+    if let Some((taken, _)) = state.workgroups.get_key_value(workgroup_name) {
+        return Some(name_already_taken(taken));
+    }
+    if state.workgroups.len() >= crate::state::MAX_WORKGROUPS {
+        return Some(quota_reached());
+    }
+    None
+}
+
+/// How this operation refuses a `workgroupName` another workgroup already holds: the modelled
+/// `ConflictException`, worded from the name the request asked for.
+fn name_already_taken(workgroup_name: &str) -> CreateWorkgroupError {
+    CreateWorkgroupErrorModeled::ConflictException(ConflictException {
+        message: format!("a workgroup named {workgroup_name} already exists"),
+    })
+    .into()
+}
+
+/// How this operation refuses a create that would take the account past its documented
+/// workgroup quota ([`crate::state::MAX_WORKGROUPS`]).
+fn quota_reached() -> CreateWorkgroupError {
+    CreateWorkgroupErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "this account has reached its quota of {} workgroups in this Region",
+            crate::state::MAX_WORKGROUPS
+        ),
+    })
+    .into()
 }

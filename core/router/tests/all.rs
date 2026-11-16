@@ -6,6 +6,10 @@
 // and nothing after the last pair.
 //
 // Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the one
+// place its name sorts to. Two branches landing at once then insert two lines in two places and
+// have no prose here to duplicate, re-word or mistype. That is what had gone wrong: successive
+// landings re-typed this block's paragraphs into the header and appended copies of them past
+// the list, until no suite of this target ran at all.
 // place its name sorts to. Two branches landing at once then insert two lines in two places
 // and have no prose to duplicate, re-word or mistype, which is what had gone wrong here: this
 // header and the tail of the list had each grown hundreds of re-typed copies of these

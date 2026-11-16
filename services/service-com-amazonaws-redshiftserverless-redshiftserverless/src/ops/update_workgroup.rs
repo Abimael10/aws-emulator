@@ -10,6 +10,12 @@
 //! values — and returns to `AVAILABLE` on its own a moment later; see
 //! [`crate::state::WorkgroupRecord::settle`].
 //!
+//! One member change is more than a value: the managed VPC endpoint a workgroup is reached
+//! through has an endpoint network interface per subnet the workgroup carries, so a request
+//! that places the workgroup in other subnets moves that endpoint too — the one it held is
+//! given back and a new one is created in the subnets named now
+//! ([`crate::state::managed_vpc_endpoint`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -191,7 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `port`'s valid ranges are documented on the member, not modelled as a
         // constraint, so the boundary validator cannot have refused a bad one.
         if let Some(port) = input.port {
@@ -215,72 +220,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.settle_due_transitions();
 
-        let Some(record) = state.workgroups.get_mut(&input.workgroup_name) else {
-            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
-            // answered with the status this service answers a resource-name refusal with.
-            // See [`crate::state::workgroup_not_found`].
-            return Err(crate::scaffolded::Scaffolded::restated(
-                crate::state::RESOURCE_NAME_REFUSAL_STATUS,
-                UpdateWorkgroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: crate::state::workgroup_not_found(&input.workgroup_name),
-                    resource_name: Some(input.workgroup_name.clone()),
-                }),
-            ));
+        // What the workgroup's managed VPC endpoint stands on TODAY, read under the guard and
+        // before any of it is changed: the subnets it is placed in and the endpoint created
+        // for them.
+        let placed_on = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+            let Some(record) = state.workgroups.get(&input.workgroup_name) else {
+                return Err(workgroup_name_not_found(&input.workgroup_name));
+            };
+            (
+                record.workgroup.subnet_ids.clone().unwrap_or_default(),
+                crate::state::held_vpc_endpoint_id(&record.workgroup).map(str::to_string),
+            )
+        };
+        let (placed_in_subnets, placed_endpoint_id) = placed_on;
+
+        let region = crate::state::request_region(ctx);
+        // The endpoint's interfaces are one per subnet the workgroup carries, so a request that
+        // moves the workgroup to other subnets moves the endpoint with it: the new placement is
+        // stood up, and the endpoint the workgroup held is given back either way, because its
+        // interfaces sit in subnets the workgroup has left. A placement no endpoint could be
+        // stood up in therefore leaves the workgroup reporting NO managed endpoint rather than
+        // one in subnets it no longer carries. A request naming no subnets, or the same set of
+        // them in any order, leaves the endpoint it has — it never stopped being reachable
+        // there. Both asks are made with NO store guard held; see
+        // [`crate::state::managed_vpc_endpoint`].
+        //
+        // `Some(None)` is "the placement moved and nothing stands behind it now", a different
+        // answer from the `None` that means "the placement did not move".
+        let moved_endpoint: Option<Option<VpcEndpoint>> = match input.subnet_ids.as_ref().filter(
+            |requested| {
+                crate::state::managed_vpc_endpoint::placement_moves(requested, &placed_in_subnets)
+            },
+        ) {
+            None => None,
+            Some(requested) => {
+                let created =
+                    crate::state::managed_vpc_endpoint::create(ctx, &region, requested).await;
+                if let Some(held) = placed_endpoint_id.as_deref() {
+                    crate::state::managed_vpc_endpoint::remove(ctx, &region, held).await;
+                }
+                Some(created)
+            }
+        };
+        // Kept so a workgroup that stops resolving between the two reads below does not leave
+        // an endpoint behind: it was created for THIS workgroup and serves no other.
+        let created_endpoint_id = moved_endpoint
+            .as_ref()
+            .and_then(|created| created.as_ref())
+            .and_then(|endpoint| endpoint.vpc_endpoint_id.clone());
+
+        let applied = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+            match state.workgroups.get_mut(&input.workgroup_name) {
+                None => None,
+                Some(record) => {
+                    // Every mutable member of `Workgroup` this operation models, applied only
+                    // when the request names it.
+                    if let Some(base_capacity) = input.base_capacity {
+                        record.workgroup.base_capacity = Some(base_capacity);
+                    }
+                    if let Some(max_capacity) = input.max_capacity {
+                        record.workgroup.max_capacity = Some(max_capacity);
+                    }
+                    if let Some(enhanced_vpc_routing) = input.enhanced_vpc_routing {
+                        record.workgroup.enhanced_vpc_routing = Some(enhanced_vpc_routing);
+                    }
+                    if let Some(publicly_accessible) = input.publicly_accessible {
+                        record.workgroup.publicly_accessible = Some(publicly_accessible);
+                    }
+                    if let Some(config_parameters) = input.config_parameters {
+                        record.workgroup.config_parameters = Some(config_parameters);
+                    }
+                    if let Some(security_group_ids) = input.security_group_ids {
+                        record.workgroup.security_group_ids = Some(security_group_ids);
+                    }
+                    if let Some(subnet_ids) = input.subnet_ids {
+                        record.workgroup.subnet_ids = Some(subnet_ids);
+                    }
+                    if let Some(ip_address_type) = input.ip_address_type {
+                        record.workgroup.ip_address_type = Some(ip_address_type);
+                    }
+                    if let Some(price_performance_target) = input.price_performance_target {
+                        record.workgroup.price_performance_target =
+                            Some(price_performance_target);
+                    }
+                    if let Some(track_name) = input.track_name {
+                        record.workgroup.track_name = Some(track_name);
+                    }
+                    if let Some(extra_compute) = input.extra_compute_for_automatic_optimization {
+                        record.workgroup.extra_compute_for_automatic_optimization =
+                            Some(extra_compute);
+                    }
+                    if let Some(port) = input.port {
+                        record.workgroup.port = Some(port);
+                        // The endpoint listens on the workgroup's port, so it moves with it.
+                        if let Some(endpoint) = record.workgroup.endpoint.as_mut() {
+                            endpoint.port = Some(port);
+                        }
+                    }
+                    // The endpoint the subnets named now stand behind, when they moved: the
+                    // address and the port the workgroup is reached at are unchanged, so only
+                    // the managed endpoint this workgroup reports is replaced — by the one
+                    // standing behind the new placement, or by none when nothing does.
+                    if let Some(managed) = moved_endpoint {
+                        if let Some(endpoint) = record.workgroup.endpoint.as_mut() {
+                            endpoint.vpc_endpoints =
+                                Some(crate::state::reported_vpc_endpoints(managed));
+                        }
+                    }
+
+                    record.begin_transition(
+                        crate::state::WORKGROUP_MODIFYING,
+                        crate::state::WORKGROUP_AVAILABLE,
+                    );
+                    Some(record.workgroup.clone())
+                }
+            }
         };
 
-        // Every mutable member of `Workgroup` this operation models, applied only when
-        // the request names it.
-        if let Some(base_capacity) = input.base_capacity {
-            record.workgroup.base_capacity = Some(base_capacity);
-        }
-        if let Some(max_capacity) = input.max_capacity {
-            record.workgroup.max_capacity = Some(max_capacity);
-        }
-        if let Some(enhanced_vpc_routing) = input.enhanced_vpc_routing {
-            record.workgroup.enhanced_vpc_routing = Some(enhanced_vpc_routing);
-        }
-        if let Some(publicly_accessible) = input.publicly_accessible {
-            record.workgroup.publicly_accessible = Some(publicly_accessible);
-        }
-        if let Some(config_parameters) = input.config_parameters {
-            record.workgroup.config_parameters = Some(config_parameters);
-        }
-        if let Some(security_group_ids) = input.security_group_ids {
-            record.workgroup.security_group_ids = Some(security_group_ids);
-        }
-        if let Some(subnet_ids) = input.subnet_ids {
-            record.workgroup.subnet_ids = Some(subnet_ids);
-        }
-        if let Some(ip_address_type) = input.ip_address_type {
-            record.workgroup.ip_address_type = Some(ip_address_type);
-        }
-        if let Some(price_performance_target) = input.price_performance_target {
-            record.workgroup.price_performance_target = Some(price_performance_target);
-        }
-        if let Some(track_name) = input.track_name {
-            record.workgroup.track_name = Some(track_name);
-        }
-        if let Some(extra_compute) = input.extra_compute_for_automatic_optimization {
-            record.workgroup.extra_compute_for_automatic_optimization = Some(extra_compute);
-        }
-        if let Some(port) = input.port {
-            record.workgroup.port = Some(port);
-            // The endpoint listens on the workgroup's port, so it moves with it.
-            if let Some(endpoint) = record.workgroup.endpoint.as_mut() {
-                endpoint.port = Some(port);
+        match applied {
+            Some(workgroup) => Ok(UpdateWorkgroupOutput { workgroup }),
+            None => {
+                if let Some(vpc_endpoint_id) = created_endpoint_id {
+                    crate::state::managed_vpc_endpoint::remove(ctx, &region, &vpc_endpoint_id)
+                        .await;
+                }
+                Err(workgroup_name_not_found(&input.workgroup_name))
             }
         }
-
-        record.begin_transition(
-            crate::state::WORKGROUP_MODIFYING,
-            crate::state::WORKGROUP_AVAILABLE,
-        );
-
-        Ok(UpdateWorkgroupOutput {
-            workgroup: record.workgroup.clone(),
-        })
     }
+}
+
+/// How this operation refuses a `workgroupName` that resolves to nothing: the modelled
+/// `ResourceNotFoundException`, answered with the status this service answers a resource-name
+/// refusal with. See [`crate::state::workgroup_not_found`].
+fn workgroup_name_not_found(workgroup_name: &str) -> UpdateWorkgroupError {
+    crate::scaffolded::Scaffolded::restated(
+        crate::state::RESOURCE_NAME_REFUSAL_STATUS,
+        UpdateWorkgroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::workgroup_not_found(workgroup_name),
+            resource_name: Some(workgroup_name.to_string()),
+        }),
+    )
 }

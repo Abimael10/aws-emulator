@@ -35,12 +35,26 @@ hex = { workspace = true }
 # the boundary, and the dependency points one way (the Data API crate does not
 # depend on this one).
 service-com-amazonaws-redshiftdata-redshiftdata = { workspace = true }
+# `service-common` carries the workspace's ONE reading of a caller-supplied Region
+# label, which the Amazon EC2 hop below names the peer service's endpoint with.
+service-common = { path = "../common" }
+# The Amazon EC2 client a workgroup's managed VPC endpoint is created, read back and
+# deleted through, over the emulator's in-process callback: `Endpoint$vpcEndpoints` is a
+# VPC endpoint with one network interface per subnet, and a VPC endpoint, a subnet and a
+# network interface are all EC2's resources (`state::managed_vpc_endpoint`).
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The workgroup-endpoint suite mounts Amazon EC2 beside Redshift Serverless on one engine,
+# because the VPC, the subnets and the endpoint network interfaces a workgroup's managed VPC
+# endpoint is made of are ITS resources: the suite builds the network through that service's
+# own API and reads the interfaces back from it. A workspace member this repository already
+# locks.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true
