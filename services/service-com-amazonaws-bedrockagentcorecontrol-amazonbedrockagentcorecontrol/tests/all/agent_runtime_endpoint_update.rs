@@ -581,7 +581,9 @@ async fn an_update_is_addressed_only_through_a_stored_runtime_and_version() {
             body: json!({}),
             code: "ResourceNotFoundException",
             status: 404,
-            message: format!("Agent with agentId: {ABSENT_RUNTIME_ID} not found"),
+            message: format!(
+                "Agent endpoint with name onlyHere not found for agent {ABSENT_RUNTIME_ID}"
+            ),
         },
         Refusal {
             case: "an endpoint name its runtime does not hold",
@@ -590,7 +592,7 @@ async fn an_update_is_addressed_only_through_a_stored_runtime_and_version() {
             body: json!({}),
             code: "ResourceNotFoundException",
             status: 404,
-            message: "Agent endpoint with name neverCreated not found.".to_string(),
+            message: format!("Agent endpoint with name neverCreated not found for agent {owner}"),
         },
         Refusal {
             case: "another runtime's endpoint name",
@@ -599,7 +601,7 @@ async fn an_update_is_addressed_only_through_a_stored_runtime_and_version() {
             body: json!({}),
             code: "ResourceNotFoundException",
             status: 404,
-            message: "Agent endpoint with name onlyHere not found.".to_string(),
+            message: format!("Agent endpoint with name onlyHere not found for agent {other}"),
         },
         Refusal {
             case: "the version just past the runtime's latest",

@@ -211,10 +211,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An endpoint is addressed only THROUGH its runtime, so the runtime that would
-        // hold it — and the version the endpoint would point at, which only that runtime
-        // publishes — are reported as the agent they are.
-        let not_found = || {
+        // This route addresses ONE endpoint, by both of the identifiers it is named by,
+        // so the lookup that fails is the endpoint's whichever half of the pair names
+        // nothing: a runtime this account does not hold and an endpoint name that
+        // runtime does not carry are the same endpoint-level not-found, naming the
+        // endpoint and the agent it was looked for on. A version the runtime never
+        // published is not that lookup — the endpoint resolves and it is the agent's
+        // version that does not — so it keeps the agent's own sentence.
+        let endpoint_not_found = || {
+            UpdateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::agent_runtime_endpoint_not_found(
+                    &input.endpoint_name,
+                    &input.agent_runtime_id,
+                ),
+            )
+        };
+        let version_not_found = || {
             UpdateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::agent_not_found_for_endpoint(&input.agent_runtime_id),
             )
@@ -222,12 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let runtime = store
             .agent_runtimes
             .get(&input.agent_runtime_id)
-            .ok_or_else(not_found)?;
-        let endpoint = runtime.endpoints.get(&input.endpoint_name).ok_or_else(|| {
-            UpdateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::agent_runtime_endpoint_not_found(&input.endpoint_name),
-            )
-        })?;
+            .ok_or_else(endpoint_not_found)?;
+        let endpoint = runtime
+            .endpoints
+            .get(&input.endpoint_name)
+            .ok_or_else(endpoint_not_found)?;
 
         // One endpoint serves ONE version at a time, so a change is taken only while the
         // endpoint is settled: a create or an earlier shift the clock still owes a
@@ -249,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => {
                 runtime
                     .version_for(Some(requested))
-                    .ok_or_else(not_found)?
+                    .ok_or_else(version_not_found)?
                     .version
             }
             None => endpoint.target_version,
@@ -272,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .agent_runtimes
             .get_mut(&input.agent_runtime_id)
             .and_then(|runtime| runtime.endpoints.get_mut(&input.endpoint_name))
-            .ok_or_else(not_found)?;
+            .ok_or_else(endpoint_not_found)?;
         endpoint.target_version = target_version;
         endpoint.live_version = Some(live_version);
         if let Some(description) = input.description {

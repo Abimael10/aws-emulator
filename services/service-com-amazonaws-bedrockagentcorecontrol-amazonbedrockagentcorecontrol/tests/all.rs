@@ -15,6 +15,8 @@
 mod agent_runtime_endpoint_lifecycle;
 #[path = "all/agent_runtime_endpoint_listing.rs"]
 mod agent_runtime_endpoint_listing;
+#[path = "all/agent_runtime_endpoint_not_found_wording.rs"]
+mod agent_runtime_endpoint_not_found_wording;
 #[path = "all/agent_runtime_endpoint_update.rs"]
 mod agent_runtime_endpoint_update;
 #[path = "all/agent_runtime_lifecycle.rs"]

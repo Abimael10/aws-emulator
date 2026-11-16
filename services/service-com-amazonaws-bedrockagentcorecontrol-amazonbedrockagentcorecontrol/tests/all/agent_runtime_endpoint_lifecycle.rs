@@ -587,7 +587,7 @@ async fn an_endpoint_is_addressed_only_through_its_runtime() {
             body: None,
             status: 404,
             code: "ResourceNotFoundException",
-            message: "Agent endpoint with name notThere not found.".to_string(),
+            message: format!("Agent endpoint with name notThere not found for agent {owner}"),
         },
         Refusal {
             case: "reading another runtime's endpoint",
@@ -596,7 +596,7 @@ async fn an_endpoint_is_addressed_only_through_its_runtime() {
             body: None,
             status: 404,
             code: "ResourceNotFoundException",
-            message: "Agent endpoint with name onlyHere not found.".to_string(),
+            message: format!("Agent endpoint with name onlyHere not found for agent {other}"),
         },
         Refusal {
             case: "reading an endpoint of a runtime nothing created",
@@ -605,7 +605,9 @@ async fn an_endpoint_is_addressed_only_through_its_runtime() {
             body: None,
             status: 404,
             code: "ResourceNotFoundException",
-            message: format!("Agent with agentId: {ABSENT_RUNTIME_ID} not found"),
+            message: format!(
+                "Agent endpoint with name onlyHere not found for agent {ABSENT_RUNTIME_ID}"
+            ),
         },
     ];
 

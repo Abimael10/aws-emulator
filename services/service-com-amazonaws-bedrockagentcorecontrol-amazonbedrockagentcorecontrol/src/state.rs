@@ -728,31 +728,48 @@ pub const MAX_ENDPOINTS_PER_AGENT_RUNTIME: usize = 1_000;
 pub const AGENT_RUNTIME_ENDPOINT_SETTLE_DELAY: Duration = Duration::from_secs(3);
 
 /// The modelled not-found error for an agent runtime — or for a VERSION of one —
-/// that an ENDPOINT operation could not resolve: the id the lookup ran for
-/// ("Agent with agentId: <id> not found").
+/// that an operation ASKING FOR AN ENDPOINT ON IT could not resolve: the id the
+/// lookup ran for ("Agent with agentId: <id> not found").
 ///
-/// The endpoint family words a runtime it cannot resolve in this shorter
-/// sentence than the runtime family's own [`agent_runtime_not_found`], and
-/// reports the agent rather than the version even when it is a version that is
-/// missing: an endpoint names a version only to pin one, so there is one
-/// sentence for "no such agent to put an endpoint on".
+/// This is the sentence for a request that addresses the RUNTIME and names the
+/// endpoint in its body — a create — so what it could not find is the agent to
+/// put an endpoint on, in this shorter sentence than the runtime family's own
+/// [`agent_runtime_not_found`]. It reports the agent rather than the version even
+/// when it is a version that is missing: an endpoint names a version only to pin
+/// one, so there is one sentence for "no such agent to put an endpoint on".
+///
+/// An operation whose route addresses ONE endpoint instead reports that
+/// endpoint's own sentence, which [`agent_runtime_endpoint_not_found`] words,
+/// whichever of the two identifiers failed to resolve.
 pub fn agent_not_found_for_endpoint(agent_runtime_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Agent with agentId: {agent_runtime_id} not found")),
     }
 }
 
-/// The modelled not-found error for an endpoint the named agent runtime does
-/// not hold.
+/// The modelled not-found error for an agent runtime endpoint the request
+/// addressed.
 ///
-/// The runtime's own absence is reported by [`agent_runtime_not_found`]; this is
-/// for a runtime that IS held and an endpoint name it does not carry, so the
-/// sentence names the endpoint rather than the agent. Shared by the handlers
-/// rather than written per operation, so one endpoint cannot be reported missing
-/// in two different sentences.
-pub fn agent_runtime_endpoint_not_found(endpoint_name: &str) -> ResourceNotFoundException {
+/// An operation whose route addresses ONE endpoint carries both identifiers the
+/// endpoint is named by — `agentRuntimeId` and `endpointName`, both `@required`
+/// `@httpLabel` — so what it could not find is that endpoint, and the sentence is
+/// at endpoint granularity: the endpoint name and the agent it was looked for on,
+/// both taken from the request path ("Agent endpoint with name <endpointName> not
+/// found for agent <agentRuntimeId>"). The owning runtime missing is the same
+/// answer: the lookup that failed is still the endpoint's, so an operation
+/// addressing an endpoint never reports the agent's own sentence
+/// ([`agent_not_found_for_endpoint`], which belongs to the operations that
+/// address a runtime). Shared by the handlers rather than written per operation,
+/// so one endpoint cannot be reported missing in two different sentences by two
+/// operations, and the asking operation's verb never appears.
+pub fn agent_runtime_endpoint_not_found(
+    endpoint_name: &str,
+    agent_runtime_id: &str,
+) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Agent endpoint with name {endpoint_name} not found.")),
+        message: Some(format!(
+            "Agent endpoint with name {endpoint_name} not found for agent {agent_runtime_id}"
+        )),
     }
 }
 

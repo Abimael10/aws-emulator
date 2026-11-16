@@ -8,9 +8,10 @@
 //! clock resolves and the instants it was created and last updated. A reporting
 //! operation, so it writes nothing.
 //!
-//! The endpoint is addressed only THROUGH its runtime: a runtime this account does not
-//! hold is the modelled 404 for the agent, and an endpoint that runtime does not hold
-//! is the modelled 404 for the endpoint.
+//! The endpoint is addressed only THROUGH its runtime, by both identifiers it is named
+//! by, so a read that resolves neither — a runtime this account does not hold, or an
+//! endpoint that runtime does not hold — is the one modelled 404 for that endpoint,
+//! naming the endpoint and the agent it was looked for on.
 //!
 //! ## Shape of an operation
 //!
@@ -187,19 +188,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
-        // An endpoint is addressed only THROUGH its runtime, so an unknown runtime is
-        // reported as the agent it is, and an endpoint the runtime does not hold as
-        // the endpoint.
-        let runtime = store.agent_runtimes.get(&input.agent_runtime_id).ok_or_else(|| {
+        // This route addresses ONE endpoint, by both of the identifiers it is named by,
+        // so the lookup that fails is the endpoint's whichever half of the pair names
+        // nothing: a runtime this account does not hold and an endpoint name that
+        // runtime does not carry are the same endpoint-level not-found, naming the
+        // endpoint and the agent it was looked for on.
+        let not_found = || {
             GetAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::agent_not_found_for_endpoint(&input.agent_runtime_id),
+                crate::state::agent_runtime_endpoint_not_found(
+                    &input.endpoint_name,
+                    &input.agent_runtime_id,
+                ),
             )
-        })?;
-        let endpoint = runtime.endpoints.get(&input.endpoint_name).ok_or_else(|| {
-            GetAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::agent_runtime_endpoint_not_found(&input.endpoint_name),
-            )
-        })?;
+        };
+        let runtime = store
+            .agent_runtimes
+            .get(&input.agent_runtime_id)
+            .ok_or_else(not_found)?;
+        let endpoint = runtime
+            .endpoints
+            .get(&input.endpoint_name)
+            .ok_or_else(not_found)?;
 
         Ok(GetAgentRuntimeEndpointOutput {
             // The version the endpoint is SERVING: the one it pins once the
