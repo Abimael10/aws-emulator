@@ -479,6 +479,56 @@ struct Recorded {
     /// WAF's own reporting, and a logging configuration is enabled on the web ACL
     /// rather than per rule.
     non_terminating: Vec<(String, String)>,
+    /// One entry per rule GROUP the web ACL RAN the request against, in the order the
+    /// groups ran ([`GroupActivity`]). Kept for the same reason as
+    /// [`Self::non_terminating`]: it is part of the log record of the request rather
+    /// than of WAF's own per-dimension reporting.
+    rule_groups: Vec<GroupActivity>,
+}
+
+/// What ONE rule group the web ACL ran did to the request.
+///
+/// A rule group is a dimension of its own in a record: the rule that decided inside it
+/// and the rules of it that only counted the request are named by their GROUP-LOCAL
+/// names, under the group that ran them, because that is the name the group's own
+/// `RuleSummary` gives them — the web ACL rule that runs the group is what the record
+/// names as the rule that terminated the evaluation.
+///
+/// Every group the request was EVALUATED against has one, whether or not any of its rules
+/// matched: the group ran, so what it made of the request — possibly nothing — is part of
+/// the record. A group the request never reached has none, which is why a group whose
+/// `ScopeDownStatement` the request does not satisfy produces no entry.
+#[derive(Debug, Clone, Default)]
+pub struct GroupActivity {
+    /// How a record names the group ([`group_log_id`]).
+    pub id: String,
+    /// The group's rule that ended the evaluation, by its group-local name, and the
+    /// `ActionValue` it applied; `None` for a group that terminated nothing.
+    pub terminating_rule: Option<(String, String)>,
+    /// The group's rules that matched without ending the evaluation, each by its
+    /// group-local name and under the `ActionValue` it applied, in the order they ran.
+    pub non_terminating: Vec<(String, String)>,
+    /// The group's rules the web ACL took out of force and left counting the request
+    /// (`ExcludedRule`: "the rules in the referenced rule group whose actions are set to
+    /// Count"), by their group-local names, in the order they ran.
+    pub excluded: Vec<String>,
+}
+
+impl GroupActivity {
+    /// Note that the group's rule `rule_name` matched without ending the evaluation,
+    /// under the `ActionValue` `counted_as`.
+    ///
+    /// A rule the web ACL EXCLUDED is reported as an exclusion rather than as a match of
+    /// its own: the action in force for it is not the rule's but the web ACL's
+    /// instruction to count it, which is what [`EXCLUDED_AS_COUNT_ACTION_VALUE`] says.
+    fn counted(&mut self, rule_name: &str, counted_as: &str) {
+        if counted_as == EXCLUDED_AS_COUNT_ACTION_VALUE {
+            self.excluded.push(rule_name.to_string());
+            return;
+        }
+        self.non_terminating
+            .push((rule_name.to_string(), counted_as.to_string()));
+    }
 }
 
 /// The instants one rate-based aggregation instance has been seen at.
@@ -530,11 +580,26 @@ const RULE_NAME_QUALIFIER_SEPARATOR: &str = "#";
 /// read by a client that splits it, so a separator with nothing in front of it would
 /// name a group that does not exist.
 fn group_rule_name(group: &[&str], rule_name: &str) -> String {
-    group
-        .iter()
-        .copied()
+    qualified(group.iter().copied().chain(::std::iter::once(rule_name)))
+}
+
+/// How a log record NAMES one rule group the web ACL ran, from the segments that name
+/// that group.
+///
+/// A MANAGED group is named by its vendor and its own name, joined as the names of its
+/// rules are qualified ([`group_rule_name`]) — the same qualification without a rule's own
+/// segment — because that is all a web ACL holds of a group it does not own. A
+/// customer-owned group is named by the ARN its `RuleGroupReferenceStatement` names it by,
+/// which is the group's own identity, so that ARN is passed in rather than composed here.
+fn group_log_id(group: &[&str]) -> String {
+    qualified(group.iter().copied())
+}
+
+/// The ONE qualification both names above are composed by: the segments that are named,
+/// joined by [`RULE_NAME_QUALIFIER_SEPARATOR`].
+fn qualified<'a>(segments: impl Iterator<Item = &'a str>) -> String {
+    segments
         .filter(|segment| !segment.is_empty())
-        .chain(::std::iter::once(rule_name))
         .collect::<Vec<&str>>()
         .join(RULE_NAME_QUALIFIER_SEPARATOR)
 }
@@ -713,6 +778,7 @@ fn decided<Eng: Send + Sync + 'static>(
         request,
         &decision,
         &recorded.non_terminating,
+        &recorded.rule_groups,
         now,
     );
     Some(decision)
@@ -1207,6 +1273,7 @@ impl Evaluation<'_> {
                 .unwrap_or_default();
             return self.run_referenced_group(
                 &rule.name,
+                &reference.arn,
                 &group_name,
                 &group,
                 reference.excluded_rules.as_deref(),
@@ -1278,6 +1345,10 @@ impl Evaluation<'_> {
             }
         }
         let counted_group = override_action.is_some_and(|action| action.count.is_some());
+        let mut activity = GroupActivity {
+            id: group_log_id(group),
+            ..GroupActivity::default()
+        };
         for group_rule in group_rules {
             if !group_rule.inspection.matches(cx) {
                 continue;
@@ -1301,12 +1372,23 @@ impl Evaluation<'_> {
                     overridden_action: decided.overridden_action.clone(),
                 },
             ) {
+                activity.terminating_rule = Some((
+                    group_rule.name.clone(),
+                    decided
+                        .action
+                        .as_ref()
+                        .and_then(action_value)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+                recorded.rule_groups.push(activity);
                 return outcome;
             }
             // The group's rule matched and did not terminate, so it COUNTED this
             // request: it belongs to the dimension of the web ACL rule that runs the
             // group, named by the group rule that counted it.
             if let Some(counted_as) = decided.counted_as {
+                activity.counted(&group_rule.name, counted_as);
                 recorded
                     .non_terminating
                     .push((named.clone(), counted_as.to_string()));
@@ -1321,6 +1403,8 @@ impl Evaluation<'_> {
                 );
             }
         }
+        // The group RAN, so the record names it whatever its rules made of the request.
+        recorded.rule_groups.push(activity);
         RuleOutcome::Continue
     }
 
@@ -1329,6 +1413,7 @@ impl Evaluation<'_> {
     fn run_referenced_group(
         &self,
         rule_name: &str,
+        group_arn: &str,
         group_name: &str,
         group_rules: &[Rule],
         excluded: Option<&[ExcludedRule]>,
@@ -1341,6 +1426,10 @@ impl Evaluation<'_> {
         visibility: &VisibilityConfig,
     ) -> RuleOutcome {
         let counted_group = override_action.is_some_and(|action| action.count.is_some());
+        let mut activity = GroupActivity {
+            id: group_arn.to_string(),
+            ..GroupActivity::default()
+        };
         for group_rule in group_rules {
             let matched = if let Some(rate) = group_rule.statement.rate_based_statement.as_deref() {
                 self.rate_based_matches(
@@ -1380,12 +1469,23 @@ impl Evaluation<'_> {
                     overridden_action: decided.overridden_action.clone(),
                 },
             ) {
+                activity.terminating_rule = Some((
+                    group_rule.name.clone(),
+                    decided
+                        .action
+                        .as_ref()
+                        .and_then(action_value)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+                recorded.rule_groups.push(activity);
                 return outcome;
             }
             // As in [`Self::run_group`]: a group rule that matched without
             // terminating counted the request, under the dimension of the web ACL
             // rule that runs the group.
             if let Some(counted_as) = decided.counted_as {
+                activity.counted(&group_rule.name, counted_as);
                 recorded
                     .non_terminating
                     .push((named.clone(), counted_as.to_string()));
@@ -1400,6 +1500,8 @@ impl Evaluation<'_> {
                 );
             }
         }
+        // As in [`Self::run_group`]: the group ran, so the record names it.
+        recorded.rule_groups.push(activity);
         RuleOutcome::Continue
     }
 

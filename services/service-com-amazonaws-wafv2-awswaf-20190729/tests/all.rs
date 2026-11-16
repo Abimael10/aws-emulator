@@ -61,6 +61,8 @@ mod ip_set_mutations;
 mod list_resources_for_web_acl;
 #[path = "all/list_rule_groups.rs"]
 mod list_rule_groups;
+#[path = "all/logged_rule_group_activity.rs"]
+mod logged_rule_group_activity;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
 #[path = "all/logging_destination_delivery.rs"]

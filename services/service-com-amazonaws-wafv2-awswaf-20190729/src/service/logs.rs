@@ -49,7 +49,7 @@
 mod delivered_objects;
 mod delivered_streams;
 
-use super::edge::{EdgeDecision, InspectedRequest};
+use super::edge::{EdgeDecision, GroupActivity, InspectedRequest};
 use crate::ops::types::{FieldToMatch, LoggingConfiguration, LoggingFilter, Rule};
 use crate::state::WebAclEntry;
 
@@ -82,6 +82,16 @@ const RULE_GROUP_RULE_TYPE: &str = "GROUP";
 /// The `terminatingRuleType` of a rule that runs a managed rule group
 /// (`ManagedRuleGroupStatement`).
 const MANAGED_RULE_GROUP_RULE_TYPE: &str = "MANAGED_RULE_GROUP";
+
+/// What a `ruleGroupList` entry reports an EXCLUDED rule of the group under: the web ACL
+/// put counting in the place of the rule's own action (`ExcludedRule`: "the rules in the
+/// referenced rule group whose actions are set to Count"), which is the one kind of
+/// exclusion a rule group reference can state.
+///
+/// It is an `ExclusionType` rather than an `ActionValue`, so it is not the sibling value a
+/// SAMPLE of such a rule reports (`super::edge`'s `EXCLUDED_AS_COUNT_ACTION_VALUE`), even
+/// though both spell the same exclusion.
+const EXCLUDED_AS_COUNT_EXCLUSION: &str = "EXCLUDED_AS_COUNT";
 
 /// The `FilterBehavior` that keeps a record (`smithy_query(query="shape",
 /// shape="FilterBehavior")`: `KEEP` or `DROP`).
@@ -154,7 +164,9 @@ pub struct LoggedRecord {
 /// the association was made by, which says what kind of resource took the request; a
 /// CLOUDFRONT-scoped web ACL is reached through no association and so names none.
 /// `non_terminating` is every rule that matched the request without terminating the
-/// evaluation, and the action it applied, in the order they ran.
+/// evaluation, and the action it applied, in the order they ran; `rule_groups` is every
+/// rule GROUP the web ACL ran the request against, in the order the groups ran.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn logged(
     entry: &WebAclEntry,
     configuration: Option<&LoggingConfiguration>,
@@ -162,6 +174,7 @@ pub(super) fn logged(
     request: &InspectedRequest,
     decision: &EdgeDecision,
     non_terminating: &[(String, String)],
+    rule_groups: &[GroupActivity],
     at_millis: i64,
 ) -> Option<LoggedRecord> {
     let configuration = configuration?;
@@ -190,6 +203,7 @@ pub(super) fn logged(
             request,
             decision,
             non_terminating,
+            rule_groups,
             at_millis,
         ),
     })
@@ -441,7 +455,10 @@ fn kept(filter: Option<&LoggingFilter>, action: &str, labels: &[String]) -> bool
 /// `non_terminating` is every rule that matched without ending the evaluation, which WAF
 /// reports under `nonTerminatingMatchingRules`: the member is always present, empty for a
 /// request no such rule matched, because "no rule counted this request" is something the
-/// evaluation knows rather than something it has no value for.
+/// evaluation knows rather than something it has no value for. `rule_groups` is every
+/// rule group the web ACL ran the request against, reported under `ruleGroupList` on the
+/// same footing ([`rule_group_entry`]).
+#[allow(clippy::too_many_arguments)]
 fn record(
     entry: &WebAclEntry,
     configuration: &LoggingConfiguration,
@@ -449,6 +466,7 @@ fn record(
     request: &InspectedRequest,
     decision: &EdgeDecision,
     non_terminating: &[(String, String)],
+    rule_groups: &[GroupActivity],
     at_millis: i64,
 ) -> String {
     let redacted = configuration.redacted_fields.as_deref().unwrap_or_default();
@@ -468,6 +486,10 @@ fn record(
                 "ruleId": rule_id,
                 "action": action,
             }))
+            .collect::<Vec<::serde_json::Value>>(),
+        "ruleGroupList": rule_groups
+            .iter()
+            .map(rule_group_entry)
             .collect::<Vec<::serde_json::Value>>(),
         "httpSourceName": http_source_name(entry, protected_resource),
         "httpSourceId": http_source_id(protected_resource),
@@ -493,6 +515,51 @@ fn record(
         document["responseCodeSent"] = ::serde_json::json!(custom.status);
     }
     document.to_string()
+}
+
+/// One `ruleGroupList` entry: what ONE rule group the web ACL ran did to the request.
+///
+/// A rule group is a dimension of its own in a record. The web ACL rule that RUNS the
+/// group is what the record names as the rule that terminated the evaluation (and as its
+/// `GROUP`/`MANAGED_RULE_GROUP` type), so the rule that actually decided inside the group
+/// is reported here, under the group that holds it and by the group-local name that
+/// group's own `RuleSummary` gives it — otherwise a reader of the record cannot tell
+/// WHICH of a group's rules refused the request. Every group the request was evaluated
+/// against has an entry, because the group ran.
+///
+/// Each member says what the group did, and the two that say "nothing of this kind
+/// happened" carry the value WAF writes them as: `terminatingRule` is null for a group
+/// that ended no evaluation, `nonTerminatingMatchingRules` is the possibly empty list of
+/// the group's rules that only counted the request, and `excludedRules` is null unless
+/// the web ACL took one of the group's rules out of force and left it counting
+/// ([`EXCLUDED_AS_COUNT_EXCLUSION`]).
+fn rule_group_entry(activity: &GroupActivity) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "ruleGroupId": activity.id,
+        "terminatingRule": activity
+            .terminating_rule
+            .as_ref()
+            .map(|(rule_id, action)| ::serde_json::json!({
+                "ruleId": rule_id,
+                "action": action,
+            })),
+        "nonTerminatingMatchingRules": activity
+            .non_terminating
+            .iter()
+            .map(|(rule_id, action)| ::serde_json::json!({
+                "ruleId": rule_id,
+                "action": action,
+            }))
+            .collect::<Vec<::serde_json::Value>>(),
+        "excludedRules": (!activity.excluded.is_empty()).then(|| activity
+            .excluded
+            .iter()
+            .map(|rule_id| ::serde_json::json!({
+                "exclusionType": EXCLUDED_AS_COUNT_EXCLUSION,
+                "ruleId": rule_id,
+            }))
+            .collect::<Vec<::serde_json::Value>>()),
+    })
 }
 
 /// The `httpRequest` of a record: the request as it arrived, with every component the
@@ -595,16 +662,55 @@ fn http_source_name(entry: &WebAclEntry, protected_resource: Option<&str>) -> &'
         .unwrap_or(UNKNOWN_SOURCE)
 }
 
-/// The `httpSourceId` of a record: WHICH resource of that kind the request arrived at,
-/// as the association's own ARN names it (its resource field).
+/// The `httpSourceId` of a record: WHICH resource the request arrived at, as the service
+/// that took it identifies that resource.
+///
+/// A resource is identified by the ACCOUNT that holds it and its own id within its
+/// service, joined by [`SOURCE_ID_SEPARATOR`] — for an Application Load Balancer, the
+/// account and `app/<name>/<id>`, which is the load balancer id its ARN states after the
+/// resource type. Both halves are read off the ARN the association was made by
+/// ([`resource_identity`]), because that ARN is what names the resource the web ACL was
+/// put in front of. An ARN that names no account identifies the resource by its own id
+/// alone: an API Gateway stage's ARN carries none, and the path it carries instead is
+/// what names the stage.
 fn http_source_id(protected_resource: Option<&str>) -> String {
-    protected_resource
-        .and_then(|arn| {
-            let mut fields = arn.splitn(6, ':');
-            fields.nth(5).filter(|resource| !resource.is_empty())
-        })
-        .unwrap_or(UNKNOWN_SOURCE)
-        .to_string()
+    let Some(arn) = protected_resource else {
+        return UNKNOWN_SOURCE.to_string();
+    };
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let Some(resource) = fields
+        .get(5)
+        .copied()
+        .filter(|resource| !resource.is_empty())
+    else {
+        return UNKNOWN_SOURCE.to_string();
+    };
+    let identity = resource_identity(resource);
+    match fields
+        .get(ARN_ACCOUNT_FIELD)
+        .copied()
+        .filter(|account| !account.is_empty())
+    {
+        Some(account) => format!("{account}{SOURCE_ID_SEPARATOR}{identity}"),
+        None => identity.to_string(),
+    }
+}
+
+/// What separates the account from the resource's own id in an `httpSourceId`.
+const SOURCE_ID_SEPARATOR: char = '-';
+
+/// The resource's own id within its service, out of the resource field of its ARN: what
+/// the field states after the resource TYPE that field leads with
+/// (`loadbalancer/app/<name>/<id>` is the type `loadbalancer` and the load balancer id
+/// `app/<name>/<id>`).
+///
+/// A field that leads with no type — one written as a PATH, as an API Gateway stage's ARN
+/// writes it — is the resource's id as it stands.
+fn resource_identity(resource: &str) -> &str {
+    match resource.split_once('/') {
+        Some((kind, rest)) if !kind.is_empty() && !rest.is_empty() => rest,
+        _ => resource,
+    }
 }
 
 #[cfg(test)]
@@ -1096,6 +1202,66 @@ mod tests {
             assert_eq!(
                 got, expected,
                 "case {case:?}: expected the source {expected:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_source_id_of_a_record_names_the_account_and_the_resource_s_own_id() {
+        // One row per ARN form `AssociateWebACLRequest$ResourceArn` publishes: each
+        // account-bearing one is identified by its account and the id its ARN states
+        // after the resource type, the one that carries no account by that id alone, and
+        // a web ACL no association names by nothing at all. (case, the ARN, the
+        // `httpSourceId`)
+        let rows: [(&str, Option<&str>, &str); 8] = [
+            (
+                "an Application Load Balancer",
+                Some(
+                    "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/web/50dc",
+                ),
+                "000000000000-app/web/50dc",
+            ),
+            (
+                "an Amazon Cognito user pool",
+                Some("arn:aws:cognito-idp:us-west-2:000000000000:userpool/us-west-2_abc"),
+                "000000000000-us-west-2_abc",
+            ),
+            (
+                "an AppSync GraphQL API",
+                Some("arn:aws:appsync:us-west-2:000000000000:apis/abc123"),
+                "000000000000-abc123",
+            ),
+            (
+                "an App Runner service",
+                Some("arn:aws:apprunner:us-west-2:000000000000:service/orders/9f1"),
+                "000000000000-orders/9f1",
+            ),
+            (
+                "a Verified Access instance",
+                Some("arn:aws:ec2:us-west-2:000000000000:verified-access-instance/vai-1"),
+                "000000000000-vai-1",
+            ),
+            (
+                "an Amplify application",
+                Some("arn:aws:amplify:us-west-2:000000000000:apps/d2abc"),
+                "000000000000-d2abc",
+            ),
+            (
+                "an API Gateway REST API stage, whose ARN names no account",
+                Some("arn:aws:apigateway:us-west-2::/restapis/a1b2c3d4e5/stages/prod"),
+                "/restapis/a1b2c3d4e5/stages/prod",
+            ),
+            (
+                "a web ACL no association put in front of a resource",
+                None,
+                UNKNOWN_SOURCE,
+            ),
+        ];
+        for (case, resource, expected) in rows {
+            let got = http_source_id(resource);
+            assert_eq!(
+                got, expected,
+                "case {case:?}: expected the source id {expected:?}, got {got:?}"
             );
         }
     }
