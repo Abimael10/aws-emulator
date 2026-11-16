@@ -294,28 +294,37 @@ pub struct ImportedPath {
     pub methods: Vec<MethodEntry>,
 }
 
-/// The refusal for a document whose VERSION is known but which cannot be read as that
-/// format.
+/// The refusal for a document the reader could not read at all.
 ///
-/// Which format a definition is written in is settled first
-/// ([`UNDETERMINED_VERSION`]); only then is the document read as that format, and this is
-/// the refusal for one that cannot be. API Gateway answers it with ONE sentence that names
-/// no detail of what is wrong with the document. The emulator's own resource guards keep
-/// their own wording instead, because they are this emulator's bounds rather than anything
-/// the service publishes, and a caller has to be able to tell the two apart.
+/// API Gateway has TWO sentences for a body that is not an API definition, and which one a
+/// caller gets says WHERE the reading stopped. This is the one for a body no reader got
+/// through: bytes that are not text, a document neither the JSON nor the YAML reader could
+/// parse (a truncated one, an unterminated collection or scalar, text that is no document),
+/// and a document that parsed and declared its version but cannot be read as that format.
+/// In each of those the reader has nothing to say about the document beyond "this is not
+/// one", which is what this one sentence states — it names no member and no position. The
+/// other sentence is for a document that DID parse and simply declares no version
+/// ([`UNDETERMINED_VERSION`]).
+///
+/// The emulator's own resource guards keep their own wording instead, because they are this
+/// emulator's bounds rather than anything the service publishes, and a caller has to be able
+/// to tell the two apart.
 pub const INVALID_DEFINITION: &str = "Invalid OAS input";
 
-/// The refusal for a body whose OAS/Swagger version this service could not determine.
+/// The refusal for a document that PARSED and declares no OAS/Swagger version.
 ///
 /// Every OpenAPI/Swagger document states its version in one of two root members —
 /// `openapi` from 3.0 on, `swagger` before it — and that is the first thing an import
-/// reads: which of the two formats the document is written in decides how the rest of it
-/// is read. A body that declares neither says nothing a reader could go on, and so does a
-/// body no reader got far enough into to find one at all — an unparsable document, or
-/// bytes that are not text — so both are refused with this one fixed sentence, which names
-/// no member. A document that DOES declare its version and still cannot be read is the
-/// next refusal along ([`INVALID_DEFINITION`]): a caller has to be able to tell "I could
-/// not tell what this is" from "this is not a valid one of those".
+/// reads once the document is in hand: which of the two formats the document is written in
+/// decides how the rest of it is read. A document that parsed and declares neither says
+/// nothing a reader could go on, and this one fixed sentence, which names no member, is
+/// what API Gateway states for it.
+///
+/// It is NOT the sentence for a body no reader got far enough into to look for a version
+/// at all: an unparsable document, or bytes that are not text, never reaches the
+/// version-detection step, and is refused as the document that did not read
+/// ([`INVALID_DEFINITION`]). A caller has to be able to tell "this is not a document" from
+/// "this document does not say what it is".
 ///
 /// Whatever the document carries BESIDE those two members — an `info`, paths, a member
 /// whose name merely resembles the version field — and whichever shape it parsed to, it
@@ -763,17 +772,18 @@ fn parse_yaml(text: &str) -> Result<Node, String> {
     let mut builder = DefinitionBuilder::default();
     ::yaml_rust2::parser::Parser::new_from_str(text)
         .load(&mut builder, true)
-        // A body the parser could not read is a body no reader got far enough into to
-        // find the member that says which format it is written in, so it is refused as a
-        // version that could not be determined rather than with the parser's own
-        // position — see [`UNDETERMINED_VERSION`].
-        .map_err(|_| UNDETERMINED_VERSION.to_string())?;
+        // A body the parser could not read is a body that is not an API definition at
+        // all, rather than one whose version could not be determined: the reader never
+        // reached the member that says which format it is written in. Refused as the
+        // document that did not read, and not with the parser's own position — see
+        // [`INVALID_DEFINITION`].
+        .map_err(|_| INVALID_DEFINITION.to_string())?;
     if let Some(refusal) = builder.refused {
         return Err(format!("Unable to parse API definition: {refusal}"));
     }
     // A document whose collections never close is the same case: it was not read.
     if !builder.open.is_empty() {
-        return Err(UNDETERMINED_VERSION.to_string());
+        return Err(INVALID_DEFINITION.to_string());
     }
     Ok(builder.root.unwrap_or_default())
 }
@@ -811,7 +821,9 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
             body.len()
         ));
     }
-    let text = std::str::from_utf8(body).map_err(|_| UNDETERMINED_VERSION.to_string())?;
+    // Bytes that are not text are a body no reader could parse, so they are the
+    // document-did-not-read refusal rather than the version one.
+    let text = std::str::from_utf8(body).map_err(|_| INVALID_DEFINITION.to_string())?;
     let document = match ::serde_json::from_str::<Node>(text) {
         Ok(document) => {
             // The YAML reader counts nodes AS it builds them

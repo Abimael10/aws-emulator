@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `Deployment$State` on the wire, pinned against the value AWS publishes for each
+//! `Deployment$State` on the wire, pinned against the value AWS serves for each
 //! `DeploymentState` member.
 //!
-//! The rule under test: an enum member goes on the wire as the value the service publishes
-//! for it, which for `DeploymentState` is the member's own Smithy name — the model declares
-//! `BAKING | VALIDATING | DEPLOYING | COMPLETE | ROLLING_BACK | ROLLED_BACK | REVERTED` with
-//! no `@enumValue` trait on any member, so each member's value IS its name — and every
-//! operation that serves a Deployment document or summary serves that same spelling, byte
-//! for byte, out of the one catalog the crate spells it in. A client waiting for a
-//! deployment to finish compares `State` against that value, so a document carrying any
-//! other spelling never satisfies the wait.
+//! The rule under test: a modelled enum member goes on the wire as the value the model
+//! gives it, which — for an enum whose members carry no `@enumValue` trait — is the member's
+//! own name. `DeploymentState`'s members are `BAKING | VALIDATING | DEPLOYING | COMPLETE |
+//! ROLLING_BACK | ROLLED_BACK | REVERTED`
+//! (`smithy_query(query="shape",shape="DeploymentState")`), none of them overridden, so a
+//! finished deployment serves `COMPLETE`, one still rolling out `DEPLOYING` and one a stop
+//! undid `ROLLED_BACK` — underscore and all for the two-word members. Every operation that
+//! serves a Deployment document or summary serves that same token, byte for byte, out of
+//! the one catalog the crate spells it in. A client waiting for a deployment to finish
+//! compares `State` against that value, so a document carrying some other spelling of the
+//! member never satisfies the wait.
 //!
-//! The sibling `Environment$State` is the ONE enum of this service that does not work that
-//! way (`environment_state_wire_form`), which is why the two are pinned separately rather
-//! than through one rule, and why a refusal that spells a deployment state into a sentence
-//! is asserted against the served value rather than assumed to differ from it.
+//! A refusal is the other side of the same rule: a sentence that spells a state out names
+//! the enum's MEMBER, which here is the very string the document serves, so the two are
+//! asserted against each other rather than against two different spellings.
+//!
+//! This is NOT a blanket rule for the service: the sibling `Environment$State` IS served in
+//! a form its members do not carry (`ReadyForDeployment`, `RollingBack`, …), which
+//! `crate::environment_state_wire_form` pins. Each enum is asserted against the form that
+//! enum is served in.
 //!
 //! The tables below span what the rule generalises over: WHICH member of the enum (all
 //! seven, including the ones no operation reaches), which OPERATION serves the document
@@ -45,7 +52,8 @@ use crate::stop_deployment_without_its_environment::list_deployments;
 /// `DEPLOYMENT_STATE_VALUES` carries it (`BAKING`, `COMPLETE`, `DEPLOYING`, `REVERTED`,
 /// `ROLLED_BACK`, `ROLLING_BACK`, `VALIDATING`). Source of the wire values: the same enum —
 /// the model JSON in `smithy-model/` ships no `@enumValue` trait on these members, so each
-/// member's value is its name, which is the form every AppConfig response carries.
+/// member's value IS its name, and the pairing below is written out so the catalog is
+/// checkable rather than circular.
 const PUBLISHED_DEPLOYMENT_STATES: &[(&str, &str)] = &[
     ("DEPLOYING", "DEPLOYING"),
     ("BAKING", "BAKING"),
@@ -59,7 +67,7 @@ const PUBLISHED_DEPLOYMENT_STATES: &[(&str, &str)] = &[
 /// Whether `value` is one of the values `Deployment$State` goes on the wire as.
 ///
 /// `pub(crate)` because every suite that asserts a served state checks it against this one
-/// catalog rather than against the model's member names.
+/// catalog rather than against a spelling of its own.
 pub(crate) fn is_a_published_deployment_state(value: &str) -> bool {
     PUBLISHED_DEPLOYMENT_STATES
         .iter()
@@ -86,24 +94,8 @@ fn served_for(member_name: &str) -> Option<&'static str> {
 /// that starts the deployment rather than as a stage of it.
 const MEMBER_NO_DEPLOYMENT_SITS_IN: &str = "VALIDATING";
 
-/// A wire value read back as the SCREAMING_SNAKE member name it belongs to, so the pairing
-/// can be checked as a round trip rather than taken on trust. For this enum the two are the
-/// same string, which is what the round trip asserts.
-fn member_name_of(wire_value: &str) -> String {
-    let mut name = String::new();
-    let mut previous: Option<char> = None;
-    for character in wire_value.chars() {
-        if character.is_uppercase() && previous.is_some_and(|earlier| earlier.is_lowercase()) {
-            name.push('_');
-        }
-        name.extend(character.to_uppercase());
-        previous = Some(character);
-    }
-    name
-}
-
 /// The catalog the crate serves covers every member the model declares, each paired with
-/// the value AppConfig publishes for it.
+/// the value the model gives it, which for this enum is the member name itself.
 #[test]
 fn every_modelled_deployment_state_member_is_served_as_its_published_wire_value() {
     assert_eq!(
@@ -121,19 +113,12 @@ fn every_modelled_deployment_state_member_is_served_as_its_published_wire_value(
             "case {member_name:?}: expected a member the model declares, which is not among {:?}",
             DEPLOYMENT_STATE_VALUES
         );
-        // The round trip is what makes the pairing checkable: the wire value, read as a
-        // member name, must be the member it is paired with.
-        let derived = member_name_of(wire_value);
-        assert_eq!(
-            derived.as_str(),
-            *member_name,
-            "case {member_name:?}: the wire value {wire_value:?} names the member {derived:?}, \
-             expected {member_name:?}"
-        );
+        // No `@enumValue` override on any member of this enum, so the value and the member
+        // name are one string — including the underscore of a two-word member.
         assert_eq!(
             wire_value, member_name,
-            "case {member_name:?}: the member carries no @enumValue trait, so its wire value \
-             is its name, got {wire_value:?}"
+            "case {member_name:?}: the wire value of a member with no @enumValue override is \
+             the member name, got {wire_value:?}"
         );
         let expected = if *member_name == MEMBER_NO_DEPLOYMENT_SITS_IN {
             None
@@ -302,7 +287,7 @@ async fn every_operation_serves_the_published_wire_value_of_a_deployments_state(
             Settle::Nothing => {
                 // Whatever the row's strategy owes, the state it owes is the published
                 // value: the wait is for the CONDITION, spelled the way AWS spells it, so a
-                // document carrying the member name would never satisfy it.
+                // document carrying another spelling would never satisfy it.
                 let reached = deployment_in_state(
                     &router,
                     case,
@@ -388,9 +373,8 @@ async fn every_operation_serves_the_published_wire_value_of_a_deployments_state(
     }
 }
 
-/// The other side of the rule: the document serves the published wire value, and the
-/// refusal that names the same state spells the enum's MEMBER — which for this enum is the
-/// very value the document serves.
+/// The other side of the rule: the refusal that names a state spells the enum's MEMBER,
+/// which for this enum is the same token the document serves.
 #[tokio::test]
 async fn a_refusal_names_the_member_of_the_state_the_document_serves() {
     let router = router();
@@ -491,9 +475,9 @@ async fn a_refusal_names_the_member_of_the_state_the_document_serves() {
             "case {case:?}: expected the refusal {expected:?}, got {message:?}"
         );
         assert!(
-            message.contains(member_name),
-            "case {case:?}: the refusal names the enum's member ({member_name:?}), which is the \
-             value the document serves ({served:?}), got {message:?}"
+            message.contains(served),
+            "case {case:?}: the refusal names the enum's member, which is also the value the \
+             document serves ({served:?}), got {message:?}"
         );
     }
 }

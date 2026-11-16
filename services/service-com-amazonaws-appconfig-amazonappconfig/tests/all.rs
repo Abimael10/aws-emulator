@@ -53,6 +53,8 @@ mod delete_experiment_definition;
 mod delete_extension_association;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
+#[path = "all/deployment_and_environment_state_tokens.rs"]
+mod deployment_and_environment_state_tokens;
 #[path = "all/deployment_event_notifications_to_sqs.rs"]
 mod deployment_event_notifications_to_sqs;
 #[path = "all/deployment_not_found_message.rs"]

@@ -843,8 +843,9 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
 
     // (case, the stop that puts the deployment in its terminal state, the value
     // `Deployment$State` serves for the state it then holds, the `DeploymentState` member
-    // name a refusal spells into its sentence): a plain stop of a completed deployment is
-    // refused, so the row that reaches the rolled-back state stops one still in flight.
+    // name a refusal spells into its sentence — the same string, since this enum's wire
+    // value IS its member name): a plain stop of a completed deployment is refused, so the
+    // row that reaches the rolled-back state stops one still in flight.
     let terminal_states: [(&str, bool, &str, &str); 2] = [
         ("a reverted deployment", true, "REVERTED", "REVERTED"),
         (

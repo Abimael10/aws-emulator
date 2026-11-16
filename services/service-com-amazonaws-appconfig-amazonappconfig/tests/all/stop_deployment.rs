@@ -113,7 +113,9 @@ pub(crate) async fn get_deployment(
 }
 
 /// The `State` `GetEnvironment` reports for one environment.
-async fn environment_state(
+///
+/// `pub(crate)` because more than one suite reads an environment's state back this way.
+pub(crate) async fn environment_state(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -179,11 +181,12 @@ fn read_deployment_state(case: &str, body: &Value) -> String {
 
 /// The terminal `DeploymentState` a stop of a deployment in progress leaves behind: the
 /// stop settles the rollback it performs, so there is no transitional state for a reader
-/// to catch. Spelled as the value `Deployment$State` goes on the wire as.
+/// to catch. Spelled as the value `Deployment$State` goes on the wire as, which for this
+/// enum is the member's own name.
 const ROLLED_BACK: &str = "ROLLED_BACK";
 
 /// The MEMBER NAME of [`ROLLED_BACK`], which is the form a refusal's sentence spells a
-/// state in.
+/// state in — the same string, since this enum's wire value IS its member name.
 const ROLLED_BACK_MEMBER: &str = "ROLLED_BACK";
 
 /// The `EnvironmentState` wire value matching [`ROLLED_BACK`].

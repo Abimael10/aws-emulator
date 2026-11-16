@@ -13,10 +13,10 @@
 //!   request is the absent `@required` member and it is refused as that (400
 //!   `ValidationException`, the member named on its own), while the two definition imports
 //!   read the body themselves and state their own sentence for an empty definition;
-//! * a definition document whose OpenAPI/Swagger version this service cannot determine —
-//!   because the document declares neither version member, or because no reader got far
-//!   enough into the body to find one — is refused as exactly that, which is a different
-//!   refusal from a VERSIONED document that cannot be read as that format.
+//! * a definition document that PARSED and declares neither version member is refused as a
+//!   version that could not be determined, which is a different refusal from a body no
+//!   reader could read as a document at all and from a VERSIONED document that cannot be
+//!   read as that format — those two share the other sentence.
 
 use crate::rest_api_create_from_import::api_count;
 use crate::rest_api_lifecycle::{create_api, page_items, Answer, Gateway};
@@ -201,20 +201,21 @@ fn definition_with_version(title: &str) -> String {
 
 /// RULE: which of the two formats a definition is written in is settled BEFORE the
 /// document is read as one, out of the two root members an OpenAPI/Swagger document states
-/// its version in — so a body that declares neither, and a body no reader got far enough
-/// into to find one, are both refused as a version that could not be determined, whatever
-/// else the body carries and whichever spelling it is written in.
+/// its version in — so a document that PARSED and declares neither is refused as a version
+/// that could not be determined, whatever else it carries and whichever spelling it is
+/// written in.
 ///
 /// The two members are the OpenAPI Specification's own root fields: `swagger` (2.0 and
 /// before) and `openapi` (3.0 on). The refused rows differ along WHY no version was found
 /// — what a readable document carries instead (nothing but an `info`, paths as well, a
 /// member whose name merely resembles the version field in Swagger 1.2's `swaggerVersion`,
-/// an `info.version`, which is the API's own version and not the format's), the shape it
-/// parsed to (a mapping, a sequence, a scalar), and where a body stopped being readable at
-/// all (an unterminated flow mapping, text that is no document, a quoted scalar that never
-/// closes) — and along the spelling, JSON and the YAML the same document is written in.
-/// The served rows are the same documents carrying each of the two members, which must
-/// NOT earn that sentence.
+/// an `info.version`, which is the API's own version and not the format's) and the shape it
+/// parsed to (a mapping, a sequence, a scalar) — and along the spelling, JSON and the YAML
+/// the same document is written in. A body that never parsed at all earns the OTHER
+/// sentence, which the sibling
+/// [`a_document_that_did_not_read_keeps_the_invalid_input_sentence`] pins. The served rows
+/// are the same documents carrying each of the two members, which must NOT earn this
+/// sentence.
 #[tokio::test]
 async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
     let gateway = Gateway::new();
@@ -252,18 +253,6 @@ async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
         (
             "a YAML mapping carrying nothing but a title",
             "info:\n  title: no version\n".to_string(),
-        ),
-        (
-            "an unterminated flow mapping",
-            "{\"openapi\": \"3.0.1\", \"paths\": {".to_string(),
-        ),
-        (
-            "text that is no document at all",
-            "}not a document{".to_string(),
-        ),
-        (
-            "an unterminated quoted scalar",
-            "openapi: \"3.0.1\ninfo:\n  title: x\n".to_string(),
         ),
     ];
 
@@ -333,32 +322,59 @@ async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
     }
 }
 
-/// RULE: once the version IS declared, the document is read as that format — and a
-/// document that cannot be read as one is the refusal beside the version one, so a caller
-/// can tell "I could not tell what this is" from "this is not a valid one of those".
+/// RULE: a body the reader could not read as a document AT ALL, and a document that read
+/// and declared its version but is not a valid definition of that format, are both the
+/// "this is not an API definition" refusal — the one beside the version sentence, so a
+/// caller can tell "this document does not say what it is" from "this is not a document /
+/// not a valid one of those".
 ///
-/// Rows differ along WHERE the versioned document stops being a definition, and along the
-/// version member it declares and the spelling it is written in.
+/// Rows span both halves of that class and differ along WHERE the reading stopped: a
+/// truncated document, an unterminated flow mapping, an unterminated quoted scalar, text
+/// that is no document, and a versioned document whose `paths` is not a mapping — in both
+/// version members and both spellings. The first four never reach version detection, which
+/// is why they are here and not in the sibling
+/// [`a_definition_whose_version_cannot_be_determined_is_refused_as_that`]. A refused
+/// request creates no API, which the count below checks.
 #[tokio::test]
-async fn a_versioned_document_that_cannot_be_read_keeps_the_invalid_input_sentence() {
+async fn a_document_that_did_not_read_keeps_the_invalid_input_sentence() {
     // Source: `crate::ops::put_rest_api::INVALID_DEFINITION`.
     const INVALID_DEFINITION: &str = "Invalid OAS input";
 
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "unreadable-definitions").await;
+    let before = api_count(&gateway, "before the unreadable bodies").await;
 
-    let refused: Vec<(&str, &str)> = vec![
+    // Rows span the half of the class that never reaches version detection and the half
+    // that reaches it and then fails: both earn the one sentence.
+    let refused: Vec<(&str, String)> = vec![
+        (
+            "a document truncated mid-object",
+            "{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"truncated\"".to_string(),
+        ),
+        (
+            "an unterminated flow mapping",
+            "{\"openapi\": \"3.0.1\", \"paths\": {".to_string(),
+        ),
+        (
+            "text that is no document at all",
+            "}not a document{".to_string(),
+        ),
+        (
+            "an unterminated quoted scalar",
+            "openapi: \"3.0.1\ninfo:\n  title: x\n".to_string(),
+        ),
         (
             "paths that are a list, under openapi",
-            "{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"x\"}, \"paths\": [\"/pets\"]}",
+            "{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"x\"}, \"paths\": [\"/pets\"]}"
+                .to_string(),
         ),
         (
             "paths that are a scalar, under swagger",
-            "{\"swagger\": \"2.0\", \"info\": {\"title\": \"x\"}, \"paths\": \"/pets\"}",
+            "{\"swagger\": \"2.0\", \"info\": {\"title\": \"x\"}, \"paths\": \"/pets\"}".to_string(),
         ),
         (
             "paths that are a list, written as YAML",
-            "openapi: 3.0.1\ninfo:\n  title: x\npaths:\n  - /pets\n",
+            "openapi: 3.0.1\ninfo:\n  title: x\npaths:\n  - /pets\n".to_string(),
         ),
     ];
 
@@ -380,6 +396,13 @@ async fn a_versioned_document_that_cannot_be_read_keeps_the_invalid_input_senten
             &format!("PutRestApi with {case}"),
         );
     }
+
+    let after = api_count(&gateway, "after the unreadable bodies").await;
+    assert_eq!(
+        after, before,
+        "case after the unreadable bodies: a refused import must create no API, expected \
+         {before}, got {after}"
+    );
 }
 
 /// `ImportRestApi` with `body` sent verbatim.

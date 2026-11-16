@@ -46,7 +46,7 @@ use crate::stop_experiment_run::stop_run;
 use crate::update_experiment_run::update_run;
 
 /// The terminal `DeploymentState` of a deployment a caller stopped while the service was
-/// still working on it, in the CamelCase form `Deployment$State` goes on the wire as.
+/// still working on it, in the form `Deployment$State` goes on the wire as.
 ///
 /// The model's `DeploymentState` enum declares the members `BAKING | COMPLETE | DEPLOYING
 /// | REVERTED | ROLLED_BACK | ROLLING_BACK | VALIDATING`
