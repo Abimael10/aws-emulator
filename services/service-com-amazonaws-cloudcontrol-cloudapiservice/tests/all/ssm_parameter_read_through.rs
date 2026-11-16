@@ -536,9 +536,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
             "a hierarchical name with no leading separator",
             "Dev/DBServer",
             json!({ "Name": "Dev/DBServer", "Type": "String", "Value": "v" }),
-            "Name 'Dev/DBServer' is hierarchical and must include a leading forward slash \
-             character (/)"
-                .to_string(),
+            "Parameter name must be a fully qualified name.".to_string(),
         ),
         (
             "a name in the hierarchy the owning service keeps for itself",

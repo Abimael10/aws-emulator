@@ -283,9 +283,13 @@ fn parameter_arn(region: &str, name: &str) -> String {
     )
 }
 
-/// A hierarchical name `levels` levels deep.
-fn name_of_depth(levels: usize) -> String {
-    (1..=levels).map(|level| format!("/level{level}")).collect()
+/// A hierarchical name of `segments` slash-separated segments. Its hierarchy is one level
+/// shallower than that: "the hierarchy is the parameter name except the last part of the
+/// parameter" (`GetParametersByPathRequest$Path`), so the leaf is not a level of the tree.
+fn name_of_depth(segments: usize) -> String {
+    (1..=segments)
+        .map(|level| format!("/level{level}"))
+        .collect()
 }
 
 /// One round-trip case: the name, the `ParameterType`, the value, and the `DataType`
@@ -728,15 +732,23 @@ async fn parameters_are_unique_within_a_region() {
 #[tokio::test]
 async fn names_outside_the_naming_constraints_are_refused() {
     let router = router();
-    let at_limit = name_of_depth(MAX_LEVELS);
-    let past_limit = name_of_depth(MAX_LEVELS + 1);
+    // A name carries at most [`MAX_LEVELS`] hierarchy levels BESIDE its leaf, so the
+    // deepest name the service accepts has one segment more than that and only the next
+    // segment is refused.
+    let at_limit = name_of_depth(MAX_LEVELS + 1);
+    let past_limit = name_of_depth(MAX_LEVELS + 2);
     let cases: Vec<(&str, &str, &str)> = vec![
         (
+            // The `/aws` hierarchy is AWS's own, so a write into it is DENIED (the refusal
+            // `all/restricted_parameter_hierarchy.rs` is about) rather than reported as a
+            // name that broke the reserved-prefix rule.
             "reserved aws prefix",
             "/aws/reserved",
-            "ParameterPatternMismatchException",
+            "AccessDeniedException",
         ),
         (
+            // Nothing is published under an `ssm`-prefixed name and no hierarchy of the
+            // account's may carry one, so this is the reserved-prefix naming constraint.
             "reserved ssm prefix",
             "/ssm/reserved",
             "ParameterPatternMismatchException",
@@ -747,19 +759,27 @@ async fn names_outside_the_naming_constraints_are_refused() {
             "ParameterPatternMismatchException",
         ),
         (
+            // A hierarchical name that does not name the hierarchy it lives in is not the
+            // fully qualified name a parameter is addressed by at all, so it is refused as
+            // a malformed request value rather than against a naming constraint.
             "hierarchical without a leading separator",
             "Dev/DBServer",
-            "ParameterPatternMismatchException",
+            "ValidationException",
         ),
         (
+            // A level with no name in it means the name names no parameter at that level,
+            // which is one of the documented naming constraints broken.
             "empty hierarchy level",
             "/Dev//DBServer",
             "ParameterPatternMismatchException",
         ),
         (
+            // A name that ENDS in the separator is not a parameter name at all, so it is
+            // refused as a malformed request value rather than against a naming
+            // constraint.
             "trailing separator",
             "/Dev/",
-            "ParameterPatternMismatchException",
+            "ValidationException",
         ),
         (
             "character outside the allowed set",

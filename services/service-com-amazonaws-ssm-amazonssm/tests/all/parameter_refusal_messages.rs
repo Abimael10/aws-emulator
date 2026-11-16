@@ -299,8 +299,9 @@ fn label_not_found(name: &str, label: &str) -> String {
 }
 
 /// A `name:selector` read that resolves to nothing names the version it could not find, or
-/// the label — whichever the caller asked for — and quotes the parameter back by its own
-/// name: a top-level name carries no leading separator, a hierarchical one its whole path.
+/// the label — whichever the caller asked for — and quotes the parameter back by the
+/// hierarchy path its name carries: a top-level name is in no hierarchy, so it carries no
+/// leading separator, while a hierarchical one is quoted as its whole path.
 #[tokio::test]
 async fn a_selector_that_resolves_to_nothing_names_the_version_or_the_label() {
     let router = router();
@@ -527,12 +528,13 @@ async fn a_rejected_filter_key_lists_the_operations_own_keys() {
         // `Label` is the one key a describe refuses; a hierarchy read takes it. Any key
         // outside the modelled `Key` pattern never reaches the handler at all.
         ("DescribeParameters", "Label", DESCRIBE_KEYS),
-        // Each of these a describe takes and a hierarchy read refuses.
+        // Each of these a describe takes and a hierarchy read refuses. A `tag:` key is
+        // the one the hierarchy read also takes — narrowing nothing by it — so it is not
+        // among the keys it refuses.
         ("GetParametersByPath", "Name", BY_PATH_KEYS),
         ("GetParametersByPath", "Path", BY_PATH_KEYS),
         ("GetParametersByPath", "Tier", BY_PATH_KEYS),
         ("GetParametersByPath", "DataType", BY_PATH_KEYS),
-        ("GetParametersByPath", "tag:owner", BY_PATH_KEYS),
     ];
     for (operation, key, listed) in rows {
         let mut request = json!({

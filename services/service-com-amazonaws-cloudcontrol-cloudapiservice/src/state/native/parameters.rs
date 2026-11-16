@@ -302,9 +302,11 @@ fn window<'a>(
 fn accepted_name(identifier: &str) -> Result<&str, NativeRefusal> {
     let name = ssm::trimmed_name(identifier).map_err(NativeRefusal::Invalid)?;
     match ssm::name_rejection(name) {
-        Some(ssm::NameRejection::Pattern(why) | ssm::NameRejection::Depth(why)) => {
-            Err(NativeRefusal::Invalid(why))
-        }
+        Some(
+            ssm::NameRejection::Pattern(why)
+            | ssm::NameRejection::Malformed(why)
+            | ssm::NameRejection::Depth(why),
+        ) => Err(NativeRefusal::Invalid(why)),
         None => Ok(name),
     }
 }

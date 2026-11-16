@@ -170,18 +170,13 @@ async fn seed_versions(
     seed_versions_in_region(router, REGION, name, type_, values).await
 }
 
-/// The `Name` a read reports for the parameter whose put named `name`: a top-level
-/// parameter's name carries no leading separator, while a hierarchical name is its whole
-/// path (`PutParameterRequest$Name`: "For parameters in a hierarchy, you must include a
-/// leading forward slash character (/)"), which is the rendering the parameter's ARN
-/// carries too.
+/// The `Name` a read reports for the parameter whose put named `name`: the name as the
+/// put wrote it, leading separator and all ("The fully qualified name includes the
+/// complete hierarchy of the parameter path and name", `PutParameterRequest$Name`). The
+/// parameter's ARN carries that name without the leading separator, which is also its
+/// store key, so either spelling addresses the one parameter.
 fn reported_name(name: &str) -> &str {
-    let canonical = name.strip_prefix('/').unwrap_or(name);
-    if canonical.contains('/') {
-        name
-    } else {
-        canonical
-    }
+    name
 }
 
 /// `GetParameterHistory` signed for `region`.
@@ -461,7 +456,10 @@ async fn each_entry_reports_the_members_its_own_put_carried() {
                 // An advanced parameter can't be reverted, so a put naming no tier
                 // stays in the one the parameter has.
                 tier: "Advanced",
-                policy_types: vec![],
+                // "All existing policies are preserved until you send new policies or an
+                // empty policy" (`PutParameterRequest$Policies`), so this put, which sends
+                // none, carries the previous version's policy document forward.
+                policy_types: vec!["Expiration"],
             },
         ),
     ];

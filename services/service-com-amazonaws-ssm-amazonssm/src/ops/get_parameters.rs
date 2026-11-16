@@ -20,13 +20,14 @@
 //! (`smithy_query(query="doc",shape="GetParametersResult",member="InvalidParameters")`).
 //! So one unresolvable name among ten still answers 200 with the other nine: a name no
 //! parameter of this Region and account is held for, a version or label the parameter
-//! does not carry, an ARN naming another account or Region, and a name that is not
-//! shaped like one a parameter could be asked for are all reported there, under the name
-//! the request asked for them by.
+//! does not carry, an ARN naming another account or Region, a name carrying spaces between
+//! its characters and a name that is not shaped like one a parameter could be asked for are
+//! all reported there, under the name the request asked for them by.
 //!
-//! The one refusal a batch read makes is the spaces rule this operation's own doc states:
-//! the service trims each name, and a trimmed name that still carries spaces between
-//! characters fails the request with a `ValidationException`.
+//! A batch read therefore refuses NOTHING for the names it was given: "the service removes
+//! any spaces specified for the beginning or end of a parameter name", so each name is
+//! resolved trimmed, and a name no parameter could be stored under resolves to nothing
+//! rather than failing the call.
 //!
 //! A name in the hierarchy AWS publishes its own parameters in is resolved against THAT
 //! catalog ([`crate::state::public_parameters`]), which no account's store holds anything
@@ -40,7 +41,9 @@
 //! The parameters are reported in alphabetical order of their names ("The results for
 //! GetParameters requests are listed in alphabetical order in query responses",
 //! `GetParametersRequest$Names`), whatever order they were asked in, and the unresolvable
-//! names keep the order they were asked in.
+//! names keep the order they were asked in. Each one is reported under the `Name` the
+//! request asked it by ([`crate::state::echoed_name`]), so a client that keys its results
+//! by the strings it sent can join them.
 //!
 //! ## `WithDecryption` and `SecureString`
 //!
@@ -226,22 +229,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The spaces rule is the one refusal a read makes, and it is made for the whole
-        // request before any name is resolved: the service trims each name and fails a
-        // name with spaces between characters with a `ValidationException`, which this
-        // operation models no error for.
+        // "The service removes any spaces specified for the beginning or end of a parameter
+        // name": each name is resolved TRIMMED. A trimmed name that still carries spaces
+        // between characters is not refused here — no parameter can be stored under such a
+        // name, so it resolves to nothing and is REPORTED among the unresolvable names, the
+        // way every other name this batch cannot resolve is. A batch read refuses nothing
+        // for the names it was given.
         //
         // The names one call carries are a set: a name asked for twice names the one
         // parameter, so it is answered once. The order they were asked in is kept, which
         // is the order the unresolvable ones among them are reported in.
         let mut asked: Vec<&str> = Vec::with_capacity(input.names.len());
         for name in &input.names {
-            let trimmed = crate::state::trimmed_name(name)
-                .map_err(crate::scaffolded::Scaffolded::validation)?;
+            let trimmed = name.trim();
             if !asked.contains(&trimmed) {
                 asked.push(trimmed);
             }
         }
+
+        // The spelling the REQUEST wrote for a trimmed name is read through
+        // [`as_written`]: a name is resolved trimmed, but each result is reported under the
+        // value the caller sent, so a client that keys its results by the strings it asked
+        // with finds them ([`crate::state::echoed_name`]).
 
         // A full ARN names the account and the Region its parameter lives in, and a
         // parameter is resolved through the endpoint it is asked for, so the Region never
@@ -353,11 +362,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // name this Region holds no parameter for names none, and a selector the
                 // parameter does not carry names no version of it.
                 let Some(query) = crate::state::parse_parameter_query(name) else {
-                    invalid.push(name.to_string());
+                    invalid.push(as_written(&input.names, name).to_string());
                     continue;
                 };
                 if query.selector == Some("") || !query.names_this_endpoint(&region) {
-                    invalid.push(name.to_string());
+                    invalid.push(as_written(&input.names, name).to_string());
                     continue;
                 }
                 // A reserved-path name was resolved against Secrets Manager above, so what
@@ -373,14 +382,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .parameter(&region, query.name)
                     .or_else(|| published.get(query.name))
                 else {
-                    invalid.push(name.to_string());
+                    invalid.push(as_written(&input.names, name).to_string());
                     continue;
                 };
                 let Some(version) = record.select(query.selector) else {
-                    invalid.push(name.to_string());
+                    invalid.push(as_written(&input.names, name).to_string());
                     continue;
                 };
-                parameters.push(version.to_parameter(record, query.selector));
+                let mut parameter = version.to_parameter(record, query.selector);
+                // Each result is reported under the `Name` it was asked with, which is what
+                // lets a batch caller join the results to its requests.
+                parameter.name = Some(
+                    crate::state::echoed_name(
+                        as_written(&input.names, name),
+                        &query,
+                        &record.name,
+                    )
+                    .to_string(),
+                );
+                parameters.push(parameter);
                 to_open.extend(
                     crate::state::secure_string::value_to_open(
                         input.with_decryption,
@@ -421,11 +441,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // query responses" (`GetParametersRequest$Names`), so the answer is ordered by the
         // name each parameter is reported under rather than by the order they were asked
         // in; two selectors of one parameter report the one name, so the version a
-        // selector resolved to orders them. Sorted AFTER the values are opened, because
-        // what a decrypt reports is placed by the position it was collected at.
+        // selector resolved to orders them. The order is the NAME's — the padding a request
+        // may have written around it is not part of it, the service trimming that away
+        // before it resolves anything. Sorted AFTER the values are opened, because what a
+        // decrypt reports is placed by the position it was collected at.
+        let ordered_by = |parameter: &Parameter| {
+            parameter
+                .name
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
         parameters.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
+            ordered_by(left)
+                .cmp(&ordered_by(right))
                 .then(left.version.cmp(&right.version))
         });
 
@@ -438,6 +468,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             invalid_parameters: Some(invalid_parameters),
         })
     }
+}
+
+/// The value the request wrote for the trimmed name `trimmed`, or `trimmed` itself when no
+/// value of `names` trims to it.
+///
+/// A batch read resolves each name trimmed ("The service removes any spaces specified for
+/// the beginning or end of a parameter name") and reports each result — served or
+/// unresolvable — under the value the caller SENT, so the two can be joined. `names` carries
+/// at most the modelled ten values, so this is a scan of the request rather than an index
+/// over it.
+fn as_written<'a>(names: &'a [String], trimmed: &'a str) -> &'a str {
+    names
+        .iter()
+        .map(String::as_str)
+        .find(|written| written.trim() == trimmed)
+        .unwrap_or(trimmed)
 }
 
 /// How a read of the reserved Secrets Manager hierarchy that the source would not serve

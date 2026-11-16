@@ -28,12 +28,20 @@
 //!
 //! ## Parameter policies
 //!
-//! A `Policies` document is validated against the supported policy types and their
-//! documented limits and is persisted with the version, but no policy EFFECT is
-//! materialised: an `Expiration` whose timestamp has passed does not delete the
-//! parameter here, and no `ExpirationNotification` event is raised. Those are the
-//! parameter-policy behaviours, and nothing in this emulator fabricates an event for
-//! work that did not run — so an accepted policy means "recorded", not "acting".
+//! A `Policies` document is validated against the supported policy types, their
+//! documented limits and the sets they may form (an `ExpirationNotification` stands only
+//! beside the `Expiration` whose time it notifies about) and is persisted with the
+//! version, but no policy EFFECT is materialised: an `Expiration` whose timestamp has
+//! passed does not delete the parameter here, and no `ExpirationNotification` event is
+//! raised. Those are the parameter-policy behaviours, and nothing in this emulator
+//! fabricates an event for work that did not run — so an accepted policy means
+//! "recorded", not "acting".
+//!
+//! The document belongs to the PARAMETER, not to one request: "All existing policies are
+//! preserved until you send new policies or an empty policy" (the `Policies` doc), so an
+//! update that sends none carries the stored document onto the new version and only one
+//! that sends an array replaces it. `KeyId` is the same: an update of a `SecureString`
+//! that names none seals the new value under the key the parameter already carries.
 //!
 //! ## Shape of an operation
 //!
@@ -226,9 +234,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `PutParameterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#PutParameter")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it
+// ("The requester doesn't have permissions to perform the requested operation") and the
+// other calls that CHANGE a parameter declare it, and it is the refusal a write addressed
+// to the hierarchy AWS reserves for its own published parameters answers with — the same
+// denial `DeleteParameter` and the label calls give for a name in it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#PutParameter",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutParameterErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     HierarchyLevelLimitExceededException(HierarchyLevelLimitExceededException),
     HierarchyTypeMismatchException(HierarchyTypeMismatchException),
     IncompatiblePolicyException(IncompatiblePolicyException),
@@ -269,12 +286,18 @@ struct Existing {
     type_: Option<String>,
     /// Its current `Tier`, which an update may raise but not lower.
     tier: Option<String>,
+    /// The `Policies` document its newest version holds — what an update that sends none
+    /// inherits: "All existing policies are preserved until you send new policies or an
+    /// empty policy" (`PutParameter`'s `Policies` doc).
+    policies: Option<String>,
     /// Its current `DataType`, `Description` and `AllowedPattern`: the attributes an
     /// update that names none inherits, exactly as it inherits the type above.
     data_type: Option<String>,
     description: Option<String>,
     allowed_pattern: Option<String>,
-    /// The KMS key its value is sealed under, which only a `SecureString` carries.
+    /// The KMS key its newest version is encrypted under — what an update of a
+    /// `SecureString` that names no `KeyId` keeps writing under, so a value stored under a
+    /// customer managed key is not re-keyed to the service default by a value-only update.
     key_id: Option<String>,
     /// How many versions are retained right now.
     retained: usize,
@@ -320,10 +343,16 @@ enum PolicyRejection {
 /// `Policies` is "one or more policies to apply to a parameter. This operation takes a
 /// JSON array", and the rules applied here are the ones the modelled policy errors
 /// state: the supported policy types (`InvalidPolicyTypeException`), at most
-/// [`crate::state::MAX_POLICIES`] of them (`PoliciesLimitExceededException`), no two
-/// policies of one type (`IncompatiblePolicyException`: "You can't, for example,
-/// specify two Expiration policies for a parameter"), and an `Attributes` value that
-/// is a policy attribute map (`InvalidPolicyAttributeException`).
+/// [`crate::state::MAX_POLICIES`] of them (`PoliciesLimitExceededException`), and an
+/// `Attributes` value that is a policy attribute map
+/// (`InvalidPolicyAttributeException`) — plus the two ways a SET of policies conflicts
+/// with itself, which `IncompatiblePolicyException` reports: two policies of one type
+/// ("You can't, for example, specify two Expiration policies for a parameter"), and a
+/// notification about an expiration with no expiration to notify about — an
+/// `ExpirationNotification` is "notification before or after the expiration time is
+/// reached", and only an `Expiration` policy sets that time, so the two stand or fall
+/// together and a document carrying the notification alone configures a notification that
+/// can never fire.
 ///
 /// What each policy then DOES — deleting the parameter when an `Expiration` comes due,
 /// raising the notification events — is not implemented: those are the parameter-policy
@@ -341,19 +370,25 @@ fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
         ));
     };
     if entries.len() > crate::state::MAX_POLICIES {
-        return Err(PolicyRejection::Limit(format!(
-            "Policies carries {} policies; the maximum is {}",
-            entries.len(),
-            crate::state::MAX_POLICIES
-        )));
+        return Err(PolicyRejection::Limit(
+            crate::state::policies_limit_message(),
+        ));
     }
     let mut seen: Vec<&str> = Vec::with_capacity(entries.len());
+    let mut carried = 0usize;
     for entry in entries {
         let Some(policy) = entry.as_object() else {
             return Err(PolicyRejection::Shape(
                 "every entry of Policies must be a policy object".to_string(),
             ));
         };
+        // "All existing policies are preserved until you send new policies or an empty
+        // policy": an EMPTY policy object states no policy at all, so it is one of the two
+        // ways a document asks for the parameter to carry none — the other being an empty
+        // array — rather than a policy missing its type.
+        if policy.is_empty() {
+            continue;
+        }
         let Some(policy_type) = policy.get("Type").and_then(::serde_json::Value::as_str) else {
             return Err(PolicyRejection::Type(
                 "a policy carries no Type".to_string(),
@@ -374,13 +409,25 @@ fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
             )));
         }
         if seen.contains(&policy_type) {
-            return Err(PolicyRejection::Incompatible(format!(
-                "Policies carries two {policy_type} policies"
-            )));
+            return Err(PolicyRejection::Incompatible(
+                crate::state::duplicate_policy_message(policy_type),
+            ));
         }
         seen.push(policy_type);
+        carried += 1;
     }
-    Ok(entries.len())
+    // A notification about an expiration needs the expiration it is measured from, so the
+    // two are one configuration: a document carrying the notification without the
+    // expiration asks for an event nothing can ever raise, and the whole put is refused —
+    // no version is created and no parameter is.
+    if seen.contains(&crate::state::POLICY_TYPE_EXPIRATION_NOTIFICATION)
+        && !seen.contains(&crate::state::POLICY_TYPE_EXPIRATION)
+    {
+        return Err(PolicyRejection::Incompatible(
+            crate::state::notification_requires_expiration_message(),
+        ));
+    }
+    Ok(carried)
 }
 
 /// Why a value is not one the request's `AllowedPattern` accepts, named by the modelled
@@ -499,12 +546,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = crate::state::trimmed_name(&input.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // The `/aws` hierarchy holds AWS's own published parameters and no parameter of
+        // this account ([`crate::state::public_parameters`]), so a put addressing a name in
+        // it asks to write data that is not the account's: the refusal is a DENIAL, as it
+        // is for every other call that would change a name in that hierarchy, and it names
+        // the reserved name the request asked to write
+        // ([`crate::state::reserved_name_denial_message`]). Decided before the naming
+        // constraints are read off the name, because what is wrong with it is whose
+        // hierarchy it is in.
+        if crate::state::public_parameters::is_published_name(name) {
+            return Err(PutParameterErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::reserved_name_denial_message(name),
+                },
+            )
+            .into());
+        }
         match crate::state::name_rejection(name) {
             Some(crate::state::NameRejection::Pattern(why)) => {
                 return Err(PutParameterErrorModeled::ParameterPatternMismatchException(
                     ParameterPatternMismatchException { message: Some(why) },
                 )
                 .into())
+            }
+            // A name carrying a level with no name in it is refused as a malformed
+            // request value, before any naming constraint is read off it.
+            Some(crate::state::NameRejection::Malformed(why)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(why))
             }
             Some(crate::state::NameRejection::Depth(why)) => {
                 return Err(
@@ -582,7 +650,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .to_string(),
             ));
         }
-        let policies = match policy_count(input.policies.as_deref()) {
+        let requested_policies = match policy_count(input.policies.as_deref()) {
             Ok(count) => count,
             Err(PolicyRejection::Shape(why)) => {
                 return Err(crate::scaffolded::Scaffolded::validation(why))
@@ -612,7 +680,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
-        let has_policies = policies > 0;
 
         // What the store already holds, read under the guard and then released: a
         // `SecureString` is sealed under its KMS key below, and no state of this service
@@ -622,6 +689,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let existing = store.parameter(&region, name).map(|record| Existing {
                 type_: record.latest().map(|latest| latest.type_.clone()),
                 tier: record.latest().map(|latest| latest.tier.clone()),
+                policies: record.latest().and_then(|latest| latest.policies.clone()),
                 data_type: record.latest().map(|latest| latest.data_type.clone()),
                 description: record.latest().and_then(|latest| latest.description.clone()),
                 allowed_pattern: record
@@ -641,6 +709,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 existing,
             )
         };
+
+        // "All existing policies are preserved until you send new policies or an empty
+        // policy" (`PutParameter`'s `Policies` doc): the member is applied only when the
+        // request CARRIES it, so an update that sends none keeps the document the
+        // parameter already holds and only one that sends an array — an empty array
+        // included — replaces it. The inherited document was validated by the put that
+        // stored it, so its policies are counted rather than judged again.
+        let (stored_policies, policies) = match input.policies.clone() {
+            Some(sent) => (Some(sent), requested_policies),
+            None => {
+                let inherited = existing.as_ref().and_then(|held| held.policies.clone());
+                let carried = crate::state::inline_policies(inherited.as_deref()).len();
+                (inherited, carried)
+            }
+        };
+        let has_policies = policies > 0;
 
         // "The parameter already exists. You can't create duplicate parameters" —
         // unless the request asked to overwrite it. The sentence names no parameter: it
@@ -813,8 +897,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If you don't specify a key ID, the system uses the default key associated with
         // your Amazon Web Services account", which Parameter Store reaches through this
-        // alias; an OVERWRITE that names none keeps the key the parameter is already sealed
-        // under, as it keeps every other attribute it states nothing about, and a type that
+        // alias — for a parameter that carries no key yet. An UPDATE that names none keeps
+        // writing under the key the parameter already carries, as it keeps every other
+        // attribute it states nothing about: `KeyId` is "the KMS ID that you want to use to
+        // encrypt a parameter", a property of the parameter rather than of one request, so a
+        // value-only update of a `SecureString` held under a customer managed key is sealed
+        // under that same key instead of being re-keyed to the service default. A type that
         // is not encrypted carries none.
         let key_id = match (secure, input.key_id) {
             (true, Some(key_id)) => Some(key_id),
@@ -889,7 +977,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description,
             allowed_pattern,
             key_id,
-            policies: input.policies,
+            policies: stored_policies,
             last_modified_date: now,
             // "ARN of the Amazon Web Services user who last changed the parameter": this
             // put is that change, so the version records the principal it was signed for.

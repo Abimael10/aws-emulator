@@ -568,8 +568,8 @@ async fn a_published_parameter_is_read_only() {
         );
         assert_eq!(
             error_code(&refused),
-            "ParameterPatternMismatchException",
-            "case {case}: expected the reserved-name refusal, got {refused}"
+            "AccessDeniedException",
+            "case {case}: expected the reserved-hierarchy denial, got {refused}"
         );
         let after = read_published(&router, name).await;
         assert_eq!(

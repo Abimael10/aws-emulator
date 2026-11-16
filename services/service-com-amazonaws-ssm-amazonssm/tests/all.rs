@@ -117,6 +117,8 @@ mod parameter_arn_spellings;
 mod parameter_deletion;
 #[path = "all/parameter_deletion_visibility.rs"]
 mod parameter_deletion_visibility;
+#[path = "all/parameter_filters_policies_and_depth.rs"]
+mod parameter_filters_policies_and_depth;
 #[path = "all/parameter_history.rs"]
 mod parameter_history;
 #[path = "all/parameter_labels.rs"]

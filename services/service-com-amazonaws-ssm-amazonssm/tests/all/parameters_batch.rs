@@ -372,11 +372,14 @@ async fn a_name_this_endpoint_resolves_nothing_for_is_reported_not_refused() {
     }
 }
 
-/// The spaces rule: a name is trimmed, and a trimmed name that still carries spaces
-/// between characters fails the whole request with a `ValidationException` — the one
-/// refusal a batch read makes.
+/// The spaces rule: a name is trimmed BEFORE it is resolved, and a trimmed name that still
+/// carries spaces between characters names no parameter, so it is REPORTED among the
+/// unresolvable names rather than refusing the call — a batch read refuses nothing for the
+/// names it was given. The padding is removed from what is RESOLVED, not from what is
+/// reported: each result is echoed under the value the caller sent, so a client can join the
+/// results to its requests.
 #[tokio::test]
-async fn a_name_is_trimmed_and_a_name_with_inner_spaces_is_refused() {
+async fn a_name_is_trimmed_and_a_name_with_inner_spaces_resolves_nothing() {
     let router = router();
     seed(&router).await;
     let held = "/batch/dev/db";
@@ -389,31 +392,41 @@ async fn a_name_is_trimmed_and_a_name_with_inner_spaces_is_refused() {
         let response = batch_ok(&router, &padded, &json!({ "Names": [&padded] })).await;
         assert_eq!(
             reported_names(&response),
-            vec![held.to_string()],
-            "case {padded:?}: the surrounding spaces are removed, so the name resolves, got \
+            vec![padded.clone()],
+            "case {padded:?}: the surrounding spaces are removed before the name is resolved, \
+             so it resolves and is echoed as asked, got {response}"
+        );
+        assert_eq!(
+            response["Parameters"][0]["Value"].as_str(),
+            Some("db.example.internal"),
+            "case {padded:?}: the padded name resolves the parameter the name holds, got \
              {response}"
         );
     }
 
-    let refused = [
+    // A trimmed name that still carries spaces between characters names no parameter this
+    // store could hold, so a batch read REPORTS it among the unresolvable names rather
+    // than refusing the call it rode in: one unresolvable name among several still answers
+    // 200 with the rest.
+    let unresolvable = [
         "/batch/dev /db".to_string(),
         "my parameter".to_string(),
         format!("{held} :1"),
     ];
-    for asked in refused {
-        for names in [json!([&asked]), json!([held, &asked])] {
-            let (status, response) = batch(&router, &json!({ "Names": names })).await;
-            assert_eq!(
-                status, 400,
-                "case {asked:?}: a name with inner spaces fails the request, got {status} \
-                 {response}"
-            );
-            assert_eq!(
-                error_code(&response),
-                "ValidationException",
-                "case {asked:?}: the refusal is a ValidationException, got {response}"
-            );
-        }
+    for asked in unresolvable {
+        let response = batch_ok(&router, &asked, &json!({ "Names": [&asked] })).await;
+        assert_eq!(
+            (reported_names(&response), invalid_names(&response)),
+            (Vec::new(), vec![asked.clone()]),
+            "case {asked:?}: a name carrying spaces between characters resolves nothing and is \
+             reported as asked, got {response}"
+        );
+        let response = batch_ok(&router, &asked, &json!({ "Names": [held, &asked] })).await;
+        assert_eq!(
+            (reported_names(&response), invalid_names(&response)),
+            (vec![held.to_string()], vec![asked.clone()]),
+            "case {asked:?}: the names beside it are still served, got {response}"
+        );
     }
 }
 

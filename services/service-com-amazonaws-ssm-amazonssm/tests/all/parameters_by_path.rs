@@ -269,10 +269,10 @@ async fn a_path_read_reports_the_parameters_under_that_level() {
             "the root's own level, however a top-level name is spelled",
             "/",
             false,
-            // Both top-level parameters are reported without a leading separator,
-            // whichever spelling their put used: the separator is not part of a
-            // top-level name.
-            vec!["RootLevel", "TopLevel"],
+            // Both top-level parameters are reported under the name their put wrote,
+            // separator and all: the separator is part of the name, and not part of the
+            // parameter's identity, so either spelling addresses it.
+            vec!["/RootLevel", "TopLevel"],
         ),
         (
             "every parameter under the root",
@@ -286,7 +286,7 @@ async fn a_path_read_reports_the_parameters_under_that_level() {
                 "/Dev/secret",
                 "/DevOps/tool",
                 "/Prod/DBServer/db-url",
-                "RootLevel",
+                "/RootLevel",
                 "TopLevel",
             ],
         ),
@@ -544,19 +544,12 @@ async fn filters_select_on_the_stored_parameter() {
             vec!["/Filt/list", "/Filt/plain"],
         ),
         (
+            // A whole type is still compared as a PREFIX, so a type the value is a prefix
+            // of matches too: the option says how to compare, and the value rule only
+            // bounds which values may be compared at all.
             "Type BeginsWith a whole type",
             json!([{ "Key": "Type", "Option": "BeginsWith", "Values": ["String"] }]),
             vec!["/Filt/list", "/Filt/plain"],
-        ),
-        (
-            "Type BeginsWith a prefix every type carries",
-            json!([{ "Key": "Type", "Option": "BeginsWith", "Values": ["S"] }]),
-            vec![
-                "/Filt/custom",
-                "/Filt/list",
-                "/Filt/plain",
-                "/Filt/secret",
-            ],
         ),
         (
             "KeyId Equals the default alias",
@@ -650,18 +643,13 @@ async fn a_refused_read_reports_the_modelled_error() {
             "InvalidFilterKey",
         ),
         (
+            // A tag filter is the one key of the modelled pattern a hierarchy read
+            // ACCEPTS without narrowing by it: the subtree is served whatever value the
+            // filter carries, matching or not.
             "a DataType filter key",
             json!({
                 "Path": "/Dev",
                 "ParameterFilters": [{ "Key": "DataType", "Values": ["text"] }],
-            }),
-            "InvalidFilterKey",
-        ),
-        (
-            "a tag filter key",
-            json!({
-                "Path": "/Dev",
-                "ParameterFilters": [{ "Key": "tag:Env", "Values": ["dev"] }],
             }),
             "InvalidFilterKey",
         ),
@@ -702,6 +690,20 @@ async fn a_refused_read_reports_the_modelled_error() {
             json!({
                 "Path": "/Dev",
                 "ParameterFilters": [{ "Key": "Type", "Option": "Equals", "Values": ["Secret"] }],
+            }),
+            "InvalidFilterValue",
+        ),
+        (
+            // A closed enum holds no value that merely BEGINS with one of its members,
+            // so the prefix comparison is refused on the same value rule as the equality.
+            "a Type prefix no ParameterType can satisfy",
+            json!({
+                "Path": "/Dev",
+                "ParameterFilters": [{
+                    "Key": "Type",
+                    "Option": "BeginsWith",
+                    "Values": ["Str"],
+                }],
             }),
             "InvalidFilterValue",
         ),

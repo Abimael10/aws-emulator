@@ -6,12 +6,13 @@
 //!
 //! The rules under test, each one level more general than any single parameter:
 //!
-//! * A parameter name is canonicalised once, when the parameter is created: a top-level
-//!   name carries no leading separator, while a hierarchical name is its whole path
-//!   ("For parameters in a hierarchy, you must include a leading forward slash character
+//! * A parameter name is kept as the create wrote it, leading separator and all ("The
+//!   fully qualified name includes the complete hierarchy of the parameter path and name.
+//!   For parameters in a hierarchy, you must include a leading forward slash character
 //!   (/)", `smithy_query(query="doc",shape="PutParameterRequest",member="Name")`), so
-//!   every read reports the name the parameter's ARN carries and a reported `Name` fed
-//!   back into another call addresses the parameter it was read from.
+//!   every read reports that spelling and a reported `Name` fed back into another call
+//!   addresses the parameter it was read from — as does that name without its leading
+//!   separator, which is the parameter's identity and what its ARN carries.
 //! * The label and policy lists of a version are lists the version always has
 //!   (`ParameterHistory$Labels`, "Labels assigned to the parameter version";
 //!   `ParameterMetadata$Policies`, "A list of policies associated with a parameter"), so
@@ -130,20 +131,21 @@ fn policy_document(count: usize) -> Value {
         .collect::<Vec<Value>>())
 }
 
-/// A name is canonicalised once, at create: every read reports the canonical rendering —
-/// the one the parameter's ARN carries — and that reported name addresses the same
-/// parameter when it is fed back into another call.
+/// A name is kept as the create wrote it: every read reports that spelling, and the
+/// reported name addresses the same parameter when it is fed back into another call — as
+/// does the same name spelled without its leading separator, which is the parameter's
+/// store key and the resource its ARN carries.
 #[tokio::test]
-async fn every_read_reports_the_canonical_name_of_the_parameter() {
+async fn every_read_reports_the_name_the_parameter_was_created_with() {
     let router = router();
 
     // (case, the name the put used, the name every read must report)
     let cases: &[(&str, &str, &str)] = &[
         ("a top-level name", "PayloadTop", "PayloadTop"),
         (
-            "the same top-level name spelled with the separator",
+            "a top-level name spelled with the separator",
             "/PayloadRooted",
-            "PayloadRooted",
+            "/PayloadRooted",
         ),
         ("a two-level name", "/Payload/two", "/Payload/two"),
         (
@@ -154,7 +156,7 @@ async fn every_read_reports_the_canonical_name_of_the_parameter() {
         (
             "a top-level name of only symbols the name rule admits",
             "/Payload_top-level.0",
-            "Payload_top-level.0",
+            "/Payload_top-level.0",
         ),
     ];
 
@@ -204,8 +206,9 @@ async fn every_read_reports_the_canonical_name_of_the_parameter() {
                 "case {case:?}: {operation} must report the name as {expected:?}, got {record}"
             );
         }
-        // The ARN carries the same rendering after its `parameter/` prefix, so the two
-        // spellings of the one parameter cannot drift apart.
+        // The ARN carries that name with its leading separator dropped, which is the
+        // parameter's identity, so the two spellings of the one parameter cannot drift
+        // apart.
         assert_eq!(
             single["Parameter"]["ARN"].as_str(),
             Some(parameter_arn(written).as_str()),

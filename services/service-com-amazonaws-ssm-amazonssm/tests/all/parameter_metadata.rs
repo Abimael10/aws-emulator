@@ -65,12 +65,12 @@ fn the_most_filters_a_describe_carries() -> Vec<Value> {
         json!({ "Key": "Name", "Option": "BeginsWith", "Values": ["/Describe"] }),
         json!({ "Key": "Name", "Option": "Contains", "Values": ["tagged"] }),
         json!({ "Key": "Type", "Values": ["String"] }),
-        json!({ "Key": "Type", "Option": "BeginsWith", "Values": ["Str"] }),
+        json!({ "Key": "Name", "Option": "BeginsWith", "Values": ["/Describe/tag"] }),
         json!({ "Key": "Tier", "Values": ["Standard"] }),
         json!({ "Key": "DataType", "Values": ["text"] }),
         json!({ "Key": "Path", "Option": "OneLevel", "Values": ["/Describe"] }),
         json!({ "Key": "tag:Environment", "Values": ["Dev"] }),
-        json!({ "Key": "tag:Environment", "Option": "BeginsWith", "Values": ["D"] }),
+        json!({ "Key": "tag:Environment", "Option": "BeginsWith", "Values": ["Dev"] }),
     ];
     assert_eq!(
         filters.len(),
@@ -263,9 +263,9 @@ fn seed_puts() -> Vec<Value> {
 }
 
 /// Every seeded name AS A READ REPORTS IT, in the ascending name order the store keeps
-/// them in (a canonical name drops the leading separator, so the parameter put as
-/// `/RootLevel` is reported as `RootLevel` and sorts beside `TopLevel`, after the
-/// `Describe` hierarchy).
+/// them in (the store is keyed by the canonical name, which drops the leading separator,
+/// so `/RootLevel` sorts beside `TopLevel` after the `Describe` hierarchy while each is
+/// reported under the name its put wrote).
 const SEEDED_NAMES: &[&str] = &[
     "/Describe/Dev/db-port",
     "/Describe/Dev/db-url",
@@ -275,7 +275,7 @@ const SEEDED_NAMES: &[&str] = &[
     "/Describe/Prod/image",
     "/Describe/advanced",
     "/Describe/tagged",
-    "RootLevel",
+    "/RootLevel",
     "TopLevel",
 ];
 
@@ -407,7 +407,7 @@ fn expected_metadata() -> Vec<Metadata<'static>> {
             0,
         ),
         (
-            "RootLevel",
+            "/RootLevel",
             "String",
             None,
             1,
@@ -643,7 +643,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
                     "Values": ["/RootLevel", "/Describe/tagged"],
                 }],
             }),
-            vec!["/Describe/tagged", "RootLevel"],
+            vec!["/Describe/tagged", "/RootLevel"],
         ),
         (
             "Name BeginsWith a hierarchy",
@@ -683,24 +683,18 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
             vec!["/Describe/Prod/db-url"],
         ),
         (
-            "Type BeginsWith a prefix two types share",
+            // A closed enum holds no value that merely begins with one of its members, so
+            // a `BeginsWith` on a prefix of a type is `InvalidFilterValue` (the refusal
+            // table below) rather than a prefix search over the enum.
+            "Type BeginsWith a whole type",
             json!({
                 "ParameterFilters": [{
                     "Key": "Type",
                     "Option": "BeginsWith",
-                    "Values": ["Str"],
+                    "Values": ["StringList"],
                 }],
             }),
-            vec![
-                "/Describe/Dev/db-port",
-                "/Describe/Dev/db-url",
-                "/Describe/Prod/db-url",
-                "/Describe/Prod/image",
-                "/Describe/advanced",
-                "/Describe/tagged",
-                "RootLevel",
-                "TopLevel",
-            ],
+            vec!["/Describe/Prod/db-url"],
         ),
         (
             "KeyId Equals a named key",
@@ -758,7 +752,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
             json!({
                 "ParameterFilters": [{ "Key": "Path", "Option": "OneLevel", "Values": ["/"] }],
             }),
-            vec!["RootLevel", "TopLevel"],
+            vec!["/RootLevel", "TopLevel"],
         ),
         (
             "Tier Equals Advanced",
@@ -781,7 +775,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
                 "/Describe/Prod/db-url",
                 "/Describe/advanced",
                 "/Describe/tagged",
-                "RootLevel",
+                "/RootLevel",
                 "TopLevel",
             ],
         ),
@@ -791,7 +785,20 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
             vec!["/Describe/tagged"],
         ),
         (
-            "a tag BeginsWith a prefix of its value",
+            // A tag is matched by its VALUE, which `BeginsWith` does not turn into a
+            // prefix search: the whole value matches, a strict prefix of it does not.
+            "a tag BeginsWith its whole value",
+            json!({
+                "ParameterFilters": [{
+                    "Key": "tag:Environment",
+                    "Option": "BeginsWith",
+                    "Values": ["Dev"],
+                }],
+            }),
+            vec!["/Describe/tagged"],
+        ),
+        (
+            "a tag BeginsWith a strict prefix of its value",
             json!({
                 "ParameterFilters": [{
                     "Key": "tag:Environment",
@@ -799,7 +806,7 @@ async fn filters_narrow_the_listing_to_the_parameters_they_match() {
                     "Values": ["D"],
                 }],
             }),
-            vec!["/Describe/tagged"],
+            vec![],
         ),
         (
             "a tag nobody set",
@@ -1109,6 +1116,30 @@ async fn a_refused_describe_reports_the_modelled_error() {
         (
             "a Tier equality no ParameterTier can satisfy",
             json!({ "ParameterFilters": [{ "Key": "Tier", "Values": ["Premium"] }] }),
+            "InvalidFilterValue",
+        ),
+        (
+            // A closed enum holds no value that merely BEGINS with one of its members, so
+            // the prefix comparison is refused on the same value rule as the equality.
+            "a Type prefix no ParameterType can satisfy",
+            json!({
+                "ParameterFilters": [{
+                    "Key": "Type",
+                    "Option": "BeginsWith",
+                    "Values": ["Str"],
+                }],
+            }),
+            "InvalidFilterValue",
+        ),
+        (
+            "a Tier prefix no ParameterTier can satisfy",
+            json!({
+                "ParameterFilters": [{
+                    "Key": "Tier",
+                    "Option": "BeginsWith",
+                    "Values": ["Stand"],
+                }],
+            }),
             "InvalidFilterValue",
         ),
         (

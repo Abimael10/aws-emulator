@@ -37,12 +37,13 @@
 //!
 //! ## Filters
 //!
-//! `ParameterFilters` accepts the three keys this operation publishes — `Type`, `KeyId`
-//! and `Label` ([`crate::state::PARAMETERS_BY_PATH_FILTER_KEYS`]) — and refuses every
-//! other key the modelled pattern allows with `InvalidFilterKey`, which is what the
-//! model's `Key` doc excludes here. An option outside `Equals` / `BeginsWith` (and
-//! `Equals` alone for `Label`) is `InvalidFilterOption`, and a filter carrying no value,
-//! or a `Type` equality no `ParameterType` can satisfy, is `InvalidFilterValue`.
+//! `ParameterFilters` accepts the three keys this operation narrows by — `Type`, `KeyId`
+//! and `Label` ([`crate::state::PARAMETERS_BY_PATH_FILTER_KEYS`]) — and the `tag:<key>`
+//! form, which it accepts and narrows NOTHING by, as the service does; every other key the
+//! modelled pattern allows is `InvalidFilterKey`, which is what the model's `Key` doc
+//! excludes here. An option outside `Equals` / `BeginsWith` (and `Equals` alone for
+//! `Label`) is `InvalidFilterOption`, and a filter carrying no value, or a value outside the
+//! closed enum its key names, is `InvalidFilterValue`.
 //!
 //! ## `WithDecryption` and `SecureString`
 //!
@@ -249,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             canonical_name, invalid_filter_key_message, invalid_filter_option_message,
             invalid_next_token_message, is_parameters_by_path_filter_key, is_under_path,
             parameter_path, parameters_by_path_filter_options, parameters_by_path_page_size,
-            request_region, FILTER_KEY_TYPE, FILTER_OPTION_EQUALS, PARAMETERS_BY_PATH_FILTER_KEYS,
+            request_region, FILTER_OPTION_EQUALS, PARAMETERS_BY_PATH_FILTER_KEYS,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -297,22 +298,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     filter.key
                 )));
             }
-            // A parameter's type is one of the modelled `ParameterType` values, so an
-            // equality filter on a value outside that enum asks for a type no parameter
-            // can have. A `BeginsWith` value is a prefix of a type, not a type, so it is
-            // not checked against the enum.
-            if filter.key == FILTER_KEY_TYPE && option == FILTER_OPTION_EQUALS {
-                if let Some(unknown) = values
+            // An attribute whose modelled target is an enum holds only a value of that
+            // enum, so a filter value outside it asks for an attribute value no parameter
+            // can carry — whatever comparison the filter names, a closed enum holding no
+            // value that merely begins with one of its members either.
+            if let Some(unknown) = crate::state::filter_enum_values(&filter.key).and_then(|allowed| {
+                values
                     .iter()
-                    .find(|value| !PARAMETER_TYPE_VALUES.contains(&value.as_str()))
-                {
-                    return Err(invalid_filter_value(format!(
-                        "Value '{unknown}' at filter key '{}' isn't a parameter type: valid \
-                         values are {}",
-                        filter.key,
-                        PARAMETER_TYPE_VALUES.join(", ")
-                    )));
-                }
+                    .find(|value| !allowed.contains(&value.as_str()))
+                    .map(|value| {
+                        crate::state::invalid_filter_value_message(value, allowed)
+                    })
+            }) {
+                return Err(invalid_filter_value(unknown));
             }
         }
 
@@ -506,13 +504,19 @@ fn select_version<'a>(
         .find(|version| labels.iter().any(|label| version.labels.contains(*label)))
 }
 
-/// Whether `version` carries a value one filter asks for. A key that names no attribute
-/// of a parameter version matches nothing — such a key is already refused above, so that
-/// arm is a backstop.
+/// Whether `version` carries a value one filter asks for.
+///
+/// A `tag:` filter narrows NOTHING here: the service accepts it on a hierarchy read and
+/// serves the subtree whatever value it carries ([`crate::state::is_parameters_by_path_filter_key`]),
+/// so every parameter satisfies it. A key that names no attribute of a parameter version
+/// matches nothing — such a key is already refused above, so that arm is a backstop.
 fn version_matches(
     version: &crate::state::ParameterVersionRecord,
     filter: &ParameterStringFilter,
 ) -> bool {
+    if crate::state::tag_filter_key(&filter.key).is_some() {
+        return true;
+    }
     let Some(held) = version.filter_values(&filter.key) else {
         return false;
     };

@@ -20,8 +20,10 @@
 //! the modelled pattern allows that this operation's `Key` doc excludes, with
 //! `InvalidFilterKey`. An option outside `Equals` / `BeginsWith` (plus `Contains` for
 //! `Name`, and `Recursive` / `OneLevel` for `Path`) is `InvalidFilterOption`, and a
-//! filter carrying no value, a `Path` value that names no hierarchy, or an equality no
-//! value of a modelled enum can satisfy, is `InvalidFilterValue`. The deprecated
+//! filter carrying no value, a `Path` value that names no hierarchy, or a value outside
+//! the closed enum its key names, is `InvalidFilterValue`. A `tag:<key>` filter compares
+//! the whole tag value whichever of its options it names, so `BeginsWith` on one narrows
+//! exactly as `Equals` does ([`crate::state::describe_parameter_matches`]). The deprecated
 //! `Filters` member is the same comparison under the key it names
 //! ([`crate::state::LEGACY_PARAMETERS_FILTER_KEYS`]), and a request carrying both is
 //! served the parameters satisfying all of them — at most
@@ -211,13 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::parameter_pagination::{page_cursor, page_token, PagedRead};
         use crate::state::{
-            canonical_name, describe_filter_enum_values, describe_parameter_matches,
+            canonical_name, describe_parameter_matches,
             describe_parameters_default_filter_option, describe_parameters_filter_options,
-            describe_parameters_page_size, invalid_filter_key_message,
-            invalid_filter_option_message, invalid_next_token_message,
-            is_describe_parameters_filter_key, parameter_path, request_region,
-            DESCRIBE_PARAMETERS_FILTER_KEYS, FILTER_KEY_PATH, FILTER_OPTION_EQUALS,
-            LEGACY_PARAMETERS_FILTER_KEYS, MAX_DESCRIBE_PARAMETERS_FILTERS,
+            describe_parameters_page_size, filter_enum_values, invalid_filter_key_message,
+            invalid_filter_option_message, invalid_filter_value_message,
+            invalid_next_token_message, is_describe_parameters_filter_key, parameter_path,
+            request_region, DESCRIBE_PARAMETERS_FILTER_KEYS, FILTER_KEY_PATH,
+            FILTER_OPTION_EQUALS, LEGACY_PARAMETERS_FILTER_KEYS,
+            MAX_DESCRIBE_PARAMETERS_FILTERS,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -306,24 +309,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        for (key, option, values) in &filters {
+        for (key, _, values) in &filters {
             // An attribute whose modelled target is an enum can hold only a value of
-            // that enum, so an equality on anything else asks for an attribute value no
-            // parameter can carry. A prefix is not a value, so a prefix comparison is
-            // not checked against the enum.
-            if *option == FILTER_OPTION_EQUALS {
-                if let Some(allowed) = describe_filter_enum_values(key) {
-                    if let Some(unknown) = values
-                        .iter()
-                        .find(|value| !allowed.contains(&value.as_str()))
-                    {
-                        return Err(invalid_filter_value(format!(
-                            "Value '{unknown}' at filter key '{key}' isn't a parameter {key}: \
-                             valid values are {}",
-                            allowed.join(", ")
-                        )));
-                    }
-                }
+            // that enum, so a filter value outside it asks for an attribute value no
+            // parameter can carry — whatever comparison the filter names, a closed enum
+            // holding no value that merely begins with one of its members either.
+            if let Some(unknown) = filter_enum_values(key).and_then(|allowed| {
+                values
+                    .iter()
+                    .find(|value| !allowed.contains(&value.as_str()))
+                    .map(|value| invalid_filter_value_message(value, allowed))
+            }) {
+                return Err(invalid_filter_value(unknown));
             }
             // A `Path` filter value names a hierarchy, which carries the parameter-name
             // rules: trimmed, no spaces between characters, and a leading forward slash.

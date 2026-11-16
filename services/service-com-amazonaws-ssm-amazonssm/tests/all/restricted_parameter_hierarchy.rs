@@ -5,11 +5,13 @@
 //!
 //! RULE under test: **the `/aws` hierarchy holds AWS's own published parameters and no
 //! parameter of this account, so a call that would change a name in it is refused as
-//! DENIED — HTTP 400 `AccessDeniedException` with the fixed sentence "Cannot
-//! access/update data for the restricted parameter." — and never as the name merely being
+//! DENIED — HTTP 400 `AccessDeniedException` — and never as the name merely being
 //! absent.** The two refusals say different things to a client: "absent" invites a retry
 //! or a recreate under the same name, which can never succeed here, while "denied" tells
-//! the caller to stop.
+//! the caller to stop. A call that addresses an EXISTING parameter of that hierarchy
+//! carries the fixed sentence "Cannot access/update data for the restricted parameter.";
+//! `PutParameter`, which asks to write a NAME, carries the sentence that names the reserved
+//! name it was asked to write.
 //!
 //! A READ of that hierarchy is not a change, so it is not denied for being one: a name AWS
 //! publishes resolves against the published catalog (`all/public_parameter_catalog.rs`) and
@@ -35,9 +37,19 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::parameter_store::{call, error_code, error_message};
 use crate::public_parameter_catalog::{emulator, AMAZON_LINUX_NAMESPACE};
 
-/// The sentence the denial carries. Wholly fixed: it names neither the parameter nor the
-/// operation, because what it says is that the hierarchy is not the account's to change.
+/// The sentence the denial of a call that addresses an EXISTING parameter of the reserved
+/// hierarchy carries. Wholly fixed: it names neither the parameter nor the operation,
+/// because what it says is that the hierarchy is not the account's to change.
 const RESTRICTED: &str = "Cannot access/update data for the restricted parameter.";
+
+/// The sentence `PutParameter`'s denial carries: a write asks for a NAME of the reserved
+/// hierarchy, so the refusal names it, canonically.
+fn reserved_name_denial(name: &str) -> String {
+    format!(
+        "No access to reserved parameter name: {}.",
+        name.trim_start_matches('/')
+    )
+}
 
 /// The modelled class the denial is reported as
 /// (`smithy_query(query="shape", shape="AccessDeniedException")`: "The requester doesn't
@@ -47,6 +59,7 @@ const DENIED: &str = "AccessDeniedException";
 /// One change a caller can ask for, as the request body that asks for it.
 fn change(operation: &str, name: &str) -> Value {
     match operation {
+        "PutParameter" => json!({ "Name": name, "Type": "String", "Value": "written" }),
         "LabelParameterVersion" => json!({ "Name": name, "Labels": ["release"] }),
         "UnlabelParameterVersion" => {
             json!({ "Name": name, "ParameterVersion": 1, "Labels": ["release"] })
@@ -57,9 +70,10 @@ fn change(operation: &str, name: &str) -> Value {
 
 /// Every call that would change a parameter addressed by name and that this slice serves.
 /// Source: each operation's modelled input (`smithy_query(query="operation",
-/// operation="DeleteParameter,LabelParameterVersion,UnlabelParameterVersion")`), all three
-/// of which take the parameter's `Name`.
+/// operation="PutParameter,DeleteParameter,LabelParameterVersion,UnlabelParameterVersion")`),
+/// all four of which take the parameter's `Name`.
 const CHANGES: &[&str] = &[
+    "PutParameter",
     "DeleteParameter",
     "LabelParameterVersion",
     "UnlabelParameterVersion",
@@ -106,16 +120,26 @@ async fn a_change_to_the_reserved_hierarchy_is_denied() {
     for (case, name) in &rows {
         for operation in CHANGES {
             let (status, body) = call(&router, operation, &change(operation, name)).await;
+            // A write names the reserved name it was refused; the calls that address an
+            // existing parameter carry the fixed sentence that names none.
+            let expected = if *operation == "PutParameter" {
+                reserved_name_denial(name)
+            } else {
+                RESTRICTED.to_string()
+            };
             assert_eq!(
                 (status, error_code(&body), error_message(&body)),
-                (400, DENIED.to_string(), RESTRICTED.to_string()),
-                "case {case:?} ({name}): expected {operation} to be denied, got {status} {body}"
+                (400, DENIED.to_string(), expected.clone()),
+                "case {case:?} ({name}): expected {operation} to be denied with {expected:?}, \
+                 got {status} {body}"
             );
-            assert!(
-                !error_message(&body).contains(name.trim_start_matches('/')),
-                "case {case:?}: the denial names no parameter, got {}",
-                error_message(&body)
-            );
+            if *operation != "PutParameter" {
+                assert!(
+                    !error_message(&body).contains(name.trim_start_matches('/')),
+                    "case {case:?}: the denial names no parameter, got {}",
+                    error_message(&body)
+                );
+            }
         }
     }
 

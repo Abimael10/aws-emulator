@@ -371,6 +371,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // The read echoes the `Name` it was ASKED with: a request that named the parameter
+        // by name is answered under that spelling, padding and all, so a client that keys
+        // its results by the string it sent finds them; one that named an ARN is answered
+        // under the name the store holds ([`crate::state::echoed_name`]).
+        let stored = parameter.name.clone().unwrap_or_default();
+        parameter.name = Some(crate::state::echoed_name(&input.name, &query, &stored).to_string());
+
         // A `WithDecryption` read of a `SecureString` has its value opened under the
         // parameter's own KMS key, so that key's policy decides the read before the value
         // is reported; a read that asks for none reports the stored ciphertext.
