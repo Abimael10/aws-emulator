@@ -188,14 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`AbortableOperationInProgress`: "Indicates if there is an in-progress
         // environment configuration update or application version deployment
         // that you can cancel"). A launching, terminating, terminated or idle
-        // `Ready` environment reports none, so such a request names a parameter
-        // value that cannot be used.
+        // `Ready` environment reports none, so the environment is in no state
+        // for this operation — the service's shared invalid-state refusal,
+        // naming the environment the request named and the state this operation
+        // requires (a deployment pending) rather than the state the environment
+        // is in.
         if !environment.abortable_operation_in_progress {
             return Err(AbortEnvironmentUpdateError::invalid_parameter_value(
-                format!(
-                    "Environment {} is not in a state from which an update can be aborted. \
-                     No abortable operation is in progress.",
-                    environment.environment_name
+                crate::state::environment_invalid_state_message(
+                    &environment.environment_name,
+                    crate::state::REQUIRED_STATE_PENDING_DEPLOYMENT,
                 ),
             ));
         }

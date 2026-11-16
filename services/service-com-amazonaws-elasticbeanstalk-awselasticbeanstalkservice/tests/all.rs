@@ -127,6 +127,8 @@ mod resource_tags;
 mod solution_stacks;
 #[path = "all/source_bundle_download.rs"]
 mod source_bundle_download;
+#[path = "all/state_guard_refusals.rs"]
+mod state_guard_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_location.rs"]

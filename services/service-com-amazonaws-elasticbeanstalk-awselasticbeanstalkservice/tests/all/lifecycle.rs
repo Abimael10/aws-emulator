@@ -1613,8 +1613,15 @@ async fn an_application_with_running_environments_is_not_deleted_silently() {
     );
     assert_eq!(
         refused.error_code(),
-        "OperationInProgressFailure",
+        "InvalidParameterValue",
         "case \"running environment\": unexpected error code in {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.error_message(),
+        "Unable to delete application busy because it has a version that is deployed to a \
+         running environment.",
+        "case \"running environment\": unexpected refusal message in {}",
         refused.body
     );
     let still_there = emulator.call("DescribeApplications", &[]).await;
@@ -1648,7 +1655,7 @@ async fn an_application_with_running_environments_is_not_deleted_silently() {
         "case \"forced\": the environment must be shutting down, got {}",
         terminating.body
     );
-    std::thread::sleep(PAST_DUE);
+    wait_for_status(&emulator, "forced", "busy-env", "Terminated").await;
     let gone = emulator.call("DescribeEnvironments", &[]).await;
     assert!(
         gone.values_at("Environments/member/EnvironmentId").is_empty(),

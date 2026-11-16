@@ -4590,21 +4590,57 @@ pub fn missing_environment_message(
 pub const MISSING_ENVIRONMENT_SELECTOR_MESSAGE: &str =
     "You must specify either EnvironmentName or EnvironmentId.";
 
-/// The message an operation that acts on an environment in ONE status refuses an
+/// The message an operation that acts on an environment in ONE state refuses an
 /// environment in any other with, built from the request and the operation's own
 /// contract: `Environment named <name> is in an invalid state for this
 /// operation. Must be <required>.`
 ///
-/// `Ready` is "available to have an action performed on it, such as update or
-/// terminate", so it is the status every operation that acts on a running
-/// environment requires and the one this template is reached with. The sentence
-/// names the environment the request named and the status the operation needs;
-/// it deliberately does NOT report the status the environment is in, which is
-/// what the reads of the environment report.
-pub fn environment_invalid_state_message(environment_name: &str, required_status: &str) -> String {
+/// `required_state` is the state THAT operation needs, worded the way the real
+/// service words it in this sentence: `Ready` — "available to have an action
+/// performed on it, such as update or terminate" — for the operations that act
+/// on a running environment, and [`REQUIRED_STATE_PENDING_DEPLOYMENT`] for the
+/// one that cancels an update in flight. The sentence names the environment the
+/// request named and the state the operation needs; it deliberately does NOT
+/// report the state the environment is in, which is what the reads of the
+/// environment report.
+///
+/// Shared by every operation that refuses an environment for its state, so they
+/// cannot word one class of refusal several ways.
+pub fn environment_invalid_state_message(environment_name: &str, required_state: &str) -> String {
     format!(
         "Environment named {environment_name} is in an invalid state for this operation. \
-         Must be {required_status}."
+         Must be {required_state}."
+    )
+}
+
+/// The state [`environment_invalid_state_message`] names for an operation that
+/// acts on an update or deployment IN FLIGHT rather than on a running
+/// environment — `AbortEnvironmentUpdate`, which "cancels in-progress
+/// environment configuration update or application version deployment".
+///
+/// Not an `EnvironmentStatus`: the environment the operation needs is one with a
+/// deployment pending, which `AbortableOperationInProgress` reports and which
+/// several statuses can carry, so the real service names that condition here
+/// instead of a status value.
+pub const REQUIRED_STATE_PENDING_DEPLOYMENT: &str = "pending deployment";
+
+/// The message `DeleteApplication` refuses a delete that would take a running
+/// environment with it — one made without `TerminateEnvByForce` — with:
+/// `Unable to delete application <name> because it has a version that is
+/// deployed to a running environment.`
+///
+/// The only variable part is the application the request named. The refusal is
+/// about the application's own state, so it names NEITHER the environments that
+/// hold it (state the caller reads through `DescribeEnvironments`) nor the
+/// versions deployed to them. The class is the service-common
+/// `InvalidParameterValue`, the one a caller branches on to retry with
+/// `TerminateEnvByForce`; the operation's modelled operation-in-progress error
+/// stays reserved for "another operation that effects an element in this
+/// activity is already in progress".
+pub fn application_has_running_environment_message(application_name: &str) -> String {
+    format!(
+        "Unable to delete application {application_name} because it has a version that is \
+         deployed to a running environment."
     )
 }
 

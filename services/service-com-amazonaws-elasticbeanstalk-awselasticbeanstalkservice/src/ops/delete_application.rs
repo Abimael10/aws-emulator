@@ -196,23 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         if !running.is_empty() {
             if input.terminate_env_by_force != Some(true) {
-                let names: Vec<&str> = store
-                    .environments
-                    .values()
-                    .filter(|environment| running.contains(&environment.environment_id))
-                    .map(|environment| environment.environment_name.as_str())
-                    .collect();
-                return Err(DeleteApplicationErrorModeled::OperationInProgressException(
-                    OperationInProgressException {
-                        message: Some(format!(
-                            "Cannot delete application {} because it still has running \
-                             environments: {}. Terminate them, or set TerminateEnvByForce.",
-                            input.application_name,
-                            names.join(", ")
-                        )),
-                    },
-                )
-                .into());
+                // The guard is about the application's own state, not about
+                // another operation already running on it: the caller is told
+                // which application it was and nothing of the environments that
+                // hold it, under the service-common code a caller branches on to
+                // retry with `TerminateEnvByForce`. The operation's modelled
+                // operation-in-progress error stays reserved for a concurrent
+                // operation on the same element.
+                return Err(DeleteApplicationError::invalid_parameter_value(
+                    crate::state::application_has_running_environment_message(
+                        &input.application_name,
+                    ),
+                ));
             }
             let mut starting: Vec<crate::state::EventSubject> = Vec::new();
             for environment_id in running {
