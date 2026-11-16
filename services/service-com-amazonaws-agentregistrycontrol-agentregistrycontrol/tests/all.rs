@@ -15,6 +15,8 @@
 mod date_time_timestamp_wire_form;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
+#[path = "all/idempotency_token_binding.rs"]
+mod idempotency_token_binding;
 #[path = "all/idempotency_tokens.rs"]
 mod idempotency_tokens;
 #[path = "all/record_approval.rs"]
