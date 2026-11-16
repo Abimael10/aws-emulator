@@ -19,8 +19,16 @@ mod scan_invariants;
 mod scan_report_annotations;
 #[path = "all/scan_sbom.rs"]
 mod scan_sbom;
+#[path = "all/scan_sbom_authorization.rs"]
+mod scan_sbom_authorization;
+#[path = "all/scan_sbom_component_fan_out.rs"]
+mod scan_sbom_component_fan_out;
+#[path = "all/scan_sbom_enum_value_set.rs"]
+mod scan_sbom_enum_value_set;
 #[path = "all/scan_sbom_refusals.rs"]
 mod scan_sbom_refusals;
+#[path = "all/scan_sbom_scoring_vendors.rs"]
+mod scan_sbom_scoring_vendors;
 #[path = "all/scan_skip_reasons.rs"]
 mod scan_skip_reasons;
 #[path = "all/scanner_build_identity.rs"]

@@ -26,15 +26,17 @@
 //! only; this handler reads it for the presented access key id it stamps on the
 //! audit record a completed scan emits.
 //!
-//! ## Authorization is NOT this handler's job
+//! ## Authorization
 //!
-//! The emulator verifies every request signature centrally, before any handler
-//! runs, and this emulator evaluates no IAM policy, so there is no principal for
-//! this handler to authorize against: a request that reaches `handle` is
-//! authorized. `AccessDeniedException` stays on the modeled error enum (a client
-//! deserializes the shape, and the model declares it) but is never raised here —
-//! read its absence as "policy evaluation is out of scope for this emulator",
-//! not as an authorization check that passed.
+//! AWS decides a signed call against the CALLING principal's identity-based IAM
+//! policies before the service acts on the request, so this handler asks
+//! [`crate::service::authorization`] FIRST — before the submitted document is
+//! read, and with the resource built from the request alone — and answers the
+//! modeled `AccessDeniedException` (HTTP 403) with IAM's own sentence when no
+//! readable policy grants `inspector-scan:ScanSbom`. A refused call carries no
+//! `sbom` member and leaves no scan behind. The decision, the documents it is
+//! taken from and the wording all live in that module and the shared evaluator
+//! behind it; nothing of either is spelled here.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -132,10 +134,13 @@ impl From<ScanSbomErrorModeled> for ScanSbomError {
 /// of the component tree (a CycloneDX assembly may nest `components[]`), not
 /// just the top level.
 ///
-/// From this operation's own modeled documentation for the `sbom` member: "This
-/// format limits you to passing 2000 components before throwing a ValidException
-/// error."
-const MAX_COMPONENTS: usize = 2000;
+/// 5000 is what the service ENFORCES: a document of exactly this many components
+/// is scanned and one more is refused. The `sbom` member's own modeled
+/// documentation still says "This format limits you to passing 2000 components
+/// before throwing a ValidException error", which is stale relative to the
+/// service — a 2001-component document is accepted — so the limit stated in the
+/// refusal and the limit checked here are this one.
+const MAX_COMPONENTS: usize = 5000;
 
 /// The deepest `components[]` nesting one scan resolves. A CycloneDX assembly
 /// tree is shallow; this bounds the recursive walk over caller-chosen input.
@@ -227,6 +232,19 @@ const INSPECTOR_PROPERTY_NAMESPACE: &str = "amazon:inspector:sbom_scanner";
 
 /// The rating source Amazon Inspector reports its own adjusted score under.
 const INSPECTOR_RATING_SOURCE: &str = "Amazon Inspector";
+
+/// The scoring vendor an exploit-probability rating is reported under: the
+/// Exploit Prediction Scoring System, whose score is a probability in `0.0..=1.0`
+/// rather than a 0-10 severity.
+const EPSS_RATING_SOURCE: &str = "EPSS";
+
+/// The CycloneDX `ratings[].method` an EPSS rating is reported under.
+///
+/// The CycloneDX 1.5 schema enumerates the scoring methods it names
+/// (`CVSSv2`, `CVSSv3`, `CVSSv31`, `CVSSv4`, `OWASP`, `SSVC`, `other`); EPSS is
+/// not among them, so the schema's own catch-all is what the method is, rather
+/// than a value the schema does not allow there.
+const EPSS_RATING_METHOD: &str = "other";
 
 /// The `name` the scanning service reports itself under in the CycloneDX
 /// report's `metadata.tools.services`.
@@ -378,6 +396,22 @@ fn invalid(defect: SbomDefect<'_>) -> ScanSbomError {
 /// A `ValidationException` (HTTP 400) carrying `message` and nothing else.
 fn refused(message: impl Into<String>) -> ScanSbomError {
     ScanSbomError::validation(message)
+}
+
+/// The operation's own modeled HTTP path (`POST /scan/sbom`,
+/// `smithy_query(query="operation", operation="ScanSbom")`), which is what a
+/// call on it ADDRESSES: this service models no resource shape and mints no
+/// resource ARN, so the resource an authorization decision is taken against is
+/// this path under the service's namespace.
+const SCAN_SBOM_PATH: &str = "/scan/sbom";
+
+/// A modeled `AccessDeniedException` (HTTP 403), carrying the sentence IAM
+/// refuses an unauthorized request with.
+///
+/// The modeled shape declares `message` alone, so the refusal carries nothing
+/// else — in particular no part of the report the call asked for.
+fn denied(message: String) -> ScanSbomError {
+    ScanSbomErrorModeled::AccessDeniedException(AccessDeniedException { message }).into()
 }
 
 /// A modeled `InternalServerException` (HTTP 500).
@@ -1261,7 +1295,7 @@ fn cyclonedx_vulnerability(finding: &Finding) -> Value {
     // disagree, so each is reported under the source that produced it — and a
     // rating whose vector the advisory does not carry is OMITTED rather than
     // claimed. `method` is read from the vector's own version prefix.
-    let mut ratings: Vec<Value> = Vec::with_capacity(2);
+    let mut ratings: Vec<Value> = Vec::with_capacity(3);
     if !advisory.cvss_v3_vector.is_empty() {
         ratings.push(json!({
             // The advisory's own publisher is what scored it.
@@ -1279,6 +1313,19 @@ fn cyclonedx_vulnerability(finding: &Finding) -> Value {
             "severity": cyclonedx_severity(&advisory.inspector_severity),
             "method": cvss_method(&advisory.inspector_cvss_vector),
             "vector": advisory.inspector_cvss_vector,
+        }));
+    }
+    // The exploit-probability rating, reported under its own scoring vendor
+    // beside the severity ones: it answers a different question (how likely is
+    // this to be exploited) on a different scale (a probability), so it is one
+    // more entry of the per-vendor set and not a restatement of a CVSS score. An
+    // advisory the scoring system has published no estimate for carries no such
+    // entry rather than a claimed zero.
+    if let Some(probability) = advisory.epss_score {
+        ratings.push(json!({
+            "source": { "name": EPSS_RATING_SOURCE },
+            "score": probability,
+            "method": EPSS_RATING_METHOD,
         }));
     }
 
@@ -1658,6 +1705,11 @@ fn inspector_finding(finding: &Finding) -> Value {
         "vendorCreatedAt": advisory.published,
         "vendorUpdatedAt": advisory.modified,
         "inspectorScore": advisory.inspector_score,
+        // The exploit-probability estimate, reported beside the severity scores
+        // for the same reason the CycloneDX form reports it beside its CVSS
+        // ratings: it is a different quantity on a different scale. Absent for
+        // an advisory the scoring system has published no estimate for.
+        "epss": advisory.epss_score.map(|probability| json!({ "score": probability })),
         "inspectorScoreDetails": { "adjustedCvss": adjusted },
         "cvss": base,
         "vulnerablePackages": [ inspector_vulnerable_package(finding) ],
@@ -1788,6 +1840,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides a signed call before the service acts on the request, so
+        // the gate is asked FIRST: with no store guard held, against the
+        // resource this operation's own modeled path addresses, and before the
+        // submitted document is read. A refused caller is told nothing the scan
+        // would have computed and leaves no record behind.
+        if let Some(message) = crate::service::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::resource_addressed(ctx.parts(), SCAN_SBOM_PATH),
+        ) {
+            return Err(denied(message));
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal("the inspector-scan vulnerability database is unavailable"))?;
 

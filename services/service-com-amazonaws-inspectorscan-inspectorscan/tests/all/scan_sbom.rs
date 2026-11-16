@@ -9,13 +9,14 @@
 //!   version against the advisory store, and a finding is reported exactly when
 //!   the resolved version falls inside the advisory's affected range;
 //! * every reported finding is a projection of the matched advisory onto the
-//!   matched component — both ratings, the CWEs, the advisory URLs, the fixed-in
+//!   matched component — one rating per scoring vendor the advisory holds a
+//!   score from, the CWEs, the advisory URLs, the fixed-in
 //!   version, and an `affects[].ref` that resolves in the submitted document;
 //! * the three `outputFormat` values render the SAME finding set;
 //! * the operation is `@idempotent`: the same SBOM scanned twice answers the
 //!   identical report and records one scan;
-//! * a document that is not a CycloneDX 1.5 BOM, or that exceeds the documented
-//!   2000-component limit, is refused with a `ValidationException` (what that
+//! * a document that is not a CycloneDX 1.5 BOM, or that exceeds the enforced
+//!   5000-component limit, is refused with a `ValidationException` (what that
 //!   refusal SAYS is pinned in `scan_sbom_refusals.rs`).
 //!
 //! The advisory catalog these cases are written against is
@@ -423,7 +424,7 @@ async fn each_component_is_matched_against_the_stored_advisories() {
 }
 
 #[tokio::test]
-async fn a_finding_carries_both_the_nvd_and_the_inspector_rating() {
+async fn a_finding_carries_one_rating_per_scoring_vendor() {
     let (_engine, router) = emulator();
     let request = json!({
         "sbom": bom(vec![component(
@@ -454,39 +455,57 @@ async fn a_finding_carries_both_the_nvd_and_the_inspector_rating() {
     );
 
     let ratings = finding["ratings"].as_array().cloned().unwrap_or_default();
-    assert_eq!(
-        ratings.len(),
-        2,
-        "expected an NVD rating and an Amazon Inspector rating, got {ratings:?}"
-    );
     let sources: Vec<&str> = ratings
         .iter()
         .map(|r| r["source"]["name"].as_str().unwrap_or_default())
         .collect();
-    assert!(
-        sources.contains(&"NVD") && sources.contains(&"Amazon Inspector"),
-        "expected ratings from NVD and Amazon Inspector, got sources {sources:?}"
+    assert_eq!(
+        sources,
+        vec!["NVD", "Amazon Inspector", "EPSS"],
+        "expected one rating per scoring vendor the advisory holds a score from, got \
+         {ratings:?}"
     );
     for rating in &ratings {
+        let source = rating["source"]["name"].as_str().unwrap_or_default();
+        if source == "EPSS" {
+            // An exploit probability, on its own scale and under the schema's
+            // catch-all method: it is not a CVSS score, so it carries no vector.
+            assert_eq!(
+                rating["method"].as_str(),
+                Some("other"),
+                "case {source:?}: EPSS is not one of CycloneDX's named methods, got {rating}"
+            );
+            assert!(
+                rating["score"]
+                    .as_f64()
+                    .is_some_and(|s| (0.0..=1.0).contains(&s)),
+                "case {source:?}: an exploit probability lies in 0.0..=1.0, got {rating}"
+            );
+            assert!(
+                rating["vector"].is_null(),
+                "case {source:?}: an EPSS rating is not a CVSS vector, got {rating}"
+            );
+            continue;
+        }
         assert_eq!(
             rating["method"].as_str(),
             Some("CVSSv31"),
-            "every rating is a CVSS v3.1 score, got {rating}"
+            "case {source:?}: a severity rating is a CVSS v3.1 score, got {rating}"
         );
         assert!(
             rating["score"].as_f64().is_some_and(|s| (0.0..=10.0).contains(&s)),
-            "a CVSS base score lies in 0.0..=10.0, got {rating}"
+            "case {source:?}: a CVSS base score lies in 0.0..=10.0, got {rating}"
         );
         assert!(
             rating["vector"]
                 .as_str()
                 .is_some_and(|v| v.starts_with("CVSS:3.1/")),
-            "a CVSS v3.1 rating carries a v3.1 vector, got {rating}"
+            "case {source:?}: a CVSS v3.1 rating carries a v3.1 vector, got {rating}"
         );
         assert_eq!(
             rating["severity"].as_str(),
             Some("critical"),
-            "CycloneDX 1.5 spells severities in lowercase, got {rating}"
+            "case {source:?}: CycloneDX 1.5 spells severities in lowercase, got {rating}"
         );
     }
 
@@ -1193,11 +1212,13 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
 }
 
 #[tokio::test]
-async fn the_documented_two_thousand_component_limit_is_enforced_at_its_bound() {
+async fn the_enforced_component_limit_is_enforced_at_its_bound() {
     let (_engine, router) = emulator();
-    // The limit from the `sbom` member's own documentation: "This format limits
-    // you to passing 2000 components before throwing a ValidException error."
-    for (count, expected_status) in [(1_usize, 200_u16), (2000, 200), (2001, 400), (2500, 400)] {
+    // The limit the service enforces: exactly 5000 components are scanned and
+    // one more is refused. (The `sbom` member's own documentation still says
+    // "This format limits you to passing 2000 components before throwing a
+    // ValidException error", which the service does not enforce.)
+    for (count, expected_status) in [(1_usize, 200_u16), (2001, 200), (5000, 200), (5001, 400)] {
         let components: Vec<Value> = (0..count)
             .map(|i| {
                 component(
@@ -1217,8 +1238,8 @@ async fn the_documented_two_thousand_component_limit_is_enforced_at_its_bound() 
             assert!(
                 response["message"]
                     .as_str()
-                    .is_some_and(|m| m.contains("2000")),
-                "case {count} components: the refusal must name the documented limit, got {response}"
+                    .is_some_and(|m| m.contains("5000")),
+                "case {count} components: the refusal must name the enforced limit, got {response}"
             );
         }
     }
@@ -1262,10 +1283,10 @@ async fn a_nested_assembly_is_scanned_and_counted_against_the_documented_limit()
         response["sbom"]["components"]
     );
 
-    // Every entry of the tree counts against the documented 2000-component
-    // limit, not just the top level: 1 top-level assembly carrying 2000
-    // children is 2001 components.
-    for (children, expected_status) in [(1998_usize, 200_u16), (1999, 200), (2000, 400)] {
+    // Every entry of the tree counts against the enforced 5000-component limit,
+    // not just the top level: 1 top-level assembly carrying 5000 children is
+    // 5001 components.
+    for (children, expected_status) in [(4998_usize, 200_u16), (4999, 200), (5000, 400)] {
         let leaves: Vec<Value> = (0..children)
             .map(|i| {
                 component(

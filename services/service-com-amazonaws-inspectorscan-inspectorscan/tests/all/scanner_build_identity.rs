@@ -82,6 +82,9 @@ fn inject_advisory(engine: &Arc<engine::InMemoryEngine>, id: &str, package_name:
         inspector_score: 5.0,
         inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N".to_string(),
         inspector_severity: "MEDIUM".to_string(),
+        // The scoring system has published no estimate for this fixture, which
+        // is reported as no EPSS rating at all.
+        epss_score: None,
         cwes: vec![20],
         description: format!("{id} applies to {package_name}."),
         advisories: Vec::new(),

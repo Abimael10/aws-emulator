@@ -45,6 +45,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether IAM lets the calling principal perform this service's action, and the sentence a
+/// refusal carries. `ScanSbom` asks this gate before it reads the submitted document.
+pub mod authorization;
+
+/// The order this service lists an enumerated type's admissible values in, applied to every
+/// boundary refusal it words.
+mod enum_value_sets;
+
 /// The `com-amazonaws-inspectorscan-inspectorscan` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +106,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. The ONE thing reworded here is the ORDER an
+        // enumerated type's admissible set is listed in: the sentence, the code,
+        // the member path and the echoed value all stay the framework's, so the
+        // code a client branches on cannot drift from the message beside it. See
+        // [`enum_value_sets`].
+        enum_value_sets::refused(refusal)
     }
 
     fn override_routing_error(

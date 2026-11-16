@@ -63,6 +63,14 @@ pub struct VulnRecord {
     pub inspector_score: f64,
     pub inspector_cvss_vector: String,
     pub inspector_severity: String,
+    /// The advisory's EPSS probability: the Exploit Prediction Scoring System's
+    /// estimate that the vulnerability will be exploited in the wild in the next
+    /// 30 days, which is a probability and so lies in `0.0..=1.0` — a different
+    /// quantity from the 0-10 CVSS severity scores above, reported beside them
+    /// under its own scoring vendor. `None` for an advisory the scoring system
+    /// has published no estimate for, which is reported as no EPSS rating rather
+    /// than as a probability of zero.
+    pub epss_score: Option<f64>,
     /// CWE ids as integers: CycloneDX 1.5 types `vulnerability.cwes` as an
     /// array of integers, so the store keeps them in that form.
     pub cwes: Vec<u32>,
@@ -577,7 +585,8 @@ pub fn normalize_version(version: &str) -> Option<ReleaseVersion> {
 /// Real, published CVEs across the ecosystems Amazon Inspector's SBOM scanner
 /// covers (npm, PyPI, Maven, Go, and OS packages), with their NVD CVSS v3.1
 /// base scores and vectors. The Inspector rating is the environment-adjusted
-/// score Inspector reports beside the NVD one.
+/// score Inspector reports beside the NVD one, and the EPSS probability the
+/// exploit-prediction estimate reported beside both.
 fn seed_vulnerability_db() -> Vec<VulnRecord> {
     vec![
         VulnRecord {
@@ -594,6 +603,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 7.2,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H".to_string(),
             inspector_severity: "HIGH".to_string(),
+            epss_score: Some(0.0043),
             cwes: vec![77],
             description: "lodash versions prior to 4.17.21 are vulnerable to command injection \
                           via the template function."
@@ -619,6 +629,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 9.8,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
             inspector_severity: "CRITICAL".to_string(),
+            epss_score: Some(0.0021),
             cwes: vec![1321],
             description: "minimist before 1.2.6 is vulnerable to prototype pollution.".to_string(),
             advisories: vec!["https://github.com/minimistjs/minimist/commit/c2b981977fa834b223b408cfb860f933c9811e4d".to_string()],
@@ -639,6 +650,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 7.5,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H".to_string(),
             inspector_severity: "HIGH".to_string(),
+            epss_score: Some(0.0062),
             cwes: vec![400],
             description: "urllib3 before 1.26.5 allows a denial of service via a crafted URL \
                           with many @ characters."
@@ -661,6 +673,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 9.8,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
             inspector_severity: "CRITICAL".to_string(),
+            epss_score: Some(0.0091),
             cwes: vec![20],
             description: "PyYAML before 5.4 allows arbitrary code execution when loading \
                           untrusted YAML with the full_load method or the FullLoader loader."
@@ -686,6 +699,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 10.0,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H".to_string(),
             inspector_severity: "CRITICAL".to_string(),
+            epss_score: Some(0.9742),
             cwes: vec![917, 502, 20],
             description: "Apache Log4j2 2.0-beta9 through 2.15.0 JNDI features used in \
                           configuration, log messages, and parameters do not protect against \
@@ -697,6 +711,37 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             ],
             published: "2021-12-10T10:15:00Z".to_string(),
             modified: "2023-11-07T03:39:00Z".to_string(),
+        },
+        VulnRecord {
+            cve_id: "CVE-2015-7501".to_string(),
+            source: "NVD".to_string(),
+            source_url: Some("https://nvd.nist.gov/vuln/detail/CVE-2015-7501".to_string()),
+            package_name: "commons-collections:commons-collections".to_string(),
+            package_type: "maven".to_string(),
+            affected: VersionRange::before(ReleaseVersion::new(3, 2, 2)),
+            fixed_in_version: Some("3.2.2".to_string()),
+            cvss_v3_score: 9.8,
+            cvss_v3_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
+            nvd_severity: "CRITICAL".to_string(),
+            inspector_score: 9.8,
+            inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
+            inspector_severity: "CRITICAL".to_string(),
+            epss_score: Some(0.9411),
+            // Deserialization of untrusted data: the InvokerTransformer gadget
+            // chain turns a deserialized object graph into remote code
+            // execution.
+            cwes: vec![502],
+            description: "Apache Commons Collections before 3.2.2 allows remote attackers to \
+                          execute arbitrary code through the InvokerTransformer gadget chain \
+                          when deserializing untrusted data."
+                .to_string(),
+            advisories: vec![
+                "https://issues.apache.org/jira/browse/COLLECTIONS-580".to_string(),
+                "https://commons.apache.org/proper/commons-collections/security-reports.html"
+                    .to_string(),
+            ],
+            published: "2017-11-09T16:29:00Z".to_string(),
+            modified: "2023-02-13T00:40:00Z".to_string(),
         },
         VulnRecord {
             cve_id: "CVE-2020-36518".to_string(),
@@ -715,6 +760,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 7.5,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H".to_string(),
             inspector_severity: "HIGH".to_string(),
+            epss_score: Some(0.0034),
             // NVD maps this advisory to uncontrolled recursion: the defect is
             // a stack exhaustion reached through deeply nested input.
             cwes: vec![674],
@@ -741,6 +787,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 7.5,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N".to_string(),
             inspector_severity: "HIGH".to_string(),
+            epss_score: Some(0.0027),
             cwes: vec![444],
             description: "github.com/gin-gonic/gin before 1.7.7 allows header injection because \
                           it does not sanitize the X-Forwarded-For header."
@@ -769,6 +816,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 7.5,
             inspector_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H".to_string(),
             inspector_severity: "HIGH".to_string(),
+            epss_score: Some(0.0048),
             cwes: vec![787],
             description: "A buffer overrun can be triggered in X.509 certificate verification, \
                           specifically in name constraint checking, in OpenSSL 3.0.0 through \
@@ -797,6 +845,7 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             inspector_score: 7.0,
             inspector_cvss_vector: "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H/E:P".to_string(),
             inspector_severity: "HIGH".to_string(),
+            epss_score: Some(0.0012),
             cwes: vec![787],
             description: "A buffer overflow was discovered in the GNU C Library's dynamic \
                           loader while processing the GLIBC_TUNABLES environment variable."

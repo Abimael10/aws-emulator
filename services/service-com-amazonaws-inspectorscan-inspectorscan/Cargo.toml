@@ -27,10 +27,22 @@ tracing = { workspace = true }
 # a package's dev and normal dependencies are one list in the lockfile.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `iam_authorization` (the one shared evaluation of IAM policy documents and the
+# one wording of an authorization refusal) and `validation_message`
+# (`in_hashed_enum_order`, the one derivation of the order an enumerated type's
+# admissible set is listed in).
+service-common = { path = "../common" }
+# `ScanSbom` is decided against the CALLING principal's identity-based policies
+# before it scans (`service::authorization`): the principal an access key id
+# speaks for is the session the token service minted it for — the record
+# `GetCallerIdentity` answers from — or the IAM user that owns a long-term key,
+# and the documents in force on it live in the IAM emulator's own store. Both
+# are reached through the one shared engine, which needs the owning services'
+# state TYPES.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
-# NO OTHER dependency is declared, and none is removed, so this change leaves
-# the workspace `Cargo.lock` untouched — the one file nearly every other
-# service's change rewrites. The percent-decoding a `purl` segment needs comes
+# NOTHING ELSE is declared. The percent-decoding a `purl` segment needs comes
 # from `smithy_server_runtime::percent_decode`, already a dependency above, and
 # the one thing left in this crate is purl's own decomposition of a coordinate
 # per the specification's layout, plus a release compared against an advisory's

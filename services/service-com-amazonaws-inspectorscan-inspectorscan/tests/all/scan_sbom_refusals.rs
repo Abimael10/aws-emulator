@@ -25,10 +25,11 @@ use serde_json::{json, Value};
 const PREFIX: &str = "Input SBOM failed validation: ";
 
 /// The component ceiling the handler enforces (`MAX_COMPONENTS` in
-/// `src/ops/scan_sbom.rs`, from the `sbom` member's own modeled documentation).
-/// The limit clause states this same number, which the bound cases below check
-/// by accepting exactly this many components and refusing one more.
-const COMPONENT_LIMIT: usize = 2000;
+/// `src/ops/scan_sbom.rs`). The limit clause states this same number, which the
+/// bound cases below check by accepting exactly this many components and
+/// refusing one more. It is the limit the service ENFORCES rather than the stale
+/// 2000 the `sbom` member's modeled documentation still states.
+const COMPONENT_LIMIT: usize = 5000;
 
 /// One row: a request's `sbom` value and the whole refusal message it must be
 /// answered with.
