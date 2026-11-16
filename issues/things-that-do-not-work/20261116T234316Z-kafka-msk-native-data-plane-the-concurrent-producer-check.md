@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: kafka.kafka-four-concurrent-producers-all-land-every-record-with-distinct-offsets kafka.msk-transactional-abort-invisible-to-read-committed-visible-to-read-uncommitted
+Issue-Shape-Id: com.amazonaws.kafka#Kafka
+Issue-Key: kafka.kafka-four-concurrent-producers-all-land-every-record-with-distinct-offsets|_invoke#12|Timeout|out = _HANDLER_NS["handler"](event, _Remaining(budget))
+Issue-Key: kafka.msk-transactional-abort-invisible-to-read-committed-visible-to-read-uncommitted|_prove_executor_in_vpc#2|AssertionError|raise _no_executor(
+Issue-Commit: 7553544b366842eca4c0d9578515a967b671a232
+
+# MSK native data plane: the concurrent-producer check never clears SASL/IAM bring-up, and the in-VPC Lambda executor has no network route so the transactional-isolation check measures nothing (2 causes)
+
+> _Note: this issue was identified against the code base at commit `7553544b366842eca4c0d9578515a967b671a232`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetBootstrapBrokers
+
+## Description
+Two net-new root causes in the emulated MSK (kafka) surface, both grounded in failing behavioral checks the suite lists under `### kafka`. Neither check's replay key is carried by any open issue, so neither is covered: the open issue 20261116T210722Z-kafka-msk-native-data-plane-sasl-iam-bring-up.md names the same family as Cause 1 and even lists that check id, but it carries a DIFFERENT replay key for it (`...|_invoke#13|Timeout|return out`) than the one this replay produced, so the failure below is not gated by it; 20261105T101629Z-kafka-every-native-msk-data-plane-check-is.md (Lambda runtime missing `os.register_at_fork`) and 20261111T015651Z-kafka-logs-s3-the-msk-broker-log-delivery-7fe3ca.md (Lambda runtime missing `select`) name in-VPC-executor breakage of a different kind than Cause 2 (a missing module, not a missing route).
+
+Cause 1 of 2 — the native SASL/IAM bring-up barrier never clears, so the four-concurrent-producers check is killed before it asserts anything.
+AWS: CreateClusterV2 with a `serverless` request (Smithy: CreateClusterV2, POST /api/v2/clusters, input member Serverless -> ServerlessRequest, output member State -> ClusterState) answers State CREATING and the cluster settles to ACTIVE, observable through DescribeClusterV2 (GET /api/v2/clusters/{ClusterArn}). GetBootstrapBrokers (Smithy: GET /v1/clusters/{ClusterArn}/bootstrap-brokers, output member BootstrapBrokerStringSaslIam, jsonName bootstrapBrokerStringSaslIam, target __string) then publishes a comma-separated host:port list, and a client inside the cluster's own VPC completes a SASL_SSL / AWS_MSK_IAM handshake on tcp/9098 and is served ApiVersions, Metadata, CreateTopics, Produce and Fetch. Recorded behavior: the check clears that two-phase readiness barrier (a TCP accept on the advertised endpoint, then a Kafka metadata call the broker actually answers) and then drives four concurrent producers, each of whose records must land with a distinct offset.
+Emulator: the check hangs in bring-up and the harness kills it — `Error: Check timed out after 60.0s`. No HTTP response and no Kafka-protocol response is ever asserted on, so the concurrency guarantee is unobservable. Hypothesis: either the serverless cluster lifecycle does not settle to ACTIVE, or nothing accepts and speaks the Kafka wire protocol on the endpoint published in bootstrapBrokerStringSaslIam.
+Why: a client that creates an MSK Serverless cluster and connects with an AWS_MSK_IAM SASL producer blocks indefinitely instead of getting records acknowledged with offsets or an error. Multi-producer offset assignment — that every produced record lands exactly once at a distinct offset — cannot be relied on at all.
+Fix: the kafka service's cluster-lifecycle state (the CreateClusterV2/DescribeClusterV2 state machine must reach ACTIVE promptly) and the emulated native broker listener behind GetBootstrapBrokers — it must accept on the host:port it advertises and serve the Kafka protocol over SASL/IAM, including per-partition offset assignment under concurrent producers.
+Traces: kafka.kafka-four-concurrent-producers-all-land-every-record-with-distinct-offsets.
+
+Cause 2 of 2 — a Lambda function configured with VpcConfig reaches no host at all, so the in-VPC executor that carries every native data-plane measurement into the cluster VPC is unusable.
+AWS: recorded behavior only (no Smithy constraint governs datagram routing). A Lambda function created with VpcConfig (subnets + security groups) is attached to those subnets through a Hyperplane ENI: a route lookup toward any address in the VPC CIDR resolves to a source address INSIDE that CIDR, and the VPC's Route 53 Resolver, at the VPC CIDR base + 2, answers DNS queries sent from the function. The recording shows the executor proving VPC attachment on both signals before any Kafka work begins.
+Emulator: both proofs fail with the emulator's own refusal. A UDP route lookup toward the resolver address returns no source address and raises `OSError: errno=101 [Errno 101] a Lambda function in this emulator reaches no host: the only address its datagrams reach is the X-Ray daemon named by AWS_XRAY_DAEMON_ADDRESS`, and the hand-framed DNS query to the VPC resolver gets the same `OSError: [Errno 101] ...` with no reply. The check then reports `AssertionError: the in-VPC executor is unusable, so this run measured nothing: neither in-VPC signal fired`. (The CIDR and resolver address in the message are this run's values; the requirement is that a VPC-attached function's source address falls inside its own subnets' CIDR and that the resolver at CIDR base + 2 replies.)
+Why: the emulator announces a Lambda function as VPC-attached (CreateFunction with VpcConfig is accepted) while giving it no route to anything but the X-Ray daemon. Every workload that depends on in-VPC reachability — an MSK client, an RDS client, a private endpoint, a VPC DNS lookup — fails with a hard errno 101 instead of connecting, and the MSK transactional-isolation guarantee (an aborted transaction invisible to read_committed and visible to read_uncommitted) cannot be measured at all.
+Fix: the Lambda function's execution sandbox networking in the lambda service — a function created with VpcConfig must be given an address in the nominated subnets and a route to the VPC's address space, and the emulated VPC resolver at CIDR base + 2 must answer queries from it, rather than egress being restricted to the X-Ray daemon address.
+Traces: kafka.msk-transactional-abort-invisible-to-read-committed-visible-to-read-uncommitted.
+
+## Evidence
+Cause 1:
+  check kafka.kafka-four-concurrent-producers-all-land-every-record-with-distinct-offsets
+  Expected: CreateClusterV2(Serverless) -> DescribeClusterV2 reaches ACTIVE -> GetBootstrapBrokers returns bootstrapBrokerStringSaslIam -> an in-VPC kafka-python client completes the SASL_SSL/AWS_MSK_IAM handshake on tcp/9098, creates the topic and four concurrent producers' records all land with distinct offsets.
+  Actual: 'Error: Check timed out after 60.0s' — the check never returns from bring-up; zero responses asserted on.
+
+Cause 2:
+  check kafka.msk-transactional-abort-invisible-to-read-committed-visible-to-read-uncommitted
+  Expected: the Lambda executor created with VpcConfig proves VPC attachment — a UDP route lookup toward an address in the executor VPC CIDR returns a source address inside that CIDR, and a DNS A query to the VPC resolver (CIDR base + 2) returns a reply — then drives the transaction: records of an aborted transaction are invisible to a read_committed consumer and visible to a read_uncommitted one.
+  Actual: AssertionError: the in-VPC executor is unusable, so this run measured nothing: neither in-VPC signal fired: the source address toward 10.226.0.2 was None (error 'OSError: errno=101 [Errno 101] a Lambda function in this emulator reaches no host: the only address its datagrams reach is the X-Ray daemon named by AWS_XRAY_DAEMON_ADDRESS'), not inside the executor VPC CIDR 10.226.0.0/16; and the VPC resolver did not reply at all (error 'OSError: [Errno 101] a Lambda function in this emulator reaches no host: the only address its datagrams reach is the X-Ray daemon named by AWS_XRAY_DAEMON_ADDRESS')
+
+## Steps to Reproduce
+Cause 1: CreateClusterV2 with a Serverless request in a private VPC whose security group admits tcp/9098; poll DescribeClusterV2 until State is ACTIVE; call GetBootstrapBrokers and read bootstrapBrokerStringSaslIam; from inside the cluster's VPC open a TCP connection to the first host:port, complete a SASL_SSL handshake with mechanism AWS_MSK_IAM, fetch metadata, CreateTopics, then run four producers concurrently and collect the acknowledged offsets. Observe that bring-up never completes within the check budget. Replay: kafka.kafka-four-concurrent-producers-all-land-every-record-with-distinct-offsets.
+
+Cause 2: create a VPC with subnets and a security group; create a Lambda function with VpcConfig naming those subnets and an execution role carrying AWSLambdaVPCAccessExecutionRole; Invoke it with a handler that (a) opens an AF_INET/SOCK_DGRAM socket, connect()s to the VPC CIDR base + 2 and reads getsockname()[0], and (b) sends a hand-framed DNS A query to that same address. Observe OSError errno 101 ('a Lambda function in this emulator reaches no host...') for both instead of a source address inside the subnet CIDR and a DNS reply. Replay: kafka.msk-transactional-abort-invisible-to-read-committed-visible-to-read-uncommitted.
