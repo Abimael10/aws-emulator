@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableImageDeprecation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableImageDeprecation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the deprecation date the request names onto the account's own AMI in
+//! [`crate::state`], where every read of that image reports it as `Image$DeprecationTime`.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableImageDeprecation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The date is STORED, never echoed: it is the requested instant rounded to the nearest
+//! minute ([`crate::state::deprecation_instant`]), so a `DescribeImages` of the image
+//! afterwards reports the minute this call fixed, and `DisableImageDeprecation` takes the
+//! same member away again.
+//!
+//! The refusals: something that is not an AMI id is `InvalidAMIID.Malformed`; a date in the
+//! past or beyond the published upper limit is `InvalidParameterValue`; a `DryRun` request
+//! is `DryRunOperation`; an id the account can see no image for is `InvalidAMIID.NotFound`;
+//! and an AMI the account does not own is `AuthFailure`, since only the AMI owner can
+//! deprecate it.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +145,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableImageDeprecation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableImageDeprecationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableImageDeprecation"))
+        use crate::state::{
+            MAX_STORED_BYTES, deprecation_date_beyond_limit, deprecation_date_in_the_past,
+            deprecation_instant, deprecation_time_rendering, dry_run_operation,
+            image_deprecation_limit, image_id_is_well_formed, internal_error,
+            invalid_ami_id_malformed, require_own_image, require_service_state,
+            resource_limit_exceeded,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // An id that is not an AMI id at all names no image that could ever exist, so it is
+        // refused before anything is looked up under it — and before the `DryRun` arm below:
+        // the FORM of a value is a fact of the request, not of the permission check.
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(invalid_ami_id_malformed(&input.image_id));
+        }
+
+        // "The date and time to deprecate the AMI … If you specify a value for seconds,
+        // Amazon EC2 rounds the seconds to the nearest minute" (`DeprecateAt`): the instant
+        // this call stores, whatever precision the caller sent.
+        let deprecate_at = deprecation_instant(input.deprecate_at);
+
+        // "You can't specify a date in the past" (`DeprecateAt`), asked of the instant the
+        // REQUEST named rather than of the rounded one, because that is the value the caller
+        // specified. A fact of the request, so it is answered before the flag below.
+        let now = ::std::time::SystemTime::now();
+        let now_seconds = ::aws_smithy_types::DateTime::from(now).secs();
+        if input.deprecate_at.secs() < now_seconds {
+            return Err(deprecation_date_in_the_past());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A `pending` AMI a copy produced reaches `available` at an instant that call fixed,
+        // so that move is owed whether or not anybody asked: it is applied before this one
+        // resolves the image it is to change.
+        store.materialize_due_transitions();
+
+        // DryRun sits after every parameter the REQUEST carries has been read and before the
+        // image it names is resolved, which is where the recorded contract of this surface
+        // puts it (`crate::ops::disable_fast_launch`): the flag asks whether the CALLER may
+        // make the request, which nothing the store holds can answer. A request answered
+        // here leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // "Only the AMI owner can enable or disable AMI deprecation": the id has to resolve
+        // to an image this account owns, and the two facts the upper limit depends on — the
+        // image's public launch permissions and its creation date — are read off that one
+        // resolution.
+        let (limit, public, refund) = {
+            let image = require_own_image(&store, &input.image_id)?;
+            (
+                image_deprecation_limit(image, now),
+                image.public.unwrap_or(false),
+                image.deprecation_time.as_deref().map_or(0, str::len),
+            )
+        };
+        if limit.is_some_and(|limit| deprecate_at > limit) {
+            return Err(deprecation_date_beyond_limit(public));
+        }
+
+        // The rendering every read of the image will report, which is what the store holds.
+        // A date no UTC rendering can carry is further out than any limit the member
+        // publishes, so it is answered the same way one past the limit is.
+        let Some(rendering) = deprecation_time_rendering(deprecate_at) else {
+            return Err(deprecation_date_beyond_limit(public));
+        };
+
+        // The stored rendering replaces whatever date the image carried, so the budget is
+        // asked about the NET change the way every other modification asks it.
+        let charge = rendering.len();
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store this deprecation date's {charge} \
+                 bytes",
+                held = store.stored_bytes(),
+            )));
+        }
+
+        // Written through the store's ONE writer of that member, so the image reports this
+        // date to every later reader.
+        store.set_image_deprecation_time(&input.image_id, Some(rendering.clone()));
+
+        // Read the answer back OUT of the store: "returns true if the request succeeds"
+        // (`Return`) is a claim about what the store now holds, so it is made from what it
+        // holds rather than from this stack frame.
+        if store.image_deprecation_time(&input.image_id).as_deref() != Some(rendering.as_str()) {
+            return Err(internal_error(format!(
+                "the deprecation date of AMI '{}' could not be read back",
+                input.image_id
+            )));
+        }
+        Ok(EnableImageDeprecationOutput {
+            r#return: Some(true),
+        })
     }
 }

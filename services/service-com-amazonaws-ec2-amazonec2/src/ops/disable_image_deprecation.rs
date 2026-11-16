@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableImageDeprecation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableImageDeprecation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the deprecation date away from the account's own AMI in
+//! [`crate::state`], so no read of that image reports an `Image$DeprecationTime` any more.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableImageDeprecation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The cancellation is the other end of the one stored member
+//! `EnableImageDeprecation` writes (`crate::state`'s one writer of it): the AMI
+//! stops being a deprecated image, so the describes report it again without
+//! `IncludeDeprecated`. An AMI that carries no deprecation date has nothing to cancel, and
+//! the call still succeeds.
+//!
+//! The refusals: something that is not an AMI id is `InvalidAMIID.Malformed`; a `DryRun`
+//! request is `DryRunOperation`; an id the account can see no image for is
+//! `InvalidAMIID.NotFound`; and an AMI the account does not own is `AuthFailure`, since only
+//! the AMI owner can cancel its deprecation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +140,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableImageDeprecation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableImageDeprecationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableImageDeprecation"))
+        use crate::state::{
+            dry_run_operation, image_id_is_well_formed, internal_error, invalid_ami_id_malformed,
+            require_own_image, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // An id that is not an AMI id at all names no image that could ever exist, so it is
+        // refused before anything is looked up under it — and before the `DryRun` arm below,
+        // the reading and the order the enable of this same member uses
+        // (`crate::ops::enable_image_deprecation`).
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(invalid_ami_id_malformed(&input.image_id));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A `pending` AMI a copy produced reaches `available` at an instant that call fixed,
+        // so that move is owed whether or not anybody asked: it is applied before this one
+        // resolves the image it is to change.
+        store.materialize_due_transitions();
+
+        // The permission question, answered before the image it names is resolved and before
+        // the write — the place the enable of this member answers it too.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // "Only the AMI owner can enable or disable AMI deprecation": the id has to resolve
+        // to an image this account owns.
+        require_own_image(&store, &input.image_id)?;
+
+        // Written through the store's ONE writer of that member: the image carries no
+        // deprecation date afterwards, whether or not it carried one before.
+        store.set_image_deprecation_time(&input.image_id, None);
+
+        // Read the answer back OUT of the store: "returns true if the request succeeds"
+        // (`Return`) is a claim about what the store now holds.
+        if let Some(remaining) = store.image_deprecation_time(&input.image_id) {
+            return Err(internal_error(format!(
+                "AMI '{}' still carries the deprecation date '{remaining}'",
+                input.image_id
+            )));
+        }
+        Ok(DisableImageDeprecationOutput {
+            r#return: Some(true),
+        })
     }
 }

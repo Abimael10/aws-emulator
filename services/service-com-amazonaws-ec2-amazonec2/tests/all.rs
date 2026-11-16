@@ -13,6 +13,13 @@
 // and inserts its two lines in sorted order, so the sorted neighbourhood of this suite is
 // the contended region of this file — this fix lost several serialized squash merges to
 // exactly that. The lines above are the file header, which no landing edits.
+// The deprecation date an AMI carries: the instant an enable stores on the image, rounded to
+// the minute and reported by every later read, the cancellation that takes it away, the
+// published bounds on the date a request may name, and what both ends refuse. Declared FIRST
+// for the reason the note above gives: the sorted neighbourhood and the tail of this file are
+// where every new ec2 suite inserts its lines.
+#[path = "all/image_deprecation.rs"]
+mod image_deprecation;
 // The NAME an Amazon Web Services-managed prefix list is published under — the Region's scope
 // for a list whose ranges are a Region's, the global scope for one AWS publishes once for every
 // Region — and that the id a lookup by that name reports resolves wherever a prefix list id is

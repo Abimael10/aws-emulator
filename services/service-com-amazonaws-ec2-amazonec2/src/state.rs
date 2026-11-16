@@ -1979,6 +1979,13 @@ use crate::ops::types::{
 };
 use crate::scaffolded::Scaffolded;
 
+/// The deprecation date an AMI carries: the one stored reading of `Image$DeprecationTime`
+/// that `EnableImageDeprecation` writes and `DisableImageDeprecation` takes away, with the
+/// bounds and the ownership rule both ends are held to. Re-exported, so a handler reaches
+/// them as `crate::state::<item>` like every other primitive of this module.
+mod image_deprecation;
+pub use image_deprecation::*;
+
 // The Recycle Bin an AMI waits in between its deregistration and its permanent deletion,
 // and every rule that moves one in or out of it, in a module of its own.
 mod image_recycle_bin;
