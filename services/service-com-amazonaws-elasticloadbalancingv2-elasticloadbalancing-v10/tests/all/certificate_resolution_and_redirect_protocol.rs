@@ -248,7 +248,14 @@ fn redirect_action(prefix: &str, protocol: Option<&str>) -> Form {
 
 /// `DescribeListenerCertificates` for one listener, as `(CertificateArn, IsDefault)` rows
 /// in the order reported.
-async fn certificate_rows(router: &MultiServiceRouter, arn: &str) -> Vec<(String, Option<String>)> {
+///
+/// `pub(crate)` because the suite that drives the same list through the operations that EDIT
+/// it (`alb_https_listener_certificate_list_state`) reads it back the same way: one spelling
+/// of that read for the crate.
+pub(crate) async fn certificate_rows(
+    router: &MultiServiceRouter,
+    arn: &str,
+) -> Vec<(String, Option<String>)> {
     let mut form = action("DescribeListenerCertificates");
     form.push(p("ListenerArn", arn));
     let reply = call(router, &form).await;

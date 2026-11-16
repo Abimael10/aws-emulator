@@ -193,3 +193,7 @@ mod internet_facing_placement;
 // authenticated.
 #[path = "all/alb_authenticate_users.rs"]
 mod alb_authenticate_users;
+// Declared after the sorted list for the same reason the four suites above are. WHICH
+// certificate an HTTPS listener presents once its certificate list has been edited.
+#[path = "all/alb_https_listener_certificate_list_state.rs"]
+mod alb_https_listener_certificate_list_state;

@@ -229,6 +229,41 @@ pub(crate) async fn add_listener_certificate(
     );
 }
 
+/// Take one certificate off a listener's certificate list, through the operation that owns
+/// that list.
+pub(crate) async fn remove_listener_certificate(
+    router: &MultiServiceRouter,
+    listener_arn: &str,
+    certificate_arn: &str,
+) {
+    let mut form = action("RemoveListenerCertificates");
+    form.push(p("ListenerArn", listener_arn));
+    form.push(p("Certificates.member.1.CertificateArn", certificate_arn));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case remove a listener certificate: expected 200, got {} body {}",
+        reply.status, reply.body
+    );
+}
+
+/// Replace a listener's DEFAULT certificate, through the operation that owns it.
+pub(crate) async fn modify_default_certificate(
+    router: &MultiServiceRouter,
+    listener_arn: &str,
+    certificate_arn: &str,
+) {
+    let mut form = action("ModifyListener");
+    form.push(p("ListenerArn", listener_arn));
+    form.push(p("Certificates.member.1.CertificateArn", certificate_arn));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case make a certificate the listener default: expected 200, got {} body {}",
+        reply.status, reply.body
+    );
+}
+
 /// Place the instant the load balancer's move to `active` is owed at in the past, so a case
 /// serves traffic without sleeping for the span the clock owes.
 pub(crate) fn make_active(engine: &Arc<engine::InMemoryEngine>, lb_arn: &str) {
@@ -341,16 +376,25 @@ impl rustls::client::danger::ServerCertVerifier for AssertedAfterwards {
 
 /// What one TLS exchange observed: the leaf the listener presented, the TLS version it
 /// negotiated, and the answer it sent.
-struct Presented {
-    leaf: Vec<u8>,
-    version: Option<rustls::ProtocolVersion>,
-    answer: String,
+///
+/// `pub(crate)` for the same reason the helpers above are: the suite beside this one that
+/// drives the certificate list through the operations that EDIT it
+/// (`alb_https_listener_certificate_list_state`) observes the same three things of the same
+/// exchange.
+pub(crate) struct Presented {
+    pub(crate) leaf: Vec<u8>,
+    pub(crate) version: Option<rustls::ProtocolVersion>,
+    pub(crate) answer: String,
 }
 
 /// Dial the published address, complete a TLS handshake asking for `server_name` (or asking
 /// for no name at all, which is what a client dialling an address does), send one request
 /// and read the answer.
-async fn tls_exchange(case: &str, published: &str, server_name: Option<&str>) -> Presented {
+pub(crate) async fn tls_exchange(
+    case: &str,
+    published: &str,
+    server_name: Option<&str>,
+) -> Presented {
     let conn = dial(published).await;
     // A client that asks for a name sends it as the `ClientHello`'s `server_name`; one that
     // asks for none dials the address itself, which carries no such extension.
