@@ -15,8 +15,9 @@
 //! 2. **a spent `ClientToken` registers nothing a second time.** `ClientToken` is an
 //!    `@idempotencyToken` the recorded service SPENDS: a retry presenting a token this
 //!    account has already registered a model package with is refused 400
-//!    `ConflictException` naming that package — whether it is still held or has since been
-//!    deleted — so a second registry version is never added under a token already used.
+//!    `ConflictException` — whether that package is still held or has since been deleted, and
+//!    whichever package the retry names — so a second registry version is never added under a
+//!    token already used.
 //!
 //! The harness is the one `model_package_registry` declares, so these cases drive the same
 //! router every other suite of this crate drives.
@@ -178,10 +179,10 @@ async fn a_container_image_path_outside_the_documented_formats_is_refused() {
 }
 
 /// RULE: a `ClientToken` this account has SPENT registers nothing a second time — a retry
-/// presenting it is refused 400 `ConflictException` naming the model package that token
-/// registered, whether that package is still held or has since been deleted, so a registry
-/// version is never added under a token already used; a token reused for a DIFFERENT package
-/// is a fresh call.
+/// presenting it is refused 400 `ConflictException` naming the model package the RETRY asked
+/// for, whether the registration that spent the token is still held or has since been
+/// deleted, and whichever package the retry names, so a registry version is never added under
+/// a token already used.
 ///
 /// The rows differ along the kind of package the token registered (an unversioned package and
 /// a version inside a group) and along what the retry does (repeat the same request, present
@@ -311,11 +312,12 @@ async fn a_spent_client_token_registers_nothing_a_second_time() {
          {described}"
     );
 
-    // And a token spent on one package is a fresh call for ANOTHER: the record is scoped to
-    // the identity the retry asks for.
-    let elsewhere = emulator
-        .create(
-            "a spent token on another package",
+    // And a token spent on one package is still spent for ANOTHER: the record is scoped to
+    // the account, so presenting it again is a reuse of the call that spent it whichever
+    // package the retry names — and the refusal names the package the RETRY asked for.
+    let (status, elsewhere) = emulator
+        .call(
+            "CreateModelPackage",
             &json!({
                 "ModelPackageName": "token-elsewhere",
                 "ClientToken": "token-spent-package",
@@ -324,8 +326,26 @@ async fn a_spent_client_token_registers_nothing_a_second_time() {
         )
         .await;
     assert_eq!(
-        elsewhere,
-        expected_arn(state::DEFAULT_REGION, "token-elsewhere"),
-        "case \"a spent token on another package\": expected a registration, got {elsewhere:?}"
+        (status, error_code(&elsewhere).as_str()),
+        (400, "ConflictException"),
+        "case \"a spent token on another package\": a spent token must be refused, got \
+         {status} with {elsewhere}"
+    );
+    assert!(
+        message(&elsewhere).contains("Name:token-elsewhere"),
+        "case \"a spent token on another package\": the refusal must name the package the \
+         retry asked for, got {:?}",
+        message(&elsewhere)
+    );
+    let (status, read) = emulator
+        .call(
+            "DescribeModelPackage",
+            &json!({"ModelPackageName": "token-elsewhere"}),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"a spent token on another package\": the refused retry must register nothing, \
+         got {status} with {read}"
     );
 }

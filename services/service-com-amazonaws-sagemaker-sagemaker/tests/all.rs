@@ -205,6 +205,8 @@ mod model_package_pending_window;
 mod model_package_registration_status;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
+#[path = "all/model_package_skipped_validation.rs"]
+mod model_package_skipped_validation;
 #[path = "all/model_package_updates.rs"]
 mod model_package_updates;
 #[path = "all/not_found_refusal_wording.rs"]

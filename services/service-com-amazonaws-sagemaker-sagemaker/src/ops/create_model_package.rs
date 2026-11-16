@@ -4,16 +4,17 @@
 //! IMPLEMENTED: registers a model package in `crate::state` — either an UNVERSIONED
 //! package under its `ModelPackageName`, or the next VERSION inside the model package
 //! group `ModelPackageGroupName` names — minting the `ModelPackageArn` from the
-//! request's region, replaying a repeated `ClientToken` instead of registering twice,
+//! request's region, refusing a repeated `ClientToken` instead of registering twice,
 //! and refusing a name already in use. This is the ONLY file to touch for this
 //! operation.
 //!
 //! Three refusals this operation settles before anything is registered: a container image
 //! path outside the two formats the member documents (see
 //! [`crate::state::container_image`]), one addressing an Amazon ECR registry SageMaker cannot
-//! pull from for this request (see [`crate::state::image_pull`]), and a `ClientToken` this
-//! account has already SPENT on another request or on a registration that is gone — none of
-//! which has a first answer to replay.
+//! pull from for this request — asked only of a registration whose model validation was not
+//! skipped (see [`crate::state::image_pull`]) — and a `ClientToken` this account has already
+//! SPENT on another request or on a registration that is gone — none of which has a first
+//! answer to replay.
 //!
 //! ## Shape of an operation
 //!
@@ -300,9 +301,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // registration refuses naming that registry and repository (see
         // `crate::state::image_pull`), rather than registering a package around an artifact
         // nothing can deploy.
-        if let Some(unpullable) =
+        //
+        // Unless the request asked for its model validation to be SKIPPED: resolving the
+        // containers the registration points at is part of the validation
+        // `SkipModelValidation` turns off ("Indicates if you want to skip model
+        // validation"), so a registration asking to skip it is admitted around whatever
+        // image path it names — which is what lets a caller register a package whose
+        // container this account cannot pull. The path's FORM is still settled above: that
+        // is a property of the value the request carries, not of the model it registers.
+        let skip_model_validation =
+            crate::state::model_validation_is_skipped(input.skip_model_validation.as_deref());
+        let unpullable = if skip_model_validation {
+            None
+        } else {
             crate::state::first_unpullable_image(ctx, container_images(&input))
-        {
+        };
+        if let Some(unpullable) = unpullable {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::image_pull_access_denied(&unpullable),
             ));
@@ -346,22 +360,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientToken` is this operation's idempotency token, and the recorded service
         // SPENDS it: a retry presenting a token this account has already registered a model
         // package with registers nothing — neither a second package nor a second version —
-        // and is refused with the modelled conflict naming the package that token minted.
-        // The record outlives the package, so a retry is refused after the registration has
-        // been deleted too. It is scoped to the identity the request asks for, so a token
-        // reused for a DIFFERENT package is a fresh call rather than a refusal about an
-        // unrelated one.
+        // and is refused with the modelled conflict. The record outlives the package, so a
+        // retry is refused after the registration has been deleted too, and it is scoped to
+        // the ACCOUNT rather than to what the first call registered: the token identifies one
+        // CALL of this operation, so presenting it again is a reuse of that call whichever
+        // package the retry names. The refusal names the identity THIS request asked for,
+        // which is the package the caller is being told it did not get.
         if input
             .client_token
             .as_deref()
-            .and_then(|token| {
-                store.model_package_registered_with_client_token(
-                    token,
-                    &target_name,
-                    target_group.as_deref(),
-                )
-            })
-            .is_some()
+            .is_some_and(|token| store.model_package_client_token_is_spent(token))
         {
             return Err(CreateModelPackageErrorModeled::ConflictException(ConflictException {
                 message: Some(spent_client_token(&client_token_identity(
@@ -476,14 +484,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token is SPENT by this registration, recorded beside the packages so a retry
-        // presenting it replays this answer even once the package is deleted.
-        store.remember_model_package_client_token(
-            input.client_token.as_deref(),
-            &key,
-            &name,
-            group_name.as_deref(),
-            &arn,
-        );
+        // presenting it is refused even once the package is deleted.
+        store.remember_model_package_client_token(input.client_token.as_deref());
         store.model_packages.insert(
             key,
             crate::state::ModelPackage {
@@ -571,15 +573,14 @@ fn container_images(input: &CreateModelPackageInput) -> Vec<&str> {
 /// How this operation words a retry presenting an idempotency token this account has already
 /// SPENT: the IDENTITY the registration that spent it was made under — the model package
 /// group a version joined, or the name an unversioned package was registered under — in the
-/// clause recorded SageMaker states it in, and the window the token stays spent for.
+/// clause recorded SageMaker states it in.
 ///
 /// A spent token registers nothing a second time, so the retry cannot be served: the modelled
 /// `ConflictException` (HTTP 400) is the conflict between the token the request carries and
-/// the registration it already stands for. The window is SageMaker's own published one for an
-/// idempotency token — "This token is valid for 8 hours. If you retry the request with the
-/// same client token within this timeframe and the same parameters" (`ClientToken`'s doc on
-/// the operations that document the timeframe) — so the sentence tells the caller when the
-/// token frees up again. It carries nothing else: not the token, which the caller sent, and
+/// the registration it already stands for. The sentence names the window the token stays spent
+/// for only as "the idempotency window", the way the recorded refusal words it: how long that
+/// window is belongs to the operation's documentation, not to the refusal, so the message
+/// asserts no duration. It carries nothing else: not the token, which the caller sent, and
 /// not the ARN, which the refused call does not report.
 ///
 /// The sentence is the recorded one, so it states the "different request parameters" clause
@@ -590,13 +591,9 @@ fn container_images(input: &CreateModelPackageInput) -> Vec<&str> {
 fn spent_client_token(identity: &str) -> String {
     format!(
         "Specified idempotent client token in Model package with {identity} was used with \
-         different request parameters in the last {CLIENT_TOKEN_WINDOW_HOURS} hours."
+         different request parameters within the idempotency window."
     )
 }
-
-/// How long a `ClientToken` this operation has spent stays spent, in hours: SageMaker's own
-/// published idempotency window ("This token is valid for 8 hours", `ClientToken`'s doc).
-const CLIENT_TOKEN_WINDOW_HOURS: u32 = 8;
 
 /// The clause [`spent_client_token`] names a registration's identity with: the model package
 /// GROUP a version joined, or the NAME an unversioned package was registered under.

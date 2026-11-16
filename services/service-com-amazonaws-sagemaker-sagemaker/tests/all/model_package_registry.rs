@@ -983,7 +983,7 @@ async fn registration_into_a_group_that_does_not_exist_is_refused() {
 
 /// RULE: a `ClientToken` is SPENT by the registration that presented it — a repeat
 /// presenting the same token is refused with the modelled `ConflictException`, naming the
-/// model package that token registered, and registers neither a second package nor a second
+/// model package the repeat asked for, and registers neither a second package nor a second
 /// version, while a different token registers a new one.
 ///
 /// (The whole rule, with every form of retry, is driven by `model_package_admission`; these
@@ -1056,26 +1056,32 @@ async fn a_repeated_client_token_registers_nothing_a_second_time() {
         "case \"same name, no token\": expected HTTP 400, got {status} with {refused}"
     );
 
-    // The record is scoped to the package the retry asks for: the same token naming a
-    // DIFFERENT package registers that package rather than being refused about the first.
+    // The record is scoped to the ACCOUNT: the same token naming a DIFFERENT package is
+    // still a reuse of the call that spent it, refused naming the package the retry asked
+    // for rather than registering a second one.
     let rows = [
         (
             "a used token on another unversioned name",
             json!({"ModelPackageName": "token-elsewhere", "ClientToken": "token-token-package"}),
-            "token-elsewhere".to_string(),
+            "Name:token-elsewhere".to_string(),
         ),
         (
             "a used token on a group",
             json!({"ModelPackageGroupName": "idempotent", "ClientToken": "token-token-package"}),
-            "idempotent/3".to_string(),
+            "Group:idempotent".to_string(),
         ),
     ];
-    for (case, body, expected_resource) in rows {
-        let created = emulator.create(case, &body).await;
+    for (case, body, identity_clause) in rows {
+        let (status, refused) = emulator.call("CreateModelPackage", &body).await;
         assert_eq!(
-            created,
-            expected_arn(state::DEFAULT_REGION, &expected_resource),
-            "case {case:?}: expected the ARN for {expected_resource:?}, got {created:?}"
+            (status, error_code(&refused).as_str()),
+            (400, "ConflictException"),
+            "case {case:?}: a spent token must be refused, got {status} with {refused}"
+        );
+        assert!(
+            message(&refused).contains(&identity_clause),
+            "case {case:?}: the refusal must name the package the retry asked for, got {:?}",
+            message(&refused)
         );
     }
 }

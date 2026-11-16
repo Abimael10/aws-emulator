@@ -130,6 +130,21 @@ fn rows() -> Vec<Row> {
                 "SkipModelValidation": "All",
             }),
         },
+        // A registration whose container this request cannot PULL is admitted only because
+        // the same member waived the validation that resolves it, so this is where the
+        // status such a registration is reported in belongs: it has nothing outstanding
+        // either, through every reader.
+        Row {
+            case: "an image this request cannot pull, waived by SkipModelValidation",
+            extras: json!({
+                "InferenceSpecification": {
+                    // Another account's Amazon ECR registry, in one of the reserved example
+                    // account ids: a registry this account cannot pull from.
+                    "Containers": [container("111122223333.dkr.ecr.us-east-1.amazonaws.com/image:1")],
+                },
+                "SkipModelValidation": "All",
+            }),
+        },
         Row {
             case: "a description, an approval decision and three containers",
             extras: json!({

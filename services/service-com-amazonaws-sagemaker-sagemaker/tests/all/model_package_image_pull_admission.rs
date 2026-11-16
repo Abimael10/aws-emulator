@@ -46,7 +46,7 @@ fn message(body: &Value) -> String {
 /// How SageMaker words an Amazon ECR reference it cannot pull, stated here independently of
 /// the service: the registry and repository the path addressed, then the sentence telling the
 /// caller what to check.
-fn access_denied(registry_id: &str, repository_name: &str) -> String {
+pub(crate) fn access_denied(registry_id: &str, repository_name: &str) -> String {
     format!(
         "Access denied for registry ID: {registry_id}, repository name: {repository_name}. \
          Please check if your ECR image exists and has proper pull permissions for SageMaker."
@@ -55,7 +55,7 @@ fn access_denied(registry_id: &str, repository_name: &str) -> String {
 
 /// An Amazon ECR registry host: `<account>.dkr.ecr.<region>.amazonaws.com`, the form the
 /// Amazon ECR User Guide gives for a pull.
-fn registry(account: &str, region: &str) -> String {
+pub(crate) fn registry(account: &str, region: &str) -> String {
     format!("{account}.dkr.ecr.{region}.amazonaws.com")
 }
 

@@ -21,6 +21,8 @@
 //!
 //! What this does NOT decide:
 //!
+//! * WHETHER the question is asked at all: a registration that asked for its model validation
+//!   to be skipped (`SkipModelValidation`) is admitted without it, which the handler decides;
 //! * a path that addresses no Amazon ECR registry at all (another registry's host, or a bare
 //!   repository name) — the form of such a path is the only question the registration's
 //!   recordings show being asked of it (`super::container_image`), and the refusal here names

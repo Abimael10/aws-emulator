@@ -972,6 +972,19 @@ pub const MODEL_PACKAGE_STATUS_COMPLETED: &str = "Completed";
 /// `None`).
 pub const SKIP_MODEL_VALIDATION_ALL: &str = "All";
 
+/// Whether a registration asked for its model validation to be skipped ENTIRELY, i.e.
+/// `SkipModelValidation` is `All` ("Indicates if you want to skip model validation").
+///
+/// Skipping it is what a registration asks for when the model it registers is not one this
+/// call can validate: nothing SageMaker would have checked about the registration's model is
+/// checked, so neither the validation work the request names nor the resolution of the
+/// inference containers it points at is performed, and the registration is admitted on the
+/// request alone.
+#[must_use]
+pub fn model_validation_is_skipped(skip_model_validation: Option<&str>) -> bool {
+    skip_model_validation == Some(SKIP_MODEL_VALIDATION_ALL)
+}
+
 /// Whether a model-package registration described by `validation_specification` and
 /// `skip_model_validation` leaves validation work outstanding — which is what decides
 /// whether the registration is reported as still settling.
@@ -987,7 +1000,7 @@ pub fn model_package_validation_is_outstanding(
     validation_specification: Option<&ModelPackageValidationSpecification>,
     skip_model_validation: Option<&str>,
 ) -> bool {
-    if skip_model_validation == Some(SKIP_MODEL_VALIDATION_ALL) {
+    if model_validation_is_skipped(skip_model_validation) {
         return false;
     }
     validation_specification
@@ -2707,16 +2720,18 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// `DeleteAssociation` address one by. See [`Association`], at the end of this module
     /// with the rest of the lineage-association slice.
     pub associations: BTreeMap<(String, String), Association>,
-    /// Every `CreateModelPackage` idempotency token this account has SPENT, oldest first:
-    /// which identity it registered and the ARN it minted.
+    /// Every `CreateModelPackage` idempotency token this account has SPENT, oldest first.
+    ///
+    /// The token and nothing else: an idempotency token identifies one CALL of the operation
+    /// by this account, so a later request presenting it is a reuse of that call whatever
+    /// package it names ([`Self::model_package_client_token_is_spent`]).
     ///
     /// Kept beside the packages rather than on them, because the question a retry asks
     /// outlives the record: a token already spent registers nothing a second time, even once
-    /// the package it registered has been deleted, so a retry presenting it is refused
-    /// ([`Self::model_package_registered_with_client_token`]). Bounded by
+    /// the package it registered has been deleted. Bounded by
     /// [`MODEL_PACKAGE_CLIENT_TOKEN_HISTORY`], so a caller registering package after
     /// package cannot grow the store without end.
-    pub model_package_client_tokens: Vec<SpentModelPackageToken>,
+    pub model_package_client_tokens: Vec<String>,
     /// The instant this account's SageMaker state came into being, i.e. when the store was
     /// constructed.
     ///
@@ -2740,28 +2755,6 @@ impl Default for StoreEpoch {
     fn default() -> Self {
         Self(SystemTime::now())
     }
-}
-
-/// One `CreateModelPackage` idempotency token this account has spent: the token, the
-/// identity the call that spent it registered, and the ARN that call minted.
-///
-/// The identity is what scopes the record: a token reused for a DIFFERENT package is a fresh
-/// call rather than a refusal about an unrelated one, so the name and the group are part of
-/// it.
-#[derive(Debug, Clone)]
-pub struct SpentModelPackageToken {
-    /// The `ClientToken` the call presented.
-    pub token: String,
-    /// The store key ([`model_package_key`]) that call registered, which is what resolves
-    /// whether the package it minted is still held.
-    pub key: String,
-    /// The package name the retry has to ask for to be a replay of this call.
-    pub name: String,
-    /// The model package group the retry has to ask for, and `None` for an unversioned
-    /// package.
-    pub group: Option<String>,
-    /// The ARN the call answered, which is what a refusal of a retry names.
-    pub arn: String,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -3025,57 +3018,35 @@ impl ComAmazonawsSagemakerSagemakerState {
             .count()
     }
 
-    /// The ARN of the model package the call that presented `token` registered under the same
-    /// identity (`name` plus `group`), if this account has spent that token.
+    /// Whether this account has SPENT `token` on a `CreateModelPackage`.
     ///
     /// This is what makes `CreateModelPackage` idempotent: a token already spent registers
     /// nothing a second time — neither a second package nor a second version — so a retry
-    /// presenting it is refused, naming the registration it already stands for. The record
-    /// outlives the package, so a retry presenting a token whose registration has since been
-    /// deleted is refused too rather than quietly registering a fresh version under a token
-    /// already used.
+    /// presenting it is refused. The record outlives the package, so a retry presenting a
+    /// token whose registration has since been deleted is refused too rather than quietly
+    /// registering a fresh version under a token already used.
     ///
-    /// The match is scoped to the identity the retry asks for, so a token reused for a
-    /// DIFFERENT package is a fresh call rather than a refusal naming an unrelated package.
-    pub fn model_package_registered_with_client_token(
-        &self,
-        token: &str,
-        name: &str,
-        group: Option<&str>,
-    ) -> Option<&str> {
+    /// The match is the TOKEN alone, because that is what an idempotency token identifies: one
+    /// call of this operation by this account. A later request presenting it is a reuse of
+    /// that call whatever package it names, so naming a different package does not make it a
+    /// fresh one — which is why the record holds the token and nothing else.
+    pub fn model_package_client_token_is_spent(&self, token: &str) -> bool {
         self.model_package_client_tokens
             .iter()
-            .rev()
-            .find(|spent| {
-                spent.token == token && spent.name == name && spent.group.as_deref() == group
-            })
-            .map(|spent| spent.arn.as_str())
+            .any(|spent| spent == token)
     }
 
-    /// Record that `token` was spent registering the package `key` under `arn`, so a retry
-    /// presenting it is refused rather than registering again.
+    /// Record that `token` was spent by a registration, so a retry presenting it is refused
+    /// rather than registering again.
     ///
     /// The oldest records are dropped past [`MODEL_PACKAGE_CLIENT_TOKEN_HISTORY`], which a
     /// caller cannot tell from a token whose deduplication window has passed. A call that
     /// presented no token records nothing.
-    pub fn remember_model_package_client_token(
-        &mut self,
-        token: Option<&str>,
-        key: &str,
-        name: &str,
-        group: Option<&str>,
-        arn: &str,
-    ) {
+    pub fn remember_model_package_client_token(&mut self, token: Option<&str>) {
         let Some(token) = token else {
             return;
         };
-        self.model_package_client_tokens.push(SpentModelPackageToken {
-            token: token.to_string(),
-            key: key.to_string(),
-            name: name.to_string(),
-            group: group.map(ToString::to_string),
-            arn: arn.to_string(),
-        });
+        self.model_package_client_tokens.push(token.to_string());
         if self.model_package_client_tokens.len() > MODEL_PACKAGE_CLIENT_TOKEN_HISTORY {
             let overflow =
                 self.model_package_client_tokens.len() - MODEL_PACKAGE_CLIENT_TOKEN_HISTORY;
