@@ -45,3 +45,5 @@ mod workflow_lifecycle;
 mod workflow_run_listing;
 #[path = "all/workflow_run_status_update.rs"]
 mod workflow_run_status_update;
+#[path = "all/workflow_run_update_scope.rs"]
+mod workflow_run_update_scope;
