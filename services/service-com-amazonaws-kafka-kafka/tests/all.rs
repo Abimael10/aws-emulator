@@ -37,6 +37,8 @@ mod channel_destination_update;
 mod channel_lifecycle;
 #[path = "all/channel_listing.rs"]
 mod channel_listing;
+#[path = "all/channel_update_observability.rs"]
+mod channel_update_observability;
 #[path = "all/client_vpc_connection_listing.rs"]
 mod client_vpc_connection_listing;
 #[path = "all/client_vpc_connection_rejection.rs"]
