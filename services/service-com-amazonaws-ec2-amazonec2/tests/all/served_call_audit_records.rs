@@ -19,6 +19,10 @@
 //! `errorCode` the RECORD carries, so the fault-class prefix is asserted against a literal
 //! rather than recomputed by the code under test.
 //!
+//! Each row also states the whole `requestParameters` document of its call, in the document
+//! form the serving API uses — the rule those documents follow, and the shapes it reaches,
+//! are `audited_call_documents.rs`.
+//!
 //! The records are read out of the shared log the recorder writes into
 //! (`service_common::management_events::ManagementEventLog`, which is the store
 //! CloudTrail's `LookupEvents` serves from) as the JSON document that lookup reports, so
@@ -90,7 +94,7 @@ struct AuditCase {
     /// answered with, and nothing for a read or for a refusal.
     records_response_elements: bool,
     /// The whole `requestParameters` document the record must carry: the parameters the
-    /// call was dispatched with, each member named as a CloudTrail event document names it.
+    /// call was dispatched with, in the document form the serving API uses.
     recorded_parameters: Value,
 }
 
@@ -142,7 +146,9 @@ async fn every_served_call_is_audited_with_the_outcome_its_caller_saw() {
             message: Some(format!("The instance ID '{ABSENT_INSTANCE}' does not exist")),
             read_only: true,
             records_response_elements: false,
-            recorded_parameters: json!({"instanceId": [ABSENT_INSTANCE]}),
+            recorded_parameters: json!({
+                "instancesSet": {"items": [{"instanceId": ABSENT_INSTANCE}]},
+            }),
         },
         AuditCase {
             case: "a read refused for a value that is no instance id at all",
@@ -154,7 +160,9 @@ async fn every_served_call_is_audited_with_the_outcome_its_caller_saw() {
             message: Some(format!("Invalid id: \"{UNREADABLE_INSTANCE}\"")),
             read_only: true,
             records_response_elements: false,
-            recorded_parameters: json!({"instanceId": [UNREADABLE_INSTANCE]}),
+            recorded_parameters: json!({
+                "instancesSet": {"items": [{"instanceId": UNREADABLE_INSTANCE}]},
+            }),
         },
         AuditCase {
             case: "a launch refused as a dry run",
@@ -173,10 +181,12 @@ async fn every_served_call_is_audited_with_the_outcome_its_caller_saw() {
             read_only: false,
             records_response_elements: false,
             recorded_parameters: json!({
-                "imageId": image_id.clone(),
+                "instancesSet": {"items": [{
+                    "imageId": image_id.clone(),
+                    "minCount": "1",
+                    "maxCount": "1",
+                }]},
                 "instanceType": "t3.micro",
-                "minCount": "1",
-                "maxCount": "1",
                 "dryRun": "true",
             }),
         },
@@ -219,7 +229,10 @@ async fn every_served_call_is_audited_with_the_outcome_its_caller_saw() {
             read_only: true,
             records_response_elements: false,
             recorded_parameters: json!({
-                "filter": [{"name": "instance-state-name", "value": ["running", "pending"]}],
+                "filterSet": {"items": [{
+                    "name": "instance-state-name",
+                    "valueSet": {"items": [{"value": "running"}, {"value": "pending"}]},
+                }]},
             }),
         },
         AuditCase {
@@ -319,8 +332,8 @@ async fn every_served_call_is_audited_with_the_outcome_its_caller_saw() {
             "case {case:?}: expected responseElements present = {}, got {record}",
             row.records_response_elements
         );
-        // The parameters the call was dispatched with are in the record, each member named
-        // as the event document names a modelled member.
+        // The parameters the call was dispatched with are in the record, in the document
+        // form the serving API uses.
         assert_eq!(
             record.get("requestParameters"),
             Some(&row.recorded_parameters),

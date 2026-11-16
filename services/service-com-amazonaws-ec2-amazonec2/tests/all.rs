@@ -20,6 +20,13 @@
 // tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/aws_managed_prefix_list_name_scopes.rs"]
 mod aws_managed_prefix_list_name_scopes;
+// The DOCUMENTS a management-event record of a served call carries: the parameters it was
+// dispatched with and what it answered, in the form EC2's own API documents take, beside the
+// resources it acted on. Declared beside `aws_managed_prefix_list_name_scopes` for the reason
+// the note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/audited_call_documents.rs"]
+mod audited_call_documents;
 // The event an EBS volume's create OUTCOME is published as: one `EBS Volume Notification` on
 // the account's default EventBridge bus per volume a create was asked for, reporting the result
 // it reached and, for one that failed, why. Declared beside `prefix_lists` for the reason the

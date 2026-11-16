@@ -68,9 +68,9 @@ use smithy_server_runtime::{OperationContext, Service};
 
 use service_common::audited_operation::{NOT_IMPLEMENTED_SHAPE_NAME, NOT_IMPLEMENTED_STATUS};
 use service_common::management_events::{
-    recorded_caller, recorded_request_parameters, recorded_shape, recorded_user_agent,
-    ManagementEventLog, RecordedSession, ServedApiCall, SessionAuditDirectory,
-    WithheldFromRecord,
+    recorded_caller, recorded_request_parameters, recorded_shape, recorded_shape_in,
+    recorded_user_agent, ManagementEventLog, RecordedDocumentForm, RecordedSession,
+    ServedApiCall, SessionAuditDirectory, WithheldFromRecord,
 };
 
 /// The `eventSource` every record of this service carries: this service's endpoint prefix
@@ -141,17 +141,6 @@ pub const SENSITIVE_MEMBERS: &[&str] = &[
     "PreSharedKey",
     "UserData",
 ];
-
-/// The parameters an ec2Query request carries that are the PROTOCOL's rather than the
-/// call's, and so are no part of the call's recorded parameters.
-const ENVELOPE_PARAMETERS: &[&str] = &["Action", "Version"];
-
-/// The most form parameters one record reports. The same bound, for the same reason, as the
-/// authorization gate's walk over the same parameter list
-/// (`super::addressed_resources`): the list is sized by the caller and every served call
-/// appends a record, so one record's parameter count is bounded here rather than by what
-/// was sent.
-const MAX_RECORDED_PARAMETERS: usize = 4_096;
 
 /// The element an ec2Query SUCCESS envelope names the request it answers with — the
 /// lowercase `requestId` the framework's ec2Query renderer writes as the last child of the
@@ -268,7 +257,15 @@ fn hold_outcome(outcome: ServedOutcome) {
 pub fn hold_success(output: &dyn SerializableStruct, output_schema: &Schema) {
     hold_outcome(ServedOutcome {
         failure: None,
-        response_elements: Some(recorded_shape(output, output_schema, withheld())),
+        response_elements: Some(recorded_shape_in(
+            output,
+            output_schema,
+            withheld(),
+            // In the document form of THIS API: a record reports a call in the serving
+            // API's own document, and this one's is the query/XML dialect the model's
+            // `@xmlName`s spell (see [`super::audited_documents`]).
+            RecordedDocumentForm::WireMembers,
+        )),
         stopped_at_authorization: false,
     });
 }
@@ -425,6 +422,36 @@ fn served_api_call<Eng: Send + Sync + 'static>(
             failure.message.clone(),
         ),
     };
+    // The parameters the call was DISPATCHED with, and none for a call the permission check
+    // stopped before it was dispatched at all — which is why the parameters are not even
+    // read for one.
+    let request_parameters = if outcome.stopped_at_authorization {
+        recorded_request_parameters(serde_json::Value::Null, true)
+    } else {
+        recorded_request_parameters(
+            super::audited_documents::request_document(operation, req),
+            false,
+        )
+    };
+    // "responseElements" is what the call ANSWERED with, which a reporting call has nothing
+    // of: CloudTrail records a read with a null `responseElements`, and so is a call that
+    // was refused — there was no response to record.
+    let response_elements = (!read_only)
+        .then(|| outcome.response_elements.clone())
+        .flatten();
+    // The resources the call ACTED ON, read out of those same two documents: the ids the
+    // request addressed and the ids the call minted, each under the resource type CloudTrail
+    // publishes for it ([`super::audited_documents::audited_resources`]). A REPORTING call
+    // acted on none, exactly as it answered no `responseElements`.
+    let resources = if read_only {
+        Vec::new()
+    } else {
+        let documents: Vec<&serde_json::Value> = [Some(&request_parameters), response_elements.as_ref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        super::audited_documents::audited_resources(&documents)
+    };
     ServedApiCall {
         event_name: operation.to_string(),
         event_source: EVENT_SOURCE.to_string(),
@@ -451,167 +478,15 @@ fn served_api_call<Eng: Send + Sync + 'static>(
         session,
         account_id: ::emulator_server::emulator_account_id().to_string(),
         user_agent: recorded_user_agent(ctx.parts()),
-        // No resource pair: the entries CloudTrail reports in an event's `Resources` name a
-        // resource by its CloudTrail type beside its ARN, and the reading this service has
-        // of the ids a request carries answers the IAM resource type instead
-        // ([`super::addressed_resources`]) — so the record carries the call, its parameters
-        // and its outcome rather than a type nothing publishes.
-        resources: Vec::new(),
+        // The resources the call acted on, by the type CloudTrail publishes for each beside
+        // its own id (see above).
+        resources,
         aws_region: region,
-        // The parameters the call was DISPATCHED with, and none for a call the permission
-        // check stopped before it was dispatched at all — which is why the parameters are
-        // not even read for one.
-        request_parameters: if outcome.stopped_at_authorization {
-            recorded_request_parameters(serde_json::Value::Null, true)
-        } else {
-            recorded_request_parameters(recorded_parameters(req), false)
-        },
-        // "responseElements" is what the call ANSWERED with, which a reporting call has
-        // nothing of: CloudTrail records a read with a null `responseElements`, and so is a
-        // call that was refused — there was no response to record.
-        response_elements: (!read_only)
-            .then(|| outcome.response_elements.clone())
-            .flatten(),
+        request_parameters,
+        response_elements,
         error_code,
         error_message,
     }
-}
-
-/// The parameters the request carried, as the record's `requestParameters`.
-///
-/// A record names a member as the CloudTrail event document names it — the modelled name
-/// with a lower-case first letter, which is what the shared
-/// [`service_common::management_events::recorded_member_name`] spells and what the shared
-/// recorder's own walk over a built input produces. An ec2Query request carries its
-/// parameters as an `application/x-www-form-urlencoded` list of flattened keys
-/// (`InstanceType`, `InstanceId.1`, `Filter.1.Name`), read through `form_urlencoded` — the
-/// crate that decodes that media type, the same reader the authorization gate takes the
-/// request's ids through (`super::addressed_resources`) — so each key is read back as the
-/// path it names: a name segment is a member of a structure, an INDEX segment an element of
-/// a list, and the document is built from the fields the call really carried.
-///
-/// The protocol's own parameters ([`ENVELOPE_PARAMETERS`]) are no part of the call and are
-/// left out, and a value held at a member this service withholds ([`SENSITIVE_MEMBERS`])
-/// carries the redaction literal instead — matched per segment, so a withheld member is
-/// withheld wherever in a request it occurs.
-fn recorded_parameters(req: &RtRequest) -> serde_json::Value {
-    let mut document = serde_json::Value::Object(serde_json::Map::new());
-    // The one walk this front door takes over a request's parameter list
-    // (`super::request_parameters`), under the bound a RECORD takes rather than the one a gate's
-    // decision takes.
-    let fields = super::request_parameters::request_parameters(req, MAX_RECORDED_PARAMETERS);
-    for (key, value) in fields {
-        if ENVELOPE_PARAMETERS.contains(&key.as_ref()) {
-            continue;
-        }
-        let segments: Vec<&str> = key
-            .split(PARAMETER_PATH_SEPARATOR)
-            .filter(|segment| *segment != WRAPPED_LIST_SEGMENT)
-            .collect();
-        if segments.is_empty() || segments.len() > MAX_PARAMETER_DEPTH {
-            continue;
-        }
-        let withheld = segments.iter().any(|segment| is_withheld(segment));
-        let recorded = if withheld {
-            ::service_common::management_events::HIDDEN_SENSITIVE_VALUE.to_string()
-        } else {
-            value.into_owned()
-        };
-        put_parameter(
-            &mut document,
-            &segments,
-            serde_json::Value::String(recorded),
-        );
-    }
-    document
-}
-
-/// Whether a record withholds the value a parameter key's `segment` names
-/// ([`SENSITIVE_MEMBERS`]).
-///
-/// Compared without regard to ASCII case: the set is the MODEL's spelling of each member,
-/// an ec2Query key is that name with its first letter capitalised, and a client's spelling
-/// of a KEY must not be what decides whether a secret reaches a record.
-fn is_withheld(segment: &str) -> bool {
-    SENSITIVE_MEMBERS
-        .iter()
-        .any(|member| member.eq_ignore_ascii_case(segment))
-}
-
-/// The separator between the segments of an ec2Query parameter key.
-const PARAMETER_PATH_SEPARATOR: char = '.';
-
-/// The segment a WRAPPED list writes between the member and the index of an element. It
-/// positions a value within the member the segment before it named rather than naming a
-/// member of its own, so a recorded path does not carry it.
-const WRAPPED_LIST_SEGMENT: &str = "member";
-
-/// How deep into a request's parameters one record goes — the same bound, for the same
-/// reason, as the shared recorder's walk over a built input.
-const MAX_PARAMETER_DEPTH: usize = 16;
-
-/// Put `value` at the path `segments` names in `document`: a name segment is a member of a
-/// structure, a segment of digits the (one-based) index of a list element.
-///
-/// A list grows only by the element the NEXT position names, so the document holds one
-/// value per field the request sent and nothing a field did not fill: a request numbering
-/// an element past the end of the list it is in states a position the fields before it
-/// never filled, and that field is left out rather than reserving the positions between.
-/// That is what keeps the document's size the size of the parameter list the request really
-/// carried — already bounded by [`MAX_RECORDED_PARAMETERS`] — rather than a number a
-/// caller wrote in a key.
-///
-/// A container already holding another kind of value is REPLACED rather than merged: a key
-/// that names a path through a value another key stated as a leaf is the caller's own
-/// inconsistency, and a record reports the last reading of it rather than both.
-fn put_parameter(document: &mut serde_json::Value, segments: &[&str], value: serde_json::Value) {
-    let Some((segment, rest)) = segments.split_first() else {
-        *document = value;
-        return;
-    };
-    match list_index(segment) {
-        Some(index) => {
-            if !document.is_array() {
-                *document = serde_json::Value::Array(Vec::new());
-            }
-            let Some(elements) = document.as_array_mut() else {
-                return;
-            };
-            if index > elements.len() {
-                return;
-            }
-            if index == elements.len() {
-                elements.push(serde_json::Value::Null);
-            }
-            // By position rather than by index expression: a record is never worth a panic
-            // on a path a request reaches.
-            if let Some(element) = elements.get_mut(index) {
-                put_parameter(element, rest, value);
-            }
-        }
-        None => {
-            if !document.is_object() {
-                *document = serde_json::Value::Object(serde_json::Map::new());
-            }
-            let Some(members) = document.as_object_mut() else {
-                return;
-            };
-            let member = members
-                .entry(::service_common::management_events::recorded_member_name(segment))
-                .or_insert(serde_json::Value::Null);
-            put_parameter(member, rest, value);
-        }
-    }
-}
-
-/// The zero-based position of the list element `segment` names, or `None` when it names a
-/// member instead.
-///
-/// ec2Query numbers the elements of a list FROM ONE (`InstanceId.1`), so the index is one
-/// less than the segment.
-fn list_index(segment: &str) -> Option<usize> {
-    let position = segment.parse::<usize>().ok()?;
-    position.checked_sub(1)
 }
 
 /// The request id the CALLER is answered under, read out of the response envelope itself.
@@ -743,81 +618,6 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "case {operation:?}: expected readOnly {expected}, got {actual}"
-            );
-        }
-    }
-
-    /// One row of the parameter-path table: the case, the fields the request carried, and the
-    /// document they are recorded as.
-    type ParameterCase<'a> = (&'a str, &'a [(&'a str, &'a str)], serde_json::Value);
-
-    /// RULE: a parameter key is read back as the path it names, each member spelled as a
-    /// CloudTrail event document spells one, and a position no field filled is left out.
-    #[test]
-    fn a_parameter_key_is_read_back_as_the_path_it_names() {
-        // (the case, the fields the request carried, the document they are recorded as)
-        let rows: &[ParameterCase<'_>] = &[
-            (
-                "a scalar member",
-                &[("InstanceType", "t3.micro")],
-                serde_json::json!({"instanceType": "t3.micro"}),
-            ),
-            (
-                "an indexed list",
-                &[("InstanceId.1", "i-0123abcd"), ("InstanceId.2", "i-4567ef01")],
-                serde_json::json!({"instanceId": ["i-0123abcd", "i-4567ef01"]}),
-            ),
-            (
-                "a wrapped list, whose wrapper segment names no member",
-                &[("InstanceId.member.1", "i-0123abcd")],
-                serde_json::json!({"instanceId": ["i-0123abcd"]}),
-            ),
-            (
-                "a list of structures, each with a list of its own",
-                &[
-                    ("Filter.1.Name", "instance-state-name"),
-                    ("Filter.1.Value.1", "running"),
-                    ("Filter.1.Value.2", "pending"),
-                ],
-                serde_json::json!({
-                    "filter": [{"name": "instance-state-name", "value": ["running", "pending"]}],
-                }),
-            ),
-            (
-                "an element numbered past the end of its list, which no field filled",
-                &[("InstanceId.1", "i-0123abcd"), ("InstanceId.9999", "i-4567ef01")],
-                serde_json::json!({"instanceId": ["i-0123abcd"]}),
-            ),
-            (
-                "a member whose value this service withholds",
-                &[("UserData", "a script nobody should read back")],
-                serde_json::json!({
-                    "userData": ::service_common::management_events::HIDDEN_SENSITIVE_VALUE,
-                }),
-            ),
-        ];
-        for (case, fields, expected) in rows {
-            let mut document = serde_json::Value::Object(serde_json::Map::new());
-            for (key, value) in *fields {
-                let segments: Vec<&str> = key
-                    .split(PARAMETER_PATH_SEPARATOR)
-                    .filter(|segment| *segment != WRAPPED_LIST_SEGMENT)
-                    .collect();
-                let withheld = segments.iter().any(|segment| is_withheld(segment));
-                let recorded = if withheld {
-                    ::service_common::management_events::HIDDEN_SENSITIVE_VALUE
-                } else {
-                    value
-                };
-                put_parameter(
-                    &mut document,
-                    &segments,
-                    serde_json::Value::String(recorded.to_string()),
-                );
-            }
-            assert_eq!(
-                &document, expected,
-                "case {case:?}: expected {expected}, got {document}"
             );
         }
     }

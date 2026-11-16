@@ -22,7 +22,7 @@ use aws_smithy_runtime_api::http::Request as RtRequest;
 /// entries), so no request is read past it.
 ///
 /// The audit leg passes its own, larger bound
-/// (`super::management_events::MAX_RECORDED_PARAMETERS`): what it reads bounds a RECORD rather
+/// (`super::audited_documents::MAX_RECORDED_PARAMETERS`): what it reads bounds a RECORD rather
 /// than a decision, so the two are stated where each is taken.
 pub const MAX_PARAMETERS_READ: usize = 4_096;
 

@@ -234,8 +234,36 @@ const MAX_RECORDED_DEPTH: usize = 16;
 /// what the caller sent.
 const MAX_RECORDED_VALUES: usize = 1_024;
 
+/// How a recorded document NAMES the members of a shape and holds its lists.
+///
+/// CloudTrail records the parameters and the response of a call in the SERVING API's own
+/// document form, and that form is the serving protocol's: an API whose protocol names a
+/// member by the model's name has its members recorded under that name, while one whose
+/// protocol renames them (a query/XML dialect, where every member carries an `@xmlName`)
+/// has them recorded under the name the wire gives them. So the form is the recording
+/// service's to choose, stated once here rather than per operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordedDocumentForm {
+    /// Each member as [`recorded_member_name`] spells it — the modelled name with a
+    /// lower-case first letter — and each list as a JSON array.
+    #[default]
+    ModelledMembers,
+    /// Each member under the name its service's WIRE protocol gives it (the model's
+    /// `@xmlName`, falling back to [`recorded_member_name`] for a member the model gives
+    /// none), and each list as an object holding its elements under
+    /// [`WIRE_LIST_ELEMENTS_MEMBER`] — a list with no elements being the empty document,
+    /// which is how such a document reports a repeated element that occurs no times.
+    WireMembers,
+}
+
+/// The member a [`RecordedDocumentForm::WireMembers`] document holds a list's elements
+/// under: a wire document of that form carries a list as repeated elements, and a reader
+/// projecting those elements onto JSON names them together here.
+pub const WIRE_LIST_ELEMENTS_MEMBER: &str = "items";
+
 /// One built shape — a request's input or a response's output — as the JSON document a
-/// record carries it in (`requestParameters` / `responseElements`).
+/// record carries it in (`requestParameters` / `responseElements`), with the members named
+/// as [`RecordedDocumentForm::ModelledMembers`] names them.
 ///
 /// SCHEMA-DRIVEN, so it holds for every modelled shape rather than per operation: the walk
 /// is the framework's own [`SerializableStruct`] walk, each member named as
@@ -253,17 +281,46 @@ pub fn recorded_shape(
     schema: &::aws_smithy_schema::Schema,
     withheld: WithheldFromRecord<'_>,
 ) -> serde_json::Value {
+    recorded_shape_in(value, schema, withheld, RecordedDocumentForm::ModelledMembers)
+}
+
+/// [`recorded_shape`], in the document `form` the recording service's own API uses.
+#[must_use]
+pub fn recorded_shape_in(
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+    withheld: WithheldFromRecord<'_>,
+    form: RecordedDocumentForm,
+) -> serde_json::Value {
     let mut walk = RecordedShape {
         stack: Vec::new(),
         root: serde_json::Value::Null,
         withheld,
         written: 0,
+        form,
     };
     // The root of a request or a response is a structure; drive it the way a codec does.
     // A walk that cannot finish leaves the document built so far: a record reports a call
     // that was already served, so failing to render one is never a failure of the call.
     let _ = ::aws_smithy_schema::serde::ShapeSerializer::write_struct(&mut walk, schema, value);
     walk.root
+}
+
+/// `elements` as a [`RecordedDocumentForm::WireMembers`] document holds a list: the
+/// elements together under [`WIRE_LIST_ELEMENTS_MEMBER`], and the EMPTY document for a list
+/// with none — a repeated element that occurs no times is an element the document does not
+/// carry, so there is nothing for such a reader to project onto a JSON array.
+fn wire_list(elements: Vec<serde_json::Value>) -> serde_json::Value {
+    if elements.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        let mut holder = serde_json::Map::new();
+        holder.insert(
+            WIRE_LIST_ELEMENTS_MEMBER.to_string(),
+            serde_json::Value::Array(elements),
+        );
+        serde_json::Value::Object(holder)
+    }
 }
 
 /// An in-progress container of the document [`recorded_shape`] builds.
@@ -292,6 +349,8 @@ struct RecordedShape<'a> {
     withheld: WithheldFromRecord<'a>,
     /// How many values have been written, against [`MAX_RECORDED_VALUES`].
     written: usize,
+    /// How the finished document names its members and holds its lists.
+    form: RecordedDocumentForm,
 }
 
 impl RecordedShape<'_> {
@@ -344,14 +403,12 @@ impl RecordedShape<'_> {
     /// container is open.
     fn place(&mut self, schema: &::aws_smithy_schema::Schema, value: serde_json::Value) {
         self.written += 1;
+        // The name before the container is borrowed: naming a member reads the walk's own
+        // form, which the borrow of the open frame below holds exclusively.
+        let name = self.recorded_name(schema);
         match self.stack.last_mut() {
             None => self.root = value,
             Some(RecordedFrame::Structure(members)) => {
-                let name = schema
-                    .member_name()
-                    .map_or_else(|| schema.shape_id().shape_name().to_string(), |name| {
-                        recorded_member_name(name)
-                    });
                 members.insert(name, value);
             }
             Some(RecordedFrame::List(elements)) => elements.push(value),
@@ -373,6 +430,24 @@ impl RecordedShape<'_> {
                 *expecting_key = !*expecting_key;
             }
         }
+    }
+
+    /// The name this document holds the member `schema` names under: the wire name for a
+    /// document of the serving protocol's own form, else the modelled name with a
+    /// lower-case first letter (see [`RecordedDocumentForm`]).
+    ///
+    /// A schema that names no member at all is a shape written as the whole document; it is
+    /// named by its own shape name, which is what a reader of such a position reports.
+    fn recorded_name(&self, schema: &::aws_smithy_schema::Schema) -> String {
+        if self.form == RecordedDocumentForm::WireMembers {
+            if let Some(wire) = schema.xml_name().map(|name| name.value().to_string()) {
+                return wire;
+            }
+        }
+        schema.member_name().map_or_else(
+            || schema.shape_id().shape_name().to_string(),
+            recorded_member_name,
+        )
     }
 
     /// Open `frame`, write the composite's children into it, then close it and place the
@@ -402,7 +477,10 @@ impl RecordedShape<'_> {
         let out = write_children(self);
         let closed = match self.stack.pop() {
             Some(RecordedFrame::Structure(members)) => serde_json::Value::Object(members),
-            Some(RecordedFrame::List(elements)) => serde_json::Value::Array(elements),
+            Some(RecordedFrame::List(elements)) => match self.form {
+                RecordedDocumentForm::ModelledMembers => serde_json::Value::Array(elements),
+                RecordedDocumentForm::WireMembers => wire_list(elements),
+            },
             Some(RecordedFrame::Map { entries, .. }) => serde_json::Value::Object(entries),
             // Unreachable: the frame just pushed is the one popped here.
             None => serde_json::Value::Null,
@@ -2138,6 +2216,7 @@ mod tests {
             root: serde_json::Value::Null,
             withheld: WithheldFromRecord::default(),
             written: 0,
+            form: RecordedDocumentForm::default(),
         };
         let recorded = walk.recorded_document(&document, 0);
 
@@ -2181,6 +2260,7 @@ mod tests {
             root: serde_json::Value::Null,
             withheld: WithheldFromRecord::default(),
             written: 0,
+            form: RecordedDocumentForm::default(),
         };
         let recorded = walk.recorded_document(&wide, 0);
         let elements = recorded

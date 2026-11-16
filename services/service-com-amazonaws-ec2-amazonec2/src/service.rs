@@ -102,6 +102,12 @@ pub mod dry_run;
 /// so the three cannot read a request differently.
 pub mod request_parameters;
 
+/// The two DOCUMENTS a record of a call carries — the parameters it was dispatched with,
+/// read back off the request's own parameter list, and the resources it acted on — in the
+/// form EC2's own API documents take: what [`management_events`] puts in the record it
+/// writes for every call this front door serves.
+pub mod audited_documents;
+
 /// This front door's AUDIT leg: every call it serves — the ones it REFUSES as much as the
 /// ones it accepts — is a management event of this service, recorded in the account's event
 /// history where CloudTrail's `LookupEvents` reads it. Written by
