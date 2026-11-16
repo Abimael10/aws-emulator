@@ -23,6 +23,8 @@ mod account_policy_removal;
 mod account_policy_selection_criteria;
 #[path = "all/anomaly_suppression.rs"]
 mod anomaly_suppression;
+#[path = "all/authorization_resource_scope.rs"]
+mod authorization_resource_scope;
 #[path = "all/cmk_event_reads.rs"]
 mod cmk_event_reads;
 #[path = "all/cmk_group_delivery_byte_fidelity.rs"]

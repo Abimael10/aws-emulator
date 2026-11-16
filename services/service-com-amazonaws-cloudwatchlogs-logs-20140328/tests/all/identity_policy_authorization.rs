@@ -10,7 +10,8 @@
 //! permissions are the role's. The decision is IAM's own: an explicit `Deny` about the
 //! request wins over every `Allow`, an `Allow` with none permits, and a principal with
 //! neither is refused. The action is `logs:<OperationName>` and the resource is what the
-//! request addresses — the log group it names, else every resource of this service — and a
+//! request addresses — the log group it names, the log stream where it names one, else every
+//! resource of this service — and a
 //! refusal is the AWS-common `AccessDeniedException` (HTTP 400) naming the principal, the
 //! action, that resource and the rule that withheld the grant, with the handler never
 //! reached and nothing of the account changed.
@@ -59,19 +60,28 @@ fn reported_code(body: &Value) -> Option<String> {
     Some(raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string())
 }
 
-/// The ARN CloudWatch Logs names a call on the log group `name` (and, where the request
-/// names one, the log stream `stream`) by: its own resource ARN, whose group and stream
-/// segments are empty where the request named none. Spelled here independently of the crate
-/// under test.
-fn logs_resource(name: &str, stream: &str) -> String {
+/// The ARN CloudWatch Logs names a call on the log STREAM `stream` of the log group `name`
+/// by — and, with both segments empty, a call that addresses no single resource of this
+/// service. Spelled here independently of the crate under test.
+fn stream_resource(name: &str, stream: &str) -> String {
     format!(
         "arn:aws:logs:{REGION}:{}:log-group:{name}:log-stream:{stream}",
         engine::emulator_account_id()
     )
 }
 
-/// The ARN a policy statement names the log group `name` of this account by: CloudWatch
-/// Logs' log-group ARN, which ends with the `:*` that covers the streams under the group.
+/// The ARN CloudWatch Logs names a call on the log GROUP `name` by: the group's own ARN,
+/// carrying no `log-stream:` segment at all. Spelled here independently of the crate under
+/// test.
+fn group_resource(name: &str) -> String {
+    format!(
+        "arn:aws:logs:{REGION}:{}:log-group:{name}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The ARN a policy statement names the STREAMS UNDER the log group `name` of this account
+/// by: CloudWatch Logs' log-group ARN with the trailing `:*`.
 fn group_arn(name: &str) -> String {
     format!(
         "arn:aws:logs:{REGION}:{}:log-group:{name}:*",
@@ -120,25 +130,25 @@ fn called() -> Vec<Called> {
             case: "a listing that names no log group",
             operation: "DescribeLogGroups",
             body: json!({}),
-            resource: logs_resource("", ""),
+            resource: stream_resource("", ""),
         },
         Called {
             case: "a create, named by the group it would mint",
             operation: "CreateLogGroup",
             body: json!({"logGroupName": GROUP}),
-            resource: logs_resource(GROUP, ""),
+            resource: group_resource(GROUP),
         },
         Called {
             case: "a retention write on the group",
             operation: "PutRetentionPolicy",
             body: json!({"logGroupName": GROUP, "retentionInDays": 7}),
-            resource: logs_resource(GROUP, ""),
+            resource: group_resource(GROUP),
         },
         Called {
             case: "a stream read addressed by log group identifier",
             operation: "DescribeLogStreams",
             body: json!({"logGroupIdentifier": GROUP}),
-            resource: logs_resource(GROUP, ""),
+            resource: group_resource(GROUP),
         },
         Called {
             case: "a write addressed by group and stream",
@@ -148,7 +158,7 @@ fn called() -> Vec<Called> {
                 "logStreamName": "stream-1",
                 "logEvents": [{"timestamp": 1_767_225_600_000i64, "message": "one"}],
             }),
-            resource: logs_resource(GROUP, "stream-1"),
+            resource: stream_resource(GROUP, "stream-1"),
         },
         Called {
             case: "a tagging call addressed by this service's own resource ARN",
@@ -245,7 +255,7 @@ async fn the_documents_in_force_decide_the_call() {
         case: "a retention write on the group",
         operation: "PutRetentionPolicy",
         body: json!({"logGroupName": GROUP, "retentionInDays": 7}),
-        resource: logs_resource(GROUP, ""),
+        resource: group_resource(GROUP),
     };
     let action = action_of(write.operation);
     // (case, the documents the role carries, the expected outcome)
@@ -257,12 +267,26 @@ async fn the_documents_in_force_decide_the_call() {
         ),
         (
             "a grant scoped to the group the request addresses",
-            vec![statement("Allow", &action, &group_arn(GROUP))],
+            vec![statement("Allow", &action, &group_resource(GROUP))],
             None,
         ),
         (
+            "a grant scoped to the names under the group's own",
+            vec![statement(
+                "Allow",
+                &action,
+                &format!("{}*", group_resource(GROUP)),
+            )],
+            None,
+        ),
+        (
+            "a grant scoped to the STREAMS under the group",
+            vec![statement("Allow", &action, &group_arn(GROUP))],
+            Some(nothing_allows(&action)),
+        ),
+        (
             "a grant scoped to another group",
-            vec![statement("Allow", &action, &group_arn("/identity/other"))],
+            vec![statement("Allow", &action, &group_resource("/identity/other"))],
             Some(nothing_allows(&action)),
         ),
         (
@@ -270,7 +294,7 @@ async fn the_documents_in_force_decide_the_call() {
             vec![statement(
                 "Allow",
                 &action_of("DeleteRetentionPolicy"),
-                &group_arn(GROUP),
+                &group_resource(GROUP),
             )],
             Some(nothing_allows(&action)),
         ),
@@ -286,7 +310,7 @@ async fn the_documents_in_force_decide_the_call() {
             "two documents, one of which grants the call",
             vec![
                 statement("Allow", "sts:GetCallerIdentity", "*"),
-                statement("Allow", &action, &group_arn(GROUP)),
+                statement("Allow", &action, &group_resource(GROUP)),
             ],
             None,
         ),
@@ -322,13 +346,13 @@ async fn a_refused_call_changes_nothing_and_resolves_nothing() {
             "a create the policies do not allow",
             "CreateLogGroup",
             json!({"logGroupName": absent}),
-            logs_resource(absent, ""),
+            group_resource(absent),
         ),
         (
             "a delete of a group the account does not hold",
             "DeleteLogGroup",
             json!({"logGroupName": absent}),
-            logs_resource(absent, ""),
+            group_resource(absent),
         ),
     ] {
         let call = Called {

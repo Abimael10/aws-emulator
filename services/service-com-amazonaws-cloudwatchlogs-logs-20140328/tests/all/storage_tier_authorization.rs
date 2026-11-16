@@ -12,12 +12,14 @@
 //! members of its request. An operation whose request carries NO member at all has nothing in
 //! it to name a resource with, so the call is about every log group of the account and the
 //! refusal names this service's log-group ARN carrying IAM's wildcard — while a request that
-//! does carry log-group members is judged against the ARN those members build, with a segment
-//! left empty where the request named none.
+//! does carry log-group members is judged against the ARN those members build: the group's
+//! own ARN where it names a group and no stream, the stream's where it names both, and this
+//! service's stream ARN with both segments empty where it names neither.
 //!
 //! The table spans what the rule generalises over: whether the operation's request carries
-//! members at all, whether the caller names a log group in them, and whether the grant the
-//! caller holds covers the account's log groups or one group alone.
+//! members at all, whether the caller names a log group in them, whether it names a log
+//! stream as well, and whether the grant the caller holds covers the account's log groups or
+//! one group alone.
 
 use serde_json::{json, Value};
 
@@ -48,6 +50,15 @@ fn every_log_group() -> String {
 fn addressed(group: &str, stream: &str) -> String {
     format!(
         "arn:aws:logs:{REGION}:{}:log-group:{group}:log-stream:{stream}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The resource ARN a call naming the log group `group` and NO log stream is judged against:
+/// the group's own ARN, which carries no `log-stream:` segment.
+fn addressed_group(group: &str) -> String {
+    format!(
+        "arn:aws:logs:{REGION}:{}:log-group:{group}",
         engine::emulator_account_id()
     )
 }
@@ -135,7 +146,13 @@ async fn a_request_with_no_member_is_refused_for_every_log_group_of_the_account(
             "a read addressed by a log group",
             "DescribeLogStreams",
             json!({"logGroupName": group}),
-            addressed(group, ""),
+            addressed_group(group),
+        ),
+        (
+            "a read addressed by a log group and a log stream",
+            "GetLogEvents",
+            json!({"logGroupName": group, "logStreamName": "one"}),
+            addressed(group, "one"),
         ),
     ];
     for (case, operation, body, resource) in rows {
