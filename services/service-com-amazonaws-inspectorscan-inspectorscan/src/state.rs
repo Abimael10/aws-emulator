@@ -34,6 +34,10 @@ pub const MAX_RECORDED_SERIAL_NUMBER_LEN: usize = 128;
 ///
 /// `affected` is the release interval the advisory applies to, held as DATA
 /// rather than as a comparator expression to parse: see [`VersionRange`].
+///
+/// `source_url` is the ONE address a scan report ever publishes for an advisory
+/// — the page its publisher published it at. No other field holds a link, and no
+/// other report member carries one.
 #[derive(Debug, Clone)]
 pub struct VulnRecord {
     /// The vulnerability id, e.g. `CVE-2021-44228`.
@@ -75,8 +79,6 @@ pub struct VulnRecord {
     /// array of integers, so the store keeps them in that form.
     pub cwes: Vec<u32>,
     pub description: String,
-    /// Advisory reference URLs, as CycloneDX `vulnerability.advisories[].url`.
-    pub advisories: Vec<String>,
     /// Advisory publication / last-modification instants, RFC 3339.
     pub published: String,
     pub modified: String,
@@ -608,10 +610,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             description: "lodash versions prior to 4.17.21 are vulnerable to command injection \
                           via the template function."
                 .to_string(),
-            advisories: vec![
-                "https://github.com/lodash/lodash/commit/3469357cff396a26c363f8c1b5a91dde28ba4b1c"
-                    .to_string(),
-            ],
             published: "2021-02-15T13:15:00Z".to_string(),
             modified: "2022-01-28T18:15:00Z".to_string(),
         },
@@ -632,7 +630,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             epss_score: Some(0.0021),
             cwes: vec![1321],
             description: "minimist before 1.2.6 is vulnerable to prototype pollution.".to_string(),
-            advisories: vec!["https://github.com/minimistjs/minimist/commit/c2b981977fa834b223b408cfb860f933c9811e4d".to_string()],
             published: "2022-03-17T16:15:00Z".to_string(),
             modified: "2023-11-07T03:39:00Z".to_string(),
         },
@@ -655,7 +652,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             description: "urllib3 before 1.26.5 allows a denial of service via a crafted URL \
                           with many @ characters."
                 .to_string(),
-            advisories: vec!["https://github.com/urllib3/urllib3/commit/2d4a3fee6de2fa45eb82169361918f759269b4ec".to_string()],
             published: "2021-06-29T11:15:00Z".to_string(),
             modified: "2023-11-07T03:35:00Z".to_string(),
         },
@@ -678,7 +674,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             description: "PyYAML before 5.4 allows arbitrary code execution when loading \
                           untrusted YAML with the full_load method or the FullLoader loader."
                 .to_string(),
-            advisories: vec!["https://github.com/yaml/pyyaml/pull/386".to_string()],
             published: "2021-02-09T22:15:00Z".to_string(),
             modified: "2023-11-07T03:17:00Z".to_string(),
         },
@@ -705,10 +700,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
                           configuration, log messages, and parameters do not protect against \
                           attacker controlled LDAP and other JNDI related endpoints."
                 .to_string(),
-            advisories: vec![
-                "https://logging.apache.org/log4j/2.x/security.html".to_string(),
-                "https://www.cisa.gov/uscert/apache-log4j-vulnerability-guidance".to_string(),
-            ],
             published: "2021-12-10T10:15:00Z".to_string(),
             modified: "2023-11-07T03:39:00Z".to_string(),
         },
@@ -735,11 +726,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
                           execute arbitrary code through the InvokerTransformer gadget chain \
                           when deserializing untrusted data."
                 .to_string(),
-            advisories: vec![
-                "https://issues.apache.org/jira/browse/COLLECTIONS-580".to_string(),
-                "https://commons.apache.org/proper/commons-collections/security-reports.html"
-                    .to_string(),
-            ],
             published: "2017-11-09T16:29:00Z".to_string(),
             modified: "2023-02-13T00:40:00Z".to_string(),
         },
@@ -767,9 +753,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             description: "jackson-databind before 2.12.6 allows a Java StackOverflow exception \
                           and denial of service via a large depth of nested objects."
                 .to_string(),
-            advisories: vec![
-                "https://github.com/FasterXML/jackson-databind/issues/2816".to_string()
-            ],
             published: "2022-03-11T06:15:00Z".to_string(),
             modified: "2023-11-07T03:22:00Z".to_string(),
         },
@@ -792,10 +775,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             description: "github.com/gin-gonic/gin before 1.7.7 allows header injection because \
                           it does not sanitize the X-Forwarded-For header."
                 .to_string(),
-            advisories: vec![
-                "https://github.com/gin-gonic/gin/pull/2844".to_string(),
-                "https://pkg.go.dev/vuln/GO-2021-0052".to_string(),
-            ],
             published: "2021-01-05T18:15:00Z".to_string(),
             modified: "2023-11-07T03:21:00Z".to_string(),
         },
@@ -822,7 +801,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
                           specifically in name constraint checking, in OpenSSL 3.0.0 through \
                           3.0.6."
                 .to_string(),
-            advisories: vec!["https://www.openssl.org/news/secadv/20221101.txt".to_string()],
             published: "2022-11-01T17:15:00Z".to_string(),
             modified: "2023-11-07T03:51:00Z".to_string(),
         },
@@ -850,7 +828,6 @@ fn seed_vulnerability_db() -> Vec<VulnRecord> {
             description: "A buffer overflow was discovered in the GNU C Library's dynamic \
                           loader while processing the GLIBC_TUNABLES environment variable."
                 .to_string(),
-            advisories: vec!["https://sourceware.org/bugzilla/show_bug.cgi?id=30976".to_string()],
             published: "2023-10-03T18:15:00Z".to_string(),
             modified: "2024-01-31T14:15:00Z".to_string(),
         },

@@ -87,7 +87,6 @@ fn inject_advisory(engine: &Arc<engine::InMemoryEngine>, id: &str, package_name:
         epss_score: None,
         cwes: vec![20],
         description: format!("{id} applies to {package_name}."),
-        advisories: Vec::new(),
         published: "2024-01-01T00:00:00Z".to_string(),
         modified: "2024-02-01T00:00:00Z".to_string(),
     });

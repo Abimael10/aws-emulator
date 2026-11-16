@@ -17,6 +17,8 @@ mod scan_inspector_alt_form;
 mod scan_invariants;
 #[path = "all/scan_report_annotations.rs"]
 mod scan_report_annotations;
+#[path = "all/scan_report_links.rs"]
+mod scan_report_links;
 #[path = "all/scan_sbom.rs"]
 mod scan_sbom;
 #[path = "all/scan_sbom_authorization.rs"]

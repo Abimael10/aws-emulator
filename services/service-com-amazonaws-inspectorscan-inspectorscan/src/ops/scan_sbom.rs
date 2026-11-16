@@ -11,7 +11,7 @@
 //! up in the state's advisory index, and render the matched advisories — plus
 //! the scan summary and the components nothing could be concluded about — in
 //! the requested `outputFormat`. Nothing in the report is a literal: every
-//! rating, CWE, advisory URL and fixed-in version is a field of the matched
+//! rating, CWE and fixed-in version is a field of the matched
 //! [`crate::state::VulnRecord`], every count is a total over the matched set,
 //! and every `affects[].ref` is a `bom-ref` this scan assigned to a component
 //! of the report.
@@ -1283,12 +1283,25 @@ fn inspector_package_manager(package_type: &str) -> &'static str {
 }
 
 /// The CycloneDX `vulnerability` object for one finding.
+///
+/// The node names the advisory's publisher once, with the page that publisher
+/// published the advisory at beside it (`VulnRecord::source_url`) — the one link
+/// a report carries. Everything else that could carry an address does not: a
+/// RATING names only the scoring vendor that produced it, since the rating is
+/// not a publication to dereference, and the node carries no `advisories`
+/// member, because CycloneDX types each entry of that member as a reference URL
+/// and this service publishes no reference pages.
 fn cyclonedx_vulnerability(finding: &Finding) -> Value {
     let advisory = &finding.advisory;
-    let source = json!({
-        "name": advisory.source,
-        "url": advisory.source_url,
-    });
+    // Every rating is scored BY a vendor, so its source names that vendor and
+    // nothing more.
+    let rating_source = json!({ "name": advisory.source });
+    let mut source = Map::new();
+    source.insert("name".to_string(), json!(advisory.source));
+    if let Some(page) = &advisory.source_url {
+        source.insert("url".to_string(), Value::String(page.clone()));
+    }
+    let source = Value::Object(source);
 
     // The operation's documentation states the output "reports NVD and CVSS
     // scores when NVD and CVSS scores are available" and warns that the two can
@@ -1299,7 +1312,7 @@ fn cyclonedx_vulnerability(finding: &Finding) -> Value {
     if !advisory.cvss_v3_vector.is_empty() {
         ratings.push(json!({
             // The advisory's own publisher is what scored it.
-            "source": source,
+            "source": rating_source,
             "score": advisory.cvss_v3_score,
             "severity": cyclonedx_severity(&advisory.nvd_severity),
             "method": cvss_method(&advisory.cvss_v3_vector),
@@ -1348,11 +1361,6 @@ fn cyclonedx_vulnerability(finding: &Finding) -> Value {
         // CycloneDX 1.5 types `vulnerability.cwes` as an array of CWE integers.
         "cwes": advisory.cwes,
         "description": advisory.description,
-        "advisories": advisory
-            .advisories
-            .iter()
-            .map(|url| json!({ "url": url }))
-            .collect::<Vec<Value>>(),
         "published": advisory.published,
         "updated": advisory.modified,
         "affects": [ { "ref": finding.component.bom_ref } ],
@@ -1597,38 +1605,25 @@ fn inspector_vulnerable_package(finding: &Finding) -> Value {
 /// The vendor advisories published for one matched advisory — the `INSPECTOR_ALT`
 /// form's per-node vendor data.
 ///
-/// Every entry is a projection of the matched [`VulnRecord`]: the publisher that
-/// issued the advisory, one of its publications (its canonical page first, then
-/// each reference URL the record carries, with no URL repeated), the BASE (NVD)
-/// severity the record holds — reported here beside the Inspector-adjusted
+/// One entry per matched advisory, every member of it a projection of the matched
+/// [`VulnRecord`]: the advisory's own id, the publisher that issued it, the BASE
+/// (NVD) severity the record holds — reported here beside the Inspector-adjusted
 /// `severity` on the node rather than instead of it, which is exactly the
 /// discrepancy the operation's documentation warns of — and the instants the
-/// advisory was published and last revised.
+/// advisory was published and last revised. The entry names the advisory by
+/// identifier and publisher and carries no link, for the reason
+/// [`inspector_finding`] gives.
+///
+/// The member is modelled as a LIST of vendor advisories, so the single
+/// projection is returned as a one-element list rather than as a bare object.
 fn vendor_advisories(advisory: &VulnRecord) -> Vec<Value> {
-    let mut urls: Vec<&str> = Vec::new();
-    for url in advisory
-        .source_url
-        .iter()
-        .chain(advisory.advisories.iter())
-        .map(String::as_str)
-        .filter(|url| !url.is_empty())
-    {
-        if !urls.contains(&url) {
-            urls.push(url);
-        }
-    }
-    urls.into_iter()
-        .map(|url| {
-            json!({
-                "id": advisory.cve_id,
-                "source": advisory.source,
-                "url": url,
-                "severity": SeverityBucket::of(&advisory.nvd_severity).as_str(),
-                "vendorCreatedAt": advisory.published,
-                "vendorUpdatedAt": advisory.modified,
-            })
-        })
-        .collect()
+    vec![json!({
+        "id": advisory.cve_id,
+        "source": advisory.source,
+        "severity": SeverityBucket::of(&advisory.nvd_severity).as_str(),
+        "vendorCreatedAt": advisory.published,
+        "vendorUpdatedAt": advisory.modified,
+    })]
 }
 
 /// One `INSPECTOR_ALT` vulnerability node: the advisory `matches` all share,
@@ -1660,6 +1655,11 @@ fn inspector_alt_vulnerability(matches: &[&Finding]) -> Option<Value> {
 }
 
 /// The Inspector-native finding for one match.
+///
+/// The advisory is named by its `source` and `id` alone: this form carries
+/// neither `sourceUrl` nor `referenceUrls`, so the only address any report form
+/// publishes is the publisher's page the CycloneDX node names on its own
+/// `source` (see [`cyclonedx_vulnerability`]).
 fn inspector_finding(finding: &Finding) -> Value {
     let advisory = &finding.advisory;
     let component = &finding.component;
@@ -1699,9 +1699,7 @@ fn inspector_finding(finding: &Finding) -> Value {
         "severity": SeverityBucket::of(&advisory.inspector_severity).as_str(),
         "description": advisory.description,
         "source": advisory.source,
-        "sourceUrl": advisory.source_url,
         "cwes": advisory.cwes.iter().map(|cwe| format!("CWE-{cwe}")).collect::<Vec<String>>(),
-        "referenceUrls": advisory.advisories,
         "vendorCreatedAt": advisory.published,
         "vendorUpdatedAt": advisory.modified,
         "inspectorScore": advisory.inspector_score,

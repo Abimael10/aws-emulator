@@ -12,14 +12,14 @@
 //! * the `INSPECTOR_ALT` form reports one node per MATCHED ADVISORY, listing
 //!   every component of the scan that advisory affects, and carries
 //!   `vendorAdvisories` on every node — projected from the matched advisory
-//!   record's own publisher, publications, vendor rating and instants — while
+//!   record's own publisher, vendor rating and instants — while
 //!   the `INSPECTOR` form carries that member nowhere in its document, which is
 //!   what distinguishes the two forms;
 //! * both Inspector forms are distinguishable from the CycloneDX document.
 //!
 //! The advisory catalog these rows are written against is
-//! `src/state.rs::seed_vulnerability_db`; the row that needs an advisory with no
-//! vendor publications at all injects one into the same store the handler reads.
+//! `src/state.rs::seed_vulnerability_db`; the row that needs an advisory the
+//! catalog does not carry injects one into the same store the handler reads.
 
 use super::scan_report_annotations::inject_advisory;
 use super::scan_sbom::{bom, component, emulator, post_scan};
@@ -49,41 +49,21 @@ struct AltCase {
     nodes: Vec<(&'static str, &'static str, Vec<&'static str>)>,
 }
 
-/// An advisory carrying NO vendor publication at all — no canonical page and no
-/// reference URL — in the SAME store the handler reads, so a scan matches it
-/// like any other. The vendor-advisory member must still be present on its node.
-/// The record is injected by the shared helper in `scan_report_annotations.rs`,
-/// which records exactly that: `source_url: None`, no reference URLs.
-const UNPUBLISHED_ADVISORY: &str = "CVE-2024-99001";
+/// An advisory the seeded catalog does not carry, in the SAME store the handler
+/// reads, so a scan matches it like any other. Its node reports the vendor
+/// advisory projected from that record, exactly as a seeded one does. The record
+/// is injected by the shared helper in `scan_report_annotations.rs`.
+const INJECTED_ADVISORY: &str = "CVE-2024-99001";
 
 fn inject_unpublished_advisory(engine: &Arc<engine::InMemoryEngine>) {
     inject_advisory(
         engine,
-        UNPUBLISHED_ADVISORY,
+        INJECTED_ADVISORY,
         "npm",
         "left-pad",
         "MEDIUM",
         vec![20],
     );
-}
-
-/// The publications the store holds for `cve_id`: the advisory's canonical page
-/// first, then every reference URL on the record, with no URL repeated.
-fn vendor_publications(engine: &Arc<engine::InMemoryEngine>, cve_id: &str) -> Vec<String> {
-    let state = engine.state::<ComAmazonawsInspectorscanInspectorscanState>();
-    let state = state.lock();
-    let record = state
-        .vulnerability_db
-        .iter()
-        .find(|record| record.cve_id == cve_id)
-        .unwrap_or_else(|| panic!("the store holds an advisory for {cve_id}"));
-    let mut urls: Vec<String> = Vec::new();
-    for url in record.source_url.iter().chain(record.advisories.iter()) {
-        if !url.is_empty() && !urls.contains(url) {
-            urls.push(url.clone());
-        }
-    }
-    urls
 }
 
 /// The advisory publisher the store records for `cve_id`.
@@ -112,7 +92,7 @@ fn carries_member(document: &Value, member: &str) -> bool {
 
 /// The node for `id` in a report's `vulnerabilities` list, and `None` when the
 /// list carries none (or is not a list at all).
-fn node_for<'r>(report: &'r Value, id: &str) -> Option<&'r Value> {
+pub(crate) fn node_for<'r>(report: &'r Value, id: &str) -> Option<&'r Value> {
     report["vulnerabilities"]
         .as_array()?
         .iter()
@@ -278,21 +258,18 @@ async fn the_inspector_alt_report_lists_vulnerability_nodes_carrying_vendor_advi
             );
 
             // And it carries the vendor advisories for it, projected from the
-            // matched record rather than invented.
+            // matched record rather than invented: one entry for the advisory
+            // the node reports.
             let advisories = node[VENDOR_ADVISORIES].as_array().unwrap_or_else(|| {
                 panic!(
                     "case {:?}: {id} must carry {VENDOR_ADVISORIES} as an array, got {node}",
                     case.what
                 )
             });
-            let urls: Vec<String> = advisories
-                .iter()
-                .map(|entry| entry["url"].as_str().unwrap_or_default().to_string())
-                .collect();
             assert_eq!(
-                urls,
-                vendor_publications(&engine, id),
-                "case {:?}: {id} must report the publications the store holds, got {node}",
+                advisories.len(),
+                1,
+                "case {:?}: {id} reports one vendor advisory, got {node}",
                 case.what
             );
             let source = vendor_source(&engine, id);
@@ -321,7 +298,7 @@ async fn the_inspector_alt_report_lists_vulnerability_nodes_carrying_vendor_advi
 }
 
 #[tokio::test]
-async fn an_advisory_with_no_vendor_publication_still_carries_the_member() {
+async fn an_advisory_the_catalog_does_not_carry_still_reports_its_vendor_advisory() {
     let (engine, router) = emulator();
     inject_unpublished_advisory(&engine);
     let request = json!({
@@ -330,7 +307,7 @@ async fn an_advisory_with_no_vendor_publication_still_carries_the_member() {
     });
     let (status, response) = post_scan(&router, &request).await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
-    let node = node_for(&response["sbom"], UNPUBLISHED_ADVISORY).unwrap_or_else(|| {
+    let node = node_for(&response["sbom"], INJECTED_ADVISORY).unwrap_or_else(|| {
         panic!(
             "expected a node for the injected advisory, got {}",
             response["sbom"]["vulnerabilities"]
@@ -338,8 +315,15 @@ async fn an_advisory_with_no_vendor_publication_still_carries_the_member() {
     });
     assert_eq!(
         node[VENDOR_ADVISORIES],
-        json!([]),
-        "an advisory with no publication reports the member as an empty list, got {node}"
+        json!([{
+            "id": INJECTED_ADVISORY,
+            "source": vendor_source(&engine, INJECTED_ADVISORY),
+            "severity": "medium",
+            "vendorCreatedAt": "2024-01-01T00:00:00Z",
+            "vendorUpdatedAt": "2024-01-02T00:00:00Z",
+        }]),
+        "an advisory injected into the store reports the vendor advisory its record \
+         holds, got {node}"
     );
 }
 

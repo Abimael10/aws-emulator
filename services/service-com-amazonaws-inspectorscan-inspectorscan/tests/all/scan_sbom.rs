@@ -10,7 +10,7 @@
 //!   the resolved version falls inside the advisory's affected range;
 //! * every reported finding is a projection of the matched advisory onto the
 //!   matched component — one rating per scoring vendor the advisory holds a
-//!   score from, the CWEs, the advisory URLs, the fixed-in
+//!   score from, the CWEs, the fixed-in
 //!   version, and an `affects[].ref` that resolves in the submitted document;
 //! * the three `outputFormat` values render the SAME finding set;
 //! * the operation is `@idempotent`: the same SBOM scanned twice answers the
@@ -521,12 +521,11 @@ async fn a_finding_carries_one_rating_per_scoring_vendor() {
         "expected the advisory's own source, got {}",
         finding["source"]
     );
+    // The node republishes no advisory reference pages: which members may carry
+    // an address at all is pinned in `scan_report_links.rs`.
     assert!(
-        finding["advisories"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty()),
-        "expected the stored advisory URLs, got {}",
-        finding["advisories"]
+        finding["advisories"].is_null(),
+        "a CycloneDX node republishes no advisory reference pages, got {finding}"
     );
     let properties = finding["properties"].as_array().cloned().unwrap_or_default();
     assert!(
