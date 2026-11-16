@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfileHistoryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfileHistoryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves one page of the history a domain keeps for one of its profiles: the actions
+//! taken on that profile — its creation, a write of its own members, a key value
+//! associated with it, an object ingested onto it, an object deleted or expired, a merge
+//! that absorbed another profile — narrowed by the filters the request carries.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfileHistoryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The records are written by the operations that TAKE those actions
+//! ([`crate::state::Domain::record_profile_action`]); this operation only reads them, in
+//! the order they happened.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfileHistoryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfileHistoryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfileHistoryRecords"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        // Everything that needs the store happens inside this block, so the shared state
+        // lock is released before the response is built. A profile's records are held in
+        // the order its actions happened, so one page's cursor resumes the next.
+        let (records, next_token) = {
+            let mut store = state.lock();
+            // A `NextToken` names a position inside itself, so a read that honoured any
+            // value of the right shape would resume at a position it never offered. This
+            // one resumes only at a position it ISSUED: the token carries an authenticator
+            // over its cursor under this store's own secret.
+            let page_tokens = store.page_tokens;
+            let resume = match input.next_token.as_deref() {
+                Some(token) => {
+                    Some(crate::state::page_cursor(page_tokens, token).ok_or_else(invalid_page)?)
+                }
+                None => None,
+            };
+            let domain = store
+                .domains
+                .get_mut(&input.domain_name)
+                .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+            // The retention the clock has already run out is materialised before the page
+            // is picked, so the `EXPIRED` records it owes are part of the history this
+            // read reports rather than appearing only once something else writes.
+            domain.expire_profile_objects(now);
+            // The history is the profile's own, so a profile this domain does not hold has
+            // none to report: it is the absent resource, not an empty page. Worded with
+            // the sentence this service reports an absent profile with wherever one is
+            // addressed by id (`crate::state::profile_not_found`), so the same unheld id
+            // reads the same whichever operation was called.
+            if !domain.profiles.contains_key(&input.profile_id) {
+                return Err(not_found(crate::state::profile_not_found(&input.profile_id)));
+            }
+
+            let listed = domain
+                .profile_history_records(&input.profile_id)
+                .iter()
+                .filter(|record| {
+                    record.selected_by(
+                        input.action_type.as_deref(),
+                        input.object_type_name.as_deref(),
+                        input.performed_by.as_deref(),
+                    )
+                })
+                .map(|record| (record.cursor(), record.as_record()));
+            let (page, cursor) =
+                crate::state::paginate(listed, resume.as_deref(), input.max_results);
+            // The cursor the page stopped at travels back as a token this store can
+            // recognise when it is handed the next call.
+            (
+                page,
+                cursor.map(|cursor| crate::state::page_token(page_tokens, &cursor)),
+            )
+        };
+
+        Ok(ListProfileHistoryRecordsOutput {
+            profile_history_records: Some(records),
+            next_token,
+        })
     }
+}
+
+/// The request named a page this listing cannot resume: a `NextToken` it did not issue.
+///
+/// One sentence for the whole pagination argument — the token and the page size together —
+/// because that is how the service words it; the page size's own modelled bounds are
+/// refused ahead of any handler, so what reaches this is the token.
+fn invalid_page() -> ListProfileHistoryRecordsError {
+    ListProfileHistoryRecordsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!(
+            "{} failed due to the nextToken or the maxResults is invalid",
+            <ListProfileHistoryRecords<()> as smithy_server_runtime::Operation>::NAME
+        )),
+    })
+    .into()
+}
+
+/// A domain or profile the request names is not stored.
+fn not_found(message: String) -> ListProfileHistoryRecordsError {
+    ListProfileHistoryRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> ListProfileHistoryRecordsError {
+    ListProfileHistoryRecordsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }

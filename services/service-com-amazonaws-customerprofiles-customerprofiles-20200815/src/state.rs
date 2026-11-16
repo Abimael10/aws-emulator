@@ -27,6 +27,17 @@ use crate::ops::types::{
 /// published `@pattern` for that member cannot make.
 pub mod tagged_resources;
 
+/// The history a domain keeps for each of its profiles: one record per action taken on a
+/// profile, written by the operations that take those actions.
+pub mod profile_history;
+
+pub use profile_history::{
+    new_history_record_id, ProfileAction, StoredProfileHistoryRecord, ACTION_ADDED_PROFILE_KEY,
+    ACTION_CREATED, ACTION_DELETED_BY_CUSTOMER, ACTION_DELETED_BY_MERGE, ACTION_EXPIRED,
+    ACTION_INGESTED, ACTION_MERGED, ACTION_UPDATED, MAX_PROFILE_HISTORY_RECORDS,
+    STANDARD_PROFILE_OBJECT_TYPE,
+};
+
 pub use tagged_resources::{
     reported_resource_tags, resource_arn_violation, resource_tags_mut, MAX_TAGS_PER_RESOURCE,
     TAGGED_RESOURCE_NOT_FOUND,
@@ -432,6 +443,15 @@ pub struct Domain {
     ///
     /// [`key_index`]: Domain::key_index
     pub profile_keys: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    /// `ProfileId` -> the history of that profile, oldest action first: what
+    /// `ListProfileHistoryRecords` serves. The operations that change a profile or the
+    /// objects ingested onto it append to it ([`Domain::record_profile_action`]), so a
+    /// listing reports actions that really happened.
+    pub profile_history: BTreeMap<String, Vec<StoredProfileHistoryRecord>>,
+    /// The next position to hand a history record of this domain. One counter per domain,
+    /// so the records of two profiles merged into one still read in the order their
+    /// actions happened.
+    pub history_sequence: u64,
 }
 
 /// One stored profile object type: the configuration `PutProfileObjectType` persisted
@@ -828,6 +848,8 @@ impl Domain {
             recommender_schemas: BTreeMap::new(),
             key_index: HashMap::new(),
             profile_keys: BTreeMap::new(),
+            profile_history: BTreeMap::new(),
+            history_sequence: 0,
         }
     }
 
@@ -1174,6 +1196,11 @@ impl Domain {
     /// removal at that instant whether or not anybody called — so every operation that
     /// touches this domain's objects does it first, and none of them reports data the
     /// domain should no longer hold.
+    ///
+    /// Each object that goes leaves an `EXPIRED` record on its profile's history: the
+    /// retention running out is one of the actions a history record describes, and it was
+    /// owed at the same instant whether or not anybody called, so recording it here is
+    /// part of materialising it rather than a change this call invented.
     pub fn expire_profile_objects(&mut self, now: SystemTime) {
         let expired: Vec<ProfileObjectId> = self
             .profile_objects
@@ -1184,7 +1211,20 @@ impl Domain {
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
-            self.profile_objects.remove(&id);
+            let Some(stored) = self.profile_objects.remove(&id) else {
+                continue;
+            };
+            self.record_profile_action(
+                &stored.profile_id,
+                ProfileAction::on_object(
+                    ACTION_EXPIRED,
+                    &stored.object_type_name,
+                    &stored.unique_key,
+                )
+                // Nobody asked for this: the retention fell due.
+                .performed_by_nobody(),
+                now,
+            );
         }
     }
 
@@ -1934,6 +1974,13 @@ pub fn ingest_profile_object(
                 created_at: now,
                 last_updated_at: now,
             });
+            // A profile inferred from an ingested object was created here, so its history
+            // starts the same way a profile created by a call does.
+            domain.record_profile_action(
+                &profile_id,
+                ProfileAction::on_profile(ACTION_CREATED),
+                now,
+            );
             profile_id
         }
         // A type that does not allow profile creation leaves an object no profile claims
@@ -1959,11 +2006,19 @@ pub fn ingest_profile_object(
         // Stored as the request carried it, so a listing reports the object that was
         // ingested rather than a re-rendering of it.
         object: object_text.to_string(),
-        profile_id,
+        profile_id: profile_id.clone(),
         index_values: ingest.index_values,
         created_at: created_at.unwrap_or(now),
         last_updated_at: now,
     });
+    // The object was ingested onto that profile, which is one of the actions a history
+    // record describes. Recorded here, in the one ingest path, so every operation that
+    // takes an object in records it the same way.
+    domain.record_profile_action(
+        &profile_id,
+        ProfileAction::on_object(ACTION_INGESTED, object_type_name, &unique_key),
+        now,
+    );
 
     Ok(unique_key)
 }

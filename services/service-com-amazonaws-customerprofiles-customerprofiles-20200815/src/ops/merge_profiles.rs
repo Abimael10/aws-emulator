@@ -300,6 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // main profile", so they move while the profile that carried them is still
             // there to move them off.
             domain.move_profile_keys(id, &input.main_profile_id);
+            // The merge is what ends this profile, so that is the last action in its own
+            // history — which then moves onto the main profile with the rest of its data.
+            domain.record_profile_action(
+                id,
+                crate::state::ProfileAction::on_profile(crate::state::ACTION_DELETED_BY_MERGE),
+                now,
+            );
+            domain.move_profile_history(id, &input.main_profile_id);
             domain.remove_profile(id);
             // The data of a merged profile belongs to the profile that absorbed it, so
             // the objects ingested onto it move rather than go.
@@ -310,6 +318,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at,
             last_updated_at: now,
         });
+        // One more action in the main profile's history: it absorbed the profiles the
+        // merge named.
+        domain.record_profile_action(
+            &input.main_profile_id,
+            crate::state::ProfileAction::on_profile(crate::state::ACTION_MERGED),
+            now,
+        );
 
         Ok(MergeProfilesOutput {
             message: Some(MERGE_COMPLETE.to_string()),

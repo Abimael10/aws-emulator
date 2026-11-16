@@ -258,6 +258,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: stored.created_at,
             last_updated_at: now,
         });
+        // One more action in this profile's history: a write of its own members.
+        domain.record_profile_action(
+            &input.profile_id,
+            crate::state::ProfileAction::on_profile(crate::state::ACTION_UPDATED),
+            now,
+        );
 
         Ok(UpdateProfileOutput {
             profile_id: input.profile_id,

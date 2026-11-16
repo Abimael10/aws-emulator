@@ -169,6 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.profile_object_unique_key,
                 ))
             })?;
+        // One more action in the profile's history: the caller deleted one of its
+        // objects.
+        domain.record_profile_action(
+            &input.profile_id,
+            crate::state::ProfileAction::on_object(
+                crate::state::ACTION_DELETED_BY_CUSTOMER,
+                &input.object_type_name,
+                &input.profile_object_unique_key,
+            ),
+            now,
+        );
 
         Ok(DeleteProfileObjectOutput {
             message: Some(DELETE_ACKNOWLEDGEMENT.to_string()),

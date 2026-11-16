@@ -186,6 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(stored) = domain.profiles.get_mut(&input.profile_id) {
             stored.last_updated_at = now;
         }
+        // One more action in this profile's history: a key value was associated with it.
+        domain.record_profile_action(
+            &input.profile_id,
+            crate::state::ProfileAction::on_profile(crate::state::ACTION_ADDED_PROFILE_KEY),
+            now,
+        );
 
         // The key this call associated values under, and the values it associated: the
         // requested ones, deduplicated, because a key carries a SET of values and a

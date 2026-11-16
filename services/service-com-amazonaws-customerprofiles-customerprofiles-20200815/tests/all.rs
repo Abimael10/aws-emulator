@@ -37,6 +37,8 @@ mod merge_profiles;
 mod modelled_refusal_envelope;
 #[path = "all/profile_collection_messages.rs"]
 mod profile_collection_messages;
+#[path = "all/profile_history_records.rs"]
+mod profile_history_records;
 #[path = "all/profile_keys.rs"]
 mod profile_keys;
 #[path = "all/profile_not_found_message.rs"]

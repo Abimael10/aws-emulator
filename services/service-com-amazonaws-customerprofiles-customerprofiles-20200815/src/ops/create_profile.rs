@@ -257,6 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             last_updated_at: now,
         });
+        // The profile's history starts with its creation: `ListProfileHistoryRecords`
+        // reports the actions taken on a profile, and this call is one of them.
+        domain.record_profile_action(
+            &profile_id,
+            crate::state::ProfileAction::on_profile(crate::state::ACTION_CREATED),
+            now,
+        );
 
         Ok(CreateProfileOutput { profile_id })
     }
