@@ -1699,6 +1699,32 @@ pub(crate) fn return_values(
             attributes.insert("SpendingLimitArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // Backup Gateway's own control plane: the hypervisor an
+        // `AWS::BackupGateway::Hypervisor` declares. "Ref returns the hypervisor ARN" (the
+        // type's primary identifier); Fn::GetAtt reads `HypervisorArn`. That service MINTS
+        // that ARN — `ImportHypervisorConfiguration` takes no identifier for the hypervisor
+        // and answers the `HypervisorArn` it assigned, whose resource path carries an id of
+        // its own form (`ServerArn`:
+        // `^arn:(aws|aws-cn|aws-us-gov):backup-gateway(:[a-zA-Z-0-9]+){3}\/[a-zA-Z-0-9]+$`) —
+        // so the value here is a STAND-IN of that form, which `super::provisioning` re-points
+        // at the ARN the import really answered
+        // ([`super::provisioner::Provisioner::BackupGatewayHypervisor`]).
+        BACKUP_GATEWAY_HYPERVISOR => {
+            let arn = ::emulator_server::emulator_arn(
+                BACKUP_GATEWAY_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "{BACKUP_GATEWAY_HYPERVISOR_PATH}/{BACKUP_GATEWAY_HYPERVISOR_ID_PREFIX}{}",
+                    service_assigned_label(
+                        BACKUP_GATEWAY_HYPERVISOR_ID_SALT,
+                        name,
+                        BACKUP_GATEWAY_HYPERVISOR_ID_DIGITS,
+                    )
+                ),
+            );
+            attributes.insert("HypervisorArn".to_string(), arn.clone());
+            (arn, attributes)
+        }
         // Recycle Bin's own control plane: the retention rule an `AWS::Rbin::Rule` declares.
         // "Ref returns the rule ARN" (the type's primary identifier); Fn::GetAtt reads `Arn`,
         // `Identifier` and `LockState`. That service MINTS the identifier —

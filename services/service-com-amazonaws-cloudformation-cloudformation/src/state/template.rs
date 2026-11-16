@@ -2752,6 +2752,11 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // A hypervisor keeps the encryption key it was imported with: `KmsKeyArn` is a member
+        // of `ImportHypervisorConfiguration` and of no member of `UpdateHypervisor` (which
+        // takes the host, the credentials, the name and the log group), so a declaration
+        // restating it asks for a different hypervisor.
+        BACKUP_GATEWAY_HYPERVISOR => &["KmsKeyArn"],
         // A retention rule retains the ONE resource type it was created for: `ResourceType` is
         // a member of `CreateRule`, and `UpdateRule`'s member of that name is documented
         // "currently not supported. You can't update a retention rule's resource type after
@@ -3100,6 +3105,10 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             | AMPLIFYUIBUILDER_COMPONENT
             | AMPLIFYUIBUILDER_FORM
             | AMPLIFYUIBUILDER_THEME
+            // A BACKUP GATEWAY hypervisor is in that same position: `UpdateHypervisor` takes
+            // the `HypervisorArn` that service minted together with a new `Name`, so renaming
+            // one is a modification of it rather than a recreation.
+            | BACKUP_GATEWAY_HYPERVISOR
     )
 }
 

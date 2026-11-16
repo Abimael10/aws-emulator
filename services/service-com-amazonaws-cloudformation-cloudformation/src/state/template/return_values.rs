@@ -260,6 +260,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // A hypervisor publishes the ARN Backup Gateway minted for it, which is the one return
+        // value these naming rules compute a stand-in for before it exists.
+        BACKUP_GATEWAY_HYPERVISOR => BACKUP_GATEWAY_HYPERVISOR_ATTRIBUTES,
         // A retention rule publishes the ARN and the identifier Recycle Bin minted for it and
         // the lock state it keeps, all three of which these naming rules compute a stand-in
         // for before the rule exists.
@@ -735,6 +738,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `UpdateRule` and `DeleteRule` each address a rule by. A name CloudFormation decides
         // satisfies neither, so the identity in force is the one that service answered.
         || resource_type == RBIN_RULE
+        // A BACKUP GATEWAY hypervisor is one more: `ImportHypervisorConfiguration` takes no
+        // identifier for the hypervisor — the declaration states the host, the name and the
+        // credentials — and answers the `HypervisorArn` that service minted, which is what
+        // "Ref returns the hypervisor ARN" publishes and what `GetHypervisor`,
+        // `UpdateHypervisor`, `DeleteHypervisor` and `AssociateGatewayToServer` each address
+        // one by. A name CloudFormation decides is no such ARN, so the identity in force is
+        // the one that service answered.
+        || resource_type == BACKUP_GATEWAY_HYPERVISOR
         // A NEPTUNE ANALYTICS graph and a snapshot of one are two more: `CreateGraph` takes
         // the graph's NAME and `CreateGraphSnapshot` the snapshot's, neither takes an
         // identifier, and each answers the id that service minted — `^g-[a-z0-9]{10}$` for a

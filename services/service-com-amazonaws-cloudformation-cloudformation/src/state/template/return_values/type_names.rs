@@ -150,6 +150,36 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of a BACKUP GATEWAY HYPERVISOR: the
+/// on-premises host Backup Gateway reads virtual machines off, connected to by that service's
+/// own `ImportHypervisorConfiguration`. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`BackupGateway`).
+///
+/// "Ref returns the hypervisor ARN" — the type's primary identifier — and `Fn::GetAtt` reads
+/// `HypervisorArn`. Backup Gateway MINTS that ARN: the import takes no identifier for the
+/// hypervisor at all and answers the `HypervisorArn` it assigned, which is the `ServerArn`
+/// every later call on one takes, so it cannot be computed from the template — that is what
+/// [`identity_is_service_assigned`] names this type for.
+pub const BACKUP_GATEWAY_HYPERVISOR: &str = "AWS::BackupGateway::Hypervisor";
+
+/// Backup Gateway's ARN namespace, which is the namespace a hypervisor ARN carries
+/// (`ServerArn`: `^arn:(aws|aws-cn|aws-us-gov):backup-gateway(:[a-zA-Z-0-9]+){3}\/[a-zA-Z-0-9]+$`),
+/// and the resource path such an ARN carries before the identifier that service minted.
+pub const BACKUP_GATEWAY_ARN_NAMESPACE: &str = "backup-gateway";
+pub(super) const BACKUP_GATEWAY_HYPERVISOR_PATH: &str = "hypervisor";
+
+/// The salt the hypervisor-id stand-in is derived under, how many characters it carries and
+/// the prefix it opens with: a hypervisor identity of that service is `hype-` followed by
+/// eight lower-case hexadecimal digits, which is the form the ARN's own
+/// `[a-zA-Z-0-9]+` resource segment carries.
+pub(super) const BACKUP_GATEWAY_HYPERVISOR_ID_SALT: &str = "backup-gateway/hypervisor";
+pub(super) const BACKUP_GATEWAY_HYPERVISOR_ID_DIGITS: usize = 8;
+pub(super) const BACKUP_GATEWAY_HYPERVISOR_ID_PREFIX: &str = "hype-";
+
+/// The one `Fn::GetAtt` attribute a [`BACKUP_GATEWAY_HYPERVISOR`] publishes: the ARN Backup
+/// Gateway minted, which is also what the type's `Ref` returns.
+pub(super) const BACKUP_GATEWAY_HYPERVISOR_ATTRIBUTES: &[&str] = &["HypervisorArn"];
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of an AWS Amplify APP: the hosting
 /// application that service's own `CreateApp` makes, and the parent every other Amplify
 /// resource hangs off. The middle segment is that model's own `awsService.cloudFormationName`

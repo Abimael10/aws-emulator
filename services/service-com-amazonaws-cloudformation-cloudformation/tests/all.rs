@@ -45,6 +45,8 @@ mod apigatewayv2_api_property_updates;
 mod application_auto_scaling_resources;
 #[path = "all/auto_emptied_bucket_deletion.rs"]
 mod auto_emptied_bucket_deletion;
+#[path = "all/backup_gateway_hypervisor_resource_type.rs"]
+mod backup_gateway_hypervisor_resource_type;
 #[path = "all/bedrock_data_source_identity.rs"]
 mod bedrock_data_source_identity;
 #[path = "all/bedrock_flow_resource_type.rs"]

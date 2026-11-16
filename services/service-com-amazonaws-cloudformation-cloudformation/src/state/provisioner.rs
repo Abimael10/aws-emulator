@@ -478,7 +478,8 @@ use super::template::{
     AOSS_SECURITY_POLICY, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
-    APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
+    APIGATEWAYV2_STAGE, BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
+    BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_DATA_SOURCE,
     BEDROCK_FLOW,
     BEDROCK_GUARDRAIL,
@@ -1170,6 +1171,13 @@ pub(super) enum Provisioner {
     /// (`^gs-[a-z0-9]{10}$`), which is the identity a `Ref` resolves to, and publishes no call
     /// that changes a snapshot that exists — so a changed declaration replaces it.
     NeptuneGraphGraphSnapshot,
+    /// `AWS::BackupGateway::Hypervisor`: the on-premises hypervisor Backup Gateway's own
+    /// `ImportHypervisorConfiguration` connects to, `UpdateHypervisor` reconfigures and
+    /// `DeleteHypervisor` removes. That service MINTS the `HypervisorArn` — the import takes no
+    /// identifier at all — so the ARN it answered is the resource's physical id, and it is the
+    /// `ServerArn` every later call on a hypervisor takes
+    /// ([`backup_gateway_hypervisors`]).
+    BackupGatewayHypervisor,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1362,6 +1370,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         NEPTUNE_GRAPH_GRAPH => Some(Provisioner::NeptuneGraphGraph),
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some(Provisioner::NeptuneGraphGraphSnapshot),
         RBIN_RULE => Some(Provisioner::RbinRule),
+        BACKUP_GATEWAY_HYPERVISOR => Some(Provisioner::BackupGatewayHypervisor),
         _ => None,
     }
 }
@@ -2066,6 +2075,13 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 create_graph_snapshot(ctx, region, resource, propagated).await
             }
+            // `AWS::BackupGateway::Hypervisor` publishes `Tags`, and
+            // `ImportHypervisorConfiguration` takes a `Tags` list of its own, so a hypervisor a
+            // stack imports carries the tags CloudFormation gives it beside the ones the
+            // declaration asks for.
+            Self::BackupGatewayHypervisor => {
+                create_backup_gateway_hypervisor(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -2226,6 +2242,12 @@ impl Provisioner {
                 // snapshot each carry the stack's own tags without the three.
                 | Self::NeptuneGraphGraph
                 | Self::NeptuneGraphGraphSnapshot
+                // Backup Gateway refuses a tag key in the reserved namespace on every call that
+                // takes tags — `ImportHypervisorConfiguration`'s own `Tags` list and
+                // `TagResource` alike, in the one check its own crate's tag validation makes
+                // ("The key can't start with `aws:`") — so a hypervisor carries the stack's own
+                // tags without the three.
+                | Self::BackupGatewayHypervisor
         );
         propagated
             .iter()
@@ -2434,6 +2456,14 @@ impl Provisioner {
             // invoked — so the resource is held open until Amazon Bedrock Agent reports the
             // flow `Prepared`.
             Self::BedrockFlow => flow_readiness(ctx, region, physical_resource_id).await,
+            // `ImportHypervisorConfiguration` leaves the hypervisor `PENDING` — the first of
+            // the states `HypervisorDetails$State` documents, in which Backup Gateway has not
+            // reached the host yet, so no gateway can be associated with it and no metadata
+            // sync of it would report anything — so the resource is held open until that
+            // service reports the hypervisor `ONLINE`.
+            Self::BackupGatewayHypervisor => {
+                backup_gateway_hypervisor_readiness(ctx, region, physical_resource_id).await
+            }
             // `CreatePipe` answers the pipe `CREATING` and `UpdatePipe` answers it
             // `UPDATING` — "the state the pipe is in" — and in neither does the pipe carry
             // the configuration the declaration asked for, so the resource is held open
@@ -3195,6 +3225,16 @@ impl Provisioner {
             Self::RbinRule => update_rbin_rule(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateHypervisor` reconfigures the hypervisor the stack imported, by the ARN
+            // Backup Gateway minted for it, taking the host, the credentials, the name and the
+            // log group — so a changed declaration of one of those is applied to that
+            // hypervisor rather than replacing it. Its tags travel separately
+            // ([`Self::retag`]).
+            Self::BackupGatewayHypervisor => {
+                update_backup_gateway_hypervisor(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateGraph` reconfigures the graph the stack created, by the id Neptune
             // Analytics minted for it, taking the memory it is provisioned with and its two
             // flags — so a changed declaration of one of those is applied to that graph rather
@@ -3301,6 +3341,13 @@ impl Provisioner {
             // up carrying is reconciled.
             Self::RbinRule => {
                 retag_rbin_rule(ctx, region, resource, declared, propagated).await
+            }
+            // A hypervisor's tags are Backup Gateway's own `TagResource` and `UntagResource`:
+            // `ImportHypervisorConfiguration`'s `Tags` list applies to the hypervisor that call
+            // imports, and `UpdateHypervisor` carries no tags at all, so this is where the set
+            // a hypervisor is to end up carrying is reconciled.
+            Self::BackupGatewayHypervisor => {
+                retag_backup_gateway_hypervisor(ctx, region, resource, declared, propagated).await
             }
             // A graph's tags are Neptune Analytics' own `TagResource` and `UntagResource`:
             // `CreateGraph`'s `tags` map applies to the graph that call creates, and
@@ -3932,6 +3979,11 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 delete_graph_snapshot(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the hypervisor by the ARN Backup Gateway minted for it,
+            // which is this resource's physical id.
+            Self::BackupGatewayHypervisor => {
+                delete_backup_gateway_hypervisor(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -4516,6 +4568,10 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 describe_graph_snapshot(ctx, region, physical_resource_id).await
             }
+            // Backup Gateway's own read of the hypervisor, by the ARN it minted for it.
+            Self::BackupGatewayHypervisor => {
+                describe_backup_gateway_hypervisor(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -4563,6 +4619,11 @@ mod bedrock_flows;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The AWS Backup Gateway HYPERVISOR arms: the on-premises host an
+/// `AWS::BackupGateway::Hypervisor` declares, imported into the service that owns it so a
+/// client's own reads — and the gateway a later declaration associates with it — resolve the
+/// ARN the stack publishes.
+mod backup_gateway_hypervisors;
 mod amplify_ui_builder;
 mod amplify_apps;
 mod amplify_branches;
@@ -4662,6 +4723,7 @@ use bedrock_data_sources::*;
 use bedrock_flows::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
+use backup_gateway_hypervisors::*;
 use amplify_ui_builder::*;
 use amplify_apps::*;
 use amplify_branches::*;

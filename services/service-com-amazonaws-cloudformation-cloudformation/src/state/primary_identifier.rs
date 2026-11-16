@@ -77,6 +77,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // A Backup Gateway hypervisor, identified by the ARN that service minted for it ("Ref
+        // returns the hypervisor ARN") — the `ServerArn` every call on a hypervisor takes; the
+        // type's own `Name` is only what the hypervisor is called.
+        BACKUP_GATEWAY_HYPERVISOR => "HypervisorArn",
         // A Recycle Bin retention rule, identified by the ARN that service built around the
         // identifier it minted ("Ref returns the rule ARN") — the type declares no name a
         // client could name one by.
