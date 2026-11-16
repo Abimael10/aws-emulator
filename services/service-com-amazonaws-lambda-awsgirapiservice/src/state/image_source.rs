@@ -30,13 +30,14 @@
 //! [`super::event_source_authorization`] reads IAM's roles through.
 //!
 //! A reference addresses that registry either at one of AWS's own registry hosts
-//! (`<account-id>.dkr.ecr.<region>.<domain>`) or at the address the registry ANNOUNCES to a
-//! client that pushed the image here: `Repository$repositoryUri` is "The URI for the
-//! repository. You can use this URI for container image `push` and `pull` operations", and
-//! on this emulator that URI is built on the endpoint the emulator answers the registry at,
-//! because AWS's own registry host resolves nowhere on the machine it runs on. A reference
-//! carrying the URI a client pushed to is therefore a reference to this registry, and is
-//! followed exactly like the AWS-hosted spelling ([`emulator_registry_authorities`]).
+//! (`<account-id>.dkr.ecr.<region>.<domain>`) or at the address a container client on this
+//! machine DIALS the registry at, which is the endpoint this emulator answers it on:
+//! AWS's own registry host resolves nowhere there, so the registry hands such a client its
+//! own endpoint to log in and push to (`AuthorizationData$proxyEndpoint`, "The registry URL
+//! to use for this authorization token in a `docker login` command"), and the reference the
+//! client then holds for the image it pushed carries that address. Such a reference is a
+//! reference to this registry, and is followed exactly like the AWS-hosted spelling
+//! ([`emulator_registry_authorities`]).
 //!
 //! Nothing is refused on evidence this emulator does not have: an engine carrying no ECR
 //! store, and a registry belonging to another account, show nothing about the image and
@@ -157,11 +158,11 @@ pub fn image_package_digest<Eng: Send + Sync + 'static>(
 /// AWS's own registry hosts: the endpoint the request reached this emulator on, and the
 /// address this emulator is served at.
 ///
-/// Those are the two addresses the registry builds a `repositoryUri` on, read through the
-/// tree's own readings of them (`service_common::data_plane_addressing`), so a reference
-/// carrying the URI a client was handed for a push is followed here. One endpoint serves
-/// every Region, so such a reference names no Region of its own and is resolved in the
-/// function's.
+/// Those are the two addresses the registry announces for a `docker login` and a push, read
+/// through the tree's own readings of them (`service_common::data_plane_addressing`), so a
+/// reference carrying the address a client was handed for a push is followed here. One
+/// endpoint serves every Region, so such a reference names no Region of its own and is
+/// resolved in the function's.
 #[must_use]
 pub fn emulator_registry_authorities(
     ctx: &::smithy_server_runtime::OperationContext<'_>,

@@ -97,6 +97,8 @@ mod collection_element_refusals;
 mod concurrency_quota_refusal_rules;
 #[path = "all/container_image_pull_permission.rs"]
 mod container_image_pull_permission;
+#[path = "all/container_image_reached_registry_address.rs"]
+mod container_image_reached_registry_address;
 #[path = "all/control_plane_request_rules.rs"]
 mod control_plane_request_rules;
 #[path = "all/dead_letter_config_execution_role_permissions.rs"]
