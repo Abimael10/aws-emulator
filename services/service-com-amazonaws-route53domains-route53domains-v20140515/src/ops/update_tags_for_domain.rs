@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTagsForDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTagsForDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds or updates the tags of one of the account's domains: a tag key that is already
+//! there has its value replaced, and the keys the request does not name are left as they
+//! were. A name this account does not hold is refused the way every domain-scoped
+//! operation refuses one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTagsForDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The tags it writes are what `ListTagsForDomain` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +106,26 @@ impl From<UpdateTagsForDomainErrorModeled> for UpdateTagsForDomainError {
     }
 }
 
+/// How this operation refuses a `DomainName` it cannot resolve: `InvalidInput` for a
+/// malformed name, `UnsupportedTLD` for a TLD the registrar does not offer. Both are
+/// errors this operation's model declares.
+fn refuse_domain_name(raw: &str, err: crate::state::DomainNameError) -> UpdateTagsForDomainError {
+    match err {
+        crate::state::DomainNameError::Invalid => {
+            UpdateTagsForDomainErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::invalid_domain_name_message(raw)),
+            })
+            .into()
+        }
+        crate::state::DomainNameError::UnsupportedTld => {
+            UpdateTagsForDomainErrorModeled::UnsupportedTLD(UnsupportedTLD {
+                message: Some(crate::state::unsupported_tld_message(raw)),
+            })
+            .into()
+        }
+    }
+}
+
 /// The `UpdateTagsForDomain` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +162,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTagsForDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTagsForDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTagsForDomain"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let name = crate::state::resolve_domain_name(&input.domain_name)
+            .map_err(|err| refuse_domain_name(&input.domain_name, err))?;
+
+        // A tag is identified by its key ("[i]f you specify a key that already exists,
+        // the corresponding value will be replaced"), so a tag that carries no key names
+        // nothing to add or update and the whole request is refused before anything is
+        // written.
+        let tags_to_update = input.tags_to_update.unwrap_or_default();
+        if tags_to_update
+            .iter()
+            .any(|tag| tag.key.as_deref().unwrap_or_default().trim().is_empty())
+        {
+            return Err(UpdateTagsForDomainErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::blank_tag_key_message()),
+            })
+            .into());
+        }
+        // The request alone cannot carry more tags than a domain may hold, so the merge
+        // below is bounded before a single key is copied: `TagList` carries no modelled
+        // maximum length, and the work a request can ask for has to be capped by
+        // something.
+        if tags_to_update.len() > crate::state::MAX_TAGS_PER_DOMAIN {
+            return Err(UpdateTagsForDomainErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::tag_limit_message()),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
+        let mut state = state.lock();
+        let Some(domain) = state.domains.get_mut(&name) else {
+            return Err(UpdateTagsForDomainErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::unknown_domain_message(&name)),
+            })
+            .into());
+        };
+
+        // The tag store is driven by the caller, so it has a stated ceiling; reaching it
+        // is a request this account cannot have served, which is the modelled
+        // `InvalidInput`.
+        let mut merged = domain.tags.clone();
+        for tag in tags_to_update {
+            let key = tag.key.unwrap_or_default();
+            // `Tag.Value` is optional and may be empty ("0-256 characters"), so a tag
+            // sent without one is stored with an empty value rather than refused.
+            merged.insert(key, tag.value.unwrap_or_default());
+        }
+        if merged.len() > crate::state::MAX_TAGS_PER_DOMAIN {
+            return Err(UpdateTagsForDomainErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::tag_limit_message()),
+            })
+            .into());
+        }
+        domain.tags = merged;
+
+        // The registration record is untouched: tags are metadata attached to the
+        // domain, not part of what the registry holds, so `UpdatedDate` does not move
+        // and no operation record is appended (the model's `OperationType` enum has no
+        // member for a tag change, and this operation returns no `OperationId`).
+        Ok(UpdateTagsForDomainOutput {})
     }
 }

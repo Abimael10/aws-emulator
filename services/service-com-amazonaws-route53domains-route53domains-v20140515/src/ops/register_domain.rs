@@ -313,6 +313,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_millis: now,
             updated_millis: now,
             expiration_millis: crate::state::expiration_millis(now, input.duration_in_years),
+            // A fresh registration carries no tags: `UpdateTagsForDomain` is the only
+            // thing that writes them.
+            tags: ::std::collections::BTreeMap::new(),
+            // Registration is one of the operations that "require confirmation that the
+            // email address for the registrant contact is valid"
+            // (`GetContactReachabilityStatus`), so the confirmation email goes out now
+            // and the reply is owed a short span later.
+            reachability_due_millis: now
+                .saturating_add(crate::state::CONTACT_REACHABILITY_REPLY_MILLIS),
         };
         state.domains.insert(name.clone(), domain);
 

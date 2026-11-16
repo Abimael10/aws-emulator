@@ -49,6 +49,18 @@ pub const TYPE_DELETE_DOMAIN: &str = "DELETE_DOMAIN";
 pub const TYPE_ENABLE_AUTORENEW: &str = "ENABLE_AUTORENEW";
 /// `DISABLE_AUTORENEW`, from the model's `OperationType` enum.
 pub const TYPE_DISABLE_AUTORENEW: &str = "DISABLE_AUTORENEW";
+/// `DOMAIN_LOCK`, from the model's `OperationType` enum: the type of the record the
+/// transfer-lock operations append (`DisableDomainTransferLock` "removes the transfer
+/// lock on the domain").
+pub const TYPE_DOMAIN_LOCK: &str = "DOMAIN_LOCK";
+
+/// `PENDING`, from the model's `ReachabilityStatus` enum
+/// (`crate::ops::types::REACHABILITY_STATUS_VALUES`): "We sent the confirmation email
+/// and haven't received a response yet."
+pub const REACHABILITY_PENDING: &str = "PENDING";
+/// `DONE`, from the model's `ReachabilityStatus` enum: "We sent the email and got
+/// confirmation from the registrant contact."
+pub const REACHABILITY_DONE: &str = "DONE";
 
 /// The EPP status a freshly registered domain carries: ICANN forbids transferring a
 /// domain away within 60 days of registration, which Route 53 expresses as the transfer
@@ -77,6 +89,17 @@ pub fn now_millis() -> i64 {
 /// observe the transient `SUBMITTED` status, the way it would against the real service.
 pub const OPERATION_SETTLE_MILLIS: i64 = 500;
 
+/// How long after a registration this emulator owes the registrant contact's reply to the
+/// confirmation email — the move of `GetContactReachabilityStatus`'s `ReachabilityStatus`
+/// out of `PENDING` into `DONE`.
+///
+/// Route 53 Domains documents no span for this either (the real reply waits on a person
+/// reading their mail), so the span is this emulator's own choice: a few seconds, long
+/// enough that a caller which asks straight after `RegisterDomain` still observes the
+/// transient `PENDING`, and short enough that a client polling for the confirmation is not
+/// left waiting.
+pub const CONTACT_REACHABILITY_REPLY_MILLIS: i64 = 3_000;
+
 /// The most operation records this emulator keeps, and the most domains it registers.
 ///
 /// Both stores are driven by the caller — a record is appended by every mutating call,
@@ -95,6 +118,15 @@ pub const OPERATION_SETTLE_MILLIS: i64 = 500;
 pub const MAX_DOMAINS: usize = 200;
 /// See [`MAX_DOMAINS`].
 pub const MAX_OPERATION_RECORDS: usize = 1000;
+/// The most tags this emulator keeps on one domain.
+///
+/// Tags are caller-driven too — `UpdateTagsForDomain` adds a key per request and nothing
+/// obliges a client to delete one — so the per-domain tag map needs a ceiling for the
+/// same reason [`MAX_DOMAINS`] does. The model publishes no per-domain tag quota, so
+/// this is this emulator's stated ceiling, far above any test or demo workload; a
+/// request that would take a domain past it is refused with the modelled `InvalidInput`
+/// rather than silently dropping a tag the caller asked for.
+pub const MAX_TAGS_PER_DOMAIN: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -122,6 +154,33 @@ pub struct Domain {
     pub creation_millis: i64,
     pub updated_millis: i64,
     pub expiration_millis: i64,
+    /// The domain's tags, keyed by tag key — what `UpdateTagsForDomain` writes and
+    /// `ListTagsForDomain` reports. A map, because a key identifies a tag: writing a key
+    /// that is already there replaces its value rather than adding a second tag.
+    pub tags: BTreeMap<String, String>,
+    /// The instant the registrant contact's reply to the confirmation email is due —
+    /// what `GetContactReachabilityStatus` reports against the clock. See
+    /// [`CONTACT_REACHABILITY_REPLY_MILLIS`].
+    pub reachability_due_millis: i64,
+}
+
+impl Domain {
+    /// Whether the registrant contact has responded to the confirmation email, as the
+    /// modelled `ReachabilityStatus` names it.
+    ///
+    /// The reply is a thing the clock owes: it is due at `reachability_due_millis`, so a
+    /// caller reads [`REACHABILITY_PENDING`] before that instant and
+    /// [`REACHABILITY_DONE`] from it on, whether or not anybody asked in between. The
+    /// enum's third member, `EXPIRED` ("[t]he time limit expired before the registrant
+    /// contact responded"), is never reported: nothing in this emulator lets the reply
+    /// window lapse, because there is no registrant to leave the email unanswered.
+    pub fn reachability_status(&self, now_millis: i64) -> &'static str {
+        if now_millis >= self.reachability_due_millis {
+            REACHABILITY_DONE
+        } else {
+            REACHABILITY_PENDING
+        }
+    }
 }
 
 /// One asynchronous operation record, as `GetOperationDetail` and `ListOperations`
@@ -362,14 +421,42 @@ pub fn unsupported_tld_message(raw: &str) -> String {
 }
 
 /// The message the `InvalidInput` refusal of a domain this account does not hold carries.
+///
+/// `InvalidInput` is the error the model binds to every operation for exactly this
+/// condition — "the request might specify a domain name that doesn't belong to the
+/// account that submitted the request" — and the real service words it the way every
+/// request-level problem it reports is worded: the fixed "Invalid request. Problems: "
+/// prefix, then the problem itself, here "Domain " followed by the name and the fixed
+/// " not found in account." (the trailing period included). The one variable part is the
+/// domain name the request asked about — resolved through [`resolve_domain_name`] first,
+/// so the name is reported the way this registrar holds names (domain names are not case
+/// sensitive, so they are lower-cased) — so every domain-scoped operation that cannot
+/// resolve a name to one of the account's domains answers with the identical sentence.
 pub fn unknown_domain_message(name: &str) -> String {
-    format!("Domain {name} is not registered to this account")
+    format!("Invalid request. Problems: Domain {name} not found in account.")
 }
 
 /// The message the `DomainLimitExceeded` refusal carries when the account is at
 /// [`MAX_DOMAINS`].
 pub fn domain_limit_message() -> String {
     format!("The number of domains has exceeded the allowed threshold of {MAX_DOMAINS}")
+}
+
+/// The message the `InvalidInput` refusal of a tag with no key carries.
+///
+/// A tag is identified by its key, so a tag without one names nothing to add or update.
+/// Worded in the envelope this service reports a request-level problem in.
+pub fn blank_tag_key_message() -> String {
+    "Invalid request. Problems: Tag key cannot be blank".to_string()
+}
+
+/// The message the `InvalidInput` refusal carries when a domain is at
+/// [`MAX_TAGS_PER_DOMAIN`].
+pub fn tag_limit_message() -> String {
+    format!(
+        "Invalid request. Problems: The number of tags for a domain has exceeded the \
+         allowed threshold of {MAX_TAGS_PER_DOMAIN}"
+    )
 }
 
 /// The TLD of an already resolved domain name: everything after its first label.
