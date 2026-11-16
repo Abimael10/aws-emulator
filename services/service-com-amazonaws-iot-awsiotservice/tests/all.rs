@@ -99,6 +99,8 @@ mod package_deletion;
 mod package_version_conflict_wording;
 #[path = "all/package_version_sbom.rs"]
 mod package_version_sbom;
+#[path = "all/package_version_sbom_accessibility.rs"]
+mod package_version_sbom_accessibility;
 #[path = "all/package_version_update.rs"]
 mod package_version_update;
 #[path = "all/package_versions.rs"]
@@ -107,12 +109,18 @@ mod package_versions;
 mod policy_attachments;
 #[path = "all/policy_deletion.rs"]
 mod policy_deletion;
+#[path = "all/policy_default_version.rs"]
+mod policy_default_version;
+#[path = "all/policy_document_grammar.rs"]
+mod policy_document_grammar;
 #[path = "all/policy_registry.rs"]
 mod policy_registry;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
 #[path = "all/provisioning_templates.rs"]
 mod provisioning_templates;
+#[path = "all/provisioning_role_trust.rs"]
+mod provisioning_role_trust;
 #[path = "all/role_alias_deletion.rs"]
 mod role_alias_deletion;
 #[path = "all/role_alias_registry.rs"]

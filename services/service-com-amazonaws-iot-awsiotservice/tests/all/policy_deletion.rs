@@ -244,11 +244,14 @@ fn attached_message(policy_name: &str) -> String {
     )
 }
 
-/// The sentence a delete refuses a policy that still holds a non-default version with.
+/// The sentence a delete refuses a policy that still holds a non-default version with:
+/// fixed text, with the policy named by the `policyName` the request carried, and the
+/// remediation the caller has to perform before retrying.
 fn non_default_versions_message(policy_name: &str) -> String {
     format!(
-        "The policy cannot be deleted as the policy has one or more non-default versions \
-         (name={policy_name})"
+        "The policy cannot be deleted as multiple versions of the policy exist \
+         (name={policy_name}). Use DeletePolicyVersion action to delete all non-default \
+         versions of the policy and retry."
     )
 }
 

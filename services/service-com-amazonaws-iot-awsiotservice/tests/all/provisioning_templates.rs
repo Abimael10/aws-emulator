@@ -461,9 +461,19 @@ async fn the_default_version_is_deletable_only_once_another_version_is_the_defau
         200,
         "case deleting the template: expected 200"
     );
-    for (case, reply) in [
-        ("the template", emulator.describe_template("guarded").await),
-        ("its version", emulator.describe_version("guarded", 2).await),
+    for (case, reply, expected) in [
+        (
+            "the template",
+            emulator.describe_template("guarded").await,
+            "Unable to find template named guarded",
+        ),
+        (
+            // The reader of ONE VERSION states its miss of the template with its own
+            // article, which is a requirement of that operation.
+            "its version",
+            emulator.describe_version("guarded", 2).await,
+            "Unable to find a template named guarded",
+        ),
     ] {
         assert_eq!(
             reply.status,
@@ -474,7 +484,7 @@ async fn the_default_version_is_deletable_only_once_another_version_is_the_defau
         );
         assert_eq!(
             reply.error_message(),
-            "Unable to find template named guarded",
+            expected,
             "case {case} after the template was deleted: got {}",
             reply.text()
         );

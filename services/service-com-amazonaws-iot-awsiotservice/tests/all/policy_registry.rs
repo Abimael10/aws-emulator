@@ -143,6 +143,12 @@ fn expected_arn(region: &str, policy_name: &str) -> String {
     format!("arn:aws:iot:{region}:{ACCOUNT_ID}:policy/{policy_name}")
 }
 
+/// `InvalidRequestException` as this service NAMES it in `x-amzn-errortype`: the shape
+/// name qualified with the service's API doc namespace, which is the form a restJson1
+/// client resolves this service's validation-refusal shape from.
+const QUALIFIED_INVALID_REQUEST: &str =
+    "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
+
 /// A `CreatePolicy` request body carrying `document` and `tags`.
 fn request_of(document: &str, tags: &[(&str, Option<&str>)]) -> Value {
     let mut body = json!({ "policyDocument": document });
@@ -201,9 +207,9 @@ struct Case {
 ///   class the pattern allows;
 /// * the shape of the document — the IAM policy grammar admits a single statement
 ///   object as well as a list, `Allow` as well as `Deny`, `NotAction` beside
-///   `Action`, a scalar or a list `Action`/`Resource`, an optional `Version`, and an
-///   optional `Condition` (an IoT policy pinning a connection with
-///   `aws:SourceVpce` is one such document);
+///   `Action`, a scalar or a list `Action`/`Resource`, and an optional `Condition` (an
+///   IoT policy pinning a connection with `aws:SourceVpce` is one such document),
+///   beside the policy-language `Version` every document declares;
 /// * how much INSIGNIFICANT whitespace it carries — a pretty-printed document and a
 ///   minified one, since the documented length rule excludes whitespace and a reader
 ///   must hand the text back verbatim either way;
@@ -231,6 +237,7 @@ fn cases() -> Vec<Case> {
             label: "a bare statement OBJECT rather than a list",
             policy_name: "bare-statement".to_string(),
             document: json!({
+                "Version": "2012-10-17",
                 "Statement": {
                     "Effect": "Allow",
                     "Action": ["iot:Connect", "iot:Publish"],
@@ -286,6 +293,7 @@ fn cases() -> Vec<Case> {
             label: "NotAction instead of Action",
             policy_name: "not-action".to_string(),
             document: json!({
+                "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Deny",
                     "NotAction": "iot:Connect",
@@ -322,6 +330,7 @@ fn cases() -> Vec<Case> {
             label: "the shortest legal policy name",
             policy_name: "a".to_string(),
             document: json!({
+                "Version": "2012-10-17",
                 "Statement": [{ "Effect": "Allow", "Action": "iot:Connect", "Resource": "*" }]
             })
             .to_string(),
@@ -332,6 +341,7 @@ fn cases() -> Vec<Case> {
             label: "the longest legal policy name",
             policy_name: "p".repeat(128),
             document: json!({
+                "Version": "2012-10-17",
                 "Statement": [{ "Effect": "Allow", "Action": "iot:Connect", "Resource": "*" }]
             })
             .to_string(),
@@ -601,6 +611,7 @@ async fn a_repeat_create_is_refused_and_changes_nothing() {
             "a different document",
             request_of(
                 &json!({
+                    "Version": "2012-10-17",
                     "Statement": [{ "Effect": "Deny", "Action": "iot:Publish", "Resource": "*" }]
                 })
                 .to_string(),
@@ -696,6 +707,7 @@ async fn reading_an_unknown_policy_is_refused() {
     // about an empty registry.
     let request = request_of(
         &json!({
+            "Version": "2012-10-17",
             "Statement": [{ "Effect": "Allow", "Action": "iot:Connect", "Resource": "*" }]
         })
         .to_string(),
@@ -746,6 +758,7 @@ async fn the_tag_count_is_bounded() {
     let emulator = Emulator::new();
 
     let document = json!({
+        "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": "iot:Connect", "Resource": "*" }]
     })
     .to_string();
@@ -773,7 +786,7 @@ async fn the_tag_count_is_bounded() {
         if expected == 400 {
             assert_eq!(
                 created.error_code.as_deref(),
-                Some("InvalidRequestException"),
+                Some(QUALIFIED_INVALID_REQUEST),
                 "case {label:?}: expected InvalidRequestException, got {created:?}"
             );
             // The refused create wrote nothing.
@@ -799,6 +812,7 @@ async fn the_registry_is_bounded() {
     let emulator = Emulator::new();
 
     let document = json!({
+        "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": "iot:Connect", "Resource": "*" }]
     })
     .to_string();
@@ -827,7 +841,7 @@ async fn the_registry_is_bounded() {
     );
     assert_eq!(
         refused.error_code.as_deref(),
-        Some("InvalidRequestException"),
+        Some(QUALIFIED_INVALID_REQUEST),
         "expected InvalidRequestException past the ceiling, got {refused:?}"
     );
     assert_eq!(

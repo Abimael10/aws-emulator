@@ -26,8 +26,9 @@
 //! does not hold is a 404 `ResourceNotFoundException`.
 //!
 //! The table spans what that rule generalises over — which members of the SBOM's
-//! `s3Location` the request names (`bucket`, `key`, the bucket `version`, none of them
-//! at all), whether the association carries a `clientToken` and how long it is, the
+//! `s3Location` the request names beside the bucket `version` it pins (`bucket`, `key`,
+//! each alone, and a location naming none of them at all), whether the association
+//! carries a `clientToken` and how long it is, the
 //! names that identify the version, and the region the call is signed for — rather than
 //! one recorded request.
 
@@ -242,10 +243,11 @@ struct Case {
 /// The table every case list below is built from. It spans what the rule generalises
 /// over:
 ///
-/// * which members of the SBOM's `s3Location` the request names — `Sbom` is one
-///   optional `s3Location` and an `S3Location` is `bucket` / `key` / `version`, each
-///   optional (`smithy_query(query="shape",shape="Sbom,S3Location")`), so the rows cover
-///   a bucket and a key, all three, each one alone, and an SBOM naming no location at
+/// * which members of the SBOM's `s3Location` the request names beside the bucket
+///   `version` every location pins — `Sbom` is one
+///   optional `s3Location` and an `S3Location` is `bucket` / `key` / `version`
+///   (`smithy_query(query="shape",shape="Sbom,S3Location")`), so the rows cover
+///   a bucket and a key, each one alone, and an SBOM naming no location at
 ///   all;
 /// * whether the association carries a `clientToken` — the `@idempotencyToken`, modelled
 ///   `length 36..64, pattern ^\S{36,64}$`, so the rows cover absent, the shortest legal
@@ -261,7 +263,13 @@ fn cases() -> Vec<Case> {
             package: "sbom-package".to_string(),
             version: "1.0.0".to_string(),
             region: REGION,
-            sbom: json!({ "s3Location": { "bucket": "sbom-bucket", "key": "sboms/v1.spdx.json" } }),
+            sbom: json!({
+                "s3Location": {
+                    "bucket": "sbom-bucket",
+                    "key": "sboms/v1.spdx.json",
+                    "version": "1HL4kqtJlcpXroDTDmk"
+                }
+            }),
             client_token: None,
         },
         Case {
@@ -283,7 +291,7 @@ fn cases() -> Vec<Case> {
             package: "bucket.only_package-1".to_string(),
             version: "Ver_01-aZ.9".to_string(),
             region: "eu-west-2",
-            sbom: json!({ "s3Location": { "bucket": "sbom-bucket" } }),
+            sbom: json!({ "s3Location": { "bucket": "sbom-bucket", "version": "2HL4kqtJlcpXroDTDmk" } }),
             client_token: Some("T".repeat(64)),
         },
         Case {
@@ -291,7 +299,9 @@ fn cases() -> Vec<Case> {
             package: "key-only-package".to_string(),
             version: "2.0.0-rc1".to_string(),
             region: "ap-southeast-1",
-            sbom: json!({ "s3Location": { "key": "sboms/key-only.json" } }),
+            sbom: json!({
+                "s3Location": { "key": "sboms/key-only.json", "version": "4HL4kqtJlcpXroDTDmk" }
+            }),
             client_token: None,
         },
         Case {
@@ -654,7 +664,13 @@ async fn a_different_sbom_replaces_the_one_the_version_holds() {
 async fn an_association_with_a_version_the_catalog_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
 
-    let sbom = json!({ "s3Location": { "bucket": "sbom-bucket", "key": "sboms/absent.json" } });
+    let sbom = json!({
+        "s3Location": {
+            "bucket": "sbom-bucket",
+            "key": "sboms/absent.json",
+            "version": "5HL4kqtJlcpXroDTDmk"
+        }
+    });
     assert_eq!(
         emulator
             .create_package("present-package", REGION)

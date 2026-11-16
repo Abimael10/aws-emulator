@@ -99,6 +99,39 @@ pub fn missing_provisioning_template_message(template_name: &str) -> String {
     format!("Unable to find template named {template_name}")
 }
 
+/// The message a create whose `provisioningRoleArn` names a role AWS IoT cannot assume is
+/// refused with: the modelled `InvalidRequestException` (HTTP 400).
+///
+/// A provisioning template PROVISIONS under that role — "The role ARN for the role
+/// associated with the provisioning template"
+/// (`smithy_query(query="operation",operation="CreateProvisioningTemplate")`) — so a role
+/// the service cannot take on is a template that could never provision anything. The
+/// sentence is entirely fixed text: it names neither the role nor the template, because
+/// what it states is that this service cannot act as the role, not which value was given.
+pub const UNASSUMABLE_PROVISIONING_ROLE_MESSAGE: &str =
+    "The provisioning role cannot be assumed by AWS IoT";
+
+/// How the reader of ONE VERSION of a template refuses a template name the account holds
+/// none under.
+///
+/// A reader of the version states its miss of the TEMPLATE with its own article — "Unable
+/// to find a template named …" — where every operation addressing the template RECORD
+/// states it without ([`missing_provisioning_template_message`]). Both wordings are
+/// requirements of the operation that answers them, so the two sit beside each other here
+/// rather than one being reused for the other. The variable part is the name the request
+/// asked about.
+pub fn missing_template_for_version_message(template_name: &str) -> String {
+    format!("Unable to find a template named {template_name}")
+}
+
+/// How a DELETE of a template refuses a name the account holds none under.
+///
+/// A delete states what it could not do rather than what it could not find, and it names
+/// NO template: the sentence is entirely fixed text, unlike the reader's
+/// ([`missing_provisioning_template_message`]).
+pub const UNDELETABLE_MISSING_TEMPLATE_MESSAGE: &str =
+    "Unable to delete template, template not found";
+
 /// The message a reader of ONE VERSION of a template refuses a `versionId` the
 /// template does not hold with.
 ///

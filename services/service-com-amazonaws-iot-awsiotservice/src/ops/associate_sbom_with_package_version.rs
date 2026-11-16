@@ -160,9 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No region is read here: the version's ARN was minted by the create, and this
-        // call changes none of its identity.
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             AssociateSbomWithPackageVersionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -171,15 +168,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The Region labels the IN-PROCESS read below: it is the Region this request was
+        // served in, and it addresses the emulator's OWN Amazon S3 through the operation
+        // callback. It selects no host — see the read itself. The version's ARN was minted
+        // by the create, and this call changes none of its identity.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
         // The SBOM is associated with "a SPECIFIC software package version", which is
         // identified by the pair `(packageName, versionName)`: a pair the catalog does
         // not hold has nothing to associate one with, so the request is refused with the
         // modelled `ResourceNotFoundException` (HTTP 404, "The specified resource does
         // not exist") instead of conjuring the version — in the wording every reader of
-        // a version refuses an unknown pair with.
+        // a version refuses an unknown pair with. The lock is taken for this lookup alone
+        // and released before the object store is asked anything.
+        if !state
+            .lock()
+            .packages
+            .get(&input.package_name)
+            .is_some_and(|package| package.versions.contains_key(&input.version_name))
+        {
+            return Err(
+                AssociateSbomWithPackageVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_package_version_message(
+                            &input.package_name,
+                            &input.version_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A bill of materials is the object at ONE version of an S3 key, so a location
+        // that pins no version names no fixed document: that is a fact about the request,
+        // refused with the modelled `ValidationException` (HTTP 400) before the object
+        // store is asked anything.
+        if crate::state::sbom_names_no_object_version(&input.sbom) {
+            return Err(
+                AssociateSbomWithPackageVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::SBOM_VERSION_REQUIRED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The bill of materials IS the S3 object it names, so one THIS EMULATOR'S OWN
+        // Amazon S3 does not serve is one the validation this call starts could never run
+        // over: the association is refused with the modelled `ValidationException` (HTTP
+        // 400) in the sentence that refusal states
+        // ([`crate::state::INACCESSIBLE_SBOM_MESSAGE`]) and nothing is recorded — so no
+        // reader of the version reports a document the version does not have.
+        //
+        // NOTHING LEAVES THIS PROCESS. The read is made the way every emulated service
+        // reaches another ([`crate::state::sbom_is_unreadable`], built on
+        // `service_common::s3_client`): the AWS SDK driven over the emulator's own
+        // in-process transport (`ctx.callback()`'s `http_client`), which opens no socket,
+        // resolves no name and cannot reach anything outside this process. No outbound
+        // connection is made and no DNS name is looked up, so no value of this request —
+        // not the Region, which is held to the Region-label grammar before it is used and
+        // only labels the SDK's addressing, and not the bucket, key or object version,
+        // which travel as the PATH of a request this same process serves — can name a
+        // destination. Only what that in-process store ANSWERED grounds the refusal.
+        if crate::state::sbom_is_unreadable(ctx, &region, &input.sbom).await {
+            return Err(
+                AssociateSbomWithPackageVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::INACCESSIBLE_SBOM_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // The record is resolved again under the write lock: the existence check above was
+        // released before the object store was asked, so this is the read the write is
+        // made through.
         let version = store
             .packages
             .get_mut(&input.package_name)

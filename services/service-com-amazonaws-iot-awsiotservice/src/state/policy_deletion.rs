@@ -62,16 +62,17 @@ pub fn attached_principals_deletion_message(policy_name: &str) -> String {
 
 /// The message a delete refuses a policy that still holds a non-default version with.
 ///
-/// The second half of the rule `DeletePolicy` documents, worded in the same shape as
-/// [`attached_principals_deletion_message`] — the relation that holds the policy back,
-/// then the policy by the `name=` member the request carried — because the caller's next
-/// step is the same kind of one, `DeletePolicyVersion` on that name. AWS publishes the
-/// rule and not the sentence it states it in, and no recorded call reaches this branch,
-/// so the fixed text here is this emulator's rendering of the documented rule.
+/// The second half of the rule `DeletePolicy` documents, worded the way AWS words this
+/// conflict: it states the relation that holds the policy back, names the policy by the
+/// `name=` member the request carried, and then states the REMEDIATION — the
+/// `DeletePolicyVersion` call the caller has to make on that name before retrying the
+/// delete. Everything outside the name is fixed text; the name is the request's
+/// `policyName`.
 pub fn non_default_versions_deletion_message(policy_name: &str) -> String {
     format!(
-        "The policy cannot be deleted as the policy has one or more non-default versions \
-         (name={policy_name})"
+        "The policy cannot be deleted as multiple versions of the policy exist \
+         (name={policy_name}). Use DeletePolicyVersion action to delete all non-default \
+         versions of the policy and retry."
     )
 }
 

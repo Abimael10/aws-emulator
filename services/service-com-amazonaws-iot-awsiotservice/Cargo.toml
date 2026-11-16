@@ -90,6 +90,11 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # are decoded and encoded with it (`state::custom_authorizer`).
 base64 = "0.22"
 
+# The IoT policy-document grammar reads an address condition clause through the maintained
+# IP parsers rather than by matching text, the same two `service_common` decides such a
+# clause with (`state::policy_document_conditions`).
+ipnet = "2"
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetDefaultPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetDefaultPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetDefaultPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Points one IoT policy at the version that is in EFFECT from now on, so every reader of
+//! the policy — the document `GetPolicy` hands back, the `isDefaultVersion` flag a version
+//! reader reports, and the version `DeletePolicyVersion` holds back — resolves through the
+//! version this call named.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetDefaultPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetDefaultPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetDefaultPolicyVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SetDefaultPolicyVersionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+        let _ = ctx;
+
+        // One pointer write
+        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::set_default_policy_version`]),
+        // so the rule is stated once: the version the request names becomes the operative
+        // one for every reader of the policy, and a policy — or a version of it — the
+        // account does not hold is the modelled `ResourceNotFoundException` (HTTP 404)
+        // with nothing written. What exists is read under the same lock as the pointer
+        // write, so a version deleted between the two cannot become the operative one.
+        let pointed = state.lock().set_default_policy_version(
+            &input.policy_name,
+            &input.policy_version_id,
+            ::std::time::SystemTime::now(),
+        );
+        match pointed {
+            Ok(()) => Ok(SetDefaultPolicyVersionOutput),
+            Err(message) => Err(
+                SetDefaultPolicyVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

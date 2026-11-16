@@ -132,7 +132,47 @@ impl super::ComAmazonawsIotAwsiotserviceState {
         }
         policy.versions.remove(&version_id);
         policy.last_modified_date = now;
-        policy.generation_id = super::fresh_uuid();
+        policy.mint_generation_id();
+        Ok(())
+    }
+}
+
+impl super::ComAmazonawsIotAwsiotserviceState {
+    /// Point the policy `policy_name` at `policy_version_id` as the version in EFFECT, or
+    /// answer the message stating what this account's state holds nothing under.
+    ///
+    /// "Sets the specified version of the specified policy as the policy's default
+    /// (operative) version" (`smithy_query(query="doc",shape="SetDefaultPolicyVersion")`),
+    /// so the pointer every reader of the policy resolves through — `GetPolicy`'s
+    /// `defaultVersionId` and the document it hands back, `GetPolicyVersion`'s and
+    /// `ListPolicyVersions`' `isDefaultVersion`, and the version `DeletePolicyVersion`
+    /// holds back — moves with this one write. A policy, or a version of it, the account
+    /// does not hold is the modelled `ResourceNotFoundException` (HTTP 404) stated in the
+    /// wording that reader of the policy or of one of its versions refuses a miss with, and
+    /// nothing is written.
+    ///
+    /// Re-pointing a policy at the version already in effect writes the pointer it already
+    /// carries, so the policy's generation moves the way any other write of it does: the
+    /// call is a write, not a read.
+    pub fn set_default_policy_version(
+        &mut self,
+        policy_name: &str,
+        policy_version_id: &str,
+        now: SystemTime,
+    ) -> Result<(), String> {
+        let Some(policy) = self.policies.get_mut(policy_name) else {
+            return Err(super::missing_policy_message(policy_name));
+        };
+        let Some(version_id) = policy_version_id
+            .parse::<u32>()
+            .ok()
+            .filter(|version_id| policy.versions.contains_key(version_id))
+        else {
+            return Err(missing_policy_version_message(policy_name, policy_version_id));
+        };
+        policy.default_version_id = version_id;
+        policy.last_modified_date = now;
+        policy.mint_generation_id();
         Ok(())
     }
 }
@@ -171,7 +211,7 @@ impl super::RegisteredPolicy {
             self.default_version_id = version_id;
         }
         self.last_modified_date = now;
-        self.generation_id = super::fresh_uuid();
+        self.mint_generation_id();
         Some(version_id)
     }
 

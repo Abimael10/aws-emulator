@@ -553,8 +553,9 @@ async fn a_credential_duration_outside_the_modelled_range_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("ValidationException"),
-            "case {duration}: expected ValidationException, got {refused:?}"
+            Some("InvalidRequestException"),
+            "case {duration}: expected this service's own validation-refusal class, got \
+             {refused:?}"
         );
 
         let read = emulator.describe(&name).await;

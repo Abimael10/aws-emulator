@@ -159,9 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeProvisioningTemplateVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::missing_provisioning_template_message(
-                            &input.template_name,
-                        )),
+                        message: Some(
+                            crate::state::provisioning_templates::missing_template_for_version_message(
+                                &input.template_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),

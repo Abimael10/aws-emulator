@@ -158,9 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteProvisioningTemplateErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::missing_provisioning_template_message(
-                            &input.template_name,
-                        )),
+                        message: Some(
+                            crate::state::provisioning_templates::UNDELETABLE_MISSING_TEMPLATE_MESSAGE
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

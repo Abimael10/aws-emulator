@@ -59,6 +59,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+// How this service words a request the framework refused before any handler ran lives in
+// `service/validation.rs`, beside the seam that answers it.
+mod validation;
+
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 
 /// The header a restJson1 client resolves an error SHAPE from.
@@ -171,6 +175,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// reads a statement under exactly the same rule as the create.
     replace_topic_rule:
         ValidationRefusalErrorType<crate::ops::replace_topic_rule::ReplaceTopicRule<Eng>>,
+    /// The policy create, served behind [`ValidationRefusalErrorType`] because a request
+    /// that breaks a modelled constraint — one carrying no `policyDocument` at all — is
+    /// refused `InvalidRequestException` by this service's validation layer
+    /// (`service::validation`), which names that shape qualified. Its other refusals keep
+    /// the bare shape name: a document that is no policy names
+    /// `MalformedPolicyException` unqualified.
+    create_policy: ValidationRefusalErrorType<crate::ops::create_policy::CreatePolicy<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -201,8 +212,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 &[SQL_PARSE_EXCEPTION],
             ),
             replace_topic_rule: ValidationRefusalErrorType::new(
-                crate::ops::replace_topic_rule::ReplaceTopicRule::new(engine),
+                crate::ops::replace_topic_rule::ReplaceTopicRule::new(Arc::clone(&engine)),
                 &[SQL_PARSE_EXCEPTION],
+            ),
+            create_policy: ValidationRefusalErrorType::new(
+                crate::ops::create_policy::CreatePolicy::new(engine),
+                &[INVALID_REQUEST_EXCEPTION],
             ),
         }
     }
@@ -252,21 +267,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if key == crate::ops::replace_topic_rule::ReplaceTopicRule::<Eng>::NAME {
             return Some(&self.replace_topic_rule as &dyn ErasedOperation);
         }
+        if key == crate::ops::create_policy::CreatePolicy::<Eng>::NAME {
+            return Some(&self.create_policy as &dyn ErasedOperation);
+        }
         None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service word
+        // it the way AWS IoT words one: the envelope and the clauses of
+        // `service::validation`, whose own module docs state what it chooses and what it
+        // leaves to the framework. `None` from there keeps the framework's wording.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

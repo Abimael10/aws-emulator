@@ -233,6 +233,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|tag| (tag.key, tag.value))
             .collect();
 
+        // A template PROVISIONS under the role it names, so a role IAM answered this
+        // service cannot assume is a template that could never provision a thing: it is
+        // refused with the modelled `InvalidRequestException` (HTTP 400) before anything
+        // is written, in the sentence that refusal states. Only what IAM ANSWERED grounds
+        // the refusal — see `service_common::iam_role` — and the question is asked with no
+        // lock held, the same way the registration task's own role pre-flight asks it
+        // (`ops::start_thing_registration_task`).
+        if ::service_common::iam_role::role_is_unassumable(
+            ctx,
+            &region,
+            &input.provisioning_role_arn,
+            crate::state::SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(
+                CreateProvisioningTemplateErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            crate::state::UNASSUMABLE_PROVISIONING_ROLE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // The name is the template's identity, so a name already taken is a conflict:

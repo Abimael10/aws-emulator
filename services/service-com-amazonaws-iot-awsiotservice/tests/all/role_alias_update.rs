@@ -597,8 +597,9 @@ async fn an_update_whose_duration_is_outside_the_modelled_range_is_refused() {
         );
         assert_eq!(
             refused.error_code.as_deref(),
-            Some("ValidationException"),
-            "case {duration}: expected ValidationException, got {refused:?}"
+            Some("InvalidRequestException"),
+            "case {duration}: expected this service's own validation-refusal class, got \
+             {refused:?}"
         );
         let after = emulator.describe("ranged_alias").await;
         assert_eq!(

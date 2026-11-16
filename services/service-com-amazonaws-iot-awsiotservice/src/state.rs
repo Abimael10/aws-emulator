@@ -1750,23 +1750,65 @@ pub enum PolicyDocumentRejection {
     /// It is longer than [`MAX_POLICY_DOCUMENT_BYTES`]; carries its length in bytes,
     /// which the request supplied.
     TooManyBytes(usize),
-    /// It is not JSON at all; carries the parser's own complaint.
-    NotJson(String),
-    /// It is JSON, but not a JSON object, so it cannot be a policy document.
-    NotAnObject,
-    /// It carries no `Statement` at all.
-    MissingStatement,
+    /// The policy parser cannot read it at all: it is not JSON, or it is JSON that is
+    /// not a JSON object, so it is not a policy document whatever else it says.
+    InvalidSyntax,
+    /// It declares no `Version`, or declares one this service does not read; the version
+    /// given is not carried, because the refusal names the one it must be.
+    UnknownVersion,
+    /// It carries no `Statement`, or a statement carries none of the elements a
+    /// statement must name; carries the element name that is missing.
+    MissingElement(&'static str),
     /// Its `Statement` list is empty, so the document grants and denies nothing.
     EmptyStatement,
     /// A `Statement` entry is not a JSON object.
     StatementNotAnObject,
-    /// A statement carries no `Effect`.
-    MissingEffect,
     /// A statement's `Effect` is neither `Allow` nor `Deny`; carries what it was.
     InvalidEffect(String),
-    /// A statement names neither `Action` nor `NotAction`.
-    MissingAction,
+    /// A statement's `Condition` keys a clause by a name that is no condition operator
+    /// the policy language defines ([`policy_document_conditions`]); carries that name,
+    /// which the request supplied.
+    InvalidConditionType(String),
+    /// A statement's `Condition` compares a key against something that is no IP address,
+    /// under an operator whose values are addresses; the value is not carried, because
+    /// the refusal names the element rather than what was in it.
+    InvalidConditionIpAddress,
+    /// A statement names an element an identity policy may not carry; carries that
+    /// element's name.
+    ProhibitedElement(&'static str),
 }
+
+/// How AWS OPENS the refusal of a policy document: the fixed prefix a
+/// malformed-document message carries, ahead of the clause naming the rule the document
+/// broke.
+///
+/// That prefix is what a client recognises a document problem by, so the sentence states
+/// the rule and nothing of this emulator's own parser — no position in the submitted
+/// text, and no echo of it beyond the value the clause names.
+pub const MALFORMED_POLICY_DOCUMENT_PREFIX: &str = "Policy document is Malformed: ";
+
+/// The clause AWS states for a document the policy parser cannot read as a policy at
+/// all.
+pub const INVALID_POLICY_SYNTAX_CLAUSE: &str = "Invalid policy syntax.";
+
+/// The policy-language version an IoT policy document declares.
+///
+/// A document's `Version` "specifies the language syntax rules that are to be used to
+/// process a policy" (the IAM JSON policy reference), and AWS IoT reads exactly ONE of
+/// them: a document that declares another, or declares none at all, names no syntax rules
+/// this service applies, so its statements would be read under rules they were not
+/// written for. That is what the refusal states — naming the version the document must
+/// declare rather than the one it declared.
+pub const POLICY_DOCUMENT_VERSION: &str = "2012-10-17";
+
+/// The statement elements an IoT policy document may NOT carry.
+///
+/// An IoT policy is an IDENTITY policy: it is attached to the principal it governs — a
+/// certificate, a thing group, a Cognito identity — so WHO the statement is about is the
+/// principal the policy hangs off, not an element of the document. The elements that name
+/// a principal belong to a resource-based policy, and a statement carrying one describes a
+/// grant this document cannot make, which is what the refusal states.
+pub const PROHIBITED_STATEMENT_ELEMENTS: [&str; 2] = ["Principal", "NotPrincipal"];
 
 impl PolicyDocumentRejection {
     /// What to tell the caller: the rule that was violated, built from the document
@@ -1782,26 +1824,34 @@ impl PolicyDocumentRejection {
                 "policyDocument must be at most {MAX_POLICY_DOCUMENT_BYTES} bytes long; \
                  this one is {bytes}"
             ),
-            Self::NotJson(complaint) => {
-                format!("policyDocument is not a valid JSON document: {complaint}")
+            Self::InvalidSyntax => {
+                format!("{MALFORMED_POLICY_DOCUMENT_PREFIX}{INVALID_POLICY_SYNTAX_CLAUSE}")
             }
-            Self::NotAnObject => {
-                "policyDocument must be a JSON object carrying a Statement".to_string()
-            }
-            Self::MissingStatement => "policyDocument must carry a Statement".to_string(),
+            Self::UnknownVersion => format!(
+                "{MALFORMED_POLICY_DOCUMENT_PREFIX}Unknown policy document version. It must \
+                 be version {POLICY_DOCUMENT_VERSION}"
+            ),
+            Self::MissingElement(element) => format!(
+                "{MALFORMED_POLICY_DOCUMENT_PREFIX}Missing required field {element}"
+            ),
             Self::EmptyStatement => {
                 "policyDocument must carry at least one statement in Statement".to_string()
             }
             Self::StatementNotAnObject => {
                 "every entry of Statement must be a JSON object".to_string()
             }
-            Self::MissingEffect => "every statement must carry an Effect".to_string(),
             Self::InvalidEffect(effect) => format!(
                 "a statement's Effect must be either Allow or Deny, not {effect:?}"
             ),
-            Self::MissingAction => {
-                "every statement must name an Action or a NotAction".to_string()
+            Self::InvalidConditionType(clause) => format!(
+                "{MALFORMED_POLICY_DOCUMENT_PREFIX}Invalid Condition type : {clause}"
+            ),
+            Self::InvalidConditionIpAddress => {
+                format!("{MALFORMED_POLICY_DOCUMENT_PREFIX}Invalid IP address in Conditions")
             }
+            Self::ProhibitedElement(element) => format!(
+                "{MALFORMED_POLICY_DOCUMENT_PREFIX}Has prohibited field {element}"
+            ),
         }
     }
 }
@@ -1809,11 +1859,18 @@ impl PolicyDocumentRejection {
 /// Check `document` against the IoT policy-document rules, naming the first rule it
 /// violates.
 ///
-/// An IoT policy document is an IAM-grammar JSON policy: a JSON object whose
+/// An IoT policy document is an IAM-grammar JSON policy: a JSON object declaring the
+/// policy-language version this service reads ([`POLICY_DOCUMENT_VERSION`]) and whose
 /// `Statement` is one statement object or a list of them, each carrying an `Effect`
-/// of exactly `Allow` or `Deny` and an `Action` (or `NotAction`). Everything else a
-/// statement may carry — `Resource`, `Condition`, `Sid` — is the caller's to shape,
-/// so nothing here reads or restricts it. The LENGTH rule is the one
+/// of exactly `Allow` or `Deny`, an `Action` (or `NotAction`), a `Resource` (or
+/// `NotResource`), none of the elements an identity policy may not carry
+/// ([`PROHIBITED_STATEMENT_ELEMENTS`]), and — where it narrows its grant with a
+/// `Condition` — only clauses keyed by a condition operator the policy language defines
+/// ([`policy_document_conditions`]), each stating values that operator can compare,
+/// since a clause naming no operator, or comparing an address against something that is
+/// no address, states a comparison nothing can perform. Everything else a statement may
+/// carry — `Sid`, the keys and values inside any other condition clause — is the
+/// caller's to shape, so nothing here reads or restricts it. The LENGTH rule is the one
 /// `CreatePolicy$policyDocument` documents, counted excluding whitespace; beside it,
 /// [`MAX_POLICY_DOCUMENT_BYTES`] bounds what the verbatim document a record keeps may
 /// cost, which the documented rule does not.
@@ -1828,14 +1885,23 @@ pub fn validate_policy_document(document: &str) -> Result<(), PolicyDocumentReje
     if !(MIN_POLICY_DOCUMENT_LENGTH..=MAX_POLICY_DOCUMENT_LENGTH).contains(&significant) {
         return Err(PolicyDocumentRejection::Length(significant));
     }
-    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
-        .map_err(|error| PolicyDocumentRejection::NotJson(error.to_string()))?;
+    let parsed: ::serde_json::Value =
+        ::serde_json::from_str(document).map_err(|_| PolicyDocumentRejection::InvalidSyntax)?;
     let members = parsed
         .as_object()
-        .ok_or(PolicyDocumentRejection::NotAnObject)?;
+        .ok_or(PolicyDocumentRejection::InvalidSyntax)?;
+    // "Version — specifies the language syntax rules that are to be used to process a
+    // policy": a document that declares rules this service does not read — another
+    // version, or none at all — is refused whatever its statements say, because those
+    // statements would be read under other rules than the ones they were written for.
+    if members.get("Version").and_then(::serde_json::Value::as_str)
+        != Some(POLICY_DOCUMENT_VERSION)
+    {
+        return Err(PolicyDocumentRejection::UnknownVersion);
+    }
     let statement = members
         .get("Statement")
-        .ok_or(PolicyDocumentRejection::MissingStatement)?;
+        .ok_or(PolicyDocumentRejection::MissingElement("Statement"))?;
     // The IAM grammar admits both a single statement object and a list of them.
     let statements: Vec<&::serde_json::Value> = match statement {
         ::serde_json::Value::Array(entries) => entries.iter().collect(),
@@ -1850,15 +1916,38 @@ pub fn validate_policy_document(document: &str) -> Result<(), PolicyDocumentReje
             .ok_or(PolicyDocumentRejection::StatementNotAnObject)?;
         let effect = statement
             .get("Effect")
-            .ok_or(PolicyDocumentRejection::MissingEffect)?;
+            .ok_or(PolicyDocumentRejection::MissingElement("Effect"))?;
         match effect.as_str() {
             Some("Allow" | "Deny") => {}
             _ => {
                 return Err(PolicyDocumentRejection::InvalidEffect(effect.to_string()));
             }
         }
-        if !statement.contains_key("Action") && !statement.contains_key("NotAction") {
-            return Err(PolicyDocumentRejection::MissingAction);
+        // A statement says WHAT may be done and TO WHAT, so each of the two elements has
+        // to be named — in whichever of its two spellings the grammar admits, the one
+        // naming what the statement covers or the one naming what it excludes.
+        for (element, complement) in [("Action", "NotAction"), ("Resource", "NotResource")] {
+            if !statement.contains_key(element) && !statement.contains_key(complement) {
+                return Err(PolicyDocumentRejection::MissingElement(element));
+            }
+        }
+        if let Some(clause) = policy_document_conditions::unknown_condition_type(entry) {
+            return Err(PolicyDocumentRejection::InvalidConditionType(
+                clause.to_string(),
+            ));
+        }
+        // A clause under an address operator states addresses; one that states something
+        // else compares nothing, whatever the operator it is written under.
+        if policy_document_conditions::condition_compares_a_non_address(entry) {
+            return Err(PolicyDocumentRejection::InvalidConditionIpAddress);
+        }
+        // An identity policy's statements say nothing about WHO they are about, so an
+        // element that names a principal is one this document may not carry.
+        if let Some(element) = PROHIBITED_STATEMENT_ELEMENTS
+            .into_iter()
+            .find(|element| statement.contains_key(*element))
+        {
+            return Err(PolicyDocumentRejection::ProhibitedElement(element));
         }
     }
     Ok(())
@@ -1899,7 +1988,8 @@ pub struct RegisteredPolicy {
     /// [`RegisteredPolicy::creation_date`] until a later write moves it.
     pub last_modified_date: SystemTime,
     /// `GetPolicy$generationId`, "The generation ID of the policy": an opaque,
-    /// server-minted token identifying the policy's current generation. It is stable
+    /// server-minted token identifying the policy's current generation, derived from
+    /// the policy's own content ([`RegisteredPolicy::mint_generation_id`]). It is stable
     /// across reads and re-minted by a write, so a caller can tell one generation
     /// from another.
     pub generation_id: String,
@@ -1919,7 +2009,7 @@ impl RegisteredPolicy {
         tags: BTreeMap<String, Option<String>>,
         created_at: SystemTime,
     ) -> Self {
-        Self {
+        let mut policy = Self {
             policy_name,
             policy_arn,
             versions: BTreeMap::from([(
@@ -1932,9 +2022,38 @@ impl RegisteredPolicy {
             default_version_id: FIRST_POLICY_VERSION_ID,
             creation_date: created_at,
             last_modified_date: created_at,
-            generation_id: fresh_uuid(),
+            generation_id: String::new(),
             tags,
+        };
+        policy.mint_generation_id();
+        policy
+    }
+
+    /// Re-mint [`RegisteredPolicy::generation_id`] from what the policy now holds.
+    ///
+    /// Called by every write of the record, so the token a reader reports identifies the
+    /// generation the policy is in: it is DERIVED from the policy's content rather than
+    /// drawn at random, so it is stable across reads of an unchanged policy, it moves
+    /// when a write changes what the policy says, and it comes back to the same value if
+    /// a later write puts that content back.
+    ///
+    /// The digest is the content's SHA-256, rendered as the 64 lowercase hex characters
+    /// `GenerationId` carries. The policy's NAME is hashed with its documents, so one
+    /// account's two policies holding the same document are still two generations: the
+    /// token identifies this policy's generation and not the text of a document.
+    pub fn mint_generation_id(&mut self) {
+        let mut hasher = Sha256::new();
+        hasher.update(self.policy_name.as_bytes());
+        // A separator, so no two fields can run together into the same digest.
+        hasher.update(b"/iot-policy-generation/");
+        hasher.update(self.default_version_id.to_string().as_bytes());
+        for (version_id, version) in &self.versions {
+            hasher.update(b"/version/");
+            hasher.update(version_id.to_string().as_bytes());
+            hasher.update(b"/document/");
+            hasher.update(version.document.as_bytes());
         }
+        self.generation_id = ::hex::encode(hasher.finalize());
     }
 
     /// The document of the version that is in effect — what `GetPolicy` reports.
@@ -3180,6 +3299,7 @@ pub use provisioning_templates::{
     validate_provisioning_template_body, ProvisioningTemplateBodyRejection,
     ProvisioningTemplateVersion, RegisteredProvisioningTemplate, DEFAULT_TEMPLATE_TYPE,
     FIRST_TEMPLATE_VERSION_ID, MAX_PROVISIONING_TEMPLATES, MAX_PROVISIONING_TEMPLATE_VERSIONS,
+    UNASSUMABLE_PROVISIONING_ROLE_MESSAGE,
 };
 
 // What a STREAM is — the record one holds, the files it streams and what every reader of
@@ -3216,6 +3336,25 @@ pub mod policy_deletion;
 pub use policy_deletion::{
     attached_principals_deletion_message, non_default_versions_deletion_message,
     PolicyDeletionRefusal,
+};
+
+// What a statement's `Condition` block may name — the condition operators the IAM policy
+// language defines — lives in `state/policy_document_conditions.rs`, beside the document
+// grammar ([`validate_policy_document`]) that reads a statement carrying one.
+pub mod policy_document_conditions;
+pub use policy_document_conditions::{
+    condition_compares_a_non_address, names_condition_operator, unknown_condition_type,
+    CONDITION_OPERATORS,
+};
+
+// Whether the software bill of materials an association names is one the service can READ
+// at all — the pre-flight on its S3 location, and the sentence a location nothing can be
+// read from is refused with — lives in `state/package_sbom.rs`, beside the package version
+// it is attached to.
+pub mod package_sbom;
+pub use package_sbom::{
+    sbom_is_unreadable, sbom_names_no_object_version, INACCESSIBLE_SBOM_MESSAGE,
+    SBOM_VERSION_REQUIRED_MESSAGE,
 };
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

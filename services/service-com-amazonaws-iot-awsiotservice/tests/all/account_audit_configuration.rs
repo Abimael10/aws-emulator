@@ -711,8 +711,8 @@ async fn a_role_arn_outside_the_modelled_length_is_refused() {
         );
         assert_eq!(
             reply.error_code(),
-            "ValidationException",
-            "case {name}: expected ValidationException, got {}",
+            "InvalidRequestException",
+            "case {name}: expected this service's own validation-refusal class, got {}",
             reply.text()
         );
         let after = emulator.reported(name).await;
