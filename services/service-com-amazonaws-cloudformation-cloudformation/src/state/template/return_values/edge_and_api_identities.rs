@@ -28,6 +28,42 @@ pub const CLOUDFRONT_CACHE_POLICY: &str = "AWS::CloudFront::CachePolicy";
 pub const CLOUDFRONT_ORIGIN_REQUEST_POLICY: &str = "AWS::CloudFront::OriginRequestPolicy";
 pub const CLOUDFRONT_RESPONSE_HEADERS_POLICY: &str = "AWS::CloudFront::ResponseHeadersPolicy";
 
+/// The `AWS::CloudFront::PublicKey` resource type: a public key signed URLs and signed
+/// cookies are verified against, identified by the `K`-prefixed id CloudFront mints.
+pub const CLOUDFRONT_PUBLIC_KEY: &str = "AWS::CloudFront::PublicKey";
+
+/// The `AWS::CloudFront::KeyGroup` resource type: the group of public keys a cache
+/// behaviour's `TrustedKeyGroups` names, identified by a UUID CloudFront mints.
+pub const CLOUDFRONT_KEY_GROUP: &str = "AWS::CloudFront::KeyGroup";
+
+/// The `AWS::CloudFront::KeyValueStore` resource type: the key value store a CloudFront
+/// function reads data out of, identified by the ARN that store's own data plane addresses it
+/// by.
+pub const CLOUDFRONT_KEY_VALUE_STORE: &str = "AWS::CloudFront::KeyValueStore";
+
+/// The `AWS::CloudFront::ConnectionFunction` resource type: the function a distribution runs
+/// on a viewer connection, identified by the ARN CloudFront built around the id it minted.
+pub const CLOUDFRONT_CONNECTION_FUNCTION: &str = "AWS::CloudFront::ConnectionFunction";
+
+/// The `AWS::CloudFront::ConnectionGroup` resource type: the group a distribution tenant is
+/// routed through, identified by the id CloudFront minted and reachable at the routing
+/// endpoint it published.
+pub const CLOUDFRONT_CONNECTION_GROUP: &str = "AWS::CloudFront::ConnectionGroup";
+
+/// The `AWS::CloudFront::Function` resource type: the function a cache behaviour runs on a
+/// viewer request or response, identified by the ARN CloudFront built around its name.
+pub const CLOUDFRONT_FUNCTION: &str = "AWS::CloudFront::Function";
+
+/// The `AWS::CloudFront::MonitoringSubscription` resource type: the additional CloudWatch
+/// metrics collected for ONE distribution.
+///
+/// The type has no identifier of its own — every call on a subscription addresses it by the
+/// `DistributionId` it belongs to, and a distribution has at most one — so the resource's
+/// identity is that distribution's id, which is what [`declared_name_property`] records and
+/// what `Ref` returns. It carries no `Fn::GetAtt` attribute, so this module computes no return
+/// values for it.
+pub const CLOUDFRONT_MONITORING_SUBSCRIPTION: &str = "AWS::CloudFront::MonitoringSubscription";
+
 /// The Amazon API Gateway resource types whose published `Ref` is a SERVICE-ASSIGNED id
 /// rather than a name a template states: a REST API, a resource of one, and a deployment
 /// of one.
@@ -186,6 +222,12 @@ pub(crate) const CLOUDFRONT_DISTRIBUTION_DOMAIN_SALT: &str = "cloudfront/distrib
 pub(crate) const CLOUDFRONT_ORIGIN_ACCESS_CONTROL_ID_SALT: &str = "cloudfront/origin-access-control-id";
 pub(crate) const CLOUDFRONT_ORIGIN_ACCESS_IDENTITY_ID_SALT: &str = "cloudfront/origin-access-identity-id";
 pub(crate) const CLOUDFRONT_S3_CANONICAL_USER_ID_SALT: &str = "cloudfront/s3-canonical-user-id";
+pub(crate) const CLOUDFRONT_PUBLIC_KEY_ID_SALT: &str = "cloudfront/public-key-id";
+pub(crate) const CLOUDFRONT_CONNECTION_GROUP_ID_SALT: &str = "cloudfront/connection-group-id";
+pub(crate) const CLOUDFRONT_CONNECTION_GROUP_ENDPOINT_SALT: &str =
+    "cloudfront/connection-group-routing-endpoint";
+pub(crate) const CLOUDFRONT_CONNECTION_FUNCTION_ID_SALT: &str =
+    "cloudfront/connection-function-id";
 pub(crate) const APIGATEWAY_REST_API_ID_SALT: &str = "apigateway/rest-api-id";
 pub(crate) const APIGATEWAY_ROOT_RESOURCE_ID_SALT: &str = "apigateway/root-resource-id";
 pub(crate) const APIGATEWAY_RESOURCE_ID_SALT: &str = "apigateway/resource-id";
@@ -214,6 +256,25 @@ pub(crate) fn cloudfront_assigned_id(salt: &str, name: &str) -> String {
     )
 }
 
+/// An identifier of the shape CloudFront assigns a PUBLIC KEY: `K` followed by
+/// [`CLOUDFRONT_ID_BODY_LEN`] uppercase characters.
+///
+/// `PublicKey$Id` is "the identifier of the public key", which CloudFront writes in the same
+/// letter-and-13-characters form a distribution id takes with the namespace's own leading
+/// letter — so this is [`cloudfront_assigned_id`] under that letter, a stand-in of the right
+/// shape and stable across reads for the reason [`derived_digits`] gives.
+pub(crate) fn cloudfront_public_key_id(name: &str) -> String {
+    format!(
+        "K{}",
+        derived_digits(
+            CLOUDFRONT_PUBLIC_KEY_ID_SALT,
+            name,
+            CLOUDFRONT_ID_BODY_LEN,
+            Alphabet::Upper,
+        )
+    )
+}
+
 /// The domain name CloudFront serves a distribution on: `d<label>.cloudfront.net`.
 ///
 /// `Distribution$DomainName` is "The domain name that corresponds to the distribution …
@@ -235,6 +296,56 @@ pub(crate) fn cloudfront_distribution_domain_name(name: &str) -> String {
 /// The DNS zone CloudFront serves a distribution's own domain name under — not
 /// [`URL_SUFFIX`], which is where the AWS service endpoints live.
 pub(crate) const CLOUDFRONT_DOMAIN_SUFFIX: &str = "cloudfront.net";
+
+/// The ARN namespace CloudFront mints its resources under, and the ARN of one.
+///
+/// CloudFront is a GLOBAL service, so the REGION segment of one of its ARNs is empty:
+/// `arn:aws:cloudfront::<account>:key-value-store/<id>`, which is the form that service's own
+/// state module builds every one of its ARNs in.
+pub(crate) const CLOUDFRONT_ARN_NAMESPACE: &str = "cloudfront";
+
+pub(crate) fn cloudfront_arn(resource: &str) -> String {
+    ::emulator_server::emulator_arn(CLOUDFRONT_ARN_NAMESPACE, "", resource)
+}
+
+/// An identifier of the shape CloudFront assigns one of its NAMESPACE-PREFIXED resources:
+/// the namespace label (`cg_` for a connection group, `cf_` for a connection function)
+/// followed by [`CLOUDFRONT_OPAQUE_ID_BODY_LEN`] characters of an opaque body.
+///
+/// A stand-in of that shape, stable across reads for the reason [`derived_digits`] gives, and
+/// replaced by the id the owning service minted once the resource exists
+/// ([`identity_is_service_assigned`]).
+pub(crate) fn cloudfront_namespaced_id(salt: &str, label: &str, name: &str) -> String {
+    format!(
+        "{label}{}",
+        derived_digits(salt, name, CLOUDFRONT_OPAQUE_ID_BODY_LEN, Alphabet::Lower)
+    )
+}
+
+/// How many characters follow the namespace label of such an identifier: 27, the width of the
+/// observed form (`dt_3JO1OQa51Jb3BZh7XQh6pbvF3Wa`).
+pub(crate) const CLOUDFRONT_OPAQUE_ID_BODY_LEN: usize = 27;
+
+/// The namespace labels of the two resource kinds above, as CloudFront writes them.
+pub(crate) const CLOUDFRONT_CONNECTION_GROUP_ID_LABEL: &str = "cg_";
+pub(crate) const CLOUDFRONT_CONNECTION_FUNCTION_ID_LABEL: &str = "cf_";
+
+/// The routing endpoint CloudFront publishes for a connection group: "the routing endpoint
+/// (also known as the DNS name) that is assigned to the connection group, such as
+/// d111111abcdef8.cloudfront.net" — a generated label under CloudFront's own zone, in the
+/// lowercase a DNS label takes, derived under its own salt so it is a different value from
+/// every other identifier of the group.
+pub(crate) fn cloudfront_routing_endpoint(name: &str) -> String {
+    format!(
+        "d{}.{CLOUDFRONT_DOMAIN_SUFFIX}",
+        derived_digits(
+            CLOUDFRONT_CONNECTION_GROUP_ENDPOINT_SALT,
+            name,
+            CLOUDFRONT_ID_BODY_LEN,
+            Alphabet::Lower,
+        )
+    )
+}
 
 /// An identifier of the shape API Gateway ASSIGNS one in: [`APIGATEWAY_ID_LEN`] lowercase
 /// characters, drawn from the same derivation as every other identifier here.

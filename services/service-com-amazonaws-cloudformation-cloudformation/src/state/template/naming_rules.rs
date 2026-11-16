@@ -705,6 +705,12 @@ pub(super) fn database_port(
 pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        // A monitoring subscription is identified by the DISTRIBUTION it is made on: every
+        // call on one binds that `DistributionId` as its URI label, CloudFront mints no
+        // identifier for the subscription itself, and a distribution has at most one — so the
+        // id the resource carries is the distribution's, which is what "Ref returns" for this
+        // type and what its create, read and delete each take.
+        CLOUDFRONT_MONITORING_SUBSCRIPTION => Some("DistributionId"),
         // API Gateway's `CreateDomainName` takes the `DomainName` the resource IS, on both
         // of its control planes, and that name is what either type's `Ref` returns — the
         // type's last segment is `DomainName`, so neither `DomainNameName` nor `Name` finds

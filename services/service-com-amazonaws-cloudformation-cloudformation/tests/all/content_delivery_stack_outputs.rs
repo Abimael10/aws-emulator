@@ -179,8 +179,31 @@ fn cases() -> Vec<Case> {
                 "        OriginAccessControlOriginType: s3\n",
                 "  Oai:\n",
                 "    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity\n",
+                // `CloudFrontOriginAccessIdentityConfig` is a REQUIRED property of the type,
+                // and the identity is one CloudFormation creates in CloudFront itself — so the
+                // declaration carries the configuration that create takes. Its
+                // `CallerReference` is CloudFormation's to supply.
+                "    Properties:\n",
+                "      CloudFrontOriginAccessIdentityConfig:\n",
+                "        Comment: the legacy origin access identity\n",
                 "  CachePolicy:\n",
                 "    Type: AWS::CloudFront::CachePolicy\n",
+                // `CachePolicyConfig` is a REQUIRED property of the type, and the policy is
+                // one CloudFormation creates in CloudFront itself — so the declaration
+                // carries the configuration that create takes, as a template deploying one
+                // really does.
+                "    Properties:\n",
+                "      CachePolicyConfig:\n",
+                "        Name: cdn-cache-policy\n",
+                "        MinTTL: 1\n",
+                "        ParametersInCacheKeyAndForwardedToOrigin:\n",
+                "          EnableAcceptEncodingGzip: true\n",
+                "          HeadersConfig:\n",
+                "            HeaderBehavior: none\n",
+                "          CookiesConfig:\n",
+                "            CookieBehavior: none\n",
+                "          QueryStringsConfig:\n",
+                "            QueryStringBehavior: none\n",
                 "  Distribution:\n",
                 "    Type: AWS::CloudFront::Distribution\n",
                 "    Properties:\n",

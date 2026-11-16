@@ -291,8 +291,40 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         CLOUDFRONT_DISTRIBUTION => &["DomainName", "Id"],
         CLOUDFRONT_ORIGIN_ACCESS_CONTROL => &["Id"],
         CLOUDFRONT_ORIGIN_ACCESS_IDENTITY => &["Id", "S3CanonicalUserId"],
-        CLOUDFRONT_CACHE_POLICY | CLOUDFRONT_ORIGIN_REQUEST_POLICY
-        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => &["Id"],
+        CLOUDFRONT_CACHE_POLICY => &["Id", "LastModifiedTime"],
+        CLOUDFRONT_ORIGIN_REQUEST_POLICY => &["Id", "LastModifiedTime"],
+        CLOUDFRONT_RESPONSE_HEADERS_POLICY => &["Id"],
+        // A function publishes the ARN a cache behaviour names it by — under the two spellings
+        // the type carries it — and the stage it is in.
+        CLOUDFRONT_FUNCTION => &["FunctionARN", "FunctionMetadata.FunctionARN", "Stage"],
+        // A public key and a key group each publish the id CloudFront minted for them beside
+        // the instant that service reports for the resource.
+        CLOUDFRONT_PUBLIC_KEY => &["CreatedTime", "Id"],
+        CLOUDFRONT_KEY_GROUP => &["Id", "LastModifiedTime"],
+        // A key value store publishes the ARN that identifies it, the id inside that ARN and
+        // the status CloudFront reports it in.
+        CLOUDFRONT_KEY_VALUE_STORE => &["Arn", "Id", "Status"],
+        // A connection function publishes the ARN CloudFront built for it, the id its own
+        // publish, update and delete take, and that service's report of the function.
+        CLOUDFRONT_CONNECTION_FUNCTION => &[
+            "ConnectionFunctionArn",
+            "CreatedTime",
+            "Id",
+            "LastModifiedTime",
+            "Stage",
+            "Status",
+        ],
+        // A connection group publishes its ARN, its id, the routing endpoint CloudFront
+        // assigned it and that service's report of the group.
+        CLOUDFRONT_CONNECTION_GROUP => &[
+            "Arn",
+            "CreatedTime",
+            "Id",
+            "IsDefault",
+            "LastModifiedTime",
+            "RoutingEndpoint",
+            "Status",
+        ],
         APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
         APIGATEWAY_RESOURCE => &["ResourceId"],
         // The AppSync types' own half of the catalogue, beside their return values.
@@ -559,6 +591,29 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // CloudFront call on the resource takes.
         || resource_type == CLOUDFRONT_DISTRIBUTION
         || resource_type == CLOUDFRONT_ORIGIN_ACCESS_CONTROL
+        // A cache policy, a public key and a key group are the same case: `CreateCachePolicy`,
+        // `CreatePublicKey` and `CreateKeyGroup` each take a CONFIGURATION and no identifier,
+        // and each answers the id CloudFront minted — the UUID of a policy or a group, the
+        // `K`-prefixed id of a key — which is what "Ref returns the cache policy's unique
+        // identifier", "Ref returns the public key ID" and "Ref returns the key group ID"
+        // publish and what every CloudFront call on one of them takes (a cache behaviour's
+        // `CachePolicyId`, a key group's `Items`, `GetKeyGroup$Id`).
+        || resource_type == CLOUDFRONT_CACHE_POLICY
+        || resource_type == CLOUDFRONT_ORIGIN_REQUEST_POLICY
+        || resource_type == CLOUDFRONT_ORIGIN_ACCESS_IDENTITY
+        || resource_type == CLOUDFRONT_PUBLIC_KEY
+        || resource_type == CLOUDFRONT_KEY_GROUP
+        // A key value store, a connection function and a connection group are three more:
+        // each create takes the resource's NAME and no identifier, and each answers an
+        // identity that service minted — the store's UUID and the ARN around it, the
+        // function's id and ARN, the group's id — which is what each type's `Ref` returns and
+        // what every CloudFront call on one of them takes (a function's
+        // `KeyValueStoreAssociation$KeyValueStoreARN`, `PublishConnectionFunction$Id`,
+        // a distribution tenant's `ConnectionGroupId`).
+        || resource_type == CLOUDFRONT_KEY_VALUE_STORE
+        || resource_type == CLOUDFRONT_FUNCTION
+        || resource_type == CLOUDFRONT_CONNECTION_FUNCTION
+        || resource_type == CLOUDFRONT_CONNECTION_GROUP
         // A GuardDuty trusted IP list is the same case: `CreateIPSet` takes no identifier
         // for the list — the `Name` a declaration states is only the user-friendly name of
         // the IPSet — and answers the `IpSetId` GuardDuty minted, which is what that

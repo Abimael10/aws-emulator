@@ -226,30 +226,17 @@ fn caller_principal_id() -> String {
 /// One event's `Timestamp`, as a notification states it: the instant in the
 /// millisecond-precision `date-time` form, which is the precision a stack event's
 /// notification carries.
+///
+/// The re-rendering itself is the one this crate writes once
+/// ([`super::provisioning::published_instant`]), shared with the instants a provisioned
+/// resource's return values carry, so the two cannot drift apart.
 fn notification_timestamp(at: ::std::time::SystemTime) -> String {
-    let rendered = super::timestamp(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default();
-    let Some(instant) = rendered.strip_suffix('Z') else {
-        return rendered;
-    };
-    let (seconds, fraction) = match instant.split_once('.') {
-        Some((seconds, fraction)) => (seconds, fraction),
-        None => (instant, ""),
-    };
-    let mut millis: String = fraction
-        .chars()
-        .filter(|digit| digit.is_ascii_digit())
-        .take(MILLISECOND_DIGITS)
-        .collect();
-    while millis.len() < MILLISECOND_DIGITS {
-        millis.push('0');
-    }
-    format!("{seconds}.{millis}Z")
+    super::provisioning::published_instant(
+        &super::timestamp(at)
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_default(),
+    )
 }
-
-/// How many fractional-second digits that form carries.
-const MILLISECOND_DIGITS: usize = 3;
 
 /// Claim every notification the stacks of `region` owe, and publish each one.
 ///

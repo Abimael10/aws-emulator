@@ -358,10 +358,83 @@ pub(crate) async fn call_rest_xml(
 /// XML implementation that reads the answers back ([`xml_element`]) — so a value carrying
 /// `&` or `<` reaches the called operation as the text it is rather than as markup.
 ///
+/// Whitespace at the value's own EDGES is written as a numeric CHARACTER REFERENCE rather
+/// than as the literal byte, for the one reason the value would otherwise lose it: an XML
+/// reader cannot tell indentation a formatter added from whitespace a value begins or ends
+/// with, so it drops layout whitespace at the edge of an element's text — which is what
+/// turns a declared PEM document (newline-terminated, as a client's own key file is) into
+/// one without its final newline by the time the owning service stores it. A reference is
+/// content the document STATES, so it survives that; it is ordinary XML, resolved to the
+/// character it names by any conformant reader. The interior of the value is left as text,
+/// which is where a formatter never puts anything.
+///
 /// The element NAME is the called model's own member name, never caller text.
 pub(crate) fn xml_leaf(name: &str, value: &str) -> String {
-    format!("<{name}>{}</{name}>", ::quick_xml::escape::escape(value))
+    format!("<{name}>{}</{name}>", stated_text(value))
 }
+
+/// The whitespace characters XML treats as layout, which is the set a reader may drop from
+/// the edge of an element's text.
+const XML_LAYOUT_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+
+/// `value` as the content of one element: its interior escaped as text, and the layout
+/// whitespace at each of its edges stated as a numeric character reference
+/// ([`character_reference`]).
+///
+/// A value that is whitespace throughout is stated in full: every one of its characters is
+/// at an edge.
+fn stated_text(value: &str) -> String {
+    let layout = |character: char| XML_LAYOUT_WHITESPACE.contains(&character);
+    let body_start = value.len() - value.trim_start_matches(layout).len();
+    let body_end = value.trim_end_matches(layout).len().max(body_start);
+    let mut stated = String::with_capacity(value.len());
+    for character in value[..body_start].chars() {
+        stated.push_str(&character_reference(character));
+    }
+    stated.push_str(&::quick_xml::escape::escape(&value[body_start..body_end]));
+    for character in value[body_end..].chars() {
+        stated.push_str(&character_reference(character));
+    }
+    stated
+}
+
+/// One character as the numeric reference that states it: `&#xA;` for a newline.
+fn character_reference(character: char) -> String {
+    format!("&#x{:X};", character as u32)
+}
+
+/// An INSTANT an owning service reported, as CloudFormation publishes one in a return value:
+/// ISO 8601 UTC with exactly three fractional digits.
+///
+/// CloudFormation reports a resource's instants to millisecond precision, while the service
+/// that owns the resource may write its own answer more finely (this emulator's restXml
+/// serializer writes microseconds) — so an attribute read off such an answer is re-rendered
+/// here rather than copied digit for digit, and a client comparing the stack's output against
+/// the owning service's own read compares two spellings of one instant.
+///
+/// The fraction is TRUNCATED, not rounded: the milliseconds of an instant are its first three
+/// fractional digits. Text this does not recognise as a UTC instant — one carrying an offset
+/// rather than `Z`, or no time at all — is passed through exactly as that service wrote it.
+pub(crate) fn published_instant(reported: &str) -> String {
+    let Some(body) = reported.strip_suffix('Z') else {
+        return reported.to_string();
+    };
+    if !body.contains('T') {
+        return reported.to_string();
+    }
+    let (seconds, fraction) = body.split_once('.').unwrap_or((body, ""));
+    if !fraction.chars().all(|digit| digit.is_ascii_digit()) {
+        return reported.to_string();
+    }
+    let mut milliseconds: String = fraction.chars().take(PUBLISHED_FRACTION_DIGITS).collect();
+    while milliseconds.len() < PUBLISHED_FRACTION_DIGITS {
+        milliseconds.push('0');
+    }
+    format!("{seconds}.{milliseconds}Z")
+}
+
+/// How many fractional digits such an instant carries: three, the milliseconds.
+const PUBLISHED_FRACTION_DIGITS: usize = 3;
 
 /// What an awsQuery parameter name or value is percent-encoded against: everything
 /// outside the UNRESERVED set of RFC 3986 (`A-Z a-z 0-9 - _ . ~`) is escaped, which is
@@ -1062,4 +1135,112 @@ pub(super) async fn callback_credentials(
         credentials.access_key_id().to_string(),
         credentials.secret_access_key().to_string(),
     ))
+}
+
+#[cfg(test)]
+mod request_text_tests {
+    use super::*;
+
+    /// RULE: a value reaches the called operation as the text it is — the five predefined
+    /// entities escaped, and whitespace at the value's own edges STATED as a character
+    /// reference, since that is the whitespace an XML reader may otherwise drop as layout.
+    #[test]
+    fn a_leaf_states_the_whitespace_at_a_values_edges() {
+        // (case, the value, the element the request carries)
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "no edge whitespace: the value as it stands",
+                "a-name",
+                "<Name>a-name</Name>",
+            ),
+            (
+                "a newline-terminated document, as a client's own key file is",
+                "-----BEGIN-----\nbody\n-----END-----\n",
+                "<Name>-----BEGIN-----\nbody\n-----END-----&#xA;</Name>",
+            ),
+            (
+                "whitespace at both edges, each character stated",
+                " \tvalue\r\n",
+                "<Name>&#x20;&#x9;value&#xD;&#xA;</Name>",
+            ),
+            (
+                "interior whitespace, which no formatter put there",
+                "two words\nand a line",
+                "<Name>two words\nand a line</Name>",
+            ),
+            (
+                "markup in the value, escaped as the entity it is",
+                "a & b <c>",
+                "<Name>a &amp; b &lt;c&gt;</Name>",
+            ),
+            (
+                "a value that is whitespace throughout: every character is at an edge",
+                "  ",
+                "<Name>&#x20;&#x20;</Name>",
+            ),
+            ("the empty value", "", "<Name></Name>"),
+        ];
+
+        for (case, value, expected) in rows {
+            let rendered = xml_leaf("Name", value);
+            assert_eq!(
+                &rendered, expected,
+                "case {case:?}: expected {expected:?}, got {rendered:?}"
+            );
+        }
+    }
+
+    /// RULE: an instant CloudFormation publishes as a return value carries exactly three
+    /// fractional digits, whatever precision the owning service wrote; text that is no UTC
+    /// instant travels exactly as that service wrote it.
+    #[test]
+    fn a_published_instant_carries_milliseconds() {
+        // (case, what the owning service answered, what the stack publishes)
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "microseconds, truncated to the milliseconds",
+                "2026-11-16T05:27:03.959597Z",
+                "2026-11-16T05:27:03.959Z",
+            ),
+            (
+                "no fraction at all",
+                "2026-11-16T05:27:03Z",
+                "2026-11-16T05:27:03.000Z",
+            ),
+            (
+                "fewer than three digits, padded",
+                "2026-11-16T05:27:03.9Z",
+                "2026-11-16T05:27:03.900Z",
+            ),
+            (
+                "exactly three digits, unchanged",
+                "2026-11-16T05:27:03.123Z",
+                "2026-11-16T05:27:03.123Z",
+            ),
+            (
+                "nanoseconds, truncated to the milliseconds",
+                "2026-11-16T05:27:03.123456789Z",
+                "2026-11-16T05:27:03.123Z",
+            ),
+            (
+                "an offset rather than Z: not an instant this re-renders",
+                "2026-11-16T05:27:03.959597+00:00",
+                "2026-11-16T05:27:03.959597+00:00",
+            ),
+            (
+                "a date with no time at all",
+                "2026-11-16Z",
+                "2026-11-16Z",
+            ),
+            ("no instant at all", "READY", "READY"),
+        ];
+
+        for (case, reported, expected) in rows {
+            let published = published_instant(reported);
+            assert_eq!(
+                &published, expected,
+                "case {case:?}: expected {expected:?}, got {published:?}"
+            );
+        }
+    }
 }

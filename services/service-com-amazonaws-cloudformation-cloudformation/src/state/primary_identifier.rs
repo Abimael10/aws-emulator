@@ -102,7 +102,16 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         | CLOUDFRONT_ORIGIN_ACCESS_IDENTITY
         | CLOUDFRONT_CACHE_POLICY
         | CLOUDFRONT_ORIGIN_REQUEST_POLICY
-        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => "Id",
+        | CLOUDFRONT_RESPONSE_HEADERS_POLICY
+        | CLOUDFRONT_PUBLIC_KEY
+        | CLOUDFRONT_KEY_GROUP
+        | CLOUDFRONT_CONNECTION_GROUP => "Id",
+        // A key value store is identified by the ARN its own data plane addresses it by, a
+        // connection function by the ARN CloudFront built around the id it minted, and a
+        // function by the ARN a cache behaviour names it by.
+        CLOUDFRONT_KEY_VALUE_STORE => "Arn",
+        CLOUDFRONT_CONNECTION_FUNCTION => "ConnectionFunctionArn",
+        CLOUDFRONT_FUNCTION => "FunctionARN",
         // The API Gateway types, each identified by the id that service assigns. An api and
         // an api mapping publish their ids under the member their own control plane names
         // them by.

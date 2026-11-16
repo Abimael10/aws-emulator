@@ -358,8 +358,12 @@ mod cloudformation_provisions_bedrock_flows;
 mod cloudformation_provisions_bedrock_guardrails;
 #[path = "all/cloudformation_provisions_braket_spending_limits.rs"]
 mod cloudformation_provisions_braket_spending_limits;
+#[path = "all/cloudformation_provisions_cloudfront_policies_and_keys.rs"]
+mod cloudformation_provisions_cloudfront_policies_and_keys;
 #[path = "all/cloudformation_provisions_cloudfront_resources.rs"]
 mod cloudformation_provisions_cloudfront_resources;
+#[path = "all/cloudformation_provisions_cloudfront_standalone_resources.rs"]
+mod cloudformation_provisions_cloudfront_standalone_resources;
 #[path = "all/cloudformation_provisions_cloudwatch_dashboards.rs"]
 mod cloudformation_provisions_cloudwatch_dashboards;
 #[path = "all/cloudformation_provisions_cloudwatch_metric_streams.rs"]

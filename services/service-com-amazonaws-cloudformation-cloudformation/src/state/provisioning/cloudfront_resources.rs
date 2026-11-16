@@ -78,27 +78,56 @@ use super::{
 use crate::state::provisioner::tags_of;
 use crate::state::{scalar_text, StoredResource};
 
-/// The two resource types this module provisions.
+/// The three types a stack declares as ONE configuration CloudFront mints an id for — a
+/// cache policy, a public key and a key group — whose own half of provisioning lives beside
+/// this one ([`policy_and_key_resources`]), reached through the same seam.
+mod policy_and_key_resources;
+
+/// The three types whose create takes the declaration's own properties as the request — a key
+/// value store, a connection function and a connection group — and the monitoring
+/// subscription a stack turns on for one distribution: each another per-type half beside this
+/// one, reached through the same seam.
+mod connection_and_store_resources;
+mod monitoring_subscription;
+
+/// The two resource types this file provisions itself.
 pub(crate) const CLOUDFRONT_DISTRIBUTION: &str = "AWS::CloudFront::Distribution";
 pub(crate) const CLOUDFRONT_ORIGIN_ACCESS_CONTROL: &str = "AWS::CloudFront::OriginAccessControl";
 
-/// Which of them a resource is. Resolved once, so every call below is about that same
-/// resource.
+/// Which CloudFront resource a resource is. Resolved once, so every call below is about that
+/// same resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// `AWS::CloudFront::Distribution`.
     Distribution,
     /// `AWS::CloudFront::OriginAccessControl`.
     OriginAccessControl,
+    /// One of the types [`policy_and_key_resources`] creates: a cache policy, a public key or
+    /// a key group. Which of them it is travels with the kind, so the type is resolved once
+    /// here as well.
+    PolicyOrKey(policy_and_key_resources::Kind),
+    /// One of the types [`connection_and_store_resources`] creates: a key value store, a
+    /// connection function or a connection group.
+    ConnectionOrStore(connection_and_store_resources::Kind),
+    /// `AWS::CloudFront::MonitoringSubscription`, whose arms are
+    /// [`monitoring_subscription`]'s.
+    MonitoringSubscription,
 }
 
-/// The kind of CloudFront resource `resource_type` is, or `None` for a type this module does
-/// not own.
+/// The kind of CloudFront resource `resource_type` is, or `None` for a type no module here
+/// owns.
 pub(crate) fn kind_of(resource_type: &str) -> Option<Kind> {
     match resource_type {
         CLOUDFRONT_DISTRIBUTION => Some(Kind::Distribution),
         CLOUDFRONT_ORIGIN_ACCESS_CONTROL => Some(Kind::OriginAccessControl),
-        _ => None,
+        monitoring_subscription::CLOUDFRONT_MONITORING_SUBSCRIPTION => {
+            Some(Kind::MonitoringSubscription)
+        }
+        other => policy_and_key_resources::kind_of(other)
+            .map(Kind::PolicyOrKey)
+            .or_else(|| {
+                connection_and_store_resources::kind_of(other).map(Kind::ConnectionOrStore)
+            }),
     }
 }
 
@@ -222,6 +251,9 @@ const RENAMED_MEMBERS: &[(&str, &str)] = &[
     ("AcmCertificateArn", "ACMCertificateArn"),
     ("IamCertificateId", "IAMCertificateId"),
     ("SslSupportMethod", "SSLSupportMethod"),
+    // A key value store's import source: `ImportSource$SourceARN` in CloudFront's own model,
+    // spelled `SourceArn` by the type that declares one.
+    ("SourceArn", "SourceARN"),
 ];
 
 /// How a declared LIST reaches the API: the container the model wraps it in, and the element
@@ -313,6 +345,17 @@ const WRAPPED_LISTS: &[(&str, &str, &str, ListShape)] = &[
         ListShape::EnabledQuantityAndItems,
     ),
     ("Headers", "Headers", "Name", ListShape::QuantityAndItems),
+    // A cache policy's and an origin request policy's cookies and query strings: a template
+    // declares the names alone, while the model wraps each in a `{Quantity, Items}` container
+    // whose items carry the element `Name` (`CookieNames`/`CookieNameList` and
+    // `QueryStringNames`/`QueryStringNamesList`).
+    ("Cookies", "Cookies", "Name", ListShape::QuantityAndItems),
+    (
+        "QueryStrings",
+        "QueryStrings",
+        "Name",
+        ListShape::QuantityAndItems,
+    ),
     (
         "WhitelistedNames",
         "WhitelistedNames",
@@ -349,6 +392,15 @@ const WRAPPED_LISTS: &[(&str, &str, &str, ListShape)] = &[
         "SslProtocol",
         ListShape::QuantityAndItems,
     ),
+    // The key value stores a CloudFront function — or a connection function — reads through: a
+    // template declares the associations alone, while the model wraps them in a
+    // `{Quantity, Items}` container whose items carry the element `KeyValueStoreAssociation`.
+    (
+        "KeyValueStoreAssociations",
+        "KeyValueStoreAssociations",
+        "KeyValueStoreAssociation",
+        ListShape::QuantityAndItems,
+    ),
     ("Locations", "", "Location", ListShape::IntoTheParent),
     ("Tags", "Tags", "Tag", ListShape::ItemsOnly),
     (
@@ -379,6 +431,15 @@ pub(super) async fn create(
         // `CreateOriginAccessControl` takes none: the type is not taggable, so no tags are
         // propagated to it.
         Kind::OriginAccessControl => create_origin_access_control(ctx, region, resource).await,
+        Kind::PolicyOrKey(kind) => {
+            policy_and_key_resources::create(ctx, region, kind, resource, propagated).await
+        }
+        Kind::ConnectionOrStore(kind) => {
+            connection_and_store_resources::create(ctx, region, kind, resource, propagated).await
+        }
+        Kind::MonitoringSubscription => {
+            monitoring_subscription::create(ctx, region, resource).await
+        }
     }
 }
 
@@ -455,6 +516,16 @@ pub(super) async fn update(
             .await?;
             Ok(Some(Created::default()))
         }
+        Kind::PolicyOrKey(kind) => {
+            policy_and_key_resources::update(ctx, region, kind, resource, declared, propagated)
+                .await
+        }
+        Kind::ConnectionOrStore(kind) => {
+            connection_and_store_resources::update(ctx, region, kind, resource, declared).await
+        }
+        Kind::MonitoringSubscription => {
+            monitoring_subscription::update(ctx, region, resource, declared).await
+        }
     }
 }
 
@@ -496,6 +567,15 @@ pub(super) async fn delete(
                 Err(refusal) => Err(refusal),
             }
         }
+        Kind::PolicyOrKey(kind) => {
+            policy_and_key_resources::delete(ctx, region, kind, resource).await
+        }
+        Kind::ConnectionOrStore(kind) => {
+            connection_and_store_resources::delete(ctx, region, kind, resource).await
+        }
+        Kind::MonitoringSubscription => {
+            monitoring_subscription::delete(ctx, region, resource).await
+        }
     }
 }
 
@@ -514,6 +594,9 @@ pub(super) async fn removal(
     match kind {
         Kind::Distribution => remove_distribution(ctx, region, physical_resource_id).await,
         Kind::OriginAccessControl => Ok(Removal::Gone),
+        Kind::PolicyOrKey(_) => Ok(policy_and_key_resources::removal()),
+        Kind::ConnectionOrStore(_) => Ok(connection_and_store_resources::removal()),
+        Kind::MonitoringSubscription => Ok(monitoring_subscription::removal()),
     }
 }
 
@@ -926,6 +1009,23 @@ fn distribution_attributes(answered: &str) -> BTreeMap<String, String> {
     }
     attributes
 }
+
+/// One attribute value as the stack REPORTS it, given the attribute it is published under.
+///
+/// Every value but an INSTANT travels exactly as the owning service wrote it. An instant is
+/// re-rendered to the millisecond precision CloudFormation publishes one in
+/// ([`super::published_instant`]), so a client comparing a stack output against CloudFront's
+/// own read of the resource compares two spellings of one instant rather than two precisions.
+pub(super) fn published_attribute(attribute: &str, value: &str) -> String {
+    if REPORTED_INSTANTS.contains(&attribute) {
+        return super::published_instant(value);
+    }
+    value.to_string()
+}
+
+/// The attributes these types publish that carry an instant: when CloudFront created the
+/// resource, and when it last changed it.
+const REPORTED_INSTANTS: &[&str] = &["CreatedTime", "LastModifiedTime"];
 
 /// The identifier the create's answer reports for the resource it made, or the refusal for
 /// an answer that identifies nothing: a resource whose id nothing reported is not one a stack

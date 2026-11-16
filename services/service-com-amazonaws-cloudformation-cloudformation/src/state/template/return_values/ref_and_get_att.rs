@@ -392,13 +392,144 @@ pub(crate) fn return_values(
         }
         // "Ref returns the cache policy's unique identifier"; Fn::GetAtt: Id,
         // LastModifiedTime. CloudFront identifies each of its three policy kinds by a
-        // UUID it mints, so that is what `Ref` and `Id` report. `LastModifiedTime` is NOT
-        // carried: it is the instant the policy was last changed, which this module has no
-        // value for, and an invented timestamp would be worse than no value.
-        CLOUDFRONT_CACHE_POLICY | CLOUDFRONT_ORIGIN_REQUEST_POLICY
-        | CLOUDFRONT_RESPONSE_HEADERS_POLICY => {
+        // UUID it mints, so that is what `Ref` and `Id` report. The policy this emulator
+        // CREATES in CloudFront also publishes the instant that service last changed it,
+        // which only that service can state: the stand-in says so, and the deployment replaces
+        // it with what the create answered.
+        CLOUDFRONT_CACHE_POLICY => {
             let id = generated_uuid(resource_type, name);
             attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "LastModifiedTime".to_string(),
+                service_assigned_document(name, "LastModifiedTime"),
+            );
+            (id, attributes)
+        }
+        // The other two policy kinds are identified the same way. An ORIGIN REQUEST policy is
+        // one this emulator creates in CloudFront as well, so it publishes that service's own
+        // `LastModifiedTime` beside its id; a RESPONSE HEADERS policy is created by no service
+        // here, so its own is NOT carried — nothing would ever answer it, and an invented
+        // timestamp would be worse than no value.
+        CLOUDFRONT_ORIGIN_REQUEST_POLICY => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "LastModifiedTime".to_string(),
+                service_assigned_document(name, "LastModifiedTime"),
+            );
+            (id, attributes)
+        }
+        CLOUDFRONT_RESPONSE_HEADERS_POLICY => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the function ARN"; Fn::GetAtt: FunctionARN,
+        // FunctionMetadata.FunctionARN, Stage. The ARN is the one "a distribution's cache
+        // behavior" names a published function by, built around the NAME the declaration gives
+        // the function, and the type publishes it under both spellings. The STAGE the function
+        // is in is CloudFront's to state.
+        CLOUDFRONT_FUNCTION => {
+            let arn = cloudfront_arn(&format!("function/{name}"));
+            attributes.insert("FunctionARN".to_string(), arn.clone());
+            attributes.insert("FunctionMetadata.FunctionARN".to_string(), arn.clone());
+            attributes.insert(
+                "Stage".to_string(),
+                service_assigned_document(name, "Stage"),
+            );
+            (arn, attributes)
+        }
+        // "Ref returns the key group ID"; Fn::GetAtt: Id, LastModifiedTime. A key group is
+        // identified by a UUID CloudFront mints, exactly as its policies are, and the instant
+        // it was last changed is that service's to state.
+        CLOUDFRONT_KEY_GROUP => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "LastModifiedTime".to_string(),
+                service_assigned_document(name, "LastModifiedTime"),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the public key ID"; Fn::GetAtt: Id, CreatedTime. CloudFront ASSIGNS the
+        // id in the letter-and-13-characters form of that namespace
+        // ([`cloudfront_public_key_id`]) — the type declares the key's name and its encoded
+        // body, never its identifier — and the instant the key was uploaded is that service's
+        // to state.
+        CLOUDFRONT_PUBLIC_KEY => {
+            let id = cloudfront_public_key_id(name);
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "CreatedTime".to_string(),
+                service_assigned_document(name, "CreatedTime"),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the key value store ARN"; Fn::GetAtt: Arn, Id. The identity of a key
+        // value store is that ARN — what the store's own data plane takes as the `KvsARN` of
+        // every one of its routes, and what a function's `KeyValueStoreAssociation` names —
+        // built around the UUID CloudFront mints for the store. `Status` is the state that
+        // service reports the store in, which only it can state.
+        CLOUDFRONT_KEY_VALUE_STORE => {
+            let id = generated_uuid(resource_type, name);
+            let arn = cloudfront_arn(&format!("key-value-store/{id}"));
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Id".to_string(), id);
+            attributes.insert(
+                "Status".to_string(),
+                service_assigned_document(name, "Status"),
+            );
+            (arn, attributes)
+        }
+        // "Ref returns the connection function ARN"; Fn::GetAtt: ConnectionFunctionArn, Id.
+        // CloudFront mints the id and builds the ARN around it; the ARN is what a
+        // distribution's `ConnectionFunctionAssociation` names, and the id is what the
+        // function's own publish, update and delete take. Its status, its stage and the two
+        // instants are that service's own report of the function, which only it can state.
+        CLOUDFRONT_CONNECTION_FUNCTION => {
+            let id = cloudfront_namespaced_id(
+                CLOUDFRONT_CONNECTION_FUNCTION_ID_SALT,
+                CLOUDFRONT_CONNECTION_FUNCTION_ID_LABEL,
+                name,
+            );
+            let arn = cloudfront_arn(&format!("connection-function/{id}"));
+            attributes.insert("ConnectionFunctionArn".to_string(), arn.clone());
+            attributes.insert("Id".to_string(), id);
+            for attribute in ["CreatedTime", "LastModifiedTime", "Stage", "Status"] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (arn, attributes)
+        }
+        // "Ref returns the ID of the connection group"; Fn::GetAtt: Arn, Id, RoutingEndpoint.
+        // The id is the one CloudFront mints, the ARN is built around it, and the routing
+        // endpoint is the DNS name that service assigns the group
+        // ([`cloudfront_routing_endpoint`]). Its status, whether it is the account's default
+        // group and the two instants are that service's own report of the group, which only it
+        // can state.
+        CLOUDFRONT_CONNECTION_GROUP => {
+            let id = cloudfront_namespaced_id(
+                CLOUDFRONT_CONNECTION_GROUP_ID_SALT,
+                CLOUDFRONT_CONNECTION_GROUP_ID_LABEL,
+                name,
+            );
+            attributes.insert(
+                "Arn".to_string(),
+                cloudfront_arn(&format!("connection-group/{id}")),
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            attributes.insert(
+                "RoutingEndpoint".to_string(),
+                cloudfront_routing_endpoint(name),
+            );
+            for attribute in ["CreatedTime", "IsDefault", "LastModifiedTime", "Status"] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
             (id, attributes)
         }
         // "Ref returns the RestApi ID"; Fn::GetAtt: RestApiId, RootResourceId. API Gateway
