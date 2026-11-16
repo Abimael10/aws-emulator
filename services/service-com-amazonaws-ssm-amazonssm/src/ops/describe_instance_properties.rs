@@ -18,15 +18,18 @@
 //! `InstancePropertyFilterKey` and no operator, so it selects the nodes whose property
 //! EQUALS one of its values, while `FiltersWithOperator` carries a free-text key and one
 //! of the modelled operators. They are ALTERNATIVES: a request naming both is refused
-//! ([`crate::state::LEGACY_AND_NEW_FILTERS_REJECTION`]), as it is on the sibling node
-//! describe, whose own doc states the rule ("Attempting to use
+//! ([`crate::state::PROPERTY_LEGACY_AND_NEW_FILTERS_REJECTION`]), as it is on the sibling
+//! node describe, whose own doc states the rule ("Attempting to use
 //! InstanceInformationFilterList and Filters leads to an exception error").
 //!
 //! The set of filter keys is CLOSED, so a key that names no property of a node is
 //! refused before any node is looked at — as a `ValidationException` whose message names
 //! the key the caller submitted and the member it filled, which is what the recorded
 //! service answers for one (`InstancePropertyStringFilter$Key` is modelled as free text,
-//! so the refusal is the service's own rather than the modelled boundary's). A tag filter
+//! so the refusal is the service's own rather than the modelled boundary's). A key the
+//! operation DOES accept, named more than once, is refused the same way, naming the
+//! repeated key ([`crate::state::duplicate_filter_key_rejection`]): the list is a
+//! conjunction of filters on distinct properties. A tag filter
 //! ANDed with a filter on a property of a node is refused the same way: both keys are
 //! keys this operation accepts, so what is invalid is their COMBINATION ("Tag filters
 //! can't be combined with other filter types"), which two tag filters and two property
@@ -227,13 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The LEGACY filter list and the current one are alternatives rather than a union:
         // a request naming both is refused the way the sibling node describe refuses the
-        // same request shape ([`crate::state::LEGACY_AND_NEW_FILTERS_REJECTION`]), before
-        // either list is read.
+        // same request shape, in this operation's own wording of that sentence
+        // ([`crate::state::PROPERTY_LEGACY_AND_NEW_FILTERS_REJECTION`]), before either list
+        // is read.
         let legacy = input.instance_property_filter_list.as_deref().unwrap_or_default();
         let with_operator = input.filters_with_operator.as_deref().unwrap_or_default();
         if !legacy.is_empty() && !with_operator.is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::LEGACY_AND_NEW_FILTERS_REJECTION,
+                crate::state::PROPERTY_LEGACY_AND_NEW_FILTERS_REJECTION,
             ));
         }
 
@@ -268,6 +272,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::filter_key_rejection(filter.key),
                 ));
             }
+        }
+
+        // Every key above is one this operation accepts, so a key named twice is a
+        // conjunction the request may not express rather than a key the operation does not
+        // know: the refusal names the repeated key
+        // ([`crate::state::duplicate_filter_key_rejection`]).
+        if let Some(why) = crate::state::duplicate_filter_key_rejection(
+            filters.iter().map(|filter| filter.key),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 
         // "Tag filters can't be combined with other filter types." Every key above is one
@@ -350,11 +364,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_from = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) if crate::state::managed_node_id_is_well_formed(token) => Some(token),
-            Some(token) => {
+            Some(_) => {
+                // The modelled `Message` is left unset, as it is on the sibling node
+                // describe that hands out the same cursor: the refusal is the error code
+                // itself, and a body member nothing fills is a member the service does not
+                // send.
                 return Err(DescribeInstancePropertiesErrorModeled::InvalidNextToken(
-                    InvalidNextToken {
-                        message: Some(format!("NextToken '{token}' isn't valid")),
-                    },
+                    InvalidNextToken { message: None },
                 )
                 .into())
             }

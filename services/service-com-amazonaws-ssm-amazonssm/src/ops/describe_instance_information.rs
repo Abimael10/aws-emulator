@@ -36,18 +36,28 @@
 //!   accepts, so what is refused is their COMBINATION, not either key — two tag filters,
 //!   and two property filters, are accepted
 //!   ([`crate::state::tag_filter_combination_rejection`]).
+//! * A filter key the operation accepts, named MORE THAN ONCE, is a `ValidationException`
+//!   naming the repeated key ([`crate::state::duplicate_filter_key_rejection`]): the list
+//!   is a conjunction of filters on distinct attributes, so one key twice is two answers
+//!   to one question rather than a narrower query.
 //! * A value that could not be a value of the node attribute its key filters is
 //!   `InvalidInstanceInformationFilterValue` ("The specified filter value isn't valid"),
-//!   except for a node id, where the operation documents its own error: "If you specify
-//!   a node ID that isn't valid … you receive an error" → `InvalidInstanceId`, carrying
-//!   the constraint the value violated ([`crate::state::MANAGED_NODE_ID_PATTERN`]). A
-//!   node id that is well formed but names no registered node is NOT a refusal: it simply
-//!   matches nothing, which is how a caller asks whether an instance is managed.
+//!   except for the two keys whose value is an identifier with a modelled error of its
+//!   own: a node id is `InvalidInstanceId` — "If you specify a node ID that isn't valid …
+//!   you receive an error" — carrying the constraint the value violated
+//!   ([`crate::state::MANAGED_NODE_ID_PATTERN`]), and an activation id is
+//!   `InvalidActivationId`, naming the values it rejected
+//!   ([`crate::state::invalid_activation_ids_message`]), the same answer the sibling
+//!   `DescribeInstanceProperties` gives one. An id that is well formed but names no
+//!   registered node or activation is NOT a refusal: it simply matches nothing, which is
+//!   how a caller asks whether an instance is managed.
 //! * `Filters` and `InstanceInformationFilterList` together are a `ValidationException`:
 //!   "Attempting to use InstanceInformationFilterList and Filters leads to an exception
 //!   error" (`DescribeInstanceInformationRequest$InstanceInformationFilterList`), which
 //!   this operation models no error for.
-//! * A `NextToken` this service did not issue is `InvalidNextToken`.
+//! * A `NextToken` this service did not issue is `InvalidNextToken`, whose optional
+//!   `Message` this operation leaves UNSET: the error code is the whole answer, so the
+//!   body carries no member a client could branch on.
 //!
 //! ## Filtering and paging
 //!
@@ -144,6 +154,9 @@
 //! ## Errors
 //!
 //! * `InternalServerError` (HTTP 500) — An error occurred on the server side.
+//! * `InvalidActivationId` (HTTP 400) — widened in through `extra_errors` (see below): The
+//!   activation ID isn't valid. Verify that you entered the correct ActivationId or
+//!   ActivationCode and try again.
 //! * `InvalidFilterKey` (HTTP 400) — The specified key isn't valid.
 //! * `InvalidInstanceId` (HTTP 400) — The following problems can cause this exception: You
 //!   don't have permission to access the managed node. Amazon Web Services Systems Manager
@@ -169,10 +182,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `DescribeInstanceInformationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#DescribeInstanceInformation")]
+// `InvalidActivationId` — which this SERVICE models, and the sibling
+// `DescribeInstanceProperties` lists, while this operation shape does not — is widened in
+// through `extra_errors`, so a filter on an activation id that could not exist is refused
+// as an activation-id failure here too rather than as a filter-value one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#DescribeInstanceInformation",
+    extra_errors = ["InvalidActivationId"]
+)]
 #[derive(Debug)]
 pub enum DescribeInstanceInformationErrorModeled {
     InternalServerError(InternalServerError),
+    InvalidActivationId(InvalidActivationId),
     InvalidFilterKey(InvalidFilterKey),
     InvalidInstanceId(InvalidInstanceId),
     InvalidInstanceInformationFilterValue(InvalidInstanceInformationFilterValue),
@@ -231,9 +252,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            filter_key_rejection, is_instance_information_filter_key, is_legacy_node_filter_key,
+            duplicate_filter_key_rejection, filter_key_rejection,
+            is_instance_information_filter_key, is_legacy_node_filter_key,
             managed_node_id_is_well_formed, node_page_size, request_region,
-            tag_filter_combination_rejection, INVALID_NEXT_TOKEN, OPERATOR_EQUAL,
+            tag_filter_combination_rejection, OPERATOR_EQUAL,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -273,6 +295,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Every key above is one the operation accepts, so a key named twice is a
+        // conjunction the request may not express rather than a key the operation does not
+        // know: the refusal names the repeated key.
+        if let Some(why) = duplicate_filter_key_rejection(
+            string_filters
+                .iter()
+                .map(|filter| filter.key.as_str())
+                .chain(legacy_filters.iter().map(|filter| filter.key.as_str())),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
         // "Tag filters can't be combined with other filter types." Every key above is one
         // the operation accepts, so a tag filter beside a filter on a property of a node
         // is a combination the request may not express — a validation of the request,
@@ -309,10 +343,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None | Some("") => None,
             Some(token) if managed_node_id_is_well_formed(token) => Some(token),
             Some(_) => {
+                // The modelled `Message` is left unset: this refusal is the error code
+                // itself, and a body member nothing fills is a member the service does
+                // not send.
                 return Err(DescribeInstanceInformationErrorModeled::InvalidNextToken(
-                    InvalidNextToken {
-                        message: Some(INVALID_NEXT_TOKEN.to_string()),
-                    },
+                    InvalidNextToken { message: None },
                 )
                 .into())
             }
@@ -367,14 +402,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse every value of one filter that could not be a value of the node attribute its
 /// key filters.
 ///
-/// A node id has its own modelled error — "If you specify a node ID that isn't valid …
-/// you receive an error" — and every other key's bad value is the filter-value error.
+/// A value whose key filters an IDENTIFIER the service models an error for is refused with
+/// THAT error — a node id with "If you specify a node ID that isn't valid … you receive an
+/// error" → `InvalidInstanceId`, an activation id with `InvalidActivationId` — and every
+/// other key's bad value is the filter-value error.
 ///
 /// The node-id refusal REPORTS THE CONSTRAINT the value violated, built from the member
 /// the id fills and its modelled pattern
 /// ([`crate::state::managed_node_id_constraint_violation`]), so the refusal says which
-/// input to fix and what it has to satisfy rather than describing it in prose.
+/// input to fix and what it has to satisfy rather than describing it in prose. The
+/// activation-id refusal names the values it rejected, taken from the request
+/// ([`crate::state::invalid_activation_ids_message`]), which is how the sibling
+/// `DescribeInstanceProperties` words the same refusal.
 fn check_filter_values(key: &str, values: &[String]) -> Result<(), DescribeInstanceInformationError> {
+    if key == crate::state::ACTIVATION_IDS_FILTER_KEY {
+        let rejected = crate::state::malformed_activation_ids(values);
+        if !rejected.is_empty() {
+            return Err(
+                DescribeInstanceInformationErrorModeled::InvalidActivationId(
+                    InvalidActivationId {
+                        message: Some(crate::state::invalid_activation_ids_message(&rejected)),
+                    },
+                )
+                .into(),
+            );
+        }
+        return Ok(());
+    }
     for value in values {
         if key == "InstanceIds" {
             if !crate::state::managed_node_id_is_well_formed(value) {

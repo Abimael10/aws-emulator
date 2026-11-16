@@ -97,6 +97,8 @@ mod managed_node_iam_role;
 mod managed_node_information;
 #[path = "all/managed_node_lifecycle.rs"]
 mod managed_node_lifecycle;
+#[path = "all/managed_node_read_refusals.rs"]
+mod managed_node_read_refusals;
 #[path = "all/node_connection_status.rs"]
 mod node_connection_status;
 #[path = "all/node_inventory.rs"]

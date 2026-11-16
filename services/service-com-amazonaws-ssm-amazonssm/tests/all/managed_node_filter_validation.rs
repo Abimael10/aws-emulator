@@ -74,6 +74,10 @@ struct NodeApi {
     legacy_member: &'static str,
     /// The member a successful report lists its nodes in.
     report_member: &'static str,
+    /// The sentence this operation refuses a request naming BOTH filter members with,
+    /// written out here independently of the service: the same rule in both, each worded as
+    /// that operation words it.
+    both_filter_members: &'static str,
 }
 
 const INFORMATION: NodeApi = NodeApi {
@@ -81,6 +85,7 @@ const INFORMATION: NodeApi = NodeApi {
     filters_member: "Filters",
     legacy_member: "InstanceInformationFilterList",
     report_member: "InstanceInformationList",
+    both_filter_members: "Cannot use both legacy and new filter simultaneously.",
 };
 
 const PROPERTIES: NodeApi = NodeApi {
@@ -88,6 +93,7 @@ const PROPERTIES: NodeApi = NodeApi {
     filters_member: "FiltersWithOperator",
     legacy_member: "InstancePropertyFilterList",
     report_member: "InstanceProperties",
+    both_filter_members: "Cannot use both legacy and new filter simultaneously",
 };
 
 /// Both managed-node describes, so every rule below is asserted on each of them.
@@ -487,15 +493,11 @@ async fn a_key_the_operation_does_not_know_is_refused_naming_that_key() {
 ///
 /// The rows differ along what makes the two lists legal on their own — the key each names,
 /// how many filters it holds — so the refusal is about naming BOTH members and not about
-/// any filter in them.
+/// any filter in them. The sentence is the same rule in both operations, each stating it
+/// in its own words ([`NodeApi::both_filter_members`]).
 #[tokio::test]
 async fn naming_both_filter_members_is_refused() {
     let router = seeded_router();
-
-    /// The sentence both describes state, written out here independently of the service
-    /// (`crate::state::LEGACY_AND_NEW_FILTERS_REJECTION`): it names neither member, so it
-    /// is the same sentence for both operations.
-    const BOTH_FILTER_MEMBERS: &str = "Cannot use both legacy and new filter simultaneously";
 
     // (case, the filters the legacy member carries, the filters the current member carries)
     let cases: &[(&str, &[Filter<'_>], &[Filter<'_>])] = &[
@@ -556,8 +558,9 @@ async fn naming_both_filter_members_is_refused() {
             );
             assert_eq!(
                 error_message(&parsed),
-                BOTH_FILTER_MEMBERS,
-                "case {case:?}: expected {BOTH_FILTER_MEMBERS:?}, got {:?}",
+                api.both_filter_members,
+                "case {case:?}: expected {:?}, got {:?}",
+                api.both_filter_members,
                 error_message(&parsed)
             );
         }

@@ -791,10 +791,13 @@ async fn a_filter_the_operation_does_not_accept_is_refused() {
             json!({ "Filters": [{ "Key": "AssociationStatus", "Values": ["Unknown"] }] }),
             "InvalidInstanceInformationFilterValue",
         ),
+        // An activation id is an identifier with a modelled error of its own, so a value
+        // outside the `ActivationId` pattern is that failure rather than a filter-value
+        // one (`all/managed_node_read_refusals.rs` pins the wording over a table).
         (
             "ActivationIds not-a-uuid",
             json!({ "Filters": [{ "Key": "ActivationIds", "Values": ["not-a-uuid"] }] }),
-            "InvalidInstanceInformationFilterValue",
+            "InvalidActivationId",
         ),
         (
             "AgentVersion with two components",

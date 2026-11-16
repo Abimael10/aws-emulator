@@ -57,6 +57,32 @@ pub fn is_legacy_node_filter_key(key: &str) -> bool {
     INSTANCE_INFORMATION_FILTER_KEY_VALUES.contains(&key)
 }
 
+/// Why a managed-node describe's filter list cannot hold together because it names ONE
+/// filter key more than once, or `None` when every key it names is distinct.
+///
+/// A filter list is a CONJUNCTION of filters on distinct attributes, and each filter's own
+/// values are the set that attribute may hold ([`is_node_filter_key`] names the
+/// attributes): two filters on the same key would be two answers to the same question, so
+/// the request is refused instead of being served under one reading of it. The refusal
+/// names the key the caller repeated, taken from the request, so the caller knows which
+/// filter to drop.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixture
+/// `ssm-w22n-traj-filter-combination-mistakes`, step `task#3`): a
+/// `DescribeInstanceInformation` whose `Filters` names one key twice is answered 400
+/// `ValidationException` with this sentence and that key.
+pub fn duplicate_filter_key_rejection<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for key in keys {
+        if !seen.insert(key) {
+            return Some(format!("Cannot specify duplicate filter {key}"));
+        }
+    }
+    None
+}
+
 /// Whether `id` is an activation id — the modelled `ActivationId` pattern
 /// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
 pub fn is_activation_id(id: &str) -> bool {
@@ -120,10 +146,10 @@ pub fn is_agent_version(version: &str) -> bool {
 /// here, and a node id is checked by its caller, which answers it with the operation's
 /// own `InvalidInstanceId` rather than with a filter-value error.
 ///
-/// An [`ACTIVATION_IDS_FILTER_KEY`] value is worded the way the service words that
-/// refusal ([`invalid_activation_ids_message`]); an operation whose model declares the
-/// activation-id error answers THAT with the same sentence rather than the filter-value
-/// error, which is why the wording is held in one place.
+/// An [`ACTIVATION_IDS_FILTER_KEY`] value is not answered here either: a value that is not
+/// an activation id has its OWN modelled error, which names the activation rather than the
+/// filter ([`malformed_activation_ids`] and [`invalid_activation_ids_message`]), so the
+/// caller checks that key before reaching this — the same way it checks a node id.
 pub fn node_filter_value_rejection(key: &str, value: &str) -> Option<String> {
     if let Some(catalog) = node_filter_key_value_set(key) {
         if !catalog.contains(&value) {
@@ -132,9 +158,6 @@ pub fn node_filter_value_rejection(key: &str, value: &str) -> Option<String> {
         return None;
     }
     match key {
-        ACTIVATION_IDS_FILTER_KEY if !is_activation_id(value) => {
-            Some(invalid_activation_ids_message(&[value]))
-        }
         "AgentVersion" if !is_agent_version(value) => Some(format!(
             "Value '{value}' for filter key '{key}' is not an SSM Agent version"
         )),

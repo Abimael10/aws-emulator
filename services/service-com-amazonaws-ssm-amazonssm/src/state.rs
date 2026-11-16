@@ -2782,16 +2782,32 @@ pub fn node_filter_keys() -> Vec<&'static str> {
 /// publishes, or `None` for a key whose values are free text (a node id, an agent
 /// version, a role name, a tag value).
 ///
-/// Each set is the modelled enum the property targets, LISTED in the order
-/// `InstanceInformationStringFilter$Key` publishes it ("Valid values for the `PingStatus`
-/// filter key: Online | ConnectionLost | Inactive (deprecated)", and so on for
-/// `AssociationStatus`, `PlatformTypes`, `ResourceType` and `SourceType`) — which is the
-/// order a refusal lists them in, so a caller reads the published list back. The generated
-/// `*_VALUES` constants carry the same values sorted; the test below holds the two to the
-/// same SET, so a model revision cannot leave this listing behind.
+/// Each set is the modelled enum the property the key selects on targets, and the ORDER is
+/// the order the service publishes that key's values in — one row per key, because the two
+/// places this service's model states a set do not always agree and the service follows
+/// neither of them for every key:
+///
+/// * `AssociationStatus` is listed as the modelled `AssociationStatusName` enum DECLARES
+///   its values (`smithy_query(query="shape", shape="AssociationStatusName")`:
+///   `Pending`, `Success`, `Failed`), which is the order recorded for this refusal
+///   (corpus `simparity-wire-aws-v1`, fixture `ssm-w22n-traj-filter-value-enum-casing`,
+///   step `task#6`) and NOT the order the filter-key doc's prose lists them in.
+/// * `ResourceType` is listed as the `InstanceInformationStringFilter$Key` doc publishes it
+///   ("Valid values for the `ResourceType` filter key: EC2Instance | ManagedInstance"),
+///   which is the order recorded for it (same fixture, step `task#5`) and the reverse of
+///   the modelled `ResourceType` declaration.
+/// * `PlatformTypes` is listed as both state it (`Windows`, `Linux`, `MacOS`), recorded in
+///   fixture `ssm-w22n-traj-instance-properties-route`, step `task#2`.
+/// * `PingStatus` and `SourceTypes` have no recorded listing of their own, so each is
+///   listed as that same filter-key doc publishes it — the list a caller reads to pick a
+///   legal value.
+///
+/// The generated `*_VALUES` constants carry the same values sorted, so they pin the SET and
+/// this listing the order; a test holds the two to the same set, so a model revision cannot
+/// leave this listing behind.
 pub fn node_filter_key_value_set(key: &str) -> Option<&'static [&'static str]> {
     match key {
-        "AssociationStatus" => Some(&["Success", "Pending", "Failed"]),
+        "AssociationStatus" => Some(&["Pending", "Success", "Failed"]),
         "PingStatus" => Some(&["Online", "ConnectionLost", "Inactive"]),
         "PlatformTypes" => Some(&["Windows", "Linux", "MacOS"]),
         "ResourceType" => Some(&["EC2Instance", "ManagedInstance"]),
@@ -2806,9 +2822,8 @@ pub fn node_filter_key_value_set(key: &str) -> Option<&'static [&'static str]> {
 }
 
 /// How a managed-node describe refuses a filter whose VALUE is outside the set its key
-/// publishes: the key the caller filtered on, then the values that key accepts, as
-/// `InstanceInformationStringFilter$Key` publishes them
-/// ([`node_filter_key_value_set`]).
+/// publishes: the key the caller filtered on, then the values that key accepts, in the
+/// order the model declares them ([`node_filter_key_value_set`]).
 ///
 /// The sentence names the KEY and the set, and quotes none of the values the request sent:
 /// what a caller has to fix is which values that key may carry, which is the same answer
@@ -2906,22 +2921,32 @@ pub fn managed_node_id_constraint_violation() -> String {
     pattern_constraint_violation(MANAGED_NODE_ID_MEMBER, MANAGED_NODE_ID_PATTERN)
 }
 
-/// How a managed-node describe refuses a request that names BOTH its LEGACY filter list and
-/// its current filter member — `InstancePropertyFilterList` beside `FiltersWithOperator`, or
-/// `InstanceInformationFilterList` beside `Filters`.
+/// How `DescribeInstanceInformation` refuses a request that names BOTH its LEGACY filter
+/// list and its current filter member — `InstanceInformationFilterList` beside `Filters`.
 ///
 /// The two members are alternatives rather than a union ("Attempting to use
 /// InstanceInformationFilterList and Filters leads to an exception error"), and the sentence
 /// names NEITHER of them: it states that the legacy and the current filter cannot be used
-/// together, which is the same answer whichever describe was called and whatever the two
-/// lists held.
+/// together, which is the same answer whatever the two lists held.
 ///
 /// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixture
-/// `ssm-w22n-traj-instance-properties-route`, step `task#3`): a `DescribeInstanceProperties`
-/// naming both `InstancePropertyFilterList` and `FiltersWithOperator` is answered 400
-/// `ValidationException` with exactly this sentence. It carries nothing of the request, so
-/// the sibling describe — whose doc states the rule — states the same one.
+/// `ssm-w22n-traj-filter-combination-mistakes`, step `task#1`): a
+/// `DescribeInstanceInformation` naming both members is answered 400 `ValidationException`
+/// with exactly this sentence, terminating period included.
 pub const LEGACY_AND_NEW_FILTERS_REJECTION: &str =
+    "Cannot use both legacy and new filter simultaneously.";
+
+/// The same refusal as the PROPERTY describe words it — `InstancePropertyFilterList` beside
+/// `FiltersWithOperator`: the same sentence, which that operation ends without a
+/// terminating period.
+///
+/// The rule the two operations share is the one [`LEGACY_AND_NEW_FILTERS_REJECTION`] states;
+/// what differs is punctuation, and each operation is worded as its OWN recording words it
+/// rather than as a guess from the other's. RECORDED BEHAVIOUR (corpus
+/// `simparity-wire-aws-v1`, fixture `ssm-w22n-traj-instance-properties-route`, step
+/// `task#3`): a `DescribeInstanceProperties` naming both members is answered 400
+/// `ValidationException` with exactly this sentence.
+pub const PROPERTY_LEGACY_AND_NEW_FILTERS_REJECTION: &str =
     "Cannot use both legacy and new filter simultaneously";
 
 /// The refusal a request that mixes filter kinds carries, as the service words it: one

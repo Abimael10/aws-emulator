@@ -247,7 +247,7 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 /// requirement it broke, and nothing of what the caller sent.
 ///
 /// Recorded behaviour of this service, and recorded for every member and every constraint
-/// class of these four:
+/// class of these five:
 ///
 /// * `DescribeSessions` — fixture
 ///   `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes`, step `task#3` (a
@@ -257,6 +257,11 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 ///   step `task#1` (an `Operator` outside its enumerated type, stated
 ///   `Value at 'filtersWithOperator.1.member.operator' …`) and step `task#6` (a
 ///   `MaxResults` above its `@range` maximum, stated `Value at 'maxResults' …`).
+/// * `DescribeInstanceInformation` — fixture
+///   `ssm-w22n-traj-filter-combination-mistakes`, step `task#4` (a filter's `Values` list
+///   shorter than its `@length` minimum, stated
+///   `Value at 'filters.1.member.values' …`), so the node describe withholds the value its
+///   sibling property describe withholds too.
 /// * `StartExecutionPreview` — fixtures `ssm-execution-preview-automation-workflow`, step
 ///   `task#4`, and `ssm-execution-preview-invalid-document-error`, step `task#1` (a
 ///   `DocumentVersion` outside its expression AND over the length the service holds one to,
@@ -276,6 +281,7 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 /// too.
 const VALUELESS_OPERATIONS: &[&str] = &[
     "DescribeSessions",
+    "DescribeInstanceInformation",
     "DescribeInstanceProperties",
     "StartExecutionPreview",
     "ListOpsItemEvents",

@@ -253,6 +253,35 @@ async fn the_valueless_operations_state_no_value() {
                 .to_string(),
         ),
         (
+            "an empty filter value list on the node describe",
+            "DescribeInstanceInformation",
+            json!({ "Filters": [{ "Key": "PlatformTypes", "Values": [] }] }),
+            "Value at 'filters.1.member.values' failed to satisfy constraint: Member must \
+             have length greater than or equal to 1"
+                .to_string(),
+        ),
+        (
+            "the same list empty in the second element",
+            "DescribeInstanceInformation",
+            json!({
+                "Filters": [
+                    { "Key": "PlatformTypes", "Values": ["Windows"] },
+                    { "Key": "PingStatus", "Values": [] },
+                ],
+            }),
+            "Value at 'filters.2.member.values' failed to satisfy constraint: Member must \
+             have length greater than or equal to 1"
+                .to_string(),
+        ),
+        (
+            "a page size under the node describe's minimum",
+            "DescribeInstanceInformation",
+            json!({ "MaxResults": 4 }),
+            "Value at 'maxResults' failed to satisfy constraint: Member must have value \
+             greater than or equal to 5"
+                .to_string(),
+        ),
+        (
             "a page size over an operation that quotes its values",
             "GetInventory",
             json!({ "MaxResults": 51 }),
@@ -376,16 +405,19 @@ async fn a_collection_over_its_bound_quotes_the_collection() {
 }
 
 /// RULE 4: a managed-node filter value outside the set its key publishes is refused naming
-/// the KEY and the values it accepts, in the order the API publishes them, on both node
-/// describes and whichever operator the filter named.
+/// the KEY and the values it accepts, in the order the service publishes that key's values,
+/// on both node describes and whichever operator the filter named.
 #[tokio::test]
 async fn a_filter_value_outside_its_published_set_names_the_key_and_the_set() {
     let router = router();
 
-    // (the filter key, the values it publishes, in the order
-    // `InstanceInformationStringFilter$Key` documents them)
+    // (the filter key, the values it publishes, in the order the service lists them: the
+    // modelled enum's own declaration for `AssociationStatus`
+    // (`smithy_query(query="shape", shape="AssociationStatusName")`) and the
+    // `InstanceInformationStringFilter$Key` doc's published list for the others
+    // (`smithy_query(query="doc", shape="InstanceInformationStringFilter", member="Key")`))
     let published: &[(&str, &str)] = &[
-        ("AssociationStatus", "Success, Pending, Failed"),
+        ("AssociationStatus", "Pending, Success, Failed"),
         ("PingStatus", "Online, ConnectionLost, Inactive"),
         ("PlatformTypes", "Windows, Linux, MacOS"),
         ("ResourceType", "EC2Instance, ManagedInstance"),
@@ -467,8 +499,8 @@ async fn a_filter_value_outside_its_published_set_names_the_key_and_the_set() {
 }
 
 /// The published sets rule 4 lists are the SETS the model's own enums declare: the listing
-/// order is the API's documentation, the membership is the model's, so a model revision
-/// cannot leave the published listing behind.
+/// order is the order the service publishes each key's values in, the membership is the
+/// generated value constant, so a model revision cannot leave the published listing behind.
 #[test]
 fn the_published_filter_value_sets_are_the_models_enums() {
     // (the filter key, the modelled enum the property it filters targets)
