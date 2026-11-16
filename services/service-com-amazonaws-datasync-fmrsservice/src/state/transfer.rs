@@ -70,7 +70,10 @@ const PRESERVE_NONE: &str = "NONE";
 ///
 /// An object store takes no last-modified time on a write — the destination object's own
 /// is when the transfer wrote it — so the SOURCE object's modification time is carried as
-/// the user-metadata entry a client reads it back from, `x-amz-meta-last-modified`.
+/// the user-metadata entry a client reads it back from, `x-amz-meta-last-modified`. Its
+/// value is that modification time in the unit a modification time is KEPT in, seconds
+/// since the epoch ([`last_modified_metadata_value`]), which is what makes the entry the
+/// preserved time of the source rather than a rendering of it.
 const LAST_MODIFIED_METADATA_KEY: &str = "last-modified";
 
 /// The S3 action DataSync performs under a location's bucket access role before it reads
@@ -359,6 +362,10 @@ struct ListedObject {
     /// The entity tag the object store derived from the object's bytes, so comparing it
     /// compares CONTENT rather than metadata.
     etag: String,
+    /// When the side holding it reports it was last modified, as the value a transfer
+    /// carries across in the destination object's [`LAST_MODIFIED_METADATA_KEY`] entry —
+    /// or `None` when the listing reported no time for it.
+    last_modified: Option<String>,
 }
 
 impl ListedObject {
@@ -436,15 +443,18 @@ async fn prepare(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
 
 /// `TRANSFERRING`: move the objects the task selects into the destination.
 ///
-/// Each object is copied from the source to the destination through this emulator's own
-/// object store, so the destination afterwards serves the source's bytes — and WITH them
-/// the metadata that object carries, since a transfer moves "the data (including
-/// metadata)" (`Options$TransferMode`): the source object's content type and `x-amz-meta-*`
-/// user metadata unless the task's `ObjectMetadata` is `NONE`, its tag set unless
-/// `ObjectTags` is `NONE`, and a [`LAST_MODIFIED_METADATA_KEY`] entry either way. Every
-/// byte counter is the number of bytes that moved. An object the task's `OverwriteMode`
-/// protects is counted as skipped and not written, and a task configured not to preserve
-/// deleted files deletes the destination objects its source no longer holds.
+/// A transfer READS each selected object off the source side and WRITES it into the
+/// destination — it is not an object-store copy of the source's record — so the
+/// destination object is a write of its own: it carries the destination bucket's
+/// encryption, its own modification time and the checksum the object store computes for a
+/// write that names no algorithm, never the source object's integrity record. What it
+/// carries ACROSS is what a transfer moves, "the data (including metadata)"
+/// (`Options$TransferMode`): the source object's content type and `x-amz-meta-*` user
+/// metadata unless the task's `ObjectMetadata` is `NONE`, its tag set unless `ObjectTags`
+/// is `NONE`, and a [`LAST_MODIFIED_METADATA_KEY`] entry either way. Every byte counter is
+/// the number of bytes that moved. An object the task's `OverwriteMode` protects is
+/// counted as skipped and not written, and a task configured not to preserve deleted files
+/// deletes the destination objects its source no longer holds.
 async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
     let mut counters = due.counters;
     let (source, destination) = listings(callback, due).await;
@@ -465,33 +475,50 @@ async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
 
     let client = ::service_common::s3_client::s3_client(callback, &due.region);
     for object in writable {
-        let Some(carried) = source_metadata(&client, source_endpoint, object).await else {
+        let Some(read) = source_object(&client, due, source_endpoint, object).await else {
             // An object the source would not answer about is one this transfer did not
             // move, and nothing here reports bytes it did not move.
             continue;
         };
+        let SourceObject {
+            body,
+            content_type,
+            user_metadata,
+            tags,
+        } = read;
         let key = format!("{}{}", destination_endpoint.prefix, object.relative_key);
-        // The one request that moves the object: the destination holds the source's bytes,
-        // and the metadata it is written with is what this task carries across. The
-        // metadata is STATED in full (`REPLACE`), because the last-modified entry is
-        // carried whatever the task's `ObjectMetadata` says, and a tag set is left behind
-        // only by a task whose `ObjectTags` is `NONE`.
-        let mut copy = client
-            .copy_object()
+        let moved = i64::try_from(body.len()).unwrap_or(i64::MAX);
+        // The media type this write DECLARES: the source object's where the task preserves
+        // object metadata, and none at all where it ignores it — a write that declares none
+        // leaves the object store to record its own default for the destination object.
+        let declared_content_type =
+            preserves_object_metadata(due).then_some(content_type).flatten();
+        let metadata = destination_metadata(due, object, &user_metadata);
+        let declares_a_content_type = declared_content_type.is_some();
+        // The one request that moves the object: a WRITE of the bytes this transfer read,
+        // stating in full the metadata it carries across — the content type and the user
+        // metadata where the task preserves object metadata, the last-modified entry
+        // whatever it says, and the tag set only where the task preserves object tags.
+        let written = client
+            .put_object()
             .bucket(&destination_endpoint.bucket)
             .key(&key)
-            .copy_source(copy_source(&source_endpoint.bucket, &object.key))
-            .metadata_directive(::aws_sdk_s3::types::MetadataDirective::Replace)
-            .set_content_type(
-                preserves_object_metadata(due)
-                    .then(|| carried.content_type.clone())
-                    .flatten(),
-            )
-            .set_metadata(Some(destination_metadata(due, &carried)));
-        if !preserves_object_tags(due) {
-            copy = copy.tagging_directive(::aws_sdk_s3::types::TaggingDirective::Replace);
-        }
-        if let Err(error) = copy.send().await {
+            .body(::aws_sdk_s3::primitives::ByteStream::from(body))
+            .set_content_type(declared_content_type)
+            .set_metadata(Some(metadata))
+            .set_tagging(tagging_header(&tags))
+            .customize()
+            // The transport would otherwise declare a media type of its own for the bytes
+            // of any write carrying a payload, so a write that declares NONE has to send
+            // no `Content-Type` at all for the object store to record its own default.
+            .mutate_request(move |request| {
+                if !declares_a_content_type {
+                    request.headers_mut().remove("content-type");
+                }
+            })
+            .send()
+            .await;
+        if let Err(error) = written {
             ::tracing::debug!(
                 error = ?error,
                 bucket = %destination_endpoint.bucket,
@@ -500,8 +527,8 @@ async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
             continue;
         }
         files_transferred += 1;
-        bytes_transferred += object.size;
-        bytes_written += object.size;
+        bytes_transferred += moved;
+        bytes_written += moved;
     }
 
     for object in deletable(due, &source, &destination) {
@@ -629,6 +656,7 @@ async fn list_location(
                     key: key.to_string(),
                     size: object.size().unwrap_or_default(),
                     etag: object.e_tag().unwrap_or_default().trim_matches('"').to_string(),
+                    last_modified: object.last_modified().map(last_modified_metadata_value),
                 },
             );
             if found.len() >= MAX_OBJECTS_PER_SIDE {
@@ -642,74 +670,146 @@ async fn list_location(
     }
 }
 
-/// The `x-amz-copy-source` that names the object `key` of `bucket`: "the name of the source
-/// bucket and the key of the source object, separated by a slash (/) … The value must be
-/// URL-encoded".
-///
-/// The key is percent-encoded over the set RFC 3986 reserves, so a key carrying a space, a
-/// `%`, a `?` or a `#` names the object it IS rather than a different one — the object store
-/// reads this value as URL-encoded text and decodes it before splitting off the bucket.
-fn copy_source(bucket: &str, key: &str) -> String {
-    let encoded =
-        ::percent_encoding::utf8_percent_encode(key, ::percent_encoding::NON_ALPHANUMERIC);
-    format!("{bucket}/{encoded}")
-}
-
-/// The metadata one source object carries, as a transfer reads it off that object.
+/// What the transfer read off ONE source object: the bytes it moves, and the metadata it
+/// carries with them.
 #[derive(Debug, Default)]
-struct CarriedMetadata {
+struct SourceObject {
+    /// The object's bytes, as the source side served them.
+    body: Vec<u8>,
     /// The object's content type.
     content_type: Option<String>,
     /// Its user metadata, which an object store reports as `x-amz-meta-*`.
     user_metadata: BTreeMap<String, String>,
-    /// Its modification time, in the form the store's own last-modified header carries
-    /// it, or `None` when the store reported none.
-    last_modified: Option<String>,
+    /// Its tag set where the task carries tags across, and no tags at all where it does
+    /// not: a task whose `ObjectTags` is `NONE` reads none, so none is written.
+    tags: Vec<(String, String)>,
 }
 
-/// The metadata the source object at `object` carries, or `None` when the object store
-/// would not ANSWER about it.
+/// The source object at `object`, read off the source side, or `None` when the object
+/// store would not ANSWER about it.
 ///
 /// Such an object is one this transfer does not move: what the store did not answer
 /// establishes nothing about the object, so nothing is written for it and no counter
-/// reports it (the module docs state the rule).
-async fn source_metadata(
+/// reports it (the module docs state the rule). ONE read carries the bytes and the metadata
+/// the destination write needs, since a read of an object reports both.
+async fn source_object(
     client: &::aws_sdk_s3::Client,
+    due: &DuePhase,
     endpoint: &S3Endpoint,
     object: &ListedObject,
-) -> Option<CarriedMetadata> {
+) -> Option<SourceObject> {
     let read = client
-        .head_object()
+        .get_object()
         .bucket(&endpoint.bucket)
         .key(&object.key)
         .send()
         .await;
-    let head = match read {
-        Ok(head) => head,
+    let read = match read {
+        Ok(read) => read,
         Err(error) => {
             ::tracing::debug!(
                 error = ?error,
                 key = %object.key,
-                "a transfer could not read a source object's metadata"
+                "a transfer could not read a source object"
             );
             return None;
         }
     };
-    Some(CarriedMetadata {
-        content_type: head.content_type().map(ToString::to_string),
-        user_metadata: head
-            .metadata()
-            .map(|metadata| {
-                metadata
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        last_modified: head.last_modified().and_then(|at| {
-            at.fmt(::aws_smithy_types::date_time::Format::HttpDate).ok()
-        }),
+    let content_type = read.content_type().map(ToString::to_string);
+    let user_metadata: BTreeMap<String, String> = read
+        .metadata()
+        .map(|metadata| {
+            metadata
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The bytes themselves, held only for as long as the one write below takes: a phase
+    // moves one object at a time, so what this holds is bounded by the largest object the
+    // object store accepts rather than by what a location holds.
+    let body = match read.body.collect().await {
+        Ok(collected) => collected.into_bytes().to_vec(),
+        Err(error) => {
+            ::tracing::debug!(
+                error = ?error,
+                key = %object.key,
+                "a transfer could not read a source object's bytes"
+            );
+            return None;
+        }
+    };
+    let tags = match preserves_object_tags(due) {
+        true => source_tags(client, endpoint, object).await?,
+        false => Vec::new(),
+    };
+    Some(SourceObject {
+        body,
+        content_type,
+        user_metadata,
+        tags,
     })
+}
+
+/// The tag set the source object at `object` carries, or `None` when the object store would
+/// not ANSWER about it.
+///
+/// A tag read that did not answer establishes nothing about the object's tags, so the object
+/// is one this transfer does not move — the same exit a source object it could not read at
+/// all takes, rather than a destination written without the tag set its source carries.
+async fn source_tags(
+    client: &::aws_sdk_s3::Client,
+    endpoint: &S3Endpoint,
+    object: &ListedObject,
+) -> Option<Vec<(String, String)>> {
+    let read = client
+        .get_object_tagging()
+        .bucket(&endpoint.bucket)
+        .key(&object.key)
+        .send()
+        .await;
+    match read {
+        Ok(tagged) => Some(
+            tagged
+                .tag_set()
+                .iter()
+                .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+                .collect(),
+        ),
+        Err(error) => {
+            ::tracing::debug!(
+                error = ?error,
+                key = %object.key,
+                "a transfer could not read a source object's tag set"
+            );
+            None
+        }
+    }
+}
+
+/// The `x-amz-tagging` a write delivers `tags` in, or `None` for a write that carries no
+/// tag set at all.
+///
+/// "The tag-set for the object. The tag-set must be encoded as URL Query parameters. (For
+/// example, "Key1=Value1")" (`PutObjectRequest$Tagging`) — so each pair is one tag with
+/// both halves percent-encoded over the set RFC 3986 reserves, which is what makes a tag
+/// carrying a `&`, an `=` or a space arrive as the tag it IS.
+fn tagging_header(tags: &[(String, String)]) -> Option<String> {
+    if tags.is_empty() {
+        return None;
+    }
+    let encoded = tags
+        .iter()
+        .map(|(key, value)| format!("{}={}", url_encoded(key), url_encoded(value)))
+        .collect::<Vec<String>>()
+        .join("&");
+    Some(encoded)
+}
+
+/// `text` as one URL-encoded query-string half.
+fn url_encoded(text: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(text, ::percent_encoding::NON_ALPHANUMERIC)
+        .to_string()
 }
 
 /// The user metadata the destination object is written with.
@@ -718,27 +818,41 @@ async fn source_metadata(
 /// across verbatim, and none of them where the task ignores it. Either way the
 /// destination ends up with a [`LAST_MODIFIED_METADATA_KEY`] entry: the source object's
 /// own where it carries one, and otherwise the modification time the source side reports
-/// for it.
+/// for the object it listed.
 fn destination_metadata(
     due: &DuePhase,
-    carried: &CarriedMetadata,
+    object: &ListedObject,
+    user_metadata: &BTreeMap<String, String>,
 ) -> ::std::collections::HashMap<String, String> {
     let mut metadata: ::std::collections::HashMap<String, String> =
         if preserves_object_metadata(due) {
-            carried
-                .user_metadata
+            user_metadata
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect()
         } else {
             ::std::collections::HashMap::new()
         };
-    if let Some(last_modified) = carried.last_modified.clone() {
+    if let Some(last_modified) = object.last_modified.clone() {
         metadata
             .entry(LAST_MODIFIED_METADATA_KEY.to_string())
             .or_insert(last_modified);
     }
     metadata
+}
+
+/// The modification time `at` as the destination object's [`LAST_MODIFIED_METADATA_KEY`]
+/// entry states it: whole seconds since the epoch, the unit a file's or an object's
+/// modification time is kept in, so a client reads the entry as the TIME it preserves and
+/// not as a rendering of it in one of the several forms an API states an instant in.
+///
+/// A modification time has one-second resolution, so the value is the seconds and nothing
+/// finer. Nothing in the model states this form — no DataSync shape describes what a
+/// transfer preserves in an object's user metadata — and it is written only for a source
+/// object that carries no entry of this name itself: one that does has its own value travel
+/// verbatim ([`destination_metadata`]).
+fn last_modified_metadata_value(at: &::aws_smithy_types::DateTime) -> String {
+    at.secs().to_string()
 }
 
 /// Whether this task carries the source object's metadata across: "specifies whether you

@@ -37,6 +37,8 @@ mod object_storage_location;
 mod object_storage_location_existence;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/s3_transfer_destination_object.rs"]
+mod s3_transfer_destination_object;
 #[path = "all/s3_transfer_execution.rs"]
 mod s3_transfer_execution;
 #[path = "all/state_roundtrip.rs"]

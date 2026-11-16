@@ -68,13 +68,13 @@ fn total_bytes(objects: &[(&str, &[u8])]) -> i64 {
 }
 
 /// DataSync, Amazon S3 and IAM on one shared engine.
-struct Aws {
+pub(crate) struct Aws {
     router: MultiServiceRouter,
 }
 
 impl Aws {
     /// Stand up the router with the three services mounted on a fresh engine.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -101,7 +101,7 @@ impl Aws {
     }
 
     /// An Amazon S3 client over that seam, built the one way the tree builds it.
-    fn s3(&self) -> ::aws_sdk_s3::Client {
+    pub(crate) fn s3(&self) -> ::aws_sdk_s3::Client {
         ::service_common::s3_client::s3_client(&self.callback(), REGION)
     }
 
@@ -141,7 +141,7 @@ impl Aws {
     }
 
     /// A DataSync call that must succeed.
-    async fn ok(&self, operation: &str, body: Value, case: &str) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value, case: &str) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -167,7 +167,7 @@ impl Aws {
     }
 
     /// Create `bucket` and put every object of `objects` in it.
-    async fn seed_bucket(&self, bucket: &str, objects: &[(&str, &[u8])], case: &str) {
+    pub(crate) async fn seed_bucket(&self, bucket: &str, objects: &[(&str, &[u8])], case: &str) {
         let created = self
             .s3()
             .create_bucket()
@@ -235,7 +235,7 @@ impl Aws {
     }
 
     /// Create the bucket access role, with an inline policy over `buckets`.
-    async fn create_role(&self, buckets: &[&str]) -> String {
+    pub(crate) async fn create_role(&self, buckets: &[&str]) -> String {
         let trust = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -301,7 +301,7 @@ impl Aws {
     }
 
     /// An Amazon S3 transfer location for `bucket`, created and returned by ARN.
-    async fn create_location(
+    pub(crate) async fn create_location(
         &self,
         bucket: &str,
         subdirectory: Option<&str>,
@@ -323,7 +323,7 @@ impl Aws {
     }
 
     /// Wait until the task is out of `CREATING`, then start one execution.
-    async fn start_execution(&self, task_arn: &str, case: &str) -> String {
+    pub(crate) async fn start_execution(&self, task_arn: &str, case: &str) -> String {
         let deadline = Instant::now() + TERMINAL_DEADLINE;
         loop {
             let described = self
@@ -350,7 +350,7 @@ impl Aws {
 
     /// Poll `DescribeTaskExecution` until the execution reaches a terminal status, and
     /// return that body.
-    async fn await_terminal(&self, execution_arn: &str, case: &str) -> Value {
+    pub(crate) async fn await_terminal(&self, execution_arn: &str, case: &str) -> Value {
         let deadline = Instant::now() + TERMINAL_DEADLINE;
         loop {
             let described = self
@@ -1803,7 +1803,8 @@ impl Aws {
         );
     }
 
-    /// The object's `Last-Modified`, in the form that header carries it.
+    /// The object's `Last-Modified`, in the unit a preserved modification time is kept in:
+    /// whole seconds since the epoch.
     async fn object_modified_at(&self, bucket: &str, key: &str, case: &str) -> String {
         let head = self
             .s3()
@@ -1816,10 +1817,7 @@ impl Aws {
                 panic!("case {case:?}: Amazon S3 must report {key:?}, got {error:?}")
             });
         head.last_modified()
-            .and_then(|at| {
-                at.fmt(::aws_smithy_types::date_time::Format::HttpDate)
-                    .ok()
-            })
+            .map(|at| at.secs().to_string())
             .unwrap_or_else(|| {
                 panic!("case {case:?}: Amazon S3 must report when {key:?} was last modified")
             })

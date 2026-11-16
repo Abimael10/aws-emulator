@@ -33,8 +33,8 @@ service-common = { path = "../common" }
 # (`state::transfer`). Only the generated client is needed — the emulator supplies the
 # transport, so the SDK's own HTTPS stack and runtime are left out.
 aws-sdk-s3 = { version = "1", default-features = false }
-# Percent-encodes the source key of the `x-amz-copy-source` a transfer moves an object
-# with: that header's value is URL-encoded text (`state::transfer`).
+# Percent-encodes the `x-amz-tagging` a transfer writes a destination object's tag set
+# in: that header's value is URL-encoded query parameters (`state::transfer`).
 percent-encoding = "2"
 
 [build-dependencies]
