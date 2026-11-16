@@ -29,5 +29,7 @@ mod state_roundtrip;
 mod usage_limit_lifecycle;
 #[path = "all/usage_limit_payload_and_name_refusals.rs"]
 mod usage_limit_payload_and_name_refusals;
+#[path = "all/usage_limit_update_invariants.rs"]
+mod usage_limit_update_invariants;
 #[path = "all/workgroup_endpoint_projection.rs"]
 mod workgroup_endpoint_projection;
