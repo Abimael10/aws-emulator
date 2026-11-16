@@ -27,3 +27,5 @@ mod subnet_group_coverage_message;
 mod subnet_group_handle;
 #[path = "all/subnet_group_placement.rs"]
 mod subnet_group_placement;
+#[path = "all/subnet_group_reads.rs"]
+mod subnet_group_reads;

@@ -1060,6 +1060,17 @@ impl ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
         records
     }
 
+    /// The replication subnet groups this emulator holds, in identifier order.
+    ///
+    /// A group is held under its identifier ("This value is stored as a lowercase
+    /// string"), which is also the only handle an operation names one by, so the key
+    /// order is a stable order for reporting them: two readings of an unchanged account
+    /// list the same groups in the same order, which is what a paged describe resumes
+    /// against.
+    pub fn ordered_subnet_groups(&self) -> Vec<&ReplicationSubnetGroupRecord> {
+        self.replication_subnet_groups.values().collect()
+    }
+
     /// The replication tasks this emulator holds, oldest first.
     pub fn ordered_tasks(&self) -> Vec<&ReplicationTaskRecord> {
         let mut records: Vec<&ReplicationTaskRecord> = self.replication_tasks.values().collect();

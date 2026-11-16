@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReplicationSubnetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReplicationSubnetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReplicationSubnetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the replication subnet groups [`crate::state`] holds — the same
+//! records `CreateReplicationSubnetGroup` persisted, projected through the one
+//! [`crate::state::ReplicationSubnetGroupRecord::to_shape`] every reading of a group goes
+//! through — narrowed by the documented filter and paged by `MaxRecords`/`Marker`. The
+//! notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReplicationSubnetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReplicationSubnetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReplicationSubnetGroups"))
+        // Reporting only: every answer comes from the store, so `ctx` carries nothing
+        // this operation needs. A replication subnet group records subnets the account
+        // already has and DMS provisions nothing for it, so there is no transition the
+        // clock owes one and this read settles nothing.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeReplicationSubnetGroupsErrorModeled::ResourceNotFoundFault(
+                    ResourceNotFoundFault {
+                        message: Some(
+                            "the dms emulator is mounted on an engine that holds no state \
+                             for it"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)?;
+        let size = crate::state::page_size(input.max_records)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let store = state.lock();
+        let matching: Vec<&crate::state::ReplicationSubnetGroupRecord> = store
+            .ordered_subnet_groups()
+            .into_iter()
+            .filter(|record| matches_filters(record, &filters))
+            .collect();
+
+        // Narrowing to nothing is an EMPTY answer, not a refusal: the recorded service
+        // answers this describe 200 for a filter that selects no group, so the groups
+        // the account holds that the filters select — none of them, here — is the whole
+        // answer, and the modelled `ResourceNotFoundFault` is not raised for it.
+        let (page, marker) = crate::state::paginate(
+            &matching,
+            input.marker.as_ref(),
+            size,
+            |record| record.arn.as_str(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(DescribeReplicationSubnetGroupsOutput {
+            replication_subnet_groups: Some(
+                matching[page]
+                    .iter()
+                    .map(|record| record.to_shape())
+                    .collect(),
+            ),
+            marker,
+        })
     }
+}
+
+/// The filter names the `Filters` member doc publishes: "Valid filter names:
+/// replication-subnet-group-id".
+const DOCUMENTED_FILTERS: &[&str] = &["replication-subnet-group-id"];
+
+/// Refuse a filter name this operation does not document, rather than ignoring it and
+/// answering with groups the caller asked to exclude.
+fn check_filter_names(filters: &[Filter]) -> Result<(), DescribeReplicationSubnetGroupsError> {
+    for filter in filters {
+        if !DOCUMENTED_FILTERS.contains(&filter.name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} is not a supported filter name; the valid filter names are {}",
+                filter.name,
+                DOCUMENTED_FILTERS.join(" | ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` satisfies every filter the request carries: each filter narrows the
+/// answer to the groups whose matching attribute is one of that filter's values.
+///
+/// A group's identifier "is stored as a lowercase string", and every operation that names
+/// one resolves it folded, so a filter value is folded before it is compared.
+fn matches_filters(
+    record: &crate::state::ReplicationSubnetGroupRecord,
+    filters: &[Filter],
+) -> bool {
+    filters.iter().all(|filter| match filter.name.as_str() {
+        "replication-subnet-group-id" => filter
+            .values
+            .iter()
+            .any(|value| value.to_lowercase() == record.identifier),
+        // `check_filter_names` has already refused every other name.
+        _ => true,
+    })
 }

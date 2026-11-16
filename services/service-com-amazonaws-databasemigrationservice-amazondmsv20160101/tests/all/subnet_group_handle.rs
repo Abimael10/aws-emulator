@@ -53,12 +53,15 @@ const FIXTURE_ZONES: usize = 3;
 
 /// The account's network: one VPC with an Amazon-provided IPv6 block, and one IPv4-only
 /// and one dual-stack subnet in each of [`FIXTURE_ZONES`] zones.
-struct Network {
+///
+/// Shared with the sibling suites in this target, so the network a group's subnets come
+/// from is created through EC2 in exactly one place.
+pub(crate) struct Network {
     /// One IPv4-only subnet per zone, in zone order.
-    ipv4_only: Vec<Subnet>,
+    pub(crate) ipv4_only: Vec<Subnet>,
     /// One dual-stack subnet per zone, in zone order: the same subnets with an IPv6 range
     /// of the VPC's associated with them.
-    dual: Vec<Subnet>,
+    pub(crate) dual: Vec<Subnet>,
 }
 
 /// The `/64` block at `index` of the VPC's Amazon-provided `/56`, which is the size a
@@ -82,7 +85,7 @@ fn subnet_ipv6_block(vpc_block: &str, index: u16) -> String {
 }
 
 /// Create the network the rows are built from, through EC2's own operations.
-async fn create_network(ec2: &::aws_sdk_ec2::Client) -> Network {
+pub(crate) async fn create_network(ec2: &::aws_sdk_ec2::Client) -> Network {
     let zones: Vec<String> = ec2
         .describe_availability_zones()
         .send()
@@ -138,7 +141,7 @@ async fn create_network(ec2: &::aws_sdk_ec2::Client) -> Network {
 }
 
 /// The `SupportedNetworkTypes` a group reports, or a marker naming their absence.
-fn network_types(group: &Value) -> Vec<String> {
+pub(crate) fn network_types(group: &Value) -> Vec<String> {
     match group.pointer("/SupportedNetworkTypes").and_then(Value::as_array) {
         Some(values) => values
             .iter()
@@ -149,7 +152,7 @@ fn network_types(group: &Value) -> Vec<String> {
 }
 
 /// Create a group over `subnet_ids`, asserting a 200, and answer the group it reports.
-async fn create_group(
+pub(crate) async fn create_group(
     emulator: &Emulator,
     case: &str,
     identifier: &str,
