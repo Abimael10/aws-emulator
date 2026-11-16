@@ -166,8 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A start is admitted from the statuses the gate's own allowed set names,
             // and from no other: the application reports `STARTING` to a caller acting
             // straight away, and the clock owes it `STARTED`. The idle span its
-            // `autoStopConfiguration` bounds runs from this call: an application only
-            // holds capacity once it is running.
+            // `autoStopConfiguration` bounds runs from the instant the application is
+            // actually up — `crate::state::ApplicationRecord::settle` carries the last
+            // activity forward to the instant `STARTED` falls due — so the activity
+            // marked here is the floor under it, never a span that has already run.
             state if crate::state::STARTABLE_APPLICATION_STATES.contains(&state) => {
                 record.application.state = "STARTING".to_string();
                 record.application.updated_at = crate::state::now_timestamp(now);

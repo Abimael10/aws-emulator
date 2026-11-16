@@ -204,21 +204,25 @@ pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 pub const JOB_RUN_STAGE_TRANSITION: Duration = Duration::from_millis(750);
 
 /// How long this emulator holds a resource idle for, per MINUTE of idle time the
-/// configuration governing it names.
+/// configuration governing it names: that minute itself.
 ///
-/// The idle spans this service is configured with are stated in MINUTES, and the
-/// shortest either of them admits — `AutoStopConfig$idleTimeoutMinutes`
-/// (`@range(min: 1, max: 10080)`) and `StartSessionRequest$idleTimeoutMinutes` — is one
-/// minute, longer than the window a client polls a lifecycle edge in. So the span an
-/// idle timeout is SERVED as is the emulator's own, exactly like [`LIFECYCLE_TRANSITION`]
-/// and [`JOB_RUN_STAGE_TRANSITION`]: each configured minute of idle time is served as
-/// this span, deliberately not zero — a client acting straight after the call that left
-/// the resource idle still observes it in the state it is idle in — and short enough that
-/// the state change the idle timeout owes falls due inside the window a client polls in,
-/// while the configured value still ORDERS those changes: a resource configured for more
-/// idle minutes always stops after one configured for fewer. The configured value itself
-/// is stored and reported verbatim; only the span the emulator waits for is its own.
-pub const IDLE_MINUTE_SPAN: Duration = Duration::from_secs(5);
+/// An idle timeout is a wait the CALLER asked for, and both of the ones this service is
+/// configured with name it in MINUTES: `AutoStopConfig$idleTimeoutMinutes` is "the amount
+/// of idle time in minutes after which your application will automatically stop"
+/// (`@range(min: 1, max: 10080)`, "Defaults to 15 minutes"), and
+/// `StartSessionRequest$idleTimeoutMinutes` is "the idle timeout in minutes for the
+/// session. After the session remains idle for this duration, Amazon EMR Serverless
+/// automatically terminates it." So the span a configured minute is served as is the
+/// minute the request named — unlike [`LIFECYCLE_TRANSITION`] and
+/// [`JOB_RUN_STAGE_TRANSITION`], which stand for work whose duration nothing documents
+/// and nobody asked for, and which the emulator is therefore free to choose.
+///
+/// Compressing it changes the answer a client gets: a resource then leaves the state it
+/// is idle IN before a client polling that lifecycle edge can observe it there — an
+/// application whose start is still settling stops itself again before any read reports
+/// `STARTED` — and a caller who asked for a minute of grace is given seconds of it. The
+/// configured value is stored and reported verbatim either way.
+pub const IDLE_MINUTE_SPAN: Duration = Duration::from_secs(60);
 
 /// The span this emulator serves `minutes` of configured idle time as: one
 /// [`IDLE_MINUTE_SPAN`] per minute, saturating rather than overflowing, and held to the

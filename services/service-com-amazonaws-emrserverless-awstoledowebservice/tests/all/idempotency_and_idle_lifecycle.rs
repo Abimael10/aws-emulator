@@ -886,13 +886,15 @@ async fn an_idle_application_stops_itself_once_its_idle_timeout_has_passed() {
             "case {case:?}: the application must be STARTED before it can stop itself"
         );
 
-        // Seconds short of the span those idle minutes are served as: still running.
-        // (Short of it by seconds whatever the configuration asks for, so every row
-        // exercises the boundary rather than a point well inside it.)
+        // Short of the span those idle minutes are served as: still running. (Short of it
+        // by the same margin whatever the configuration asks for, so every row exercises
+        // the boundary rather than a point well inside it. The margin is generous: the
+        // case is which side of the configured span the read falls on, not how fast the
+        // host runs.)
         rewind_last_activity(
             &engine,
             &application_id,
-            idle_span(idle_minutes) - Duration::from_secs(3),
+            idle_span(idle_minutes) - Duration::from_secs(30),
         );
         assert_eq!(
             get_application(&router, &application_id)
@@ -903,7 +905,7 @@ async fn an_idle_application_stops_itself_once_its_idle_timeout_has_passed() {
         );
 
         // Past it: stopped by the service itself, if it is configured to.
-        rewind_last_activity(&engine, &application_id, Duration::from_secs(4));
+        rewind_last_activity(&engine, &application_id, Duration::from_secs(45));
         let observed = get_application(&router, &application_id).await;
         let expected = if stops { "STOPPED" } else { "STARTED" };
         assert_eq!(
@@ -1216,23 +1218,32 @@ async fn a_create_refusal_names_the_member_that_failed() {
     );
 }
 
-/// Move an application's recorded last activity `span` into the past, through the
-/// store the handlers share, so an idle span longer than any test can sit through has
-/// elapsed by the time the next request reads it.
-fn rewind_last_activity(engine: &engine::InMemoryEngine, application_id: &str, span: Duration) {
+/// Move an application's recorded last activity — and any transition the clock still owes
+/// it — `span` into the past, through the store the handlers share, so a read taken
+/// afterwards is the read of a client arriving that much later: an idle span longer than
+/// any test can sit through has elapsed by the time the next request reads it, and a start
+/// that was still settling has come up that long ago.
+pub(crate) fn rewind_last_activity(
+    engine: &engine::InMemoryEngine,
+    application_id: &str,
+    span: Duration,
+) {
     let state = engine.state::<ComAmazonawsEmrserverlessAwstoledowebserviceState>();
     let mut store = state.lock();
     let record = store
         .applications
         .get_mut(application_id)
         .expect("the application the test created is in the store");
+    if let Some(pending) = record.pending.as_mut() {
+        pending.due -= span;
+    }
     record.last_activity_at -= span;
 }
 
 /// Move a session's recorded idle instant — and the termination its own idle timeout
 /// owes it — `span` into the past, so the span the session's `idleTimeoutMinutes`
 /// bounds has elapsed by the time the next request reads it.
-fn rewind_session_idle_since(
+pub(crate) fn rewind_session_idle_since(
     engine: &engine::InMemoryEngine,
     application_id: &str,
     session_id: &str,

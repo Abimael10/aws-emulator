@@ -836,8 +836,8 @@ fn at_secs(value: aws_smithy_types::DateTime) -> i64 {
 /// due, measured from the instant the session became idle, and a session that asked for
 /// none is owed no termination however long nobody reads it.
 ///
-/// The smallest timeout the model admits (`@range(min: 0, max: 1000000)`) is one minute,
-/// which the emulator serves as a span of its own choosing, so the owed termination is
+/// The smallest timeout the model admits (`@range(min: 0, max: 1000000)`) past zero is
+/// one minute, which the emulator serves as that minute, so the owed termination is
 /// asserted against a synthetic clock over the stored record instead of being waited for;
 /// the HTTP-level tests above cover the same record's `STARTED` transition.
 #[test]
