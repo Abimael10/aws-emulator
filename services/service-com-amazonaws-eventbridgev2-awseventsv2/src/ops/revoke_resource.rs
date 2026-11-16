@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: withdraws a revocable resource stored in `crate::state` — an EventSource
+//! or a subscriber — by setting the flag both reads report as `Revoked`.
 //!
 //! ## Shape of an operation
 //!
@@ -91,10 +84,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `RevokeResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#RevokeResource")]
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation (`AWSEventsV2`'s `errors` list), so it is
+// the modelled answer when the engine cannot hand back this service's store, but
+// the scaffold generated the enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#RevokeResource",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum RevokeResourceErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
+    InternalException(InternalException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -150,18 +151,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeResource"))
+        // The resource is addressed by ARN, which carries its own region and
+        // account, so nothing here is read from the request's credential scope.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(RevokeResourceErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        state.settle_lifecycles(now);
+
+        // `RevocableResourceArn` admits exactly two resource types — a subscriber
+        // and an EventSource — and each registry is keyed by its resources' own
+        // ARNs, so at most one of the two holds the resource this call addresses.
+        if let Some(source) = state.event_sources.get_mut(&input.arn) {
+            // Revocation is terminal and `@idempotent`: the first call records
+            // the withdrawal, a repeat changes nothing — not even the resource's
+            // `LastModifiedTime`, because there is no second modification to
+            // report.
+            if !source.revoked {
+                source.revoked = true;
+                source.last_modified_time = now;
+            }
+            return Ok(RevokeResourceOutput {
+                arn: Some(source.arn.clone()),
+            });
+        }
+        if let Some(subscriber) = state.subscribers.get_mut(&input.arn) {
+            if !subscriber.revoked {
+                subscriber.revoked = true;
+                subscriber.last_modified_time = now;
+            }
+            return Ok(RevokeResourceOutput {
+                arn: Some(subscriber.arn.clone()),
+            });
+        }
+
+        Err(RevokeResourceErrorModeled::ResourceNotFoundException(
+            crate::state::revocable_resource_not_found(&input.arn),
+        )
+        .into())
     }
 }

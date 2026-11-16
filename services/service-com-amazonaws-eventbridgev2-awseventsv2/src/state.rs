@@ -519,6 +519,23 @@ pub fn event_bus_not_found(event_bus_arn: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` an operation addressing a REVOCABLE resource
+/// answers with when the store holds nothing at the requested ARN.
+///
+/// `RevocableResourceArn` admits exactly two resource types — a subscriber and an
+/// EventSource — and an ARN names which one it addresses in its resource-type
+/// segment, so the refusal names the kind of resource the caller asked about
+/// rather than a generic one. Each kind is worded by the one construction its
+/// own registry owns, so an operation reaching across both registries cannot
+/// word the refusal differently from the read of that resource.
+pub fn revocable_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    if ::service_common::arn::resource_type(arn) == Some(ARN_RESOURCE_TYPE_SUBSCRIBER) {
+        subscriber_not_found(arn)
+    } else {
+        event_source_not_found(arn)
+    }
+}
+
 /// The retention period a request asking for `requested` leaves the bus on: the
 /// `RetentionPeriodInDays` it named, or [`DEFAULT_RETENTION_PERIOD_IN_DAYS`] when
 /// it named none.

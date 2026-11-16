@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use super::{base36, spread, ARN_SERVICE, ComAmazonawsEventbridgev2Awseventsv2State};
 use crate::ops::types::{
     AwsServiceEventsSourceConfiguration, EventSourceConfiguration,
-    PartnerEventsSourceConfiguration,
+    PartnerEventsSourceConfiguration, ResourceNotFoundException,
 };
 
 /// The resource-type segment of an `EventSourceArn`, from the modelled pattern
@@ -201,6 +201,17 @@ impl HasOnFailure for PartnerEventsSourceConfiguration {
         self.on_failure_configuration
             .as_ref()
             .map(|config| config.arn.as_deref())
+    }
+}
+
+/// The `ResourceNotFoundException` every EventSource-addressed operation answers
+/// with when the store holds no source at the requested ARN.
+///
+/// ONE construction, so no two operations word the same refusal differently: a
+/// fixed sentence plus a single variable part, the ARN the request addressed.
+pub fn event_source_not_found(event_source_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("event source {event_source_arn} does not exist")),
     }
 }
 

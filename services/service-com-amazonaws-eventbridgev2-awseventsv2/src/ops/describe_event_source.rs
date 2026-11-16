@@ -187,12 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(source) = state.event_source(&input.event_source_arn) else {
             return Err(DescribeEventSourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "event source {} does not exist",
-                        input.event_source_arn
-                    )),
-                },
+                crate::state::event_source_not_found(&input.event_source_arn),
             )
             .into());
         };

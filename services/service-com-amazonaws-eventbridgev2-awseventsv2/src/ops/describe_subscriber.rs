@@ -197,9 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(subscriber) = state.subscriber(&input.subscriber_arn) else {
             return Err(DescribeSubscriberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("subscriber {} does not exist", input.subscriber_arn)),
-                },
+                crate::state::subscriber_not_found(&input.subscriber_arn),
             )
             .into());
         };

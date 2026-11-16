@@ -21,7 +21,8 @@ use std::time::SystemTime;
 use super::{base36, spread, ComAmazonawsEventbridgev2Awseventsv2State, StoredEvent, ARN_SERVICE};
 use crate::ops::types::{
     BatchConfiguration, Filter, FilterConfiguration, InvokeConfiguration, LogConfiguration,
-    OnFailureConfiguration, PointInTimeConfiguration, RetryPolicy, Transformer,
+    OnFailureConfiguration, PointInTimeConfiguration, ResourceNotFoundException, RetryPolicy,
+    Transformer,
 };
 
 /// The resource-type segment of a `SubscriberArn`, from the modelled pattern
@@ -717,6 +718,17 @@ fn to_event_time(at: SystemTime) -> String {
 pub struct DueDelivery {
     pub subscriber: Subscriber,
     pub events: Vec<StoredEvent>,
+}
+
+/// The `ResourceNotFoundException` every subscriber-addressed operation answers
+/// with when the store holds no subscriber at the requested ARN.
+///
+/// ONE construction, so no two operations word the same refusal differently: a
+/// fixed sentence plus a single variable part, the ARN the request addressed.
+pub fn subscriber_not_found(subscriber_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("subscriber {subscriber_arn} does not exist")),
+    }
 }
 
 impl ComAmazonawsEventbridgev2Awseventsv2State {

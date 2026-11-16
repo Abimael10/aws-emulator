@@ -25,6 +25,8 @@ mod event_source_lifecycle;
 mod put_events_entry_results;
 #[path = "all/resource_already_exists_wording.rs"]
 mod resource_already_exists_wording;
+#[path = "all/revoke_resource.rs"]
+mod revoke_resource;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscriber_delivery.rs"]
