@@ -27,6 +27,8 @@ mod modelled_input_refusal;
 mod put_events_entry_results;
 #[path = "all/resource_already_exists_wording.rs"]
 mod resource_already_exists_wording;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/revoke_resource.rs"]
 mod revoke_resource;
 #[path = "all/state_roundtrip.rs"]

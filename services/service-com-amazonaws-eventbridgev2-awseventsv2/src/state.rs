@@ -11,11 +11,13 @@
 //! The resources that hang off a bus live in their own modules, re-exported
 //! here so every handler reaches one store: [`event_sources`] holds the
 //! EventSource registry and [`subscribers`] the subscriber registry, whose
-//! deliveries are made by [`subscriber_delivery`].
+//! deliveries are made by [`subscriber_delivery`]. The `tags` module resolves
+//! one taggable ARN against all three registries, because tagging spans them.
 
 mod event_sources;
 pub mod subscriber_delivery;
 mod subscribers;
+mod tags;
 
 pub use event_sources::*;
 pub use subscribers::*;
