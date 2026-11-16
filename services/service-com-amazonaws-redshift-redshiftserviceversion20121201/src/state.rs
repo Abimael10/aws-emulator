@@ -1815,6 +1815,11 @@ pub enum PolicyResourceRefusal {
     /// Redshift resource policy — the modelled `UnsupportedOperationFault`,
     /// declared by all three resource-policy operations.
     UnsupportedResource(String),
+    /// The ARN names a resource of this service of a TYPE that carries no
+    /// resource policy ([`POLICY_RESOURCE_TYPE`]). The service models no error
+    /// for it: it is a fact about the parameter's value, so it is the up-front
+    /// parameter refusal, `InvalidParameterValue`.
+    UnsupportedResourceType(String),
     /// The ARN is this service's own and names a resource that does not exist,
     /// so there is no resource to attach a policy to, report one for or detach
     /// one from. The service models no error for it: this is the up-front
@@ -1824,12 +1829,15 @@ pub enum PolicyResourceRefusal {
 }
 
 /// Whether `resource_arn` names a resource an Amazon Redshift resource policy
-/// attaches to: an ARN ([`is_arn`]) of one of [`POLICY_RESOURCE_SERVICES`].
+/// attaches to: an ARN ([`is_arn`]) of one of [`POLICY_RESOURCE_SERVICES`],
+/// naming a resource of the one type a resource policy is attached to
+/// ([`POLICY_RESOURCE_TYPE`]).
 ///
-/// The ARN's SYNTAX and the service that owns the resource, which is as far as
-/// the value itself goes; whether that resource EXISTS is resolved against the
-/// control plane that owns it ([`resolve_policy_resource`]), which is what the
-/// three resource-policy operations call.
+/// The ARN's SYNTAX, the service that owns the resource and the TYPE of resource
+/// it names, which is as far as the value itself goes; whether that resource
+/// EXISTS is resolved against the control plane that owns it
+/// ([`resolve_policy_resource`]), which is what the three resource-policy
+/// operations call.
 pub fn check_policy_resource_arn(resource_arn: &str) -> Result<(), PolicyResourceRefusal> {
     if !is_arn(resource_arn) {
         return Err(PolicyResourceRefusal::NotAResource(
@@ -1841,6 +1849,16 @@ pub fn check_policy_resource_arn(resource_arn: &str) -> Result<(), PolicyResourc
         return Err(PolicyResourceRefusal::UnsupportedResource(format!(
             "{UNSUPPORTED_POLICY_RESOURCE} {resource_arn}"
         )));
+    }
+    // A resource policy is attached to a namespace, so every other type of
+    // resource either service publishes is refused on the strength of the type
+    // alone — before the resource is resolved and before any policy is
+    // attached, reported or detached.
+    let resource_type = arn_resource_type(resource_arn);
+    if resource_type != POLICY_RESOURCE_TYPE {
+        return Err(PolicyResourceRefusal::UnsupportedResourceType(
+            unsupported_policy_resource_type_message(resource_type),
+        ));
     }
     Ok(())
 }
@@ -1893,9 +1911,11 @@ pub async fn resolve_policy_resource<Eng: Send + Sync + 'static>(
     engine: &Eng,
     resource_arn: &str,
 ) -> Result<(), PolicyResourceRefusal> {
-    // The ARN's syntax and the service that owns the resource first: a value
-    // that is no ARN, or one of a service whose resources carry no Amazon
-    // Redshift resource policy, is already answered.
+    // The ARN's syntax, the service that owns the resource and the type of
+    // resource it names first: a value that is no ARN, one of a service whose
+    // resources carry no Amazon Redshift resource policy, and one naming a
+    // resource type no resource policy is attached to are each already
+    // answered.
     check_policy_resource_arn(resource_arn)?;
 
     if serverless::is_serverless_arn(resource_arn) {
@@ -1931,10 +1951,9 @@ pub async fn resolve_policy_resource<Eng: Send + Sync + 'static>(
         policy_resource_undecided(resource_arn, STORE_UNAVAILABLE);
         return Ok(());
     };
-    let region = request_region(ctx);
     let held = {
         let store = state.lock();
-        store.holds_policy_resource(resource_arn, &region)
+        store.holds_policy_resource(resource_arn)
     };
     if held {
         Ok(())
@@ -2345,6 +2364,18 @@ pub const NAMESPACE_REGISTERING: &str = "Registering";
 /// The registration status reported for a namespace a `DeregisterNamespace`
 /// call has just deregistered; same source as [`NAMESPACE_REGISTERING`].
 pub const NAMESPACE_DEREGISTERING: &str = "Deregistering";
+
+/// What `RegisterNamespace` answers for a provisioned cluster that is not in the
+/// state a registration is made from.
+///
+/// Registering a namespace is a capability of the cluster rather than a step a
+/// caller can retry into: Amazon Redshift refuses the call as one this cluster
+/// cannot serve — the 400 `InvalidParameterValue` it answers a request it cannot
+/// honour with — rather than as the transient cluster-state fault, so a client
+/// that tells a precondition it can wait out apart from one it cannot does not
+/// retry forever. The sentence is entirely fixed: it takes nothing from the
+/// request.
+pub const REGISTER_NAMESPACE_UNSUPPORTED: &str = "This cluster version doesn't support Register Namespace operation. Please upgrade to the latest cluster version.";
 
 /// Which namespace a registration request names: the namespace of a
 /// provisioned cluster, or a serverless namespace reached through one of its

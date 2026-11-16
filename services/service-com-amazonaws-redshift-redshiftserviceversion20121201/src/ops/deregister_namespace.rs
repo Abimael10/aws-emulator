@@ -6,10 +6,13 @@
 //! under way. The namespace has to EXIST, through the same resolution
 //! `RegisterNamespace` admits one by — this service's clusters for the provisioned arm,
 //! the Redshift Serverless control plane that owns the pair for the serverless arm
-//! (`crate::state::serverless`). The record this service stored for that pair leaves the
-//! store once the release falls due, so a namespace nothing registered cannot be
-//! released. The cluster of a provisioned namespace is being modified from this call
-//! until the change falls due, applied by the store's clock-owed settle.
+//! (`crate::state::serverless`) — but it does NOT have to be registered: a pair this
+//! service holds no registration for is already in the state the call asks for, so the
+//! call is accepted and releases nothing. The record this service stored for a pair it
+//! does hold leaves the store once the release falls due, and the cluster of a
+//! provisioned namespace is being modified from this call until the change falls due —
+//! whether or not a registration was there to release — applied by the store's
+//! clock-owed settle.
 //!
 //! ## Shape of an operation
 //!
@@ -156,9 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// A MUTATION, and the INVERSE of `RegisterNamespace`: the stored
     /// registration for that pair is reported `Deregistering` from this call
     /// and is gone a span later, applied by the store's clock-owed settle
-    /// rather than by this call. A pair this service holds no registration for
-    /// is a namespace there is nothing to release, which is the modelled
-    /// invalid-namespace refusal rather than a release of nothing.
+    /// rather than by this call. There is NO registration precondition: a pair
+    /// this service holds no registration for is already in the state the call
+    /// asks for, so the call is accepted and releases nothing — and the cluster
+    /// of a provisioned namespace takes the change either way.
     async fn handle(
         &self,
         input: Self::Input,
@@ -205,24 +209,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .registration_target(&input.namespace_identifier)
             .map_err(refused)?;
 
-        let Some(position) = store.namespace_registration_position(&namespace, &consumer_identifier)
-        else {
-            return Err(refused(st::NamespaceRefusal::InvalidNamespace(format!(
-                "The namespace of {} is not registered to consumer account {consumer_identifier}.",
-                namespace.described()
-            ))));
-        };
+        // A pair this service holds a registration for has it released; a pair
+        // it holds none for is a namespace already in the state the call asks
+        // for, so there is simply nothing to release. Either way the call is
+        // accepted: asking for a state a resource is already in is not a
+        // failure, which is what makes a teardown that runs twice, and a
+        // register/deregister toggle, work.
+        if let Some(position) =
+            store.namespace_registration_position(&namespace, &consumer_identifier)
+        {
+            let stored = &mut store.namespace_registrations[position];
+            stored.status = st::NAMESPACE_DEREGISTERING.to_string();
+            // The release is not instantaneous: the registration is gone a span
+            // from this call, so a caller acting straight afterwards still
+            // observes it leaving. The due instant is stored and nothing sleeps
+            // for it.
+            stored.removed_at = Some(started + st::NAMESPACE_REGISTRATION_SPAN);
+        }
 
-        let stored = &mut store.namespace_registrations[position];
-        stored.status = st::NAMESPACE_DEREGISTERING.to_string();
-        // The release is not instantaneous: the registration is gone a span
-        // from this call, so a caller acting straight afterwards still observes
-        // it leaving. The due instant is stored and nothing sleeps for it.
-        stored.removed_at = Some(started + st::NAMESPACE_REGISTRATION_SPAN);
-
-        // Releasing a provisioned cluster's namespace registration is a change
-        // to that cluster, exactly as making it is, so the cluster is being
-        // modified from this call until the change falls due.
+        // The call asks the CLUSTER of a provisioned namespace for the change
+        // whether or not a registration was there to release, exactly as making
+        // one does, so the cluster is being modified from this call until the
+        // change falls due — a client polling the cluster can tell the call
+        // reached the service apart from one that never did.
         store.begin_namespace_registration_change(&namespace, started);
 
         Ok(DeregisterNamespaceOutput {

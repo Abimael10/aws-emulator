@@ -175,10 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same resolution the write and the read use, so the three cannot
         // disagree about which ARN names a policy holder: a value that is no
-        // ARN, a resource of another service, and a Redshift resource that does
-        // not exist are each answered before any policy state is touched. A
-        // resource of another control plane is resolved over the in-process
-        // callback seam, so nothing here opens a socket.
+        // ARN, a resource of another service, a resource of a type no policy is
+        // attached to, and a Redshift resource that does not exist are each
+        // answered before any policy state is touched. A resource of another
+        // control plane is resolved over the in-process callback seam, so
+        // nothing here opens a socket.
         if let Err(refusal) = st::resolve_policy_resource(ctx, &*self.engine, &input.resource_arn).await
         {
             return Err(match refusal {
@@ -198,7 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into()
                 }
-                st::PolicyResourceRefusal::NoSuchResource(message) => {
+                st::PolicyResourceRefusal::UnsupportedResourceType(message)
+                | st::PolicyResourceRefusal::NoSuchResource(message) => {
                     crate::scaffolded::Scaffolded::invalid_parameter_value(message)
                 }
             });

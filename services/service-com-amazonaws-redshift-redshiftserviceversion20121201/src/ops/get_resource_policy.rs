@@ -3,8 +3,11 @@
 //! @op GetResourcePolicy
 //!
 //! Reports the resource policy attached to the resource the request's
-//! `ResourceArn` names — the document VERBATIM, exactly as the write that
-//! attached it sent it.
+//! `ResourceArn` names — the document the write attached, in the service's own
+//! canonical form.
+//!
+//! A resource policy is attached to a NAMESPACE, so an ARN naming any other
+//! resource type is refused rather than answered with a document.
 //!
 //! ## Shape of an operation
 //!
@@ -142,7 +145,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// A pure read: nothing here writes, and a resource carrying no policy has
     /// no document to report — the same refusal the write answers an ARN naming
-    /// nothing a policy attaches to with.
+    /// nothing a policy attaches to with. The document reported is the one the
+    /// write attached, in the service's canonical form.
     async fn handle(
         &self,
         input: Self::Input,
@@ -162,8 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The same resolution the write path uses, so the two cannot disagree
         // about which ARN names a policy holder: a value that is no ARN, a
-        // resource of another service, and a Redshift resource that does not
-        // exist are each answered before any policy state is read. A resource
+        // resource of another service, a resource of a type no policy is
+        // attached to, and a Redshift namespace that does not exist are each
+        // answered before any policy state is read. A resource
         // of another control plane is resolved over the in-process callback
         // seam, so this read opens no socket and writes nothing.
         if let Err(refusal) = st::resolve_policy_resource(ctx, &*self.engine, &input.resource_arn).await
@@ -183,7 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into()
                 }
-                st::PolicyResourceRefusal::NoSuchResource(message) => {
+                st::PolicyResourceRefusal::UnsupportedResourceType(message)
+                | st::PolicyResourceRefusal::NoSuchResource(message) => {
                     crate::scaffolded::Scaffolded::invalid_parameter_value(message)
                 }
             });

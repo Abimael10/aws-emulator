@@ -6,7 +6,10 @@
 //! namespace has to EXIST: the provisioned arm is resolved against this service's own
 //! clusters and the serverless arm against the Redshift Serverless control plane that
 //! owns the pair (`crate::state::serverless`), and a target that resolves to nothing is
-//! refused rather than recorded. The registration is then recorded in this service's
+//! refused rather than recorded. A provisioned cluster that is not available cannot
+//! serve the call at all, which is refused as a capability the cluster does not have
+//! (`crate::state::REGISTER_NAMESPACE_UNSUPPORTED`) rather than as a cluster-state
+//! fault. The registration is then recorded in this service's
 //! store, which is what makes a later `DeregisterNamespace` of the same pair a release
 //! of something rather than a release of nothing. The cluster of a provisioned namespace
 //! is being modified from this call until the change falls due, applied by the store's
@@ -249,12 +252,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled error this operation answers a namespace that can take no
-/// registration change with.
+/// The error this operation answers a namespace that can take no registration
+/// with.
 ///
-/// The three causes the store resolves are the three errors the model declares
-/// for this operation, so the mapping is total and `DeregisterNamespace` maps
-/// the same cause to the same error.
+/// Two of the three causes the store resolves map to the modelled error of the
+/// same name. The third — a provisioned cluster that is not in the state a
+/// registration is made from — is answered as a capability this cluster does
+/// not have ([`crate::state::REGISTER_NAMESPACE_UNSUPPORTED`]) rather than as
+/// the modelled cluster-state fault, so the refusal does not read as one a
+/// caller can retry into. That is the one classification this operation does
+/// not share with `DeregisterNamespace`, whose refusal names its own operation.
 fn refused(refusal: crate::state::NamespaceRefusal) -> RegisterNamespaceError {
     use crate::state::NamespaceRefusal as Refusal;
     match refusal {
@@ -263,10 +270,13 @@ fn refused(refusal: crate::state::NamespaceRefusal) -> RegisterNamespaceError {
                 message: Some(message),
             })
         }
-        Refusal::InvalidClusterState(message) => {
-            RegisterNamespaceErrorModeled::InvalidClusterStateFault(InvalidClusterStateFault {
-                message: Some(message),
-            })
+        // The sentence carries nothing from the request, so the cause's own
+        // message — which names the cluster and its state — is not what a
+        // client reads here.
+        Refusal::InvalidClusterState(_) => {
+            return crate::scaffolded::Scaffolded::invalid_parameter_value(
+                crate::state::REGISTER_NAMESPACE_UNSUPPORTED.to_string(),
+            );
         }
         Refusal::InvalidNamespace(message) => {
             RegisterNamespaceErrorModeled::InvalidNamespaceFault(InvalidNamespaceFault {

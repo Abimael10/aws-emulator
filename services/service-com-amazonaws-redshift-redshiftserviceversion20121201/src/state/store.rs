@@ -218,9 +218,11 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// that holds it — or why it can take no registration change.
     ///
     /// Half of the ONE precondition rule `RegisterNamespace` and
-    /// `DeregisterNamespace` share: a provisioned cluster's namespace can be
-    /// registered only while this account holds that cluster and the cluster is
-    /// [`STATUS_AVAILABLE`].
+    /// `DeregisterNamespace` share: a provisioned cluster's namespace can take a
+    /// registration change only while this account holds that cluster and the
+    /// cluster is [`STATUS_AVAILABLE`]. What each operation ANSWERS a cluster
+    /// that is not is its own (see `crate::ops::register_namespace`): the rule
+    /// is shared, the wording is per operation.
     ///
     /// The OTHER half is the serverless arm, whose namespace and workgroup live
     /// in the Redshift Serverless control plane — a DIFFERENT service with its
@@ -1499,16 +1501,17 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// names.
     ///
     /// A resource policy is attached to a resource, so the ARN has to identify
-    /// one that EXISTS before any policy state is read or written. The ARN is
-    /// matched exactly, the way [`Self::resource_slot`] matches a tag target and
-    /// [`Self::cluster_with_namespace_arn`] matches a zero-ETL target: against
-    /// the ARN each stored resource itself publishes, in the Region the request
-    /// was signed for. A cluster is reachable under either ARN it publishes — the
-    /// cluster's own and its namespace's — because a policy is attached to the
-    /// data (the namespace) as well as to the cluster serving it.
-    pub fn holds_policy_resource(&self, resource_arn: &str, region: &str) -> bool {
-        self.resource_slot(resource_arn, region).is_some()
-            || self.cluster_with_namespace_arn(resource_arn).is_some()
+    /// one that EXISTS before any policy state is read or written. The only
+    /// resource type a policy is attached to is a namespace
+    /// ([`POLICY_RESOURCE_TYPE`], which [`check_policy_resource_arn`] settles
+    /// before this is asked), and the namespace of this control plane is the one
+    /// holding a cluster's data: the ARN is matched against the namespace ARN
+    /// each stored cluster itself publishes, the way
+    /// [`Self::cluster_with_namespace_arn`] matches a zero-ETL target. That ARN
+    /// carries the Region the cluster was created in, so a cluster of this
+    /// account in another Region is no match.
+    pub fn holds_policy_resource(&self, resource_arn: &str) -> bool {
+        self.cluster_with_namespace_arn(resource_arn).is_some()
     }
 
     /// The policy document attached to the resource `resource_arn` names, or

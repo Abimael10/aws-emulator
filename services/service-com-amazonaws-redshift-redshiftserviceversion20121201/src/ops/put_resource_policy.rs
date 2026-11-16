@@ -6,9 +6,14 @@
 //! `ResourceArn` names, replacing whatever document that resource held, and
 //! reports the resource and the document now attached to it.
 //!
-//! The document is stored and reported back VERBATIM — the characters the
-//! request sent, never a re-rendering of the JSON they parse as — so a reader
-//! sees the same bytes the writer sent.
+//! A resource policy is attached to a NAMESPACE, so an ARN naming any other
+//! resource type is refused before anything is written.
+//!
+//! The document is held in the service's own canonical form
+//! ([`crate::state::canonical_resource_policy`]) — the characters the request
+//! sent, with a policy element written as a one-element list reported as the
+//! single value that list holds — so the write and every later read report one
+//! document.
 //!
 //! ## Shape of an operation
 //!
@@ -174,8 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which resource the policy is attached to is settled before the
         // document is read, so a request naming nothing a Redshift resource
         // policy attaches to — a value that is no ARN, a resource of another
-        // service, or a Redshift resource that does not exist — is refused
-        // without parsing what it carried and without attaching anything. A
+        // service, a resource of a type no policy is attached to, or a Redshift
+        // namespace that does not exist — is refused without parsing what it
+        // carried and without attaching anything. A
         // resource of another control plane is resolved over the same
         // in-process callback seam the notification publish uses, so nothing
         // here opens a socket or leaves the host.
@@ -196,7 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into()
                 }
-                st::PolicyResourceRefusal::NoSuchResource(message) => {
+                st::PolicyResourceRefusal::UnsupportedResourceType(message)
+                | st::PolicyResourceRefusal::NoSuchResource(message) => {
                     crate::scaffolded::Scaffolded::invalid_parameter_value(message)
                 }
             });
@@ -226,12 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.set_resource_policy(&input.resource_arn, input.policy.clone());
+        // What is held is the document in the service's canonical form, so the
+        // write and every later read report the same document: a document
+        // already canonical is held as the characters it arrived as.
+        let attached = st::canonical_resource_policy(&input.policy).unwrap_or(input.policy);
+        store.set_resource_policy(&input.resource_arn, attached.clone());
 
         Ok(PutResourcePolicyOutput {
             resource_policy: Some(ResourcePolicy {
                 resource_arn: Some(input.resource_arn),
-                policy: Some(input.policy),
+                policy: Some(attached),
             }),
         })
     }

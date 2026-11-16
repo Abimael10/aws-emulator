@@ -12,10 +12,11 @@
 //! The suite asserts the RULE rather than one recorded request: a registration
 //! of a namespace that exists is RECORDED against the (namespace, consumer
 //! account) pair and reported as under way, the same pair registered twice is
-//! one registration, the release of a pair the service holds a registration for
-//! is reported as under way and has happened once its span has passed, and a
-//! pair it holds none for — or a namespace that cannot take a registration
-//! change at all — is refused and changes nothing. The tables span what the
+//! one registration, the release of a pair is reported as under way — whether
+//! or not the service holds a registration for it, since a pair it holds none
+//! for is already in the state the release asks for — and has happened once its
+//! span has passed, and a namespace that cannot take a registration change at
+//! all is refused and changes nothing. The tables span what the
 //! rule generalises over: both arms of the modelled `NamespaceIdentifierUnion`,
 //! the identifiers inside each arm, the consumer account, and the states a
 //! registration change is refused in. A provisioned namespace's cluster is
@@ -339,15 +340,27 @@ async fn a_registration_is_recorded_reported_and_released() {
             "case {case}: expected the registration to be gone once the release fell due, got {:?}",
             stored(&emulator, &namespace)
         );
+        // Releasing what is already released is accepted: the namespace is in
+        // the state the call asks for, so the call reports the release as under
+        // way and there is simply nothing left to release.
         let nothing_left = deregister(&emulator, &namespace, consumer).await;
         assert_eq!(
-            (nothing_left.status, nothing_left.error_code()),
-            (400, Some("InvalidNamespaceFault".to_string())),
-            "case {case}: expected 400 InvalidNamespaceFault once nothing is registered, got {} / {:?} with body {}",
+            (nothing_left.status, nothing_left.text("Status")),
+            (200, Some(state::NAMESPACE_DEREGISTERING.to_string())),
+            "case {case}: expected 200 / Status={:?} once nothing is registered, got {} / {:?} with body {}",
+            state::NAMESPACE_DEREGISTERING,
             nothing_left.status,
-            nothing_left.error_code(),
+            nothing_left.text("Status"),
             nothing_left.body
         );
+        assert!(
+            stored(&emulator, &namespace).is_empty(),
+            "case {case}: expected a release of nothing to record nothing, got {:?}",
+            stored(&emulator, &namespace)
+        );
+        // That release asked the cluster for the change too, so the fresh
+        // registration below is admitted once it has fallen due.
+        settle(&emulator);
 
         // The namespace takes a fresh registration afterwards, so the walk is
         // repeatable rather than a one-shot transition.
@@ -410,13 +423,17 @@ async fn a_registration_is_held_per_consumer_account_and_per_namespace() {
     // to has nothing to release, and the accounts that hold it keep it.
     let stranger = deregister(&emulator, &cluster, "777766665555").await;
     assert_eq!(
-        (stranger.status, stranger.error_code()),
-        (400, Some("InvalidNamespaceFault".to_string())),
-        "case an account the namespace is not registered to: expected 400 InvalidNamespaceFault, got {} / {:?} with body {}",
+        (stranger.status, stranger.text("Status")),
+        (200, Some(state::NAMESPACE_DEREGISTERING.to_string())),
+        "case an account the namespace is not registered to: expected 200 / Status={:?}, got {} / {:?} with body {}",
+        state::NAMESPACE_DEREGISTERING,
         stranger.status,
-        stranger.error_code(),
+        stranger.text("Status"),
         stranger.body
     );
+    // That call asked the cluster for the change as well, so the release below
+    // is admitted once it has fallen due.
+    settle(&emulator);
     let released = deregister(&emulator, &cluster, "111122223333").await;
     assert_eq!(
         released.status, 200,
@@ -444,14 +461,19 @@ async fn a_registration_is_held_per_consumer_account_and_per_namespace() {
 }
 
 /// One row of the refusal table: the case name, the namespace the call names,
-/// the consumer account it names, and the status and error code BOTH
-/// registration operations must answer.
+/// the consumer account it names, and the status and error code
+/// `RegisterNamespace` and then `DeregisterNamespace` must answer.
+///
+/// The two expectations are per operation because one cause is classified per
+/// operation: a cluster that is not available cannot SERVE a registration at
+/// all, which the register answers as a capability refusal, while every other
+/// cause is the same for both.
 type RefusalCase = (
     &'static str,
     state::RegisteredNamespace,
     &'static str,
-    u16,
-    &'static str,
+    (u16, &'static str),
+    (u16, &'static str),
 );
 
 #[tokio::test]
@@ -468,9 +490,9 @@ async fn a_namespace_that_cannot_take_a_registration_change_is_refused() {
         created.status, created.body
     );
 
-    // The refusal's message is this pair of operations' own template with the
-    // identifier interpolated from the request, so a client reading the text
-    // learns which cluster it named.
+    // A cluster that is not available cannot serve a registration at all, so
+    // the register answers the fixed capability sentence — which takes nothing
+    // from the request.
     let in_progress = register(
         &emulator,
         &provisioned("register-provisioning"),
@@ -479,8 +501,22 @@ async fn a_namespace_that_cannot_take_a_registration_change_is_refused() {
     .await;
     assert_eq!(
         in_progress.text("Message").as_deref(),
+        Some(state::REGISTER_NAMESPACE_UNSUPPORTED),
+        "case a cluster still being provisioned: expected the capability sentence, got {:?}",
+        in_progress.text("Message")
+    );
+    // The release of that cluster's namespace answers its own modelled
+    // cluster-state fault, whose message names the cluster the request carried.
+    let in_progress = deregister(
+        &emulator,
+        &provisioned("register-provisioning"),
+        "111122223333",
+    )
+    .await;
+    assert_eq!(
+        in_progress.text("Message").as_deref(),
         Some("Cluster register-provisioning is not in available state."),
-        "case a cluster still being provisioned: expected the message to name the cluster, got {:?}",
+        "case a cluster still being provisioned, released: expected the message to name the cluster, got {:?}",
         in_progress.text("Message")
     );
 
@@ -489,15 +525,15 @@ async fn a_namespace_that_cannot_take_a_registration_change_is_refused() {
             "a cluster identifier nothing created",
             provisioned("no-such-cluster"),
             "111122223333",
-            404,
-            "ClusterNotFound",
+            (404, "ClusterNotFound"),
+            (404, "ClusterNotFound"),
         ),
         (
             "another cluster identifier nothing created",
             provisioned("register-provisioning-2"),
             "111122223333",
-            404,
-            "ClusterNotFound",
+            (404, "ClusterNotFound"),
+            (404, "ClusterNotFound"),
         ),
         (
             "the longest cluster identifier the rule admits, naming nothing",
@@ -510,55 +546,58 @@ async fn a_namespace_that_cannot_take_a_registration_change_is_refused() {
                     .collect(),
             },
             "111122223333",
-            404,
-            "ClusterNotFound",
+            (404, "ClusterNotFound"),
+            (404, "ClusterNotFound"),
         ),
         (
             "a cluster still being provisioned",
             provisioned("register-provisioning"),
             "111122223333",
-            400,
-            "InvalidClusterState",
+            (400, "InvalidParameterValue"),
+            (400, "InvalidClusterState"),
         ),
         (
             "a serverless identifier carrying no namespace",
             serverless("", "register-wg"),
             "111122223333",
-            400,
-            "InvalidNamespaceFault",
+            (400, "InvalidNamespaceFault"),
+            (400, "InvalidNamespaceFault"),
         ),
         (
             "a serverless identifier carrying no workgroup",
             serverless("register-ns", "   "),
             "111122223333",
-            400,
-            "InvalidNamespaceFault",
+            (400, "InvalidNamespaceFault"),
+            (400, "InvalidNamespaceFault"),
         ),
         (
             "a consumer identifier shorter than an account id",
             serverless("register-ns", "register-wg"),
             "12345",
-            400,
-            "InvalidParameterValue",
+            (400, "InvalidParameterValue"),
+            (400, "InvalidParameterValue"),
         ),
         (
             "a consumer identifier of the right length but not all digits",
             serverless("register-ns", "register-wg"),
             "12345678901a",
-            400,
-            "InvalidParameterValue",
+            (400, "InvalidParameterValue"),
+            (400, "InvalidParameterValue"),
         ),
         (
             "a consumer identifier given as an ARN",
             serverless("register-ns", "register-wg"),
             "arn:aws:iam::123456789012:root",
-            400,
-            "InvalidParameterValue",
+            (400, "InvalidParameterValue"),
+            (400, "InvalidParameterValue"),
         ),
     ];
 
-    for (case, namespace, consumer, status, code) in cases {
-        for action in ["RegisterNamespace", "DeregisterNamespace"] {
+    for (case, namespace, consumer, registering, deregistering) in cases {
+        for (action, (status, code)) in [
+            ("RegisterNamespace", registering),
+            ("DeregisterNamespace", deregistering),
+        ] {
             let refused = call(&emulator, action, &namespace, consumer).await;
             assert_eq!(
                 (refused.status, refused.error_code()),

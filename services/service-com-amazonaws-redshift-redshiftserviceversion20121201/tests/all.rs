@@ -127,6 +127,8 @@ mod modify_snapshot_schedule;
 mod multi_az_secondary;
 #[path = "all/namespace_registration.rs"]
 mod namespace_registration;
+#[path = "all/namespace_registration_preconditions.rs"]
+mod namespace_registration_preconditions;
 #[path = "all/namespace_registration_serverless.rs"]
 mod namespace_registration_serverless;
 #[path = "all/node_configuration_options.rs"]
@@ -153,6 +155,8 @@ mod refusal_message_templates;
 mod refusal_payloads_use_aws_wording;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_policy_namespace_only.rs"]
+mod resource_policy_namespace_only;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/reserved_node_exchange.rs"]

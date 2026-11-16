@@ -8,15 +8,19 @@
 //! form-urlencoded deserialize -> handler -> XML serialize.
 //!
 //! The suite asserts RULES over tables of inputs rather than one recorded
-//! request: a policy is held against the ARN it was attached to and reported
-//! back VERBATIM, whatever the shape of the document and whichever Redshift
-//! resource the ARN names; a second write to one resource REPLACING the document
-//! it held and leaving every other resource's where it was; a delete making the
+//! request: a policy is held against the namespace ARN it was attached to and
+//! reported back as the document the write attached, whatever the shape of that
+//! document; a second write to one namespace REPLACING the document it held and
+//! leaving every other namespace's where it was; a delete making the
 //! policy absent from a later read and freeing nothing else; a document that is
 //! not a JSON policy document, or larger than this service holds under one
 //! resource, being refused with nothing written; and an ARN that names no
-//! resource, a resource of another service, or a Redshift resource that does not
-//! exist, being refused by the write, the read and the delete alike.
+//! resource, a resource of another service, or a Redshift namespace that does
+//! not exist, being refused by the write, the read and the delete alike.
+//!
+//! Which resource TYPES carry a resource policy at all, and the canonical form
+//! the service reports a document in, are
+//! [`crate::resource_policy_namespace_only`].
 //!
 //! Tables rather than a generated corpus, for the reason the crate's
 //! `Cargo.toml` records: a property-based generator would add an entry to the
@@ -31,7 +35,7 @@ use crate::cluster_lifecycle::{Answer, Emulator, REGION};
 /// Create one provisioned cluster, so the ARNs a row carries for it identify a
 /// resource this account holds: a resource policy is attached TO a resource,
 /// and an ARN that identifies none is refused by all three operations.
-async fn seed_cluster(emulator: &Emulator, identifier: &str) {
+pub(crate) async fn seed_cluster(emulator: &Emulator, identifier: &str) {
     let created = emulator.create_minimal(identifier).await;
     assert_eq!(
         created.status, 200,
@@ -46,7 +50,7 @@ async fn seed_cluster(emulator: &Emulator, identifier: &str) {
 /// `CreateClusterSnapshot` takes a cluster that has finished provisioning, and
 /// what these rows need is only that the snapshot ARN they carry identifies a
 /// snapshot this account holds.
-fn seed_snapshot(emulator: &Emulator, cluster: &str, snapshot: &str) {
+pub(crate) fn seed_snapshot(emulator: &Emulator, cluster: &str, snapshot: &str) {
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");
     let mut store = store.lock();
     store.snapshots.push(state::StoredSnapshot {
@@ -67,7 +71,7 @@ fn seed_snapshot(emulator: &Emulator, cluster: &str, snapshot: &str) {
 }
 
 /// `PutResourcePolicy` with one ARN and one document.
-async fn put(emulator: &Emulator, resource_arn: &str, policy: &str) -> Answer {
+pub(crate) async fn put(emulator: &Emulator, resource_arn: &str, policy: &str) -> Answer {
     emulator
         .call(
             "PutResourcePolicy",
@@ -77,14 +81,14 @@ async fn put(emulator: &Emulator, resource_arn: &str, policy: &str) -> Answer {
 }
 
 /// `GetResourcePolicy` for one ARN.
-async fn get(emulator: &Emulator, resource_arn: &str) -> Answer {
+pub(crate) async fn get(emulator: &Emulator, resource_arn: &str) -> Answer {
     emulator
         .call("GetResourcePolicy", &[("ResourceArn", resource_arn)])
         .await
 }
 
 /// `DeleteResourcePolicy` for one ARN.
-async fn delete(emulator: &Emulator, resource_arn: &str) -> Answer {
+pub(crate) async fn delete(emulator: &Emulator, resource_arn: &str) -> Answer {
     emulator
         .call("DeleteResourcePolicy", &[("ResourceArn", resource_arn)])
         .await
@@ -92,21 +96,21 @@ async fn delete(emulator: &Emulator, resource_arn: &str) -> Answer {
 
 /// The document the store holds against one ARN, read straight from this
 /// service's state rather than from a response.
-fn stored_policy(emulator: &Emulator, resource_arn: &str) -> Option<String> {
+pub(crate) fn stored_policy(emulator: &Emulator, resource_arn: &str) -> Option<String> {
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");
     let store = store.lock();
     store.resource_policy(resource_arn).map(str::to_string)
 }
 
 /// Every ARN the store holds a policy against.
-fn stored_arns(emulator: &Emulator) -> Vec<String> {
+pub(crate) fn stored_arns(emulator: &Emulator) -> Vec<String> {
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");
     let store = store.lock();
     store.resource_policies.keys().cloned().collect()
 }
 
 /// Assert one refusal row: the answer's status and `<Code>`.
-fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
     assert_eq!(
         answer.status, status,
         "case {case}: expected status {status}, got {} with body {}",
@@ -123,13 +127,13 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 
 /// The ARN of a Redshift Serverless namespace, the resource the published
 /// zero-ETL authorization workflow attaches a policy to.
-fn serverless_namespace_arn(uuid: &str) -> String {
+pub(crate) fn serverless_namespace_arn(uuid: &str) -> String {
     format!("arn:aws:redshift-serverless:{REGION}:000000000000:namespace/{uuid}")
 }
 
 /// A JSON policy document whose `Sid` is `sid`, so two rows of a table differ in
 /// the document they carry without differing in its form.
-fn policy_with_sid(sid: &str) -> String {
+pub(crate) fn policy_with_sid(sid: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Principal":{{"Service":"redshift.amazonaws.com"}},"Action":"redshift:CreateInboundIntegration","Resource":"*"}}]}}"#
     )
@@ -160,12 +164,17 @@ struct PolicyCase {
 }
 
 /// The round-trip table: rows differing along everything the rule generalises
-/// over — the Redshift resource the ARN names (a serverless namespace, a
-/// provisioned cluster's namespace, a cluster, a snapshot, a resource portion
-/// using `/` and one using `:`) and the shape of the document (an empty object,
-/// one statement, several statements, a nested condition, text needing XML
-/// escaping, non-ASCII text, a pretty-printed document whose whitespace is part
-/// of its bytes, and a document at this service's size bound).
+/// over — the namespace the ARN names (a serverless namespace, a provisioned
+/// cluster's namespace, a resource portion using `/` and one using `:`) and the
+/// shape of the document (an empty object, one statement, several statements, a
+/// nested condition, text needing XML escaping, non-ASCII text, a
+/// pretty-printed document whose whitespace is part of its bytes, and a
+/// document at this service's size bound).
+///
+/// Every document here is already in the service's canonical form, so what it
+/// reports back is the very characters the write sent; the collapse the service
+/// applies to a document that is not is
+/// [`crate::resource_policy_namespace_only`].
 fn round_trip_table() -> Vec<PolicyCase> {
     vec![
         PolicyCase {
@@ -184,13 +193,13 @@ fn round_trip_table() -> Vec<PolicyCase> {
             policy: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"000000000000"},"Action":"redshift:AuthorizeDataShare","Resource":"*"},{"Effect":"Deny","Principal":"*","Action":"redshift:DeauthorizeDataShare","Resource":"*"}]}"#.to_string(),
         },
         PolicyCase {
-            case: "a nested condition on a cluster",
-            resource_arn: state::cluster_arn("policy-holder", REGION),
+            case: "a nested condition on another cluster's namespace",
+            resource_arn: state::namespace_arn("policy-holder-two", REGION),
             policy: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"glue.amazonaws.com"},"Action":"redshift:GetClusterCredentials","Resource":"*","Condition":{"StringEquals":{"aws:SourceAccount":"000000000000"},"Null":{"aws:SourceArn":"false"}}}]}"#.to_string(),
         },
         PolicyCase {
-            case: "text needing XML escaping on a snapshot",
-            resource_arn: state::snapshot_arn("policy-holder", "snap-1", REGION),
+            case: "text needing XML escaping",
+            resource_arn: serverless_namespace_arn("3b9b6a0e-6f34-4f5d-9f0f-9a8d0a1f0c21"),
             policy: r#"{"Sid":"a <b> & 'c' \"d\"","Statement":[]}"#.to_string(),
         },
         PolicyCase {
@@ -212,13 +221,13 @@ fn round_trip_table() -> Vec<PolicyCase> {
     ]
 }
 
-/// The document a write attaches is reported back verbatim, by the write itself
-/// and by a later read, and is held against the ARN the write named.
+/// The document a write attaches is reported back by the write itself and by a
+/// later read, and is held against the ARN the write named.
 #[tokio::test]
 async fn a_put_policy_is_reported_back_verbatim_by_the_put_and_by_a_later_get() {
     let emulator = Emulator::new();
     seed_cluster(&emulator, "policy-holder").await;
-    seed_snapshot(&emulator, "policy-holder", "snap-1");
+    seed_cluster(&emulator, "policy-holder-two").await;
 
     for row in round_trip_table() {
         let written = put(&emulator, &row.resource_arn, &row.policy).await;
@@ -367,7 +376,7 @@ async fn a_delete_detaches_the_policy_of_that_resource_alone() {
     let holders = [
         serverless_namespace_arn("5533bed2-5c89-4049-91c3-77252462b84d"),
         state::namespace_arn("second-holder", REGION),
-        state::cluster_arn("third-holder", REGION),
+        state::namespace_arn("third-holder", REGION),
     ];
 
     for holder in &holders {
@@ -572,38 +581,28 @@ async fn an_arn_naming_no_policy_holder_is_refused_by_every_resource_policy_oper
         );
     }
 
-    // A well-formed Redshift ARN whose resource does not exist identifies no
-    // policy holder either: the up-front parameter refusal,
+    // A well-formed Redshift namespace ARN whose namespace does not exist
+    // identifies no policy holder either: the up-front parameter refusal,
     // `InvalidParameterValue`, decided before any policy state is touched. The
-    // rows span the resource types an account's ARNs name — a datashare of a
-    // namespace nothing created, a cluster, a cluster's namespace, a snapshot of
-    // a cluster that exists and one of a cluster that does not.
+    // rows span the ways a namespace ARN of either service resolves to nothing —
+    // the namespace of a cluster nothing created, a namespace of this account in
+    // another Region, and a namespace portion written with each separator.
     let unresolvable = [
-        (
-            "a datashare of a namespace nothing created",
-            format!(
-                "arn:aws:redshift:{REGION}:000000000000:datashare:3fd3f0cf-11bd-4fd0-9c4b-1c0f2c4b1a4f/sales"
-            ),
-        ),
-        (
-            "a cluster nothing created",
-            state::cluster_arn("no-such-cluster", REGION),
-        ),
         (
             "the namespace of a cluster nothing created",
             state::namespace_arn("no-such-cluster", REGION),
         ),
         (
-            "a snapshot nothing took of a cluster that exists",
-            state::snapshot_arn("policy-holder", "no-such-snapshot", REGION),
+            "the namespace of another cluster nothing created",
+            state::namespace_arn("no-such-cluster-either", REGION),
         ),
         (
-            "a snapshot of a cluster nothing created",
-            state::snapshot_arn("no-such-cluster", "snap-1", REGION),
+            "a namespace of this account in another Region",
+            state::namespace_arn("policy-holder", "eu-west-1"),
         ),
         (
-            "a cluster of this account in another Region",
-            state::cluster_arn("policy-holder", "eu-west-1"),
+            "a namespace portion written with a slash, naming nothing",
+            format!("arn:aws:redshift:{REGION}:000000000000:namespace/3fd3f0cf-11bd-4fd0-9c4b-1c0f2c4b1a4f"),
         ),
     ];
     for (case, resource_arn) in &unresolvable {
@@ -640,12 +639,9 @@ async fn an_arn_naming_no_policy_holder_is_refused_by_every_resource_policy_oper
 async fn a_resource_that_carries_no_policy_has_none_to_report_or_detach() {
     let emulator = Emulator::new();
     seed_cluster(&emulator, "never-written").await;
-    seed_snapshot(&emulator, "never-written", "snap-1");
     let unwritten = [
         serverless_namespace_arn("00000000-1111-2222-3333-444444444444"),
         state::namespace_arn("never-written", REGION),
-        state::cluster_arn("never-written", REGION),
-        state::snapshot_arn("never-written", "snap-1", REGION),
     ];
 
     for resource_arn in &unwritten {

@@ -19,7 +19,13 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# A resource policy is held in the service's own canonical form, which keeps the
+# document's own member ORDER (`state::canonical_resource_policy`); the feature
+# is what makes `serde_json`'s object map an insertion-ordered one rather than a
+# sorted one, in a build of this crate alone as well as in a build of the
+# workspace. Features are additive and are not recorded in Cargo.lock, so this
+# adds no locked package.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 # Stable, content-addressed derivation of a cluster's endpoint host token and
 # namespace id (never a per-run value), and of the per-response correlation id the

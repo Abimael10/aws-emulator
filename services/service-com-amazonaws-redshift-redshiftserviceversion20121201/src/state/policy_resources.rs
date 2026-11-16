@@ -8,6 +8,11 @@
 //! [`super::resolve_policy_resource`], so one file holds the whole decision
 //! about which ARN names a policy holder — and the only thing split out here is
 //! the wording, which the write, the read and the delete all answer with.
+//!
+//! This file also holds the two other things that are about the DOCUMENT and
+//! the resource TYPE rather than about a single operation: which resource type
+//! carries a resource policy at all ([`POLICY_RESOURCE_TYPE`]), and the
+//! canonical form of a policy document ([`canonical_resource_policy`]).
 
 /// Why a resource-policy request's `ResourceArn` names no resource a policy can
 /// be attached to, naming the ARN the request carried.
@@ -33,4 +38,160 @@ pub(super) fn policy_resource_undecided(resource_arn: &str, reason: &str) {
         reason = %reason,
         "the resource a resource-policy request names could not be resolved"
     );
+}
+
+/// The ONE resource type an Amazon Redshift resource policy is attached to: a
+/// namespace, the resource that holds the data a policy shares.
+///
+/// A namespace is the resource type both arms of
+/// [`super::POLICY_RESOURCE_SERVICES`] publish under this name — the
+/// provisioned control plane as `namespace:<uuid>` ([`super::namespace_arn`])
+/// and Redshift Serverless as `namespace/<id>` — and no other type of either
+/// service carries a resource policy.
+pub const POLICY_RESOURCE_TYPE: &str = "namespace";
+
+/// The resource TYPE an ARN names: the first component of its resource portion,
+/// whether that portion is written `<type>:<id>` or `<type>/<id>`.
+///
+/// Both separators are in use across AWS, and Amazon Redshift itself publishes
+/// ARNs in both forms, so the type is read up to whichever comes first. A value
+/// whose resource portion is missing names no type and reads as empty.
+pub fn arn_resource_type(resource_arn: &str) -> &str {
+    let portion = resource_arn.split(':').nth(5).unwrap_or_default();
+    portion.split(['/', ':']).next().unwrap_or(portion)
+}
+
+/// Why a resource-policy request naming a resource of a type that carries no
+/// resource policy is refused, naming the type it carried.
+///
+/// A resource policy is attached to a namespace ([`POLICY_RESOURCE_TYPE`]), so a
+/// request naming any other type of this service's resources — a cluster, a
+/// snapshot, a datashare — is refused on the strength of the TYPE alone, before
+/// the resource it names is resolved and before any policy is attached, read or
+/// detached. The sentence's only variable part is the type read from the
+/// request's own `ResourceArn` ([`arn_resource_type`]).
+pub fn unsupported_policy_resource_type_message(resource_type: &str) -> String {
+    format!(
+        "Resource type {resource_type} isn't supported for the resource policy. Choose another resource type."
+    )
+}
+
+/// The policy-document members whose value is either one value or a LIST of
+/// values, and which a canonical document therefore writes as the one value
+/// when the list holds exactly one.
+///
+/// Source: the IAM JSON policy grammar, whose `Principal`, `Action` and
+/// `Resource` elements (and their `Not…` counterparts) each take "a value or a
+/// list of values" — the same reading
+/// [`service_common::iam_policy::canonical_document`] renders by. No other
+/// element of the grammar has that form.
+const SINGLE_OR_LIST_POLICY_MEMBERS: [&str; 6] = [
+    "Action",
+    "NotAction",
+    "Resource",
+    "NotResource",
+    "Principal",
+    "NotPrincipal",
+];
+
+/// The policy-document members whose value is a map of CALLER-CHOSEN keys, which
+/// a canonical document leaves exactly as it was written.
+///
+/// A condition block's keys and values are the caller's own vocabulary, not
+/// policy-grammar elements, so nothing inside one is rewritten even where a key
+/// happens to spell a grammar element.
+const OPAQUE_POLICY_MEMBERS: [&str; 1] = ["Condition"];
+
+/// The members a `Principal` map is written with, each of which takes one value
+/// or a list of values in the same way the enclosing element does.
+///
+/// Source: the IAM JSON policy grammar's `Principal` element, written as
+/// `{"<type>": "<identifier>"}` or `{"<type>": ["<identifier>", …]}`.
+const PRINCIPAL_MEMBERS: [&str; 2] = ["Principal", "NotPrincipal"];
+
+/// The canonical form of one resource-policy document, or `None` when the
+/// document is already canonical (or is no JSON document at all).
+///
+/// The service reports the policy it holds in ITS canonical form rather than
+/// the characters a write happened to send: a `Principal`, `Action` or
+/// `Resource` written as a one-element list is reported as the single value that
+/// list holds, while a list of several values stays a list. Everything else —
+/// every other member, the order they were written in, every condition key and
+/// value, and every non-ASCII character in any of them — is the document's own
+/// and is carried through unchanged, so canonicalizing twice changes nothing.
+///
+/// The one CLAUSE this shares with the policy rendering
+/// [`service_common::iam_policy::canonical_document`] states for the services
+/// whose reads show it is that collapse; the rest of that rendering — IAM's own
+/// indentation and key separators — is not applied here, because no read of this
+/// service reports a layout other than the one the document was written in.
+///
+/// `None` says there was nothing to canonicalize, which is what lets a document
+/// already in canonical form be reported as the very characters it arrived as.
+///
+/// The walk descends only as deep as the document nests, which the parser's own
+/// nesting limit bounds and the length check a write makes before it gets here
+/// ([`super::check_resource_policy`]) bounds again — so a document a caller
+/// sends cannot drive it without end.
+pub fn canonical_resource_policy(policy: &str) -> Option<String> {
+    let mut document: serde_json::Value = serde_json::from_str(policy).ok()?;
+    if !canonicalize_policy_value(&mut document) {
+        return None;
+    }
+    serde_json::to_string(&document).ok()
+}
+
+/// Rewrite every single-or-list policy member of `value` and of the documents
+/// nested in it to its canonical form, and report whether anything changed.
+fn canonicalize_policy_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(members) => {
+            let mut changed = false;
+            for (name, member) in members.iter_mut() {
+                if OPAQUE_POLICY_MEMBERS.contains(&name.as_str()) {
+                    continue;
+                }
+                if !SINGLE_OR_LIST_POLICY_MEMBERS.contains(&name.as_str()) {
+                    changed |= canonicalize_policy_value(member);
+                    continue;
+                }
+                changed |= collapse_single_element_list(member);
+                // A `Principal` map's members carry identifiers the same way
+                // the element itself does, so each of them collapses too.
+                if PRINCIPAL_MEMBERS.contains(&name.as_str()) {
+                    if let serde_json::Value::Object(by_type) = member {
+                        for (_, identifiers) in by_type.iter_mut() {
+                            changed |= collapse_single_element_list(identifiers);
+                        }
+                    }
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(canonicalize_policy_value)
+            .fold(false, |changed, item| changed | item),
+        _ => false,
+    }
+}
+
+/// Rewrite a one-element list of one value as that value, and report whether it
+/// did.
+///
+/// Only a list of exactly one VALUE collapses: a list of several values is what
+/// the document means, and a one-element list holding a structure is not a value
+/// a policy element is written as.
+fn collapse_single_element_list(value: &mut serde_json::Value) -> bool {
+    let serde_json::Value::Array(items) = value else {
+        return false;
+    };
+    let [only] = items.as_slice() else {
+        return false;
+    };
+    if !only.is_string() {
+        return false;
+    }
+    *value = only.clone();
+    true
 }
