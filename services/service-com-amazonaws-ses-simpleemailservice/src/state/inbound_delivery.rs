@@ -29,6 +29,12 @@
 //!   envelope ([`super::s3_encryption_envelope`]) rather than the message in the clear.
 //! * `AddHeaderAction` "adds a header to the received email", which the actions after it
 //!   therefore act on.
+//! * `LambdaAction` "calls an Amazon Web Services Lambda function": the function the action
+//!   names is invoked once for the received message, with the invocation type the action
+//!   carries — "a value of `Event` means that the function is invoked asynchronously" — and the
+//!   documented Amazon SES receipt event as its payload
+//!   ([`super::lambda_action_event`]), so a handler is handed the message's own `mail`
+//!   envelope, the `receipt` of it and the action that called it.
 //!
 //! And before the actions of a rule whose `ScanEnabled` is set — "if true, then messages that
 //! this receipt rule applies to are scanned for spam and viruses" — the results of the sender
@@ -36,14 +42,15 @@
 //! ([`super::received_scan`]), so the actions of that rule act on a message carrying them.
 //!
 //! Every other action addresses a resource this module does not act on (a bounce sent back to
-//! the sender, a Lambda function, an Amazon SNS notification, a WorkMail organization, an
-//! Amazon Connect instance); nothing here reports one of them as carried out.
+//! the sender, an Amazon SNS notification, a WorkMail organization, an Amazon Connect
+//! instance); nothing here reports one of them as carried out.
 //!
-//! The write is made the way the framework documents a handler reaching another emulated
+//! Each call is made the way the framework documents a handler reaching another emulated
 //! service ([`smithy_server_runtime::OperationContext::callback`]): the AWS SDK driven over
-//! the emulator's own in-process transport ([`::service_common::s3_client`]), so nothing here
-//! opens a socket or leaves the host. The destination is a bucket NAME and an object key, both
-//! resolved by this same emulator's own object store, and the only part of the client's
+//! the emulator's own in-process transport ([`::service_common::s3_client`],
+//! [`super::receipt_destinations::lambda_client`]), so nothing here opens a socket or leaves
+//! the host. The destination is a bucket NAME and an object key, or a function ARN, each
+//! resolved by this same emulator's own services, and the only part of the client's
 //! addressing a request contributes is the signing Region, which is a Region LABEL by the time
 //! it reaches here ([`super::region_from_request`]) — so no text of a request can steer where
 //! a received message goes. A delivery that cannot be made leaves a line for an operator and
@@ -99,6 +106,21 @@ pub enum ReceiptStep {
         /// `S3Action$KmsKeyArn`, when the action names a key to encrypt the message under.
         kms_key_arn: Option<String>,
     },
+    /// `LambdaAction`: hand the received message to the function the action names.
+    Invoke {
+        /// `LambdaAction$FunctionArn`.
+        function_arn: String,
+        /// `LambdaAction$InvocationType`, which a stored rule always carries
+        /// ([`super::DEFAULT_LAMBDA_ACTION_INVOCATION_TYPE`] for an action that named none).
+        invocation_type: String,
+        /// `LambdaAction$TopicArn`, when the action names a topic beside the function.
+        topic_arn: Option<String>,
+        /// The recipients of this message the invoking rule applied to, which is what the
+        /// event's receipt reports as the matched recipients.
+        recipients: Vec<String>,
+        /// The verdicts of the checks made on this message, which that receipt carries.
+        verdicts: super::received_scan::Verdicts,
+    },
 }
 
 /// The message this account has just ACCEPTED, as the receive path reads it.
@@ -119,6 +141,9 @@ pub struct AcceptedMessage<'a> {
     pub envelope_from: &'a str,
     /// The domain the message's `From` field claims, which DMARC alignment is about.
     pub from_domain: &'a str,
+    /// The instant the message was accepted, which is what a received message's own event is
+    /// stamped with and what its processing time is measured from.
+    pub accepted_at: ::std::time::SystemTime,
 }
 
 /// A message this account has accepted, as Amazon SES SENDS it, together with what the account's
@@ -141,6 +166,8 @@ pub struct Accepted {
     envelope_from: String,
     /// The domain the message's `From` field claims.
     from_domain: String,
+    /// The instant the message was accepted.
+    accepted_at: ::std::time::SystemTime,
     /// What the active rule set does with the message, in evaluation order.
     steps: Vec<ReceiptStep>,
 }
@@ -195,6 +222,7 @@ pub fn accepted(
             recipients: recipients.to_vec(),
             envelope_from,
             from_domain,
+            accepted_at: sent_at,
             steps: Vec::new(),
         };
     }
@@ -210,6 +238,7 @@ pub fn accepted(
             raw: &message,
             envelope_from: &envelope_from,
             from_domain: &from_domain,
+            accepted_at: sent_at,
         },
     );
     Accepted {
@@ -218,6 +247,7 @@ pub fn accepted(
         recipients: recipients.to_vec(),
         envelope_from,
         from_domain,
+        accepted_at: sent_at,
         steps,
     }
 }
@@ -240,6 +270,7 @@ pub fn deliver_accepted(
             raw: &accepted.message,
             envelope_from: &accepted.envelope_from,
             from_domain: &accepted.from_domain,
+            accepted_at: accepted.accepted_at,
         },
         &accepted.steps,
     );
@@ -305,15 +336,23 @@ pub fn receipt_steps(
     // active set ask for the scan, and that one reading is what each of those rules stamps.
     // Reading them per rule would multiply message-sized work by the size of the rule set.
     let mut scanned: Option<Vec<(String, String)>> = None;
+    // The verdicts of those same checks, read once per message for the same reason and carried
+    // by every invocation this message drives ([`super::lambda_action_event`]).
+    let mut verdicts: Option<super::received_scan::Verdicts> = None;
     for rule in &rule_set.rules {
         // "If false, the receipt rule is inactive."
         if !rule.enabled {
             continue;
         }
-        if !received
+        // The recipients of this message the rule APPLIES TO, which is what an action that
+        // reports the matched recipients reports. A rule that applies to none of them is not a
+        // rule of this message.
+        let matched: Vec<String> = received
             .iter()
-            .any(|recipient| matches_recipients(rule, recipient))
-        {
+            .filter(|recipient| matches_recipients(rule, recipient))
+            .map(|recipient| (*recipient).clone())
+            .collect();
+        if matched.is_empty() {
             continue;
         }
         // "If true, then messages that this receipt rule applies to are scanned for spam and
@@ -358,6 +397,32 @@ pub fn receipt_steps(
                         .clone()
                         .unwrap_or_default(),
                     kms_key_arn: s3_action.kms_key_arn.clone(),
+                });
+            }
+            if let Some(lambda_action) = &action.lambda_action {
+                let carried = *verdicts.get_or_insert_with(|| {
+                    super::received_scan::verdicts(
+                        state,
+                        accepted.raw,
+                        accepted.envelope_from,
+                        accepted.from_domain,
+                    )
+                });
+                steps.push(ReceiptStep::Invoke {
+                    function_arn: lambda_action.function_arn.clone(),
+                    invocation_type: lambda_action
+                        .invocation_type
+                        .clone()
+                        // A stored rule carries the member's documented default
+                        // ([`super::materialize_receipt_rule_defaults`]); a rule written before
+                        // that was materialised is read the same way rather than invoked with
+                        // no invocation type at all.
+                        .unwrap_or_else(|| {
+                            super::DEFAULT_LAMBDA_ACTION_INVOCATION_TYPE.to_string()
+                        }),
+                    topic_arn: lambda_action.topic_arn.clone(),
+                    recipients: matched.clone(),
+                    verdicts: carried,
                 });
             }
             // "This action terminates the evaluation of the receipt rule set": the actions
@@ -517,8 +582,13 @@ pub fn deliver(
     let callback = ctx.callback().clone();
     let region = region.to_string();
     let identifier = accepted.message_id.to_string();
-    let from_domain = accepted.from_domain.to_string();
-    let message = accepted.raw.to_vec();
+    let delivered = DeliveredMessage {
+        message_id: identifier.clone(),
+        envelope_from: accepted.envelope_from.to_string(),
+        from_domain: accepted.from_domain.to_string(),
+        accepted_at: accepted.accepted_at,
+        raw: accepted.raw.to_vec(),
+    };
     let steps = steps.to_vec();
     runtime.spawn(async move {
         // Moved into the task, so the permit is held for exactly as long as the task runs and
@@ -526,7 +596,7 @@ pub fn deliver(
         let _permit = permit;
         if ::tokio::time::timeout(
             DELIVERY_DEADLINE,
-            carry_out(&callback, &region, &identifier, &from_domain, message, &steps),
+            carry_out(&callback, &region, &delivered, &steps),
         )
         .await
         .is_err()
@@ -549,20 +619,41 @@ pub fn deliver(
 /// from holding its permit for the life of the process.
 pub const DELIVERY_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
 
+/// The received message a delivery task carries out its steps for: the message as it was
+/// accepted, and the facts about that acceptance its steps report.
+///
+/// Owned, because the task outlives the request that accepted the message.
+#[derive(Debug, Clone)]
+struct DeliveredMessage {
+    /// The id the send was accepted under.
+    message_id: String,
+    /// The envelope sender Amazon SES relays the message under.
+    envelope_from: String,
+    /// The domain the message's `From` field claims.
+    from_domain: String,
+    /// The instant the message was accepted.
+    accepted_at: ::std::time::SystemTime,
+    /// The message's RFC 5322 bytes as it was accepted.
+    raw: Vec<u8>,
+}
+
 /// Carry out `steps` for one received message, in order, against the services their actions
 /// address.
 async fn carry_out(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
-    message_id: &str,
-    from_domain: &str,
-    raw: Vec<u8>,
+    delivered: &DeliveredMessage,
     steps: &[ReceiptStep],
 ) {
     let client = ::service_common::s3_client::s3_client(callback, region);
+    // The clients the steps address: the object store a saving action writes into, and Lambda,
+    // which a calling action's function is invoked through — both over the in-process callback
+    // and built once per message rather than once per step.
+    let functions = super::receipt_destinations::lambda_client(callback, region);
+    let message_id = delivered.message_id.as_str();
     // The message as the steps taken so far leave it: the bytes a client submitted, plus the
     // headers an `AddHeaderAction` or a scan has added to it.
-    let mut message = raw;
+    let mut message = delivered.raw.clone();
     for step in steps {
         match step {
             ReceiptStep::AddHeader { name, value } => with_header(&mut message, name, value),
@@ -597,7 +688,7 @@ async fn carry_out(
                             rule_set,
                             rule,
                             message_id,
-                            from_domain,
+                            &delivered.from_domain,
                             kms_key_arn,
                         );
                         let Some(envelope) = super::s3_encryption_envelope::sealed(
@@ -631,7 +722,78 @@ async fn carry_out(
                     );
                 }
             }
+            ReceiptStep::Invoke {
+                function_arn,
+                invocation_type,
+                topic_arn,
+                recipients,
+                verdicts,
+            } => {
+                // "This action calls an Amazon Web Services Lambda function": the function is
+                // called with the received message as the documented Amazon SES receipt event,
+                // under the invocation type the action carries — asynchronously for `Event`,
+                // waiting for the handler's own answer for `RequestResponse`.
+                let event = super::lambda_action_event::event(
+                    &super::lambda_action_event::ReceivedMessage {
+                        message_id,
+                        raw: &message,
+                        recipients,
+                        envelope_from: &delivered.envelope_from,
+                        received_at: delivered.accepted_at,
+                        processing_time: processed_for(delivered.accepted_at),
+                        verdicts: *verdicts,
+                    },
+                    &super::lambda_action_event::InvokedAction {
+                        function_arn,
+                        invocation_type,
+                        topic_arn: topic_arn.as_deref(),
+                    },
+                );
+                let invoked = functions
+                    .invoke()
+                    .function_name(function_arn)
+                    .invocation_type(invocation_type_of(invocation_type))
+                    .payload(::aws_sdk_lambda::primitives::Blob::new(
+                        ::serde_json::to_vec(&event).unwrap_or_default(),
+                    ))
+                    .send()
+                    .await;
+                if let Err(failure) = invoked {
+                    ::tracing::warn!(
+                        function_arn = ?function_arn,
+                        invocation_type = ?invocation_type,
+                        error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                        "a received message could not be handed to the receipt rule's function"
+                    );
+                }
+            }
         }
+    }
+}
+
+/// How long the message accepted at `accepted_at` has been in the receive path, which is the
+/// processing time the receipt of an invocation made now reports.
+///
+/// Measured rather than asserted, and never negative: a clock that has moved backwards since the
+/// acceptance leaves the span it has observed, which is none.
+fn processed_for(accepted_at: ::std::time::SystemTime) -> ::std::time::Duration {
+    ::std::time::SystemTime::now()
+        .duration_since(accepted_at)
+        .unwrap_or_default()
+}
+
+/// The Lambda invocation type an action's `InvocationType` asks for.
+///
+/// The member models two values, `Event` and `RequestResponse`
+/// (`smithy_query(query="shape", shape="InvocationType")`), which are the two Lambda's own
+/// `Invoke` names. Any other text is invoked under the member's documented default — "the
+/// default value is `Event`" — rather than being passed on as an invocation type Lambda does
+/// not model.
+fn invocation_type_of(named: &str) -> ::aws_sdk_lambda::types::InvocationType {
+    if named == super::lambda_action_event::INVOCATION_TYPE_REQUEST_RESPONSE {
+        ::aws_sdk_lambda::types::InvocationType::RequestResponse
+    } else {
+        ::aws_sdk_lambda::types::InvocationType::Event
     }
 }
 

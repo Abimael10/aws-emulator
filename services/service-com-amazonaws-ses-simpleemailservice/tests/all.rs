@@ -91,6 +91,8 @@ mod ses_query_error_envelope;
 mod ses_receipt_filters;
 #[path = "all/ses_receipt_rule_destination_preflight.rs"]
 mod ses_receipt_rule_destination_preflight;
+#[path = "all/ses_receipt_rule_lambda_action_invocation.rs"]
+mod ses_receipt_rule_lambda_action_invocation;
 #[path = "all/ses_receipt_rule_s3_destination_authorization.rs"]
 mod ses_receipt_rule_s3_destination_authorization;
 #[path = "all/ses_receipt_rule_set_creation.rs"]

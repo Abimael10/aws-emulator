@@ -274,7 +274,7 @@ async fn function_refusal(
     function_arn: &str,
     rule_arn: &str,
 ) -> Option<String> {
-    let answered = lambda_client(ctx, region)
+    let answered = lambda_client(ctx.callback(), region)
         .get_policy()
         .function_name(function_arn)
         .send()
@@ -450,19 +450,24 @@ fn unanswered<E, R>(
 /// The transport is in-process, so this disables what a network client needs and this one
 /// cannot have: retries, timeouts, stalled-stream protection and identity caching each need a
 /// sleep implementation the callback transport is not given, and there is nothing to retry
-/// behind it anyway. Nothing here opens a socket or leaves the host — `ctx.callback()` is the
+/// behind it anyway. Nothing here opens a socket or leaves the host — the callback is the
 /// framework's in-process channel into this same emulator's services — and the only
 /// caller-supplied value that reaches the client's authority is the signing Region, which is a
 /// Region LABEL by the time it gets here ([`crate::state::region_from_request`]), so no text of
 /// a request can steer the address.
-fn lambda_client(
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
+///
+/// The ONE construction of that hop for this service, so the pre-flight that reads a function's
+/// policy and the receive path that INVOKES the function ([`super::inbound_delivery`]) reach
+/// Lambda the same way. It is handed the callback rather than the operation context, because a
+/// received message's actions are carried out behind the request that accepted it.
+pub(crate) fn lambda_client(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_lambda::Client {
     let config = ::aws_sdk_lambda::Config::builder()
         .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
         .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())

@@ -97,6 +97,9 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# The `LambdaAction` suite deploys a REAL handler, so the deployment package it uploads is a
+# .zip archive it writes in memory — the form `FunctionCode$ZipFile` carries.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

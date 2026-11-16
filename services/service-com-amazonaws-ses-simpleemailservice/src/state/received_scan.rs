@@ -55,6 +55,97 @@ pub const VERDICT_PASS: &str = "PASS";
 /// The verdict of a scan that found what it scans for.
 pub const VERDICT_FAIL: &str = "FAIL";
 
+/// The verdict of a check that was made and established nothing either way.
+pub const VERDICT_GRAY: &str = "GRAY";
+
+/// The verdict of a check that could not be carried out at all.
+pub const VERDICT_PROCESSING_FAILED: &str = "PROCESSING_FAILED";
+
+/// What the checks Amazon SES makes on a received message established, as the RECEIPT of that
+/// message reports them: one verdict per check, each in the value set a verdict is reported in
+/// ([`VERDICT_PASS`], [`VERDICT_FAIL`], [`VERDICT_GRAY`], [`VERDICT_PROCESSING_FAILED`]).
+///
+/// The same readings the result headers of a scanning rule are stamped from
+/// ([`result_headers`]) — read off the message's own bytes, this account's keys and this
+/// envelope sender — so what a rule stamps on a message and what the receipt of that message
+/// reports cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verdicts {
+    /// What the spam scan of the message's content found.
+    pub spam: &'static str,
+    /// What the virus scan of the message's content found.
+    pub virus: &'static str,
+    /// What the SPF check of the envelope sender established.
+    pub spf: &'static str,
+    /// What checking the message's own `DKIM-Signature` established.
+    pub dkim: &'static str,
+    /// What the DMARC alignment of those two established.
+    pub dmarc: &'static str,
+}
+
+/// The verdicts of the checks made on the received message `raw`.
+///
+/// `envelope_from` is the envelope sender Amazon SES relayed the message under and `from_domain`
+/// the domain its `From` field claims, as they are for [`result_headers`].
+#[must_use]
+pub fn verdicts(
+    state: &super::ComAmazonawsSesSimpleemailserviceState,
+    raw: &[u8],
+    envelope_from: &str,
+    from_domain: &str,
+) -> Verdicts {
+    let envelope_domain = super::identity_domain(super::addr_spec(envelope_from));
+    let dkim = super::dkim::outcome(state, raw);
+    Verdicts {
+        spam: verdict(carries(raw, SPAM_TEST_PATTERN)),
+        virus: verdict(carries(raw, VIRUS_TEST_SIGNATURE)),
+        // `spf=pass`, for the reason the module docs give: the host that submitted the message
+        // IS this deployment's own sending host.
+        spf: VERDICT_PASS,
+        dkim: dkim_verdict(dkim.result),
+        dmarc: passed(dmarc_passes(&dkim, envelope_domain, from_domain)),
+    }
+}
+
+/// The verdict of checking a received message's `DKIM-Signature`, in the value set a verdict is
+/// reported in: a check that passed or failed reports that, a message carrying no signature at
+/// all leaves the check undetermined, and a signature that could not be checked is a check that
+/// did not complete.
+fn dkim_verdict(result: super::dkim::DkimResult) -> &'static str {
+    match result {
+        super::dkim::DkimResult::Pass => VERDICT_PASS,
+        super::dkim::DkimResult::Fail => VERDICT_FAIL,
+        super::dkim::DkimResult::None => VERDICT_GRAY,
+        super::dkim::DkimResult::PermError => VERDICT_PROCESSING_FAILED,
+    }
+}
+
+/// The verdict of a check that did or did not pass.
+fn passed(ok: bool) -> &'static str {
+    if ok {
+        VERDICT_PASS
+    } else {
+        VERDICT_FAIL
+    }
+}
+
+/// Whether the message passes DMARC: the alignment rule of RFC 7489 §3.1 — an identifier
+/// passes when an authentication that passed is for a domain aligned with the one the `From`
+/// field claims. SPF is about the envelope sender's domain and DKIM about the signature's.
+///
+/// The ONE reading, so the `dmarc=` a scanning rule stamps and the `dmarcVerdict` the receipt
+/// reports are the same answer.
+fn dmarc_passes(
+    dkim: &super::dkim::DkimOutcome,
+    envelope_domain: &str,
+    from_domain: &str,
+) -> bool {
+    let aligned_spf = aligned(envelope_domain, from_domain);
+    let aligned_dkim = dkim.result == super::dkim::DkimResult::Pass
+        && aligned(dkim.domain.as_deref().unwrap_or_default(), from_domain);
+    aligned_spf || aligned_dkim
+}
+
 /// The published spam test pattern — the Generic Test for Unsolicited Bulk Email, the one
 /// pattern a spam filter is expected to report on so that reporting can be tested — which is
 /// what the spam scan here looks for.
@@ -103,13 +194,7 @@ pub fn result_headers(
     if !dkim_domain.is_empty() {
         results.push_str(&format!(" header.i=@{dkim_domain}"));
     }
-    // RFC 7489 §3.1: an identifier passes DMARC when an authentication that passed is for a
-    // domain aligned with the `From` domain. SPF is about the envelope sender's domain and DKIM
-    // about the signature's.
-    let aligned_spf = aligned(envelope_domain, from_domain);
-    let aligned_dkim =
-        dkim.result == super::dkim::DkimResult::Pass && aligned(&dkim_domain, from_domain);
-    let dmarc = if aligned_spf || aligned_dkim {
+    let dmarc = if dmarc_passes(&dkim, envelope_domain, from_domain) {
         "pass"
     } else {
         "fail"

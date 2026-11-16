@@ -263,24 +263,12 @@ fn has_header_body_separator(data: &[u8]) -> bool {
         || data.windows(2).any(|window| window == b"\n\n")
 }
 
-/// Every addr-spec on one address header's value, in the order it lists them.
-///
-/// An address header is an RFC 5322 address list, so one line may carry several
-/// mailboxes, each of them optionally behind a display name, and may group them
-/// behind a group name; every mailbox of it is a recipient. `None` when the value
-/// is not an address list at all, which makes the whole message rejected.
+/// Every addr-spec on one address header's value, in the order it lists them —
+/// the crate's own reading of an address list ([`crate::state::header_addresses`]),
+/// which every mailbox of the field is read with. `None` when the value is not an
+/// address list at all, which makes the whole message rejected.
 fn header_addresses(value: &str) -> Option<Vec<String>> {
-    let parsed = ::mailparse::addrparse(value).ok()?;
-    let mut addresses = Vec::new();
-    for entry in parsed.iter() {
-        match entry {
-            ::mailparse::MailAddr::Single(single) => addresses.push(single.addr.clone()),
-            ::mailparse::MailAddr::Group(group) => {
-                addresses.extend(group.addrs.iter().map(|single| single.addr.clone()));
-            }
-        }
-    }
-    Some(addresses)
+    crate::state::header_addresses(value)
 }
 
 /// How deeply the parsed message NESTS: 0 for a single part, and one more for

@@ -87,6 +87,10 @@ pub mod received_scan;
 /// that saves it names a KMS key.
 pub mod s3_encryption_envelope;
 
+/// The event document the function a receipt rule's `LambdaAction` names is invoked with — the
+/// received message as a handler parses it.
+pub mod lambda_action_event;
+
 /// The bound a caller's MIME tree is held to BEFORE anything parses it — the ONE pre-parse
 /// reading of a raw message every path of this service that reads one applies.
 pub mod mime_bounds;
@@ -2094,6 +2098,32 @@ pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
 /// which mailbox a value names.
 pub fn addr_spec(value: &str) -> &str {
     ::service_common::ses_identities::addr_spec(value)
+}
+
+/// Every addr-spec on one address header's value, in the order it lists them.
+///
+/// An address header is an RFC 5322 address list, so one line may carry several mailboxes, each
+/// of them optionally behind a display name, and may group them behind a group name; every
+/// mailbox of it is an address the field names. `None` when the value is not an address list at
+/// all.
+///
+/// Read with the RFC 5322 address reader this crate already parses messages with (`mailparse`)
+/// rather than by cutting the string: the ONE reading, so the recipients a raw send is accepted
+/// for ([`crate::ops::send_raw_email`]) and the addresses a received message's own fields name
+/// ([`lambda_action_event`]) cannot disagree.
+#[must_use]
+pub fn header_addresses(value: &str) -> Option<Vec<String>> {
+    let parsed = ::mailparse::addrparse(value).ok()?;
+    let mut addresses = Vec::new();
+    for entry in parsed.iter() {
+        match entry {
+            ::mailparse::MailAddr::Single(single) => addresses.push(single.addr.clone()),
+            ::mailparse::MailAddr::Group(group) => {
+                addresses.extend(group.addrs.iter().map(|single| single.addr.clone()));
+            }
+        }
+    }
+    Some(addresses)
 }
 
 /// The identity an ARN of this service names, when it names one: the ARN's
