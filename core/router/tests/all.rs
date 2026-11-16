@@ -1097,6 +1097,8 @@ mod logs_subscription_filter_role_trust;
 mod logs_subscription_filter_to_firehose_s3;
 #[path = "all/logs_subscription_filter_to_lambda.rs"]
 mod logs_subscription_filter_to_lambda;
+#[path = "all/logs_subscription_filter_to_lambda_pattern_forms.rs"]
+mod logs_subscription_filter_to_lambda_pattern_forms;
 #[path = "all/logs_vended_group_lambda_subscriber_permission.rs"]
 mod logs_vended_group_lambda_subscriber_permission;
 #[path = "all/marketplace_signing_name_routing.rs"]

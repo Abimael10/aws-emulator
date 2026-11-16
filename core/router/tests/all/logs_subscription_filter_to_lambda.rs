@@ -51,6 +51,12 @@
 //! pattern and makes the hand-over, AWS Lambda runs the function and delivers its log, IAM
 //! holds the execution role that log is written under, and CloudFormation declares one row's
 //! topology — so the suite lives here rather than in any one of them.
+//!
+//! The wiring this suite needs is `pub(crate)`: standing the topology up — the four services on
+//! one engine, the destination function's handler and execution role, the calls each service is
+//! addressed over, and the reading of what the function printed — is what ANY suite stating a
+//! rule about this hand-over needs, so a sibling suite takes it from here rather than keeping a
+//! second copy of it (`crate::logs_subscription_filter_to_lambda_pattern_forms`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -65,55 +71,55 @@ use crate::query_wire::{element, form_encode, outputs_of};
 
 /// The Region every request below is signed for, and so the Region every ARN here names — the
 /// same Region the shared stack-status helper signs for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `StackStatus` a completed create reports.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
 /// The destination function every row's filter points at, and the execution role it runs as.
-const FUNCTION: &str = "logs-subscription-destination";
-const EXECUTION_ROLE: &str = "logs-subscription-destination-role";
+pub(crate) const FUNCTION: &str = "logs-subscription-destination";
+pub(crate) const EXECUTION_ROLE: &str = "logs-subscription-destination-role";
 
 /// The log group AWS Lambda delivers an invocation's log to, for a function whose
 /// `LoggingConfig` names none: "a default log group named `/aws/lambda/<function name>`"
 /// (`LoggingConfig$LogGroup`).
-const LAMBDA_LOG_GROUP_PREFIX: &str = "/aws/lambda/";
+pub(crate) const LAMBDA_LOG_GROUP_PREFIX: &str = "/aws/lambda/";
 
 /// The `messageType` a subscription envelope carrying ingested log events reports.
-const DATA_MESSAGE: &str = "DATA_MESSAGE";
+pub(crate) const DATA_MESSAGE: &str = "DATA_MESSAGE";
 
 /// What the handler prefixes the envelope document with, so the line it printed can be told
 /// apart from the runtime's own framing in the same log group.
-const ENVELOPE_PREFIX: &str = "ENVELOPE ";
+pub(crate) const ENVELOPE_PREFIX: &str = "ENVELOPE ";
 
 /// The fixed framing AWS Lambda writes for every run it finishes, which is what says the log
 /// of a run really was delivered beside what the handler printed.
-const REPORT_PREFIX: &str = "REPORT RequestId: ";
+pub(crate) const REPORT_PREFIX: &str = "REPORT RequestId: ";
 
 /// How long one invocation of the handler below is given, as the function's own `Timeout`.
-const FUNCTION_TIMEOUT: u64 = 30;
+pub(crate) const FUNCTION_TIMEOUT: u64 = 30;
 
 /// How long to wait between polls of something another service owes, and how many polls to
 /// make. The budget is far longer than any span these services choose, so a loaded host is
 /// slower without the rule being any different; nothing here asserts on elapsed time.
-const POLL: Duration = Duration::from_millis(100);
-const POLLS: usize = 600;
+pub(crate) const POLL: Duration = Duration::from_millis(100);
+pub(crate) const POLLS: usize = 600;
 
 /// How many polls the LOCAL waits make: the stack reporting itself complete and the function
 /// reporting itself invocable are both answered out of this emulator's own store, so they are
 /// given a budget many times the span those services choose rather than the whole one above.
-const LOCAL_POLLS: usize = 200;
+pub(crate) const LOCAL_POLLS: usize = 200;
 
 /// The trust policy the destination function's execution role carries: Lambda assumes it to
 /// run the function.
-const TRUST_POLICY: &str = concat!(
+pub(crate) const TRUST_POLICY: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"#,
     r#"{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
 );
 
 /// What that role may do: the three CloudWatch Logs calls an invocation's log delivery makes,
 /// which is what the AWS-managed basic execution policy grants a function.
-const ROLE_POLICY: &str = concat!(
+pub(crate) const ROLE_POLICY: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"#,
     r#"["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#
 );
@@ -122,7 +128,7 @@ const ROLE_POLICY: &str = concat!(
 /// framed in — base64, then gzip — and prints the envelope document it found, so the document
 /// the function was handed is readable in the function's own log group and every claim about
 /// it is checked by the suite rather than by the handler.
-const HANDLER_SOURCE: &str = r#"
+pub(crate) const HANDLER_SOURCE: &str = r#"
 import binascii
 import gzip
 
@@ -135,7 +141,7 @@ def handler(event, context):
 
 /// The logical id the ONE stack below declares the destination function under, which the suite
 /// reads its published ARN back by.
-const DESTINATION_ID: &str = "Destination";
+pub(crate) const DESTINATION_ID: &str = "Destination";
 
 /// What the logical id of each child the stack declares for a stack-wired row ends in: the
 /// stack carries one group, one invoke permission and one filter PER such row, so each row's
@@ -306,17 +312,17 @@ impl Row {
 }
 
 /// One answered request: its status and its body verbatim.
-struct Answered {
-    status: u16,
-    body: Bytes,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) body: Bytes,
 }
 
 impl Answered {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 }
@@ -326,7 +332,7 @@ impl Answered {
 ///
 /// Request authentication is off, as in every other suite here: each call carries a credential
 /// scope so the router can name the target service, and SigV4 itself is not under test.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -359,7 +365,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// Dispatch one request as it arrives on the wire.
-async fn dispatch(
+pub(crate) async fn dispatch(
     router: &MultiServiceRouter,
     signing_name: &str,
     method: &str,
@@ -387,7 +393,7 @@ async fn dispatch(
 }
 
 /// One Amazon CloudWatch Logs call over its `awsJson1_1` wire.
-async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> Answered {
+pub(crate) async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> Answered {
     dispatch(
         router,
         "logs",
@@ -403,7 +409,12 @@ async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> Answ
 }
 
 /// One CloudWatch Logs call that must succeed.
-async fn logs_ok(router: &MultiServiceRouter, case: &str, operation: &str, body: Value) -> Value {
+pub(crate) async fn logs_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
     let answered = logs(router, operation, body).await;
     assert_eq!(
         answered.status,
@@ -416,7 +427,7 @@ async fn logs_ok(router: &MultiServiceRouter, case: &str, operation: &str, body:
 }
 
 /// One AWS Lambda call over its `restJson1` wire.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -435,7 +446,7 @@ async fn lambda(
 }
 
 /// One `awsQuery` call, which is how both IAM and CloudFormation are addressed.
-async fn query(
+pub(crate) async fn query(
     router: &MultiServiceRouter,
     signing_name: &str,
     version: &str,
@@ -461,7 +472,11 @@ async fn query(
 }
 
 /// One IAM action that must succeed, answering the body it was served.
-async fn iam(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> String {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> String {
     let answered = query(router, "iam", "2010-05-08", action, members).await;
     assert_eq!(
         answered.status,
@@ -474,7 +489,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 }
 
 /// One CloudFormation action that must succeed, answering the body it was served.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -493,22 +508,31 @@ async fn cloudformation(
 
 /// The ARN of one log group, which is the resource an invoke permission is scoped to with
 /// `SourceArn`.
-fn group_arn(account: &str, group: &str) -> String {
+pub(crate) fn group_arn(account: &str, group: &str) -> String {
     format!("arn:aws:logs:{REGION}:{account}:log-group:{group}:*")
 }
 
 /// Grant `logs.amazonaws.com` the invocation of the destination function for ONE source log
 /// group, which is the grant a Lambda-destination subscription filter is authorized by.
-async fn add_permission(router: &MultiServiceRouter, case: &str, row: &Row, account: &str) {
+///
+/// `pub(crate)` and stated in terms of the GROUP rather than of this suite's `Row`, because it
+/// is the same grant every suite about this hand-over has to make.
+pub(crate) async fn grant_logs_invoke(
+    router: &MultiServiceRouter,
+    case: &str,
+    statement_id: &str,
+    group: &str,
+    account: &str,
+) {
     let answered = lambda(
         router,
         "POST",
         &format!("/2015-03-31/functions/{FUNCTION}/policy"),
         Some(json!({
-            "StatementId": row.statement_id(),
+            "StatementId": statement_id,
             "Action": "lambda:InvokeFunction",
             "Principal": "logs.amazonaws.com",
-            "SourceArn": group_arn(account, &row.group()),
+            "SourceArn": group_arn(account, group),
             "SourceAccount": account,
         })),
     )
@@ -520,6 +544,48 @@ async fn add_permission(router: &MultiServiceRouter, case: &str, row: &Row, acco
         answered.status,
         answered.text()
     );
+}
+
+/// The destination function ARN `stack` publishes, answered once the stack reports itself
+/// complete and AWS Lambda reports the function invocable.
+///
+/// `pub(crate)` for the same reason: a template is what archives inline source into a deployment
+/// package this emulator can run, so every suite about this hand-over deploys its destination
+/// function this way and owes the same two waits.
+pub(crate) async fn published_function_arn(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> String {
+    let (reached, described) = wait_for_stack_status(router, stack, CREATE_COMPLETE).await;
+    assert_eq!(
+        reached, CREATE_COMPLETE,
+        "case {case:?}: expected the stack to reach {CREATE_COMPLETE}, got {described}"
+    );
+    let arn = outputs_of(&described)
+        .get("FunctionArn")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the stack published no FunctionArn, got {described}")
+        });
+
+    // Nothing is delivered to a function that cannot yet be invoked: "During this time, you
+    // can't invoke or modify the function" (`CreateFunction`), so a hand-over withheld there
+    // would be the lifecycle's refusal rather than any rule about the hand-over itself.
+    for _ in 0..LOCAL_POLLS {
+        let reported = lambda(
+            router,
+            "GET",
+            &format!("/2015-03-31/functions/{FUNCTION}/configuration"),
+            None,
+        )
+        .await;
+        if reported.json().get("State").and_then(Value::as_str) == Some("Active") {
+            return arn;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    panic!("case {case:?}: Lambda never reported {FUNCTION} Active");
 }
 
 /// The ONE stack this suite deploys, which is the recorded topology: the destination function
@@ -613,40 +679,14 @@ async fn deploy_topology(
         &[("StackName", stack), ("TemplateBody", &template)],
     )
     .await;
-    let (reached, described) = wait_for_stack_status(router, stack, CREATE_COMPLETE).await;
-    assert_eq!(
-        reached, CREATE_COMPLETE,
-        "setup: expected the stack to reach {CREATE_COMPLETE}, got {described}"
-    );
-    let arn = outputs_of(&described)
-        .get("FunctionArn")
-        .cloned()
-        .unwrap_or_else(|| panic!("setup: the stack published no FunctionArn, got {described}"));
-
-    // Nothing is delivered to a function that cannot yet be invoked: "During this time, you
-    // can't invoke or modify the function" (`CreateFunction`), so a hand-over withheld there
-    // would be the lifecycle's refusal rather than the rule under test.
-    for _ in 0..LOCAL_POLLS {
-        let reported = lambda(
-            router,
-            "GET",
-            &format!("/2015-03-31/functions/{FUNCTION}/configuration"),
-            None,
-        )
-        .await;
-        if reported.json().get("State").and_then(Value::as_str) == Some("Active") {
-            return arn;
-        }
-        tokio::time::sleep(POLL).await;
-    }
-    panic!("setup: Lambda never reported {FUNCTION} Active");
+    published_function_arn(router, rows[0].case, stack).await
 }
 
 /// Every envelope document the destination function printed, as the suite reads them back out
 /// of the function's own log group. A group nothing has written to yet does not exist, which
 /// that service answers as a refusal rather than as an empty list, so such an answer reads as
 /// nothing printed; a line that is not an envelope (the runtime's own framing) is kept apart.
-async fn printed(router: &MultiServiceRouter) -> (Vec<Value>, Vec<String>) {
+pub(crate) async fn printed(router: &MultiServiceRouter) -> (Vec<Value>, Vec<String>) {
     let answered = logs(
         router,
         "FilterLogEvents",
@@ -689,7 +729,7 @@ async fn printed(router: &MultiServiceRouter) -> (Vec<Value>, Vec<String>) {
 /// documents, and answer the last reading taken. The hand-over is asynchronous (the function's
 /// answer is nothing the ingesting request reports), so this waits for the CONDITION rather
 /// than for a span.
-async fn printed_at_least(
+pub(crate) async fn printed_at_least(
     router: &MultiServiceRouter,
     wanted: usize,
 ) -> (Vec<Value>, Vec<String>) {
@@ -705,7 +745,7 @@ async fn printed_at_least(
 }
 
 /// The string at `member` of `envelope`, or a failure naming the row.
-fn text_member(case: &str, envelope: &Value, member: &str) -> String {
+pub(crate) fn text_member(case: &str, envelope: &Value, member: &str) -> String {
     envelope
         .get(member)
         .and_then(Value::as_str)
@@ -769,7 +809,14 @@ async fn a_subscription_filters_lambda_destination_is_handed_the_events_it_selec
                     json!({ "logGroupName": row.group() }),
                 )
                 .await;
-                add_permission(&router, case, row, account).await;
+                grant_logs_invoke(
+                    &router,
+                    case,
+                    &row.statement_id(),
+                    &row.group(),
+                    account,
+                )
+                .await;
                 logs_ok(
                     &router,
                     case,
