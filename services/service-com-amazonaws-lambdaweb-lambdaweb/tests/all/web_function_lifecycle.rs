@@ -931,11 +931,14 @@ async fn a_deleted_function_is_gone_from_every_reader() {
             listed.body
         );
 
-        // `@idempotent` is retry safety, not success for a name that never existed.
+        // The delete states an end state, so repeating it settles the same way: the
+        // function is already gone, which is what the call asks for. The dedicated
+        // suite spans that rule; this row is the repeat of a delete that did remove
+        // something.
         let again = emulator.delete(name).await;
         assert_eq!(
-            again.status, 404,
-            "case {name:?}: deleting what is gone is a 404, got {} with {:?}",
+            again.status, 204,
+            "case {name:?}: deleting what is already gone settles 204, got {} with {:?}",
             again.status, again.body
         );
     }
@@ -975,10 +978,13 @@ async fn an_unknown_function_is_a_404_not_a_501() {
             "case {name:?}: CreateWebFunctionRevision on an unknown function expected 404, got {} with {:?}",
             created_revision.status, created_revision.body
         );
+        // The delete is the one operation here that does not report an absent
+        // function: it asks for the function not to exist, and it does not. Its own
+        // suite spans that rule.
         let deleted = emulator.delete(name).await;
         assert_eq!(
-            deleted.status, 404,
-            "case {name:?}: DeleteWebFunction expected 404, got {} with {:?}",
+            deleted.status, 204,
+            "case {name:?}: DeleteWebFunction expected 204, got {} with {:?}",
             deleted.status, deleted.body
         );
     }

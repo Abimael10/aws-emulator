@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_function_message.rs"]
 mod absent_function_message;
+#[path = "all/delete_web_function_idempotence.rs"]
+mod delete_web_function_idempotence;
 #[path = "all/endpoint_data_plane.rs"]
 mod endpoint_data_plane;
 #[path = "all/enum_constraint_message.rs"]

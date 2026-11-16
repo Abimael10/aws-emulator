@@ -2,9 +2,13 @@
 
 //! @op DeleteWebFunction
 //!
-//! Removes a stored web function with its revisions and tags. `@idempotent` is
-//! about retry safety, not about inventing success for a name that never existed,
-//! so an unknown name is a 404.
+//! Removes a stored web function with its revisions and tags. The delete states an
+//! end state rather than an event: the function this request names is not to exist
+//! afterwards. A name that holds no record already satisfies that, so the call
+//! settles as the modelled 204 with an empty body instead of reporting the function
+//! absent — which is what makes the modelled `@idempotent` retry safe. A sub-resource
+//! call addressed THROUGH a function that is not stored still reports the function,
+//! because it cannot reach what it was asked to act on.
 //!
 //! ## Shape of an operation
 //!
@@ -189,24 +193,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // revisions and its tags live in the same record.
         let name = crate::state::resolve_function_name(&input.function_name);
         let Some(removed) = state.functions.remove(name) else {
-            // The audit record for a refused destructive call: who, what, outcome.
-            // No secret and no credential material — the access key id identifies
-            // the caller the way the real service's trail does.
+            // Nothing is stored under that name, so the end state this call asks for
+            // already holds and it settles as the modelled success: no record is
+            // touched, and no error shape is reported for work there was none of.
+            //
+            // The audit record for a destructive call that removed nothing: who,
+            // what, outcome. No secret and no credential material — the access key
+            // id identifies the caller the way the real service's trail does.
             ::tracing::info!(
                 operation = "DeleteWebFunction",
                 akid = %akid,
-                function_name = %input.function_name,
-                outcome = "not_found",
+                // Quoted and escaped, not interpolated raw: the value came
+                // straight from the request's URI label, and the record is one
+                // line of the trail.
+                function_name = ?input.function_name,
+                outcome = "already_absent",
                 "a web function delete named no stored function"
             );
-            return Err(DeleteWebFunctionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::function_not_found_message(&input.function_name),
-                    resource_id: Some(input.function_name.clone()),
-                    resource_type: Some("WebFunction".to_string()),
-                },
-            )
-            .into());
+            return Ok(DeleteWebFunctionOutput);
         };
 
         // The function's endpoints went with it, so the listeners their published

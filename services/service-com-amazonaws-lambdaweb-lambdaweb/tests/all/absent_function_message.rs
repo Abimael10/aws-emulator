@@ -90,8 +90,9 @@ struct Call {
 /// Every implemented operation that resolves a web function, addressing it by
 /// `identifier`.
 ///
-/// `DeleteWebFunction` resolves one the same way; what it answers for a function
-/// that is not stored is pinned by the lifecycle suite, which owns that operation.
+/// `DeleteWebFunction` resolves one the same way, but it is not in this table: it
+/// asks for the function not to exist, so a function that is not stored already
+/// satisfies it. The `delete_web_function_idempotence` suite pins that.
 fn calls_for(identifier: &str) -> Vec<Call> {
     let label = percent_encoded(identifier);
     vec![
