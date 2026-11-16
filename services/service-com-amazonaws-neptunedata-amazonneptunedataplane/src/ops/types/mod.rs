@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema and the serializer every modelled exception of this service uses, because
+// the wire carries one member more than the on-disk model declares — see that module's
+// own note. `#[macro_use]`, and declared FIRST, so the macros are in the textual scope of
+// every `*_types` module below.
+#[macro_use]
+pub mod error_message_wire;
+
 pub mod cancel_gremlin_query_types;
 pub mod cancel_loader_job_types;
 pub mod cancel_ml_data_processing_job_types;

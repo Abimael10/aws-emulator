@@ -197,9 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A @readonly operation: the registry is read, never written.
         let store = state.lock();
-        let queries = store.current_queries(include_waiting, now);
-        let accepted = store.accepted_query_count();
-        let running = store.running_query_count();
+        let queries = store.gremlin_queries.current(include_waiting, now);
+        let accepted = store.gremlin_queries.accepted_count();
+        let running = store.gremlin_queries.running_count();
         drop(store);
 
         Ok(ListGremlinQueriesOutput {

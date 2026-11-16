@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMLEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMLEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMLEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the inference endpoint the `id` label names, by looking that id up in the ML
+//! registry in [`crate::state`] — the one `CreateMLEndpoint` writes. An id the registry
+//! does not hold is refused with the modelled `MLResourceNotFoundException` (HTTP 404),
+//! never answered with an empty success, so a create that was refused leaves nothing a
+//! later read can find.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +168,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMLEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMLEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMLEndpoint"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMLEndpointErrorModeled::BadRequestException(
+                crate::state::store_unavailable_bad_request(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+
+        // A @readonly operation: the record is looked up, never created or changed. The
+        // status it reports does follow the clock — an endpoint comes into service a span
+        // after the create that started it, whether or not anybody reads it — so it is
+        // computed from the instant the record stores rather than written here.
+        let store = state.lock();
+        let Some(endpoint) = store.ml.endpoints.get(&input.id) else {
+            drop(store);
+            return Err(GetMLEndpointErrorModeled::MLResourceNotFoundException(
+                crate::state::ml_resource_not_found(),
+            )
+            .into());
+        };
+        let answer = GetMLEndpointOutput {
+            status: Some(endpoint.status(now).to_string()),
+            id: Some(endpoint.id.clone()),
+            endpoint: Some(endpoint.definition(now)),
+            endpoint_config: Some(endpoint.config()),
+        };
+        drop(store);
+
+        Ok(answer)
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMLEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMLEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMLEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the inference endpoint that serves the model one completed job produced, and
+//! records it in the ML registry in [`crate::state`] — which is what `GetMLEndpoint` reads
+//! it back from. The endpoint can only point at a resource this engine HOLDS, so an
+//! `mlModelTrainingJobId` or `mlModelTransformJobId` naming no such job, and an update
+//! naming no such endpoint, are refused with the modelled `MLResourceNotFoundException`
+//! (HTTP 404) and nothing is left behind.
 //!
 //! ## Shape of an operation
 //!
@@ -176,6 +174,11 @@ impl<Eng> CreateMLEndpoint<Eng> {
     }
 }
 
+/// The input members the job the endpoint serves arrives in, by their wire names, which
+/// are the names a refusal has to name for the caller to fix the request from it.
+const ML_MODEL_TRAINING_JOB_ID_MEMBER: &str = "mlModelTrainingJobId";
+const ML_MODEL_TRANSFORM_JOB_ID_MEMBER: &str = "mlModelTransformJobId";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateMLEndpoint<Eng>
 {
@@ -193,18 +196,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMLEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMLEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMLEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, "store-unavailable");
+            return Err(CreateMLEndpointErrorModeled::BadRequestException(
+                crate::state::store_unavailable_bad_request(),
+            )
+            .into());
+        };
+
+        // "You must supply either the mlModelTrainingJobId or the mlModelTransformJobId":
+        // the endpoint serves ONE model, and without a job id there is no model for it to
+        // serve, so the request is missing the parameter that names one.
+        let Some(job_id) = named_job_id(&input) else {
+            record_access(ctx, "missing-job-id");
+            return Err(CreateMLEndpointErrorModeled::MissingParameterException(
+                crate::state::missing_one_of_parameters(&[
+                    ML_MODEL_TRAINING_JOB_ID_MEMBER,
+                    ML_MODEL_TRANSFORM_JOB_ID_MEMBER,
+                ]),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let created_at = ::std::time::SystemTime::now();
+        // "If set to true, update indicates that this is an update request. The default is
+        // false."
+        let update = input.update.unwrap_or(false);
+
+        let mut store = state.lock();
+
+        // The job whose model the endpoint is to serve has to be one this engine holds:
+        // an id that names no data this engine has is not a resource an endpoint can point
+        // at, whichever of the two members carried it.
+        let Some(job) = store.ml.model_job(job_id) else {
+            drop(store);
+            record_access(ctx, "unknown-model-job");
+            return Err(CreateMLEndpointErrorModeled::MLResourceNotFoundException(
+                crate::state::ml_resource_not_found(),
+            )
+            .into());
+        };
+        // "The job Id of the COMPLETED model-training job that has created the model that
+        // the inference endpoint will point to": a job that has not finished has produced
+        // no model yet, so the precondition for serving one is not satisfied.
+        if !job.is_completed() {
+            let status = job.status.clone();
+            drop(store);
+            record_access(ctx, "model-job-not-completed");
+            return Err(CreateMLEndpointErrorModeled::PreconditionsFailedException(
+                crate::state::ml_job_not_completed(job_id, &status),
+            )
+            .into());
+        }
+
+        // "A unique identifier for the new inference endpoint. The default is an
+        // autogenerated timestamped name."
+        let endpoint_id = match input.id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => id.to_string(),
+            None => crate::state::default_ml_endpoint_id(created_at),
+        };
+
+        let held = store.ml.endpoints.get(&endpoint_id);
+        if update && held.is_none() {
+            // An update changes an endpoint that is there; naming none is the same missing
+            // ML resource a job id that names nothing is.
+            drop(store);
+            record_access(ctx, "unknown-endpoint");
+            return Err(CreateMLEndpointErrorModeled::MLResourceNotFoundException(
+                crate::state::ml_resource_not_found(),
+            )
+            .into());
+        }
+        if !update && held.is_some() {
+            // The id is "a unique identifier for the NEW inference endpoint", so creating
+            // one over an endpoint that already holds that id is a precondition this
+            // request did not satisfy — an update is how an existing endpoint is changed.
+            drop(store);
+            record_access(ctx, "endpoint-exists");
+            return Err(CreateMLEndpointErrorModeled::PreconditionsFailedException(
+                crate::state::ml_endpoint_exists(&endpoint_id),
+            )
+            .into());
+        }
+        // A create that would add an endpoint is bounded: an update replaces one the
+        // registry already holds, so it is not what grows it.
+        if held.is_none() && store.ml.endpoints.len() >= crate::state::MAX_ML_ENDPOINTS {
+            drop(store);
+            record_access(ctx, "endpoint-limit");
+            return Err(CreateMLEndpointErrorModeled::ConstraintViolationException(
+                crate::state::ml_endpoint_limit(),
+            )
+            .into());
+        }
+
+        // An endpoint that is being updated keeps the instant it was created: its creation
+        // time is when the endpoint came into being, not when it was last changed. Either
+        // way the endpoint is provisioned again, so it is reported as being created until
+        // the span that transition takes has passed.
+        let endpoint_created_at = held.map_or(created_at, |endpoint| endpoint.created_at);
+        let record = crate::state::MlEndpointRecord {
+            id: endpoint_id.clone(),
+            arn: crate::state::ml_endpoint_arn(&region, &endpoint_id),
+            config_arn: crate::state::ml_endpoint_config_arn(&region, &endpoint_id),
+            source_job_id: job_id.to_string(),
+            created_at: endpoint_created_at,
+            in_service_at: created_at + crate::state::ML_ENDPOINT_PROVISIONING,
+            instance_type: input
+                .instance_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|instance| !instance.is_empty())
+                .unwrap_or(crate::state::DEFAULT_ML_INSTANCE_TYPE)
+                .to_string(),
+            instance_count: input
+                .instance_count
+                .unwrap_or(crate::state::DEFAULT_ML_INSTANCE_COUNT),
+            model_name: input
+                .model_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string),
+        };
+        let answer = CreateMLEndpointOutput {
+            id: Some(record.id.clone()),
+            arn: Some(record.arn.clone()),
+            creation_time_in_millis: Some(record.created_at_millis()),
+        };
+        store.ml.endpoints.insert(endpoint_id, record);
+        drop(store);
+
+        record_access(ctx, if update { "updated" } else { "created" });
+        Ok(answer)
     }
+}
+
+/// The id of the job whose model the endpoint is to serve: whichever of the two members
+/// the request carried, with a blank one counting as absent because it names no job.
+fn named_job_id(input: &CreateMLEndpointInput) -> Option<&str> {
+    input
+        .ml_model_training_job_id
+        .as_deref()
+        .or(input.ml_model_transform_job_id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+/// Record one create: what was asked (the method and the URI), who asked (the access key
+/// the request presented), and how it ended — refusals included.
+///
+/// The ids the request carried are deliberately absent: they are the caller's own names
+/// for its resources, and a log is a file. No secret is recorded (the access key id is an
+/// identifier, never the signing key).
+fn record_access(ctx: &smithy_server_runtime::OperationContext<'_>, outcome: &'static str) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "CreateMLEndpoint",
+        method = %parts.method,
+        uri = %parts.uri,
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata create ML endpoint"
+    );
 }

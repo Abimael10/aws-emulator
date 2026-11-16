@@ -31,19 +31,19 @@ pub struct FastResetToken {
     pub token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#MethodNotAllowedException")]
-#[derive(Debug, Clone, Default)]
-pub struct MethodNotAllowedException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    MethodNotAllowedException,
+    SCHEMA_METHOD_NOT_ALLOWED_EXCEPTION,
+    "com.amazonaws.neptunedata#MethodNotAllowedException",
+    "com.amazonaws.neptunedata",
+    "MethodNotAllowedException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ServerShutdownException")]
-#[derive(Debug, Clone, Default)]
-pub struct ServerShutdownException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ServerShutdownException,
+    SCHEMA_SERVER_SHUTDOWN_EXCEPTION,
+    "com.amazonaws.neptunedata#ServerShutdownException",
+    "com.amazonaws.neptunedata",
+    "ServerShutdownException",
+);
 

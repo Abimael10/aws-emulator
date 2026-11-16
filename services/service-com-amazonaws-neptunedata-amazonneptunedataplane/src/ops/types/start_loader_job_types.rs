@@ -36,11 +36,11 @@ pub struct StartLoaderJobOutput {
     pub payload: std::collections::HashMap<String, String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#S3Exception")]
-#[derive(Debug, Clone, Default)]
-pub struct S3Exception {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    S3Exception,
+    SCHEMA_S3_EXCEPTION,
+    "com.amazonaws.neptunedata#S3Exception",
+    "com.amazonaws.neptunedata",
+    "S3Exception",
+);
 

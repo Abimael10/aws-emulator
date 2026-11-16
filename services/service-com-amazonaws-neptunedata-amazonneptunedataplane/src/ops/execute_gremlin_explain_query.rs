@@ -251,8 +251,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The explain is answered within this call, so the query the engine has just read
         // and planned is recorded as one it accepted and finished: the status family
         // reports every query this engine accepts, and this is one of them.
-        let query_id = crate::state::new_gremlin_query_id();
-        state.lock().record_finished_query(
+        let query_id = crate::state::new_query_id();
+        state.lock().gremlin_queries.record_finished(
             query_id,
             input.gremlin_query.clone(),
             accepted_at,

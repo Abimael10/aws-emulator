@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteGremlinQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteGremlinQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` for a
+//! traversal it READ and cannot evaluate — this emulator has no in-process engine that
+//! evaluates an Apache TinkerPop traversal, and a result, or an evaluation time, for a
+//! traversal nothing ran would be a fabrication. What it does NOT do is answer 501 for a
+//! query that is not a traversal at all: the submitted query is read first (see
+//! [`crate::state::parse_gremlin_traversal`]), and a query the parser cannot read is
+//! refused through the modelled error that states so, with the parser's own message.
+//! Implement the evaluation here — this is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ExecuteGremlinQuery::handle`] with real behaviour and
@@ -188,6 +193,10 @@ impl<Eng> ExecuteGremlinQuery<Eng> {
     }
 }
 
+/// The input member the query arrives in, by its wire name (`gremlinQuery`'s `jsonName`),
+/// which is the name a refusal has to name for the caller to fix the request from it.
+const GREMLIN_QUERY_MEMBER: &str = "gremlin";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ExecuteGremlinQuery<Eng>
 {
@@ -205,18 +214,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteGremlinQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteGremlinQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteGremlinQuery"))
+        // The member is required, so it is here — but a blank one carries no query, and a
+        // query endpoint with nothing to run is the parameter being missing.
+        if input.gremlin_query.trim().is_empty() {
+            record_access(ctx, &input, "missing-query");
+            return Err(ExecuteGremlinQueryErrorModeled::MissingParameterException(
+                crate::state::missing_parameter(GREMLIN_QUERY_MEMBER),
+            )
+            .into());
+        }
+
+        // READ the query before anything else. What the query says is decided from the
+        // query alone, so a text that is not a traversal is refused here whatever this
+        // engine can go on to do with one that is — each refusal through the modelled
+        // error whose own documentation states that fact, carrying the parser's report of
+        // where it stopped.
+        match crate::state::parse_gremlin_traversal(&input.gremlin_query) {
+            Ok(_traversal) => {}
+            Err(rejection @ crate::state::QueryRejection::Malformed(_)) => {
+                record_access(ctx, &input, "malformed-query");
+                return Err(ExecuteGremlinQueryErrorModeled::MalformedQueryException(
+                    crate::state::malformed_gremlin_query(rejection.reason()),
+                )
+                .into());
+            }
+            Err(rejection @ crate::state::QueryRejection::TooLarge(_)) => {
+                record_access(ctx, &input, "query-too-large");
+                return Err(ExecuteGremlinQueryErrorModeled::QueryTooLargeException(
+                    crate::state::gremlin_query_too_large(rejection.reason()),
+                )
+                .into());
+            }
+            Err(rejection @ crate::state::QueryRejection::TooComplex(_)) => {
+                record_access(ctx, &input, "query-too-complex");
+                return Err(ExecuteGremlinQueryErrorModeled::QueryLimitException(
+                    crate::state::gremlin_query_too_complex(rejection.reason()),
+                )
+                .into());
+            }
+        }
+
+        // The traversal is one this engine could read and cannot EVALUATE: there is no
+        // in-process TinkerPop engine here, so the query is answered 501 rather than with
+        // a result nothing computed. Nothing is recorded in the query registry either: no
+        // query was accepted.
+        record_access(ctx, &input, "not-implemented");
+        let _ = &self.engine;
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            "ExecuteGremlinQuery",
+        ))
     }
+}
+
+/// Record one query request: what was asked (the method, the URI and how long the query
+/// was), who asked (the access key the request presented), and how it ended — refusals
+/// included.
+///
+/// The query itself is deliberately absent: a query carries the caller's own data (the
+/// values it filters on), and a log is a file. Its LENGTH is recorded instead, which is
+/// what tells an oversized request from an empty one, and no secret is recorded (the
+/// access key id is an identifier, never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    input: &ExecuteGremlinQueryInput,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "ExecuteGremlinQuery",
+        method = %parts.method,
+        uri = %parts.uri,
+        query_length = input.gremlin_query.len(),
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata execute gremlin query"
+    );
 }

@@ -192,6 +192,9 @@ pub struct Call {
     /// list at all (`g`, or the `desc` of `Order.desc`), so a step written without
     /// parentheses is not reported as one applied to nothing.
     pub arguments: Option<Vec<Argument>>,
+    /// Where the segment's name begins in the submitted query, which is the position a
+    /// refusal about this segment reports.
+    pub offset: usize,
 }
 
 impl Call {
@@ -248,9 +251,10 @@ impl QueryRejection {
 }
 
 /// The `MalformedQueryException` payload for a query this engine could not read as a
-/// Gremlin traversal. `reason` says what was wrong and where, so the caller can fix the
-/// query from the message alone, and `code` carries the HTTP status the member's own
-/// documentation says it carries.
+/// Gremlin traversal. `reason` is the parser's own report of where the parse stopped and
+/// what it could not continue past (see [`super::gremlin_parse_failure`]), so the caller
+/// can fix the query from the message alone, and `code` carries the HTTP status the
+/// member's own documentation says it carries.
 pub fn malformed_gremlin_query(reason: &str) -> MalformedQueryException {
     MalformedQueryException {
         detailed_message: format!("Failed to interpret Gremlin query: {reason}"),
@@ -291,43 +295,35 @@ pub fn parse_gremlin_traversal(query: &str) -> Result<Traversal, QueryRejection>
     for (lexed, span) in Token::lexer(query).spanned() {
         match lexed {
             Ok(token) => tokens.push((token, span)),
-            Err(()) => {
-                return Err(QueryRejection::Malformed(format!(
-                    "unexpected character {} at offset {}",
-                    super::echoed(query.get(span.clone()).unwrap_or_default()),
-                    span.start
-                )))
-            }
+            // A character the Gremlin string form has no token for: the parse stops
+            // THERE, which is the position the refusal reports.
+            Err(()) => return Err(malformed_at(query, span.start)),
         }
     }
 
     let mut stream = TokenStream {
+        text: query,
         tokens,
         position: 0,
         end: query.len(),
     };
     if stream.peek().is_none() {
-        return Err(QueryRejection::Malformed(
-            "the query carries no Gremlin traversal".to_string(),
-        ));
+        return Err(malformed_at(query, 0));
     }
 
     let chain = stream.parse_chain(0)?;
     if stream.peek().is_some() {
-        return Err(stream.unexpected("the end of the query"));
+        return Err(stream.unexpected());
     }
 
     let mut segments = chain.into_iter();
     let Some(source) = segments.next() else {
-        return Err(QueryRejection::Malformed(
-            "the query carries no Gremlin traversal".to_string(),
-        ));
+        return Err(malformed_at(query, 0));
     };
     if source.name != GRAPH_TRAVERSAL_SOURCE || source.arguments.is_some() {
-        return Err(QueryRejection::Malformed(format!(
-            "a Gremlin query starts from the traversal source '{GRAPH_TRAVERSAL_SOURCE}', not '{}'",
-            super::echoed(&source.name)
-        )));
+        // A traversal is read from its source onwards, so a query that starts from
+        // anything else stops at the name it starts with.
+        return Err(malformed_at(query, source.offset));
     }
     let steps: Vec<Call> = segments.collect();
 
@@ -341,10 +337,7 @@ pub fn parse_gremlin_traversal(query: &str) -> Result<Traversal, QueryRejection>
         }
         if MODULATORS.contains(&name) || name == STEP_LABEL {
             if !has_step {
-                return Err(QueryRejection::Malformed(format!(
-                    "'{}' configures the step it follows, but no step precedes it",
-                    super::echoed(name)
-                )));
+                return Err(malformed_at(query, step.offset));
             }
             continue;
         }
@@ -357,15 +350,23 @@ pub fn parse_gremlin_traversal(query: &str) -> Result<Traversal, QueryRejection>
     })
 }
 
+/// The refusal for a query whose parse stopped at `byte_offset`, worded the way the
+/// Gremlin endpoint words one.
+fn malformed_at(query: &str, byte_offset: usize) -> QueryRejection {
+    QueryRejection::Malformed(super::gremlin_parse_failure(query, byte_offset))
+}
+
 /// The tokens of one query, and how far through them the parse has got.
-struct TokenStream {
+struct TokenStream<'query> {
+    /// The query as it was submitted, which a refusal reports the position in.
+    text: &'query str,
     tokens: Vec<(Token, ::std::ops::Range<usize>)>,
     position: usize,
     /// The length of the query text, so "the query ends here" can name an offset.
     end: usize,
 }
 
-impl TokenStream {
+impl TokenStream<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.position).map(|(token, _)| token)
     }
@@ -380,20 +381,14 @@ impl TokenStream {
         self.position = (self.position + 1).min(self.tokens.len());
     }
 
-    /// The refusal for a token that cannot appear where the parse is, naming what was
-    /// expected, what was found and the offset it was found at.
-    fn unexpected(&self, expected: &str) -> QueryRejection {
-        match self.tokens.get(self.position) {
-            Some((token, span)) => QueryRejection::Malformed(format!(
-                "expected {expected} at offset {}, found {}",
-                span.start,
-                describe(token)
-            )),
-            None => QueryRejection::Malformed(format!(
-                "expected {expected}, but the query ends at offset {}",
-                self.end
-            )),
-        }
+    /// The refusal for a token that cannot appear where the parse is: the parse stopped at
+    /// that token, or at the end of the query when it ran out of tokens.
+    fn unexpected(&self) -> QueryRejection {
+        let stopped_at = match self.tokens.get(self.position) {
+            Some((_, span)) => span.start,
+            None => self.end,
+        };
+        malformed_at(self.text, stopped_at)
     }
 
     /// A dotted chain of segments: `g.V().has('code','ANC')`, `__.out()`, `Order.desc`.
@@ -408,21 +403,27 @@ impl TokenStream {
 
     /// One segment: a name, optionally applied to an argument list.
     fn parse_segment(&mut self, depth: usize) -> Result<Call, QueryRejection> {
+        let offset = self
+            .tokens
+            .get(self.position)
+            .map_or(self.end, |(_, span)| span.start);
         let Some(Token::Name(name)) = self.peek().cloned() else {
-            return Err(self.unexpected("a step name"));
+            return Err(self.unexpected());
         };
         self.advance();
         if self.peek() != Some(&Token::OpenParen) {
             return Ok(Call {
                 name,
                 arguments: None,
+                offset,
             });
         }
         self.advance();
-        let arguments = self.parse_arguments(depth + 1, &Token::CloseParen, "')'")?;
+        let arguments = self.parse_arguments(depth + 1, &Token::CloseParen)?;
         Ok(Call {
             name,
             arguments: Some(arguments),
+            offset,
         })
     }
 
@@ -431,7 +432,6 @@ impl TokenStream {
         &mut self,
         depth: usize,
         closing: &Token,
-        closing_name: &str,
     ) -> Result<Vec<Argument>, QueryRejection> {
         let mut arguments = Vec::new();
         if self.peek() != Some(closing) {
@@ -445,7 +445,7 @@ impl TokenStream {
             }
         }
         if self.peek() != Some(closing) {
-            return Err(self.unexpected(closing_name));
+            return Err(self.unexpected());
         }
         self.advance();
         Ok(arguments)
@@ -468,7 +468,7 @@ impl TokenStream {
             }
             Some(Token::OpenBracket) => {
                 self.advance();
-                let items = self.parse_arguments(depth + 1, &Token::CloseBracket, "']'")?;
+                let items = self.parse_arguments(depth + 1, &Token::CloseBracket)?;
                 Ok(Argument::List(items))
             }
             Some(Token::Name(name)) => {
@@ -492,23 +492,8 @@ impl TokenStream {
                 }
                 Ok(Argument::Expression(self.parse_chain(depth)?))
             }
-            _ => Err(self.unexpected("an argument")),
+            _ => Err(self.unexpected()),
         }
-    }
-}
-
-/// A token as a refusal message names it.
-fn describe(token: &Token) -> String {
-    match token {
-        Token::Dot => "'.'".to_string(),
-        Token::Comma => "','".to_string(),
-        Token::OpenParen => "'('".to_string(),
-        Token::CloseParen => "')'".to_string(),
-        Token::OpenBracket => "'['".to_string(),
-        Token::CloseBracket => "']'".to_string(),
-        Token::Name(name) => format!("'{}'", super::echoed(name)),
-        Token::Text(text) => format!("the string '{}'", super::echoed(text)),
-        Token::Number(value) => format!("the number {}", super::echoed(value)),
     }
 }
 

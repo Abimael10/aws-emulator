@@ -11,221 +11,231 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-neptunedata-amazonneptunedataplane.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#BadRequestException")]
-#[derive(Debug, Clone, Default)]
-pub struct BadRequestException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+// Every exception this service declares carries the same three modelled members, and the
+// data plane writes the refusal's text under `message` as well — the member a client reads
+// as the error message, which the on-disk model omits. Each shape is therefore declared
+// through `neptune_error_shape!` (see `types::error_message_wire`) rather than through
+// `#[smithy_macros::smithy(shape = ...)]`, whose derive admits exactly the model's member
+// list.
+//
+// Shape list and member set from smithy_query(query="shape", shape="<Exception>",
+// model_path="services/service-com-amazonaws-neptunedata-amazonneptunedataplane/\
+// smithy-model/com-amazonaws-neptunedata-amazonneptunedataplane.json").
+neptune_error_shape!(
+    BadRequestException,
+    SCHEMA_BAD_REQUEST_EXCEPTION,
+    "com.amazonaws.neptunedata#BadRequestException",
+    "com.amazonaws.neptunedata",
+    "BadRequestException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ClientTimeoutException")]
-#[derive(Debug, Clone, Default)]
-pub struct ClientTimeoutException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ClientTimeoutException,
+    SCHEMA_CLIENT_TIMEOUT_EXCEPTION,
+    "com.amazonaws.neptunedata#ClientTimeoutException",
+    "com.amazonaws.neptunedata",
+    "ClientTimeoutException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ConcurrentModificationException")]
-#[derive(Debug, Clone, Default)]
-pub struct ConcurrentModificationException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ConcurrentModificationException,
+    SCHEMA_CONCURRENT_MODIFICATION_EXCEPTION,
+    "com.amazonaws.neptunedata#ConcurrentModificationException",
+    "com.amazonaws.neptunedata",
+    "ConcurrentModificationException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ConstraintViolationException")]
-#[derive(Debug, Clone, Default)]
-pub struct ConstraintViolationException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ConstraintViolationException,
+    SCHEMA_CONSTRAINT_VIOLATION_EXCEPTION,
+    "com.amazonaws.neptunedata#ConstraintViolationException",
+    "com.amazonaws.neptunedata",
+    "ConstraintViolationException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#FailureByQueryException")]
-#[derive(Debug, Clone, Default)]
-pub struct FailureByQueryException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    FailureByQueryException,
+    SCHEMA_FAILURE_BY_QUERY_EXCEPTION,
+    "com.amazonaws.neptunedata#FailureByQueryException",
+    "com.amazonaws.neptunedata",
+    "FailureByQueryException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#IllegalArgumentException")]
-#[derive(Debug, Clone, Default)]
-pub struct IllegalArgumentException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    IllegalArgumentException,
+    SCHEMA_ILLEGAL_ARGUMENT_EXCEPTION,
+    "com.amazonaws.neptunedata#IllegalArgumentException",
+    "com.amazonaws.neptunedata",
+    "IllegalArgumentException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#InvalidArgumentException")]
-#[derive(Debug, Clone, Default)]
-pub struct InvalidArgumentException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    InvalidArgumentException,
+    SCHEMA_INVALID_ARGUMENT_EXCEPTION,
+    "com.amazonaws.neptunedata#InvalidArgumentException",
+    "com.amazonaws.neptunedata",
+    "InvalidArgumentException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#InvalidParameterException")]
-#[derive(Debug, Clone, Default)]
-pub struct InvalidParameterException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    InvalidParameterException,
+    SCHEMA_INVALID_PARAMETER_EXCEPTION,
+    "com.amazonaws.neptunedata#InvalidParameterException",
+    "com.amazonaws.neptunedata",
+    "InvalidParameterException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#MissingParameterException")]
-#[derive(Debug, Clone, Default)]
-pub struct MissingParameterException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    MissingParameterException,
+    SCHEMA_MISSING_PARAMETER_EXCEPTION,
+    "com.amazonaws.neptunedata#MissingParameterException",
+    "com.amazonaws.neptunedata",
+    "MissingParameterException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ParsingException")]
-#[derive(Debug, Clone, Default)]
-pub struct ParsingException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ParsingException,
+    SCHEMA_PARSING_EXCEPTION,
+    "com.amazonaws.neptunedata#ParsingException",
+    "com.amazonaws.neptunedata",
+    "ParsingException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#PreconditionsFailedException")]
-#[derive(Debug, Clone, Default)]
-pub struct PreconditionsFailedException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    PreconditionsFailedException,
+    SCHEMA_PRECONDITIONS_FAILED_EXCEPTION,
+    "com.amazonaws.neptunedata#PreconditionsFailedException",
+    "com.amazonaws.neptunedata",
+    "PreconditionsFailedException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#TimeLimitExceededException")]
-#[derive(Debug, Clone, Default)]
-pub struct TimeLimitExceededException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    TimeLimitExceededException,
+    SCHEMA_TIME_LIMIT_EXCEEDED_EXCEPTION,
+    "com.amazonaws.neptunedata#TimeLimitExceededException",
+    "com.amazonaws.neptunedata",
+    "TimeLimitExceededException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#TooManyRequestsException")]
-#[derive(Debug, Clone, Default)]
-pub struct TooManyRequestsException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    TooManyRequestsException,
+    SCHEMA_TOO_MANY_REQUESTS_EXCEPTION,
+    "com.amazonaws.neptunedata#TooManyRequestsException",
+    "com.amazonaws.neptunedata",
+    "TooManyRequestsException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#UnsupportedOperationException")]
-#[derive(Debug, Clone, Default)]
-pub struct UnsupportedOperationException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    UnsupportedOperationException,
+    SCHEMA_UNSUPPORTED_OPERATION_EXCEPTION,
+    "com.amazonaws.neptunedata#UnsupportedOperationException",
+    "com.amazonaws.neptunedata",
+    "UnsupportedOperationException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#BulkLoadIdNotFoundException")]
-#[derive(Debug, Clone, Default)]
-pub struct BulkLoadIdNotFoundException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    BulkLoadIdNotFoundException,
+    SCHEMA_BULK_LOAD_ID_NOT_FOUND_EXCEPTION,
+    "com.amazonaws.neptunedata#BulkLoadIdNotFoundException",
+    "com.amazonaws.neptunedata",
+    "BulkLoadIdNotFoundException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#InternalFailureException")]
-#[derive(Debug, Clone, Default)]
-pub struct InternalFailureException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    InternalFailureException,
+    SCHEMA_INTERNAL_FAILURE_EXCEPTION,
+    "com.amazonaws.neptunedata#InternalFailureException",
+    "com.amazonaws.neptunedata",
+    "InternalFailureException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#LoadUrlAccessDeniedException")]
-#[derive(Debug, Clone, Default)]
-pub struct LoadUrlAccessDeniedException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    LoadUrlAccessDeniedException,
+    SCHEMA_LOAD_URL_ACCESS_DENIED_EXCEPTION,
+    "com.amazonaws.neptunedata#LoadUrlAccessDeniedException",
+    "com.amazonaws.neptunedata",
+    "LoadUrlAccessDeniedException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#MLResourceNotFoundException")]
-#[derive(Debug, Clone, Default)]
-pub struct MLResourceNotFoundException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    MLResourceNotFoundException,
+    SCHEMA_ML_RESOURCE_NOT_FOUND_EXCEPTION,
+    "com.amazonaws.neptunedata#MLResourceNotFoundException",
+    "com.amazonaws.neptunedata",
+    "MLResourceNotFoundException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#InvalidNumericDataException")]
-#[derive(Debug, Clone, Default)]
-pub struct InvalidNumericDataException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    InvalidNumericDataException,
+    SCHEMA_INVALID_NUMERIC_DATA_EXCEPTION,
+    "com.amazonaws.neptunedata#InvalidNumericDataException",
+    "com.amazonaws.neptunedata",
+    "InvalidNumericDataException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#AccessDeniedException")]
-#[derive(Debug, Clone, Default)]
-pub struct AccessDeniedException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    AccessDeniedException,
+    SCHEMA_ACCESS_DENIED_EXCEPTION,
+    "com.amazonaws.neptunedata#AccessDeniedException",
+    "com.amazonaws.neptunedata",
+    "AccessDeniedException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ReadOnlyViolationException")]
-#[derive(Debug, Clone, Default)]
-pub struct ReadOnlyViolationException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ReadOnlyViolationException,
+    SCHEMA_READ_ONLY_VIOLATION_EXCEPTION,
+    "com.amazonaws.neptunedata#ReadOnlyViolationException",
+    "com.amazonaws.neptunedata",
+    "ReadOnlyViolationException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#CancelledByUserException")]
-#[derive(Debug, Clone, Default)]
-pub struct CancelledByUserException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    CancelledByUserException,
+    SCHEMA_CANCELLED_BY_USER_EXCEPTION,
+    "com.amazonaws.neptunedata#CancelledByUserException",
+    "com.amazonaws.neptunedata",
+    "CancelledByUserException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#MalformedQueryException")]
-#[derive(Debug, Clone, Default)]
-pub struct MalformedQueryException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    MalformedQueryException,
+    SCHEMA_MALFORMED_QUERY_EXCEPTION,
+    "com.amazonaws.neptunedata#MalformedQueryException",
+    "com.amazonaws.neptunedata",
+    "MalformedQueryException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#MemoryLimitExceededException")]
-#[derive(Debug, Clone, Default)]
-pub struct MemoryLimitExceededException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    MemoryLimitExceededException,
+    SCHEMA_MEMORY_LIMIT_EXCEEDED_EXCEPTION,
+    "com.amazonaws.neptunedata#MemoryLimitExceededException",
+    "com.amazonaws.neptunedata",
+    "MemoryLimitExceededException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#QueryLimitExceededException")]
-#[derive(Debug, Clone, Default)]
-pub struct QueryLimitExceededException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    QueryLimitExceededException,
+    SCHEMA_QUERY_LIMIT_EXCEEDED_EXCEPTION,
+    "com.amazonaws.neptunedata#QueryLimitExceededException",
+    "com.amazonaws.neptunedata",
+    "QueryLimitExceededException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#QueryLimitException")]
-#[derive(Debug, Clone, Default)]
-pub struct QueryLimitException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    QueryLimitException,
+    SCHEMA_QUERY_LIMIT_EXCEPTION,
+    "com.amazonaws.neptunedata#QueryLimitException",
+    "com.amazonaws.neptunedata",
+    "QueryLimitException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#QueryTooLargeException")]
-#[derive(Debug, Clone, Default)]
-pub struct QueryTooLargeException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    QueryTooLargeException,
+    SCHEMA_QUERY_TOO_LARGE_EXCEPTION,
+    "com.amazonaws.neptunedata#QueryTooLargeException",
+    "com.amazonaws.neptunedata",
+    "QueryTooLargeException",
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#QueryEvalStats")]
 #[derive(Debug, Clone, Default)]
@@ -254,37 +264,37 @@ pub struct MlConfigDefinition {
     pub arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ExpiredStreamException")]
-#[derive(Debug, Clone, Default)]
-pub struct ExpiredStreamException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ExpiredStreamException,
+    SCHEMA_EXPIRED_STREAM_EXCEPTION,
+    "com.amazonaws.neptunedata#ExpiredStreamException",
+    "com.amazonaws.neptunedata",
+    "ExpiredStreamException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#StreamRecordsNotFoundException")]
-#[derive(Debug, Clone, Default)]
-pub struct StreamRecordsNotFoundException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    StreamRecordsNotFoundException,
+    SCHEMA_STREAM_RECORDS_NOT_FOUND_EXCEPTION,
+    "com.amazonaws.neptunedata#StreamRecordsNotFoundException",
+    "com.amazonaws.neptunedata",
+    "StreamRecordsNotFoundException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#ThrottlingException")]
-#[derive(Debug, Clone, Default)]
-pub struct ThrottlingException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    ThrottlingException,
+    SCHEMA_THROTTLING_EXCEPTION,
+    "com.amazonaws.neptunedata#ThrottlingException",
+    "com.amazonaws.neptunedata",
+    "ThrottlingException",
+);
 
-#[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#StatisticsNotAvailableException")]
-#[derive(Debug, Clone, Default)]
-pub struct StatisticsNotAvailableException {
-    pub detailed_message: String,
-    pub request_id: String,
-    pub code: String,
-}
+neptune_error_shape!(
+    StatisticsNotAvailableException,
+    SCHEMA_STATISTICS_NOT_AVAILABLE_EXCEPTION,
+    "com.amazonaws.neptunedata#StatisticsNotAvailableException",
+    "com.amazonaws.neptunedata",
+    "StatisticsNotAvailableException",
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.neptunedata#GremlinQueryStatus")]
 #[derive(Debug, Clone, Default)]

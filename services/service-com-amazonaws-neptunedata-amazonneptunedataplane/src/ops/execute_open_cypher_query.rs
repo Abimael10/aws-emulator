@@ -256,6 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is what makes two concurrent writers apply one whole query at a time.
         let store = state.clone();
         let text = input.open_cypher_query.clone();
+        let accepted_at = ::std::time::SystemTime::now();
         let answered = ::tokio::task::spawn_blocking(move || {
             let mut held = store.lock();
             // The span starts when the run does: neither the wait for a free thread nor
@@ -263,7 +264,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so a query that queued behind another is not refused for the time it spent
             // waiting.
             let deadline = ::std::time::Instant::now() + crate::state::QUERY_RUN_TIMEOUT;
-            crate::state::run_query(&mut held.graph, &text, parameters, deadline)
+            let answered = crate::state::run_query(&mut held.graph, &text, parameters, deadline);
+            // A query the engine EVALUATED is one it accepted and finished within this
+            // call, so it is recorded in the openCypher registry the status family reports
+            // from — under the id this call minted, which is the `queryId` that family
+            // takes. A query that was never run (one the parser refused, one past a bound)
+            // is not recorded: the engine accepted no such query.
+            if answered.is_ok() {
+                held.open_cypher_queries.record_finished(
+                    crate::state::new_query_id(),
+                    text,
+                    accepted_at,
+                    ::std::time::SystemTime::now(),
+                );
+            }
+            answered
         })
         .await
         .unwrap_or_else(|joined| {

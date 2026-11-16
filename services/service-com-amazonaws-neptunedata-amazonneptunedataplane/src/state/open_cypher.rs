@@ -556,8 +556,15 @@ pub fn run_query(
             .stack_size(QUERY_STACK_BYTES)
             .spawn_scoped(scope, || {
                 let parsed = ::opencypher::parse(source).map_err(|refused| {
+                    // The refusal is worded the way the openCypher endpoint words one,
+                    // from the parser's own report: what it could not read, what it
+                    // expected there, and where in THIS query it stopped.
                     QueryFailure::Malformed {
-                        reason: format!("{refused}"),
+                        reason: super::open_cypher_parse_failure(
+                            source,
+                            &refused.message,
+                            refused.span.start..refused.span.end,
+                        ),
                     }
                 })?;
                 // Semantic checks a query is refused by BEFORE it is evaluated, so what
@@ -1791,12 +1798,13 @@ fn json_to_document(value: &Value) -> ::aws_smithy_types::Document {
 /// The `MalformedQueryException` payload for a text this engine could not read as an
 /// openCypher query, or could read and not evaluate.
 ///
-/// `reason` is what the parser or the evaluation reported, so the caller can fix the
-/// query from the message alone, and `code` carries the HTTP status the member's own
-/// documentation says it carries.
+/// `reason` is the whole message: what the parser or the evaluation reported, worded the
+/// way the openCypher endpoint words it (see [`super::open_cypher_parse_failure`]), so the
+/// caller can fix the query from the message alone. `code` carries the HTTP status the
+/// member's own documentation says it carries.
 pub fn malformed_open_cypher_query(reason: &str) -> MalformedQueryException {
     MalformedQueryException {
-        detailed_message: format!("Failed to interpret openCypher query: {reason}"),
+        detailed_message: reason.to_string(),
         request_id: super::new_request_id(),
         code: "400".to_string(),
     }

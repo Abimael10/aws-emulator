@@ -21,5 +21,7 @@ mod loader_jobs;
 mod neptune_data_plane;
 #[path = "all/open_cypher_query.rs"]
 mod open_cypher_query;
+#[path = "all/refusal_paths.rs"]
+mod refusal_paths;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

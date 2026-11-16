@@ -74,3 +74,27 @@ Cause 5 — expected: MalformedQueryException (400) with "Invalid input '<char>'
 5. Cause 4: execute_gremlin_query(gremlinQuery="g.addV('<label>').property((((") and inspect Error.Code/Message.
 6. Cause 5: execute_open_cypher_query(openCypherQuery="CREAT (n:`<Label>`) SET n.x = ") and inspect Error.Code/Message.
 7. Replay: run_behavioral_suite and re-check the five check ids in trace_ids.
+
+## Resolution
+
+All five causes' refusal paths are served from state, with tests in
+`services/service-com-amazonaws-neptunedata-amazonneptunedataplane/tests/all/refusal_paths.rs`:
+
+* Cause 1 — `CreateMLEndpoint` and `GetMLEndpoint` answer 404 `MLResourceNotFoundException`
+  for an id the ML registry in `src/state/ml.rs` does not hold, and a create over a job it
+  does hold is read back through `GetMLEndpoint`.
+* Cause 2 — every modelled exception of this service is written to the wire with `message`
+  as well as `detailedMessage` (`src/ops/types/error_message_wire.rs`).
+* Cause 3 — `GetOpenCypherQueryStatus`, `CancelOpenCypherQuery` and `ListOpenCypherQueries`
+  report from an openCypher query registry of their own; an id it does not hold is refused
+  400 `InvalidParameterException` naming it.
+* Cause 4 — REFUSAL PATH ONLY. `ExecuteGremlinQuery` now READS the submitted query and
+  refuses one its parser cannot read with 400 `MalformedQueryException` and the endpoint's
+  own message. A well-formed traversal is still answered 501: nothing here evaluates an
+  Apache TinkerPop traversal, which is the separate auto-filed "Implement neptunedata
+  ExecuteGremlinQuery" item, and the recorded unit
+  `neptunedata.gremlin-malformed-query-rejected` still diverges on an earlier step of its
+  own that submits such a traversal.
+* Cause 5 — the openCypher parse refusal carries the parser's message in the endpoint's
+  wording: the input it could not read, the alternatives it expected, and the line, column
+  and offset it stopped at.

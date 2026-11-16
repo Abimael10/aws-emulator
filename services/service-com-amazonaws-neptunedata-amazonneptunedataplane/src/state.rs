@@ -45,17 +45,20 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    FailureByQueryException, GremlinQueryStatus, IllegalArgumentException,
+    BadRequestException, FailureByQueryException, GremlinQueryStatus, IllegalArgumentException,
     InternalFailureException, InvalidParameterException, MissingParameterException, QueryEvalStats,
     ServerShutdownException,
 };
-
 mod gremlin_plan;
+mod ml;
 mod open_cypher;
+mod parse_refusal;
 mod property_graph;
 
 pub use gremlin_plan::*;
+pub use ml::*;
 pub use open_cypher::*;
+pub use parse_refusal::*;
 pub use property_graph::*;
 
 /// `GetEngineStatusOutput$status` for an instance that is not experiencing problems:
@@ -354,6 +357,125 @@ impl GremlinQueryRecord {
     }
 }
 
+/// One query language's registry: every query of that language the engine has accepted,
+/// keyed by query id.
+///
+/// The two query languages keep SEPARATE registries, because each has its own status
+/// family: a `queryId` the openCypher endpoints minted is not one the Gremlin status
+/// reports on, and the other way round. What a registry holds is the same either way —
+/// the model projects an openCypher query's status through the same `GremlinQueryStatus`
+/// shape (`OpenCypherQueries`'s member), so one record type serves both.
+///
+/// Derefs to the map it holds, so a record is reached by id exactly as before.
+#[derive(Debug, Default)]
+pub struct QueryRegistry {
+    /// A `BTreeMap` is what gives a list a stable order over the ids.
+    queries: BTreeMap<String, GremlinQueryRecord>,
+}
+
+impl ::std::ops::Deref for QueryRegistry {
+    type Target = BTreeMap<String, GremlinQueryRecord>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.queries
+    }
+}
+
+impl ::std::ops::DerefMut for QueryRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.queries
+    }
+}
+
+impl QueryRegistry {
+    /// How many accepted-but-not-completed queries this registry holds — what
+    /// `acceptedQueryCount` counts ("accepted but not yet completed, including queries in
+    /// the queue").
+    pub fn accepted_count(&self) -> usize {
+        self.queries
+            .values()
+            .filter(|query| query.state.is_accepted())
+            .count()
+    }
+
+    /// How many of its queries are evaluating right now, which is what
+    /// `runningQueryCount` counts.
+    pub fn running_count(&self) -> usize {
+        self.queries
+            .values()
+            .filter(|query| query.state.is_running())
+            .count()
+    }
+
+    /// The current queries, oldest id first: the running ones, plus the queued ones when
+    /// `include_waiting` is set.
+    pub fn current(&self, include_waiting: bool, now: SystemTime) -> Vec<GremlinQueryStatus> {
+        self.queries
+            .values()
+            .filter(|query| {
+                query.state.is_running() || (include_waiting && query.state == QueryState::Waiting)
+            })
+            .map(|query| query.status(now))
+            .collect()
+    }
+
+    /// Record a query this engine accepted, answered and finished within the call that
+    /// submitted it.
+    ///
+    /// The finished record is KEPT, so the status family can still report the query the
+    /// caller submitted — bounded by [`FINISHED_QUERY_HISTORY`], so a stream of queries
+    /// cannot grow the registry without end.
+    pub fn record_finished(
+        &mut self,
+        query_id: impl Into<String>,
+        query_string: impl Into<String>,
+        accepted_at: SystemTime,
+        finished_at: SystemTime,
+    ) {
+        let record = GremlinQueryRecord::finished(query_id, query_string, accepted_at, finished_at);
+        self.queries.insert(record.query_id.clone(), record);
+        self.forget_oldest_finished();
+    }
+
+    /// Cancel every query the engine still owes an answer, as of `now`, and apply the
+    /// registry's bound to the records that just became finished.
+    pub fn cancel_all(&mut self, now: SystemTime) {
+        for query in self.queries.values_mut() {
+            query.cancel(now);
+        }
+        self.forget_oldest_finished();
+    }
+
+    /// Drop the finished queries past [`FINISHED_QUERY_HISTORY`], oldest first.
+    ///
+    /// Only FINISHED queries are forgotten: a query the engine still owes an answer is
+    /// one the status family and a cancel have to go on reaching, however long the
+    /// registry grows.
+    fn forget_oldest_finished(&mut self) {
+        let mut finished: Vec<(SystemTime, String)> = self
+            .queries
+            .values()
+            .filter(|query| query.state.is_terminal())
+            .map(|query| {
+                (
+                    query.finished_at.unwrap_or(query.accepted_at),
+                    query.query_id.clone(),
+                )
+            })
+            .collect();
+        if finished.len() <= FINISHED_QUERY_HISTORY {
+            return;
+        }
+        // Oldest first, ties broken by query id, so the same records are forgotten
+        // whatever order the registry is walked in.
+        finished.sort();
+        let surplus = finished.len() - FINISHED_QUERY_HISTORY;
+        for (_, query_id) in finished.iter().take(surplus) {
+            self.queries.remove(query_id);
+        }
+    }
+}
+
 /// How far a bulk-load job this engine has admitted has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderJobState {
@@ -470,9 +592,13 @@ pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     /// The one engine record `GetEngineStatus` reports, built when this state is first
     /// reached.
     pub engine_status: EngineStatusRecord,
-    /// Every Gremlin query the engine has accepted, keyed by query id. A `BTreeMap` is
-    /// what gives `ListGremlinQueries` a stable order over the ids.
-    pub gremlin_queries: BTreeMap<String, GremlinQueryRecord>,
+    /// Every Gremlin query the engine has accepted, keyed by query id. The Gremlin status
+    /// family reports from this one.
+    pub gremlin_queries: QueryRegistry,
+    /// Every openCypher query the engine has accepted, keyed by query id. The openCypher
+    /// status family reports from this one: a `queryId` one language minted is not one the
+    /// other's status reports on.
+    pub open_cypher_queries: QueryRegistry,
     /// The fast-reset token and reset history `ExecuteFastReset` reads and writes.
     pub fast_reset: FastResetRecord,
     /// Every bulk-load job the engine has admitted, keyed by load id. `ListLoaderJobs`
@@ -481,41 +607,11 @@ pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     /// The nodes and relationships the openCypher endpoints read and write — this
     /// engine's one copy of the graph's data.
     pub graph: PropertyGraph,
+    /// The Neptune ML resources this engine holds, which the ML endpoints read and write.
+    pub ml: MlRegistry,
 }
 
 impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
-    /// How many accepted-but-not-completed queries the registry holds.
-    pub fn accepted_query_count(&self) -> usize {
-        self.gremlin_queries
-            .values()
-            .filter(|query| query.state.is_accepted())
-            .count()
-    }
-
-    /// How many queries are evaluating right now.
-    pub fn running_query_count(&self) -> usize {
-        self.gremlin_queries
-            .values()
-            .filter(|query| query.state.is_running())
-            .count()
-    }
-
-    /// The current queries, oldest id first: the running ones, plus the queued ones when
-    /// `include_waiting` is set.
-    pub fn current_queries(
-        &self,
-        include_waiting: bool,
-        now: SystemTime,
-    ) -> Vec<GremlinQueryStatus> {
-        self.gremlin_queries
-            .values()
-            .filter(|query| {
-                query.state.is_running() || (include_waiting && query.state == QueryState::Waiting)
-            })
-            .map(|query| query.status(now))
-            .collect()
-    }
-
     /// The load ids of the active loader jobs — the jobs the loader still owes an
     /// outcome — newest admission first, at most `limit` of them.
     ///
@@ -542,74 +638,21 @@ impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
             .collect()
     }
 
-    /// Record a query this engine accepted, answered and finished within the call that
-    /// submitted it, and report the record it stored.
-    ///
-    /// The finished record is KEPT, so the status family can still report the query the
-    /// caller submitted — bounded by [`FINISHED_QUERY_HISTORY`], so a stream of queries
-    /// cannot grow the registry without end.
-    pub fn record_finished_query(
-        &mut self,
-        query_id: impl Into<String>,
-        query_string: impl Into<String>,
-        accepted_at: SystemTime,
-        finished_at: SystemTime,
-    ) {
-        let record =
-            GremlinQueryRecord::finished(query_id, query_string, accepted_at, finished_at);
-        self.gremlin_queries.insert(record.query_id.clone(), record);
-        self.forget_oldest_finished_queries();
-    }
-
-    /// Drop the finished queries past [`FINISHED_QUERY_HISTORY`], oldest first.
-    ///
-    /// Only FINISHED queries are forgotten: a query the engine still owes an answer is
-    /// one the status family and a cancel have to go on reaching, however long the
-    /// registry grows.
-    fn forget_oldest_finished_queries(&mut self) {
-        let mut finished: Vec<(SystemTime, String)> = self
-            .gremlin_queries
-            .values()
-            .filter(|query| query.state.is_terminal())
-            .map(|query| {
-                (
-                    query.finished_at.unwrap_or(query.accepted_at),
-                    query.query_id.clone(),
-                )
-            })
-            .collect();
-        if finished.len() <= FINISHED_QUERY_HISTORY {
-            return;
-        }
-        // Oldest first, ties broken by query id, so the same records are forgotten
-        // whatever order the registry is walked in.
-        finished.sort();
-        let surplus = finished.len() - FINISHED_QUERY_HISTORY;
-        for (_, query_id) in finished.iter().take(surplus) {
-            self.gremlin_queries.remove(query_id);
-        }
-    }
-
     /// Perform the fast reset `token` authorises, and report whether it did.
     ///
     /// `false` means `token` is not the outstanding one — nothing was reset, so a wrong
     /// token cannot empty the database. On a match the database is emptied: the graph's
-    /// own data is dropped, every query the engine has accepted but not completed was
-    /// asked about data the reset removes, so it is marked cancelled exactly as a cancel
-    /// marks one (the record is KEPT, so the status family goes on reporting those ids),
-    /// and the token is consumed.
+    /// own data is dropped, every query the engine has accepted but not completed — in
+    /// EITHER language — was asked about data the reset removes, so it is marked cancelled
+    /// exactly as a cancel marks one (the record is KEPT, so the status families go on
+    /// reporting those ids), and the token is consumed.
     pub fn perform_fast_reset(&mut self, token: &str, now: SystemTime) -> bool {
         if !self.fast_reset.authorises(token) {
             return false;
         }
         self.graph.clear();
-        for query in self.gremlin_queries.values_mut() {
-            query.cancel(now);
-        }
-        // The cancellation above moved every accepted query into a terminal state, so the
-        // registry's bound on finished queries is applied to them now rather than at
-        // whatever later write happens to apply it.
-        self.forget_oldest_finished_queries();
+        self.gremlin_queries.cancel_all(now);
+        self.open_cypher_queries.cancel_all(now);
         self.fast_reset.consume(now);
         true
     }
@@ -665,14 +708,27 @@ pub fn new_fast_reset_token() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
 
-/// A fresh query id: the `queryId` the Gremlin status API reports for a query this
-/// engine has accepted, and the label a cancel names it by.
+/// A fresh query id: the `queryId` a query status API reports for a query this engine has
+/// accepted, and the label a cancel names it by.
 ///
 /// Version 4, so the id is derived from nothing the caller sent and no caller can guess
 /// the id of somebody else's query, which is what a cancel takes.
-pub fn new_gremlin_query_id() -> String {
+pub fn new_query_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
+
+/// The region this request's ARNs are minted in: the region of the caller's SigV4
+/// credential scope, or [`DEFAULT_REGION`] when the request carries no scope to read one
+/// from.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The region an ARN carries when the request named none.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// At most this many characters of a request-supplied value are echoed back in an error
 /// message. Neptune names the offending value in its message, so echoing it is right, but
@@ -793,6 +849,32 @@ pub fn store_unavailable_shutdown() -> ServerShutdownException {
         detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
         request_id: new_request_id(),
         code: SERVER_ERROR_STATUS.to_string(),
+    }
+}
+
+/// The same server-side failure for an operation that models no server error at all: the
+/// ML endpoints model only client errors, and `BadRequestException` — "raised when a
+/// request is submitted that cannot be processed" — is the one of them that states what
+/// happened without blaming a member of the request.
+pub fn store_unavailable_bad_request() -> BadRequestException {
+    BadRequestException {
+        detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
+        request_id: new_request_id(),
+        code: SERVER_ERROR_STATUS.to_string(),
+    }
+}
+
+/// The `MissingParameterException` payload for a request that had to carry ONE of several
+/// parameters and carried none of them.
+pub fn missing_one_of_parameters(members: &[&str]) -> MissingParameterException {
+    let named: Vec<String> = members.iter().map(|member| format!("'{member}'")).collect();
+    MissingParameterException {
+        detailed_message: format!(
+            "Request is missing mandatory parameter {}",
+            named.join(" or ")
+        ),
+        request_id: new_request_id(),
+        code: "400".to_string(),
     }
 }
 
