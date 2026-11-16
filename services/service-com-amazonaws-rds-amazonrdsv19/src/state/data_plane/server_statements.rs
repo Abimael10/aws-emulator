@@ -33,6 +33,9 @@ pub struct Extension {
     /// The version its control file declares as the default, which is what
     /// `pg_extension.extversion` reports for an install that names no version.
     pub version: &'static str,
+    /// The one-line description its control file declares, which is what
+    /// `pg_available_extensions.comment` reports for it.
+    pub comment: &'static str,
     /// The extensions it requires, which `CASCADE` installs with it.
     pub requires: &'static [&'static str],
 }
@@ -41,18 +44,20 @@ pub struct Extension {
 ///
 /// Source: the list of extensions Amazon RDS for PostgreSQL supports, in the Amazon RDS
 /// User Guide ("Extension versions for Amazon RDS for PostgreSQL"), with each default
-/// version as that extension's own control file declares it. A name this list does not
-/// carry is one the instance has no control file for, which is the condition PostgreSQL
-/// answers `extension "<name>" is not available` to.
+/// version and each `comment` as that extension's own control file declares them. A name
+/// this list does not carry is one the instance has no control file for, which is the
+/// condition PostgreSQL answers `extension "<name>" is not available` to.
 const EXTENSIONS: &[Extension] = &[
     Extension {
         name: "plpgsql",
         version: "1.0",
+        comment: "PL/pgSQL procedural language",
         requires: &[],
     },
     Extension {
         name: "aws_commons",
         version: "1.2",
+        comment: "Common data types across AWS services and their functions",
         requires: &[],
     },
     // The two integrations whose functions live in these extensions: `aws_s3` imports and
@@ -61,64 +66,89 @@ const EXTENSIONS: &[Extension] = &[
     Extension {
         name: "aws_s3",
         version: "1.1",
+        comment: "AWS S3 extension for importing data from S3",
         requires: &["aws_commons"],
     },
     Extension {
         name: "aws_lambda",
         version: "1.0",
+        comment: "AWS Lambda Postgres integration",
         requires: &["aws_commons"],
     },
     Extension {
         name: "pgcrypto",
         version: "1.3",
+        comment: "cryptographic functions",
         requires: &[],
     },
     Extension {
         name: "uuid-ossp",
         version: "1.1",
+        comment: "generate universally unique identifiers (UUIDs)",
         requires: &[],
     },
     Extension {
         name: "hstore",
         version: "1.8",
+        comment: "data type for storing sets of (key, value) pairs",
         requires: &[],
     },
     Extension {
         name: "citext",
         version: "1.6",
+        comment: "data type for case-insensitive character strings",
         requires: &[],
     },
     Extension {
         name: "ltree",
         version: "1.2",
+        comment: "data type for hierarchical tree-like structures",
         requires: &[],
     },
     Extension {
         name: "pg_trgm",
         version: "1.6",
+        comment: "text similarity measurement and index searching based on trigrams",
         requires: &[],
     },
     Extension {
         name: "btree_gin",
         version: "1.3",
+        comment: "support for indexing common datatypes in GIN",
         requires: &[],
     },
     Extension {
         name: "btree_gist",
         version: "1.7",
+        comment: "support for indexing common datatypes in GiST",
         requires: &[],
     },
     Extension {
         name: "tablefunc",
         version: "1.0",
+        comment: "functions that manipulate whole tables, including crosstab",
         requires: &[],
     },
     Extension {
         name: "pg_stat_statements",
         version: "1.10",
+        comment: "track planning and execution statistics of all SQL statements executed",
+        requires: &[],
+    },
+    Extension {
+        name: "vector",
+        version: "0.8.0",
+        comment: "vector data type and ivfflat and hnsw access methods",
         requires: &[],
     },
 ];
+
+/// The extensions this endpoint ships, in the order it publishes them; see [`EXTENSIONS`].
+/// What `pg_available_extensions` is built from (`super::pg_server`).
+#[must_use]
+pub fn available_extensions() -> &'static [Extension] {
+    EXTENSIONS
+}
 
 /// The extension `name` names among the ones this endpoint ships.
 ///
@@ -192,18 +222,33 @@ pub fn extension_is_installed(
 
 /// The extensions installed in the session's database, in the order they were installed.
 fn installed(database: &InstanceDatabase, facts: &SessionFacts) -> Result<Vec<String>, EngineError> {
+    Ok(installed_extensions(database, facts)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// The extensions installed in the session's database with the version each was installed
+/// at, in the order they were installed: what `pg_available_extensions.installed_version`
+/// reports (`super::pg_server`).
+pub fn installed_extensions(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+) -> Result<Vec<(String, String)>, EngineError> {
     database.execute_in(facts.connection_id, &facts.database, PG_EXTENSION_SCHEMA, &[])?;
     let rows = database.execute_in(
         facts.connection_id,
         &facts.database,
-        "SELECT extname FROM pg_extension ORDER BY oid",
+        "SELECT extname, extversion FROM pg_extension ORDER BY oid",
         &[],
     )?;
     Ok(rows
         .rows
         .iter()
-        .filter_map(|row| match row.first() {
-            Some(Cell::Text(name)) => Some(name.clone()),
+        .filter_map(|row| match (row.first(), row.get(1)) {
+            (Some(Cell::Text(name)), Some(Cell::Text(version))) => {
+                Some((name.clone(), version.clone()))
+            }
             _ => None,
         })
         .collect())

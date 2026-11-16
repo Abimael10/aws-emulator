@@ -1536,6 +1536,21 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .get(&(region.to_string(), identifier))
     }
 
+    /// Whether the database `arn` is the GREEN database of a blue/green deployment this
+    /// store holds, which is what makes its endpoint serve no writes.
+    ///
+    /// "The databases in the green environment are read-only" until the deployment is
+    /// switched over: the green environment is kept in sync with production by replaying the
+    /// blue environment's writes, so a client cannot write to it, exactly as it cannot write
+    /// to a read replica. The pairing is what says so, so the database stops being read-only
+    /// when the deployment that made it green is no longer there — which is what a switchover
+    /// and a delete of the deployment both leave behind.
+    pub fn is_a_green_database(&self, region: &str, arn: &str) -> bool {
+        self.blue_green_deployments_in(region)
+            .into_iter()
+            .any(|deployment| deployment.target_arn.eq_ignore_ascii_case(arn))
+    }
+
     /// The integrations stored in `region`, in name order.
     pub fn integrations_in(&self, region: &str) -> Vec<&IntegrationRecord> {
         range_in(&self.integrations, region)
@@ -3296,6 +3311,20 @@ pub fn new_request_id() -> String {
     // mistaken for a name-based or time-based one.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid_text(&bytes)
+}
+
+/// The sixteen bytes `bytes` as a UUID in the 8-4-4-4-12 form every one of them is written
+/// in, or the empty string for a value that is not sixteen bytes.
+///
+/// The ONE place that layout is written, so a minted request id and a `uuid` value a client
+/// bound to a statement (`data_plane::pg_binary`) cannot be spelled differently. The
+/// hexadecimal is the maintained `hex` crate's, so nothing here is hand-rolled.
+#[must_use]
+pub fn uuid_text(bytes: &[u8]) -> String {
+    if bytes.len() != 16 {
+        return String::new();
+    }
     let hex = ::hex::encode(bytes);
     format!(
         "{}-{}-{}-{}-{}",

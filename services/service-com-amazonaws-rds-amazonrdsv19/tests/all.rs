@@ -199,6 +199,8 @@ mod engine_default_catalog_head;
 mod engine_default_cluster_parameters;
 #[path = "all/engine_default_parameters.rs"]
 mod engine_default_parameters;
+#[path = "all/engine_dialect_surface.rs"]
+mod engine_dialect_surface;
 #[path = "all/engine_iam_authentication_mysql.rs"]
 mod engine_iam_authentication_mysql;
 #[path = "all/engine_result_column_types.rs"]

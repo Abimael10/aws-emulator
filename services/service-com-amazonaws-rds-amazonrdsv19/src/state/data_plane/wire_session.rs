@@ -258,8 +258,10 @@ impl SessionContext {
                 // update the read replica", and such a replica serves reads only. The
                 // relationship is what says so, so an instance `PromoteReadReplica` has
                 // promoted — which clears it — serves writes from then on, under the same
-                // session.
-                read_only: record.is_read_replica(),
+                // session. The GREEN database of a blue/green deployment serves reads only
+                // for the same reason, and while the deployment pairs it with the blue one
+                // (`ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`).
+                read_only: serves_reads_only(&store, record),
                 runtime: engine_runtime_of(&store, record),
             },
             &self.database,
@@ -285,7 +287,7 @@ impl SessionContext {
                 resource_id,
             } => {
                 let record = store.instance_by_resource_id(region, resource_id)?;
-                let read_only = record.is_read_replica();
+                let read_only = serves_reads_only(&store, record);
                 Some((
                     replaying(engine_runtime_of(&store, record), read_only),
                     read_only,
@@ -504,6 +506,7 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
                 .map(|entry| entry.engine_version.to_string())
         })
         .unwrap_or_default();
+    let server_version = reported_server_version(&record.engine, server_version);
     let mut comes_with = Vec::new();
     if let Some(name) = &record.database_name {
         comes_with.push(name.clone());
@@ -551,6 +554,63 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
     }
 }
 
+/// Whether a session on the DB INSTANCE `record`'s own endpoint serves NO WRITES.
+///
+/// Two relationships put an instance's engine in that state, and both are a database that is
+/// replaying another's writes rather than taking its own:
+///
+/// * it is a READ REPLICA of another resource (`DbInstanceRecord::is_read_replica`);
+/// * it is the GREEN database of a blue/green deployment
+///   ([`ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`]).
+///
+/// Read for the login and again for each statement ([`SessionContext::engine_now`]), so a
+/// relationship that ends under a live session — a promotion, a deployment that is gone —
+/// gives that session its writes from then on.
+#[must_use]
+pub(super) fn serves_reads_only(
+    store: &ComAmazonawsRdsAmazonrdsv19State,
+    record: &crate::state::DbInstanceRecord,
+) -> bool {
+    record.is_read_replica() || store.is_a_green_database(&record.region, &record.arn())
+}
+
+/// The version string the engine reports for ITSELF, which is not always the engine version
+/// the control plane records for the resource.
+///
+/// A MariaDB server appends its own name to the version it reports — `<version>-MariaDB` —
+/// and a client reads that token to tell MariaDB from MySQL, the two engines that speak the
+/// same wire. Every other engine reports the version as recorded.
+#[must_use]
+pub(super) fn reported_server_version(engine: &str, version: String) -> String {
+    if !engine.eq_ignore_ascii_case(MARIADB_ENGINE)
+        || version.is_empty()
+        || version.to_ascii_lowercase().contains(&MARIADB_VERSION_TOKEN.to_ascii_lowercase())
+    {
+        return version;
+    }
+    format!("{version}-{MARIADB_VERSION_TOKEN}")
+}
+
+/// The `Engine` of an Amazon RDS for MariaDB resource.
+const MARIADB_ENGINE: &str = "mariadb";
+
+/// The token a MariaDB server's own version string carries; see [`reported_server_version`].
+const MARIADB_VERSION_TOKEN: &str = "MariaDB";
+
+/// What `@@version_comment` reports for a MySQL-family engine: how that server describes the
+/// build it is.
+///
+/// A MariaDB server reports its own distribution and a MySQL server the build Amazon RDS
+/// runs, which is one of the two values a client discriminates the engines by (the other is
+/// the version string itself).
+#[must_use]
+fn mysql_version_comment(engine: &str) -> &'static str {
+    if engine.eq_ignore_ascii_case(MARIADB_ENGINE) {
+        return "mariadb.org binary distribution";
+    }
+    "Source distribution"
+}
+
 /// `runtime` with the endpoint's write role written into it.
 ///
 /// An endpoint that serves no writes is served by an engine that is REPLAYING someone
@@ -592,7 +652,7 @@ pub(super) fn parameter_group_family(
 /// role of the endpoint the session is on, which [`replaying`] writes onto the runtime.
 pub(super) fn running_engine(
     family: &str,
-    catalog: Option<&'static [crate::state::ClusterParameterSpec]>,
+    catalogs: &[&'static [crate::state::ClusterParameterSpec]],
     group: Option<&BTreeMap<String, crate::state::ParameterSetting>>,
     engine_started_at: f64,
     master_username: Option<String>,
@@ -600,7 +660,7 @@ pub(super) fn running_engine(
     EngineRuntime {
         parameters: super::pg_server::running_parameters(
             family,
-            catalog,
+            catalogs,
             group,
             engine_started_at,
         ),
@@ -626,11 +686,20 @@ pub(super) fn engine_runtime_of(
     );
     running_engine(
         &family,
-        crate::state::published_db_parameters(&family),
+        // A DB instance runs the parameters its own family publishes.
+        &published_catalogs(&[crate::state::published_db_parameters(&family)]),
         group.map(|group| &group.parameters),
         record.engine_started_at.as_secs_f64(),
         record.master_username.clone(),
     )
+}
+
+/// The catalogs a resource's parameters come from, with the ones this emulator publishes
+/// nothing for left out; see [`running_engine`].
+pub(super) fn published_catalogs(
+    catalogs: &[Option<&'static [crate::state::ClusterParameterSpec]>],
+) -> Vec<&'static [crate::state::ClusterParameterSpec]> {
+    catalogs.iter().flatten().copied().collect()
 }
 
 /// What the engine of one DB instance is running with, as of now.
@@ -1156,10 +1225,11 @@ pub const MYSQL_MASTER_HOST_PATTERN: &str = "%";
 
 /// The settings the SERVER itself answers for, by name — the ones that are not
 /// parameter-group parameters at all. See [`server_setting`], which answers each of them.
-pub const SERVER_SETTING_NAMES: [&str; 27] = [
+pub const SERVER_SETTING_NAMES: [&str; 28] = [
     "ssl",
     "server_version",
     "version",
+    "version_comment",
     "server_encoding",
     "client_encoding",
     "character_set_server",
@@ -1198,6 +1268,14 @@ fn server_setting(facts: &SessionFacts, lowered: &str) -> Option<String> {
         // so the in-band upgrade is always available.
         "ssl" => on_off(true),
         "server_version" | "version" => Some(facts.server_version.clone()),
+        // `version_comment` is how the server DESCRIBES the build it is: a MySQL server
+        // reports its distribution and a MariaDB server its own, which is one of the values a
+        // client reads to tell which engine it is talking to. The PostgreSQL family has no
+        // such variable, and no `@@` form to read one with ([`super::dialect`]).
+        "version_comment" => match facts.wire {
+            EngineWire::MySql => Some(mysql_version_comment(&facts.engine).to_string()),
+            EngineWire::Postgres => None,
+        },
         "server_encoding" | "client_encoding" | "character_set_server"
         | "character_set_client" | "character_set_results" | "character_set_connection" => {
             Some(match facts.wire {
@@ -1393,6 +1471,13 @@ pub fn run_statement(
         return Ok(StatementAnswer::new(String::new(), ResultSet::default()));
     }
     let words = leading_words(&tokens, 3);
+    // A statement written in a form the SESSION'S OWN dialect does not define is refused as
+    // that engine's parse error, before anything is served for it: the two engines are not
+    // one generic SQL front end, and a client that probes which one it is talking to has to
+    // be able to tell ([`dialect::dialect_refusal`]).
+    if let Some(refusal) = dialect::dialect_refusal(facts, &tokens) {
+        return Err(refusal);
+    }
     // A statement that writes is refused whenever the transaction it would run in is
     // read-only — the endpoint serves no writes, or the session's own read-only mode is on
     // ([`SessionFacts::read_only_transaction`]) — exactly as the engine it runs on refuses
@@ -1417,6 +1502,13 @@ pub fn run_statement(
     // A `COPY` that names a FILE or a program on the host is a capability no Amazon RDS
     // instance serves, so it is refused before anything is served for it.
     if let Some(refusal) = super::pg_copy::refused_file_copy(facts, &tokens) {
+        return Err(refusal);
+    }
+    // And so is a FUNCTION that reads or writes that host: the privilege for one belongs to a
+    // predefined role the master user is not a member of, which is what the refusal says.
+    if let Some(refusal) =
+        super::pg_grants::refused_server_file_function(database, facts, &tokens)
+    {
         return Err(refusal);
     }
     if let Some(answer) = server_command(database, facts, &words, &tokens)? {
@@ -1449,6 +1541,13 @@ pub fn run_statement(
         {
             return Ok(answer);
         }
+        // The statements of a MySQL SERVER that are the server's own: the Amazon RDS stored
+        // procedures, and the statement that ends another session.
+        if let Some(answer) =
+            super::mysql_server::server_statement(database, facts, &words, &tokens)?
+        {
+            return Ok(answer);
+        }
     }
     let verb = statement_verb(&words);
     // The system catalogs the statement READS are rebuilt from this service's state first,
@@ -1457,6 +1556,8 @@ pub fn run_statement(
     if !named.is_empty() {
         super::pg_server::refresh_catalogs(database, facts, &named)?;
     }
+    let named = super::mysql_server::catalogs_named(facts, &tokens);
+    super::mysql_server::refresh_catalogs(database, facts, &named)?;
     // Where the statement's own names put it, and the statement as the engine reads it.
     let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
     let prepared = dialect::render_for_engine(facts, &stream);
@@ -1482,8 +1583,9 @@ pub fn run_statement(
         )
         .map_err(|error| {
             let error = server_statements::as_the_engine_words_it(facts.wire, &prepared, error);
+            let error = super::mysql_server::as_mysql_words_it(facts.wire, &target, error);
             super::constraint_names::as_the_engine_names_it(
-                database, facts, &target, &prepared, error,
+                database, facts, &target, &prepared, params, error,
             )
         });
     // The rows a statement WROTE are the rows its transaction has to be able to put back.
@@ -1504,7 +1606,15 @@ pub fn run_statement(
     if !database.in_transaction(facts.connection_id) {
         database.locks().release_rows(facts.connection_id, &held.rows);
     }
-    Ok(StatementAnswer::new(verb, result?))
+    let answer = result?;
+    // A MySQL table's columns carry a CHARACTER SET and a COLLATION the engine declares
+    // nothing for, so what the client declared is recorded for the column catalog to report
+    // ([`super::mysql_server::record_column_charsets`]). Only for a create that SUCCEEDED,
+    // and only after it has: the columns recorded are the columns the table now has.
+    if facts.wire == EngineWire::MySql && verb == "CREATE TABLE" {
+        super::mysql_server::record_column_charsets(database, facts, &tokens)?;
+    }
+    Ok(StatementAnswer::new(verb, answer))
 }
 
 /// The RELATIONS a statement names: the identifier after each `FROM`, `JOIN`, `INTO`,
@@ -1785,6 +1895,7 @@ pub fn server_view(facts: &SessionFacts) -> super::sql_engine::ServerView {
             .setting("statement_timeout")
             .and_then(|value| value.trim().parse().ok())
             .unwrap_or(0),
+        wire: Some(facts.wire),
         deadline: None,
     }
 }

@@ -305,11 +305,9 @@ async fn serve_session(
         application_name: String::new(),
         client_address: facts.endpoint_host.clone(),
         backend_start: super::pg_server::timestamptz_text(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64(),
+            super::engine_time::now_epoch_seconds(),
         ),
+        state_since: super::engine_time::now_epoch_seconds(),
         state: super::pg_sessions::STATE_IDLE.to_string(),
         query: String::new(),
         query_start: None,
@@ -352,6 +350,13 @@ async fn serve_session(
         let Some((sequence, payload)) = packet else {
             return Ok(());
         };
+        // Another session of this endpoint has ENDED this one (`KILL`): a server that kills
+        // a connection closes it without answering, which is what the killed client reports
+        // as the server going away in the middle of its statement. Checked when the
+        // statement arrives, because that is when a killed client next reaches this server.
+        if context.sessions.is_killed(session_facts.connection_id) {
+            return Ok(());
+        }
         let command = *payload.first().unwrap_or(&1);
         let argument = payload.get(1..).unwrap_or_default();
         match command {
@@ -550,6 +555,13 @@ async fn serve_query(
     let Some(statement) = statements.into_iter().next() else {
         return write_error(conn, sequence, 1065, "42000", "Query was empty").await;
     };
+    // What this session is doing NOW, which is what the process list reports: the thread is
+    // executing this statement until it answers.
+    context.sessions.running(
+        facts.connection_id,
+        &statement,
+        super::pg_server::timestamptz_text(super::engine_time::now_epoch_seconds()),
+    );
     let answer = {
         // The instance's engine runtime as it is NOW, so a parameter group a caller
         // modifies under a live session is what this statement runs against — and so is the
@@ -574,8 +586,13 @@ async fn serve_query(
     };
     let answer = match answer {
         Ok(answer) => answer,
-        Err(error) => return write_engine_error(conn, sequence, &error).await,
+        Err(error) => {
+            context.sessions.idle(facts.connection_id);
+            return write_engine_error(conn, sequence, &error).await;
+        }
     };
+    // The statement is through, so the thread is between statements again.
+    context.sessions.idle(facts.connection_id);
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
     }
@@ -756,6 +773,9 @@ fn column_type(column: &ColumnInfo, sample: Option<&Cell>) -> (u8, bool) {
             "date" => Some((DATE, true)),
             "time" => Some((TIME, true)),
             "datetime" => Some((DATETIME, true)),
+            // The instant a server function answers with, which a MySQL client decodes as
+            // the `DATETIME` its own `NOW()` answers with.
+            "timestamptz" | "timestamp with time zone" => Some((DATETIME, true)),
             "timestamp" => Some((TIMESTAMP, true)),
             "json" => Some((JSON, false)),
             "blob" | "bytea" | "binary" | "varbinary" => Some((BLOB, true)),

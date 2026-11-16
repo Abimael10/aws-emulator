@@ -21,12 +21,144 @@
 
 use sqlparser::tokenizer::Token;
 
+use super::sql_engine::{EngineError, EngineErrorKind};
 use super::wire_session::{server_version_banner, SessionFacts};
 use super::EngineWire;
 
 /// The statement as the engine is asked to run it; see this module's own notes.
 pub fn render_for_engine(facts: &SessionFacts, tokens: &[Token]) -> String {
     render_at(facts, tokens, 0)
+}
+
+/// How a reference to a system variable is written in the MySQL family's grammar: `@@name`,
+/// or `@@` on its own followed by the name.
+const MYSQL_SYSTEM_VARIABLE_PREFIX: &str = "@@";
+
+/// The refusal a statement written in a form the SESSION'S OWN dialect does not define is
+/// answered with, or `None` for a statement its dialect reads.
+///
+/// Two forms are refused here, and both are the same rule: the two engines are not one
+/// generic SQL front end, so what one family defines the other does not have.
+///
+/// * The `@@<name>` reference is the MySQL family's spelling of a system variable, and the
+///   PostgreSQL grammar has no such form: a statement carrying one does not parse there. The
+///   refusal is this server's rather than the embedded engine's so that it carries
+///   PostgreSQL's own sentence for a token its grammar cannot read.
+/// * A FUNCTION only the other family defines (`current_setting` and the `pg_*` functions on
+///   PostgreSQL, `UTC_TIMESTAMP` and the rest on MySQL) is refused as the engine refuses an
+///   undefined function, in that engine's own words. The embedded engine has both families'
+///   functions registered on one connection, which is exactly what a client probing which
+///   engine it is talking to must not see.
+#[must_use]
+pub fn dialect_refusal(facts: &SessionFacts, tokens: &[Token]) -> Option<EngineError> {
+    if facts.wire == EngineWire::Postgres {
+        if let Some(named) = mysql_system_variable_at(tokens) {
+            return Some(EngineError::new(
+                EngineErrorKind::Syntax,
+                format!("syntax error at or near \"{named}\""),
+            ));
+        }
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(at, token)| match token {
+            // Only a word that is CALLED is a function reference; a column or an alias that
+            // happens to share a function's name is the identifier it is.
+            Token::Word(word)
+                if next_significant(tokens, at + 1)
+                    .and_then(|next| tokens.get(next))
+                    .is_some_and(|next| matches!(next, Token::LParen)) =>
+            {
+                Some(word.value.clone())
+            }
+            _ => None,
+        })
+        .find(|called| other_familys_function(facts.wire, called))
+        .map(|called| undefined_function(facts, &called))
+}
+
+/// Whether `function` is one a session on `wire` does not have because it belongs to the
+/// OTHER engine family; see [`dialect_refusal`].
+fn other_familys_function(wire: EngineWire, function: &str) -> bool {
+    if super::engine_time::is_defined_on(function, wire) == Some(false) {
+        return true;
+    }
+    // The PostgreSQL SERVER functions, which no MySQL server has. `md5` is absent from this:
+    // both families define it, under that name, over the same bytes.
+    wire == EngineWire::MySql && super::pg_server::is_postgres_only_function(function)
+}
+
+/// The system-variable reference a statement carries, as the client wrote it, or `None` where
+/// it carries none.
+///
+/// A reference is the `@@` prefix IMMEDIATELY followed by the variable's NAME — `@@name` as
+/// one token, or `@@` followed by the name (and by a scope and a period). The bare operator is
+/// not one: `@@` is also PostgreSQL's own text-search match operator, and a statement written
+/// in its grammar is the statement it is.
+fn mysql_system_variable_at(tokens: &[Token]) -> Option<String> {
+    for (at, token) in tokens.iter().enumerate() {
+        let text = token.to_string();
+        let Some(rest) = text.strip_prefix(MYSQL_SYSTEM_VARIABLE_PREFIX) else {
+            continue;
+        };
+        // Only where a VALUE can begin: a reference is an expression of its own, so one with
+        // an operand to its left is the binary operator PostgreSQL defines instead.
+        if !begins_an_expression(tokens, at) {
+            continue;
+        }
+        // The name may be joined to the prefix, or be the next token.
+        if !rest.is_empty() {
+            return Some(text);
+        }
+        if let Some(Token::Word(word)) = next_significant(tokens, at + 1).and_then(|next| tokens.get(next)) {
+            return Some(format!("{MYSQL_SYSTEM_VARIABLE_PREFIX}{}", word.value));
+        }
+    }
+    None
+}
+
+/// Whether a VALUE can begin at `at`: nothing precedes it, or what does cannot end an
+/// expression.
+///
+/// A keyword, a comma, an opening parenthesis and an operator all leave the next token to
+/// begin a value; an identifier, a literal, a number and a closing parenthesis are values
+/// themselves, so what follows one is an operator applied to it.
+fn begins_an_expression(tokens: &[Token], at: usize) -> bool {
+    let before = (0..at)
+        .rev()
+        .find(|index| !matches!(tokens.get(*index), Some(Token::Whitespace(_))))
+        .and_then(|index| tokens.get(index));
+    match before {
+        None => true,
+        Some(Token::Word(word)) => word.keyword != ::sqlparser::keywords::Keyword::NoKeyword,
+        Some(
+            Token::RParen
+            | Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::Number(..)
+            | Token::Placeholder(_),
+        ) => false,
+        Some(_) => true,
+    }
+}
+
+/// What the session's own engine answers for a function it does not have.
+fn undefined_function(facts: &SessionFacts, called: &str) -> EngineError {
+    match facts.wire {
+        // `ER_SP_DOES_NOT_EXIST`: MySQL names the schema it looked for the function in,
+        // which is the database the session is on.
+        EngineWire::MySql => EngineError::new(
+            EngineErrorKind::UndefinedObject,
+            format!("FUNCTION {}.{called} does not exist", facts.database),
+        )
+        .with_mysql_error(1305, "42000"),
+        EngineWire::Postgres => EngineError::new(
+            EngineErrorKind::UndefinedObject,
+            format!("function {called}() does not exist"),
+        )
+        .with_sqlstate("42883"),
+    }
 }
 
 /// How deep a NESTED catalog-function call this rewriting follows.
@@ -58,6 +190,12 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
         EngineWire::MySql => mysql_column_list_close(tokens),
         EngineWire::Postgres => None,
     };
+    // Where a MySQL `CREATE TABLE`'s table-constraint clauses are, and what each becomes in
+    // the engine's own grammar ([`mysql_table_constraints`]).
+    let table_constraints = match column_list_close {
+        Some(close) => mysql_table_constraints(tokens, close),
+        None => Vec::new(),
+    };
     while index < tokens.len() {
         let token = &tokens[index];
         let text = token.to_string();
@@ -67,8 +205,28 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
             out.push(text);
             break;
         }
+        // A table-constraint clause of a MySQL `CREATE TABLE`, written as the engine
+        // declares the same constraint.
+        if let Some(rewrite) = table_constraints
+            .iter()
+            .find(|rewrite| rewrite.from == index)
+        {
+            match &rewrite.declared {
+                Some(declared) => out.push(declared.clone()),
+                // A clause the engine declares nothing for leaves the list, and the comma
+                // that separated it from the clause before goes with it.
+                None => drop_the_separating_comma(&mut out),
+            }
+            index = rewrite.until;
+            continue;
+        }
         // A MySQL system variable: `@@name`, `@@scope.name`, or `@@` followed by either.
-        if let Some(name) = text.strip_prefix("@@") {
+        // Only on the MySQL wire: the form is that family's own, and the other wire's
+        // statements never reach this pass ([`dialect_refusal`]).
+        if let Some(name) = text
+            .strip_prefix(MYSQL_SYSTEM_VARIABLE_PREFIX)
+            .filter(|_| facts.wire == EngineWire::MySql)
+        {
             let (name, consumed) = system_variable_name(tokens, index, name);
             out.push(quote_value(facts.setting(&name)));
             index += consumed;
@@ -103,6 +261,17 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
                     widen_to_rowid_type(&mut out);
                     index += 1;
                     continue;
+                }
+                // The CHARACTER SET and the COLLATION a MySQL column is declared with: the
+                // engine stores text as UTF-8 and names its collations differently, so the
+                // clause is not part of the declaration it is handed. The column holds the
+                // same characters either way — which is what a client reading its rows back
+                // sees — and a statement that names one is not refused for the spelling.
+                if facts.wire == EngineWire::MySql {
+                    if let Some(consumed) = mysql_character_set_clause(tokens, index) {
+                        index += consumed;
+                        continue;
+                    }
                 }
                 let next = next_significant(tokens, index + 1);
                 let called = matches!(next.and_then(|at| tokens.get(at)), Some(Token::LParen));
@@ -307,6 +476,172 @@ fn leads_with_create_table(tokens: &[Token]) -> bool {
         && words.iter().take(4).any(|word| word == "TABLE")
 }
 
+/// One TABLE-CONSTRAINT clause of a MySQL `CREATE TABLE`, and what the engine is handed in
+/// its place.
+struct TableConstraintRewrite {
+    /// The index of the clause's first significant token.
+    from: usize,
+    /// The index the rendering carries on at: the separator after the clause, or — for a
+    /// clause that leaves the list first — just past that separator.
+    until: usize,
+    /// How the engine declares the same constraint, or `None` for one it declares nothing
+    /// for.
+    declared: Option<String>,
+}
+
+/// The TABLE-CONSTRAINT clauses of the MySQL `CREATE TABLE` whose column list closes at
+/// `close`, each with what the engine is handed for it.
+///
+/// MySQL declares a table constraint with its own `KEY`/`INDEX` vocabulary, where the engine
+/// (and the SQL standard) declares the same constraint with `CONSTRAINT <name>`:
+///
+/// * `UNIQUE [KEY|INDEX] [<name>] (<columns>)` is a NAMED UNIQUE CONSTRAINT — "a UNIQUE
+///   index … creates a constraint such that all values in the index must be distinct" — so
+///   it is declared as `CONSTRAINT <name> UNIQUE (<columns>)`, which is the same rule under
+///   the same name. The name matters past the DDL: it is what the server names in the
+///   refusal of a row that violates it (`super::constraint_names`).
+/// * `[KEY|INDEX] <name> (<columns>)`, and the `FULLTEXT`/`SPATIAL` forms, declare an INDEX
+///   and no constraint: MySQL's manual separates the two, and an index changes which rows a
+///   query reads rather than which rows the table admits. The engine has no inline index
+///   declaration, so the clause leaves the table definition and the table it creates holds
+///   exactly the rows MySQL's would.
+///
+/// Every other clause — a column definition, `PRIMARY KEY`, `FOREIGN KEY`, `CHECK` — is
+/// already written in a form the engine declares, and carries no entry here.
+fn mysql_table_constraints(tokens: &[Token], close: usize) -> Vec<TableConstraintRewrite> {
+    let significant: Vec<usize> = (0..close)
+        .filter(|at| !matches!(tokens.get(*at), Some(Token::Whitespace(_))))
+        .collect();
+    // Where the column list opens: the parenthesis the one at `close` matches, which is the
+    // first one of the statement that is still open there.
+    let mut depth = 0usize;
+    let mut open = None;
+    for at in &significant {
+        match tokens.get(*at) {
+            Some(Token::LParen) => {
+                depth += 1;
+                if depth == 1 {
+                    open = Some(*at);
+                    break;
+                }
+            }
+            Some(Token::RParen) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return Vec::new();
+    };
+    // The clauses: the spans of the list separated by its own commas.
+    let mut rewrites = Vec::new();
+    let mut depth = 0usize;
+    let mut clause: Vec<usize> = Vec::new();
+    let mut first = true;
+    let push = |clause: &[usize], at: usize, first: bool, rewrites: &mut Vec<TableConstraintRewrite>| {
+        if let Some(declared) = table_constraint_declaration(tokens, clause) {
+            let from = clause.first().copied().unwrap_or(at);
+            // A clause that LEAVES the list first takes the separator after it with it, so
+            // the list the engine reads has no empty entry where it was. Only a separator:
+            // the parenthesis that closes the list is the list's own.
+            let separates = matches!(tokens.get(at), Some(Token::Comma));
+            let until = if declared.is_none() && first && separates {
+                at + 1
+            } else {
+                at
+            };
+            rewrites.push(TableConstraintRewrite {
+                from,
+                until,
+                declared,
+            });
+        }
+    };
+    for at in significant.iter().copied().filter(|at| *at > open) {
+        match tokens.get(at) {
+            Some(Token::LParen) => depth += 1,
+            Some(Token::RParen) => depth = depth.saturating_sub(1),
+            Some(Token::Comma) if depth == 0 => {
+                push(&clause, at, first, &mut rewrites);
+                clause.clear();
+                first = false;
+                continue;
+            }
+            _ => {}
+        }
+        clause.push(at);
+    }
+    push(&clause, close, first, &mut rewrites);
+    rewrites
+}
+
+/// How the engine declares the table-constraint clause whose significant tokens are at
+/// `clause`: `Some(Some(..))` for a clause it declares differently, `Some(None)` for one it
+/// declares nothing for, and `None` for a clause that is already in its own grammar.
+///
+/// See [`mysql_table_constraints`] for which clause is which.
+fn table_constraint_declaration(
+    tokens: &[Token],
+    clause: &[usize],
+) -> Option<Option<String>> {
+    let token_at = |position: usize| clause.get(position).and_then(|at| tokens.get(*at));
+    let word_at = |position: usize| match token_at(position) {
+        Some(Token::Word(word)) if word.quote_style.is_none() => {
+            Some(word.value.to_ascii_uppercase())
+        }
+        _ => None,
+    };
+    let mut position = 0usize;
+    // An explicitly named constraint: the name the client gave it, and the kind that
+    // follows.
+    let mut named: Option<String> = None;
+    if word_at(0).as_deref() == Some("CONSTRAINT") {
+        named = token_at(1).map(ToString::to_string);
+        position = 2;
+    }
+    match word_at(position).as_deref() {
+        Some("UNIQUE") => {}
+        Some("KEY" | "INDEX" | "FULLTEXT" | "SPATIAL") => return Some(None),
+        _ => return None,
+    }
+    position += 1;
+    // The `KEY` or `INDEX` noun MySQL writes after `UNIQUE`, which the declaration does not
+    // carry.
+    if matches!(word_at(position).as_deref(), Some("KEY" | "INDEX")) {
+        position += 1;
+    }
+    // The index's own name, where the clause names one before the column list.
+    if let Some(Token::Word(word)) = token_at(position) {
+        if named.is_none() {
+            named = Some(word.to_string());
+        }
+        position += 1;
+    }
+    // The columns the constraint is over, exactly as the client wrote them.
+    let columns: String = clause
+        .get(position..)?
+        .iter()
+        .map(|at| tokens[*at].to_string())
+        .collect();
+    if !columns.starts_with('(') {
+        return None;
+    }
+    Some(Some(match named {
+        Some(named) => format!("CONSTRAINT {named} UNIQUE {columns}"),
+        None => format!("UNIQUE {columns}"),
+    }))
+}
+
+/// Drop the separator before the clause that has just left a `CREATE TABLE`'s column list,
+/// so the list the engine reads has no empty entry where the clause was.
+fn drop_the_separating_comma(out: &mut Vec<String>) {
+    while out.last().is_some_and(|piece| piece.trim().is_empty()) {
+        out.pop();
+    }
+    if out.last().map(String::as_str) == Some(",") {
+        out.pop();
+    }
+}
+
 /// The column types a MySQL `AUTO_INCREMENT` column may be declared with, and which the
 /// engine needs declared as its own rowid type for the column to be assigned values.
 ///
@@ -340,6 +675,45 @@ fn widen_to_rowid_type(out: &mut [String]) {
         if piece == "," || piece == "(" {
             return;
         }
+    }
+}
+
+/// How many tokens the CHARACTER SET or COLLATE clause at `at` spans, or `None` where no
+/// such clause starts there.
+///
+/// MySQL writes a column's character set as `CHARACTER SET <name>` or `CHARSET <name>` and
+/// its collation as `COLLATE <name>`, each optionally with an `=`; see the call site for why
+/// the clause is not part of the declaration the engine is handed.
+fn mysql_character_set_clause(tokens: &[Token], at: usize) -> Option<usize> {
+    let word_at = |index: usize| match tokens.get(index) {
+        Some(Token::Word(word)) if word.quote_style.is_none() => {
+            Some(word.value.to_ascii_lowercase())
+        }
+        _ => None,
+    };
+    let mut cursor = match word_at(at)?.as_str() {
+        // `CHARACTER SET <name>`: the noun is two words.
+        "character" => {
+            let set = next_significant(tokens, at + 1)
+                .filter(|index| word_at(*index).as_deref() == Some("set"))?;
+            set + 1
+        }
+        "charset" | "collate" => at + 1,
+        _ => return None,
+    };
+    // The optional `=` a table or column option may be written with.
+    if let Some(equals) = next_significant(tokens, cursor) {
+        if matches!(tokens.get(equals), Some(Token::Eq)) {
+            cursor = equals + 1;
+        }
+    }
+    // The name itself, which the clause has to carry for this to be one.
+    let named = next_significant(tokens, cursor)?;
+    match tokens.get(named) {
+        Some(Token::Word(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)) => {
+            Some(named + 1 - at)
+        }
+        _ => None,
     }
 }
 
@@ -530,10 +904,18 @@ fn session_function(facts: &SessionFacts, lowered: &str, called: bool) -> Option
         // the account whose privileges the session holds — for the RDS master user, the
         // `'<master>'@'%'` account RDS grants — and `USER()` reports the account name with
         // the host the client actually connected from, which is the endpoint's own host.
+        //
+        // `USER` and `SESSION_USER` are MySQL FUNCTIONS and not keywords of its grammar —
+        // only `CURRENT_USER` may be written without parentheses there — so they are
+        // substituted only where they are called. A bare `USER` is the identifier it is: the
+        // noun of `CREATE USER`, and the `User` column of the server's own grant tables.
         "current_user" | "current_role" if facts.wire == EngineWire::MySql => {
             text(&facts.mysql_account())
         }
         "user" | "session_user" if facts.wire == EngineWire::MySql => {
+            if !called {
+                return None;
+            }
             text(&format!("{}@{}", facts.user, facts.endpoint_host))
         }
         "current_user" | "session_user" | "user" | "current_role" => text(&facts.user),
@@ -559,11 +941,20 @@ fn session_function(facts: &SessionFacts, lowered: &str, called: bool) -> Option
 /// A system variable whose value is a WHOLE NUMBER is a numeric variable of the server
 /// (`read_only`, `max_connections`), and both engines answer one as a number rather than as
 /// text — which is the type the wire then reports for the column, and what a client reads it
-/// back as. Every other value is text, quoted so the statement the engine runs carries it as
-/// one literal whatever it contains.
+/// back as.
+///
+/// A BOOLEAN system variable of a MySQL server is one of those: `SHOW VARIABLES` renders its
+/// value as `ON` or `OFF`, and a `@@`-reference to the same variable answers 1 or 0, which is
+/// what a typed driver decodes as an integer. The two readings are the same state written the
+/// way each statement class writes it.
+///
+/// Every other value is text, quoted so the statement the engine runs carries it as one
+/// literal whatever it contains.
 fn quote_value(value: Option<String>) -> String {
     match value {
         Some(value) if value.trim().parse::<i64>().is_ok() => value.trim().to_string(),
+        Some(value) if value.trim().eq_ignore_ascii_case("on") => "1".to_string(),
+        Some(value) if value.trim().eq_ignore_ascii_case("off") => "0".to_string(),
         Some(value) => format!("'{}'", value.replace('\'', "''")),
         None => "NULL".to_string(),
     }

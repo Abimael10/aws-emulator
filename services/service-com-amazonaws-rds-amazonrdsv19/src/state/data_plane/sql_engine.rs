@@ -76,11 +76,11 @@ const PROGRESS_HANDLER_OPS: std::os::raw::c_int = 1_000;
 /// mirror the ones this emulator's other SQL data plane uses
 /// (`service-com-amazonaws-rdsdata-rdsdataservice`), so the two cannot drift on what a
 /// statement may cost.
-const MAX_VALUE_BYTES: i32 = 1024 * 1024;
+pub const MAX_VALUE_BYTES: i32 = 1024 * 1024;
 const MAX_SQL_BYTES: i32 = 65_536;
 const MAX_EXPRESSION_DEPTH: i32 = 200;
 const MAX_COMPOUND_SELECT: i32 = 20;
-const MAX_BOUND_PARAMETERS: i32 = 1_000;
+pub const MAX_BOUND_PARAMETERS: i32 = 1_000;
 
 /// The page ceiling on each database the connection has, so the rows one instance holds
 /// cannot grow the process without limit (16,384 pages of 4 KiB, 64 MiB per schema).
@@ -192,6 +192,11 @@ pub struct EngineError {
     /// The error number and SQLSTATE the MySQL wire reports this refusal under, where the
     /// CONDITION names one of its own ([`EngineError::with_mysql_error`]).
     pub mysql_error: Option<(u16, &'static str)>,
+    /// The CONSTRAINT this refusal is about, where it is about one: the rule the row
+    /// violated, which the PostgreSQL wire reports as a FIELD of the error rather than only
+    /// inside its sentence — a client reads it to decide which unique or foreign-key rule it
+    /// broke ([`EngineError::with_constraint`]).
+    pub constraint: Option<String>,
 }
 
 impl EngineError {
@@ -203,7 +208,15 @@ impl EngineError {
             offset: None,
             sqlstate: None,
             mysql_error: None,
+            constraint: None,
         }
+    }
+
+    /// The same failure, naming the CONSTRAINT the row violated.
+    #[must_use]
+    pub fn with_constraint(mut self, constraint: impl Into<String>) -> Self {
+        self.constraint = Some(constraint.into());
+        self
     }
 
     /// The same failure, reported on the PostgreSQL wire under `sqlstate`.
@@ -322,6 +335,10 @@ pub struct ServerView {
     /// `statement_timeout` for this statement, in milliseconds; 0 disables it, as the
     /// parameter documents.
     pub statement_timeout_ms: u64,
+    /// Which WIRE the session running this statement speaks, and so which dialect's
+    /// functions the statement may call ([`super::engine_time`]). `None` for one of the
+    /// server's own statements, which runs under no session.
+    pub wire: Option<super::EngineWire>,
     /// When the statement running now must be cancelled, which is what `pg_sleep` waits
     /// against.
     pub deadline: Option<Instant>,
@@ -1326,6 +1343,7 @@ fn open_confined_database(view: &Arc<Mutex<ServerView>>) -> Result<Connection, E
     conn.authorizer(Some(confine_to_the_instance))
         .map_err(unavailable)?;
     register_server_functions(&conn, view)?;
+    super::engine_time::register_time_functions(&conn, view)?;
     super::pg_numeric::register_numeric_functions(&conn)?;
     Ok(conn)
 }
@@ -1521,7 +1539,78 @@ fn register_server_functions(
         },
     )
     .map_err(unavailable)?;
+
+    // `char_length(text)` / `character_length(text)` — the number of CHARACTERS in the
+    // argument, which both families define under both names. The count is over the
+    // argument's own characters, so a multi-byte character counts once, which is what
+    // separates it from the byte length.
+    for name in ["char_length", "character_length"] {
+        conn.create_scalar_function(
+            name,
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| Ok(measured(context.get_raw(0), Measure::Characters)),
+        )
+        .map_err(unavailable)?;
+    }
+
+    // `length(x)` means a DIFFERENT measure in each family: MySQL's "returns the length of
+    // the string measured in bytes", while PostgreSQL's is the number of characters — and
+    // `octet_length(x)`, which both define, is the bytes. So the measure follows the wire the
+    // session speaks, and a client asking its own engine's question gets its own engine's
+    // answer.
+    let measures = Arc::clone(view);
+    conn.create_scalar_function(
+        "length",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        move |context| {
+            let measure = match read(&measures).wire {
+                Some(super::EngineWire::MySql) => Measure::Bytes,
+                _ => Measure::Characters,
+            };
+            Ok(measured(context.get_raw(0), measure))
+        },
+    )
+    .map_err(unavailable)?;
+    conn.create_scalar_function(
+        "octet_length",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| Ok(measured(context.get_raw(0), Measure::Bytes)),
+    )
+    .map_err(unavailable)?;
     Ok(())
+}
+
+/// WHAT a length function counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Measure {
+    /// The characters in the value, so a multi-byte character counts once.
+    Characters,
+    /// The bytes the value occupies.
+    Bytes,
+}
+
+/// The length of `value` under `measure`, or `None` for SQL NULL — whose length is NULL on
+/// both engines.
+///
+/// A number is measured as the digits the engine renders it with, which is the string both
+/// engines measure for a numeric argument; a byte string is its own bytes either way, having
+/// no character boundaries to count.
+fn measured(value: ValueRef<'_>, measure: Measure) -> Option<i64> {
+    let count = |bytes: &[u8]| match measure {
+        Measure::Bytes => bytes.len(),
+        Measure::Characters => String::from_utf8_lossy(bytes).chars().count(),
+    };
+    let measured = match value {
+        ValueRef::Null => return None,
+        ValueRef::Text(bytes) => count(bytes),
+        ValueRef::Blob(bytes) => bytes.len(),
+        ValueRef::Integer(number) => count(number.to_string().as_bytes()),
+        ValueRef::Real(number) => count(number.to_string().as_bytes()),
+    };
+    Some(i64::try_from(measured).unwrap_or_default())
 }
 
 /// The bytes `md5()` hashes: the argument's own, as the engine holds them — text as its
@@ -1716,7 +1805,11 @@ fn from_engine(error: rusqlite::Error) -> EngineError {
         ..
     } = &error
     {
-        return EngineError::new(failure_kind(failure), msg.clone())
+        // The SENTENCE still decides the class where it names one: an object the statement
+        // reads that does not exist is an undefined object whether the engine reported it
+        // while reading the statement or while running it, and a client branches on that
+        // class rather than on a parse error.
+        return EngineError::new(named_class(msg).unwrap_or_else(|| failure_kind(failure)), msg.clone())
             .at_offset(usize::try_from(*offset).ok());
     }
     let message = engine_message(&error);
@@ -1727,31 +1820,34 @@ fn from_engine(error: rusqlite::Error) -> EngineError {
         }
         _ => EngineErrorKind::Internal,
     };
-    // SQLite words a missing table or column as "no such <thing>", which is the one
-    // failure class every client branches on separately. A configuration parameter the
-    // server does not have is the same class: PostgreSQL answers it as an undefined
-    // object, and the sentence comes from `current_setting` above.
-    let kind = if message.contains("no such table")
+    EngineError::new(named_class(&message).unwrap_or(kind), message)
+}
+
+/// The class the engine's own SENTENCE names, for the conditions whose wording says which
+/// they are, or `None` where only the failure code says.
+///
+/// SQLite words a missing table or column as "no such <thing>", which is the one failure
+/// class every client branches on separately. A configuration parameter the server does not
+/// have is the same class: PostgreSQL answers it as an undefined object, and the sentence
+/// comes from `current_setting` above. The exact-decimal functions (`super::pg_numeric`) each
+/// carry the engine's own sentence for their condition, and the class is read back off it
+/// here.
+fn named_class(message: &str) -> Option<EngineErrorKind> {
+    if message.contains("no such table")
         || message.contains("no such column")
         || message.contains("no such function")
         || message.contains("no such index")
         || message.contains("no such view")
         || message.starts_with("unrecognized configuration parameter")
     {
-        EngineErrorKind::UndefinedObject
-    } else if message == STATEMENT_TIMEOUT_CANCELLATION {
-        EngineErrorKind::Cancelled
-    } else if message == NUMERIC_FIELD_OVERFLOW {
-        // The conditions the exact-decimal functions report (`super::pg_numeric`), each
-        // under the class its own engine reports it under: the function surface carries the
-        // engine's sentence, and the class is read back off it here.
-        EngineErrorKind::NumericValueOutOfRange
-    } else if message == DIVISION_BY_ZERO {
-        EngineErrorKind::DivisionByZero
-    } else {
-        kind
-    };
-    EngineError::new(kind, message)
+        return Some(EngineErrorKind::UndefinedObject);
+    }
+    match message {
+        STATEMENT_TIMEOUT_CANCELLATION => Some(EngineErrorKind::Cancelled),
+        NUMERIC_FIELD_OVERFLOW => Some(EngineErrorKind::NumericValueOutOfRange),
+        DIVISION_BY_ZERO => Some(EngineErrorKind::DivisionByZero),
+        _ => None,
+    }
 }
 
 /// What PostgreSQL tells a client whose value no longer fits the precision and scale its
@@ -1856,6 +1952,7 @@ fn confine_to_the_instance(context: AuthContext<'_>) -> Authorization {
             if ::service_common::sqlite_confinement::sql_function_is_permitted(function_name)
                 || super::pg_server::is_server_function(function_name)
                 || super::pg_numeric::is_engine_function(function_name)
+                || super::engine_time::is_time_function(function_name)
             {
                 Authorization::Allow
             } else {

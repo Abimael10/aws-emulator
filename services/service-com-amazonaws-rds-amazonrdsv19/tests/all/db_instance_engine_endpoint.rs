@@ -295,6 +295,10 @@ impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificat
 /// A PostgreSQL session a client has opened.
 pub(crate) struct PostgresSession {
     conn: Client,
+    /// The CONSTRAINT field (`n`) of the last `ErrorResponse` this session read, where it
+    /// carried one: the field a driver reads the violated constraint's name out of, which is
+    /// not part of the message.
+    pub(crate) last_refusal_constraint: Option<String>,
 }
 
 /// Open a PostgreSQL session on `address:port`, as libpq does: the optional `SSLRequest`
@@ -367,7 +371,10 @@ pub(crate) async fn postgres_login(
             }
             b'E' => return Err(postgres_refusal(&body)),
             // ReadyForQuery: the session is open.
-            b'Z' => return Ok(PostgresSession { conn }),
+            b'Z' => return Ok(PostgresSession {
+                conn,
+                last_refusal_constraint: None,
+            }),
             // ParameterStatus, BackendKeyData, NoticeResponse.
             _ => {}
         }
@@ -506,7 +513,10 @@ impl PostgresSession {
                     }
                     answer.rows.push(row);
                 }
-                b'E' => refusal = Some(postgres_refusal(&body)),
+                b'E' => {
+                    refusal = Some(postgres_refusal(&body));
+                    self.last_refusal_constraint = postgres_error_field(&body, b'n');
+                }
                 // NoticeResponse: what the server has to say about the statement.
                 b'N' => answer.notices.push(postgres_refusal(&body)),
                 // ReadyForQuery ends the exchange.
@@ -570,6 +580,20 @@ fn postgres_refusal(body: &[u8]) -> Refusal {
         at = next;
     }
     refusal
+}
+
+/// The value of one FIELD of an `ErrorResponse`, by its field code.
+pub(crate) fn postgres_error_field(body: &[u8], field: u8) -> Option<String> {
+    let mut at = 0usize;
+    while at < body.len() && body[at] != 0 {
+        let this = body[at];
+        let (value, next) = read_cstring(body, at + 1);
+        if this == field {
+            return Some(value);
+        }
+        at = next;
+    }
+    None
 }
 
 /// Append a NUL-terminated string.
@@ -722,18 +746,22 @@ impl MySqlSession {
         let mut answer = Rows::default();
         for _ in 0..columns {
             let (_, definition) = mysql_read(&mut self.conn).await;
-            // catalog, schema, table, org_table, name: the name is the fifth
-            // length-encoded string.
+            // catalog, schema, table, org_table, name, org_name: the name is the fifth
+            // length-encoded string. Then the fixed part the protocol declares the length
+            // of: the character set (2), the column length (4) and the TYPE CODE — which is
+            // what a driver picks its decoder by.
             let mut at = 0usize;
             let mut name = String::new();
-            for field in 0..5 {
+            for field in 0..6 {
                 let (value, next) = read_length_encoded_string(&definition, at);
                 at = next;
                 if field == 4 {
                     name = value;
                 }
             }
+            let (_, fixed) = read_length_encoded(&definition, at);
             answer.columns.push(name);
+            answer.type_oids.push(i32::from(definition[fixed + 6]));
         }
         loop {
             let (_, packet) = mysql_read(&mut self.conn).await;

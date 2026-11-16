@@ -344,6 +344,23 @@ pub(crate) fn served_engines() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
+/// Whether two engines are of the SAME FAMILY — the engines whose published parameter
+/// vocabulary is one table, because they are one engine with different management around it:
+/// the MySQL-compatible engines (MySQL, MariaDB and Aurora MySQL) share one, and the
+/// PostgreSQL-compatible engines share another.
+///
+/// It decides what a published name is EVIDENCE of: a parameter one engine of a family
+/// publishes and another of the same family does not is no evidence that the second lacks it,
+/// because the published tables here are samples of each family's list rather than the whole
+/// of it (see [`MYSQL_PARAMETERS`]) and a family's engines run the same server variables.
+/// Across families the evidence holds: a PostgreSQL parameter is no parameter of a MySQL
+/// family (`crate::state::published_for_another_engine`).
+pub(crate) fn engines_of_one_family(engine: &str, other: &str) -> bool {
+    ParameterVocabulary::ALL
+        .iter()
+        .any(|vocabulary| vocabulary.is_spoken_by(engine) && vocabulary.is_spoken_by(other))
+}
+
 /// The engine `family` names, or `None` when it names none.
 ///
 /// The LONGEST engine name that prefixes the family wins, because the engine names
@@ -572,15 +589,23 @@ pub(crate) enum ParameterVocabulary {
     /// family's version can be COMPARED against this vocabulary's release columns is a
     /// second question ([`family_version_is_in_catalog_numbering`]).
     MysqlCompatible,
+    /// The PostgreSQL-compatible engines, which share [`POSTGRES_PARAMETERS`] and the
+    /// cluster-level PostgreSQL table: Amazon RDS for PostgreSQL and Aurora PostgreSQL.
+    PostgresCompatible,
 }
 
 impl ParameterVocabulary {
+    /// Every vocabulary this front door publishes, which is what decides whether two engines
+    /// are of one family ([`engines_of_one_family`]).
+    const ALL: [Self; 2] = [Self::MysqlCompatible, Self::PostgresCompatible];
+
     /// Whether `engine` is one of the engines that share this vocabulary — the same reading
     /// [`engine_default_parameters`] selects its catalog by, so the two cannot disagree
     /// about which engines a published column is about.
     fn is_spoken_by(self, engine: &str) -> bool {
         match self {
             Self::MysqlCompatible => engine.ends_with("mysql") || engine == "mariadb",
+            Self::PostgresCompatible => is_postgres_engine(engine),
         }
     }
 }

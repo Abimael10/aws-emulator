@@ -27,7 +27,7 @@ use crate::state::{ClusterParameterSpec, ParameterSetting};
 ///
 /// A statement that names one has that catalog rebuilt from state before it runs
 /// ([`refresh_catalogs`]); a statement that names none pays nothing.
-pub const CATALOGS: [&str; 8] = [
+pub const CATALOGS: [&str; 9] = [
     "pg_settings",
     "pg_database",
     "pg_roles",
@@ -36,6 +36,7 @@ pub const CATALOGS: [&str; 8] = [
     "pg_auth_members",
     "pg_namespace",
     "pg_class",
+    "pg_available_extensions",
 ];
 
 /// The catalog tables' definitions, with the columns PostgreSQL publishes for each and the
@@ -46,7 +47,7 @@ pub const CATALOGS: [&str; 8] = [
 /// `pg_auth_members`, `pg_namespace` and `pg_class` — reduced
 /// to the columns this server has state behind. A column it has no state for is left out of
 /// the view rather than filled with a value nothing stands behind.
-const CATALOG_SCHEMA: [&str; 8] = [
+const CATALOG_SCHEMA: [&str; 9] = [
     "CREATE TABLE IF NOT EXISTS pg_settings (\
        name text PRIMARY KEY, setting text, unit text, category text, short_desc text, \
        context text, vartype text, source text, min_val text, max_val text, enumvals text, \
@@ -63,7 +64,8 @@ const CATALOG_SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS pg_stat_activity (\
        pid integer PRIMARY KEY, datid integer, datname text, usesysid integer, \
        usename text, application_name text, client_addr text, backend_start text, \
-       xact_start text, query_start text, state text, query text, backend_type text)",
+       xact_start text, query_start text, wait_event_type text, wait_event text, \
+       state text, query text, backend_type text)",
     // `pg_user` is PostgreSQL's view of the roles that can LOG IN, which is why its
     // `passwd` column is the fixed `********` the view substitutes rather than anything
     // derived from a password.
@@ -83,6 +85,11 @@ const CATALOG_SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS pg_class (\
        oid integer PRIMARY KEY, relname text UNIQUE, relnamespace integer, \
        relowner integer, relkind text, relacl text)",
+    // The extensions the instance has a control file for, with the version each declares
+    // and the version installed in THIS database — which is what an extension is installed
+    // in.
+    "CREATE TABLE IF NOT EXISTS pg_available_extensions (\
+       name text PRIMARY KEY, default_version text, installed_version text, comment text)",
 ];
 
 /// The encoding every database on an RDS for PostgreSQL instance is created with, as
@@ -234,14 +241,28 @@ fn context(spec: &ClusterParameterSpec) -> &'static str {
 ///
 /// `engine_started_at` is when this instance's engine last came up, as epoch seconds, and
 /// `family` is the parameter-group family whose engine the compiled defaults come from.
+///
+/// `catalogs` are the published catalogs the resource's parameters come from, in the order
+/// that resolves one a parameter is in several of. A DB INSTANCE has one — the parameters its
+/// family publishes — while a DB CLUSTER has TWO: its family's cluster-level list and the
+/// same family's engine parameters, because a DB cluster parameter group carries both
+/// (`crate::state::published_cluster_parameter_at_any_level`), and the engine of a cluster
+/// runs its own server parameters exactly as an instance's does.
 pub fn running_parameters(
     family: &str,
-    catalog: Option<&'static [ClusterParameterSpec]>,
+    catalogs: &[&'static [ClusterParameterSpec]],
     group: Option<&BTreeMap<String, ParameterSetting>>,
     engine_started_at: f64,
 ) -> Vec<RunningParameter> {
     let mut parameters: Vec<RunningParameter> = Vec::new();
-    for spec in catalog.unwrap_or_default() {
+    for spec in catalogs.iter().flat_map(|catalog| catalog.iter()) {
+        // A parameter SEVERAL of the resource's catalogs publish is one parameter of its
+        // engine: the first catalog that carries it is the one it is described by, which is
+        // the same precedence a describe of the group reads it under
+        // (`crate::state::published_cluster_parameter_at_any_level`).
+        if parameters.iter().any(|known| known.name == spec.name) {
+            continue;
+        }
         // The record the FAMILY publishes for this parameter, which for one the engine moved
         // between versions is the one this family's version carries: the engine runs, and
         // reports, what its own release publishes.
@@ -341,10 +362,48 @@ pub fn refresh_catalogs(
             "pg_auth_members" => refresh_roles(database, facts)?,
             "pg_namespace" => refresh_namespaces(database, facts)?,
             "pg_class" => refresh_relations(database, facts)?,
+            "pg_available_extensions" => refresh_available_extensions(database, facts)?,
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Replace `pg_available_extensions` with the extensions this instance has a control file
+/// for, each carrying the version it declares as its default and the version installed in
+/// the session's own database.
+///
+/// Both halves are state this server already holds: the extensions it ships
+/// ([`super::server_statements::available_extensions`]) and the ones a client has installed
+/// in this database, which is where an extension lives on PostgreSQL. An extension that is
+/// available and not installed reports no installed version, which is how a client tells the
+/// two apart.
+fn refresh_available_extensions(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+) -> Result<(), EngineError> {
+    database.execute_in(
+        facts.connection_id,
+        &facts.database,
+        "DELETE FROM pg_available_extensions",
+        &[],
+    )?;
+    let installed = super::server_statements::installed_extensions(database, facts)?;
+    let rows: Vec<Vec<Option<String>>> = super::server_statements::available_extensions()
+        .iter()
+        .map(|entry| {
+            vec![
+                Some(entry.name.to_string()),
+                Some(entry.version.to_string()),
+                installed
+                    .iter()
+                    .find(|(name, _)| name == entry.name)
+                    .map(|(_, version)| version.clone()),
+                Some(entry.comment.to_string()),
+            ]
+        })
+        .collect();
+    insert_rows(database, facts, "pg_available_extensions", 4, &rows)
 }
 
 /// Replace `pg_settings` with the parameters the engine is running with, plus the settings
@@ -756,20 +815,33 @@ fn refresh_activity(
                 Some(session.backend_start),
                 None,
                 session.query_start,
+                // `wait_event_type` and `wait_event` are "the type of event for which the
+                // backend is waiting" and the event itself, and are NULL for a backend that
+                // is waiting for none. No session this endpoint serves ever waits: a row
+                // another transaction holds is refused rather than queued
+                // ([`super::row_locks`]), so there is no event to report.
+                None,
+                None,
                 Some(session.state),
                 Some(session.query),
                 Some("client backend".to_string()),
             ]
         })
         .collect();
-    insert_rows(database, facts, "pg_stat_activity", 13, &rows)
+    insert_rows(database, facts, "pg_stat_activity", 15, &rows)
 }
 
 /// Insert `rows` into `table` in ONE statement, with every value bound rather than written
 /// into the SQL: a parameter value or a role name a client chose never becomes SQL text.
-fn insert_rows(
+///
+/// The ONE place a catalog's rows are written, read by both engines' catalog modules
+/// (`super::mysql_server` serves its own schema's): `schema` is the database the table is in
+/// — the session's own for a catalog of the DATABASE, the system schema for a catalog of the
+/// SERVER.
+pub(super) fn insert_catalog_rows(
     database: &InstanceDatabase,
     facts: &SessionFacts,
+    schema: &str,
     table: &str,
     columns: usize,
     rows: &[Vec<Option<String>>],
@@ -786,11 +858,23 @@ fn insert_rows(
     let values: Vec<Option<String>> = rows.iter().flatten().cloned().collect();
     database.execute_in(
         facts.connection_id,
-        &facts.database,
+        schema,
         &format!("INSERT OR REPLACE INTO {table} VALUES {tuples}"),
         &values,
     )?;
     Ok(())
+}
+
+/// [`insert_catalog_rows`] into a catalog of the session's own DATABASE, which every catalog
+/// of this module is.
+fn insert_rows(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    table: &str,
+    columns: usize,
+    rows: &[Vec<Option<String>>],
+) -> Result<(), EngineError> {
+    insert_catalog_rows(database, facts, &facts.database, table, columns, rows)
 }
 
 /// The role statements a client sends, served from this server's own role catalog.
@@ -965,12 +1049,19 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
         // served by: the value they answer with is of that type.
         return Some("numeric");
     }
+    if let Some(named) = super::engine_time::function_result_type(function) {
+        // The date and time functions each engine defines ([`super::engine_time`]), whose
+        // own surface says what each of them answers with.
+        return Some(named);
+    }
     match function {
         "pg_postmaster_start_time" => Some("timestamptz"),
         "pg_is_in_recovery" => Some("boolean"),
         "pg_backend_pid" => Some("integer"),
         "current_setting" => Some("text"),
         "md5" => Some("text"),
+        "char_length" | "character_length" => Some("integer"),
+        "length" | "octet_length" => Some("integer"),
         // `pg_has_role` answers a question about the role catalog, which this server serves
         // as the lookup in that catalog ([`catalog_function`]) wrapped in the call itself,
         // so the column carries the boolean the function returns.
@@ -1058,7 +1149,7 @@ fn has_role_lookup(user: &str, role: &str) -> String {
 /// connection), so a statement that calls one is planned and run by the engine like any
 /// other — and so a function this list does not carry is refused as undefined rather than
 /// silently answered.
-pub const SERVER_FUNCTIONS: [(&str, i32); 7] = [
+pub const SERVER_FUNCTIONS: [(&str, i32); 11] = [
     ("pg_postmaster_start_time", 0),
     ("pg_is_in_recovery", 0),
     ("pg_backend_pid", 0),
@@ -1072,6 +1163,26 @@ pub const SERVER_FUNCTIONS: [(&str, i32); 7] = [
     // `pg_has_role`, as the ONE argument the lookup above leaves it: the truth of the
     // membership the engine resolved out of the role catalog.
     ("pg_has_role", 1),
+    // `char_length(text)` / `character_length(text)` — "the number of characters in the
+    // string" (PostgreSQL, "String Functions and Operators"), and MySQL's `CHAR_LENGTH()`,
+    // which "returns the length of the string measured in characters": the same count, under
+    // both of the two names both families define it under.
+    ("char_length", 1),
+    ("character_length", 1),
+    // `length(x)` and `octet_length(x)`, which both families define — the first measuring
+    // what each of them measures (see the registration in `super::sql_engine`).
+    ("length", 1),
+    ("octet_length", 1),
+];
+
+/// The server functions BOTH families define, under the same name and over the same values,
+/// so neither wire is refused one of them ([`is_postgres_only_function`]).
+const SHARED_FUNCTIONS: [&str; 5] = [
+    "md5",
+    "char_length",
+    "character_length",
+    "length",
+    "octet_length",
 ];
 
 /// Whether `function` is one of [`SERVER_FUNCTIONS`].
@@ -1079,6 +1190,18 @@ pub fn is_server_function(function: &str) -> bool {
     SERVER_FUNCTIONS
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(function))
+}
+
+/// Whether `function` is a server function ONLY PostgreSQL defines, so no MySQL session has
+/// it ([`super::dialect::dialect_refusal`]).
+///
+/// Every one of [`SERVER_FUNCTIONS`] except the ones in [`SHARED_FUNCTIONS`].
+#[must_use]
+pub fn is_postgres_only_function(function: &str) -> bool {
+    is_server_function(function)
+        && !SHARED_FUNCTIONS
+            .iter()
+            .any(|shared| shared.eq_ignore_ascii_case(function))
 }
 
 /// A timestamp in the text form PostgreSQL renders `timestamp with time zone` in: the date

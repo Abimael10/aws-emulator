@@ -529,7 +529,11 @@ pub fn publishes_a_complete_vocabulary(family: &str) -> bool {
 /// * the family's own engine publishes a vocabulary that does NOT carry it. An engine this
 ///   emulator publishes nothing for (the Db2 engines today) makes no claim either way, so a
 ///   family of one carries whatever name the request sends — the same reading every other
-///   unpublished column gets.
+///   unpublished column gets. An engine of the SAME FAMILY as the family's own
+///   ([`crate::ops::describe_engine_default_parameters::engines_of_one_family`]) is no other
+///   engine for this purpose: the MySQL-compatible engines run one server's variables, and
+///   their published tables are samples of one list, so a name only one of them publishes
+///   says nothing about whether the others have it.
 ///
 /// A value that names no family at all is no engine's, so it is not another engine's either:
 /// the family rule ([`validate_parameter_group_family`]) is what refuses such a value, at the
@@ -542,8 +546,12 @@ pub fn published_for_another_engine(family: &str, name: &str) -> bool {
     if engine_vocabulary_carries(engine, name) || !publishes_a_vocabulary(engine) {
         return false;
     }
-    crate::ops::describe_engine_default_parameters::served_engines()
-        .any(|other| engine_vocabulary_carries(other, name))
+    crate::ops::describe_engine_default_parameters::served_engines().any(|other| {
+        engine_vocabulary_carries(other, name)
+            && !crate::ops::describe_engine_default_parameters::engines_of_one_family(
+                engine, other,
+            )
+    })
 }
 
 /// Whether the vocabulary this front door publishes for `engine` carries the parameter

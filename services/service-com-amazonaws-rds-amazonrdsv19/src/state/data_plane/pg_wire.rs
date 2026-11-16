@@ -309,11 +309,9 @@ async fn serve_session(
             .unwrap_or_default(),
         client_address: facts.endpoint_host.clone(),
         backend_start: super::pg_server::timestamptz_text(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64(),
+            super::engine_time::now_epoch_seconds(),
         ),
+        state_since: super::engine_time::now_epoch_seconds(),
         state: super::pg_sessions::STATE_IDLE.to_string(),
         query: String::new(),
         query_start: None,
@@ -401,7 +399,7 @@ async fn serve_session(
             // Parse.
             b'P' => {
                 let (name, at) = cstring(&body, 0);
-                let (sql, _) = cstring(&body, at);
+                let (sql, at) = cstring(&body, at);
                 if prepared.len() >= MAX_PREPARED_STATEMENTS {
                     error_response(
                         &mut conn,
@@ -414,7 +412,13 @@ async fn serve_session(
                     .await?;
                     continue;
                 }
-                prepared.insert(name, PreparedStatement { sql });
+                prepared.insert(
+                    name,
+                    PreparedStatement {
+                        sql,
+                        parameter_types: declared_parameter_types(&body, at),
+                    },
+                );
                 send(&mut conn, b'1', &[]).await?;
             }
             // Bind.
@@ -599,6 +603,31 @@ const MAX_PREPARED_STATEMENTS: usize = 64;
 /// A statement the client parsed under a name.
 struct PreparedStatement {
     sql: String,
+    /// The type the `Parse` message declared for each of the statement's parameters, as the
+    /// object identifier of that type (`0` where it declared none): what the BINARY form of
+    /// a value bound to it is read under ([`super::pg_binary`]).
+    parameter_types: Vec<i32>,
+}
+
+/// The parameter types a `Parse` message declares, read from `at`: a count and then one
+/// object identifier per parameter.
+///
+/// A message that declares none — which a client may do, leaving the types to the server —
+/// carries an empty list, and a parameter with no type declared can only be read as text.
+fn declared_parameter_types(body: &[u8], at: usize) -> Vec<i32> {
+    let Ok(count) = read_i16(body, at) else {
+        return Vec::new();
+    };
+    // Not sized from the count the message declares: each type is pushed as it is read, so
+    // a count a client overstates cannot make this allocate for it.
+    let mut types = Vec::new();
+    for index in 0..count.max(0) {
+        let Ok(oid) = read_i32(body, at + 2 + usize::from(index.unsigned_abs()) * 4) else {
+            break;
+        };
+        types.push(oid);
+    }
+    types
 }
 
 /// A statement bound to its parameter values, ready to execute.
@@ -632,18 +661,29 @@ fn bind_portal(
         formats.push(read_i16(body, at)?);
         at += 2;
     }
-    if formats.iter().any(|format| *format != 0) {
-        return Err(EngineError::new(
-            EngineErrorKind::InsufficientPrivilege,
-            "this endpoint reads parameters in the text format only".to_string(),
-        ));
-    }
     let value_count = usize::from(read_i16(body, at)?.max(0).unsigned_abs());
     at += 2;
+    // A statement takes at most as many parameters as the ENGINE binds
+    // ([`sql_engine::MAX_BOUND_PARAMETERS`]), and the count is the client's own number: a
+    // message that declares more is refused before any value is read for it.
+    if value_count > usize::try_from(super::sql_engine::MAX_BOUND_PARAMETERS).unwrap_or_default()
+    {
+        return Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!(
+                "this endpoint binds at most {} parameters per statement",
+                super::sql_engine::MAX_BOUND_PARAMETERS
+            ),
+        ));
+    }
     // Not sized from the count the message declares: the values are pushed as they are
     // read, so a count a client overstates cannot make this allocate for it.
     let mut params = Vec::new();
-    for _ in 0..value_count {
+    // What the decoded values add up to, which is what the portal holds: a value whose own
+    // bytes are few can still name a long one (`super::pg_binary`), so the TOTAL is bounded
+    // as well as each value.
+    let mut bytes_held = 0usize;
+    for index in 0..value_count {
         let length = read_i32(body, at)?;
         at += 4;
         if length < 0 {
@@ -653,7 +693,18 @@ fn bind_portal(
         let length = usize::try_from(length).unwrap_or_default();
         let bytes = body.get(at..at + length).ok_or_else(truncated)?;
         at += length;
-        params.push(Some(String::from_utf8_lossy(bytes).into_owned()));
+        let value = parameter_value(statement, &formats, index, bytes)?;
+        bytes_held = bytes_held.saturating_add(value.len());
+        if value.len() > value_ceiling() || bytes_held > super::sql_engine::MAX_RESULT_BYTES {
+            return Err(EngineError::new(
+                EngineErrorKind::LimitExceeded,
+                format!(
+                    "this endpoint binds at most {} MiB of parameter values per statement",
+                    super::sql_engine::MAX_RESULT_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        params.push(Some(value));
     }
     let result_formats = usize::from(read_i16(body, at)?.max(0).unsigned_abs());
     at += 2;
@@ -673,12 +724,55 @@ fn bind_portal(
     })
 }
 
+/// The most ONE parameter value may hold, which is the ceiling the ENGINE itself binds a
+/// value under ([`super::sql_engine::MAX_VALUE_BYTES`]).
+fn value_ceiling() -> usize {
+    usize::try_from(super::sql_engine::MAX_VALUE_BYTES).unwrap_or_default()
+}
+
 /// A message that ended before it said everything it declared.
 fn truncated() -> EngineError {
     EngineError::new(
         EngineErrorKind::Syntax,
         "the message ended before its declared length".to_string(),
     )
+}
+
+/// The value the parameter at `index` of a `Bind` carries, as the text the engine binds.
+///
+/// "The parameter format codes. Each must presently be zero (text) or one (binary)", and
+/// the list a client sends is either empty (every parameter is text), one code (it applies
+/// to every parameter) or one code per parameter. A value sent in the binary format is read
+/// under the type the `Parse` declared for that parameter ([`super::pg_binary`]), because
+/// that is what says what its bytes mean.
+fn parameter_value(
+    statement: &PreparedStatement,
+    formats: &[i16],
+    index: usize,
+    bytes: &[u8],
+) -> Result<String, EngineError> {
+    let binary = match formats {
+        [] => false,
+        [only] => *only != 0,
+        several => several.get(index).is_some_and(|format| *format != 0),
+    };
+    if !binary {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    }
+    // A parameter the client sent in binary but declared no type for carries no reading of
+    // its bytes: the type is what says what they mean.
+    let Some(oid) = statement
+        .parameter_types
+        .get(index)
+        .copied()
+        .filter(|oid| *oid != 0)
+    else {
+        return Err(EngineError::new(
+            EngineErrorKind::FeatureNotSupported,
+            "a parameter sent in the binary format must declare its type".to_string(),
+        ));
+    };
+    super::pg_binary::parameter_text(oid, bytes)
 }
 
 fn read_i16(body: &[u8], at: usize) -> Result<i16, EngineError> {
@@ -1258,7 +1352,10 @@ async fn engine_error_response(
     error: &EngineError,
 ) -> std::io::Result<()> {
     let code = error.sqlstate.unwrap_or_else(|| sqlstate(error.kind));
-    error_response(conn, "ERROR", code, &error.message).await
+    // The CONSTRAINT field, for a refusal that is about one: PostgreSQL carries the
+    // constraint's name in its own field of the error, which is where a client reads which
+    // rule the row broke rather than parsing it out of the sentence.
+    constrained_response(conn, "ERROR", code, &error.message, error.constraint.as_deref()).await
 }
 
 /// One `NoticeResponse`: what the server has to say about a statement it did not refuse.
@@ -1266,7 +1363,7 @@ async fn notice_response(
     conn: &mut ::emulator_server::ListenerConn,
     notice: &wire_session::WireNotice,
 ) -> std::io::Result<()> {
-    message_response(conn, b'N', notice.severity, notice.code, &notice.message).await
+    message_response(conn, b'N', notice.severity, notice.code, &notice.message, None).await
 }
 
 /// One `ErrorResponse`.
@@ -1276,7 +1373,18 @@ async fn error_response(
     code: &str,
     message: &str,
 ) -> std::io::Result<()> {
-    message_response(conn, b'E', severity, code, message).await
+    message_response(conn, b'E', severity, code, message, None).await
+}
+
+/// One `ErrorResponse` that names the CONSTRAINT the statement violated.
+async fn constrained_response(
+    conn: &mut ::emulator_server::ListenerConn,
+    severity: &str,
+    code: &str,
+    message: &str,
+    constraint: Option<&str>,
+) -> std::io::Result<()> {
+    message_response(conn, b'E', severity, code, message, constraint).await
 }
 
 /// One `ErrorResponse` or `NoticeResponse`, which carry the same fields.
@@ -1286,6 +1394,7 @@ async fn message_response(
     severity: &str,
     code: &str,
     message: &str,
+    constraint: Option<&str>,
 ) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -1296,6 +1405,12 @@ async fn message_response(
     put_cstring(&mut body, code);
     body.push(b'M');
     put_cstring(&mut body, message);
+    // `n`: "Constraint name: the name of the constraint that was violated", which the
+    // protocol carries as a field of its own.
+    if let Some(constraint) = constraint {
+        body.push(b'n');
+        put_cstring(&mut body, constraint);
+    }
     body.push(0);
     send(conn, kind, &body).await?;
     conn.flush().await

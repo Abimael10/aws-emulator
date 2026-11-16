@@ -293,8 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        let mut store = state.lock();
-        store.settle_due_transitions(&region);
+        // Everything the STORE decides, under one lock: the refusals, the green database
+        // the deployment clones and the deployment record itself. The lock is released at the
+        // end of this block, because what follows it — opening the green database's own
+        // endpoint — is asynchronous and must not hold it.
+        let (blue_green_deployment, green_engine, deployment_identifier) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
 
         // "The name of the blue/green deployment" is the caller's, and one name names one
         // deployment.
@@ -326,6 +331,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and has to be in a state it can be cloned from.
         let mint = store.next_mint();
         let deployment_identifier = crate::state::mint_blue_green_deployment_identifier(mint);
+        // The green database's own identity, which its ENGINE ENDPOINT is opened for once
+        // the lock is released below. Assigned by whichever branch below clones the source.
+        let green_engine: GreenDatabase;
         let target_arn = if source_is_cluster {
             let Some(source) = store
                 .db_clusters
@@ -400,6 +408,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 green.allocated_storage = Some(allocated);
             }
             let arn = green.arn();
+            green_engine = GreenDatabase {
+                key: (region.clone(), green.identifier.clone()),
+                resource_id: green.resource_id.clone(),
+                engine: green.engine.clone(),
+                is_cluster: true,
+            };
             store
                 .db_clusters
                 .insert((region.clone(), green.identifier.clone()), green);
@@ -477,6 +491,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 green.storage_throughput = throughput;
             }
             let arn = green.arn();
+            green_engine = GreenDatabase {
+                key: (region.clone(), green.identifier.clone()),
+                resource_id: green.dbi_resource_id.clone(),
+                engine: green.engine.clone(),
+                is_cluster: false,
+            };
             store
                 .db_instances
                 .insert((region.clone(), green.identifier.clone()), green);
@@ -502,14 +522,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
         let blue_green_deployment = record.to_wire();
-        store
-            .blue_green_deployments
-            .insert((region, deployment_identifier), record);
+            store
+                .blue_green_deployments
+                .insert((region.clone(), deployment_identifier.clone()), record);
+            (blue_green_deployment, green_engine, deployment_identifier)
+        };
+
+        // The green database's OWN engine endpoint, opened with the state lock released,
+        // exactly as a read replica's is: binding is asynchronous and the core owns the
+        // socket, the bind interface and the port. The green environment is a database of its
+        // own — "RDS creates a staging environment that is a copy of the production
+        // environment" — so it serves its own sessions on its own address, over a copy of the
+        // source's data, rather than reporting the blue database's.
+        //
+        // A green environment that could not be brought up is no deployment: the records this
+        // create published are taken back out before the failure is answered, so a caller is
+        // never left with a deployment whose green database has no endpoint.
+        if let Err(refusal) =
+            open_the_green_endpoint(&*self.engine, &state, &source_identifier, &green_engine).await
+        {
+            let mut store = state.lock();
+            store
+                .blue_green_deployments
+                .remove(&(region.clone(), deployment_identifier));
+            if green_engine.is_cluster {
+                store.db_clusters.remove(&green_engine.key);
+            } else {
+                store.db_instances.remove(&green_engine.key);
+            }
+            return Err(refusal);
+        }
 
         Ok(CreateBlueGreenDeploymentOutput {
             blue_green_deployment: Some(blue_green_deployment),
         })
     }
+}
+
+/// The GREEN database this create cloned, as the endpoint it needs is opened for it.
+#[derive(Debug)]
+struct GreenDatabase {
+    /// Where the store holds the green record.
+    key: crate::state::RegionalKey,
+    /// The resource id a session on the green endpoint is admitted against.
+    resource_id: String,
+    /// The engine it runs, which decides the wire its endpoint speaks — and whether this
+    /// emulator serves one at all.
+    engine: String,
+    /// Whether the green database is a DB CLUSTER rather than a DB instance.
+    is_cluster: bool,
+}
+
+/// Open the green database's engine endpoint and load the source's data into it, then publish
+/// the address on the green record.
+///
+/// The data is copied by the ENGINE, on a blocking task and with no state lock held, exactly
+/// as a read replica's is (`crate::ops::create_db_instance_read_replica`): a client's first
+/// session on the green endpoint reads the production rows the environment was cloned from,
+/// rather than an empty database.
+///
+/// Nothing is opened for an engine this emulator serves no wire for: such a resource keeps the
+/// DNS-form endpoint it has always reported.
+async fn open_the_green_endpoint<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<crate::state::ComAmazonawsRdsAmazonrdsv19State>,
+    source_identifier: &str,
+    green: &GreenDatabase,
+) -> Result<(), CreateBlueGreenDeploymentError> {
+    let Some(wire) = crate::state::engine_wire(&green.engine) else {
+        return Ok(());
+    };
+    let (region, _) = green.key.clone();
+    let source_key = (region.clone(), source_identifier.to_string());
+    let source_storage = if green.is_cluster {
+        crate::state::capture_cluster_storage(state, &source_key).await
+    } else {
+        crate::state::capture_instance_storage(state, &source_key).await
+    }
+    .map_err(CreateBlueGreenDeploymentError::internal_failure)?;
+    let target = if green.is_cluster {
+        crate::state::SessionTarget::DbCluster {
+            region: region.clone(),
+            resource_id: green.resource_id.clone(),
+        }
+    } else {
+        crate::state::SessionTarget::DbInstance {
+            region: region.clone(),
+            resource_id: green.resource_id.clone(),
+        }
+    };
+    let endpoint = crate::state::open_engine_endpoint(
+        engine,
+        state,
+        crate::state::EngineEndpointPlan {
+            target,
+            wire,
+            // The green environment's writer endpoint. Whether a session on it may WRITE is
+            // decided by the deployment that pairs it with the blue database — a green
+            // database is read-only until the switchover
+            // (`crate::state::ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`) — and
+            // not by the role of the address.
+            role: crate::state::EndpointRole::Writer,
+            // A DB cluster publishes a reader endpoint beside its writer one.
+            reader: green.is_cluster,
+            storage: None,
+        },
+    )
+    .await
+    .map_err(CreateBlueGreenDeploymentError::internal_failure)?;
+    if let Some(storage) = source_storage {
+        let destination = endpoint.database();
+        ::tokio::task::spawn_blocking(move || destination.load_from(&storage))
+            .await
+            .map_err(|error| {
+                CreateBlueGreenDeploymentError::internal_failure(format!(
+                    "the source's data could not be copied into the green environment: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                CreateBlueGreenDeploymentError::internal_failure(format!(
+                    "the source's data could not be copied into the green environment: {}",
+                    error.message
+                ))
+            })?;
+    }
+    let mut store = state.lock();
+    let served = endpoint.endpoint.clone();
+    let reader = endpoint.reader.clone();
+    if green.is_cluster {
+        if let Some(record) = store.db_clusters.get_mut(&green.key) {
+            record.served_endpoint = Some(served);
+            record.served_reader_endpoint = reader;
+        }
+        store
+            .db_cluster_engine_endpoints
+            .insert(green.key.clone(), endpoint);
+    } else {
+        if let Some(record) = store.db_instances.get_mut(&green.key) {
+            record.served_endpoint = Some(served);
+        }
+        store
+            .db_engine_endpoints
+            .insert(green.key.clone(), endpoint);
+    }
+    Ok(())
 }
 
 /// How this operation names a source that is a DB INSTANCE, for

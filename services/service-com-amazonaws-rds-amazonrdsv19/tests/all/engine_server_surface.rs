@@ -837,7 +837,10 @@ async fn a_mysql_endpoint_parses_the_mysql_dialect_and_reports_an_account_identi
         );
     }
 
-    // A system variable, in each of the scopes a client may name it with.
+    // A system variable, in each of the scopes a client may name it with. A boolean one
+    // reads back as the integer MySQL answers a `@@` reference with — `SHOW VARIABLES`
+    // renders the same state as `ON`/`OFF`, which `a_mysql_endpoint_serves_its_version_its_sql_and_its_privilege_refusals`
+    // covers.
     for (case, statement) in [
         ("no scope", "SELECT @@require_secure_transport"),
         ("the session scope", "SELECT @@session.require_secure_transport"),
@@ -849,7 +852,7 @@ async fn a_mysql_endpoint_parses_the_mysql_dialect_and_reports_an_account_identi
             .unwrap_or_else(|refusal| panic!("case {case:?}: {statement:?} must run, got {refusal:?}"));
         assert_eq!(
             read.only(),
-            Some("OFF"),
+            Some("0"),
             "case {case:?}: the variable must report the instance's value, got {read:?}"
         );
     }

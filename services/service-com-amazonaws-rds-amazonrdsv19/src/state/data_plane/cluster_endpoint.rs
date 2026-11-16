@@ -250,11 +250,18 @@ pub(super) fn cluster_facts(
 /// writes exactly while that member is the one the cluster writes through — the member
 /// `DBClusterMembers` reports `IsClusterWriter` for, which is what `FailoverDBCluster`
 /// moves.
+///
+/// Whatever the role, NO endpoint of a cluster that is the GREEN database of a blue/green
+/// deployment writes: that whole environment is read-only while the deployment pairs it with
+/// the blue one ([`ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`]).
 pub(super) fn serves_reads_only(
     store: &ComAmazonawsRdsAmazonrdsv19State,
     record: &DbClusterRecord,
     role: &EndpointRole,
 ) -> bool {
+    if store.is_a_green_database(&record.region, &record.arn()) {
+        return true;
+    }
     match role {
         EndpointRole::Writer => false,
         EndpointRole::Reader => true,
@@ -290,7 +297,14 @@ pub(super) fn cluster_runtime_of(
     );
     running_engine(
         &family,
-        crate::state::published_cluster_parameters(&family),
+        // A DB CLUSTER runs BOTH of its family's lists: the cluster-level parameters a DB
+        // cluster parameter group carries, and that same family's engine parameters, which
+        // such a group carries too — the engine of a cluster has the server's own parameters
+        // exactly as an instance's engine does, and a session reads them the same way.
+        &super::wire_session::published_catalogs(&[
+            crate::state::published_cluster_parameters(&family),
+            crate::state::published_db_parameters(&family),
+        ]),
         group.map(|group| &group.parameters),
         record.cluster_create_time.as_secs_f64(),
         record.master_username.clone(),

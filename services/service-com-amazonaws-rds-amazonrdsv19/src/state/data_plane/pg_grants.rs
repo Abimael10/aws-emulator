@@ -861,6 +861,78 @@ pub fn user_authenticates_with_a_token(
     is_member_of(database, db_name, user, IAM_AUTHENTICATION_ROLE).unwrap_or(false)
 }
 
+/// The predefined roles whose members may reach the HOST the engine runs on, and the
+/// functions whose execute privilege each of them holds.
+///
+/// Source: the PostgreSQL documentation's "Predefined Roles" — `pg_read_server_files` is
+/// "allow reading files and directories directly on the server" and `pg_write_server_files`
+/// "allow writing … directly on the server" — and the server-file functions of its "System
+/// Administration Functions" chapter, whose `EXECUTE` is granted to those roles and revoked
+/// from `public`.
+///
+/// Amazon RDS gives the master user neither role, which is what a client discovers by calling
+/// one: the server HAS the function, and the caller holds no privilege for it.
+const SERVER_FILE_FUNCTIONS: [(&str, &str); 8] = [
+    ("pg_read_file", "pg_read_server_files"),
+    ("pg_read_binary_file", "pg_read_server_files"),
+    ("pg_stat_file", "pg_read_server_files"),
+    ("pg_ls_dir", "pg_read_server_files"),
+    ("pg_ls_logdir", "pg_monitor"),
+    ("pg_ls_waldir", "pg_monitor"),
+    ("lo_import", "pg_read_server_files"),
+    ("lo_export", "pg_write_server_files"),
+];
+
+/// The refusal a statement that calls a SERVER-FILE function gets, or `None` for a statement
+/// that calls none.
+///
+/// Such a function reads or writes the host the engine runs on, and its `EXECUTE` privilege
+/// belongs to a predefined role ([`SERVER_FILE_FUNCTIONS`]). A session whose user is not a
+/// member of that role is refused the way PostgreSQL refuses a function it may not execute —
+/// `permission denied for function <name>`, SQLSTATE `42501` — which is what a client reads
+/// to learn that the RDS master user does not hold the role. A session whose user HAS been
+/// made a member is answered with the capability refusal instead: no client of an Amazon RDS
+/// instance reaches the host its engine runs on, which is the same answer the server-side
+/// forms of `COPY` get ([`super::pg_copy`]).
+#[must_use]
+pub fn refused_server_file_function(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    tokens: &[sqlparser::tokenizer::Token],
+) -> Option<EngineError> {
+    if facts.wire != super::EngineWire::Postgres {
+        return None;
+    }
+    let called = tokens.iter().enumerate().find_map(|(at, token)| {
+        let sqlparser::tokenizer::Token::Word(word) = token else {
+            return None;
+        };
+        let called = super::dialect::next_significant(tokens, at + 1)
+            .and_then(|next| tokens.get(next))
+            .is_some_and(|next| matches!(next, sqlparser::tokenizer::Token::LParen));
+        if !called {
+            return None;
+        }
+        SERVER_FILE_FUNCTIONS
+            .iter()
+            .find(|(named, _)| word.value.eq_ignore_ascii_case(named))
+    })?;
+    let (function, role) = called;
+    if is_member_of(database, &facts.database, &facts.user, role).unwrap_or(false) {
+        return Some(
+            EngineError::new(
+                EngineErrorKind::FeatureNotSupported,
+                format!("{function} is not supported"),
+            )
+            .with_sqlstate("0A000"),
+        );
+    }
+    Some(EngineError::new(
+        EngineErrorKind::InsufficientPrivilege,
+        format!("permission denied for function {function}"),
+    ))
+}
+
 /// Serve the object-privilege form: the privileges are merged into (or removed from) the
 /// access control list of each object's catalog row.
 fn object_privileges(
