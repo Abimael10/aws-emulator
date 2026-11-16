@@ -136,11 +136,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the groups the request names, so a request that names none asks nothing, and is
         // told which parameter it left out rather than answered with an empty set. A request
         // that leaves the member out ALTOGETHER is already refused by the boundary
-        // validator; an empty list is not an absent member, so it is refused here.
+        // validator, in this same sentence; an empty list is not an absent member, so it is
+        // refused here. The parameter named is the LIST the ids are read into
+        // ([`crate::state::SECURITY_GROUP_IDS_PARAMETER`]), which is what EC2's own refusal
+        // names.
         let requested: &[String] = &input.group_id;
         if requested.is_empty() {
             return Err(crate::state::missing_parameter(
-                "The request must contain the parameter groupId",
+                crate::state::missing_wire_parameter_message(
+                    crate::state::SECURITY_GROUP_IDS_PARAMETER,
+                ),
             ));
         }
         // The list is caller-sized and every entry is resolved against the store, so it is

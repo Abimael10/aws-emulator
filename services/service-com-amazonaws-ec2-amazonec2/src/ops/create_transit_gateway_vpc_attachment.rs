@@ -169,12 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below either.
         //
         // "You must specify at least one subnet" (`SubnetIds`): the member is `@required`, so
-        // the boundary validator already refuses a request that leaves it out; this is the
-        // backstop that keeps an empty list from reading as a success whatever reaches the
-        // handler, worded as EC2 words a parameter the request left out.
+        // the boundary validator already refuses a request that leaves it out, in this same
+        // sentence; this is the backstop that keeps an empty list from reading as a success
+        // whatever reaches the handler, worded through the one definition of that sentence so
+        // the two sides of dispatch cannot disagree.
         if input.subnet_ids.is_empty() {
             return Err(state::missing_parameter(
-                "The request must contain the parameter SubnetIds",
+                state::missing_required_parameter_message("SubnetIds"),
             ));
         }
         // The model publishes no bound on that list and every id named is resolved against

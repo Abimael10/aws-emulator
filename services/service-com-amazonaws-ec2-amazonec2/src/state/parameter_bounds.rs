@@ -49,17 +49,130 @@ pub fn max_results_below_published_minimum<E>(
 /// How EC2 states a parameter the request left out: `The request must include the <Member>
 /// parameter. Add the required parameter and retry the request.`
 ///
-/// The one sentence EC2's `MissingParameter` carries, whichever member is absent and whichever
-/// operation was called: the member is named as the MODEL declares it and the rest is fixed
-/// text, so nothing of one run's request is written into the template. Answered both by a
-/// handler that resolves an absent member itself ([`missing_required_parameter`]) and by the
-/// refusal override for the `@required` members the boundary resolves
-/// (`crate::service::parameter_refusals`), so the two cannot word it differently.
+/// One of the two sentences EC2's `MissingParameter` carries — the one the input validation of
+/// the surfaces added to EC2 after it words, naming the member as the MODEL declares it, the
+/// rest being fixed text, so nothing of one run's request is written into the template. Answered
+/// both by a handler that resolves an absent member itself ([`missing_required_parameter`]) and
+/// by the refusal override for the `@required` members the boundary resolves
+/// ([`absent_required_member_message`]), so the two cannot word it differently.
 pub fn missing_required_parameter_message(member: &str) -> String {
     format!(
         "The request must include the {member} parameter. Add the required parameter and retry \
          the request."
     )
+}
+
+/// How EC2's CORE parameter validator states a parameter the request left out: `The request
+/// must contain the parameter <parameter>`.
+///
+/// The other of the two sentences EC2's `MissingParameter` carries, and the one the surfaces of
+/// the original EC2 and VPC objects answer. It names the parameter as the ec2Query WIRE spells
+/// it — lowerCamel, the spelling `aws_smithy_schema_server::constraints::path` reports a member
+/// under — where [`missing_required_parameter_message`] names the modelled member; the rest is
+/// fixed text, so nothing of one run's request is written into the template. The sentence every
+/// handler of this crate that resolves an absent parameter itself answers, so the two sides of
+/// dispatch cannot word one refusal differently.
+pub fn missing_wire_parameter_message(parameter: &str) -> String {
+    format!("The request must contain the parameter {parameter}")
+}
+
+/// How EC2 refuses a request that carried no filter at all for an operation whose `Filters` is
+/// `@required`: `Filters cannot be null or empty`.
+///
+/// Fixed text with no variable part, and about the member rather than about the request's shape:
+/// an operation that SELECTS what it reports with filters can report nothing until it is given
+/// one, so a filter list that is absent and one that arrives empty are the same mistake and EC2
+/// states both this way. Named here so the boundary refusal and the handler's own check on an
+/// empty list answer one sentence.
+pub const FILTERS_CANNOT_BE_NULL_OR_EMPTY: &str = "Filters cannot be null or empty";
+
+/// The path the boundary's constraint walk reports an absent `Filters` member under: the
+/// member's own name in lowerCamel, which is how `aws_smithy_schema_server::constraints::path`
+/// spells a member. Named here so the one place that reads a violation path and the one that
+/// words the refusal cannot drift apart.
+pub const FILTERS_MEMBER_PATH: &str = "filters";
+
+/// The input shapes whose operation EC2 refuses an absent `@required` member on through its CORE
+/// parameter validator, which words the refusal [`missing_wire_parameter_message`].
+///
+/// EC2 answers `MissingParameter` in two sentences, and WHICH of them an operation answers is a
+/// fact of the API SURFACE that operation belongs to, recorded by its callers — exactly as the
+/// two sentences for a page size outside a published range are
+/// ([`RECORDED_PAGE_SIZE_WORDINGS`]). The surfaces of the original EC2 and VPC objects — the
+/// network-interface attachment, the subnet, the security-group reference — are refused by the
+/// core parameter validator and answer its sentence; the surfaces added later (IPAM, Client VPN,
+/// the Transit Gateway attachments, Capacity Manager) are refused by their own input validation
+/// and answer [`missing_required_parameter_message`], which is therefore the default.
+///
+/// Keyed to the INPUT SHAPE because that is the one key that names the members of ONE operation,
+/// so EVERY `@required` member of an operation named here is refused in that operation's own
+/// sentence rather than only the member some recording happened to leave out.
+pub const CORE_PARAMETER_VALIDATOR_INPUT_SHAPES: &[&str] = &[
+    "AttachNetworkInterfaceRequest",
+    "DetachNetworkInterfaceRequest",
+    "CreateSubnetRequest",
+    "DeleteSubnetRequest",
+    "DescribeSecurityGroupReferencesRequest",
+];
+
+/// The parameter EC2 names the security groups a reference report is asked about by.
+///
+/// `DescribeSecurityGroupReferencesRequest$GroupId` targets the LIST shape `GroupIds`
+/// (`smithy_query(query="operation",operation="DescribeSecurityGroupReferences")`), the member
+/// itself keeping the singular name the ec2Query wire indexes its entries under. EC2's refusal
+/// names the LIST the service reads the ids into, so the parameter is that shape's name in the
+/// lowerCamel the core validator spells a parameter in.
+pub const SECURITY_GROUP_IDS_PARAMETER: &str = "groupIds";
+
+/// The parameter EC2's core validator names for a required member whose own name is not the name
+/// it reads the value under: `(input shape, member path, parameter)`.
+///
+/// One entry per member whose target shape, rather than the member, is what the refusal names
+/// ([`SECURITY_GROUP_IDS_PARAMETER`]). A member not named here is reported by the path the
+/// constraint walk gives, which is already the wire's own spelling.
+pub const RECORDED_WIRE_PARAMETER_SPELLINGS: &[(&str, &str, &str)] = &[(
+    "DescribeSecurityGroupReferencesRequest",
+    "groupId",
+    SECURITY_GROUP_IDS_PARAMETER,
+)];
+
+/// The parameter EC2's core validator names the member at `path` of `input_shape` by: the path
+/// the constraint walk reports, unless that member's recorded spelling differs
+/// ([`RECORDED_WIRE_PARAMETER_SPELLINGS`]).
+pub fn wire_parameter_name(input_shape: Option<&str>, path: &str) -> String {
+    RECORDED_WIRE_PARAMETER_SPELLINGS
+        .iter()
+        .find(|(shape, member, _)| Some(*shape) == input_shape && *member == path)
+        .map_or_else(
+            || path.to_string(),
+            |(_, _, parameter)| (*parameter).to_string(),
+        )
+}
+
+/// The sentence EC2 refuses a request that left out the `@required` member at `path` of
+/// `input_shape` with, under the one code it answers that refusal with
+/// ([`MISSING_PARAMETER`]).
+///
+/// Three answers, read off the member and the surface rather than off the request:
+///
+/// * a required FILTER LIST is [`FILTERS_CANNOT_BE_NULL_OR_EMPTY`], the sentence EC2 states
+///   that member's own non-empty rule in, whichever operation carries it;
+/// * an operation of a surface the core parameter validator refuses
+///   ([`CORE_PARAMETER_VALIDATOR_INPUT_SHAPES`]) answers
+///   [`missing_wire_parameter_message`], naming the parameter as the wire spells it;
+/// * every other operation answers [`missing_required_parameter_message`], naming the member as
+///   the model declares it.
+///
+/// `input_shape` is the input being read; `None` — a refusal given before any input shape was
+/// read — takes the default, never another request's surface.
+pub fn absent_required_member_message(input_shape: Option<&str>, path: &str) -> String {
+    if path == FILTERS_MEMBER_PATH {
+        return FILTERS_CANNOT_BE_NULL_OR_EMPTY.to_string();
+    }
+    if input_shape.is_some_and(|shape| CORE_PARAMETER_VALIDATOR_INPUT_SHAPES.contains(&shape)) {
+        return missing_wire_parameter_message(&wire_parameter_name(input_shape, path));
+    }
+    missing_required_parameter_message(&declared_member_name(path))
 }
 
 /// The code and the words EC2 refuses a page size OUTSIDE the range an operation publishes

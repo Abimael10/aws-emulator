@@ -20,6 +20,13 @@
 // where every new ec2 suite inserts its lines.
 #[path = "all/create_vpn_gateway_availability_zone.rs"]
 mod create_vpn_gateway_availability_zone;
+// The CODE and the SENTENCE a request that left out a modelled `@required` input member is
+// refused with: EC2's `MissingParameter` in the sentence the validator of that operation's
+// surface words, over both surfaces, every member kind and a required filter list. Declared
+// FIRST for the reason the note above gives: the sorted neighbourhood and the tail of this file
+// are where every new ec2 suite inserts its lines.
+#[path = "all/absent_required_parameter_wording.rs"]
+mod absent_required_parameter_wording;
 #[path = "all/image_deprecation.rs"]
 mod image_deprecation;
 // The NAME an Amazon Web Services-managed prefix list is published under — the Region's scope

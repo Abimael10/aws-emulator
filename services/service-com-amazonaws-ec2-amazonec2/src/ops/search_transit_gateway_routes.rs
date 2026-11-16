@@ -162,16 +162,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `Filters` is `@required` as well, and a LIST, so a request that carries no filter at
         // all carries no `Filter.N.*` field either and the member arrives null — which the
-        // boundary validator refuses before this handler runs (asserted as a row of this
-        // operation's refusal table). An empty slice is therefore unreachable from the wire,
-        // and narrowing by nothing below would report the whole table rather than answer for a
-        // member the request did not carry.
+        // boundary validator refuses before this handler runs, in the sentence EC2 states this
+        // member's own non-empty rule in (asserted as a row of this operation's refusal table).
+        // A list that arrives EMPTY is the same mistake — narrowing by nothing would report the
+        // whole table rather than answer for a member the request did not really carry — so it
+        // is refused here in that same sentence.
         if input.transit_gateway_route_table_id.is_empty() {
             return Err(state::missing_parameter(
                 "The request must contain the parameter transitGatewayRouteTableId",
             ));
         }
         let filters: &[Filter] = input.filters.as_slice();
+        if filters.is_empty() {
+            return Err(state::missing_parameter(
+                state::FILTERS_CANNOT_BE_NULL_OR_EMPTY,
+            ));
+        }
 
         // "The token for the next page of results" (`NextToken`) — anything else is refused
         // rather than read as a destination.

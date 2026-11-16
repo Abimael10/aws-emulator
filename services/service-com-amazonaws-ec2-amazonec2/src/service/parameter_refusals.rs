@@ -172,22 +172,29 @@ fn nonexistent_instance_types(
 /// per operation come from the input shape being read.
 ///
 /// An absent `@required` member is the one refusal here that is about no value at all: EC2
-/// answers its own `MissingParameter` naming the member the request left out
-/// ([`crate::state::missing_required_parameter_message`]), which is the sentence this
-/// service's handlers answer for a member they resolve as absent themselves — so a caller
-/// reads one code and one wording whichever side of dispatch found the absence. It is keyed
-/// on the violation's kind alone, so it holds for every operation of this service.
+/// answers its own `MissingParameter` in the sentence the validator of that operation's SURFACE
+/// words ([`crate::state::absent_required_member_message`]) — the core parameter validator's
+/// `The request must contain the parameter <parameter>` for the surfaces of the original EC2 and
+/// VPC objects, the later surfaces' `The request must include the <Member> parameter. Add the
+/// required parameter and retry the request.` otherwise, and a required filter list's own
+/// non-empty sentence for a member that selects what the operation reports. That is the sentence
+/// this service's handlers answer for a member they resolve as absent themselves, so a caller
+/// reads one code and one wording whichever side of dispatch found the absence.
 pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
     use aws_smithy_schema_server::ViolationKind;
 
     match &violation.kind {
         ViolationKind::MissingRequiredMember => Some(Refused {
             code: crate::state::MISSING_PARAMETER.to_string(),
-            // The member as the MODEL declares it, from the lowerCamel path the walk reports
-            // (`crate::state::declared_member_name`), which is how EC2's own sentence names
-            // it. Nothing of the request is echoed: an absent member carried no value.
-            message: crate::state::missing_required_parameter_message(
-                &crate::state::declared_member_name(&violation.path),
+            // The sentence EC2's own validator for this operation's surface words, read off the
+            // member the walk reports and the input being read
+            // (`crate::state::absent_required_member_message`) — which is the sentence this
+            // service's handlers answer for a member they resolve as absent themselves, so a
+            // caller reads one code and one wording whichever side of dispatch found the
+            // absence. Nothing of the request is echoed: an absent member carried no value.
+            message: crate::state::absent_required_member_message(
+                input_being_read().as_deref(),
+                &violation.path,
             ),
         }),
         ViolationKind::EnumValue(allowed) if crate::state::is_caller_role_catalog(allowed) => {

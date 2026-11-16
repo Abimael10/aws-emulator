@@ -749,19 +749,16 @@ async fn a_request_naming_no_group_is_refused() {
     let world = world(&engine);
     seed_row(&engine, &world, 0, &rows()[0]);
 
-    // Rows: no `GroupId` field at all — refused at the boundary, which names the member as
-    // the MODEL declares it — and one carrying an empty value at no list position, which
-    // reaches the handler and is named as the WIRE spells it. "The IDs of the security groups
+    // Rows: no `GroupId` field at all — refused at the boundary — and one carrying an empty
+    // value at no list position, which reaches the handler. "The IDs of the security groups
     // in your account" (`$GroupId`, required) names a group in neither, so the required member
-    // is absent either way and each refusal names it in its own spelling.
-    for (case, params, named) in [
-        ("no GroupId field", Vec::new(), "GroupId"),
-        (
-            "a GroupId field at no position",
-            vec![param("GroupId", "")],
-            "groupId",
-        ),
+    // is absent either way, and both sides of dispatch name the parameter EC2 names: the LIST
+    // shape that member targets (`GroupIds`), in the lowerCamel EC2's own refusal spells it.
+    for (case, params) in [
+        ("no GroupId field", Vec::new()),
+        ("a GroupId field at no position", vec![param("GroupId", "")]),
     ] {
+        let named = "groupIds";
         let (status, body) = describe(&router, &params).await;
         assert_eq!(
             status, 400,
