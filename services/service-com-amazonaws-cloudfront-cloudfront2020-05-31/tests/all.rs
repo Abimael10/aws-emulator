@@ -86,6 +86,8 @@ mod continuous_deployment_policy_update;
 mod create_location_header;
 #[path = "all/delete_conflict_refusals.rs"]
 mod delete_conflict_refusals;
+#[path = "all/dialled_edge_address_metrics.rs"]
+mod dialled_edge_address_metrics;
 #[path = "all/distribution_config_defaults.rs"]
 mod distribution_config_defaults;
 #[path = "all/distribution_config_read.rs"]

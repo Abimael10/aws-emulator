@@ -70,7 +70,13 @@ fn config(caller_reference: &str) -> String {
 }
 
 /// Create one distribution for a row and answer its `(id, DomainName)`.
-async fn created(router: &MultiServiceRouter, caller_reference: &str) -> (String, String) {
+///
+/// `pub(crate)` so a sibling suite that drives this same traffic through a distribution of
+/// this shape creates it the same way rather than carrying its own copy.
+pub(crate) async fn created(
+    router: &MultiServiceRouter,
+    caller_reference: &str,
+) -> (String, String) {
     let created = create_distribution(router, &config(caller_reference)).await;
     assert_eq!(
         created.status, 201,
@@ -91,7 +97,15 @@ async fn created(router: &MultiServiceRouter, caller_reference: &str) -> (String
 
 /// `CreateMonitoringSubscription` for `id`, carrying `status` — or carrying no
 /// `RealtimeMetricsSubscriptionConfig` at all when the row names none.
-async fn subscribe(router: &MultiServiceRouter, case: &str, id: &str, status: Option<&str>) {
+///
+/// `pub(crate)` so every suite that varies the subscription flag states it through this one
+/// call rather than carrying its own copy.
+pub(crate) async fn subscribe(
+    router: &MultiServiceRouter,
+    case: &str,
+    id: &str,
+    status: Option<&str>,
+) {
     let mut document = format!(
         "<MonitoringSubscription xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
     );
