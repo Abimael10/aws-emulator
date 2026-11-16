@@ -28,6 +28,18 @@
 //! Each row asserts the whole path: the status and body the client was served
 //! (which is the handler's own), the item DynamoDB holds and the object S3 holds
 //! afterwards, and then the tree X-Ray reports for the chain the handler saw.
+//!
+//! The second rule under test is how a client that does not hold a trace id
+//! FINDS that chain at all: **the trace a request leaves behind is reported by
+//! `GetTraceSummaries` to any query whose window holds the instant the chain
+//! began and whose filter expression selects it, and by none whose window does
+//! not — one summary per trace, carrying the entry point the chain started at,
+//! one service id per node of its own service graph, the HTTP request the root
+//! segment served, and the id that reads the whole tree back through
+//! `BatchGetTraces`.** Its rows differ along what that rule generalises over:
+//! which hop of the chain the expression names and how (by name, by name and
+//! the type it was reported with, by the outcome the chain had), and where the
+//! window falls relative to the instant the chain began.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -392,7 +404,9 @@ async fn documents_of(router: &MultiServiceRouter, trace_id: &str) -> Vec<Value>
 
 /// Poll `BatchGetTraces` until the chain holds a document for every `origin`
 /// wanted, and answer the documents it last reported. The documents arrive as
-/// each hop reports them, which no fixed sleep can name.
+/// each hop reports them, which no fixed sleep can name; a wait that runs out
+/// says so itself, so a hop that never reported is not read downstream as a
+/// tree of the wrong shape.
 async fn awaited_documents(
     router: &MultiServiceRouter,
     trace_id: &str,
@@ -410,7 +424,10 @@ async fn awaited_documents(
         }
         tokio::time::sleep(POLL).await;
     }
-    held
+    panic!(
+        "expected X-Ray to hold a document for each of {wanted:?} of the chain {trace_id}, got \
+         {held:?}"
+    );
 }
 
 /// A required string member of a JSON object.
@@ -1078,4 +1095,404 @@ fn entity_ids(document: &Value) -> Vec<String> {
         ids.extend(entity_ids(nested));
     }
     ids
+}
+
+// =============================================================================
+// Finding that chain without holding its id: GetTraceSummaries
+// =============================================================================
+
+/// How far either side of the instant the chain began a discovery window
+/// reaches. Well inside both bounds the read publishes — the widest window it
+/// serves, and how far ahead of the clock a window's end may land — so what each
+/// row below asserts is the selection, never a refused window.
+const WINDOW_BEFORE: f64 = 60.0;
+const WINDOW_AFTER: f64 = 60.0;
+
+/// An hour, in the epoch seconds every instant on this wire travels as: the
+/// distance a window that holds none of this chain is placed at.
+const HOUR: f64 = 3_600.0;
+
+/// How many pages of one window the walk below follows before calling the query
+/// unbounded. A window of two minutes is paged by hour-long slices, so one or
+/// two pages is what it takes; the cap only has to terminate.
+const SUMMARY_PAGES: usize = 32;
+
+/// The `Service$Type` of the node X-Ray carries for the callers of a root
+/// segment, which report no segment of their own.
+const CLIENT_TYPE: &str = "client";
+
+/// What one query over a window reported: the summaries it served over every
+/// page of that window, and the count of traces the window itself holds.
+struct Queried {
+    summaries: Vec<Value>,
+    processed: i64,
+}
+
+impl Queried {
+    /// The trace ids the query reported.
+    fn ids(&self) -> Vec<String> {
+        self.summaries
+            .iter()
+            .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Query `GetTraceSummaries` over `[start, end)` for `filter`, following the
+/// window's own pagination to its end — the pages of one query are slices of
+/// the window, so the trace a client is looking for need not be on the first.
+/// Following them is what a paginating client does, and what this suite reads
+/// the selection through; whether the FIRST page of a window already reports
+/// what the window holds is a rule of its own, which this walk neither asserts
+/// nor stands in for.
+async fn summaries_over(
+    router: &MultiServiceRouter,
+    case: &str,
+    start: f64,
+    end: f64,
+    filter: Option<&str>,
+) -> Queried {
+    let mut summaries: Vec<Value> = Vec::new();
+    let mut processed: Option<i64> = None;
+    let mut token: Option<String> = None;
+    for page in 0..SUMMARY_PAGES {
+        let mut body = json!({ "StartTime": start, "EndTime": end });
+        if let Some(expression) = filter {
+            body["FilterExpression"] = json!(expression);
+        }
+        if let Some(resume) = &token {
+            body["NextToken"] = json!(resume);
+        }
+        let answered = dispatch(
+            router,
+            "POST",
+            &format!("xray.{REGION}.amazonaws.com"),
+            "/TraceSummaries",
+            &[
+                ("content-type", "application/json"),
+                ("authorization", &authorization("xray")),
+            ],
+            Bytes::from(body.to_string()),
+        )
+        .await;
+        assert_eq!(
+            answered.status, 200,
+            "case {case:?}: expected HTTP 200 from GetTraceSummaries over [{start}, {end}) for \
+             {filter:?}, got {} with {:?}",
+            answered.status,
+            answered.text()
+        );
+        let answer = answered.json();
+        summaries.extend(
+            answer
+                .get("TraceSummaries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let counted = answer.get("TracesProcessedCount").and_then(Value::as_i64);
+        // The count describes the window, so it is the same on every page of one
+        // query — a page that reported a different one would be describing
+        // itself instead.
+        if let Some(first) = processed {
+            assert_eq!(
+                counted,
+                Some(first),
+                "case {case:?}: page {page} must report the count of the window, got {answer}"
+            );
+        }
+        processed = counted.or(processed);
+        token = answer
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            return Queried {
+                summaries,
+                processed: processed.unwrap_or_default(),
+            };
+        }
+    }
+    panic!("case {case:?}: the pages of one window must end, stopped after {SUMMARY_PAGES}");
+}
+
+/// Whether `summary` reports a service id named `name` and typed `kind`.
+fn summary_names_service(summary: &Value, name: &str, kind: &str) -> bool {
+    summary
+        .get("ServiceIds")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .any(|service| {
+            service.get("Name").and_then(Value::as_str) == Some(name)
+                && service.get("Type").and_then(Value::as_str) == Some(kind)
+        })
+}
+
+#[tokio::test]
+async fn the_chains_trace_is_found_by_a_client_that_does_not_hold_its_id() {
+    let router = emulator();
+    let role_arn = given_role(&router).await;
+    given_table(&router).await;
+    given_bucket(&router).await;
+    let (_function, function_arn) = given_function(&router, &role_arn).await;
+    let api = given_api(&router, &function_arn).await;
+
+    // One request through the tracing stage, so there is a chain to find.
+    let case = "the chain a request to the tracing stage left behind";
+    let key = format!("{TRACED_STAGE}-discovery");
+    let served = dispatch(
+        &router,
+        "GET",
+        &format!("{api}.execute-api.{REGION}.amazonaws.com"),
+        &format!(
+            "/{TRACED_STAGE}/{RESOURCE_PATH}?ddb_sub_id={DDB_SPAN}&s3_sub_id={S3_SPAN}&k={key}"
+        ),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "case {case:?}: expected HTTP 200 from the stage, got {} with {:?}",
+        served.status,
+        served.text()
+    );
+    let trace = text_of(&served.json(), "root");
+    assert!(
+        is_trace_id(&trace),
+        "case {case:?}: expected the invocation to report the chain it belongs to, got {:?}",
+        served.text()
+    );
+
+    // The hops the chain took, read back out of the stored documents: each
+    // origin, and the name the node that reported it carries. The rows below are
+    // built from these, so the catalog of hops is the trace's own rather than
+    // one this test states twice.
+    let origins = [
+        STAGE_ORIGIN,
+        LAMBDA_ORIGIN,
+        FUNCTION_ORIGIN,
+        TABLE_ORIGIN,
+        BUCKET_ORIGIN,
+    ];
+    let documents = awaited_documents(&router, &trace, &origins).await;
+    let hops: Vec<(&str, String)> = origins
+        .iter()
+        .map(|origin| {
+            (
+                *origin,
+                text_of(one_with_origin(case, &documents, origin), "name"),
+            )
+        })
+        .collect();
+    let stage_name = hops[0].1.clone();
+    // Each hop's own name, which every row below is built from: a node reports one,
+    // so an empty name would make the rows and the service-id assertions compare a
+    // default against a default.
+    for (origin, name) in &hops {
+        assert!(
+            !name.is_empty(),
+            "case {case:?}: the {origin} document names the service that reported it, got \
+             {documents:?}"
+        );
+    }
+    let began = documents
+        .iter()
+        .filter_map(|document| document.get("start_time").and_then(Value::as_f64))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        began.is_finite() && began > 0.0,
+        "case {case:?}: every stored document carries the instant it began, got {documents:?}"
+    );
+    let (start, end) = (began - WINDOW_BEFORE, began + WINDOW_AFTER);
+
+    // 1. WHICH EXPRESSION finds it. The rows differ along which hop of the chain
+    //    the expression names and how: by the name a node carries, by that name
+    //    together with the type it was reported with, by a name no hop of the
+    //    chain has, and by the outcome the chain had.
+    let mut rows: Vec<(String, Option<String>, bool)> = vec![(
+        "no expression at all, which selects every trace of the window".to_string(),
+        None,
+        true,
+    )];
+    for (origin, name) in &hops {
+        rows.push((
+            format!("the {origin} hop, by its name and the type it was reported with"),
+            Some(format!("service(\"{name}\", \"{origin}\")")),
+            true,
+        ));
+    }
+    rows.extend([
+        (
+            "the stage, by its name alone".to_string(),
+            Some(format!("service(\"{stage_name}\")")),
+            true,
+        ),
+        (
+            "the stage's name paired with the type of another hop".to_string(),
+            Some(format!("service(\"{stage_name}\", \"{LAMBDA_ORIGIN}\")")),
+            false,
+        ),
+        (
+            "a service no hop of this chain is".to_string(),
+            Some("service(\"a-service-this-chain-never-called\")".to_string()),
+            false,
+        ),
+        (
+            "the outcome the chain had, every hop of it having answered".to_string(),
+            Some("ok".to_string()),
+            true,
+        ),
+        (
+            "an outcome no hop of the chain recorded".to_string(),
+            Some("fault".to_string()),
+            false,
+        ),
+    ]);
+
+    for (label, expression, selects) in &rows {
+        let queried = summaries_over(&router, label, start, end, expression.as_deref()).await;
+        let ids = queried.ids();
+        assert_eq!(
+            ids.contains(&trace),
+            *selects,
+            "case {label:?}: expected the window to {} {trace}, got {ids:?}",
+            if *selects { "report" } else { "report nothing for" }
+        );
+        // The count is of the traces the WINDOW holds, "including traces that did
+        // not match the specified filter expression", so it does not move with
+        // the expression.
+        assert!(
+            queried.processed >= 1,
+            "case {label:?}: the window holds the chain's trace whatever the expression \
+             selects, got {} processed",
+            queried.processed
+        );
+    }
+
+    // 2. WHICH WINDOW finds it: the one holding the instant the chain began, and
+    //    no window placed away from it.
+    let windows: [(&str, f64, f64, bool); 3] = [
+        ("the window the chain began in", start, end, true),
+        (
+            "a window that ended before the chain began",
+            began - 3.0 * HOUR,
+            began - 2.0 * HOUR,
+            false,
+        ),
+        (
+            "a window that started after the chain began",
+            began + WINDOW_AFTER,
+            began + 2.0 * WINDOW_AFTER,
+            false,
+        ),
+    ];
+    for (label, from, to, holds) in windows {
+        let queried = summaries_over(&router, label, from, to, None).await;
+        let ids = queried.ids();
+        assert_eq!(
+            ids.contains(&trace),
+            holds,
+            "case {label:?}: [{from}, {to}) {} the chain that began at {began}, got {ids:?}",
+            if holds { "holds" } else { "does not hold" }
+        );
+    }
+
+    // 3. WHAT the summary says about the chain: the entry point it started at,
+    //    one service id per node of its own graph, and the request the root
+    //    segment served.
+    let queried = summaries_over(&router, case, start, end, None).await;
+    let summary = queried
+        .summaries
+        .iter()
+        .find(|summary| summary.get("Id").and_then(Value::as_str) == Some(trace.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the window must report the chain's trace, got {:?}",
+                queried.ids()
+            )
+        });
+    assert_eq!(
+        (
+            text_of(&summary["EntryPoint"], "Name"),
+            text_of(&summary["EntryPoint"], "Type")
+        ),
+        (stage_name.clone(), STAGE_ORIGIN.to_string()),
+        "case {case:?}: the entry point of the chain is the stage that started it, got {summary}"
+    );
+    for (origin, name) in &hops {
+        assert!(
+            summary_names_service(summary, name, origin),
+            "case {case:?}: the summary reports one service id per node of the trace, so it must \
+             name {name:?} typed {origin:?}, got {summary}"
+        );
+    }
+    // And the caller of the root segment, which reported no segment of its own.
+    assert!(
+        summary_names_service(summary, &stage_name, CLIENT_TYPE),
+        "case {case:?}: the summary names the clients of the root service, got {summary}"
+    );
+    assert_eq!(
+        (
+            text_of(&summary["Http"], "HttpMethod"),
+            summary["Http"]["HttpStatus"].as_u64(),
+        ),
+        ("GET".to_string(), Some(200)),
+        "case {case:?}: the summary reports the request the root segment served, got {summary}"
+    );
+    let url = text_of(&summary["Http"], "HttpURL");
+    assert!(
+        url.starts_with(&format!("https://{api}.execute-api."))
+            && url.contains(&format!("/{TRACED_STAGE}/{RESOURCE_PATH}")),
+        "case {case:?}: expected the invoke URL the request was made to, got {url:?}"
+    );
+    for (flag, held) in [
+        ("HasFault", false),
+        ("HasError", false),
+        ("HasThrottle", false),
+        ("IsPartial", false),
+    ] {
+        assert_eq!(
+            summary.get(flag).and_then(Value::as_bool),
+            Some(held),
+            "case {case:?}: every hop of this chain answered, so {flag} is {held}, got {summary}"
+        );
+    }
+    assert!(
+        summary["StartTime"]
+            .as_f64()
+            .is_some_and(|at| (at - began).abs() < 1e-3),
+        "case {case:?}: a trace starts at its earliest segment's start, which is {began}, got \
+         {summary}"
+    );
+    let duration = summary["Duration"].as_f64();
+    let response_time = summary["ResponseTime"].as_f64();
+    assert!(
+        duration.is_some_and(|span| span >= 0.0)
+            && response_time.is_some_and(|span| span >= 0.0)
+            && duration
+                .zip(response_time)
+                .is_some_and(|(whole, root)| whole + 1e-6 >= root),
+        "case {case:?}: a trace lasts at least as long as its root segment answered in, got \
+         {duration:?} and {response_time:?}"
+    );
+
+    // 4. "To get the full traces, pass the trace IDs to BatchGetTraces": the id
+    //    the summary reported is what reads the whole tree back.
+    let discovered = text_of(summary, "Id");
+    let read_back = documents_of(&router, &discovered).await;
+    let reported: BTreeSet<String> = read_back
+        .iter()
+        .map(|document| text_of(document, "origin"))
+        .collect();
+    for origin in origins {
+        assert!(
+            reported.contains(origin),
+            "case {case:?}: the id the summary reported reads the whole tree back, so it must \
+             hold the {origin} hop, got {reported:?}"
+        );
+    }
 }
