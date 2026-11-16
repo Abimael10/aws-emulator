@@ -791,6 +791,8 @@ mod connect_signing_name_routing;
 mod connectcampaigns_signing_name_routing;
 #[path = "all/contributor_insights_log_events.rs"]
 mod contributor_insights_log_events;
+#[path = "all/ddb_stream_lambda_custom_metric_alarm.rs"]
+mod ddb_stream_lambda_custom_metric_alarm;
 #[path = "all/ddb_stream_lambda_esm_provisioning.rs"]
 mod ddb_stream_lambda_esm_provisioning;
 #[path = "all/declaration_roots_are_canonical_and_complete.rs"]
