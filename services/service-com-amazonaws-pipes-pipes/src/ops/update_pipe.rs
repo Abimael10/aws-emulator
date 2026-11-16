@@ -7,7 +7,9 @@
 //! mid-transition is `ConflictException` (409); `SourceParameters` the pipe's source
 //! cannot have, and a configuration the resources it names cannot hold (a batch size past
 //! what the target takes per delivery, a FIFO queue target with no message group id, a
-//! filter that is not an event pattern), are `ValidationException` (400). An update that
+//! filter that is not an event pattern), are `ValidationException` (400), as is a
+//! `KmsKeyIdentifier` naming a customer managed key KMS holds none for
+//! ([`crate::state::kms_key`]), refused before any member is written. An update that
 //! leaves the pipe unable to poll its source ([`crate::state::bring_up`]: a `RoleArn` this
 //! service cannot assume or that may not take the source's records, or a source that does
 //! not exist) cannot be completed: the pipe settles in
@@ -239,6 +241,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
+
+        // The customer managed key the pipe's data is to be encrypted under is a KMS
+        // resource, so whether it exists is KMS's answer and not a pattern: the identifier
+        // is resolved against KMS BEFORE anything is stored, and one KMS holds no key for is
+        // refused with the modelled `ValidationException`, so no update can leave a pipe
+        // bound to a key that could not encrypt it. Awaited with NO store lock held.
+        if let Some(identifier) = input.kms_key_identifier.as_deref() {
+            let region = crate::state::request_region(ctx.parts());
+            if crate::state::kms_key::is_absent(ctx, &region, identifier).await {
+                return Err(UpdatePipeErrorModeled::ValidationException(
+                    crate::state::kms_key::key_not_found(),
+                )
+                .into());
+            }
+        }
 
         // Whether the pipe this update leaves behind could still poll its source: the role
         // the update stores against the source the pipe reads from, which `UpdatePipe`

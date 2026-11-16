@@ -7,7 +7,9 @@
 //! a source with no `SourceParameters` for the kind of resource its `Source` names, a
 //! batch size past what the target takes per delivery, a FIFO queue target with no
 //! message group id, a filter that is not an event pattern — is refused with the modelled
-//! `ValidationException` (400); a `Tags` entry breaking a published tag rule is refused
+//! `ValidationException` (400); a `KmsKeyIdentifier` naming a customer managed key KMS holds
+//! none for is refused with that same `ValidationException` ([`crate::state::kms_key`])
+//! before any record is written; a `Tags` entry breaking a published tag rule is refused
 //! with the `BadRequestException` (400) the tagging layer answers a broken tag rule with,
 //! so a pipe cannot be created carrying a tag `TagResource` would refuse. A pipe the caller
 //! asked to RUN also gets its data-plane poller ([`crate::state::data_plane`]), which is
@@ -288,6 +290,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // The customer managed key the pipe's data is to be encrypted under is a KMS
+        // resource, so whether it exists is KMS's answer and not a pattern: the identifier
+        // is resolved against KMS BEFORE anything is stored, and one KMS holds no key for
+        // is refused with the modelled `ValidationException`, so no pipe is ever bound to a
+        // key that could not encrypt it.
+        if let Some(identifier) = input.kms_key_identifier.as_deref() {
+            if crate::state::kms_key::is_absent(ctx, &region, identifier).await {
+                return Err(CreatePipeErrorModeled::ValidationException(
+                    crate::state::kms_key::key_not_found(),
+                )
+                .into());
+            }
+        }
         // Whether the pipe this call creates could poll its source at all — the role it is
         // to act as, and the source itself — decided against the account's own records
         // BEFORE the pipes store is locked, so nothing waits on it behind that lock. A pipe

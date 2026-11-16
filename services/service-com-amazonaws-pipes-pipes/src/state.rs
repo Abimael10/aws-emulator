@@ -22,10 +22,15 @@
 //! [`bring_up`] is the lifecycle's own reading of those: what a pipe could not poll its
 //! source without, which is where a creation, a start or a reconfiguration that cannot be
 //! completed settles.
+//!
+//! [`kms_key`] is the one resource a pipe names that is resolved BEFORE the write rather
+//! than settled after it: the customer managed key its data is to be encrypted under, which
+//! KMS owns and which a write naming a key KMS holds none for is refused on.
 
 pub mod bring_up;
 pub mod data_plane;
 pub mod execution_role;
+pub mod kms_key;
 pub mod metrics;
 pub mod request_authorization;
 

@@ -54,6 +54,10 @@ aws-sdk-dynamodbstreams = { version = "1", default-features = false }
 # `StartingPosition` names, `GetRecords` for the records themselves, and
 # `DescribeStreamSummary` for whether the stream a pipe names is there at all.
 aws-sdk-kinesis = { version = "1", default-features = false }
+# The KMS surface the customer managed key a pipe's `KmsKeyIdentifier` names is resolved
+# through before a write stores it (`state::kms_key`): `DescribeKey`, which resolves every
+# form that member takes (a key id, a key ARN, an alias, an alias ARN).
+aws-sdk-kms = { version = "1", default-features = false }
 # A binary message attribute travels as base64 in a record envelope.
 base64 = "0.22"
 # The CloudWatch store a RUNNING pipe publishes its own metrics to (the
@@ -120,6 +124,10 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # the identity gate with, so the token service is mounted beside pipes there and the session
 # is minted the way a client mints one (`sts:AssumeRole`).
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The key a pipe's `KmsKeyIdentifier` names lives in KMS, so KMS is mounted beside pipes in
+# the encryption-key suite and the key is created the way a client creates one
+# (`kms:CreateKey`).
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true
