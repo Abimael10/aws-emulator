@@ -585,28 +585,47 @@ fn models(key: &str, published: &[&str]) -> bool {
 /// Why a request naming `expected` as the account that owns the bucket it addresses is
 /// refused, or `None` for one that names the owner or names no account at all.
 ///
-/// "The account ID of the expected bucket owner. If the account ID that you provide does not
-/// match the actual owner of the bucket, the request fails with the HTTP status code 403
-/// Forbidden (access denied)" — the `ExpectedBucketOwner` member every bucket and object
-/// operation of this model binds to `x-amz-expected-bucket-owner`. This emulator serves ONE
-/// account, so that account owns every bucket it holds and any other value names an owner no
-/// bucket here has.
+/// TWO refusals, in this order, because they say different things about the request:
 ///
-/// One place, so the confused-deputy guard is the same answer on every operation that carries
-/// the header, and judged BEFORE the store is reached: a mismatched guard says nothing about
-/// what the bucket holds.
+/// * a value that is not an AWS account id at all — anything but the twelve decimal digits
+///   an account id carries ([`crate::state::is_account_id`]) — is a MALFORMED parameter,
+///   refused [`crate::state::INVALID_BUCKET_OWNER_CODE`] at 400 naming the rejected value,
+///   before any owner is compared: nothing can be said about ownership from a value that
+///   names no account;
+/// * a well-formed account id that is not the owner is the confused-deputy guard the request
+///   asked for — "The account ID of the expected bucket owner. If the account ID that you
+///   provide does not match the actual owner of the bucket, the request fails with the HTTP
+///   status code 403 Forbidden (access denied)", the `ExpectedBucketOwner` member every
+///   bucket and object operation of this model binds to `x-amz-expected-bucket-owner`. This
+///   emulator serves ONE account, so that account owns every bucket it holds and any other
+///   well-formed id names an owner no bucket here has.
+///
+/// Keeping them apart is what lets a client tell "I sent a bad value for this parameter"
+/// from "this bucket belongs to another account": the first is its own request to fix, the
+/// second a cross-account grant.
+///
+/// One place, so the guard is the same answer on every operation that carries the header,
+/// and judged BEFORE the store is reached: neither refusal says anything about what the
+/// bucket holds. The malformed half is also what the request boundary refuses for every
+/// operation of this service ([`super::expected_bucket_owner`]), from this same reading.
 pub fn expected_bucket_owner_refusal<E>(
     expected: Option<&str>,
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
-    expected
-        .filter(|account| *account != ::engine::emulator_account_id())
-        .map(|_| {
-            crate::scaffolded::Scaffolded::unmodeled(
-                ACCESS_DENIED_CODE,
-                ACCESS_DENIED_STATUS,
-                ACCESS_DENIED_MESSAGE,
-            )
-        })
+    let expected = expected?;
+    if !crate::state::is_account_id(expected) {
+        return Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_BUCKET_OWNER_CODE,
+            crate::state::INVALID_BUCKET_OWNER_STATUS,
+            crate::state::invalid_bucket_owner_message(expected),
+        ));
+    }
+    (expected != ::engine::emulator_account_id()).then(|| {
+        crate::scaffolded::Scaffolded::unmodeled(
+            ACCESS_DENIED_CODE,
+            ACCESS_DENIED_STATUS,
+            ACCESS_DENIED_MESSAGE,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -799,25 +818,80 @@ mod tests {
         }
     }
 
-    /// The guard compares the account the request names against the one account this emulator
-    /// serves: the rows differ along whose account it names.
+    /// The guard tells a MALFORMED expected-owner value from a well-formed id that is not the
+    /// owner: the rows differ along the form of the value and whose account it names.
     #[test]
-    fn the_expected_bucket_owner_guard_admits_only_the_owner() {
+    fn the_expected_bucket_owner_guard_separates_a_bad_value_from_a_foreign_owner() {
         let owner = ::engine::emulator_account_id().to_string();
-        let rows: [(&str, Option<&str>, bool); 4] = [
-            ("no account named at all", None, false),
-            ("the account this emulator serves", Some(&owner), false),
-            ("another account of the same shape", Some("123456789012"), true),
-            ("a value that is no account id", Some("not-an-account"), true),
+        /// The answer one row expects: the code and status, or nothing at all.
+        type Expected = Option<(&'static str, u16)>;
+        // (case, the value the request names, the code and status expected, if any)
+        let rows: [(&str, Option<&str>, Expected); 7] = [
+            ("no account named at all", None, None),
+            ("the account this emulator serves", Some(&owner), None),
+            (
+                "another account of the same shape",
+                Some("123456789012"),
+                Some((crate::state::ACCESS_DENIED_CODE, crate::state::ACCESS_DENIED_STATUS)),
+            ),
+            (
+                "a value that is no account id",
+                Some("not-an-account"),
+                Some((
+                    crate::state::INVALID_BUCKET_OWNER_CODE,
+                    crate::state::INVALID_BUCKET_OWNER_STATUS,
+                )),
+            ),
+            (
+                "an account id one digit short",
+                Some("12345678901"),
+                Some((
+                    crate::state::INVALID_BUCKET_OWNER_CODE,
+                    crate::state::INVALID_BUCKET_OWNER_STATUS,
+                )),
+            ),
+            (
+                "an ARN pasted where an account id belongs",
+                Some("arn:aws:iam::123456789012:root"),
+                Some((
+                    crate::state::INVALID_BUCKET_OWNER_CODE,
+                    crate::state::INVALID_BUCKET_OWNER_STATUS,
+                )),
+            ),
+            (
+                "the parameter left empty",
+                Some(""),
+                Some((
+                    crate::state::INVALID_BUCKET_OWNER_CODE,
+                    crate::state::INVALID_BUCKET_OWNER_STATUS,
+                )),
+            ),
         ];
         for (case, expected, refused) in rows {
-            let refusal = expected_bucket_owner_refusal::<()>(expected);
+            let answered = match expected_bucket_owner_refusal::<()>(expected) {
+                None => None,
+                Some(crate::scaffolded::Scaffolded::Unmodeled(refusal)) => {
+                    Some((refusal.code, refusal.status, refusal.message))
+                }
+                other => panic!("case {case:?}: expected an unmodelled refusal, got {other:?}"),
+            };
             assert_eq!(
-                refusal.is_some(),
+                answered
+                    .as_ref()
+                    .map(|(code, status, _)| (*code, *status)),
                 refused,
-                "case {case:?}: expected refused={refused}, got {:?}",
-                refusal.is_some()
+                "case {case:?}: expected {refused:?}, got {answered:?}"
             );
+            // A malformed value is quoted back, so the caller sees which text was refused.
+            if let (Some(supplied), Some((code, _, message))) = (expected, answered.as_ref()) {
+                if *code == crate::state::INVALID_BUCKET_OWNER_CODE {
+                    assert!(
+                        message.ends_with(&format!("[{supplied}]")),
+                        "case {case:?}: expected the message to name the rejected value, got \
+                         {message:?}"
+                    );
+                }
+            }
         }
     }
 }

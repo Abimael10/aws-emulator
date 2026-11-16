@@ -1144,10 +1144,17 @@ async fn an_acl_call_naming_another_expected_bucket_owner_is_access_denied() {
     let bucket = "acl-expected-owner";
     create_bucket_with_acls_enabled(&router, bucket, None).await;
 
-    // Account ids that are NOT the one account this emulator serves, including one
-    // differing from it in a single digit and the canonical user id (which is not an
-    // account id at all).
-    for expected in ["123456789012", "000000000001", &canonical_user_id()] {
+    // Values that are NOT the one account this emulator serves, each with the class S3
+    // answers it: a well-formed account id that is not the owner is the ownership refusal,
+    // while a value that is no account id at all — the canonical user id is 64 hex
+    // characters, not twelve digits — is the malformed parameter, refused for its own form.
+    let canonical = canonical_user_id();
+    let rows: [(&str, u16, &str); 3] = [
+        ("123456789012", 403, "AccessDenied"),
+        ("000000000001", 403, "AccessDenied"),
+        (&canonical, 400, "InvalidBucketOwnerAWSAccountID"),
+    ];
+    for (expected, status, code) in rows {
         for (operation, answer) in [
             (
                 "PutBucketAcl",
@@ -1175,15 +1182,15 @@ async fn an_acl_call_naming_another_expected_bucket_owner_is_access_denied() {
             ),
         ] {
             assert_eq!(
-                answer.status, 403,
-                "case {expected:?}/{operation}: an expected owner that is not the bucket's \
-                 owner answers HTTP 403, got {} with body {:?}",
+                answer.status, status,
+                "case {expected:?}/{operation}: an expected owner the bucket's owner is not \
+                 answers HTTP {status}, got {} with body {:?}",
                 answer.status,
                 String::from_utf8_lossy(&answer.body)
             );
             assert_eq!(
                 answer.error_code(),
-                "AccessDenied",
+                code,
                 "case {expected:?}/{operation}: expected the documented error code, got {:?}",
                 answer.error_code()
             );

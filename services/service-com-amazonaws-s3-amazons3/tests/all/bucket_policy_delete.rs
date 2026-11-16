@@ -292,20 +292,27 @@ async fn a_refused_delete_bucket_policy_keeps_its_own_status_and_error_document(
         );
     }
 
-    // An expected owner that is not the account serving the bucket: 403 AccessDenied. The
-    // rows span a well-formed foreign account id and one of a different length.
-    for mismatched in ["123456789012", "0", "99999999999999"] {
+    // An expected owner the account serving the bucket is not. The rows span the two classes:
+    // a well-formed foreign account id is 403 `AccessDenied`, while a value of another length
+    // is no account id at all and so the malformed parameter, 400
+    // `InvalidBucketOwnerAWSAccountID`.
+    let mismatched_rows: [(&str, u16, &str); 3] = [
+        ("123456789012", 403, "AccessDenied"),
+        ("0", 400, "InvalidBucketOwnerAWSAccountID"),
+        ("99999999999999", 400, "InvalidBucketOwnerAWSAccountID"),
+    ];
+    for (mismatched, status, code) in mismatched_rows {
         let answer = delete_bucket_policy_as_owner(&router, bucket, mismatched).await;
         assert_eq!(
-            answer.status, 403,
-            "case {mismatched:?}: expected HTTP 403, got {} with body {:?}",
+            answer.status, status,
+            "case {mismatched:?}: expected HTTP {status}, got {} with body {:?}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
         assert_eq!(
             answer.error_code(),
-            "AccessDenied",
-            "case {mismatched:?}: expected error code AccessDenied, got {:?}",
+            code,
+            "case {mismatched:?}: expected error code {code}, got {:?}",
             answer.error_code()
         );
     }

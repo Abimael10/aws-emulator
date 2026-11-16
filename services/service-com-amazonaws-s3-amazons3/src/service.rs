@@ -75,6 +75,10 @@ pub mod data_events;
 // The S3 Express session token a Zonal endpoint request presents, and what it authorizes —
 // see `service/express_session.rs`.
 pub mod express_session;
+// The refusal a request naming an EXPECTED BUCKET OWNER that is no account id at all earns,
+// for every operation of this service that carries the header — see
+// `service/expected_bucket_owner.rs`.
+pub mod expected_bucket_owner;
 // The refusal a request addressing a bucket by a name S3 can address no bucket by earns, for
 // every operation of this service but the create — see `service/invalid_bucket_name.rs`.
 pub mod invalid_bucket_name;
@@ -1353,6 +1357,14 @@ fn front_door<Eng: Send + Sync + 'static>(
         withdrawn_credential::REFUSE_WITHDRAWN_CREDENTIAL,
         Box::new(withdrawn_credential::RefuseWithdrawnCredential::new()),
     );
+    // And the refusal a request earns for the EXPECTED BUCKET OWNER it names, when that value
+    // is no account id at all ([`expected_bucket_owner`]): held here for the same reason and
+    // under a key of the same kind, because it stands in front of every operation of this
+    // service that carries the header.
+    table.add_operation(
+        expected_bucket_owner::REFUSE_EXPECTED_BUCKET_OWNER,
+        Box::new(expected_bucket_owner::RefuseExpectedBucketOwner::new()),
+    );
     // And the WEBSITE ENDPOINT, the one surface of this service that is not the REST API at
     // all: a request addressed to a bucket's website host is served from here
     // ([`website_endpoint`]), under a key of the same kind as the refusals above, because no
@@ -2119,6 +2131,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // caller's session is asked.
         if let Some(refusal) = self.refuses_the_bucket_name(req) {
             return Some(refusal);
+        }
+        // A request naming an EXPECTED BUCKET OWNER that is no account id at all is refused
+        // for that value, whichever operation its address names and before any owner is
+        // compared; see [`expected_bucket_owner`]. After the bucket NAME, which is part of
+        // the address, and before anything that reads the store: the parameter's FORM is a
+        // statement about the request alone.
+        if expected_bucket_owner::malformed_value(req).is_some() {
+            if let Some(refusal) = self
+                .door
+                .get(expected_bucket_owner::REFUSE_EXPECTED_BUCKET_OWNER)
+            {
+                return Some(refusal);
+            }
         }
         // A Zonal endpoint request carries the session it acts under in its
         // `x-amz-s3session-token` header, and may equally be signed with that session's own

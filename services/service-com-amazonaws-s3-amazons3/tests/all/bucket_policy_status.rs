@@ -51,7 +51,8 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// Written out here rather than imported so the handler and this table cannot agree on a
 /// wrong catalog; `aws:SourceIp` carries a documentation range (RFC 5737 `203.0.113.0/24`)
 /// because that key restricts only while the addresses it names are not the whole internet.
-const RESTRICTING_CONDITIONS: [(&str, &str, &str); 13] = [
+const RESTRICTING_CONDITIONS: [(&str, &str, &str); 14] = [
+    ("aws:PrincipalAccount", "StringEquals", "111122223333"),
     ("aws:PrincipalArn", "ArnEquals", "arn:aws:iam::111122223333:role/Reader"),
     ("aws:PrincipalOrgID", "StringEquals", "o-exampleorgid"),
     ("aws:PrincipalOrgPaths", "ForAnyValue:StringLike", "o-exampleorgid/r-examplerootid/*"),

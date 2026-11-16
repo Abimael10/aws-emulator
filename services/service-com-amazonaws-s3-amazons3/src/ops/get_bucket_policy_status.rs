@@ -6,7 +6,8 @@
 //! ([`crate::state::policy_grants_public_access`]). A bucket carrying no policy grants the
 //! public nothing, so it is reported not public; a bucket this emulator does not hold is
 //! `NoSuchBucket` (404), and a request naming another account as the expected bucket owner
-//! is `AccessDenied` (403).
+//! is `AccessDenied` (403) — while one whose expected-owner value is no account id at all is
+//! the malformed parameter, `InvalidBucketOwnerAWSAccountID` (400).
 //!
 //! Block Public Access does NOT enter this answer: the switches `PutPublicAccessBlock`
 //! sets govern what S3 lets a public policy DO, while this operation reports the policy's
@@ -149,20 +150,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read needs nothing from the request beyond its deserialized input.
         let _ = ctx;
 
-        // "If the account ID that you provide does not match the actual owner of the
-        // bucket, the request fails with the HTTP status code 403 Forbidden (access
-        // denied)" — `GetBucketPolicyStatusRequest$ExpectedBucketOwner`. This emulator
-        // serves one account, so that account owns every bucket it holds.
-        if input
-            .expected_bucket_owner
-            .as_deref()
-            .is_some_and(|expected| expected != ::engine::emulator_account_id())
-        {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                "AccessDenied",
-                ACCESS_DENIED_STATUS,
-                "Access Denied",
-            ));
+        // The confused-deputy guard the request itself asks for, judged through the one rule
+        // every operation of this service judges it by
+        // ([`crate::service::authorization::expected_bucket_owner_refusal`]): a value that is
+        // no account id at all is the malformed parameter (400), and a well-formed account id
+        // that is not the owner is "the HTTP status code 403 Forbidden (access denied)"
+        // (`GetBucketPolicyStatusRequest$ExpectedBucketOwner`). Judged before the store is
+        // reached, so neither refusal says anything about what the bucket holds.
+        if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            input.expected_bucket_owner.as_deref(),
+        ) {
+            return Err(refusal);
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -206,7 +204,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The HTTP status AWS answers a bucket-owner mismatch with: 403, as
-/// `GetBucketPolicyStatusRequest$ExpectedBucketOwner` documents.
-const ACCESS_DENIED_STATUS: u16 = 403;

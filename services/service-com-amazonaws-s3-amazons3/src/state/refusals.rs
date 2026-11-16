@@ -1708,6 +1708,35 @@ pub fn is_account_id(value: &str) -> bool {
     value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|digit| digit.is_ascii_digit())
 }
 
+/// The code S3 answers a request whose EXPECTED BUCKET OWNER parameter carries a value that
+/// is not an AWS account id at all, with HTTP 400: the parameter is malformed, which is a
+/// statement about the REQUEST and is settled before any owner is compared.
+///
+/// `ExpectedBucketOwner` and `ExpectedSourceBucketOwner` both target `AccountId`
+/// (`smithy_query(query="operation",operation="CopyObject")`), a plain string the model puts
+/// no pattern on, so the value's form is judged here: twelve decimal digits
+/// ([`is_account_id`]) and nothing else names an account. A well-formed id that is not the
+/// bucket's owner is a different answer — [`ACCESS_DENIED_CODE`] at 403, which the owner
+/// guard makes — so a client can tell a bad VALUE from a foreign OWNER.
+pub const INVALID_BUCKET_OWNER_CODE: &str = "InvalidBucketOwnerAWSAccountID";
+
+/// The HTTP status [`INVALID_BUCKET_OWNER_CODE`] is rendered with: the 400 a value outside
+/// its parameter's rules is refused with.
+pub const INVALID_BUCKET_OWNER_STATUS: u16 = INVALID_ARGUMENT_STATUS;
+
+/// The fixed text S3 states [`INVALID_BUCKET_OWNER_CODE`] with, which
+/// [`invalid_bucket_owner_message`] carries the rejected value after.
+const INVALID_BUCKET_OWNER_SENTENCE: &str =
+    "The value of the expected bucket owner parameter must be an AWS Account ID...";
+
+/// How S3 words [`INVALID_BUCKET_OWNER_CODE`] for the value `supplied`: the fixed sentence
+/// followed by the rejected value in brackets, taken verbatim from the request so the caller
+/// sees which text of its own was refused (an unexpanded template variable, an ARN pasted
+/// where an account id belongs).
+pub fn invalid_bucket_owner_message(supplied: &str) -> String {
+    format!("{INVALID_BUCKET_OWNER_SENTENCE} [{supplied}]")
+}
+
 /// Why a value is not an id a bucket configuration may be identified by — which is what
 /// decides the refusal a call naming it answers with.
 ///
@@ -2179,7 +2208,8 @@ pub fn is_valid_policy_document(policy: &str) -> bool {
 /// principal is public "unless it contains a `Condition` that restricts access to a set of
 /// fixed values" for one of these keys. Lower-case because IAM condition keys are
 /// case-insensitive, so lookups fold the policy's spelling to this one.
-pub(super) const PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS: [&str; 13] = [
+pub(super) const PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS: [&str; 14] = [
+    "aws:principalaccount",
     "aws:principalarn",
     "aws:principalorgid",
     "aws:principalorgpaths",

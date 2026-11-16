@@ -17,6 +17,8 @@ mod access_point_data_plane;
 mod account_credential_federation_sessions;
 #[path = "all/account_public_access_block.rs"]
 mod account_public_access_block;
+#[path = "all/account_scoped_bucket_policy.rs"]
+mod account_scoped_bucket_policy;
 #[path = "all/account_wide_listing_authorization.rs"]
 mod account_wide_listing_authorization;
 #[path = "all/analytics_document_rules.rs"]
@@ -189,6 +191,8 @@ mod error_message_envelope;
 // `error_message_envelope`, which spans the same rule from the model's own catalog.
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/expected_bucket_owner_parameter.rs"]
+mod expected_bucket_owner_parameter;
 #[path = "all/export_destination_account_id.rs"]
 mod export_destination_account_id;
 #[path = "all/express_session_tokens.rs"]

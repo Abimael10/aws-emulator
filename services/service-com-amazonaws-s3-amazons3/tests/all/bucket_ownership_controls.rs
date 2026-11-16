@@ -748,20 +748,27 @@ async fn deleting_ownership_controls_as_an_account_that_is_not_the_owner_is_acce
         String::from_utf8_lossy(&put.body)
     );
 
-    // Account ids that are NOT this emulator's: another well-formed 12-digit id, the
-    // owner's id truncated, an empty one, and the owner's id with its last digit changed.
-    let mut mismatched: Vec<String> = vec![
-        "123456789012".to_string(),
-        owner[..owner.len() - 1].to_string(),
-        String::new(),
+    // Values that are NOT this emulator's account, each with the class it earns: another
+    // well-formed 12-digit id and the owner's id with its last digit changed are the
+    // ownership refusal (403 `AccessDenied`), while the owner's id truncated and an empty one
+    // are no account id at all and so the malformed parameter (400
+    // `InvalidBucketOwnerAWSAccountID`).
+    let mut mismatched: Vec<(String, u16, &str)> = vec![
+        ("123456789012".to_string(), 403, "AccessDenied"),
+        (
+            owner[..owner.len() - 1].to_string(),
+            400,
+            "InvalidBucketOwnerAWSAccountID",
+        ),
+        (String::new(), 400, "InvalidBucketOwnerAWSAccountID"),
     ];
     let mut rotated: String = owner.to_string();
     if let Some(last) = rotated.pop() {
         rotated.push(if last == '9' { '0' } else { '9' });
-        mismatched.push(rotated);
+        mismatched.push((rotated, 403, "AccessDenied"));
     }
 
-    for expected in &mismatched {
+    for (expected, status, code) in &mismatched {
         assert_ne!(
             expected.as_str(),
             owner,
@@ -769,15 +776,15 @@ async fn deleting_ownership_controls_as_an_account_that_is_not_the_owner_is_acce
         );
         let refused = delete_ownership_controls(&router, bucket, Some(expected)).await;
         assert_eq!(
-            refused.status, 403,
-            "case {expected:?}: expected HTTP 403 for an account that is not the owner, got \
+            refused.status, *status,
+            "case {expected:?}: expected HTTP {status} for an account the owner is not, got \
              {} with body {:?}",
             refused.status,
             String::from_utf8_lossy(&refused.body)
         );
         assert_eq!(
             refused.error_code(),
-            "AccessDenied",
+            *code,
             "case {expected:?}: expected the published error code, got {:?}",
             refused.error_code()
         );

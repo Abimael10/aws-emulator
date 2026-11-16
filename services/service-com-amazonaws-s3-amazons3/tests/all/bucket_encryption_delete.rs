@@ -505,8 +505,10 @@ async fn a_delete_against_a_bucket_this_emulator_does_not_hold_is_no_such_bucket
     assert_default_reported(&router, held, "the held bucket").await;
 }
 
-/// The owner gate the delete carries: an `ExpectedBucketOwner` that is not this account's is
-/// `AccessDenied` (HTTP 403) and resets nothing; the account's own id is served.
+/// The owner gate the delete carries: an `ExpectedBucketOwner` the bucket's owner is not
+/// resets nothing — a well-formed account id that is not the owner is `AccessDenied` (HTTP
+/// 403), a value that is no account id at all is the malformed parameter (HTTP 400) — and the
+/// account's own id is served.
 #[tokio::test]
 async fn a_delete_for_an_unexpected_bucket_owner_is_refused() {
     let router = router();
@@ -524,23 +526,30 @@ async fn a_delete_for_an_unexpected_bucket_owner_is_refused() {
         text(&put)
     );
 
-    // Account ids that are not this emulator's: another twelve-digit id, this account's with
-    // its first digit changed, and a value that is not an account id at all.
+    // Values that are not this emulator's account, each with the class it earns: another
+    // twelve-digit id and this account's with its first digit changed are the ownership
+    // refusal (403), while a value that is no account id at all is the malformed parameter
+    // (400).
     let account = engine::emulator_account_id();
     let other_account = format!("9{}", &account[1..]);
-    for expected in ["111122223333", other_account.as_str(), "not-an-account"] {
+    let rows: [(&str, u16, &str); 3] = [
+        ("111122223333", 403, "AccessDenied"),
+        (other_account.as_str(), 403, "AccessDenied"),
+        ("not-an-account", 400, "InvalidBucketOwnerAWSAccountID"),
+    ];
+    for (expected, status, code) in rows {
         let refused =
             delete_encryption(&router, bucket, &[("x-amz-expected-bucket-owner", expected)]).await;
         assert_eq!(
-            refused.status, 403,
-            "case {expected:?}: an ExpectedBucketOwner that is not the owner must be refused \
-             with HTTP 403, got {} with body {:?}",
+            refused.status, status,
+            "case {expected:?}: an ExpectedBucketOwner the owner is not must be refused \
+             with HTTP {status}, got {} with body {:?}",
             refused.status,
             text(&refused)
         );
         assert_eq!(
             refused.error_code(),
-            "AccessDenied",
+            code,
             "case {expected:?}: expected the documented error code, got {:?}",
             refused.error_code()
         );

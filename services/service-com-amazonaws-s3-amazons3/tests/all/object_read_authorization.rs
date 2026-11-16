@@ -557,16 +557,28 @@ async fn an_expected_bucket_owner_that_is_not_the_owner_refuses_the_read() {
         text(&written)
     );
 
-    // (case, the account id the request expects, the status it must answer). The rows differ
-    // along WHOSE account the guard names: the one this emulator serves, another account of
-    // the same shape, and a value that is not an account id at all.
+    // (case, the account id the request expects, the status it must answer, the error code
+    // when it is refused). The rows differ along WHOSE account the guard names and along the
+    // FORM of the value: the account this emulator serves is served, another account of the
+    // same shape is the ownership refusal, and a value that is not an account id at all is
+    // the malformed parameter.
     let owner = engine::emulator_account_id();
-    let rows: [(&str, String, u16); 3] = [
-        ("the account this emulator serves", owner.to_string(), 200),
-        ("another account of the same shape", "123456789012".to_string(), 403),
-        ("a value that is no account id", "not-an-account".to_string(), 403),
+    let rows: [(&str, String, u16, &str); 3] = [
+        ("the account this emulator serves", owner.to_string(), 200, ""),
+        (
+            "another account of the same shape",
+            "123456789012".to_string(),
+            403,
+            ACCESS_DENIED,
+        ),
+        (
+            "a value that is no account id",
+            "not-an-account".to_string(),
+            400,
+            "InvalidBucketOwnerAWSAccountID",
+        ),
     ];
-    for (case, expected_owner, status) in rows {
+    for (case, expected_owner, status, code) in rows {
         for (call, answer) in [
             (
                 "GetObject",
@@ -600,16 +612,18 @@ async fn an_expected_bucket_owner_that_is_not_the_owner_refuses_the_read() {
             if status != 200 && call == "GetObject" {
                 assert_eq!(
                     answer.error_code(),
-                    ACCESS_DENIED,
-                    "case {case:?}/{call}: expected the {ACCESS_DENIED:?} code, got {:?}",
+                    code,
+                    "case {case:?}/{call}: expected the {code:?} code, got {:?}",
                     answer.error_code()
                 );
-                assert_eq!(
-                    answer.error_message(),
-                    ACCESS_DENIED_MESSAGE,
-                    "case {case:?}/{call}: expected the published message, got {:?}",
-                    answer.error_message()
-                );
+                if code == ACCESS_DENIED {
+                    assert_eq!(
+                        answer.error_message(),
+                        ACCESS_DENIED_MESSAGE,
+                        "case {case:?}/{call}: expected the published message, got {:?}",
+                        answer.error_message()
+                    );
+                }
             }
         }
     }

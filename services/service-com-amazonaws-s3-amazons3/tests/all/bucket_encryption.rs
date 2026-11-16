@@ -728,11 +728,17 @@ async fn an_expected_bucket_owner_that_is_not_the_account_is_access_denied() {
         String::from_utf8_lossy(&put.body)
     );
 
-    // Account ids that are not this emulator's: another twelve-digit id, the account id
-    // with a digit changed, and a value that is not an account id at all.
+    // Values that are not this emulator's account, each with the class it earns: another
+    // twelve-digit id and the account id with a digit changed are the ownership refusal
+    // (403), while a value that is no account id at all is the malformed parameter (400).
     let account = engine::emulator_account_id();
     let other_account = format!("9{}", &account[1..]);
-    for expected in ["111122223333", other_account.as_str(), "not-an-account"] {
+    let rows: [(&str, u16, &str); 3] = [
+        ("111122223333", 403, "AccessDenied"),
+        (other_account.as_str(), 403, "AccessDenied"),
+        ("not-an-account", 400, "InvalidBucketOwnerAWSAccountID"),
+    ];
+    for (expected, status, code) in rows {
         let refused = put_encryption_payload(
             &router,
             bucket,
@@ -741,15 +747,15 @@ async fn an_expected_bucket_owner_that_is_not_the_account_is_access_denied() {
         )
         .await;
         assert_eq!(
-            refused.status, 403,
-            "case {expected:?}: an ExpectedBucketOwner that is not the owner must be refused \
-             with HTTP 403, got {} with body {:?}",
+            refused.status, status,
+            "case {expected:?}: an ExpectedBucketOwner the owner is not must be refused \
+             with HTTP {status}, got {} with body {:?}",
             refused.status,
             String::from_utf8_lossy(&refused.body)
         );
         assert_eq!(
             refused.error_code(),
-            "AccessDenied",
+            code,
             "case {expected:?}: expected the documented error code, got {:?}",
             refused.error_code()
         );
@@ -763,7 +769,7 @@ async fn an_expected_bucket_owner_that_is_not_the_account_is_access_denied() {
         )
         .await;
         assert_eq!(
-            read.status, 403,
+            read.status, status,
             "case {expected:?}: the read must be refused the same way, got {} with body {:?}",
             read.status,
             String::from_utf8_lossy(&read.body)

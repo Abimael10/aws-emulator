@@ -388,15 +388,28 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
         }
     }
 
-    // Naming another account as the bucket owner is a 403, as it is on a write.
-    for (case, owner, expected) in [
+    // Naming an account the bucket's owner is not refuses the read, in the class the value's
+    // own form earns: a well-formed foreign account id is the 403 a write earns, and a value
+    // that is no account id at all is the malformed parameter, 400.
+    for (case, owner, expected, code) in [
         (
             "the account this emulator serves",
             engine::emulator_account_id(),
             200,
+            "",
         ),
-        ("another twelve-digit account", "111122223333", 403),
-        ("an account id that is not one", "not-an-account", 403),
+        (
+            "another twelve-digit account",
+            "111122223333",
+            403,
+            "AccessDenied",
+        ),
+        (
+            "an account id that is not one",
+            "not-an-account",
+            400,
+            "InvalidBucketOwnerAWSAccountID",
+        ),
     ] {
         let answer = head_object(
             &router,
@@ -411,11 +424,11 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
-        if expected == 403 {
+        if !code.is_empty() {
             assert_eq!(
                 answer.error_code(),
-                "AccessDenied",
-                "case {case:?}: expected AccessDenied, got {:?}",
+                code,
+                "case {case:?}: expected {code}, got {:?}",
                 answer.error_code()
             );
         }
