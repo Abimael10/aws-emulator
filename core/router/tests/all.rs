@@ -406,6 +406,8 @@ mod boot_serve;
 mod cfn_deployed_backup_pipeline_delivers_job_events;
 #[path = "all/cfn_provisions_declared_resources.rs"]
 mod cfn_provisions_declared_resources;
+#[path = "all/cfn_redeploy_reaches_a_terminal_status.rs"]
+mod cfn_redeploy_reaches_a_terminal_status;
 #[path = "all/chime_app_instance_admin_authorization.rs"]
 mod chime_app_instance_admin_authorization;
 #[path = "all/chime_deleted_meeting_tagging.rs"]

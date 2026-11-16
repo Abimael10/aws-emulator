@@ -455,6 +455,8 @@ mod rds_published_name_identity;
 mod rds_refused_resource_sdk_diagnostic;
 #[path = "all/rds_stack_resources.rs"]
 mod rds_stack_resources;
+#[path = "all/redeployed_stack_terminal_status.rs"]
+mod redeployed_stack_terminal_status;
 #[path = "all/redshift_snapshot_copy_grant_resource_type.rs"]
 mod redshift_snapshot_copy_grant_resource_type;
 #[path = "all/refusals_name_their_modelled_taxonomy.rs"]
