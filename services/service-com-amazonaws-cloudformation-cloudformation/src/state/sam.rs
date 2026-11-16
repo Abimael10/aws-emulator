@@ -103,6 +103,10 @@ use super::template::{declared_transforms, MAX_TEMPLATE_DEPTH, PARTITION};
 /// each one stands for.
 mod policy_templates;
 
+/// The OBJECT-EVENT source a function declares (`Events: { <name>: { Type: S3 } }`), which is
+/// written into the BUCKET it names rather than becoming a resource of its own.
+mod object_events;
+
 /// The macro name the AWS Serverless Application Model is published under, as a template's
 /// `Transform` section names it.
 pub const TRANSFORM: &str = "AWS::Serverless-2016-10-31";
@@ -577,6 +581,11 @@ fn expanded_resources(
     implicit_api(&mut added, &events, globals, true);
     implicit_api(&mut added, &events, globals, false);
 
+    // The OBJECT events: each one is written into the bucket resource it names, which is a
+    // resource of this same template, so it is done once every declaration has taken its
+    // place in `primary` ([`object_events`]).
+    expand_object_events(&mut primary, &mut added, resources, &functions);
+
     let mut out = primary;
     for (logical_id, resource) in added {
         out.entry(logical_id).or_insert(resource);
@@ -584,6 +593,58 @@ fn expanded_resources(
     Expansion {
         resources: out,
         renamed,
+    }
+}
+
+/// Expand every `S3` event source the functions declare: the grant Amazon S3 needs on the
+/// function, and the notification configuration written into the bucket the source names.
+///
+/// Done after every declaration has taken its place in `primary`, because what an object event
+/// produces is a change to ANOTHER resource of the same template — the bucket's own
+/// `NotificationConfiguration` — rather than a resource of its own ([`object_events`] states
+/// the whole rule). A source whose bucket this template does not declare contributes nothing,
+/// so a stack is never left with a grant for a configuration nothing carries.
+fn expand_object_events(
+    primary: &mut Map<String, Value>,
+    added: &mut Map<String, Value>,
+    resources: &Map<String, Value>,
+    functions: &[(String, Value)],
+) {
+    for (logical_id, properties) in functions {
+        let condition = resources
+            .get(logical_id)
+            .and_then(|declaration| declaration.get("Condition"))
+            .cloned();
+        for (event, declaration) in object(properties.get("Events")) {
+            if declaration.get("Type").and_then(Value::as_str) != Some(object_events::S3_EVENT) {
+                continue;
+            }
+            let event_properties = object(declaration.get("Properties"));
+            let Some(source) = object_events::object_event(
+                logical_id,
+                &event,
+                &event_properties,
+                condition.as_ref(),
+            ) else {
+                continue;
+            };
+            // The bucket the source names has to be one this template declares, since the
+            // configuration is written into it; a source naming anything else is left alone.
+            let Some(bucket) = primary.get_mut(&source.bucket) else {
+                continue;
+            };
+            object_events::inject(bucket, &source);
+            added.insert(
+                source.permission_id.clone(),
+                conditioned(
+                    resource(
+                        "AWS::Lambda::Permission",
+                        object_events::invoke_permission(&source),
+                    ),
+                    source.condition.as_ref(),
+                ),
+            );
+        }
     }
 }
 
@@ -864,9 +925,11 @@ fn expand_function(
                     ),
                 );
             }
-            // Every other event type (an S3 notification, a Cognito trigger) rewrites a
-            // resource beside the function rather than adding one of its own; nothing is
-            // synthesized for it here.
+            // Every other event type (a Cognito trigger) rewrites a resource beside the
+            // function rather than adding one of its own; nothing is synthesized for it here.
+            // An S3 event is one of those — the bucket's own `NotificationConfiguration` is
+            // what it writes — and it is expanded once every declaration has taken its place
+            // ([`expand_object_events`]).
             _ => {}
         }
     }

@@ -538,6 +538,8 @@ mod sam_api_stages;
 mod sam_deployed_resources;
 #[path = "all/sam_layer_version_references.rs"]
 mod sam_layer_version_references;
+#[path = "all/sam_object_event_source.rs"]
+mod sam_object_event_source;
 #[path = "all/sam_policies_shorthand.rs"]
 mod sam_policies_shorthand;
 #[path = "all/sam_transform.rs"]
