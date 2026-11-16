@@ -185,9 +185,13 @@ pub(super) struct ParameterRow(
 /// that published catalog, and the engine's own defaults are the values. Nothing
 /// in the Smithy model enumerates parameters (`Parameter` describes only the
 /// shape of one), so this table is the emulator's single statement of what the
-/// Redis OSS-compatible engine defaults ARE; it is deliberately a representative
-/// catalog rather than every parameter AWS ships, and every family that draws on
-/// it reports exactly the rows whose minimum engine version its line covers.
+/// Redis OSS-compatible engine defaults ARE: the parameters the published
+/// catalog carries for the engine's generations, each row with the published
+/// default, value set, modifiability, change type and minimum engine version of
+/// that parameter. Every family that draws on it reports exactly the rows whose
+/// minimum engine version its line covers, so a family's reported set is the
+/// WHOLE published set of its line — the parameters the Redis OSS 6 and 7
+/// generations introduced included — rather than a sample of it.
 ///
 /// The allowed-values column follows [`ParameterRow`]: each numeric parameter a
 /// customer may modify carries the range the ENGINE constrains it to, as the
@@ -311,6 +315,42 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "client-output-buffer-limit-normal-hard-limit",
+        "0",
+        "The output buffer, in bytes, at which an ordinary client is disconnected, or 0 for \
+         no limit.",
+        "integer",
+        "",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-normal-soft-limit",
+        "0",
+        "The output buffer, in bytes, an ordinary client is disconnected for holding for \
+         longer than the soft seconds, or 0 for no limit.",
+        "integer",
+        "",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-normal-soft-seconds",
+        "0",
+        "How long, in seconds, an ordinary client may hold the soft-limit output buffer \
+         before it is disconnected.",
+        "integer",
+        "",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "client-output-buffer-limit-pubsub-hard-limit",
         "33554432",
         "The output buffer size, in bytes, a pub/sub client is disconnected at.",
@@ -345,6 +385,76 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "client-output-buffer-limit-replica-hard-limit",
+        "",
+        "The output buffer, in bytes, at which a replica is disconnected.",
+        "integer",
+        "",
+        false,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        // A share of the node's own memory, so the value is per cache node type.
+        true,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-replica-soft-limit",
+        "",
+        "The output buffer, in bytes, a replica is disconnected for holding for longer than \
+         the soft seconds.",
+        "integer",
+        "",
+        false,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        // A share of the node's own memory, so the value is per cache node type.
+        true,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-replica-soft-seconds",
+        "60",
+        "How long, in seconds, a replica may hold the soft-limit output buffer before it is \
+         disconnected.",
+        "integer",
+        "",
+        false,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "close-on-replica-write",
+        "yes",
+        "Whether a client writing to a read-only replica is disconnected.",
+        "string",
+        "yes,no",
+        true,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "cluster-allow-pubsubshard-when-down",
+        "yes",
+        "Whether sharded pub/sub is served while the cluster is down.",
+        "string",
+        "yes,no",
+        true,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "cluster-allow-reads-when-down",
+        "no",
+        "Whether reads are served while the cluster is down.",
+        "string",
+        "yes,no",
+        true,
+        "5.0.6",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "cluster-enabled",
         "no",
         "Whether cluster mode is enabled for the cluster.",
@@ -370,6 +480,17 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "hash-max-listpack-entries",
         "128",
         "The largest hash, in entries, kept in the memory-efficient listpack encoding.",
+        "integer",
+        "0-",
+        true,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "hash-max-listpack-value",
+        "64",
+        "The largest hash value, in bytes, kept in the memory-efficient listpack encoding.",
         "integer",
         "0-",
         true,
@@ -412,6 +533,17 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "latency-tracking",
+        "yes",
+        "Whether per-command latency percentiles are tracked.",
+        "string",
+        "yes,no",
+        true,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "lazyfree-lazy-eviction",
         "no",
         "Whether an evicted key is freed in a background thread.",
@@ -430,6 +562,86 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "yes,no",
         true,
         "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lazyfree-lazy-server-del",
+        "no",
+        "Whether a key the server replaces as a side effect of a command is freed in a \
+         background thread.",
+        "string",
+        "yes,no",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lazyfree-lazy-user-del",
+        "no",
+        "Whether a key a DEL deletes is freed in a background thread.",
+        "string",
+        "yes,no",
+        true,
+        "6.0.5",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lazyfree-lazy-user-flush",
+        "no",
+        "Whether the keys a FLUSHALL or FLUSHDB removes are freed in a background thread.",
+        "string",
+        "yes,no",
+        true,
+        "6.2.6",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lfu-decay-time",
+        "1",
+        "How long, in minutes, before a key's access counter is halved under an LFU \
+         eviction policy.",
+        "integer",
+        "0-",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lfu-log-factor",
+        "10",
+        "How quickly a key's access counter saturates under an LFU eviction policy.",
+        "integer",
+        "0-",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "list-compress-depth",
+        "0",
+        "How many entries at each end of a list are left uncompressed, or 0 to compress \
+         none of it.",
+        "integer",
+        "0-",
+        true,
+        "3.2.4",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "list-max-listpack-size",
+        "128",
+        "The largest list, in entries, kept in the memory-efficient listpack encoding.",
+        "integer",
+        "0-",
+        true,
+        "7.0.0",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -465,6 +677,30 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
         "2.6.13",
         CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "maxmemory-clients",
+        "",
+        "The memory, in bytes, the client output buffers of all clients together may use.",
+        "integer",
+        "",
+        false,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        // A share of the node's own memory, so the value is per cache node type.
+        true,
+    ),
+    ParameterRow(
+        "maxmemory-eviction-tenacity",
+        "10",
+        "How much effort, as a percentage, is spent evicting keys when the data stored \
+         reaches maxmemory.",
+        "integer",
+        "0-100",
+        true,
+        "6.0.5",
+        CHANGE_TYPE_IMMEDIATE,
         false,
     ),
     ParameterRow(
@@ -525,6 +761,17 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "propagation-error-behavior",
+        "ignore",
+        "What a replica does when it cannot apply a command the primary propagated.",
+        "string",
+        "ignore,panic",
+        true,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "proto-max-bulk-len",
         "536870912",
         "The largest single protocol element, in bytes, a request may carry.",
@@ -579,6 +826,28 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "0-",
         true,
         "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "set-max-listpack-entries",
+        "128",
+        "The largest set, in entries, kept in the memory-efficient listpack encoding.",
+        "integer",
+        "0-",
+        true,
+        "7.2.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "set-max-listpack-value",
+        "64",
+        "The largest set value, in bytes, kept in the memory-efficient listpack encoding.",
+        "integer",
+        "0-",
+        true,
+        "7.2.0",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -646,6 +915,42 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "0,20-",
         true,
         "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "tracking-table-max-keys",
+        "1000000",
+        "How many keys the client-side caching invalidation table holds, or 0 for no \
+         limit.",
+        "integer",
+        "0-",
+        true,
+        "6.0.5",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "zset-max-listpack-entries",
+        "128",
+        "The largest sorted set, in entries, kept in the memory-efficient listpack \
+         encoding.",
+        "integer",
+        "0-",
+        true,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "zset-max-listpack-value",
+        "64",
+        "The largest sorted set value, in bytes, kept in the memory-efficient listpack \
+         encoding.",
+        "integer",
+        "0-",
+        true,
+        "7.0.0",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -945,9 +1250,28 @@ pub(super) fn node_type_capacity(cache_node_type: &str) -> Option<(i64, i64)> {
 pub(super) fn node_type_specific_value(name: &str, memory_mib: i64, vcpus: i64) -> Option<String> {
     /// Mebibytes to bytes.
     const BYTES_PER_MIB: i64 = 1024 * 1024;
+    /// The share of a node's memory a REPLICA's output buffer may grow to
+    /// before the replica is disconnected, as a percentage.
+    ///
+    /// Like [`NODE_SIZES`], the emulator's own scale rather than a claim about
+    /// AWS's published default: what the published catalog states is that the
+    /// limit is a share of the node's own memory, which is what makes it a
+    /// `CacheNodeTypeSpecificParameter` at all.
+    const REPLICA_BUFFER_PERCENT: i64 = 10;
+    /// The share of a node's memory the output buffers of all clients together
+    /// may use, as a percentage; see [`REPLICA_BUFFER_PERCENT`].
+    const CLIENT_BUFFER_PERCENT: i64 = 5;
+    let share = |percent: i64| (memory_mib * BYTES_PER_MIB / 100 * percent).to_string();
     match name {
         // The data a Redis OSS / Valkey node may hold, in bytes.
         "maxmemory" => Some((memory_mib * BYTES_PER_MIB).to_string()),
+        // The replication output buffers, in bytes, which the node's own
+        // capacity sizes.
+        "client-output-buffer-limit-replica-hard-limit"
+        | "client-output-buffer-limit-replica-soft-limit" => Some(share(REPLICA_BUFFER_PERCENT)),
+        // The client output buffers, in bytes, which the node's own capacity
+        // sizes.
+        "maxmemory-clients" => Some(share(CLIENT_BUFFER_PERCENT)),
         // The cache a Memcached node may hold, in megabytes.
         "max_cache_memory" => Some(memory_mib.to_string()),
         // One Memcached worker thread per vCPU.

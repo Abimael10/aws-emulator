@@ -67,14 +67,14 @@ const OFFERED_VERSIONS: [(&str, &str, &str); 10] = [
 /// The patch spellings of the Redis OSS lines above are the interesting rows:
 /// the catalog offers `6.0`, `6.2` and `7.0`, so a request naming a patch
 /// release behind one of them names a version the service does not publish.
-/// Beside them sit a Memcached patch release below the oldest line and a Valkey
-/// minor past the newest.
+/// Beside them sit a Memcached patch release below the oldest line, a retired
+/// Redis OSS release and a Valkey generation past the newest.
 const UNOFFERED_VERSIONS: [(&str, &str); 5] = [
     ("redis", "6.0.5"),
     ("redis", "6.2.6"),
-    ("redis", "7.0.7"),
+    ("redis", "2.8.24"),
     ("memcached", "1.4.4"),
-    ("valkey", "9.1"),
+    ("valkey", "10.0"),
 ];
 
 /// Ask one describe and assert it succeeded.
@@ -120,14 +120,36 @@ async fn every_published_family_is_offered_a_version_and_a_default_group() {
         groups.body
     );
 
-    // The axis: the family — every one this service publishes, the current
-    // engine generation included.
-    for family in state::PARAMETER_GROUP_FAMILIES {
+    // Every family the VERSION catalog names is one this service publishes, so
+    // the published families are a superset of them: a family outlives the
+    // engine versions it was published for, which is why the retired Redis OSS
+    // lines are published here with their default groups while the version
+    // catalog offers no version of them.
+    for family in &version_families {
         assert!(
-            version_families.contains(family),
-            "case {family}: a published family must be the family of a published engine \
-             version, got {version_families:?}"
+            state::PARAMETER_GROUP_FAMILIES.contains(family),
+            "case {family}: a version's family must be one this service publishes, got {:?}",
+            state::PARAMETER_GROUP_FAMILIES
         );
+    }
+
+    // The axis: the family — every one this service publishes, the current
+    // engine generation included. A family OUTLIVES the engine versions it was
+    // published for: the retired Redis OSS lines still carry their default
+    // parameter groups (asserted for every family below), so only a family the
+    // catalog still offers a version of is checked against the version catalog.
+    for family in state::PARAMETER_GROUP_FAMILIES {
+        if let Some(version) = state::CACHE_ENGINE_VERSIONS.iter().find(|row| {
+            state::parameter_group_family(row.engine, row.engine_version) == Some(family)
+        }) {
+            assert!(
+                version_families.contains(family),
+                "case {family}: the family of the published version {} {} must be reported by \
+                 the version catalog, got {version_families:?}",
+                version.engine,
+                version.engine_version
+            );
+        }
         let plain = format!("default.{family}");
         let mut expected = vec![(
             plain.clone(),

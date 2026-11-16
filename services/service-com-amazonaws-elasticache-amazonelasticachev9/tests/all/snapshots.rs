@@ -111,7 +111,7 @@ async fn a_created_snapshot_is_read_back_from_persisted_state() {
             ],
             snapshot_extra: &[("KmsKeyId", "alias/aws-elasticache")],
             engine: "valkey",
-            engine_version: "9.0",
+            engine_version: "9.1",
             num_cache_nodes: "1",
             parameter_group: "default.valkey9",
             retention_limit: "5",

@@ -27,11 +27,9 @@
 //! content, the tag count, the page size, the Region signed for), so no single
 //! recorded request is what makes them pass.
 
-use std::time::Duration;
-
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, Reply};
+use crate::harness::{params, poll_until, Emulator, Reply};
 
 /// The region every test signs with unless it is exercising the Region rule
 /// itself.
@@ -44,9 +42,10 @@ const REGION: &str = "us-east-1";
 /// member="CacheParameterGroupFamily")`: "Valid values are: valkey8 | valkey7 |
 /// memcached1.4 | memcached1.5 | memcached1.6 | redis2.6 | redis2.8 | redis3.2
 /// | redis4.0 | redis5.0 | redis6.x | redis7"), plus `valkey9` — the family of
-/// the current Valkey generation, which that value list does not name yet while
-/// the default groups ElastiCache publishes do carry it — in the sorted order a
-/// describe reports them in.
+/// the Valkey generation that value list does not name yet while the catalog
+/// offers its versions — in the sorted order a describe reports them in. A
+/// family outlives the engine versions it was published for, so the families of
+/// the retired Redis OSS lines are here too.
 const FAMILIES: [&str; 13] = [
     "memcached1.4",
     "memcached1.5",
@@ -93,10 +92,6 @@ fn published_default_groups() -> Vec<String> {
     names.sort();
     names
 }
-
-/// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a cluster
-/// its next status; the handlers never sleep, so only the test waits.
-const PAST_TRANSITION: Duration = Duration::from_millis(750);
 
 /// Create one cache parameter group, with whatever tags `tags` names.
 async fn create_group(
@@ -940,7 +935,7 @@ async fn a_cluster_joins_a_group_the_account_holds_and_nothing_else() {
     let derived: [(&str, &str, Option<&str>); 4] = [
         ("derived-redis6", "6.2", Some("default.redis6.x")),
         ("derived-redis7", "7.1", Some("default.redis7")),
-        ("derived-redis28", "2.8.24", Some("default.redis2.8")),
+        ("derived-redis40", "4.0.10", Some("default.redis4.0")),
         ("derived-unsupported", "9.9", None),
     ];
     for (id, version, expected) in derived {
@@ -998,8 +993,19 @@ async fn a_cluster_joins_a_group_the_account_holds_and_nothing_else() {
     }
 
     // The same rule on the modify path: a created group is accepted there too,
-    // and the cluster reports the group it moved to.
-    std::thread::sleep(PAST_TRANSITION);
+    // and the cluster reports the group it moved to. A modify is only accepted
+    // once the cluster has settled, so this waits for THAT condition rather
+    // than for a span of time.
+    poll_until(
+        &emulator,
+        REGION,
+        "joins-own-group",
+        "the cluster settling at available",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "joins-own-group")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
     let modified = emulator
         .call(
             "ModifyCacheCluster",

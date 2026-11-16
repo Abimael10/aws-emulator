@@ -57,12 +57,13 @@ const ENGINE_NAMING: [(&str, &str, &str); 3] = [
 /// One catalog-floor row: the engine, the oldest version the service offers for
 /// it, and a version it does not offer at all.
 ///
-/// Source: the engine lines ElastiCache publishes — Memcached starts at 1.4.5,
-/// Redis OSS at 2.6.13 and Valkey at 7.2 — so a lower version of the same line
-/// (1.4.4, 2.6.0, 7.0) is one no entry reports.
+/// Source: the engine lines ElastiCache offers — Memcached starts at 1.4.5,
+/// Redis OSS at 4.0.10 (the 2.6, 2.8, 3.2 and pre-5.0.6 lines have been
+/// retired) and Valkey at 7.2 — so a lower version of the same line (1.4.4,
+/// 7.0) and a retired Redis OSS release (2.8.24) are versions no entry reports.
 const CATALOG_FLOOR: [(&str, &str, &str); 3] = [
     ("memcached", "1.4.5", "1.4.4"),
-    ("redis", "2.6.13", "2.6.0"),
+    ("redis", "4.0.10", "2.8.24"),
     ("valkey", "7.2", "7.0"),
 ];
 
@@ -621,50 +622,80 @@ async fn every_offering_publishes_its_hourly_recurring_charge() {
 }
 
 #[tokio::test]
-async fn published_service_update_names_do_not_move_with_the_clock() {
-    // The axis: the instant the catalog is built at, spanning years either side
-    // of now. The identities a catalog publishes must not depend on it; the
-    // DATES must.
+async fn published_service_updates_do_not_move_with_the_clock() {
+    // The axis: the instant the catalog is read at, spanning years either side
+    // of now. NOTHING a catalog publishes may depend on it — neither the
+    // identities nor the dates — because the catalog is a published set rather
+    // than one computed from the clock the store came up on.
     let now = SystemTime::now();
     let year = Duration::from_secs(365 * 24 * 60 * 60);
-    let anchors = [
-        ("now", now),
-        ("a year ago", now - year),
-        ("four years ago", now - 4 * year),
-        ("a year from now", now + year),
-    ];
 
-    let expected: BTreeSet<String> = state::published_service_updates(now).keys().cloned().collect();
+    let expected: BTreeSet<String> = state::published_service_updates()
+        .keys()
+        .cloned()
+        .collect();
     assert!(
         !expected.is_empty(),
         "case now: the service publishes a catalog of updates"
     );
-    let mut release_dates = BTreeSet::new();
-    for (case, anchor) in anchors {
-        let catalog = state::published_service_updates(anchor);
-        let names: BTreeSet<String> = catalog.keys().cloned().collect();
+    // Every date of every entry, collected over repeated readings of the
+    // catalog: a clock-derived date would differ between them.
+    let dates = |case: &str| -> BTreeSet<(String, u64, u64, u64)> {
+        state::published_service_updates()
+            .values()
+            .map(|record| {
+                let secs = |at: SystemTime| {
+                    at.duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_else(|_| {
+                            panic!("case {case}: a published date must be after the epoch")
+                        })
+                        .as_secs()
+                };
+                (
+                    record.service_update_name.clone(),
+                    secs(record.release_date),
+                    secs(record.recommended_apply_by_date),
+                    secs(record.end_date),
+                )
+            })
+            .collect()
+    };
+    let published = dates("now");
+    for case in ["again", "a third time"] {
         assert_eq!(
-            names, expected,
-            "case {case}: a catalog published at any instant carries the same names"
+            dates(case),
+            published,
+            "case {case}: every published date must be the catalog's own, not the clock's"
         );
-        for record in catalog.values() {
-            release_dates.insert(
-                record
-                    .release_date
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("a release date after the epoch")
-                    .as_secs(),
+    }
+    for (name, release, apply_by, end) in &published {
+        assert!(
+            release < apply_by && apply_by < end,
+            "case {name}: a published window must run release < apply-by < end, got \
+             {release} {apply_by} {end}"
+        );
+        // None of the three dates may sit at the instant the catalog was read:
+        // that is what a date derived from the store's own clock looks like.
+        let read_at = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        for (member, date) in [
+            ("ServiceUpdateReleaseDate", release),
+            ("ServiceUpdateRecommendedApplyByDate", apply_by),
+            ("ServiceUpdateEndDate", end),
+        ] {
+            assert!(
+                date.abs_diff(read_at) > year.as_secs() / 365,
+                "case {name}: {member} must be a published date, got {date} within a day of \
+                 the instant the catalog was read ({read_at})"
             );
         }
     }
-    assert!(
-        release_dates.len() >= anchors.len(),
-        "case dates: the catalog's dates must hang off the anchor the store came up on, got \
-         {release_dates:?}"
-    );
 
-    // Over the wire: a store whose catalog was built at an older anchor reports
-    // the same names, and every one of them is still resolvable by name.
+    // Over the wire: the describe reports the published set, every name of it
+    // resolves, and both availability windows are represented — an update still
+    // inside its window and one the clock has carried past its end date.
     let emulator = Emulator::new();
     let served = emulator.call("DescribeServiceUpdates", &[]).await;
     assert_eq!(
@@ -681,26 +712,16 @@ async fn published_service_update_names_do_not_move_with_the_clock() {
         served_names, expected,
         "case served: the describe must report the published names, got {served_names:?}"
     );
+    let statuses: BTreeSet<&str> = served.all("ServiceUpdateStatus").into_iter().collect();
+    for status in [state::SERVICE_UPDATE_AVAILABLE, state::SERVICE_UPDATE_EXPIRED] {
+        assert!(
+            statuses.contains(status),
+            "case served: the catalog must publish an update in status {status}, got \
+             {statuses:?}"
+        );
+    }
 
-    emulator.with_state(|store| {
-        store.service_updates = state::published_service_updates(now - 4 * year);
-    });
-    let aged = emulator.call("DescribeServiceUpdates", &[]).await;
-    assert_eq!(
-        aged.status, 200,
-        "case aged: DescribeServiceUpdates must answer 200, got {} {}",
-        aged.status, aged.body
-    );
-    let aged_names: BTreeSet<String> = aged
-        .all("ServiceUpdateName")
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        aged_names, served_names,
-        "case aged: an older catalog publishes the same names, got {aged_names:?}"
-    );
-    for name in &aged_names {
+    for name in &served_names {
         let looked_up = emulator
             .call(
                 "DescribeServiceUpdates",

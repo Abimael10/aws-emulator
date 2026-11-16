@@ -207,6 +207,8 @@ mod migrations;
 mod network_types;
 mod settle_wait;
 mod snapshots;
+mod service_updates;
+pub use service_updates::*;
 pub use network_types::*;
 pub use snapshots::*;
 pub use migrations::*;
@@ -973,12 +975,12 @@ pub fn default_port(engine: &str) -> i32 {
 /// Valkey and current Redis OSS, `<major>.<minor>` for Memcached and the older
 /// Redis OSS lines, and `6.x` for Redis OSS 6.
 ///
-/// `valkey9` is published beside them: the member's value list above does not
-/// name the current Valkey generation yet, while the default parameter groups
-/// ElastiCache answers `DescribeCacheParameterGroups` with do carry
-/// `default.valkey9` and `default.valkey9.cluster.on`. A family is published
-/// exactly when the engine line behind it is, and [`CACHE_ENGINE_VERSIONS`]
-/// offers that line.
+/// The published set is exactly that documented one plus `valkey9`, the family
+/// of the Valkey generation that value list does not name yet while
+/// [`CACHE_ENGINE_VERSIONS`] offers its versions: a family outlives the engine
+/// versions it was published for, so the families of the retired Redis OSS
+/// lines are still published (and still carry their default parameter groups)
+/// even though the catalog no longer offers a version of them.
 pub const PARAMETER_GROUP_FAMILIES: [&str; 13] = [
     "memcached1.4",
     "memcached1.5",
@@ -2151,213 +2153,6 @@ pub struct NewServerlessCache {
     pub now: SystemTime,
 }
 
-/// `ServiceUpdateStatus`'s values (`smithy_query(query="shape",
-/// shape="ServiceUpdateStatus")`: `available | cancelled | expired`). A filter
-/// naming anything else is refused by the boundary validator before a handler
-/// runs, because the member is a modelled enum.
-pub const SERVICE_UPDATE_AVAILABLE: &str = "available";
-/// See [`SERVICE_UPDATE_AVAILABLE`].
-pub const SERVICE_UPDATE_CANCELLED: &str = "cancelled";
-/// See [`SERVICE_UPDATE_AVAILABLE`].
-pub const SERVICE_UPDATE_EXPIRED: &str = "expired";
-
-/// The only value `ServiceUpdateType` declares
-/// (`smithy_query(query="shape", shape="ServiceUpdateType")`:
-/// `security-update`).
-pub const SERVICE_UPDATE_TYPE: &str = "security-update";
-
-/// The type an END-OF-LIFE update carries: the update that asks for an engine
-/// major version to be left before it stops being served.
-///
-/// `ServiceUpdateType`'s enum lists only [`SERVICE_UPDATE_TYPE`], while
-/// ElastiCache publishes this second type beside it; `ServiceUpdate$Type` is a
-/// plain string on the wire, so an update reports the type of its own kind
-/// rather than the one value the enum lists.
-pub const SERVICE_UPDATE_TYPE_ENGINE_MAJOR_VERSION: &str = "engine-major-version-update";
-
-/// The `EstimatedUpdateTime` every published update carries: "The estimated
-/// length of time the service update will take".
-///
-/// Nothing in the model or the docs states what that length is for a given
-/// update, so the emulator publishes one estimate for all of them rather than
-/// inventing a per-update one.
-pub const SERVICE_UPDATE_ESTIMATED_TIME: &str = "15 minutes";
-
-/// A day, the unit the published catalog's dates are spaced by.
-pub const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// One row of the service-update catalog this emulator publishes, as offsets in
-/// whole days from the instant the store came up.
-///
-/// AWS publishes ElastiCache service updates itself — the API has no operation
-/// that creates, cancels or expires one — and neither the model nor the docs
-/// name any particular update, so this table is the emulator's OWN published
-/// catalog rather than a claim about what AWS has released. The dates are
-/// relative to the store's own anchor so the catalog keeps the shape a real
-/// account sees (a recent update still inside its availability window, and an
-/// earlier one the clock has already carried past its end date) however long
-/// after this build the emulator runs.
-struct PublishedUpdate {
-    /// The tail of this row's `ServiceUpdateName`, FIXED by the catalog: an
-    /// update's identity is part of what the service publishes, so it is the
-    /// same string on every store this build brings up and is never derived
-    /// from the clock — a client that discovered a name, or that was written
-    /// against one, can still name it in `BatchApplyUpdateAction` /
-    /// `BatchStopUpdateAction` a day later. See [`published_service_updates`]
-    /// for the whole name.
-    slug: &'static str,
-    /// One of `ServiceUpdateSeverity`'s values (`critical | important | medium |
-    /// low`).
-    severity: &'static str,
-    /// How long before the anchor the update was released.
-    released_days_before: u64,
-    /// How long after its release the update is recommended to be applied by.
-    apply_by_days_after_release: u64,
-    /// How long after its release the update stops being available.
-    end_days_after_release: u64,
-    /// `AutoUpdateAfterRecommendedApplyByDate`: "whether the service update
-    /// will be automatically applied once the recommended apply-by date has
-    /// expired".
-    auto_update_after_recommended_apply_by_date: bool,
-}
-
-/// The catalog's rows. Every engine gets one update per row, so the set spans
-/// both the availability window a published update is inside and the one it has
-/// fallen out of.
-const PUBLISHED_UPDATES: [PublishedUpdate; 2] = [
-    PublishedUpdate {
-        slug: "security-update-001",
-        severity: "critical",
-        released_days_before: 180,
-        apply_by_days_after_release: 30,
-        end_days_after_release: 120,
-        auto_update_after_recommended_apply_by_date: true,
-    },
-    PublishedUpdate {
-        slug: "security-update-002",
-        severity: "important",
-        released_days_before: 7,
-        apply_by_days_after_release: 30,
-        end_days_after_release: 120,
-        auto_update_after_recommended_apply_by_date: false,
-    },
-];
-
-/// The engine major versions ElastiCache publishes an END-OF-LIFE update for,
-/// as `(engine, how that engine is spelled in an update's name, the major
-/// version segment of the name, the engine version LINE the update applies
-/// to)`.
-///
-/// Redis OSS 6 is the line ElastiCache has announced the end of life of; the
-/// engine's name in an update's name is its published product name, which is
-/// why Redis OSS carries the `-oss` of it. A line added here is published the
-/// moment it is announced, one update per [`EOL_RESOURCE_KINDS`] entry, so the
-/// catalog states each end of life once instead of once per resource kind.
-const PUBLISHED_EOL_UPDATES: [(&str, &str, &str, &str); 1] =
-    [(DEFAULT_ENGINE, "redis-oss", "v6", "6.x")];
-
-/// The KINDS of resource an end-of-life update is published for, as the tail of
-/// its `ServiceUpdateName` and as the words its description names them by.
-///
-/// One update per kind, because the resources that run an engine version are
-/// carried onto a later major version by different operations — a cache cluster
-/// by `ModifyCacheCluster` and a replication group by `ModifyReplicationGroup` —
-/// so a client applies the update that names the kind of resource it holds.
-const EOL_RESOURCE_KINDS: [(&str, &str); 2] = [
-    ("cache-clusters", "cache clusters"),
-    ("replication-groups", "replication groups"),
-];
-
-/// The window an end-of-life update is published over, in whole days from the
-/// store's anchor, and the severity it carries.
-///
-/// Longer than a security update's ([`PUBLISHED_UPDATES`]): leaving a major
-/// version is a planned upgrade of the resources that run it rather than a
-/// patch, so the recommended apply-by date and the end date are further out.
-/// Like the security rows, only the DATES hang off the anchor — the names, the
-/// types and the severities are fixed by the catalog.
-const EOL_RELEASED_DAYS_BEFORE: u64 = 60;
-/// See [`EOL_RELEASED_DAYS_BEFORE`].
-const EOL_APPLY_BY_DAYS_AFTER_RELEASE: u64 = 180;
-/// See [`EOL_RELEASED_DAYS_BEFORE`].
-const EOL_END_DAYS_AFTER_RELEASE: u64 = 365;
-/// See [`EOL_RELEASED_DAYS_BEFORE`]; one of `ServiceUpdateSeverity`'s values.
-const EOL_SEVERITY: &str = "important";
-
-/// One published service update, as this emulator holds it.
-///
-/// `ServiceUpdateStatus` is NOT stored: it follows from the update's dates and
-/// the clock, so [`ServiceUpdateRecord::status`] derives it on every read
-/// instead of letting a stored copy drift from the dates beside it.
-#[derive(Debug, Clone)]
-pub struct ServiceUpdateRecord {
-    /// "The unique ID of the service update", and the identity
-    /// `ServiceUpdateName` names it by.
-    pub service_update_name: String,
-    /// "The Elasticache engine to which the update applies."
-    pub engine: String,
-    /// "The Elasticache engine version to which the update applies."
-    pub engine_version: String,
-    /// One of `ServiceUpdateSeverity`'s values.
-    pub severity: String,
-    /// One of `ServiceUpdateType`'s values — see [`SERVICE_UPDATE_TYPE`].
-    pub update_type: String,
-    /// "Provides details of the service update."
-    pub description: String,
-    /// "The date when the service update is initially available."
-    pub release_date: SystemTime,
-    /// "The recommendend date to apply the service update in order to ensure
-    /// compliance."
-    pub recommended_apply_by_date: SystemTime,
-    /// "The date after which the service update is no longer available."
-    pub end_date: SystemTime,
-    /// See [`PublishedUpdate::auto_update_after_recommended_apply_by_date`].
-    pub auto_update_after_recommended_apply_by_date: bool,
-    /// See [`SERVICE_UPDATE_ESTIMATED_TIME`].
-    pub estimated_update_time: String,
-}
-
-impl ServiceUpdateRecord {
-    /// This update's `ServiceUpdateStatus` at `now`.
-    ///
-    /// `ServiceUpdateEndDate` is "the date after which the service update is no
-    /// longer available", so an update the clock has carried past it is
-    /// `expired` and one still inside its window is `available`. The third
-    /// status, `cancelled`, is the status of an update AWS withdrew before its
-    /// end date; this emulator publishes none, and no operation in this service
-    /// withdraws one, so no record ever reports it.
-    pub fn status(&self, now: SystemTime) -> &'static str {
-        if now >= self.end_date {
-            SERVICE_UPDATE_EXPIRED
-        } else {
-            SERVICE_UPDATE_AVAILABLE
-        }
-    }
-
-    /// This record as the modelled `ServiceUpdate`, with its status taken from
-    /// the clock at `now`.
-    pub fn to_modeled(&self, now: SystemTime) -> ServiceUpdate {
-        ServiceUpdate {
-            service_update_name: Some(self.service_update_name.clone()),
-            service_update_release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
-            service_update_end_date: Some(::aws_smithy_types::DateTime::from(self.end_date)),
-            service_update_severity: Some(self.severity.clone()),
-            service_update_recommended_apply_by_date: Some(::aws_smithy_types::DateTime::from(
-                self.recommended_apply_by_date,
-            )),
-            service_update_status: Some(self.status(now).to_string()),
-            service_update_description: Some(self.description.clone()),
-            service_update_type: Some(self.update_type.clone()),
-            engine: Some(self.engine.clone()),
-            engine_version: Some(self.engine_version.clone()),
-            auto_update_after_recommended_apply_by_date: Some(
-                self.auto_update_after_recommended_apply_by_date,
-            ),
-            estimated_update_time: Some(self.estimated_update_time.clone()),
-        }
-    }
-}
-
 /// The values a new snapshot carries that do not come from the source cluster —
 /// one argument so [`SnapshotRecord::from_cluster`] does not take a row of
 /// positional strings.
@@ -2391,97 +2186,6 @@ pub struct SnapshotCopy {
     pub kms_key_id: Option<String>,
     pub tags: Vec<(String, String)>,
     pub now: SystemTime,
-}
-
-/// The service-update catalog as of `anchor`, keyed by `ServiceUpdateName`.
-///
-/// Two kinds of update make it up, which is what gives
-/// `BatchApplyUpdateAction` / `DescribeUpdateActions` the names a client reads
-/// off this catalog:
-///
-/// * a SECURITY update per engine per row of [`PUBLISHED_UPDATES`], named
-///   `elasticache-<engine>-<slug>`: the service, the engine the update applies
-///   to and the row's own [`PublishedUpdate::slug`];
-/// * an END-OF-LIFE update per resource kind per row of
-///   [`PUBLISHED_EOL_UPDATES`], named
-///   `elasticache-<engine-name>-<major>-eol-<resource-kind>`.
-///
-/// Every name is FIXED by the catalog, so a store built at any instant
-/// publishes the same set of names and a name a client holds stays resolvable;
-/// only the DATES hang off `anchor`, which is what keeps the window shape a
-/// real account sees. A `BTreeMap` is what gives `DescribeServiceUpdates` the
-/// stable total order its `Marker` indexes into.
-pub fn published_service_updates(anchor: SystemTime) -> BTreeMap<String, ServiceUpdateRecord> {
-    let mut catalog = BTreeMap::new();
-    for row in &PUBLISHED_UPDATES {
-        let release_date = anchor
-            .checked_sub(DAY * u32::try_from(row.released_days_before).unwrap_or(u32::MAX))
-            .unwrap_or(anchor);
-        for engine in ENGINES {
-            let name = format!("{ARN_NAMESPACE}-{engine}-{}", row.slug);
-            let engine_version = default_engine_version(engine);
-            let severity = row.severity;
-            catalog.insert(
-                name.clone(),
-                ServiceUpdateRecord {
-                    service_update_name: name,
-                    engine: engine.to_string(),
-                    engine_version: engine_version.to_string(),
-                    severity: severity.to_string(),
-                    update_type: SERVICE_UPDATE_TYPE.to_string(),
-                    description: format!(
-                        "A {severity} security update for {engine} {engine_version}."
-                    ),
-                    release_date,
-                    recommended_apply_by_date: release_date
-                        + DAY * u32::try_from(row.apply_by_days_after_release).unwrap_or(u32::MAX),
-                    end_date: release_date
-                        + DAY * u32::try_from(row.end_days_after_release).unwrap_or(u32::MAX),
-                    auto_update_after_recommended_apply_by_date: row
-                        .auto_update_after_recommended_apply_by_date,
-                    estimated_update_time: SERVICE_UPDATE_ESTIMATED_TIME.to_string(),
-                },
-            );
-        }
-    }
-    let eol_release_date = anchor
-        .checked_sub(DAY * u32::try_from(EOL_RELEASED_DAYS_BEFORE).unwrap_or(u32::MAX))
-        .unwrap_or(anchor);
-    for (engine, engine_in_name, major_in_name, version_line) in PUBLISHED_EOL_UPDATES {
-        for (kind_in_name, kind_words) in EOL_RESOURCE_KINDS {
-            let name =
-                format!("{ARN_NAMESPACE}-{engine_in_name}-{major_in_name}-eol-{kind_in_name}");
-            catalog.insert(
-                name.clone(),
-                ServiceUpdateRecord {
-                    service_update_name: name,
-                    engine: engine.to_string(),
-                    // "The Elasticache engine version to which the update
-                    // applies": an end-of-life update applies to a whole
-                    // version LINE rather than to one release, so the version
-                    // it reports is the engine and that line.
-                    engine_version: format!("{engine} {version_line}"),
-                    severity: EOL_SEVERITY.to_string(),
-                    update_type: SERVICE_UPDATE_TYPE_ENGINE_MAJOR_VERSION.to_string(),
-                    description: format!(
-                        "{engine} {version_line} is reaching end of life: upgrade your \
-                         {kind_words} to a later major version."
-                    ),
-                    release_date: eol_release_date,
-                    recommended_apply_by_date: eol_release_date
-                        + DAY * u32::try_from(EOL_APPLY_BY_DAYS_AFTER_RELEASE).unwrap_or(u32::MAX),
-                    end_date: eol_release_date
-                        + DAY * u32::try_from(EOL_END_DAYS_AFTER_RELEASE).unwrap_or(u32::MAX),
-                    // A major version upgrade changes what the resource runs,
-                    // so it is applied when the customer asks for it rather
-                    // than automatically once the apply-by date has passed.
-                    auto_update_after_recommended_apply_by_date: false,
-                    estimated_update_time: SERVICE_UPDATE_ESTIMATED_TIME.to_string(),
-                },
-            );
-        }
-    }
-    catalog
 }
 
 /// `UpdateActionStatus`'s values (`smithy_query(query="shape",
@@ -4033,7 +3737,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             global_replication_groups: BTreeMap::new(),
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
-            service_updates: published_service_updates(SystemTime::now()),
+            service_updates: published_service_updates(),
             update_actions: BTreeMap::new(),
             events: BTreeMap::new(),
             event_seq: 0,

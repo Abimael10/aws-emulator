@@ -514,9 +514,21 @@ async fn a_node_type_specific_parameter_carries_one_value_per_published_node_typ
 
     // The axis: the family, and with it which parameters depend on the node
     // type. Each row names the parameters that must be reported among the
-    // cache-node-type-specific ones.
+    // cache-node-type-specific ones, in the order the catalog reports them.
+    // The Redis OSS-compatible families gain the output-buffer limits a replica
+    // and the clients together are held to from the line that renamed them
+    // (5.0), and the client-buffer total from the line that introduced it (7.0),
+    // so an older family carries fewer of them.
     let cases: [(&str, &[&str]); 3] = [
-        ("redis7", &["maxmemory"]),
+        (
+            "redis7",
+            &[
+                "client-output-buffer-limit-replica-hard-limit",
+                "client-output-buffer-limit-replica-soft-limit",
+                "maxmemory",
+                "maxmemory-clients",
+            ],
+        ),
         ("redis2.6", &["maxmemory"]),
         ("memcached1.6", &["max_cache_memory", "num_threads"]),
     ];

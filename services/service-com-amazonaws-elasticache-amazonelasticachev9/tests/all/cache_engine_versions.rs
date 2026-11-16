@@ -162,7 +162,7 @@ const FILTER_CASES: [FilterCase; 12] = [
         engine: None,
         family: None,
         engine_version: None,
-        must_report: &["7.1", "1.6.22", "8.0"],
+        must_report: &["7.1", "1.6.22", "9.1"],
         must_be_empty: false,
     },
     FilterCase {
@@ -170,7 +170,7 @@ const FILTER_CASES: [FilterCase; 12] = [
         engine: Some("redis"),
         family: None,
         engine_version: None,
-        must_report: &["2.6.13", "7.1"],
+        must_report: &["4.0.10", "7.1"],
         must_be_empty: false,
     },
     FilterCase {
@@ -187,7 +187,7 @@ const FILTER_CASES: [FilterCase; 12] = [
         engine: Some("valkey"),
         family: None,
         engine_version: None,
-        must_report: &["7.2", "8.0"],
+        must_report: &["7.2", "8.0", "9.1"],
         must_be_empty: false,
     },
     FilterCase {
@@ -244,8 +244,8 @@ const FILTER_CASES: [FilterCase; 12] = [
         name: "a whole version line",
         engine: None,
         family: None,
-        engine_version: Some("5.0"),
-        must_report: &["5.0.5", "5.0.6"],
+        engine_version: Some("6"),
+        must_report: &["6.0", "6.2"],
         must_be_empty: false,
     },
     FilterCase {
@@ -321,7 +321,29 @@ async fn the_published_catalog_is_reported_with_every_member_of_the_shape() {
             published.iter().map(|row| &row.engine).collect::<Vec<_>>()
         );
     }
-    for family in DOCUMENTED_FAMILIES {
+    // Every family of an engine line the service still OFFERS carries a
+    // published version. The documented family list OUTLIVES the versions: the
+    // families of the retired Redis OSS lines (redis2.6, redis2.8, redis3.2)
+    // are still published, and still carry their default parameter groups,
+    // though the catalog offers no version of them — so the documented families
+    // are a superset of the families below.
+    for family in [
+        "memcached1.4",
+        "memcached1.5",
+        "memcached1.6",
+        "redis4.0",
+        "redis5.0",
+        "redis6.x",
+        "redis7",
+        "valkey7",
+        "valkey8",
+        "valkey9",
+    ] {
+        assert!(
+            DOCUMENTED_FAMILIES.contains(&family),
+            "case {case}: {family} must be one of the documented families \
+             {DOCUMENTED_FAMILIES:?}"
+        );
         assert!(
             published.iter().any(|row| row.family == family),
             "case {case}: the catalog must publish a version in the published {family} family, \
@@ -518,7 +540,7 @@ async fn default_only_reports_the_newest_version_of_each_version_line_it_selects
     }
     for (family, newest) in [
         ("memcached1.4", "1.4.34"),
-        ("redis2.8", "2.8.24"),
+        ("redis6.x", "6.2"),
         ("redis7", "7.1"),
     ] {
         let name = format!("DefaultOnly for family {family}");

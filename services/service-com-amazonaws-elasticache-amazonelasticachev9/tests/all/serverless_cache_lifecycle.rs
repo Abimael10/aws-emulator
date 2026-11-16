@@ -314,7 +314,7 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             stored_name: "metered-cache",
             engine: "valkey",
             major_engine_version: "9",
-            full_engine_version: "9.0",
+            full_engine_version: "9.1",
             port: "6379",
             description: None,
             storage_encryption_type: "sse-elasticache",

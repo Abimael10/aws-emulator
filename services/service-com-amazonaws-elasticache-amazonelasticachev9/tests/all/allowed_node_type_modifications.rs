@@ -132,11 +132,12 @@ async fn the_lists_are_the_catalogue_split_around_the_stored_node_type() {
             down_is_empty: true,
         },
         Case {
-            // One patch below the gated families' Redis OSS floor of 5.0.6.
+            // Below the gated families' Redis OSS floor of 5.0.6, on the oldest
+            // Redis OSS line the catalog still offers.
             id: "redis-before-the-gate",
             extra: &[
                 ("Engine", "redis"),
-                ("EngineVersion", "5.0.5"),
+                ("EngineVersion", "4.0.10"),
                 ("CacheNodeType", "cache.m5.xlarge"),
             ],
             up: &["cache.m5.2xlarge", "cache.r4.16xlarge"],
@@ -412,7 +413,7 @@ async fn the_split_is_complete_and_sound_over_the_whole_catalogue() {
     // split by direction.
     let engines = [
         ("redis", "7.1"),
-        ("redis", "5.0.5"),
+        ("redis", "4.0.10"),
         ("memcached", "1.6.22"),
         ("memcached", "1.5.10"),
         ("valkey", "8.0"),
@@ -641,7 +642,7 @@ async fn a_replication_group_is_scaled_from_its_own_stored_node_type() {
             "group-before-the-gate",
             &[
                 ("Engine", "redis"),
-                ("EngineVersion", "5.0.5"),
+                ("EngineVersion", "4.0.10"),
                 ("CacheNodeType", "cache.m5.2xlarge"),
             ],
             &["cache.m5.4xlarge", "cache.r7g.8xlarge"],

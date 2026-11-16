@@ -39,17 +39,17 @@ const ENGINE_LABELS: [(&str, &str); 3] = [
 ///
 /// Written here rather than read from the service, so a catalog that published a different
 /// release would fail.
-const LINE_RELEASES: [(&str, &str, &str); 7] = [
+const LINE_RELEASES: [(&str, &str, &str); 10] = [
     ("redis", "6.0", "6.0.5"),
     ("redis", "6.2", "6.2.6"),
     ("redis", "7.0", "7.0.7"),
     ("redis", "7.1", "7.1.0"),
     ("valkey", "7.2", "7.2.6"),
     ("valkey", "8.0", "8.0.1"),
-    // The Valkey 9.0 line this emulator's catalog publishes beside them has no AWS release
-    // behind it: a line's first release is its `.0`, which is the form every engine line's
-    // first release takes.
+    ("valkey", "8.1", "8.1.0"),
+    ("valkey", "8.2", "8.2.0"),
     ("valkey", "9.0", "9.0.0"),
+    ("valkey", "9.1", "9.1.0"),
 ];
 
 /// The full release `version` of `engine` stands for: the row [`LINE_RELEASES`] holds for a

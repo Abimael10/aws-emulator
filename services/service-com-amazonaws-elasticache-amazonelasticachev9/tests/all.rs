@@ -288,6 +288,12 @@ mod rbac_minimum_engine_version;
 // which drives the RESP client of the data-plane suite declared above.
 #[path = "all/cache_data_consequences.rs"]
 mod cache_data_consequences;
+// Appended for the same reason: the suite about what the read-only reference
+// catalogs CONTAIN — the engine versions the service still offers, a family's
+// whole published parameter set, the published service updates and the offering
+// catalog's stable entries.
+#[path = "all/reference_catalog_fidelity.rs"]
+mod reference_catalog_fidelity;
 // Appended for the same reason: the suite about what a REPORT answers while the clock
 // still owes the resource a change it has already scheduled.
 #[path = "all/lifecycle_convergence.rs"]

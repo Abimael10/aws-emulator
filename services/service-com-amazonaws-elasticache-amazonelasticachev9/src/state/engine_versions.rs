@@ -38,12 +38,18 @@ pub(super) const fn engine_version_row(
 /// of the published [`PARAMETER_GROUP_FAMILIES`], which is where its
 /// `CacheParameterGroupFamily` comes from.
 ///
-/// The rows are the engine lines ElastiCache offers, from the oldest Memcached
-/// release it still serves to the current Valkey generation; what the rest of
-/// the service relies on beside them is the SHAPE of the catalog — several
-/// version lines per engine, several versions per line, at least one version per
-/// published family, and a newest version per engine, which is the one
-/// [`default_engine_version`] hands a cluster that names none.
+/// The rows are the versions ElastiCache OFFERS today, per engine: the
+/// Memcached releases it still serves, the Redis OSS lines it still serves
+/// (4.0.10 and 5.0.6, then the 6 and 7 generations) and the Valkey generations.
+/// A version ElastiCache has RETIRED is offered by nothing, so it is absent
+/// here even where a parameter group family of that line is still published —
+/// the family catalog outlives the engine versions it was published for, which
+/// is why [`PARAMETER_GROUP_FAMILIES`] is the longer list.
+///
+/// What the rest of the service relies on beside the entries is the SHAPE of the
+/// catalog — several version lines per engine, several versions per line, and a
+/// newest version per engine, which is the one [`default_engine_version`] hands
+/// a cluster that names none.
 ///
 /// A Memcached version and a Redis OSS version up to 5 are named by their patch
 /// release (`1.6.22`, `5.0.6`), while ElastiCache names a Redis OSS 6 or later
@@ -51,7 +57,7 @@ pub(super) const fn engine_version_row(
 /// `7.1`, `7.2`, `8.0`) — which is also the spelling a create or an upgrade has
 /// to name, so the catalog publishes those lines rather than a patch release
 /// behind them.
-pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 33] = [
+pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 23] = [
     // The oldest Memcached version ElastiCache still offers.
     engine_version_row("memcached", "1.4.5"),
     // The version `EngineVersion`'s own documentation uses as its example.
@@ -65,20 +71,9 @@ pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 33] = [
     engine_version_row("memcached", "1.6.12"),
     engine_version_row("memcached", "1.6.17"),
     engine_version_row("memcached", "1.6.22"),
-    engine_version_row("redis", "2.6.13"),
-    engine_version_row("redis", "2.8.6"),
-    engine_version_row("redis", "2.8.19"),
-    engine_version_row("redis", "2.8.22"),
-    engine_version_row("redis", "2.8.23"),
-    engine_version_row("redis", "2.8.24"),
-    engine_version_row("redis", "3.2.4"),
-    engine_version_row("redis", "3.2.6"),
-    engine_version_row("redis", "3.2.10"),
+    // The oldest Redis OSS releases ElastiCache still offers; the lines below
+    // 4.0 have been retired.
     engine_version_row("redis", "4.0.10"),
-    engine_version_row("redis", "5.0.0"),
-    engine_version_row("redis", "5.0.3"),
-    engine_version_row("redis", "5.0.4"),
-    engine_version_row("redis", "5.0.5"),
     engine_version_row("redis", "5.0.6"),
     engine_version_row("redis", "6.0"),
     engine_version_row("redis", "6.2"),
@@ -86,9 +81,12 @@ pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 33] = [
     engine_version_row("redis", "7.1"),
     engine_version_row("valkey", "7.2"),
     engine_version_row("valkey", "8.0"),
+    engine_version_row("valkey", "8.1"),
+    engine_version_row("valkey", "8.2"),
+    engine_version_row("valkey", "9.0"),
     // The current Valkey generation, whose family is `valkey9` (see
     // `PARAMETER_GROUP_FAMILIES`).
-    engine_version_row("valkey", "9.0"),
+    engine_version_row("valkey", "9.1"),
 ];
 
 /// How a published version's engine is described
@@ -119,22 +117,25 @@ pub fn engine_description(engine: &str) -> &'static str {
 /// Source: the release AWS lists for each of those engine lines among the
 /// ElastiCache engine versions it supports — Redis OSS 6.0 is 6.0.5, 6.2 is
 /// 6.2.6, 7.0 is 7.0.7 and 7.1 is 7.1.0; Valkey 7.2 is 7.2.6 and 8.0 is 8.0.1.
-/// The Valkey 9.0 line this catalog publishes beside them (see
-/// [`CACHE_ENGINE_VERSIONS`], family `valkey9`) is this emulator's own current
-/// generation rather than an AWS line, so it has no published release to cite:
-/// its release is the `.0` every engine line's FIRST release is numbered with.
+/// The Valkey lines above 8.0 are each published by their FIRST release, the
+/// `.0` an engine line's first release is numbered with (8.1.0, 8.2.0, 9.0.0,
+/// 9.1.0), which is the release the published version description names them
+/// by.
 ///
 /// Every other published version already NAMES a patch release (`1.6.22`,
 /// `5.0.6`), so it is its own release and is absent from this table — see
 /// [`patch_release`].
-const LINE_PATCH_RELEASES: [(&str, &str, &str); 7] = [
+const LINE_PATCH_RELEASES: [(&str, &str, &str); 10] = [
     ("redis", "6.0", "6.0.5"),
     ("redis", "6.2", "6.2.6"),
     ("redis", "7.0", "7.0.7"),
     ("redis", "7.1", "7.1.0"),
     (ENGINE_VALKEY, "7.2", "7.2.6"),
     (ENGINE_VALKEY, "8.0", "8.0.1"),
+    (ENGINE_VALKEY, "8.1", "8.1.0"),
+    (ENGINE_VALKEY, "8.2", "8.2.0"),
     (ENGINE_VALKEY, "9.0", "9.0.0"),
+    (ENGINE_VALKEY, "9.1", "9.1.0"),
 ];
 
 /// The full release `engine_version` of `engine` stands for: the patch release
