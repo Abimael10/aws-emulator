@@ -3281,6 +3281,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// the modelled shape itself, which carries no member for when a transient
     /// `NatGatewayState` resolves. A gateway whose state is terminal has no entry here.
     pub nat_gateway_moves: BTreeMap<String, PendingStateMove>,
+    /// Where the CloudWatch series each available NAT gateway publishes has got to, and the
+    /// one in-process clock that advances them ([`NatGatewayMetricPublisher`]).
+    ///
+    /// Beside the gateway store for the same reason the moves above are: that store holds the
+    /// modelled shape itself, which carries no member for the window a gateway has published
+    /// through. The data points themselves are never held here — they live in the CloudWatch
+    /// store, which is their one home.
+    pub nat_gateway_metrics: NatGatewayMetricPublisher,
     /// A `CreateNatGateway` `ClientToken` and the `NatGatewayId` it minted, so a repeat of
     /// the same request answers with that gateway instead of creating a second one —
     /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
@@ -3938,6 +3946,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             nat_gateways: BTreeMap::new(),
             nat_gateway_address_transitions: BTreeMap::new(),
             nat_gateway_moves: BTreeMap::new(),
+            // A fresh account holds no NAT gateway, so no series is running and no clock
+            // advances one.
+            nat_gateway_metrics: NatGatewayMetricPublisher::default(),
             nat_gateway_client_tokens: HashMap::new(),
             capacity_reservation_fleets: BTreeMap::new(),
             capacity_reservation_fleet_client_tokens: HashMap::new(),

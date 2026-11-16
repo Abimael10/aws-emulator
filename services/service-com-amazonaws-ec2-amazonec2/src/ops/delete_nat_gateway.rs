@@ -234,6 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the NAT gateway" (`DeleteNatGatewayResult$NatGatewayId`): the gateway
         // the deletion is under way for.
+        //
+        // A gateway that is no longer available carries no traffic, so the series it was
+        // publishing ends here ([`crate::state::nat_gateway_metrics`]): the write publishes
+        // what was still due and closes it, with this store's guard released.
+        drop(store);
+        crate::state::drive_nat_gateway_metrics(&self.engine);
         Ok(DeleteNatGatewayOutput {
             nat_gateway_id: Some(input.nat_gateway_id.clone()),
         })

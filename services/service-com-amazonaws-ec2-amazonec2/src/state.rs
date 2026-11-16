@@ -2742,6 +2742,12 @@ mod fleet_placements;
 mod fleet_deletion;
 mod network_insights;
 mod nat_gateways_and_vpn_connections;
+/// The CloudWatch series a NAT gateway publishes about the traffic it carries — the namespace
+/// and dimension it is published under, the catalog of its metrics, and the clock the windows
+/// are published on — in a file of its own rather than as more lines beside the gateway
+/// record. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::drive_nat_gateway_metrics` like any helper of this module.
+mod nat_gateway_metrics;
 /// What MAKING a Site-to-Site VPN connection consists of — the two tunnels it is brought up
 /// with, the options and defaults the model publishes for one, the values this service mints
 /// for a tunnel, the configuration document a connection hands its network administrator, and
@@ -2919,6 +2925,7 @@ pub use spot_instance_requests::*;
 pub use spot_fleets::*;
 pub use spot_fleet_history::*;
 pub use nat_gateways_and_vpn_connections::*;
+pub use nat_gateway_metrics::*;
 pub use vpn_connection_creation::*;
 pub use network_insights::*;
 pub use fleets::*;

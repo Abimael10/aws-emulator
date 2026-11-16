@@ -602,6 +602,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Only returned if a client token was provided in the request"
         // (`CreateNatGatewayResult$ClientToken`), and the gateway as it was stored, so this
         // answer and a later `DescribeNatGateways` cannot drift apart.
+        //
+        // The gateway is stored, so the series it publishes while it is available is now this
+        // store's to advance ([`crate::state::nat_gateway_metrics`]): the write starts the
+        // clock, with this store's guard released, so nothing a client has to call makes a
+        // window fall due.
+        drop(store);
+        crate::state::drive_nat_gateway_metrics(&self.engine);
         Ok(CreateNatGatewayOutput {
             client_token,
             nat_gateway: Some(stored),

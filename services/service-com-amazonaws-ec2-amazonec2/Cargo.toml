@@ -113,6 +113,11 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # delivery service needs to write a flow log's records are Amazon S3's own resource. No network
 # client feature is enabled: the transport is the emulator's own.
 aws-sdk-s3 = { version = "1", default-features = false }
+# `state::nat_gateway_metrics`: a NAT gateway publishes its traffic metrics in the
+# `AWS/NATGateway` namespace, and a metric has ONE home — the CloudWatch emulator's own metric
+# store, which `ListMetrics` and `GetMetricStatistics` read. The data points are appended
+# through that service's own state accessor rather than through a second copy of them.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

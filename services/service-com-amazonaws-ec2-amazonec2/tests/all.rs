@@ -1271,6 +1271,8 @@ mod nat_gateway_address_settling;
 mod nat_gateway_addresses;
 #[path = "all/nat_gateway_lifecycle.rs"]
 mod nat_gateway_lifecycle;
+#[path = "all/nat_gateway_metrics.rs"]
+mod nat_gateway_metrics;
 #[path = "all/network_insights_access_scope_analyses.rs"]
 mod network_insights_access_scope_analyses;
 #[path = "all/network_insights_access_scopes.rs"]
