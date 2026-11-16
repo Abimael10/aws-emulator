@@ -153,6 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` channel.
         crate::state::validate_anomaly_monitor(&monitor)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // The tags a create seeds are the same per-resource set the tagging operations
+        // read and write, so they go through the tagging surface's one normalisation rule
+        // rather than being stored as sent.
+        let requested_tags = input.resource_tags.as_deref().unwrap_or_default();
+        let resource_tags = crate::state::normalize_created_resource_tags(requested_tags)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // `MonitorArn`, `CreationDate`, `LastUpdatedDate`, `LastEvaluatedDate` and
         // `DimensionalValueCount` are members the SERVICE owns — the ARN is minted here and
@@ -205,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A monitor nobody has updated was last written when it was created.
                 last_updated_date: created_at,
                 last_evaluated_date: None,
-                resource_tags: input.resource_tags.unwrap_or_default(),
+                resource_tags,
             },
         );
         drop(store);

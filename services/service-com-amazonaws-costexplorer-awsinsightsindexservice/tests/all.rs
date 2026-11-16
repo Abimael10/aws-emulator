@@ -32,6 +32,8 @@ mod granularity_refusal;
 // kept with the suites so a new suite sees it.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unknown_monitor_references.rs"]

@@ -180,6 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::Timestamp::now();
+        // The tags a create seeds are the same per-resource set the tagging operations read
+        // and write, so they go through the tagging surface's one normalisation rule rather
+        // than being stored as sent.
+        let requested_tags = input.resource_tags.as_deref().unwrap_or_default();
+        let resource_tags = crate::state::normalize_created_resource_tags(requested_tags)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
         let mut store = state.lock();
 
         // Admission first, so a refused Create leaves the store exactly as it was.
@@ -224,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rules: input.rules,
                 split_charge_rules: input.split_charge_rules,
                 default_value: input.default_value,
-                resource_tags: input.resource_tags.unwrap_or_default(),
+                resource_tags,
                 effective_start: effective_start.clone(),
                 effective_end: None,
                 applied_at: ::std::time::Instant::now() + crate::state::PROCESSING_SPAN,

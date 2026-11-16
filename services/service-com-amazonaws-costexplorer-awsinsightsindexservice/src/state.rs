@@ -19,6 +19,10 @@
 //! and threshold expansion live in [`anomaly_subscriptions`] — one module per resource, so
 //! each file holds one registry's concern.
 //!
+//! The TAGGING surface spans all three registries — a tag set is held on the resource's
+//! own record — so what a resource's tag set is, how it resolves from an ARN and how a
+//! tag request merges into it live in [`resource_tags`], once for every tagging operation.
+//!
 //! The billing-date helpers live here rather than in one operation's file: all five
 //! operations have to agree on what a `ZonedDateTime` means, and duplicating that across
 //! five handlers is how they would drift apart. The pagination cursor codec and the page
@@ -26,6 +30,7 @@
 
 mod anomaly_subscriptions;
 mod pagination;
+mod resource_tags;
 
 pub use anomaly_subscriptions::{
     absolute_threshold_of, admitted_subscribers, threshold_expression_for, unknown_subscription,
@@ -38,6 +43,10 @@ pub use anomaly_subscriptions::{
 pub use pagination::{
     decode_next_token, encode_next_token, page, page_size_below_minimum, requested_page_size, Page,
     INVALID_NEXT_TOKEN_REFUSAL, MIN_PAGE_SIZE, UNPAGED,
+};
+pub use resource_tags::{
+    merged_tags, normalize_created_resource_tags, normalize_resource_tags, tags_without_keys,
+    too_many_tags, unknown_tagged_resource, MAX_USER_TAGS, RESERVED_TAG_KEY_PREFIX,
 };
 
 use std::collections::BTreeMap;
@@ -371,8 +380,8 @@ pub struct CostCategoryDefinition {
     pub split_charge_rules: Option<Vec<CostCategorySplitChargeRule>>,
     /// The value charges fall into when no rule matches.
     pub default_value: Option<String>,
-    /// Resource tags supplied at create time (reported by the tagging operations, which
-    /// are still scaffolded, and kept here so they survive for them).
+    /// Resource tags: the set the create seeded and the tagging operations read and write
+    /// (see [`resource_tags`]).
     pub resource_tags: Vec<ResourceTag>,
     /// The billing start date: a `ZonedDateTime`, always the first day of some month.
     pub effective_start: String,
