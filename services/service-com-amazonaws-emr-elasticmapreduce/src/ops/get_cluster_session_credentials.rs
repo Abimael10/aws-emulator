@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClusterSessionCredentials
-//! Resolves the cluster and then refuses, with the modelled `InvalidRequestException`,
-//! to issue credentials for a cluster whose security configuration enables no runtime
-//! role.
+//! Resolves the cluster, decides from its stored SECURITY CONFIGURATION whether it has
+//! fine-grained access control activated, and issues the session credentials such a cluster
+//! vends — or refuses, with the modelled `InvalidRequestException`, a cluster whose security
+//! configuration activates neither runtime roles nor IAM Identity Center.
 //!
 //! What this operation returns is "temporary, HTTP basic credentials … used by a
 //! cluster with fine-grained access control activated", for connecting "to cluster
 //! endpoints that support username and password authentication" (its own model
 //! documentation). A cluster gets that activation from the runtime roles or IAM
-//! Identity Center integration its SECURITY CONFIGURATION enables, and this emulator
-//! enables neither on any cluster, so there is no runtime role for a username and
-//! password to be issued against: minting a pair here would be a credential for a
-//! service nothing runs. Both refusals are the one client error this operation models —
-//! a cluster id no cluster carries, and a cluster with no runtime role — and they are
+//! Identity Center integration its SECURITY CONFIGURATION enables, so that document is what
+//! this operation reads ([`crate::state::ComAmazonawsEmrElasticmapreduceState::activates_fine_grained_access_control`]):
+//! a cluster whose configuration enables one of them has a runtime role for credentials to be
+//! issued against, and a cluster whose configuration enables neither — like a cluster naming
+//! no security configuration at all — has none, which is what the refusal names. The pair
+//! itself is the state module's ([`crate::state::session_credentials`]): a username derived
+//! from the cluster and the identity the session belongs to, and a password drawn from the
+//! emulator's credential store. Both refusals of this operation are the one client error it
+//! models — a cluster id no cluster carries, and a cluster with no runtime role — and they are
 //! told apart by their message, never by a 501.
 //!
 //! ## Shape of an operation
@@ -156,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
         // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
@@ -196,14 +200,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Identity Center integration its SECURITY CONFIGURATION enables; a cluster
         // whose security configuration enables neither has no runtime role to issue
         // credentials for, and that is what the refusal names.
-        Err(
-            GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(crate::state::runtime_roles_not_enabled_message()),
-                },
+        if !store.activates_fine_grained_access_control(&input.cluster_id) {
+            return Err(
+                GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error_code: None,
+                        message: Some(crate::state::runtime_roles_not_enabled_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The cluster has it activated, so the credentials are issued. The SESSION they
+        // belong to is the cluster and the identity asked for: "the Amazon Resource Name
+        // (ARN) of the runtime role for interactive workload submission on the cluster"
+        // (`ExecutionRoleArn` doc) where the request names one, and otherwise the cluster's
+        // own IAM Identity Center integration, which is the identity a session with no
+        // runtime role carries. The username follows from that pair alone, so asking twice
+        // for one role identifies one session and two roles never share it.
+        let identity = input
+            .execution_role_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty())
+            .unwrap_or(crate::state::IDENTITY_CENTER_SESSION_SCOPE);
+        let username = crate::state::session_credentials_username(&input.cluster_id, identity);
+        // The store's own guard is given up before the secret is drawn: the credential store
+        // is the emulator's, not this service's state.
+        drop(store);
+        // The password is a SECRET, so it comes from the one component that generates them
+        // and is not kept here; a call that could not draw one answers this operation's
+        // modelled server error rather than a credential weaker than that store gives.
+        let Some(password) = crate::state::mint_session_password(ctx.credential_store()) else {
+            return Err(GetClusterSessionCredentialsErrorModeled::InternalServerError(
+                InternalServerError {},
             )
-            .into(),
-        )
+            .into());
+        };
+
+        Ok(GetClusterSessionCredentialsOutput {
+            credentials: Some(Credentials::UsernamePassword(UsernamePassword {
+                username: Some(username),
+                password: Some(password),
+            })),
+            // "The time when the credentials that are returned by the
+            // GetClusterSessionCredentials API expire."
+            // (`GetClusterSessionCredentialsOutput$ExpiresAt` doc.)
+            expires_at: Some(crate::state::timestamp(
+                now + crate::state::SESSION_CREDENTIALS_LIFETIME,
+            )),
+        })
     }
 }

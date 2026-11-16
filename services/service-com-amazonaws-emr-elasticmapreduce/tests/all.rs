@@ -33,6 +33,8 @@ mod cluster_read_facts;
 mod cluster_sessions;
 #[path = "all/cluster_self_termination.rs"]
 mod cluster_self_termination;
+#[path = "all/cluster_session_credentials.rs"]
+mod cluster_session_credentials;
 #[path = "all/cluster_step_execution.rs"]
 mod cluster_step_execution;
 #[path = "all/created_window.rs"]
@@ -125,6 +127,8 @@ mod state_roundtrip;
 mod step_command_object_transfers;
 #[path = "all/step_concurrency_band_sentences.rs"]
 mod step_concurrency_band_sentences;
+#[path = "all/step_log_delivery.rs"]
+mod step_log_delivery;
 #[path = "all/step_state_change_events.rs"]
 mod step_state_change_events;
 #[path = "all/studio_notebook_and_catalog_contract.rs"]

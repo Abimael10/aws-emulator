@@ -15,7 +15,8 @@
 //! is parsed into a syntax tree by `brush-parser` — a library that builds a tree and runs
 //! nothing — and the status is answered by that session's catalog of SESSION-LOCAL utilities,
 //! whose whole effect is inside the session itself: `echo` (a line of the session's own
-//! output, which a step keeps none of), `cat` (a file of the session's own tree), `true`,
+//! output, which reaches the step's own log files and nothing else), `cat` (a file of the
+//! session's own tree), `true`,
 //! `false` and `:` (a status), `exit` (a status, ending the session) and `export`/`unset` (the
 //! session's own variables) — beside the ONE program the environment of a step's command line
 //! provides, the AWS CLI's Amazon S3 transfers ([`super::step_command_transfers`]), which are
@@ -58,7 +59,9 @@
 //! cluster's Hive metastore ([`super::step_runner`]) — answer for themselves, so a step
 //! submitting one of them is never read as a command.
 
-use ::service_common::posix_shell_session::{EnvironmentPrograms, SessionConfig, ShellSession};
+use ::service_common::posix_shell_session::{
+    EnvironmentPrograms, OutputLimits, SessionConfig, ShellSession,
+};
 
 use super::*;
 
@@ -152,12 +155,23 @@ impl StepCommand {
     }
 }
 
+/// How much of what a step's command WROTE the session keeps.
+///
+/// CHOSEN: the two console streams of a command reach the step's own log files, gzipped under
+/// its cluster's `LogUri` ([`super::step_logs`]), and nothing else — so what is kept is
+/// bounded here as well as where the file is written.
+const COMMAND_OUTPUT_LIMITS: OutputLimits = OutputLimits {
+    lines: 256,
+    line_bytes: 4 * 1024,
+};
+
 /// What this command ANSWERED, or `None` when the session answered for nothing of it.
 ///
-/// The status is the session's ([`answered_status`]), and the step's end follows from it the
+/// The status is the session's ([`performed_command`]), and the step's end follows from it the
 /// way `AddJobFlowSteps` documents: a zero status is the step's completion, and any other
 /// status is the modelled failure state carrying the status in both members the model gives a
-/// step failure.
+/// step failure. Either way the two console streams the command wrote and the status it exited
+/// with are kept for the step's log files ([`StepRunLog`]).
 ///
 /// `cli` is the ONE program the environment of a step's command line provides, so a command
 /// line that carries a file to or from Amazon S3 really carries it; a command performed
@@ -165,24 +179,51 @@ impl StepCommand {
 /// command line is then one the session reports it could not run.
 #[must_use]
 pub fn command_outcome(command: &StepCommand, cli: Option<StepObjectCli>) -> Option<StepOutcome> {
-    let status = answered_status(command, cli)?;
-    if status == 0 {
+    let answered = performed_command(command, cli)?;
+    let log = StepRunLog {
+        stdout: console_text(&answered.output),
+        stderr: console_text(&answered.errors),
+        exit_status: Some(answered.status),
+    }
+    .bounded();
+    if answered.status == 0 {
         return Some(StepOutcome {
             state: step_state::COMPLETED.to_string(),
             failure: None,
+            log: Some(log),
         });
     }
     Some(StepOutcome {
         state: step_state::FAILED.to_string(),
         failure: Some(StepFailure {
             reason: COMMAND_FAILED_REASON.to_string(),
-            message: command_failure_message(status),
+            message: command_failure_message(answered.status),
         }),
+        log: Some(log),
     })
 }
 
-/// The status the session answered for `command`, or `None` when it answered for nothing of
-/// it.
+/// `lines` as the text one console file carries: one line per entry, each ended by a newline,
+/// which is how the program wrote them.
+fn console_text(lines: &[String]) -> String {
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
+/// What the session answered for one command: the status it exited with and the two console
+/// streams it wrote.
+#[derive(Debug, Clone)]
+struct PerformedCommand {
+    status: i32,
+    output: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// What the session answered for `command`, or `None` when it answered for nothing of it.
 ///
 /// The session holds the parse, the allow-list and the one environment program this module's
 /// header states, and nothing else: no process is started here. It is given no variables
@@ -192,8 +233,14 @@ pub fn command_outcome(command: &StepCommand, cli: Option<StepObjectCli>) -> Opt
 /// is the one a shell gives a utility it could not find, which is what the session answers for
 /// every command outside its catalog — unless the program ENDED the session itself, which is a
 /// status the command really asked for.
-fn answered_status(command: &StepCommand, cli: Option<StepObjectCli>) -> Option<i32> {
-    let config = SessionConfig::default();
+///
+/// What the command WROTE is kept beside that status ([`COMMAND_OUTPUT_LIMITS`]), because the
+/// step's own log files are what a client reads it out of.
+fn performed_command(command: &StepCommand, cli: Option<StepObjectCli>) -> Option<PerformedCommand> {
+    let config = SessionConfig {
+        output: Some(COMMAND_OUTPUT_LIMITS),
+        ..SessionConfig::default()
+    };
     let mut session = match cli {
         Some(cli) => ShellSession::with_programs(
             BTreeMap::new(),
@@ -206,5 +253,9 @@ fn answered_status(command: &StepCommand, cli: Option<StepObjectCli>) -> Option<
     if status == config.statuses.could_not_run && session.exit_status().is_none() {
         return None;
     }
-    Some(status)
+    Some(PerformedCommand {
+        status,
+        output: session.output().to_vec(),
+        errors: session.errors().to_vec(),
+    })
 }

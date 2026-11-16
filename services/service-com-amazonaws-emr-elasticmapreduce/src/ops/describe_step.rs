@@ -187,6 +187,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
+        // And the LOG FILES a finished step leaves: a step that has ENDED is owed the gzipped
+        // log directory under its cluster's `LogUri` (`crate::state::step_logs`), owed from the
+        // instant it ended whether or not anybody read it. The write is an Amazon S3 call, so
+        // it is made here rather than under this service's lock, and one step's files are
+        // written once however many calls report it afterwards.
+        crate::state::deliver_due_step_logs(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.cluster_id,
+            now,
+        )
+        .await;
+
         // The store is taken and RELEASED inside this block: the publication below reaches
         // EventBridge's own handler, which may call back into this service, so this
         // service's lock is never held across it.

@@ -86,13 +86,21 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # emulator's own object store, over the in-process callback the runtime gives a guest's AWS
 # SDK.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# `flate2`: a step's delivered log file IS a gzip stream (`<LogUri>/<cluster>/steps/<step>/
+# controller.gz`, `stderr.gz`, `stdout.gz`), so it is framed with the maintained DEFLATE
+# implementation this workspace already uses for every other gzipped artifact
+# (`state::step_logs`).
+flate2 = "1"
+# `sha2` and `hex`: the USERNAME of a cluster's session credentials is a digest of the cluster
+# and the identity the session belongs to, so one pair always identifies one session and two
+# pairs never share it (`state::session_credentials`).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 # A step's state changes are published onto the account's default EventBridge bus and routed
 # from there, so the suite that asserts them mounts EventBridge and Amazon SQS beside Amazon
 # EMR on ONE engine and reads each event back off the queue a rule delivered it to — the

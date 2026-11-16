@@ -187,6 +187,17 @@ pub use step_events::*;
 mod sessions;
 pub use sessions::*;
 
+/// The SESSION CREDENTIALS a cluster with fine-grained access control issues — which security
+/// configuration activates that, and what the pair it hands out is — split out and
+/// re-exported the same way.
+mod session_credentials;
+pub use session_credentials::*;
+
+/// The gzipped LOG DIRECTORY a finished step leaves under its cluster's `LogUri`, split out
+/// and re-exported the same way.
+mod step_logs;
+pub use step_logs::*;
+
 /// The SPARK release family of the release catalog — the labels an Amazon EMR Spark
 /// release carries and what one bundles — split out and re-exported the same way.
 mod spark_releases;
@@ -1984,25 +1995,19 @@ impl ComAmazonawsEmrElasticmapreduceState {
     /// configuration the cluster names and the document that configuration holds,
     /// rather than stored twice: a cluster naming no security configuration, one naming
     /// a configuration this account does not hold, and one whose document leaves the
-    /// flag out are all not runtime role enabled.
+    /// flag out are all not runtime role enabled
+    /// ([`Self::cluster_security_configuration`] is the one reading of that document).
     pub fn is_runtime_role_enabled_cluster(&self, cluster_id: &str) -> bool {
-        let Some(cluster) = self.clusters.get(cluster_id) else {
-            return false;
-        };
-        let Some(name) = cluster.security_configuration.as_deref() else {
-            return false;
-        };
-        let Some(record) = self.security_configurations.get(name) else {
-            return false;
-        };
-        ::serde_json::from_str::<::serde_json::Value>(&record.security_configuration)
-            .ok()
+        self.cluster_security_configuration(cluster_id)
             .and_then(|document| {
-                document
-                    .get("AuthorizationConfiguration")
-                    .and_then(|section| section.get("IAMConfiguration"))
-                    .and_then(|section| section.get("EnableApplicationScopedIAMRole"))
-                    .and_then(::serde_json::Value::as_bool)
+                flag(
+                    &document,
+                    &[
+                        AUTHORIZATION_CONFIGURATION,
+                        IAM_CONFIGURATION,
+                        ENABLE_APPLICATION_SCOPED_IAM_ROLE,
+                    ],
+                )
             })
             .unwrap_or(false)
     }
@@ -4196,30 +4201,55 @@ const PRESIGNED_URL_TOKEN_MINT_ATTEMPTS: usize = 4;
 /// the call then answers its modelled server error rather than a URL carrying something
 /// weaker than the store gives.
 pub fn mint_presigned_url_token(store: &::emulator_server::CredentialStore) -> Option<String> {
-    let mut token = String::with_capacity(PRESIGNED_URL_TOKEN_LEN);
+    mint_store_secret(store, PRESIGNED_URL_TOKEN_LEN)
+}
+
+/// A fresh secret of `length` characters, drawn from the emulator's CREDENTIAL STORE.
+///
+/// The one place this crate takes a secret from, shared by every non-SigV4 secret it vends —
+/// the browser token of a presigned application-UI URL ([`mint_presigned_url_token`]) and the
+/// password of a cluster's session credentials ([`mint_session_password`]). Each of those
+/// authenticates something OTHER than a request to this emulator, so the credential the store
+/// minted is removed from it again: the emulator must not go on accepting it as one of its
+/// own, and nothing accumulates per call.
+///
+/// Nothing of any request, of state or of the clock enters it, so one call's secret is never
+/// predictable from another's. Only the characters that travel as themselves are kept
+/// ([`is_presigned_url_token_char`]), which is a filter over a uniformly drawn secret rather
+/// than a derivation from anything.
+///
+/// `None` when the store minted no secret, when it could not be removed again, or when
+/// [`PRESIGNED_URL_TOKEN_MINT_ATTEMPTS`] draws together held too few admissible characters:
+/// the call then answers its modelled server error rather than a secret weaker than the store
+/// gives.
+pub(crate) fn mint_store_secret(
+    store: &::emulator_server::CredentialStore,
+    length: usize,
+) -> Option<String> {
+    let mut token = String::with_capacity(length);
     for _ in 0..PRESIGNED_URL_TOKEN_MINT_ATTEMPTS {
         let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
         let secret = minted
             .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
             .map(str::to_string);
-        // The token is not a credential of this emulator; see above.
+        // The secret is not a credential of this emulator; see above.
         if let Err(error) = store.delete(&minted.id) {
             ::tracing::warn!(
                 access_key_id = %minted.id,
                 error = ?error,
-                "a credential minted for a presigned URL token could not be deleted"
+                "a credential minted for a secret this service vends could not be deleted"
             );
             return None;
         }
         // Every admissible character is ASCII, so `len` counts them.
-        let room = PRESIGNED_URL_TOKEN_LEN - token.len();
+        let room = length - token.len();
         token.extend(
             secret?
                 .chars()
                 .filter(|character| is_presigned_url_token_char(*character))
                 .take(room),
         );
-        if token.len() == PRESIGNED_URL_TOKEN_LEN {
+        if token.len() == length {
             return Some(token);
         }
     }

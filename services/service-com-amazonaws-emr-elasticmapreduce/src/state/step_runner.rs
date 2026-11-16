@@ -106,12 +106,16 @@ pub struct StepWork {
     pub tables: Vec<TableReference>,
 }
 
-/// What a step's work ANSWERED: the state the step ends in, and the failure that answer
-/// is when it is one.
+/// What a step's work ANSWERED: the state the step ends in, the failure that answer is when
+/// it is one, and what the work WROTE while it ran.
 #[derive(Debug, Clone)]
 pub struct StepOutcome {
     pub state: String,
     pub failure: Option<StepFailure>,
+    /// The console streams and the exit status of the work, for the step's own log directory
+    /// ([`StepRunLog`], [`deliver_due_step_logs`]) — `None` for a step whose work nothing
+    /// ran, which wrote nothing anywhere and exited with no status.
+    pub log: Option<StepRunLog>,
 }
 
 /// A failure a step's own work answered with, in the two members the model gives one:
@@ -504,10 +508,15 @@ fn resolve_outcome(
                 reason: TABLE_NOT_FOUND_REASON.to_string(),
                 message: table_not_found_message(reference),
             }),
+            // The statement was resolved against the metastore rather than run by an
+            // engine of this emulator, so no console stream and no exit status of it
+            // exists to report.
+            log: None,
         },
         None => StepOutcome {
             state: step_state::COMPLETED.to_string(),
             failure: None,
+            log: None,
         },
     }
 }

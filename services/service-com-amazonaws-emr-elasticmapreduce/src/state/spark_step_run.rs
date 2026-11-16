@@ -121,10 +121,16 @@ const MAX_APPLICATION_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_APPLICATION_RECURSION: usize = 2_000;
 
 /// How much of an application's output is kept, and how large a value it may answer with.
-/// Neither reaches the wire: a step reports no application output.
+///
+/// The application's own console streams reach the step's LOG FILES
+/// ([`super::step_logs`]) rather than the wire: each is bounded inside the run
+/// ([`APPLICATION_STREAM_CHARACTERS`]) and the two travel back in the document the run
+/// answers with, which is what the ceiling below admits — the escaping of two bounded
+/// streams, with room to spare. The log budget bounds what the interpreter's own runtime
+/// writes beside them.
 const MAX_APPLICATION_LOG_BYTES: usize = 64 * 1024;
 /// See [`MAX_APPLICATION_LOG_BYTES`].
-const MAX_APPLICATION_ANSWER_BYTES: usize = 64 * 1024;
+const MAX_APPLICATION_ANSWER_BYTES: usize = 1024 * 1024;
 
 /// The permits [`MAX_CONCURRENT_APPLICATION_RUNS`] hands out, for the whole process.
 ///
@@ -153,6 +159,13 @@ pub fn application_failure_message(error_type: &str, error_message: &str) -> Str
         return error_type.to_string();
     }
     format!("{error_type}: {error_message}")
+}
+
+/// `FailureDetails$Message` of a step whose application RAN and exited with a non-zero status
+/// without raising: the status it exited with, which is the whole of what it reported.
+#[must_use]
+pub fn application_exit_message(status: i32) -> String {
+    format!("The application the step submitted exited with status {status}.")
 }
 
 /// `FailureDetails$Reason` of a step whose application ran past a bound of this emulator.
@@ -390,6 +403,7 @@ async fn run_application(
         "path": plan.application.path,
         "source": source,
         "arguments": plan.application.arguments,
+        "streamCharacters": APPLICATION_STREAM_CHARACTERS,
     })
     .to_string();
     let step_id = plan.step_id.clone();
@@ -450,14 +464,15 @@ async fn run_application(
 /// What the step ends in, given what the interpreter answered.
 fn read_outcome(completion: &python::Completion) -> StepOutcome {
     match completion {
-        // An application is a program rather than a function, so what it ANSWERED is not
-        // part of the outcome: an application that ran to its end exited cleanly, which is
-        // the step's completion ("for a step to be considered complete, the main function
-        // must exit with a zero exit code", `AddJobFlowSteps` doc).
-        python::Completion::Returned(_) | python::Completion::Streamed { .. } => StepOutcome {
-            state: step_state::COMPLETED.to_string(),
-            failure: None,
-        },
+        // The entry module REPORTS what the run came to ([`super::spark_runtime`]): the
+        // status the application exited with, the two console streams it wrote, and the
+        // exception it ended on when it ended on one.
+        python::Completion::Returned(answered) => reported_run(answered),
+        // A streaming answer is one nothing here asks for, so a run that produced one is a
+        // run this service can say nothing about.
+        python::Completion::Streamed { .. } => not_executed(),
+        // The entry module itself raised, which is not the application's own failure: the
+        // engine reports the exception, and what it ran is still what failed.
         python::Completion::Raised {
             error_type,
             error_message,
@@ -486,6 +501,60 @@ fn read_outcome(completion: &python::Completion) -> StepOutcome {
     }
 }
 
+/// What the step ends in, given the document the entry module reported the run in.
+///
+/// "For a step to be considered complete, the main function must exit with a zero exit code"
+/// (`AddJobFlowSteps` doc), so the status the application exited with IS the step's end: zero
+/// is its completion and anything else the modelled failure state, carrying the application's
+/// own exception where it ended on one and the status it exited with where it did not. Either
+/// way the run's console streams and that status are kept for the step's log files
+/// ([`StepRunLog`]).
+///
+/// A document this service cannot read is one nothing is known from, so the step ends the way
+/// every step this emulator ran no application for ends.
+fn reported_run(answered: &str) -> StepOutcome {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(answered) else {
+        return not_executed();
+    };
+    let Some(status) = document
+        .get("exitStatus")
+        .and_then(::serde_json::Value::as_i64)
+        .and_then(|status| i32::try_from(status).ok())
+    else {
+        return not_executed();
+    };
+    let text = |member: &str| {
+        document
+            .get(member)
+            .and_then(::serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let log = StepRunLog {
+        stdout: text("stdout"),
+        stderr: text("stderr"),
+        exit_status: Some(status),
+    }
+    .bounded();
+    if status == 0 {
+        return StepOutcome {
+            state: step_state::COMPLETED.to_string(),
+            failure: None,
+            log: Some(log),
+        };
+    }
+    let error_type = text("errorType");
+    let message = if error_type.is_empty() {
+        application_exit_message(status)
+    } else {
+        application_failure_message(&error_type, &text("errorMessage"))
+    };
+    StepOutcome {
+        log: Some(log),
+        ..failed(APPLICATION_FAILED_REASON, message)
+    }
+}
+
 /// The step's end for an application that FAILED, in the two members the model gives a step
 /// failure.
 fn failed(reason: &str, message: String) -> StepOutcome {
@@ -495,6 +564,7 @@ fn failed(reason: &str, message: String) -> StepOutcome {
             reason: reason.to_string(),
             message,
         }),
+        log: None,
     }
 }
 
@@ -511,5 +581,7 @@ pub fn not_executed() -> StepOutcome {
             reason: STEP_NOT_EXECUTED_REASON.to_string(),
             message: STEP_NOT_EXECUTED_MESSAGE.to_string(),
         }),
+        // Nothing ran, so nothing wrote a console stream and nothing exited with a status.
+        log: None,
     }
 }

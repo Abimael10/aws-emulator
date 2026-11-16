@@ -58,6 +58,12 @@ pub struct StepRecord {
     /// event bus exactly once however it was materialised ([`step_events`]). `None` while
     /// nothing of this step has been published.
     pub published_state: Option<String>,
+    /// The `s3://` directory this step's log files were DELIVERED to, once the clock owed
+    /// them and they were written ([`deliver_due_step_logs`]) — which is what keeps one
+    /// step's files written once however many calls report it afterwards, and is the
+    /// directory a failed step reports its log file under. `None` while nothing has been
+    /// delivered for this step, including for a cluster whose launch named no `LogUri`.
+    pub delivered_log_uri: Option<String>,
 }
 
 impl StepRecord {
@@ -123,6 +129,7 @@ impl StepRecord {
             application,
             command,
             published_state: None,
+            delivered_log_uri: None,
         }
     }
 
@@ -366,8 +373,15 @@ impl StepRecord {
             failure_details: failed.then_some(FailureDetails {
                 reason: Some(reason),
                 message: Some(message),
-                // No step log was written, so there is no path to one to report.
-                log_file: None,
+                // "The path to the log file where the step failure root cause was
+                // originally recorded." (`FailureDetails$LogFile` doc.) The step's own log
+                // directory is that path, and it is reported only once the files really
+                // exist there ([`StepRecord::delivered_log_uri`]): a cluster that named no
+                // `LogUri` has no log file to point a reader at.
+                log_file: self
+                    .delivered_log_uri
+                    .as_deref()
+                    .map(|directory| format!("{directory}/{STDERR_LOG_OBJECT}")),
             }),
             timeline: Some(StepTimeline {
                 creation_date_time: Some(timestamp(self.creation_date_time)),
