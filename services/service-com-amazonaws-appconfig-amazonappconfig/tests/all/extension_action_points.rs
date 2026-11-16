@@ -152,7 +152,9 @@ pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> 
 
 /// An extension binding one action at each of `action_points`, all of them pointing at
 /// `uri`, and declaring the parameters `parameters` names. Answers its `(id, name)`.
-async fn given_extension(
+///
+/// `pub(crate)` because more than one suite binds its actions this way.
+pub(crate) async fn given_extension(
     router: &MultiServiceRouter,
     name: &str,
     action_points: &[&str],

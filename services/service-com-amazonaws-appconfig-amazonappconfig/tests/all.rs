@@ -91,12 +91,16 @@ mod experiment_run_timeline;
 mod experiment_run_treatment_assignment;
 #[path = "all/experiment_run_wire_fidelity.rs"]
 mod experiment_run_wire_fidelity;
+#[path = "all/extension_action_point_trigger.rs"]
+mod extension_action_point_trigger;
 #[path = "all/extension_action_points.rs"]
 mod extension_action_points;
 #[path = "all/extension_association_refusal_messages.rs"]
 mod extension_association_refusal_messages;
 #[path = "all/extension_associations.rs"]
 mod extension_associations;
+#[path = "all/extension_gate_refusal_message.rs"]
+mod extension_gate_refusal_message;
 #[path = "all/extensions.rs"]
 mod extensions;
 #[path = "all/feature_flag_attribute_constraints.rs"]

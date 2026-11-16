@@ -98,7 +98,10 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// A .zip deployment package holding `source` as the handler's module, written in memory
 /// the way a caller uploads one and base64-encoded as `FunctionCode$ZipFile` carries it.
-fn package(source: &str) -> String {
+///
+/// `pub(crate)` because more than one suite's extension target is a FUNCTION it has to
+/// upload the code of.
+pub(crate) fn package(source: &str) -> String {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -132,7 +135,10 @@ fn steering_source(answer: &str) -> String {
 
 /// Create the function `name` running `source`, bring the activation Lambda's own clock
 /// owes it forward so no row waits for that window, and answer the function's ARN.
-async fn given_function(
+///
+/// `pub(crate)` because more than one suite's extension target is a function it has to
+/// create this way.
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,

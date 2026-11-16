@@ -39,7 +39,10 @@ const REGION: &str = "us-east-1";
 
 /// AppConfig and Lambda on ONE engine: a `LAMBDA` validator's function lives in the other
 /// service, and the verdict is whatever that service answers for the invocation.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because every suite whose fixture is a FUNCTION mounts the same two services
+/// on one engine.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);

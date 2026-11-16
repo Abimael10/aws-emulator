@@ -565,7 +565,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .member(
                 "PreviousDeploymentNumber",
                 ::serde_json::Value::from(previous_deployment_number),
-            );
+            )
+            // This point is reached inside the caller's own request, so the entity that
+            // triggered it is the caller — the same attribution the `DEPLOYMENT_STARTED`
+            // event this call is about to record carries.
+            .triggered_by(crate::state::TRIGGERED_BY_USER);
         event = match &candidate_content {
             Some((content_type, content)) => event.content(
                 content_type,

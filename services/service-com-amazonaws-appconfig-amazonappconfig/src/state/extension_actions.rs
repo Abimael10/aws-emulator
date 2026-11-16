@@ -437,6 +437,19 @@ impl ActionEvent {
         self
     }
 
+    /// The entity an action point of a DEPLOYMENT's workflow is attributed to, as the
+    /// `TriggeredBy` member every event of that workflow carries.
+    ///
+    /// The values are the model's (`super::TRIGGERED_BY_USER` and the constants beside
+    /// it): a point reached inside a caller's own request is the caller's
+    /// (`smithy_query(query="doc",shape="DeploymentEvent",member="TriggeredBy")` — "the
+    /// entity that triggered the deployment event"), and one the service's own schedule
+    /// made due is AppConfig's, so a target can tell a release a client asked for from one
+    /// AppConfig's pacing or a guard's own abort drove.
+    pub fn triggered_by(self, triggered_by: &str) -> Self {
+        self.member("TriggeredBy", Value::from(triggered_by))
+    }
+
     /// The configuration content the workflow is handling: `ContentType`,
     /// `ContentVersion` as a STRING whatever the version is numbered, and `Content`
     /// base64-encoded.
@@ -990,7 +1003,16 @@ fn next_owed_point(
         .get(environment_id)?;
     let deployment = environment.deployments.get(&deployment_number)?;
     let (action_point, event_index) = owed_point_of(deployment, now)?;
-    let event = deployment_event(store, application_id, environment_id, deployment_number)?;
+    // What triggered the point is what triggered the stage that owes it: the deployment
+    // event's own `TriggeredBy`, so a stage a caller's request reached is the caller's and
+    // one an extension's directive drove is the extension's. A tick is owed by no event —
+    // it is the interval AppConfig paces the rollout with, so AppConfig triggered it.
+    let triggered_by = event_index
+        .and_then(|index| deployment.event_log.get(index))
+        .and_then(|event| event.triggered_by.clone())
+        .unwrap_or_else(|| super::TRIGGERED_BY_APPCONFIG.to_string());
+    let event = deployment_event(store, application_id, environment_id, deployment_number)?
+        .triggered_by(&triggered_by);
     // Marked BEFORE the invocation: an action point whose target does not answer has
     // still been reached, and the deployment's stage happened once however its actions
     // went.
