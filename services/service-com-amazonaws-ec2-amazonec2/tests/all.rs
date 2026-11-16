@@ -2553,3 +2553,11 @@ mod allocate_ipam_pool_cidr;
 // Declared beside `snapshot_attributes` for the reason the note above gives: the sorted
 #[path = "all/published_amd_and_graviton_catalog_rows.rs"]
 mod published_amd_and_graviton_catalog_rows;
+// WHAT a `DryRun` probe answers the caller: the two sides of IAM's decision about
+// `ec2:<OperationName>` on the resource the request addresses — `DryRunOperation` only for a
+// principal whose documents allow exactly that action there, `UnauthorizedOperation` for every
+// other one, for an assumed-role session and an IAM user alike, for an operation nobody has
+// written as much as for one that is written, and with neither answer creating anything.
+// Declared at the tail of this file, which is where every new ec2 suite lands.
+#[path = "all/dry_run_probe_decides_on_iam.rs"]
+mod dry_run_probe_decides_on_iam;
