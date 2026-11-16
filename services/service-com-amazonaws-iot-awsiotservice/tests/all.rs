@@ -141,6 +141,8 @@ mod stream_file_objects;
 mod streams;
 #[path = "all/thing_group_hierarchy.rs"]
 mod thing_group_hierarchy;
+#[path = "all/thing_group_listing.rs"]
+mod thing_group_listing;
 #[path = "all/thing_group_membership.rs"]
 mod thing_group_membership;
 #[path = "all/thing_group_update.rs"]

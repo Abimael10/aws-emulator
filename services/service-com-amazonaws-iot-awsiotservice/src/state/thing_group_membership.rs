@@ -349,26 +349,41 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             .count()
     }
 
+    /// The names of the thing groups whose PARENT is `thing_group_name` — its direct
+    /// children only — in registry order.
+    ///
+    /// A group's place in the hierarchy is its own record's `parentGroupName`
+    /// ([`super::ThingGroupConfiguration`]), so the children are derived from those
+    /// records and never recorded beside them. [`Self::descendant_thing_groups`] is the
+    /// transitive closure of this relation.
+    pub fn child_thing_groups(&self, thing_group_name: &str) -> Vec<String> {
+        self.thing_groups
+            .values()
+            .filter(|group| {
+                group
+                    .configuration
+                    .parent_group_name
+                    .as_deref()
+                    .is_some_and(|parent_group_name| parent_group_name == thing_group_name)
+            })
+            .map(|group| group.thing_group_name.clone())
+            .collect()
+    }
+
     /// The names of every thing group BELOW `thing_group_name` in the hierarchy, in
     /// registry order.
     ///
-    /// A group's place in the hierarchy is its own record's `parentGroupName`
-    /// ([`super::ThingGroupConfiguration`]), so the descendants are derived from those
-    /// records and never recorded beside them. The walk is bounded by the number of
-    /// groups that exist, so a record whose parent chain is somehow cyclic terminates
-    /// instead of spinning.
+    /// The transitive closure of [`Self::child_thing_groups`], so the parent relation is
+    /// read one way and the children of a group and its descendants cannot disagree. The
+    /// walk is bounded by the number of groups that exist, so a record whose parent
+    /// chain is somehow cyclic terminates instead of spinning.
     pub fn descendant_thing_groups(&self, thing_group_name: &str) -> Vec<String> {
         let mut descendants: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut frontier = vec![thing_group_name.to_string()];
         while let Some(parent) = frontier.pop() {
-            for group in self.thing_groups.values() {
-                let is_child = group
-                    .configuration
-                    .parent_group_name
-                    .as_deref()
-                    .is_some_and(|parent_group_name| parent_group_name == parent);
-                if is_child && descendants.insert(group.thing_group_name.clone()) {
-                    frontier.push(group.thing_group_name.clone());
+            for child in self.child_thing_groups(&parent) {
+                if descendants.insert(child.clone()) {
+                    frontier.push(child);
                 }
             }
         }
