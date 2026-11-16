@@ -27,7 +27,7 @@ use std::fs;
 // makes that crate's own `all` target fail to compile, so no suite inside it ever runs to
 // report the break. This target is the one that links every service crate.
 use crate::all_rs_declares_each_suite_once::{
-    declaration_roots, declared_suite_files, workspace_root,
+    automod_suite_files, declaration_roots, declared_suite_files, workspace_root,
 };
 
 /// The 1-based line the first item of `source` starts on, if it has one.
@@ -200,7 +200,13 @@ fn every_declared_suite_file_keeps_its_inner_doc_comments_ahead_of_its_first_ite
     // and fails that whole target too.
     let root = workspace_root();
     let roots = declaration_roots();
-    let suite_files: Vec<_> = roots.iter().flat_map(|r| declared_suite_files(r)).collect();
+    // Both classes of compiled suite file: the ones a declaration root names, and the ones
+    // `automod` declares from the directory beside an `all/main.rs` root — this crate's own.
+    let suite_files: Vec<_> = roots
+        .iter()
+        .flat_map(|r| declared_suite_files(r))
+        .chain(automod_suite_files())
+        .collect();
     assert!(
         suite_files.len() > roots.len(),
         "expected the {} declaration roots under {} to declare at least one suite file each, \

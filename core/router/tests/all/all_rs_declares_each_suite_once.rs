@@ -14,6 +14,11 @@
 //! module into `tests/all/` (a bare `mod` would resolve to a sibling of `tests/all.rs`,
 //! which the layout check refuses), and the file that attribute names.
 //!
+//! A crate whose `all` target is rooted at `tests/all/main.rs` has no such list: `automod`
+//! declares one module per file beside that root, so a suite needs no declaration and none can
+//! be written twice. The rules below are read for the crates that DO hold a list — every
+//! service crate's `tests/all.rs`, and this crate's own while it has one ([`all_rs`]).
+//!
 //! The collision is a property of the NAME, not of how the declaration is written, so the
 //! reader below takes a declaration in every spelling the compiler does — with or without a
 //! visibility, with or without a trailing line comment — and counts them all against the one
@@ -339,6 +344,36 @@ pub(crate) fn declared_suite_files(declaration_root: &Path) -> Vec<PathBuf> {
         .map(|path| tests.join(path))
         .filter(|path| path.is_file())
         .collect()
+}
+
+/// Every suite file of THIS crate's `automod`-rooted `all` target: the `.rs` files beside
+/// `tests/all/main.rs`, which `automod::dir!` declares one module each. They are the files
+/// that target compiles without any declaration naming them, so a rule about what a compiled
+/// suite file may hold is read for these beside the files a declaration root names
+/// ([`declared_suite_files`]). Empty for a crate rooted at a declaration list instead.
+pub(crate) fn automod_suite_files() -> Vec<PathBuf> {
+    let all_dir = tests_dir().join("all");
+    if !all_dir.join("main.rs").is_file() {
+        return Vec::new();
+    }
+    let mut files: Vec<PathBuf> = fs::read_dir(&all_dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", all_dir.display()))
+        .map(|entry| {
+            // An entry this reader skipped would quietly shrink the set of files a rule about
+            // a compiled suite file is read for, so a directory this target compiles out of
+            // has to be readable whole \u2014 the contract `declaration_roots` keeps for a root.
+            entry
+                .unwrap_or_else(|error| panic!("read an entry of {}: {error}", all_dir.display()))
+                .path()
+        })
+        .filter(|path| {
+            path.is_file()
+                && path.extension().is_some_and(|kind| kind == "rs")
+                && path.file_name().is_some_and(|name| name != "main.rs")
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 #[test]
