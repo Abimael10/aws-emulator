@@ -45,8 +45,11 @@ use crate::ssoadmin_permission_sets::{
 ///
 /// These are exactly the members `InstanceMetadata` declares in the model
 /// (`smithy_query(query="shape",shape="com.amazonaws.ssoadmin#InstanceMetadata")`), whose
-/// values a `DescribeInstanceResponse` repeats.
-const SHARED_MEMBERS: &[&str] = &[
+/// values a `DescribeInstanceResponse` repeats — bar `StatusReason`, which no served view
+/// carries. Shared with `listed_instance_state_beside_the_modelled_members.rs`, which reads
+/// the model's member set against the members a view actually serves, so this crate's tests
+/// keep ONE copy of that list.
+pub(crate) const SHARED_MEMBERS: &[&str] = &[
     "InstanceArn",
     "IdentityStoreId",
     "IdentityStoreArn",

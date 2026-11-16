@@ -157,6 +157,8 @@ mod listed_instance_projection_matches_describe;
 mod listed_instance_state_across_read_edge_cases;
 #[path = "all/listed_instance_state_after_instance_writes.rs"]
 mod listed_instance_state_after_instance_writes;
+#[path = "all/listed_instance_state_beside_the_modelled_members.rs"]
+mod listed_instance_state_beside_the_modelled_members;
 #[path = "all/listed_instance_state_by_enablement_path.rs"]
 mod listed_instance_state_by_enablement_path;
 #[path = "all/listed_instance_state_by_region_count.rs"]
