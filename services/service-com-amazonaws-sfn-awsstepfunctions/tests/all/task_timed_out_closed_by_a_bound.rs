@@ -83,7 +83,16 @@ fn rows() -> Vec<Row> {
 
 /// Describe `execution_arn` until the bound has closed its task, and report what it then
 /// says.
-async fn closed_by_the_bound(emulator: &Emulator, case: &str, execution_arn: &str) -> Value {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so the suite that
+/// drives SEVERAL lapsed tokens side by side
+/// (`crate::task_timed_out_attributes_its_activity`) waits for the same condition through this
+/// one poll rather than carrying a second copy of it.
+pub(crate) async fn closed_by_the_bound(
+    emulator: &Emulator,
+    case: &str,
+    execution_arn: &str,
+) -> Value {
     let began = Instant::now();
     loop {
         let described = describe_execution(emulator, execution_arn).await;

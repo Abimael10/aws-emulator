@@ -296,6 +296,8 @@ mod task_role_over_dynamodb;
 mod task_role_session_principal;
 #[path = "all/task_target_authorization.rs"]
 mod task_target_authorization;
+#[path = "all/task_timed_out_attributes_its_activity.rs"]
+mod task_timed_out_attributes_its_activity;
 #[path = "all/task_timed_out_closed_by_a_bound.rs"]
 mod task_timed_out_closed_by_a_bound;
 #[path = "all/task_timed_out_quotes_the_activity.rs"]
