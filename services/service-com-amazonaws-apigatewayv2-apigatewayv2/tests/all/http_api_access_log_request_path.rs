@@ -9,7 +9,8 @@
 //! `Api$ApiEndpoint`), and no stage segment at all for the `$default` stage, which serves the
 //! api's root — whichever of the addressings a client on this machine reached the emulator
 //! by. It is the path ASKED FOR, so the route TEMPLATE the request matched belongs to
-//! `$context.routeKey` and not here.**
+//! `$context.routeKey` and not here. `$context.domainName` is that same endpoint's HOST, for
+//! the same reason.**
 //!
 //! It is the same reading the proxy event's own path members take
 //! ([`crate::http_api_event_path`]), over the same addressings: a client cannot resolve
@@ -24,10 +25,11 @@
 //!
 //! The rows differ along what the rule generalises over: HOW the request addresses the api
 //! (the api's own `execute-api` host, that host with the root stage's name spelled out, the
-//! local endpoint marker with and without that name, the api id as the first path segment,
-//! and the stage segment alone), which stage serves it (the one that serves the api's root
-//! and a named one), the SHAPE of the route key the path matches (a literal path, a path
-//! variable and the greedy remainder), and the number of path segments.
+//! local endpoint marker with and without that name, the marker carrying the endpoint HOST
+//! instead of the api id, the api id as the first path segment, and the stage segment alone),
+//! which stage serves it (the one that serves the api's root and two named ones), the SHAPE of
+//! the route key the path matches (a literal path, a path variable, the greedy remainder and
+//! the `$default` catch-all), and the number of path segments, down to the api's own root.
 //!
 //! Every assertion reads the record back through CloudWatch Logs' own reader
 //! (`FilterLogEvents`), so a record that did not reach that store cannot pass.
@@ -45,6 +47,10 @@ const ROOT_STAGE: &str = "$default";
 /// `service::data_plane::LOCAL_ENDPOINT_PREFIX` spells it.
 const LOCAL_MARKER: &str = "/_aws/execute-api";
 
+/// The marker WITHOUT the `execute-api` label: the spelling a rewriter that carried the
+/// endpoint's own HOST across produces, which the data plane reads on any host too.
+const LOCAL_MARKER_PREFIX: &str = "/_aws";
+
 /// An address of the emulator's own endpoint, which names no service: what a client that
 /// cannot resolve the api's host sends to.
 const LOCAL_HOST: &str = "127.0.0.1:9297";
@@ -61,10 +67,10 @@ const HANDLER_SOURCE: &str = "def lambda_handler(event, context):\n    \
                               return {'statusCode': 200, 'body': 'served'}\n";
 
 /// The format every stage below renders its records by: the request's own id, the route key it
-/// matched and the path it asked for.
+/// matched, the path it asked for and the endpoint host it asked at.
 const FORMAT: &str = concat!(
     r#"{"requestId":"$context.requestId","routeKey":"$context.routeKey","#,
-    r#""path":"$context.path"}"#
+    r#""path":"$context.path","domainName":"$context.domainName"}"#
 );
 
 /// The header API Gateway reports the id of the request it processed in, which the record's
@@ -83,6 +89,9 @@ enum Addressing {
     LocalMarker,
     /// The same, with the stage's name spelled out too.
     LocalMarkerNamingTheStage,
+    /// The same, with the api's endpoint HOST behind the marker in place of its id — the other
+    /// spelling a rewriter of that endpoint produces.
+    LocalMarkerCarryingTheHost,
     /// The emulator's own endpoint, with the api id as the first path segment.
     ApiIdFirst,
     /// The emulator's own endpoint, with the stage segment alone naming the deployment.
@@ -126,6 +135,10 @@ fn addressed(row: &Row, api_id: &str, endpoint_host: &str) -> (String, String) {
             LOCAL_HOST.to_string(),
             format!("{LOCAL_MARKER}/{api_id}{staged}"),
         ),
+        Addressing::LocalMarkerCarryingTheHost => (
+            LOCAL_HOST.to_string(),
+            format!("{LOCAL_MARKER_PREFIX}/{endpoint_host}{aws_path}"),
+        ),
         Addressing::ApiIdFirst => (LOCAL_HOST.to_string(), format!("/{api_id}{aws_path}")),
         Addressing::StageOnly => (LOCAL_HOST.to_string(), staged),
     }
@@ -155,6 +168,13 @@ fn rows() -> Vec<Row> {
             addressing: Addressing::LocalMarkerNamingTheStage,
         },
         Row {
+            case: "the root stage behind the marker carrying the endpoint host",
+            stage: ROOT_STAGE,
+            route_key: "GET /orders/{id}/items",
+            route_path: "/orders/7/items",
+            addressing: Addressing::LocalMarkerCarryingTheHost,
+        },
+        Row {
             case: "the root stage with the api id as the first segment",
             stage: ROOT_STAGE,
             route_key: "GET /alpha",
@@ -176,6 +196,13 @@ fn rows() -> Vec<Row> {
             addressing: Addressing::ApiHostNamingTheStage,
         },
         Row {
+            case: "the root stage at the api's own root path, matched by the catch-all route",
+            stage: ROOT_STAGE,
+            route_key: "$default",
+            route_path: "/",
+            addressing: Addressing::ApiHost,
+        },
+        Row {
             case: "a named stage on the api's own host",
             stage: "prod",
             route_key: "GET /orders/{id}/items",
@@ -188,6 +215,14 @@ fn rows() -> Vec<Row> {
             route_key: "GET /items/{item}",
             route_path: "/items/one",
             addressing: Addressing::LocalMarker,
+        },
+        Row {
+            case: "a named stage behind the marker carrying the endpoint host, the catch-all \
+                   route",
+            stage: "prod",
+            route_key: "$default",
+            route_path: "/anything/at/all",
+            addressing: Addressing::LocalMarkerCarryingTheHost,
         },
         Row {
             case: "a named stage named by its segment alone",
@@ -265,22 +300,25 @@ async fn a_record_reports_the_path_the_apis_own_endpoint_was_addressed_at() {
                 "requestId": request_id,
                 "routeKey": row.route_key,
                 "path": expected,
+                "domainName": endpoint_host,
             }),
             "case {case:?}: expected the record of {path:?} to report the path {expected:?} \
-             asked for, got {rendered}"
+             asked for at the endpoint {endpoint_host:?}, got {rendered}"
         );
         // Whatever the addressing carried, the path the record reports names neither the
-        // emulator's own marker, nor the api id, nor the root stage's reserved name.
+        // emulator's own marker, nor the api id, nor the root stage's reserved name — nor the
+        // template of the route key that matched it.
         let reported = rendered
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            !reported.contains(LOCAL_MARKER)
+            !reported.contains(LOCAL_MARKER_PREFIX)
                 && !reported.contains(&api_id)
-                && !reported.contains(ROOT_STAGE),
+                && !reported.contains(ROOT_STAGE)
+                && !reported.contains('{'),
             "case {case:?}: expected the record's path to carry neither the local marker, the \
-             api id nor the root stage's name, got {reported:?}"
+             api id, the root stage's name nor a route template, got {reported:?}"
         );
     }
 }
