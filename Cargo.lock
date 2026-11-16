@@ -11498,6 +11498,7 @@ dependencies = [
  "quick-xml",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
+ "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-firehose-firehose-20150804",

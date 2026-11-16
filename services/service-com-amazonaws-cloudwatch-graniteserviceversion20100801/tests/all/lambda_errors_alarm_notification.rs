@@ -31,15 +31,15 @@
 
 use std::io::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    element, given_queue, grant_sns_delivery_on, received_messages, rpc, sns, subscribe_queue,
-    Emulator, REGION, TARGET_PREFIX,
+    given_topic_with_subscriber, notifications, rpc, states_over_the_watch, until_notified,
+    until_state, Emulator, LOOK_INTERVAL, REGION, TARGET_PREFIX, WORK_WAIT,
 };
 
 /// The namespace Lambda publishes its own series into, the series it reports an invocation's
@@ -74,19 +74,6 @@ def lambda_handler(event, context):
 /// CloudWatch takes, with the one-period look-back a client writes for "any failure now".
 const PERIOD: i64 = 60;
 const EVALUATION_PERIODS: i64 = 1;
-
-/// How long a row waits for work a clock owes — a created function becoming `Active`, the
-/// evaluation that grades the published datapoints, and the delivery of the notification — before
-/// calling it undelivered. Generous on purpose: nothing asserted here is about how fast the host
-/// runs, and only a state or a message that never arrives fails a row.
-const WORK_WAIT: Duration = Duration::from_secs(120);
-
-/// How often it looks while waiting.
-const LOOK_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How long a row watches an alarm it expects NOT to breach, once the invocations it grades have
-/// been published: long enough to span several of the alarm clock's own wake-ups.
-const QUIET_WATCH: Duration = Duration::from_secs(2);
 
 /// CloudWatch, AWS Lambda, CloudWatch Logs, SNS and SQS over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them: the series Lambda publishes about its invocations is the
@@ -267,78 +254,6 @@ async fn given_alarm(
         }),
     )
     .await;
-}
-
-/// The state `DescribeAlarms` reports for the alarm `name`.
-async fn alarm_state(emulator: &Emulator, name: &str) -> String {
-    let described = monitoring(emulator, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
-    described["MetricAlarms"][0]["StateValue"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// Look at the alarm `name` until it reports `wanted`, and answer the last state it reported.
-async fn until_state(emulator: &Emulator, name: &str, wanted: &str) -> String {
-    let deadline = Instant::now() + WORK_WAIT;
-    let mut last = alarm_state(emulator, name).await;
-    while last != wanted && Instant::now() < deadline {
-        tokio::time::sleep(LOOK_INTERVAL).await;
-        last = alarm_state(emulator, name).await;
-    }
-    last
-}
-
-/// Every state the alarm `name` reports over [`QUIET_WATCH`], which is how a row shows a state it
-/// expects the alarm to HOLD.
-async fn states_over_the_watch(emulator: &Emulator, name: &str) -> Vec<String> {
-    let deadline = Instant::now() + QUIET_WATCH;
-    let mut seen = Vec::new();
-    while Instant::now() < deadline {
-        let state = alarm_state(emulator, name).await;
-        if seen.last() != Some(&state) {
-            seen.push(state);
-        }
-        tokio::time::sleep(LOOK_INTERVAL).await;
-    }
-    seen
-}
-
-/// The alarm notifications waiting on the queue at `url`, as SNS envelopes them.
-async fn notifications(emulator: &Emulator, url: &str) -> Vec<Value> {
-    let mut found = Vec::new();
-    for message in received_messages(emulator, url).await {
-        let body = message["Body"].as_str().unwrap_or_default();
-        let envelope: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-        let inner = envelope["Message"].as_str().unwrap_or_default();
-        found.push(serde_json::from_str(inner).unwrap_or(Value::Null));
-    }
-    found
-}
-
-/// Look at the queue until it holds at least one notification, and answer what it held last.
-async fn until_notified(emulator: &Emulator, url: &str) -> Vec<Value> {
-    let deadline = Instant::now() + WORK_WAIT;
-    loop {
-        let held = notifications(emulator, url).await;
-        if !held.is_empty() || Instant::now() >= deadline {
-            return held;
-        }
-        tokio::time::sleep(LOOK_INTERVAL).await;
-    }
-}
-
-/// A topic in this Region with a queue subscribed to it, the queue granting SNS the send its
-/// delivery makes. Answers the topic's ARN and the queue's url.
-async fn given_topic_with_subscriber(emulator: &Emulator, name: &str) -> (String, String) {
-    let (queue_url, queue_arn) = given_queue(emulator, name).await;
-    grant_sns_delivery_on(emulator, &queue_url, &queue_arn).await;
-    let topic = element(
-        &sns(emulator, "CreateTopic", &[("Name", name)]).await,
-        "TopicArn",
-    );
-    subscribe_queue(emulator, &topic, &queue_arn).await;
-    (topic, queue_url)
 }
 
 /// One row: how many invocations of the function fail, how many return, the threshold their

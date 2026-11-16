@@ -11,7 +11,7 @@
 //! subscription — or an EC2 INSTANCE action, whose effect is asserted where a client sees
 //! that: on the instance EC2 reports.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
@@ -975,4 +975,108 @@ pub fn document_instant_secs(text: &str) -> Option<f64> {
     )
     .ok()
     .map(|instant| instant.as_secs_f64())
+}
+
+// ---------------------------------------------------------------------------
+// The fixtures a suite that asserts an alarm END TO END needs: the state the service's own
+// alarm clock settles an alarm into, and the notification a transition delivers to the
+// subscribers of the topic its action names. Held here once, so the suites that drive a series
+// ANOTHER service published — a function's invocations, a table's refused conditional writes —
+// cannot each grow their own copy of the same poll loops and the same topic-and-queue setup.
+// ---------------------------------------------------------------------------
+
+/// How long such a suite waits for work a clock owes — the evaluation that grades the published
+/// datapoints, the delivery of a notification — before calling it undelivered.
+///
+/// Generous on purpose: nothing those suites assert is about how fast the host runs, and only a
+/// state or a message that never arrives fails a row.
+pub const WORK_WAIT: Duration = Duration::from_secs(120);
+
+/// How often it looks while waiting.
+pub const LOOK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a row watches an alarm it expects NOT to breach, once the work it grades has been
+/// done: long enough to span several of the alarm clock's own wake-ups.
+pub const QUIET_WATCH: Duration = Duration::from_secs(2);
+
+/// The state `DescribeAlarms` reports for the alarm `name`.
+pub async fn alarm_state(emulator: &Emulator, name: &str) -> String {
+    let described = rpc(
+        emulator,
+        "monitoring",
+        TARGET_PREFIX,
+        "DescribeAlarms",
+        &::serde_json::json!({"AlarmNames": [name]}),
+    )
+    .await;
+    described["MetricAlarms"][0]["StateValue"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Look at the alarm `name` until it reports `wanted`, and answer the last state it reported —
+/// a wait for the CONDITION, so the caller asserts on a state rather than on a span.
+pub async fn until_state(emulator: &Emulator, name: &str, wanted: &str) -> String {
+    let deadline = Instant::now() + WORK_WAIT;
+    let mut last = alarm_state(emulator, name).await;
+    while last != wanted && Instant::now() < deadline {
+        ::tokio::time::sleep(LOOK_INTERVAL).await;
+        last = alarm_state(emulator, name).await;
+    }
+    last
+}
+
+/// Every state the alarm `name` reports over [`QUIET_WATCH`], in the order it reported them,
+/// which is how a case shows a state it expects the alarm to HOLD.
+pub async fn states_over_the_watch(emulator: &Emulator, name: &str) -> Vec<String> {
+    let deadline = Instant::now() + QUIET_WATCH;
+    let mut seen: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        let state = alarm_state(emulator, name).await;
+        if seen.last() != Some(&state) {
+            seen.push(state);
+        }
+        ::tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+    seen
+}
+
+/// The alarm notifications waiting on the queue at `url`, unwrapped from the envelope SNS
+/// delivers them in.
+pub async fn notifications(emulator: &Emulator, url: &str) -> Vec<Value> {
+    let mut found = Vec::new();
+    for message in received_messages(emulator, url).await {
+        let body = message["Body"].as_str().unwrap_or_default();
+        let envelope: Value = ::serde_json::from_str(body).unwrap_or(Value::Null);
+        let inner = envelope["Message"].as_str().unwrap_or_default();
+        found.push(::serde_json::from_str(inner).unwrap_or(Value::Null));
+    }
+    found
+}
+
+/// Look at the queue at `url` until it holds at least one notification, and answer what it held
+/// last.
+pub async fn until_notified(emulator: &Emulator, url: &str) -> Vec<Value> {
+    let deadline = Instant::now() + WORK_WAIT;
+    loop {
+        let held = notifications(emulator, url).await;
+        if !held.is_empty() || Instant::now() >= deadline {
+            return held;
+        }
+        ::tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// A topic called `name` with a queue of the same name subscribed to it, the queue granting SNS
+/// the send its delivery makes. Answers the topic's ARN and the queue's url.
+pub async fn given_topic_with_subscriber(emulator: &Emulator, name: &str) -> (String, String) {
+    let (queue_url, queue_arn) = given_queue(emulator, name).await;
+    grant_sns_delivery_on(emulator, &queue_url, &queue_arn).await;
+    let topic = element(
+        &sns(emulator, "CreateTopic", &[("Name", name)]).await,
+        "TopicArn",
+    );
+    subscribe_queue(emulator, &topic, &queue_arn).await;
+    (topic, queue_url)
 }

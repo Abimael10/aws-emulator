@@ -174,6 +174,11 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The deployment package that suite uploads is a .zip archive it writes in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# Amazon DynamoDB is mounted beside CloudWatch on one engine in the conditional-write alarm
+# suite, because the `AWS/DynamoDB` series that alarm grades is published by that service's own
+# refused writes: the refusals are made with its API so the datapoints under test are the ones
+# it really published.
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # IAM and the token service are mounted beside CloudWatch on one engine in the authorization
 # suite, because the principal a call is judged as is made with THEIR operations — a role
 # carrying inline policies, assumed for a session — so the documents this service reads are

@@ -111,6 +111,8 @@ mod describe_alarms_creation_identity;
 mod describe_alarms_for_metric_views;
 #[path = "all/disable_alarm_actions.rs"]
 mod disable_alarm_actions;
+#[path = "all/dynamodb_conditional_write_alarm_notification.rs"]
+mod dynamodb_conditional_write_alarm_notification;
 #[path = "all/ec2_alarm_actions.rs"]
 mod ec2_alarm_actions;
 #[path = "all/ec2_instance_action_execution.rs"]
