@@ -29,6 +29,8 @@ mod batch_get_stream_key;
 mod channel_configuration_arns;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/channel_projection_scope.rs"]
+mod channel_projection_scope;
 #[path = "all/default_sub_structures.rs"]
 mod default_sub_structures;
 #[path = "all/delete_attachment_conflict.rs"]
