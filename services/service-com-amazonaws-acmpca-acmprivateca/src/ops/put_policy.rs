@@ -253,12 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The policy can be displayed with GetPolicy and removed with DeletePolicy": one
-        // policy per CA, so attaching replaces whatever was attached before. It is held as
-        // this service holds a policy document — the submitted document with the
-        // whitespace between its tokens dropped, and everything else (member order, and
-        // every string with every character `AWSPolicy` admits) exactly as it was
-        // submitted.
-        record.resource_policy = Some(crate::state::canonical_policy_document(&input.policy));
+        // policy per CA, so attaching replaces whatever was attached before. What is held
+        // is the policy the document states, rendered the way a policy store reports one
+        // ([`crate::state::reported_policy_document`]) — the whitespace between the
+        // tokens gone and a one-element string-or-array element reported as that string,
+        // with every other byte the caller's own.
+        record.resource_policy = Some(crate::state::reported_policy_document(&input.policy));
 
         Ok(PutPolicyOutput)
     }

@@ -705,6 +705,8 @@ pub fn permission_policy_document(
 ///
 /// * the document has to BE a policy — the grammar [`is_well_formed_policy`] reads, whose
 ///   refusal is the service's own [`INVALID_POLICY_MESSAGE`];
+/// * each statement has to GRANT, so its `Effect` is `Allow` and nothing else
+///   ([`NON_ALLOW_EFFECT_MESSAGE`]);
 /// * each statement has to name WHO it is about, in a `Principal` that names an identity
 ///   ([`unresolvable_principal_reason`]);
 /// * each statement has to name WHAT it grants, in actions a certificate authority can be
@@ -728,6 +730,9 @@ pub fn invalid_policy_reason(policy: &str, certificate_authority_arn: &str) -> O
     };
     for statement in statements {
         let statement = statement.as_object()?;
+        if let Some(reason) = unsupported_effect_reason(statement.get("Effect")) {
+            return Some(reason);
+        }
         if let Some(reason) = unresolvable_principal_reason(statement.get("Principal")) {
             return Some(reason);
         }
@@ -743,16 +748,91 @@ pub fn invalid_policy_reason(policy: &str, certificate_authority_arn: &str) -> O
     None
 }
 
+/// The `Effect` a statement of a private CA's resource-based policy carries: a resource
+/// policy of a private CA GRANTS access to it — "A policy grants access on a private CA to
+/// an Amazon Web Services customer account, to Amazon Web Services Organizations, or to an
+/// Amazon Web Services Organizations unit" (`PutPolicy` docs) — so the one effect it
+/// expresses is the allow.
+pub const POLICY_GRANT_EFFECT: &str = "Allow";
+
+/// What Amazon Web Services Private CA answers a resource policy whose statement does not
+/// grant, i.e. whose `Effect` is anything other than [`POLICY_GRANT_EFFECT`].
+///
+/// Wholly fixed text: the refusal is about the effect a private CA's resource policy can
+/// express, so neither the offending statement nor the document is echoed in it.
+pub const NON_ALLOW_EFFECT_MESSAGE: &str = "InvalidPolicy: Only the Allow effect is supported";
+
+/// Why the `Effect` of a policy statement is not one a private CA's resource policy can
+/// carry, or `None` when it grants.
+///
+/// A resource policy on a private CA exists to GRANT the CA to another identity, so the
+/// only statement it can hold is an allow ([`POLICY_GRANT_EFFECT`]); a statement carrying
+/// any other effect — the deny IAM's own grammar admits included — is "a statement that is
+/// not allowed" (`PutPolicyRequest$Policy` docs) and the whole document is refused
+/// ([`NON_ALLOW_EFFECT_MESSAGE`]) with nothing attached.
+fn unsupported_effect_reason(effect: Option<&::serde_json::Value>) -> Option<String> {
+    if effect.and_then(::serde_json::Value::as_str) == Some(POLICY_GRANT_EFFECT) {
+        None
+    } else {
+        Some(NON_ALLOW_EFFECT_MESSAGE.to_string())
+    }
+}
+
+/// The JSON type of `value`, as the refusal of a rejected policy element names it: the
+/// token of the JSON type system itself, so a member added to a document is reported by
+/// what it IS rather than by where it sat.
+fn json_type_token(value: &::serde_json::Value) -> &'static str {
+    match value {
+        ::serde_json::Value::Null => "NULL",
+        ::serde_json::Value::Bool(_) => "BOOLEAN",
+        ::serde_json::Value::Number(_) => "NUMBER",
+        ::serde_json::Value::String(_) => "STRING",
+        ::serde_json::Value::Array(_) => "ARRAY",
+        ::serde_json::Value::Object(_) => "OBJECT",
+    }
+}
+
 /// What Amazon Web Services Private CA answers when a statement of the submitted policy
 /// is about a resource other than the private CA the policy is being attached to.
 ///
-/// Built from the REQUEST: the refusal names `certificate_authority_arn`, the CA the
-/// policy is being attached to and so the one resource its statements can be about.
-pub fn different_resource_message(certificate_authority_arn: &str) -> String {
+/// Built from the REQUEST, and it identifies the offending element of the submitted
+/// document rather than only the CA: the CA the policy is being attached to (and so the
+/// one resource its statements can be about), then the JSON type of the `rejected` value
+/// ([`json_type_token`]), then that value written as JSON on a line of its own.
+///
+/// Fixed text: the prefix, " and type: ", the label "string: " and the two newlines; from
+/// the request: the CA's ARN, the type token and the rejected value. The label is the
+/// recorded one and does not follow the type token — what the type token is for is saying
+/// what the rejected value WAS.
+pub fn different_resource_message(
+    certificate_authority_arn: &str,
+    rejected: &::serde_json::Value,
+) -> String {
     format!(
         "InvalidPolicy: The supplied policy contains different resource or incorrect ARN \
-         format: {certificate_authority_arn}"
+         format: {certificate_authority_arn} and type: {token}\nstring: {rejected}\n",
+        token = json_type_token(rejected),
     )
+}
+
+/// The policy document as Amazon Web Services Private CA holds and displays one: the
+/// policy the submitted document states, rendered the way a policy store reports a
+/// document ([`::service_common::iam_policy_rendering::rendered`]).
+///
+/// Two things differ from the submitted text, and nothing else does: the whitespace
+/// between the document's JSON tokens is gone, and an element the policy language types as
+/// a string or an array of strings (a statement's `Action`/`Resource` and the principal
+/// lists) that carries a one-element array of one string is reported as that string. What
+/// says the second holds here is the recorded read: a statement whose `Action` arrived as a
+/// one-element list is displayed with a scalar `Action`, while a `Statement` holding one
+/// statement keeps its one-element array.
+///
+/// Everything else is the caller's own: the member order, the statement count, the type and
+/// spelling of every other value, and every byte inside a string literal, escapes and
+/// non-ASCII characters included. The shared walk is one pass over the text with no
+/// recursion, and the size it may be handed is `AWSPolicy`'s modelled length.
+pub fn reported_policy_document(policy: &str) -> String {
+    ::service_common::iam_policy_rendering::rendered(policy)
 }
 
 /// Why the `Resource` of a policy statement is not the private CA the policy is attached
@@ -771,6 +851,8 @@ fn different_resource_reason(
             "Each policy statement must name the Resource it is about.".to_string(),
         );
     };
+    // Every entry is judged on its own, so the refusal names the one value that was
+    // rejected rather than the element it sat in.
     let entries: Vec<&::serde_json::Value> = match resource {
         ::serde_json::Value::Array(values) => values.iter().collect(),
         other => vec![other],
@@ -780,48 +862,10 @@ fn different_resource_reason(
     }
     for entry in entries {
         if entry.as_str() != Some(certificate_authority_arn) {
-            return Some(different_resource_message(certificate_authority_arn));
+            return Some(different_resource_message(certificate_authority_arn, entry));
         }
     }
     None
-}
-
-/// The policy document as this service HOLDS and displays one: the submitted document
-/// with the whitespace between its tokens dropped.
-///
-/// A policy is attached as a document and reported as a document, and the documents this
-/// service reports are compact — the policy a grant expresses
-/// ([`permission_policy_document`]) is reported with no whitespace between its tokens — so
-/// a policy attached pretty-printed is displayed in that same compact form. Everything
-/// else survives untouched: the member order the caller wrote, every string exactly as it
-/// was written (escapes and all), and so every character `AWSPolicy` admits.
-pub fn canonical_policy_document(policy: &str) -> String {
-    let mut compact = String::with_capacity(policy.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for character in policy.chars() {
-        if in_string {
-            compact.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '"' => {
-                in_string = true;
-                compact.push(character);
-            }
-            // Whitespace between JSON tokens carries nothing.
-            ' ' | '\t' | '\n' | '\r' => {}
-            other => compact.push(other),
-        }
-    }
-    compact
 }
 
 /// The actions a resource-based policy on a private CA can grant: the read-and-issue
@@ -2036,6 +2080,10 @@ fn published_key_identifier(certificate: &Certificate) -> Option<OctetString> {
 /// a JSON object carrying a `Statement` that is a non-empty list of statement objects (or
 /// a single statement object), each with an `Effect` of exactly `Allow` or `Deny` and an
 /// `Action`. The document is read as JSON by `serde_json`, never matched as text.
+///
+/// This is the GRAMMAR the policy language sets, not what a private CA's policy may say:
+/// a well-formed statement that does not grant is refused on its own
+/// ([`NON_ALLOW_EFFECT_MESSAGE`], from `invalid_policy_reason`).
 ///
 /// The same grammar is checked by Amazon S3's `is_valid_policy_document`
 /// (`services/service-com-amazonaws-s3-amazons3/src/state.rs`) for `PutBucketPolicy`; both

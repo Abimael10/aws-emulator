@@ -13,7 +13,8 @@
 //! 2. `PutPolicy` attaches the submitted resource policy to the private CA its
 //!    `ResourceArn` names and `GetPolicy` displays it back: as a document, with the
 //!    whitespace between its tokens dropped and everything else — member order, and every
-//!    string with every character `AWSPolicy` admits — exactly as submitted.
+//!    string with every character `AWSPolicy` admits — exactly as submitted (the whole
+//!    rendering is tabled in `resource_policy_grant_contract.rs`).
 //! 3. `PutPolicy` refuses, with `InvalidPolicyException`, a document that is not a policy
 //!    of the CA it is being attached to: one that is not a JSON policy, one whose
 //!    statement is about no identity, one granting an action outside this service, and one
@@ -506,14 +507,14 @@ fn attach_rows(ca_arn: &str) -> Vec<AttachRow> {
             ),
         ),
         pretty(
-            "two statements, one of them a Deny",
+            "two statements, the second granting one action to two principals",
             &json!({
                 "Version": "2012-10-17",
                 "Statement": [
                     statement_for(ca_arn, "cross-account-read"),
                     {
-                        "Sid": "no-issuance",
-                        "Effect": "Deny",
+                        "Sid": "issuance",
+                        "Effect": "Allow",
                         "Principal": {"AWS": [format!("arn:aws:iam::{ACCOUNT}:role/issuer"),
                                               ACCOUNT]},
                         "Action": "acm-pca:IssueCertificate",
@@ -738,13 +739,25 @@ async fn each_private_ca_carries_only_the_policy_attached_to_it() {
 // PutPolicy: the documents it refuses
 // ---------------------------------------------------------------------------
 
-/// The message a refused `Resource` carries, naming the CA the policy is attached to:
-/// the refusal is built from the request, which is what tells the caller what the
+/// The message a refused `Resource` carries: the CA the policy is attached to, then the
+/// JSON type of the rejected value and that value itself — the refusal is built from the
+/// request, which is what tells the caller which statement element was wrong and what the
 /// statements have to be about.
-fn different_resource_message(ca_arn: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite reads the sentence from ONE test-side derivation of it
+/// (`resource_policy_grant_contract.rs`) rather than from a second copy.
+pub(crate) fn different_resource_message(ca_arn: &str, rejected: &Value) -> String {
+    let token = match rejected {
+        Value::Null => "NULL",
+        Value::Bool(_) => "BOOLEAN",
+        Value::Number(_) => "NUMBER",
+        Value::String(_) => "STRING",
+        Value::Array(_) => "ARRAY",
+        Value::Object(_) => "OBJECT",
+    };
     format!(
         "InvalidPolicy: The supplied policy contains different resource or incorrect ARN \
-         format: {ca_arn}"
+         format: {ca_arn} and type: {token}\nstring: {rejected}\n"
     )
 }
 
@@ -856,14 +869,14 @@ async fn put_policy_refuses_a_document_that_is_not_a_policy_of_the_ca() {
             statement(json!({"Effect": "Allow", "Principal": "*",
                              "Action": "acm-pca:GetCertificate", "Resource": "*"}))
             .to_string(),
-            Some(different_resource_message(&arn)),
+            Some(different_resource_message(&arn, &json!("*"))),
         ),
         (
             "another CA of this account as the resource",
             statement(json!({"Effect": "Allow", "Principal": "*",
                              "Action": "acm-pca:GetCertificate", "Resource": other}))
             .to_string(),
-            Some(different_resource_message(&arn)),
+            Some(different_resource_message(&arn, &json!(other))),
         ),
         (
             "the CA's own ARN with a resource segment appended",
@@ -871,7 +884,10 @@ async fn put_policy_refuses_a_document_that_is_not_a_policy_of_the_ca() {
                              "Action": "acm-pca:GetCertificate",
                              "Resource": format!("{arn}/certificate/*")}))
             .to_string(),
-            Some(different_resource_message(&arn)),
+            Some(different_resource_message(
+                &arn,
+                &json!(format!("{arn}/certificate/*")),
+            )),
         ),
         (
             "one statement about this CA beside one about another",
@@ -883,7 +899,7 @@ async fn put_policy_refuses_a_document_that_is_not_a_policy_of_the_ca() {
                 ]
             })
             .to_string(),
-            Some(different_resource_message(&arn)),
+            Some(different_resource_message(&arn, &json!(other))),
         ),
         (
             "a resource list carrying one resource that is not this CA",
@@ -891,7 +907,24 @@ async fn put_policy_refuses_a_document_that_is_not_a_policy_of_the_ca() {
                              "Action": "acm-pca:GetCertificate",
                              "Resource": [arn.clone(), other.clone()]}))
             .to_string(),
-            Some(different_resource_message(&arn)),
+            Some(different_resource_message(&arn, &json!(other))),
+        ),
+        (
+            // The rejected element need not be a string: the refusal names the JSON type
+            // it had, so a `Resource` of another type is reported as that type.
+            "a resource that is a number",
+            statement(json!({"Effect": "Allow", "Principal": "*",
+                             "Action": "acm-pca:GetCertificate", "Resource": 17}))
+            .to_string(),
+            Some(different_resource_message(&arn, &json!(17))),
+        ),
+        (
+            "a resource that is an object",
+            statement(json!({"Effect": "Allow", "Principal": "*",
+                             "Action": "acm-pca:GetCertificate",
+                             "Resource": {"Arn": arn.clone()}}))
+            .to_string(),
+            Some(different_resource_message(&arn, &json!({"Arn": arn}))),
         ),
     ];
 

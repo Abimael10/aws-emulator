@@ -100,10 +100,16 @@ fn other_resource_statement(sid: &str) -> Value {
         sid,
         json!({"AWS": ACCOUNT}),
         json!(format!("acm-pca:{}", POLICY_ALLOWED_ACTIONS[0])),
-        json!(format!(
-            "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
-             11111111-1111-1111-1111-111111111111"
-        )),
+        json!(other_resource()),
+    )
+}
+
+/// The resource such a statement names: a certificate authority of this service that is
+/// not the one the policy is attached to, which is what the refusal echoes back.
+fn other_resource() -> String {
+    format!(
+        "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
+         11111111-1111-1111-1111-111111111111"
     )
 }
 
@@ -192,7 +198,7 @@ async fn put_policy_judges_every_statement_of_the_document() {
                 attachable_statement("second", &arn),
                 other_resource_statement("third")
             ]),
-            different_resource_message(&arn),
+            different_resource_message(&arn, &json!(other_resource())),
         ),
     ];
 
@@ -344,7 +350,7 @@ async fn a_refused_document_leaves_the_carried_policy_untouched() {
         (
             "a statement about another authority",
             document(other_resource_statement("elsewhere")),
-            different_resource_message(&arn),
+            different_resource_message(&arn, &json!(other_resource())),
         ),
     ];
 

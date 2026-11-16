@@ -61,10 +61,12 @@ fn request(operation: &str, arn: &str, policy: &str) -> Value {
 /// Every row is a policy OF `ca_arn`: a statement of a CA's resource policy names that CA
 /// as its `Resource`, and the recorded refusal of a statement that names anything else
 /// ("InvalidPolicy: The supplied policy contains different resource or incorrect ARN
-/// format: <the CA>", replayed by
+/// format: <the CA> and type: ...", replayed by
 /// `issues/.../20261022T185258Z-acm-pca-policy-documents-are-never-reported-listpermissions.md`)
 /// is what says so. A document a CA displays is the one submitted with the whitespace
-/// between its tokens dropped, which is why the pretty-printed row's two columns differ.
+/// between its tokens dropped (the whole rendering is tabled in
+/// `resource_policy_grant_contract.rs`), which is why the pretty-printed row's two columns
+/// differ and every other row's two columns are the same text.
 fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
     let one_statement = json!({
         "Version": "2012-10-17",
@@ -92,7 +94,7 @@ fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
              "Action": "acm-pca:IssueCertificate", "Resource": ca_arn},
             {"Effect": "Allow", "Principal": {"Service": "acm.amazonaws.com"},
              "Action": "acm-pca:GetCertificate", "Resource": ca_arn},
-            {"Effect": "Deny", "Principal": "*",
+            {"Effect": "Allow", "Principal": "*",
              "Action": "acm-pca:ListTags", "Resource": ca_arn}
         ]
     });
@@ -139,15 +141,17 @@ fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
             three_statements.to_string(),
             three_statements.to_string(),
         ),
-        (
-            "pretty printed with newlines and tabs",
-            format!(
-                "{{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{pretty_statement}\n\t]\n}}\r\n"
-            ),
-            // The members keep the order the document was written in; only the whitespace
-            // between the tokens goes.
-            format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{pretty_statement}]}}"),
-        ),
+        {
+            // The document is held with the whitespace between its tokens dropped and
+            // everything else — the member order included — as it was written.
+            (
+                "pretty printed with newlines and tabs",
+                format!(
+                    "{{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{pretty_statement}\n\t]\n}}\r\n"
+                ),
+                format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{pretty_statement}]}}"),
+            )
+        },
         (
             "non-ASCII statement id",
             non_ascii.to_string(),
@@ -232,7 +236,7 @@ fn invalid_policy_documents() -> Vec<(&'static str, String)> {
             json!({"Version": "2012-10-17",
                    "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
                                   "Action": "acm-pca:GetCertificate", "Resource": "*"},
-                                 {"Effect": "Deny", "Principal": {"AWS": "*"},
+                                 {"Effect": "Allow", "Principal": {"AWS": "*"},
                                   "Resource": "*"}]})
             .to_string(),
         ),

@@ -71,6 +71,8 @@ mod private_ca_lifecycle;
 mod refusal_message_text;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_policy_grant_contract.rs"]
+mod resource_policy_grant_contract;
 #[path = "all/resource_policy_read.rs"]
 mod resource_policy_read;
 #[path = "all/resource_policy_rules.rs"]
