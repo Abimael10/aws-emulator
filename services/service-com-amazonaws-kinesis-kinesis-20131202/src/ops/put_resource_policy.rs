@@ -14,10 +14,10 @@
 //! An ARN this account and region hold no resource under is the modelled
 //! `ResourceNotFoundException` ("If you receive a ResourceNotFoundException, check to see if
 //! you passed a valid stream or consumer resource"), and a `Policy` that is no policy
-//! document — not a JSON object, or larger than this emulator retains — is the modelled
-//! `InvalidArgumentException`. A resource that is held in a state the operation is not
-//! available in is the modelled `ResourceInUseException`, raised BEFORE the policy store is
-//! written
+//! document — one the IAM JSON policy language cannot read, or larger than this emulator
+//! retains — is the modelled `InvalidArgumentException`. A resource that is held in a state
+//! the operation is not available in is the modelled `ResourceInUseException`, raised BEFORE
+//! the policy store is written
 //! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_policy_readiness`]), so
 //! nothing is attached to a resource AWS would have left unpoliced.
 //!
@@ -199,9 +199,11 @@ fn resource_in_use(message: String) -> PutResourcePolicyError {
 }
 
 /// Check the request's `Policy` is a policy document this service can store and report
-/// back: bounded in size, and a JSON object, since a resource-based policy "is formatted as
-/// a JSON string" naming "the identity of the principal and the actions allowed on this
-/// resource" (`PutResourcePolicyInput$Policy`).
+/// back: bounded in size, and a document in the IAM JSON policy language whose every
+/// statement states an effect, "the identity of the principal and the actions allowed on this
+/// resource" (`PutResourcePolicyInput$Policy`) — which is exactly the grammar of a
+/// resource-based policy ([`::service_common::iam_policy::resource_policy_defect_of`]), read
+/// there so two services handed one document cannot disagree about whether it is a policy.
 ///
 /// The size is checked BEFORE the document is parsed, so an oversized one is refused without
 /// being walked.
@@ -211,15 +213,28 @@ fn check_policy_document(policy: &str) -> Result<(), PutResourcePolicyError> {
             policy.len(),
         )));
     }
-    // What is wrong with the text is stated as the SERVICE states it, in the one fixed
-    // sentence its policy-document validation states: the parser's own diagnostic, the
-    // offending bytes and the offset are details of the crate that read the document, not of
-    // this API, and the refusal carries none of them.
-    match ::serde_json::from_str::<::serde_json::Value>(policy) {
-        Ok(::serde_json::Value::Object(_)) => Ok(()),
-        _ => Err(invalid_argument(
-            crate::state::POLICY_INVALID_JSON_MESSAGE.to_string(),
-        )),
+    let invalid_json =
+        || invalid_argument(crate::state::POLICY_INVALID_JSON_MESSAGE.to_string());
+    // Parsed ONCE here and both readings taken off the parsed value, so a document is not
+    // walked twice to be refused.
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return Err(invalid_json());
+    };
+    // WHICH clause of the language the document broke is stated as the SERVICE states it: the
+    // one clause whose refusal names a value names the effect the rejected statement
+    // declared, and every other clause is the one fixed sentence its policy-document
+    // validation states — the reading that rejected the document, the offending bytes and the
+    // offset are details of that reading, not of this API, so a text that is no JSON and one
+    // that is JSON the policy language cannot read are refused alike.
+    match ::service_common::iam_policy::resource_policy_defect_of(&document) {
+        None => Ok(()),
+        Some(::service_common::iam_policy::PolicyDefect::MissingEffect) => Err(
+            ::service_common::iam_policy::undefined_effect_of(&document).map_or_else(
+                invalid_json,
+                |effect| invalid_argument(crate::state::policy_invalid_effect_message(&effect)),
+            ),
+        ),
+        Some(_) => Err(invalid_json()),
     }
 }
 

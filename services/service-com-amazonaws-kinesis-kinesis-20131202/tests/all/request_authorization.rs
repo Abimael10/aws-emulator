@@ -47,7 +47,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::stream_tags::{error_code, error_message, poll_until, REGION};
 
 /// The canonical emulator account id, spelled out so the test pins the ARN a client sees.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The `X-Amz-Target` prefix of this service (`OPERATIONS.md`, "Wire protocol").
 const TARGET_PREFIX: &str = "Kinesis_20131202";
@@ -55,10 +55,10 @@ const TARGET_PREFIX: &str = "Kinesis_20131202";
 /// The access key id of the account's own published credential: a key neither STS nor IAM
 /// holds a record for, which is the position AWS account root credentials are in — and the
 /// key every other suite of this crate signs with.
-const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// The access key id of the assumed-role session the role rows sign with.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLEKINESIS01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLEKINESIS01";
 
 /// The access key id of the IAM user's long-term key the user rows sign with.
 const USER_KEY_ID: &str = "AKIAEXAMPLEKINESIS01";
@@ -81,18 +81,18 @@ const SESSION_SECONDS: i32 = 3_600;
 /// The error code an authorization refusal names, and the status it answers with: the shape
 /// this model declares for it is a client error defaulted to HTTP 400
 /// (`smithy_query(query="operation", operation="PutRecord")`).
-const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
-const ACCESS_DENIED_STATUS: u16 = 400;
+pub(crate) const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 400;
 
 /// Kinesis, IAM and STS over ONE engine — the shape `core/router/src/lib.rs` mounts them in —
 /// so the policies and the session the cases seed are the records those services hold.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here, so requests are unauthenticated; the
@@ -115,7 +115,12 @@ impl Emulator {
 
     /// Call `operation` with `body`, signed with `access_key_id` — what names the principal
     /// the request speaks for.
-    async fn call_as(&self, access_key_id: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_as(
+        &self,
+        access_key_id: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -139,7 +144,7 @@ impl Emulator {
 
     /// Call `operation` as the account's own published credential, which this gate does not
     /// bound, asserting a 200 and answering the body.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, response) = self.call_as(ACCOUNT_KEY_ID, operation, body).await;
         assert_eq!(
             status, 200,
@@ -151,13 +156,13 @@ impl Emulator {
 }
 
 /// The principal ARN the seeded session speaks for — what a refusal must name.
-fn session_arn() -> String {
+pub(crate) fn session_arn() -> String {
     format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/{SESSION}")
 }
 
 /// The ARN the account holds the role under, which is the identity whose policies an
 /// assumed-role session's request is judged on.
-fn role_arn() -> String {
+pub(crate) fn role_arn() -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{ROLE}")
 }
 
@@ -168,7 +173,7 @@ fn user_arn() -> String {
 
 /// Record the role and the assumed-role session [`SESSION_KEY_ID`] speaks for, as
 /// `iam:CreateRole` and `sts:AssumeRole` record them. NO policy is attached.
-fn given_session(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn given_session(engine: &Arc<engine::InMemoryEngine>) {
     let role_arn = role_arn();
     let iam_store = iam::service_state(&**engine).expect("the IAM store");
     iam_store.lock().roles.insert(
@@ -250,7 +255,7 @@ fn inline(document: &Value) -> BTreeMap<String, iam::InlinePolicy> {
 
 /// Attach `document` to the role as its inline policy, replacing whatever it carried. `None`
 /// takes every policy off it, as `iam:DeleteRolePolicy` does.
-fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
+pub(crate) fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
     let store = iam::service_state(&**engine).expect("the IAM store");
     let mut store = store.lock();
     store.role_inline_policies.remove(&iam::name_key(ROLE));
@@ -274,7 +279,7 @@ fn given_user_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Val
 }
 
 /// A policy allowing `actions` on `resource`.
-fn allow_on(actions: Value, resource: Value) -> Value {
+pub(crate) fn allow_on(actions: Value, resource: Value) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": resource }]
@@ -283,7 +288,7 @@ fn allow_on(actions: Value, resource: Value) -> Value {
 
 /// Create the stream `name` with one shard and wait until it reports `ACTIVE`, through the
 /// account's own credential — the setup every case starts from.
-async fn given_stream(emulator: &Emulator, case: &str, name: &str) -> String {
+pub(crate) async fn given_stream(emulator: &Emulator, case: &str, name: &str) -> String {
     emulator
         .ok(
             case,
@@ -353,7 +358,7 @@ async fn given_consumer(
 }
 
 /// The id of the stream's one shard, read as the account's own credential.
-async fn one_shard(emulator: &Emulator, case: &str, name: &str) -> String {
+pub(crate) async fn one_shard(emulator: &Emulator, case: &str, name: &str) -> String {
     let listed = emulator
         .ok(case, "ListShards", &json!({ "StreamName": name }))
         .await;

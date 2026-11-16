@@ -303,8 +303,14 @@ impl Caller {
         if granted && capped == Decision::Allowed {
             return None;
         }
-        let reason = if said == Decision::Denied || resource_said == Decision::Denied {
+        // WHICH document the deny stands in is a fact the clause names: an explicit `Deny` in
+        // one of the principal's own documents is the identity-based clause, and one in the
+        // resource's own policy is the resource-based clause, since "an explicit deny in any
+        // policy overrides any allow" and the caller is told which policy to go and change.
+        let reason = if said == Decision::Denied {
             iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
+        } else if resource_said == Decision::Denied {
+            iam::RESOURCE_POLICY_EXPLICIT_DENY.to_string()
         } else if !granted {
             iam::no_identity_policy_allows(action)
         } else if capped == Decision::Denied {
@@ -646,6 +652,20 @@ mod tests {
             caller.refusal(&action, &stream, Some(&policy)),
             None,
             "case \"a resource policy naming the caller\": expected the call to be served"
+        );
+        // An explicit deny in the RESOURCE's policy refuses a caller whose own documents
+        // allow the call, and the clause names THAT document rather than the identity's.
+        let denies = format!(
+            r#"{{"Statement":[{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},
+             "Action":"{action}","Resource":"{stream}"}}]}}"#
+        );
+        let stated = allowed
+            .refusal(&action, &stream, Some(&denies))
+            .expect("an explicit deny in the resource policy refuses");
+        assert!(
+            stated.ends_with(iam::RESOURCE_POLICY_EXPLICIT_DENY),
+            "case \"an explicit deny in the resource policy\": expected the resource clause, \
+             got {stated:?}"
         );
     }
 }

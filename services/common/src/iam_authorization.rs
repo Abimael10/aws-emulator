@@ -763,6 +763,14 @@ pub fn not_authorized_to_perform_unpunctuated(
 /// rather than the action.
 pub const IDENTITY_POLICY_EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
 
+/// The reason clause for a request an explicit `Deny` in the RESOURCE-BASED policy of the
+/// resource it addresses refuses: the deny is a fact about THAT document, so the sentence
+/// names it rather than the principal's own. The counterpart of
+/// [`IDENTITY_POLICY_EXPLICIT_DENY`] for the resource-based half of the decision, stated here
+/// for the same reason the sentences around it are: two services that reach the same decision
+/// must word it the same way.
+pub const RESOURCE_POLICY_EXPLICIT_DENY: &str = "with an explicit deny in a resource-based policy";
+
 /// The reason clause for a request an explicit `Deny` in the principal's PERMISSIONS BOUNDARY
 /// refuses.
 pub const PERMISSIONS_BOUNDARY_EXPLICIT_DENY: &str =

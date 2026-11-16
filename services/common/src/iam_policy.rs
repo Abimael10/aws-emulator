@@ -164,6 +164,33 @@ fn declares_unsupported_version(document: &::serde_json::Value) -> bool {
 /// carry to be read as an ARN at all.
 pub const ARN_PREFIX: &str = "arn:";
 
+/// The first value the statements of `document` declare as their `Effect` that is not one of
+/// [`POLICY_EFFECTS`], or `None` when the first statement declaring one outside them declares
+/// no string at all — which includes a statement declaring no `Effect` — and for a value that
+/// is no policy.
+///
+/// The grammar reads whether a statement declares an effect the language defines
+/// ([`PolicyDefect::MissingEffect`]); this hands the OFFENDING VALUE over, as submitted, for a
+/// service whose refusal for that clause names it. Reading stops at the FIRST statement
+/// breaking the clause — the one the grammar rejected, since it reports the first defective
+/// statement — so the value a refusal names always belongs to the statement that failed; a
+/// value that is not a string declares no effect to name, and what that statement failed to be
+/// is the grammar's answer rather than this one's.
+///
+/// Takes the PARSED document, as [`resource_policy_defect_of`] does, so a caller applying both
+/// readings parses the text once.
+pub fn undefined_effect_of(document: &::serde_json::Value) -> Option<String> {
+    let declared = statements(document).into_iter().find_map(|statement| {
+        let effect = statement.get("Effect");
+        let named = effect.and_then(::serde_json::Value::as_str);
+        match named {
+            Some(effect) if POLICY_EFFECTS.contains(&effect) => None,
+            _ => Some(named),
+        }
+    })?;
+    declared.map(str::to_string)
+}
+
 /// The first value the statements' resource elements name that is not an ARN, or `None`
 /// when every value they name is one — which includes a document naming no resource at
 /// all, and a text that is not a policy.

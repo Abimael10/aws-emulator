@@ -14,17 +14,21 @@
 //! this account and region hold no resource under is the modelled `ResourceNotFoundException`
 //! for all three; a resource that exists and carries no policy has none for the delete to
 //! remove (the same refusal) while the READ is served for it, reporting the empty document —
-//! that half of the rule is [`crate::resource_policy_absence`]'s. A `Policy` that is no policy
-//! document at all is the modelled `InvalidArgumentException`, and a resource held in a state
-//! the operation is not available in is the modelled `ResourceInUseException` — that
-//! precondition is [`crate::resource_policy_stream_state`]'s.
+//! that half of the rule is [`crate::resource_policy_absence`]'s. A `Policy` the IAM JSON
+//! policy language cannot read as a resource-based policy — one that is not JSON, not an
+//! object, or an object breaking one of the language's clauses (no statement, an undefined
+//! `Version` or `Effect`, a statement naming no action or no principal) — is the modelled
+//! `InvalidArgumentException`, and a resource held in a state the operation is not available
+//! in is the modelled `ResourceInUseException` — that precondition is
+//! [`crate::resource_policy_stream_state`]'s.
 //!
 //! The recorded flows these were derived from attach ONE document to ONE stream and read it
 //! back, and read a stream that carries none — each one row of the tables below. The rows
 //! differ along what the rule generalises over: the resource KIND the ARN names, the form of
-//! the document (statement count, nesting, non-ASCII text, whitespace), its SIZE (up to the
-//! ceiling this emulator retains and one byte past it), how many attaches a resource takes,
-//! and the region the request is signed for.
+//! the document (statement count, nesting, non-ASCII text, whitespace, which of the policy
+//! language's optional elements it uses, and which of its clauses a refused one breaks), its
+//! SIZE (up to the ceiling this emulator retains and one byte past it), how many attaches a
+//! resource takes, and the region the request is signed for.
 //!
 //! The wire harness, the ARN builders and the channel helpers are [`crate::stream_tags`]' and
 //! [`crate::channel_lifecycle`]', reused rather than copied.
@@ -170,7 +174,9 @@ struct Document {
 }
 
 /// The documents the attach-and-report rule is checked over. The rows differ in statement
-/// count, nesting, the script their text is written in, their whitespace, and their size.
+/// count, nesting, the script their text is written in, their whitespace, their size, and
+/// which of the policy language's OPTIONAL elements they use — every one of them a document
+/// the language reads, so every one is stored and reported back.
 fn documents(arn: &str) -> Vec<Document> {
     vec![
         // The recorded shape: one statement granting one action to the account root.
@@ -242,7 +248,229 @@ fn documents(arn: &str) -> Vec<Document> {
             label: "the-whole-size-ceiling",
             policy: policy_of_bytes(MAX_RESOURCE_POLICY_BYTES),
         },
+        // A document declaring NO version: the policy language lets a document omit
+        // `Version`, so this is a policy and is stored as one.
+        Document {
+            label: "no-version-at-all",
+            policy: json!({
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "AWS": format!("arn:aws:iam::{}:root", account()) },
+                    "Action": "kinesis:GetRecords",
+                    "Resource": arn,
+                }],
+            })
+            .to_string(),
+        },
+        // The LEGACY policy version, the other value the language defines for that element
+        // (`service_common::iam_policy`'s `POLICY_VERSIONS`).
+        Document {
+            label: "the-legacy-policy-version",
+            policy: json!({
+                "Version": "2008-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "kinesis:ListShards",
+                    "Resource": arn,
+                }],
+            })
+            .to_string(),
+        },
+        // ONE statement written as the object itself rather than as a list of one.
+        Document {
+            label: "one-statement-not-in-a-list",
+            policy: json!({
+                "Version": "2012-10-17",
+                "Statement": {
+                    "Effect": "Deny",
+                    "Principal": { "AWS": "arn:aws:iam::111122223333:root" },
+                    "Action": "kinesis:GetRecords",
+                    "Resource": arn,
+                },
+            })
+            .to_string(),
+        },
+        // The COMPLEMENT elements, which name an action and a principal exactly as their
+        // plain forms do.
+        Document {
+            label: "complement-action-and-principal",
+            policy: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "NotPrincipal": { "AWS": format!("arn:aws:iam::{}:root", account()) },
+                    "NotAction": ["kinesis:DescribeStream", "kinesis:ListShards"],
+                    "Resource": arn,
+                }],
+            })
+            .to_string(),
+        },
+        // No `Resource` element at all: in a resource-based policy the resource the document
+        // is attached to is the implicit one, which is why IAM's own resource-policy examples
+        // omit it.
+        Document {
+            label: "no-resource-element",
+            policy: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": [
+                            format!("arn:aws:iam::{}:root", account()),
+                            "arn:aws:iam::111122223333:root",
+                        ],
+                    },
+                    "Action": "kinesis:GetRecords",
+                }],
+            })
+            .to_string(),
+        },
     ]
+}
+
+/// The documents a JSON OBJECT can be while being no policy, one per clause of the policy
+/// language a resource-based document has to satisfy: a row breaks exactly one clause and is
+/// otherwise the document [`policy_for`] builds, paired with what the refusal must say — the
+/// one fixed sentence, except for the statement's EFFECT, whose refusal names the value the
+/// document declared.
+fn broken_documents(arn: &str) -> Vec<(&'static str, String, String)> {
+    let invalid_json = "Policy validation error: This policy contains invalid Json".to_string();
+    let principal = json!({ "AWS": format!("arn:aws:iam::{}:root", account()) });
+    // One well-formed statement, which each row then takes a clause out of.
+    let statement = json!({
+        "Sid": "Readers",
+        "Effect": "Allow",
+        "Principal": principal,
+        "Action": "kinesis:GetRecords",
+        "Resource": arn,
+    });
+    let with = |change: fn(&mut Value)| {
+        let mut statement = statement.clone();
+        change(&mut statement);
+        json!({ "Version": "2012-10-17", "Statement": [statement] }).to_string()
+    };
+    // The effects the language does not define, each named back by the refusal as the
+    // document declared it.
+    let undefined_effects = ["Permit", "allow ", "DENY!", "MaybeAllow", ""].map(|effect| {
+        (
+            "an effect the language does not define",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": effect,
+                    "Principal": principal.clone(),
+                    "Action": "kinesis:GetRecords",
+                    "Resource": arn,
+                }],
+            })
+            .to_string(),
+            format!("Policy validation error: Invalid effect: {effect}"),
+        )
+    });
+    let mut rows: Vec<(&'static str, String, String)> = vec![
+        // The document a read reports for a resource carrying NO policy: an object, and no
+        // policy — the language requires a `Statement` element.
+        (
+            "the empty json object",
+            EMPTY_POLICY_DOCUMENT.to_string(),
+            invalid_json.clone(),
+        ),
+        (
+            "no statement element",
+            json!({ "Version": "2012-10-17" }).to_string(),
+            invalid_json.clone(),
+        ),
+        (
+            "an empty statement list",
+            json!({ "Version": "2012-10-17", "Statement": [] }).to_string(),
+            invalid_json.clone(),
+        ),
+        (
+            "a statement that is not an object",
+            json!({ "Version": "2012-10-17", "Statement": ["kinesis:GetRecords"] }).to_string(),
+            invalid_json.clone(),
+        ),
+        (
+            "a version the language does not define",
+            json!({ "Version": "2020-01-01", "Statement": [statement.clone()] }).to_string(),
+            invalid_json.clone(),
+        ),
+        (
+            "a statement declaring no effect",
+            with(|statement| {
+                statement.as_object_mut().expect("the statement").remove("Effect");
+            }),
+            invalid_json.clone(),
+        ),
+        (
+            "a statement whose effect is not a string",
+            with(|statement| statement["Effect"] = json!(2012)),
+            invalid_json.clone(),
+        ),
+        (
+            "a statement naming no action",
+            with(|statement| {
+                statement.as_object_mut().expect("the statement").remove("Action");
+            }),
+            invalid_json.clone(),
+        ),
+        (
+            "a statement naming no principal",
+            with(|statement| {
+                statement.as_object_mut().expect("the statement").remove("Principal");
+            }),
+            invalid_json.clone(),
+        ),
+        (
+            "a statement whose principal names nothing",
+            with(|statement| statement["Principal"] = json!({})),
+            invalid_json.clone(),
+        ),
+        // Two statements, the FIRST of them the one that breaks the effect clause: the value
+        // a refusal names belongs to the statement that failed, so a statement declaring no
+        // effect is refused with the fixed sentence however a later one is written.
+        (
+            "a statement declaring no effect ahead of one declaring an undefined effect",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Principal": principal.clone(),
+                        "Action": "kinesis:GetRecords",
+                        "Resource": arn,
+                    },
+                    {
+                        "Effect": "Permit",
+                        "Principal": principal.clone(),
+                        "Action": "kinesis:PutRecord",
+                        "Resource": arn,
+                    },
+                ],
+            })
+            .to_string(),
+            invalid_json.clone(),
+        ),
+        (
+            "an undefined effect in the second statement, the first one well formed",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    statement.clone(),
+                    {
+                        "Effect": "Permit",
+                        "Principal": principal.clone(),
+                        "Action": "kinesis:PutRecord",
+                        "Resource": arn,
+                    },
+                ],
+            })
+            .to_string(),
+            "Policy validation error: Invalid effect: Permit".to_string(),
+        ),
+    ];
+    rows.extend(undefined_effects);
+    rows
 }
 
 /// Every document of the table is attached to one stream in turn, and each read reports the
@@ -505,12 +733,14 @@ async fn an_absent_policy_is_refused_by_the_delete() {
 
 /// A `Policy` that is no policy document is refused with the modelled
 /// `InvalidArgumentException`, and the resource keeps whatever it carried: a value that is not
-/// JSON at all, a JSON value that is not an object, and a document one byte past the size
-/// ceiling this emulator retains.
+/// JSON at all, a JSON value that is not an object, a JSON object the IAM policy language
+/// cannot read as a policy, and a document one byte past the size ceiling this emulator
+/// retains.
 ///
-/// The document check states ONE fixed sentence, which quotes neither the document, nor an
-/// offset, nor a member name — so every form of document that is not a policy is refused with
-/// the very same text.
+/// The document check states ONE fixed sentence for every text it cannot read as a policy,
+/// quoting neither the document, nor an offset, nor a member name — except for the one clause
+/// whose refusal names a value, the statement's `Effect`, which the sentence carries as the
+/// document declared it.
 #[tokio::test]
 async fn a_policy_that_is_no_policy_document_is_refused() {
     let emulator = Emulator::new();
@@ -524,7 +754,7 @@ async fn a_policy_that_is_no_policy_document_is_refused() {
     // here rather than borrowed from the crate so the wording itself is what the cases pin.
     let invalid_json = "Policy validation error: This policy contains invalid Json".to_string();
     // (case, the value sent, what the refusal must say)
-    let rows: Vec<(&str, String, String)> = vec![
+    let mut rows: Vec<(&str, String, String)> = vec![
         ("not json at all", "Allow everyone to read".to_string(), invalid_json.clone()),
         (
             "truncated json",
@@ -548,6 +778,14 @@ async fn a_policy_that_is_no_policy_document_is_refused() {
             ),
         ),
     ];
+    // Every clause of the policy language a JSON OBJECT can break, each sent as an otherwise
+    // well-formed document with that one clause broken. The clauses and their value
+    // catalogues are the IAM JSON policy language's own, read through the one reading of it
+    // this tree holds (`service_common::iam_policy`: the two `Version` values it defines, the
+    // two `Effect` values it defines, the required `Statement` element) beside what this
+    // member documents a resource policy must carry — "the identity of the principal and the
+    // actions allowed on this resource" (`PutResourcePolicyInput$Policy`).
+    rows.extend(broken_documents(&arn));
 
     for (case, policy, says) in &rows {
         let (status, response) = put(&emulator, REGION, &arn, policy).await;

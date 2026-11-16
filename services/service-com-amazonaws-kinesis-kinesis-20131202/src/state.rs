@@ -3513,15 +3513,27 @@ pub fn policy_too_large_message(sent: usize) -> String {
 
 /// How an attach refuses a `Policy` that is no policy document at all: a resource-based
 /// policy "is formatted as a JSON string" (`PutResourcePolicyInput$Policy`) and names "the
-/// identity of the principal and the actions allowed on this resource", which is a JSON
-/// object — anything else is the modelled "a specified parameter ... is not supported, or
-/// can't be used" refusal, stated as the service's policy-document validation states it.
+/// identity of the principal and the actions allowed on this resource", which is a document
+/// in the IAM JSON policy language — anything else is the modelled "a specified parameter ...
+/// is not supported, or can't be used" refusal, stated as the service's policy-document
+/// validation states it.
 ///
 /// FIXED text: the refusal quotes neither the document, nor an offset, nor a member name, so
-/// a document that does not parse and one that parses as something other than a policy
-/// object are refused with the one sentence.
+/// every text the policy reading rejects without naming a value — one that does not parse as
+/// JSON, and one that parses as JSON the language cannot read as a policy — is refused with
+/// the very same sentence. The one clause whose refusal does name a value is the statement's
+/// effect ([`policy_invalid_effect_message`]).
 pub const POLICY_INVALID_JSON_MESSAGE: &str =
     "Policy validation error: This policy contains invalid Json";
+
+/// How an attach refuses a statement declaring an `Effect` the policy language does not
+/// define — "the Effect element is required and specifies whether the statement results in an
+/// allow or an explicit deny", so the two values it may take are the only ones a statement is
+/// read with. Built FROM the request: the fixed text names the clause, and the one variable
+/// part is the effect as the document declared it.
+pub fn policy_invalid_effect_message(effect: &str) -> String {
+    format!("Policy validation error: Invalid effect: {effect}")
+}
 
 /// What a read reports for a resource that carries no resource-based policy: a policy "is
 /// formatted as a JSON string" (`GetResourcePolicyOutput$Policy`) holding "the identity of
