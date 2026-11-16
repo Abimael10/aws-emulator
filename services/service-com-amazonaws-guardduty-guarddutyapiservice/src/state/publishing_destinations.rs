@@ -85,3 +85,83 @@ impl PublishingDestinationRecord {
         self.verification_due_millis = Some(now.saturating_add(VERIFICATION_DELAY_MILLIS));
     }
 }
+
+/// The message GuardDuty refuses a `destinationArn` whose resource does not exist
+/// with: AWS's own published wording for that parameter, naming the member in the
+/// words AWS uses for it and quoting neither the ARN nor the resource back.
+///
+/// "Before you start exporting the findings, the destination resource must exist"
+/// (`smithy_query(query="doc",shape="CreatePublishingDestination")`), so a request
+/// naming a resource that is not there describes an export that could never happen
+/// and is refused at configuration time rather than recorded.
+pub const DESTINATION_RESOURCE_ABSENT_MESSAGE: &str =
+    "The request failed because the resource specified in the destinationArn parameter does not exist.";
+
+/// The Amazon S3 BUCKET the destination ARN `destination_arn` publishes into, or
+/// `None` when it names no bucket at all.
+///
+/// "To specify an S3 bucket folder use the following format:
+/// `arn:aws:s3:::DOC-EXAMPLE-BUCKET/myFolder/`"
+/// (`smithy_query(query="doc",shape="DestinationProperties",member="DestinationArn")`),
+/// so the resource field opens with the bucket and anything after the first `/` is
+/// a folder inside it: the resource whose EXISTENCE decides the request is the
+/// bucket. The ARN is split by the shared ARN reader rather than by hand, and the
+/// NAME itself is left to Amazon S3 to judge — what this service needs to know is
+/// whether the store holds a bucket under it, which is the store's answer and not a
+/// reading of the spelling.
+#[must_use]
+pub fn destination_bucket(destination_arn: &str) -> Option<&str> {
+    let arn = ::service_common::arn::parse_of(destination_arn, S3_SERVICE)?;
+    let bucket = arn.resource.split('/').next().unwrap_or(arn.resource);
+    (!bucket.is_empty()).then_some(bucket)
+}
+
+/// Whether the resource `destination_arn` names is one Amazon S3 ANSWERED that it
+/// does not hold — the question
+/// [`DESTINATION_RESOURCE_ABSENT_MESSAGE`] is the refusal for.
+///
+/// A publishing destination's resource belongs to another service, so this service
+/// resolves it where that service holds it: the bucket is asked for with
+/// `HeadBucket` ("you can use this operation to determine if a bucket exists"),
+/// over the in-process callback every call this emulator makes to another emulated
+/// service goes through ([`smithy_server_runtime::OperationContext::callback`]) and
+/// the shared client that hop is configured by
+/// ([`service_common::s3_client::s3_client`]) — nothing here opens a socket, and
+/// the only caller-supplied value that reaches the client's address is the signing
+/// Region, narrowed to a Region label before it gets there.
+///
+/// `false` for every answer that is not the object store reporting the bucket
+/// absent: an emulator assembled with no object store to ask establishes nothing
+/// about the bucket, and a refusal has to be grounded in what Amazon S3 answered
+/// rather than assumed. A value that names no bucket to ask about is refused by the
+/// FORM check the same request already passes through
+/// ([`validate_destination_property_forms`]), so it is not this refusal either.
+pub async fn destination_resource_is_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    destination_arn: &str,
+) -> bool {
+    let Some(bucket) = destination_bucket(destination_arn) else {
+        return false;
+    };
+    // The Region decides nothing about which store answers — the emulator serves one
+    // — so a scope carrying no Region label falls back to the default rather than
+    // putting caller text in the client's authority.
+    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
+    let answer = ::service_common::s3_client::s3_client(ctx.callback(), region)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await;
+    match answer {
+        // Amazon S3 holds the bucket.
+        Ok(_) => false,
+        Err(error) => {
+            // What the object store's refusal ESTABLISHED, read by the one shared
+            // reading of such an answer: only the store itself saying it holds
+            // nothing there is the absent resource this refuses on.
+            let read = ::service_common::s3_object_read::answered_refusal(&error);
+            read == ::service_common::s3_object_read::ObjectRead::Absent
+        }
+    }
+}

@@ -19,10 +19,11 @@
 //! 3. `MaxResults`/`NextToken` page that ordered list: whatever the page size, each
 //!    investigation appears exactly once, in the unpaged order, and only the last page
 //!    carries no `NextToken`.
-//! 4. A `DetectorId` the account/Region does not hold is an AUTHORIZATION failure
-//!    (HTTP 403), a value that cannot be a `DetectorId` at all is a parameter failure
-//!    (HTTP 400) — never an empty page; so are a sort attribute the model does not
-//!    carry and a `NextToken` the service never issued.
+//! 4. A `DetectorId` the account/Region does not hold is the DETECTOR family's
+//!    ownership refusal and a value that cannot be a `DetectorId` at all is a
+//!    parameter failure — both the service's HTTP 400 — never an empty page; so are
+//!    a sort attribute the model does not carry and a `NextToken` the service never
+//!    issued.
 //! 5. The operation is served exactly through the Regions its documentation lists.
 //! 6. Listing is a REPORT: it never moves an investigation's status early and never
 //!    changes what a later list or read sees; the only transition it materialises is
@@ -33,10 +34,11 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
+    call, call_in, error_code, investigation_detector, investigation_detector_in, new_router,
+    Router, ABSENT_DETECTOR_ID,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    investigation_sort_fields, INVESTIGATION_REGIONS, INVESTIGATION_TRANSITION_MILLIS,
+    investigation_sort_fields, INVESTIGATION_REGIONS,
 };
 
 /// The `InvestigationStatus` members a listed investigation can be in here: it starts
@@ -48,10 +50,10 @@ const FAILED: &str = "FAILED";
 /// The `OrderBy` members, `ASC | DESC` (`smithy_query(shape="OrderBy")`).
 const ORDERS: [&str; 2] = ["ASC", "DESC"];
 
-/// Long enough for the clock to owe the terminal status, plus slack.
-fn past_the_transition() -> std::time::Duration {
-    std::time::Duration::from_millis(INVESTIGATION_TRANSITION_MILLIS as u64 + 250)
-}
+/// How long a poll waits for the terminal status the clock owes an investigation
+/// before the test gives up: deliberately generous, since what decides the test is
+/// the CONDITION the poll looks for and not how fast the host runs.
+const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn list(router: &Router, detector_id: &str, body: Value) -> (u16, Value) {
     call(
@@ -129,16 +131,41 @@ fn ids(summaries: &[Value]) -> Vec<String> {
     summaries.iter().map(id_of).collect()
 }
 
+/// Read each of `investigation_ids` until it reports the terminal status the CLOCK
+/// owes it, or fail once [`SETTLE_DEADLINE`] has passed.
+///
+/// The transition is due a fixed span after the create
+/// (`state::INVESTIGATION_TRANSITION_MILLIS`), so this waits for the condition
+/// rather than for a duration: a slower or busier host takes more attempts, not a
+/// different outcome. Each attempt is an ordinary read over the in-process wire, so
+/// the loop also proves that reading settles nothing early.
+async fn settled(router: &Router, detector_id: &str, investigation_ids: &[String]) {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    for id in investigation_ids {
+        loop {
+            let got = read(router, detector_id, id).await;
+            if got["status"] != json!(RUNNING) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{id} never left {RUNNING} within {SETTLE_DEADLINE:?}, last read {got:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 /// A detector holding investigations in BOTH statuses: the first batch has had the
 /// clock owe it its terminal status, the second has not. That spans what the sort keys
 /// can carry — a present and an absent `EndTime`, two different `Status` values.
 async fn detector_with_mixed_investigations(router: &Router) -> (String, Vec<String>) {
-    let detector_id = enabled_detector(router).await;
+    let detector_id = investigation_detector(router).await;
     let mut created = Vec::new();
     for n in 1..=3 {
         created.push(initiated(router, &detector_id, &format!("settled {n}")).await);
     }
-    tokio::time::sleep(past_the_transition()).await;
+    settled(router, &detector_id, &created).await;
     for n in 1..=3 {
         created.push(initiated(router, &detector_id, &format!("running {n}")).await);
     }
@@ -156,7 +183,7 @@ async fn a_list_reports_exactly_the_persisted_investigations() {
     // A detector that holds none reports an empty list — not absent, not canned.
     // Its own router: GuardDuty allows one detector per account per Region.
     let empty_router = new_router();
-    let empty_detector = enabled_detector(&empty_router).await;
+    let empty_detector = investigation_detector(&empty_router).await;
     assert_eq!(
         listed(&empty_router, &empty_detector, json!({})).await,
         Vec::<Value>::new(),
@@ -437,13 +464,12 @@ const MALFORMED_DETECTOR_IDS: [(&str, &str); 4] = [
 #[tokio::test]
 async fn a_list_over_an_unresolvable_detector_is_refused_not_emptied() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     initiated(&router, &detector_id, "a real investigation").await;
 
-    // A well-formed id this account/Region does not hold: the caller's permission on
-    // it is decided before it is resolved, so the answer says nothing about whether it
-    // names anything. Case is not significant in the FORM, so an upper-cased id is
-    // well formed too and is denied the same way.
+    // A well-formed id this account/Region does not hold: the DETECTOR family's own
+    // ownership refusal, the service's HTTP 400. Case is not significant in the FORM,
+    // so an upper-cased id is well formed too and is refused the same way.
     for (absent, case) in [
         (ABSENT_DETECTOR_ID, "a well-formed id nothing minted"),
         (
@@ -453,12 +479,12 @@ async fn a_list_over_an_unresolvable_detector_is_refused_not_emptied() {
     ] {
         let (status, denied) = list(&router, absent, json!({})).await;
         assert_eq!(
-            status, 403,
-            "list over {case}: expected 403, got {status} {denied:?}"
+            status, 400,
+            "list over {case}: expected 400, got {status} {denied:?}"
         );
         assert_eq!(
             error_code(&denied),
-            "AccessDeniedException",
+            "InvalidInputException",
             "list over {case}: got {denied:?}"
         );
     }
@@ -477,15 +503,15 @@ async fn a_list_over_an_unresolvable_detector_is_refused_not_emptied() {
     assert_eq!(status, 200, "delete-detector: got {status} {body:?}");
     let (status, denied) = list(&router, &detector_id, json!({})).await;
     assert_eq!(
-        status, 403,
-        "list after the detector was deleted: expected 403, got {status} {denied:?}"
+        status, 400,
+        "list after the detector was deleted: expected 400, got {status} {denied:?}"
     );
 }
 
 #[tokio::test]
 async fn an_unmodelled_sort_attribute_and_an_unissued_token_are_refused() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     for n in 1..=3 {
         initiated(&router, &detector_id, &format!("investigation {n}")).await;
     }
@@ -543,13 +569,7 @@ const REGIONS_WITHOUT_INVESTIGATIONS: [&str; 4] =
 async fn the_list_is_served_exactly_through_the_documented_regions() {
     for region in INVESTIGATION_REGIONS {
         let router = new_router();
-        let (status, created) =
-            call_in(&router, region, "POST", "/detector", Some(json!({"enable": true}))).await;
-        assert_eq!(
-            status, 200,
-            "create-detector in {region}: got {status} {created:?}"
-        );
-        let detector_id = created["detectorId"].as_str().unwrap_or_default().to_string();
+        let detector_id = investigation_detector_in(&router, region).await;
 
         let (status, body) = call_in(
             &router,
@@ -621,7 +641,7 @@ async fn the_list_is_served_exactly_through_the_documented_regions() {
 #[tokio::test]
 async fn listing_never_moves_an_investigation_early_and_agrees_with_a_read() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     let id = initiated(&router, &detector_id, "summarize suspicious IAM activity").await;
 
     // The transient status is observable: the span is never zero, so a list straight
@@ -652,7 +672,7 @@ async fn listing_never_moves_an_investigation_early_and_agrees_with_a_read() {
         "a read after the lists must still report the transient status"
     );
 
-    tokio::time::sleep(past_the_transition()).await;
+    settled(&router, &detector_id, std::slice::from_ref(&id)).await;
 
     // Once the clock owes it, the list reports the terminal status — and so does the
     // read, with the same instants: one record, settled once.
@@ -671,10 +691,11 @@ async fn listing_never_moves_an_investigation_early_and_agrees_with_a_read() {
     }
 
     // And it never moves again: the terminal status is stable across later lists.
-    tokio::time::sleep(past_the_transition()).await;
-    let again = listed(&router, &detector_id, json!({})).await;
-    assert_eq!(
-        again, settled,
-        "a terminal investigation must never move again, got {again:?} after {settled:?}"
-    );
+    for attempt in 1..=3 {
+        let again = listed(&router, &detector_id, json!({})).await;
+        assert_eq!(
+            again, settled,
+            "attempt {attempt}: a terminal investigation must never move again, got {again:?} after {settled:?}"
+        );
+    }
 }

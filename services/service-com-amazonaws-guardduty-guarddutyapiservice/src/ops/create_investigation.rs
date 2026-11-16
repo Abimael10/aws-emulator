@@ -8,9 +8,11 @@
 //!
 //! * the feature is available only through the Regions the doc lists
 //!   ([`crate::state::INVESTIGATION_REGIONS`]);
-//! * `DetectorId` must name a detector this account/Region holds;
-//! * "the AI_ANALYST feature must be enabled on your detector", else the call is DENIED
-//!   with HTTP 403;
+//! * `DetectorId` must name a detector this account/Region holds, else the request is
+//!   refused as the unusable input it is (HTTP 400), the way every other
+//!   detector-scoped operation of this service refuses one;
+//! * "the AI_ANALYST feature must be enabled on your detector", else the request is
+//!   refused as an unacceptable input (HTTP 400);
 //! * the preview limits — 10 investigations per account per day, 100 in total — refuse a
 //!   create past either one;
 //! * `ClientToken` is `@idempotencyToken`, so a replayed create returns the investigation
@@ -228,10 +230,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To use this operation, the AI_ANALYST feature must be enabled on your
         // detector" (`smithy_query(query="doc",shape="CreateInvestigation")`): a
-        // detector without it is not entitled to the operation, which is the 403
-        // the model declares, not a 400.
+        // prerequisite the REQUEST does not meet, which is the service's
+        // unacceptable-input refusal (HTTP 400 under the `InvalidInputException`
+        // class) and not an authorization failure — the caller may make the call,
+        // the detector it names is simply not configured for it.
         if detector.feature_status(crate::state::FEATURE_AI_ANALYST) != crate::state::ENABLED {
-            return Err(access_denied(
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::INVESTIGATION_FEATURE_DENIED_MESSAGE,
             ));
         }
@@ -290,35 +294,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse a `DetectorId` the store does not resolve.
+/// Refuse a `DetectorId` the store does not resolve, through the ONE classification
+/// every detector-scoped operation of this service shares
+/// ([`crate::state::detector_id_rejection`]): a well-formed id this account and
+/// Region do not hold is the DETECTOR family's ownership refusal, a value that
+/// cannot be a `DetectorId` at all is a parameter failure, and both are the
+/// service's HTTP 400 under the `InvalidInputException` class.
 ///
-/// This operation declares `AccessDeniedException` (HTTP 403) beside
-/// `BadRequestException`, and the caller's PERMISSION on the detector is decided
-/// before the detector is resolved: an id the account/Region does not hold is
-/// answered as an authorization failure, which discloses nothing about whether the
-/// id names anything. A value that cannot be a `DetectorId` at all never named a
-/// resource to be authorized on, so it stays the parameter failure every operation
-/// in this service answers it with (HTTP 400).
+/// The operation's modelled `AccessDeniedException` (HTTP 403) answers an
+/// authorization decision about the CALLER — which is taken over the caller's own
+/// identity policies, not over whether an id resolves — so an id the store does not
+/// hold is not one.
 fn detector_rejection(detector_id: &str) -> CreateInvestigationError {
-    if crate::state::is_detector_id(detector_id) {
-        access_denied(crate::state::not_authorized_message(
-            crate::state::DETECTOR_ID_MEMBER,
-        ))
-    } else {
-        crate::scaffolded::Scaffolded::invalid_input(crate::state::invalid_parameter_message(
-            crate::state::DETECTOR_ID_MEMBER,
-        ))
-    }
-}
-
-/// Deny the request the way the model declares it: HTTP 403 `AccessDeniedException`,
-/// with `type` carrying the error class the body's `__type` discriminator also
-/// carries (`smithy_query(shape="AccessDeniedException")` — `Type` is "The error
-/// type").
-fn access_denied(message: impl Into<String>) -> CreateInvestigationError {
-    CreateInvestigationErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: Some(message.into()),
-        r#type: Some("AccessDeniedException".to_string()),
-    })
-    .into()
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }

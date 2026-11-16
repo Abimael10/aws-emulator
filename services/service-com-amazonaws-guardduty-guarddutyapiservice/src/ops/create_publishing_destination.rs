@@ -7,6 +7,12 @@
 //! ([`crate::state::VERIFICATION_DELAY_MILLIS`] after this call); a replayed
 //! `ClientToken` returns the destination the first call minted.
 //!
+//! "Before you start exporting the findings, the destination resource must exist"
+//! (this operation's own documentation), so the resource `destinationArn` names is
+//! resolved against the service that OWNS it before anything is written: a
+//! destination is never recorded pointing at a bucket Amazon S3 does not hold
+//! ([`crate::state::destination_resource_is_absent`]).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -157,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Refuse an unacceptable request before anything is written, so a rejected
-        // create leaves no destination behind. Both checks read the REQUEST only:
+        // create leaves no destination behind. These checks read the REQUEST only:
         // what the store holds does not change whether the input is acceptable.
         let destination_service =
             crate::state::validate_destination_type(&input.destination_type).map_err(bad_request)?;
@@ -167,6 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(bad_request)?;
 
+        let region = crate::state::request_region(ctx);
+        // "Before you start exporting the findings, the destination resource must
+        // exist" (`smithy_query(query="doc",shape="CreatePublishingDestination")`):
+        // the resource belongs to another service, so it is resolved where that
+        // service holds it. Asked here, with no lock held — the answer is about the
+        // REQUEST, like the two checks above, and a destination is never recorded
+        // for a resource that is not there.
+        if crate::state::destination_resource_is_absent(ctx, &region, &destination_arn).await {
+            return Err(bad_request(
+                crate::state::DESTINATION_RESOURCE_ABSENT_MESSAGE,
+            ));
+        }
+
         // The per-resource tag ceiling holds however the tags arrive, so a create
         // carrying more of them than a resource may hold is refused here rather
         // than storing a resource past the limit
@@ -175,7 +194,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(message));
         }
 
-        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
         // `ClientToken` is `@idempotencyToken`

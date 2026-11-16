@@ -339,6 +339,18 @@ pub fn validate_destination_type(destination_type: &str) -> Result<&'static str,
         })
 }
 
+/// The message GuardDuty refuses a `kmsKeyArn` it cannot use with: AWS's own
+/// published wording for that parameter, naming the member in the words AWS uses
+/// for it rather than the request's dotted wire path, and interpolating nothing.
+///
+/// It answers EVERY value the service cannot encrypt published findings with — one
+/// the create left out, an empty one, and one that is not a KMS key ARN — because
+/// each of them is the parameter carrying no value the service can use: the caller
+/// is told the value is not valid rather than that it is missing, so it looks at
+/// the key it supplied instead of supplying it again.
+pub const KMS_KEY_NOT_VALID_MESSAGE: &str =
+    "The request failed because the value specified for the kmsKeyArn parameter is not valid.";
+
 /// Refuse a `DestinationProperties` this service cannot accept, returning the
 /// destination and KMS key ARNs it validated, or the message the refusal carries.
 ///
@@ -365,11 +377,14 @@ pub fn validate_destination_properties(
         .filter(|arn| !arn.is_empty())
         .ok_or_else(|| missing_parameter_message(DESTINATION_ARN_MEMBER))?
         .to_string();
+    // A `kmsKeyArn` the create cannot encrypt with is reported as the parameter's
+    // VALUE not being valid, whether the request left it out or supplied something
+    // unusable ([`KMS_KEY_NOT_VALID_MESSAGE`]).
     let kms_key_arn = properties
         .kms_key_arn
         .as_deref()
         .filter(|arn| !arn.is_empty())
-        .ok_or_else(|| missing_parameter_message(KMS_KEY_ARN_MEMBER))?
+        .ok_or_else(|| KMS_KEY_NOT_VALID_MESSAGE.to_string())?
         .to_string();
     // Both members the create cannot do without are present, so what is left is
     // the FORM of each value supplied — the same rule, for the same members, that
@@ -405,7 +420,10 @@ pub fn validate_destination_property_forms(
     }
     if let Some(kms_key_arn) = properties.kms_key_arn.as_deref() {
         if !is_arn_for(KMS_SERVICE, kms_key_arn) {
-            return Err(invalid_parameter_message(KMS_KEY_ARN_MEMBER));
+            // The same sentence an absent key gets: what the caller is told is
+            // that the value this parameter carries is not one the service can
+            // encrypt with ([`KMS_KEY_NOT_VALID_MESSAGE`]).
+            return Err(KMS_KEY_NOT_VALID_MESSAGE.to_string());
         }
     }
     if let Some(owner) = properties.expected_bucket_owner.as_deref() {

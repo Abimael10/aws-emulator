@@ -107,6 +107,8 @@ mod findings_statistics;
 mod free_trial_days;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
+#[path = "all/investigation_api_gates.rs"]
+mod investigation_api_gates;
 #[path = "all/investigation_clock_coupling.rs"]
 mod investigation_clock_coupling;
 #[path = "all/investigation_cloud_environment.rs"]
@@ -257,6 +259,8 @@ mod publishing_destination_delete;
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]
 mod publishing_destination_listing;
+#[path = "all/publishing_destination_property_refusals.rs"]
+mod publishing_destination_property_refusals;
 #[path = "all/publishing_destination_update.rs"]
 mod publishing_destination_update;
 #[path = "all/read_response_member_sets.rs"]

@@ -29,9 +29,9 @@
 //!    request is signed for. A delete addressed through another Region's endpoint, or
 //!    under another detector's id, is refused and writes nothing.
 //! 4. A refusal is the classified HTTP 400 every id rejection on this service carries —
-//!    the `BadRequestException` envelope, the `InvalidInputException` class, the fixed
-//!    sentence the refused resource family and operation class answer with (a WRITE
-//!    says no such destination exists, the describe reports an unusable input
+//!    the `BadRequestException` envelope, the `InvalidInputException` class, the ONE
+//!    fixed sentence this resource family answers a destination id it cannot resolve
+//!    with (the delete and the describe word it alike, reporting an unusable input
 //!    parameter) and never the caller's value — and persists nothing.
 //!
 //! The rows span what the rule generalises over: the stored destination's PROPERTIES
@@ -45,9 +45,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DESTINATION_ABSENT_MESSAGE, DESTINATION_ID_MEMBER, DESTINATION_NOT_FOUND_MESSAGE,
-    DETECTOR_ID_MEMBER, PENDING_VERIFICATION, PUBLISHING,
-    PUBLISHING_DESTINATIONS_PER_DETECTOR, VERIFICATION_DELAY_MILLIS,
+    DESTINATION_ID_MEMBER, DESTINATION_NOT_FOUND_MESSAGE, DETECTOR_ID_MEMBER,
+    PENDING_VERIFICATION, PUBLISHING, PUBLISHING_DESTINATIONS_PER_DETECTOR,
+    VERIFICATION_DELAY_MILLIS,
 };
 
 use crate::client_rejections::{invalid_parameter, not_owned};
@@ -381,7 +381,7 @@ async fn a_delete_drops_exactly_the_destination_it_names() {
             &format!("{case}: an update after the delete"),
             status,
             &refused,
-            DESTINATION_ABSENT_MESSAGE,
+            DESTINATION_NOT_FOUND_MESSAGE,
             &victim,
         );
         let (status, refused) = delete(&router, &detector_id, &victim).await;
@@ -389,7 +389,7 @@ async fn a_delete_drops_exactly_the_destination_it_names() {
             &format!("{case}: a second delete"),
             status,
             &refused,
-            DESTINATION_ABSENT_MESSAGE,
+            DESTINATION_NOT_FOUND_MESSAGE,
             &victim,
         );
 
@@ -664,7 +664,7 @@ async fn a_delete_reaches_only_the_detector_and_region_it_names() {
         "a delete of a destination another detector holds",
         status,
         &refused,
-        DESTINATION_ABSENT_MESSAGE,
+        DESTINATION_NOT_FOUND_MESSAGE,
         &away_destination,
     );
 
@@ -733,21 +733,21 @@ async fn a_delete_of_something_the_store_does_not_hold_is_refused() {
             detector_id.clone(),
             ABSENT_DESTINATION_ID.to_string(),
             DESTINATION_ID_MEMBER,
-            DESTINATION_ABSENT_MESSAGE.to_string(),
+            DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a destination id that is not one at all",
             detector_id.clone(),
             "not-a-destination-id".to_string(),
             DESTINATION_ID_MEMBER,
-            DESTINATION_ABSENT_MESSAGE.to_string(),
+            DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "the stored destination id upper-cased",
             detector_id.clone(),
             destination_id.to_uppercase(),
             DESTINATION_ID_MEMBER,
-            DESTINATION_ABSENT_MESSAGE.to_string(),
+            DESTINATION_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 

@@ -146,6 +146,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
+        // The same rule the create is held to: a destination's resource "must
+        // exist" (`smithy_query(query="doc",shape="CreatePublishingDestination")`),
+        // so an update that points the destination at another resource is refused
+        // unless the service that owns that resource holds it
+        // ([`crate::state::destination_resource_is_absent`]). Asked with no lock
+        // held, before the store is reached, and only for a `destinationArn` this
+        // request actually carries — a member it omits is not being written.
+        if let Some(destination_arn) = input
+            .destination_properties
+            .as_ref()
+            .and_then(|properties| properties.destination_arn.as_deref())
+            .filter(|arn| !arn.is_empty())
+        {
+            if crate::state::destination_resource_is_absent(ctx, &region, destination_arn).await {
+                return Err(bad_request(
+                    crate::state::DESTINATION_RESOURCE_ABSENT_MESSAGE,
+                ));
+            }
+        }
         let mut state = state.lock();
 
         // Resolve the destination and refuse an unacceptable request BEFORE anything
@@ -165,11 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(destination) = detector.publishing_destinations.get(&input.destination_id)
             else {
-                // The one fixed refusal a WRITE on this family answers a
-                // `DestinationId` it cannot resolve with
-                // ([`crate::state::DESTINATION_ABSENT_MESSAGE`]): the destination is
-                // not there, where the describe reports a bad input parameter.
-                return Err(bad_request(crate::state::DESTINATION_ABSENT_MESSAGE));
+                // The ONE fixed refusal this family answers a `DestinationId` it
+                // cannot resolve with
+                // ([`crate::state::DESTINATION_NOT_FOUND_MESSAGE`]): the same
+                // sentence the describe and the delete answer.
+                return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
             };
             let destination_service =
                 crate::state::validate_destination_type(&destination.destination_type)
@@ -214,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable: the same two lookups resolved above under the same lock.
             // The branch is kept rather than unwrapped so a lookup that ever stops
             // resolving answers the caller's own refusal instead of panicking.
-            return Err(bad_request(crate::state::DESTINATION_ABSENT_MESSAGE));
+            return Err(bad_request(crate::state::DESTINATION_NOT_FOUND_MESSAGE));
         };
         // Materialise the verification the clock already made due before this call's
         // own change is applied, so an update neither skips it nor replays it.

@@ -69,16 +69,20 @@ pub const INVESTIGATION_REGION_MESSAGE: &str =
     "The request is rejected because GuardDuty Investigation is not available in the current Region.";
 
 /// The message `GetInvestigation` answers an `InvestigationId` this detector does
-/// not hold with. GuardDuty does not echo the caller's id back, so this names the
-/// resource class only.
-pub const INVESTIGATION_NOT_FOUND_MESSAGE: &str =
-    "The request is rejected because the requested investigation could not be found.";
+/// not hold with: the Investigation family's own not-found sentence, a short fixed
+/// text naming neither the operation, nor the member that carried the id, nor the
+/// id itself — GuardDuty does not echo the caller's id back.
+pub const INVESTIGATION_NOT_FOUND_MESSAGE: &str = "Resource not found.";
 
-/// The message `CreateInvestigation` is denied with when the detector does not
-/// have the AI_ANALYST feature enabled — the feature the operation requires
+/// The message `CreateInvestigation` refuses a detector that does not have the
+/// AI_ANALYST feature enabled with — "to use this operation, the AI_ANALYST feature
+/// must be enabled on your detector"
 /// (`smithy_query(query="doc",shape="CreateInvestigation")`).
+///
+/// Entirely FIXED text, naming no account and no detector: it states the
+/// prerequisite and how to meet it, and nothing of the request is interpolated.
 pub const INVESTIGATION_FEATURE_DENIED_MESSAGE: &str =
-    "The request is rejected because the AI_ANALYST feature is not enabled for the detector.";
+    "The request is rejected because the AI Analyst feature is not enabled for the delegated administrator account. Enable the AI_ANALYST feature on your delegated administrator's detector to use the Investigation API.";
 
 /// The message a request past the documented per-day investigation limit is
 /// refused with.

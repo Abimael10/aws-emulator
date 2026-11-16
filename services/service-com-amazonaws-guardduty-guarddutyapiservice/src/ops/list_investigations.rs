@@ -273,26 +273,15 @@ fn investigation_summary(
     }
 }
 
-/// Refuse a `DetectorId` the store does not resolve, the way this operation's own
-/// error set classifies it: the caller's PERMISSION on the detector is decided before
-/// the detector is resolved, so a well-formed id the account/Region does not hold is
-/// denied with HTTP 403 `AccessDeniedException` and discloses nothing about whether it
-/// names anything, while a value that cannot be a `DetectorId` at all stays the HTTP
-/// 400 parameter failure — the classification `GetInvestigation` also answers with.
+/// Refuse a `DetectorId` the store does not resolve, through the ONE classification
+/// every detector-scoped operation of this service shares
+/// ([`crate::state::detector_id_rejection`]): a well-formed id this account and
+/// Region do not hold is the DETECTOR family's ownership refusal, a value that
+/// cannot be a `DetectorId` at all is a parameter failure, and both are the
+/// service's HTTP 400 under the `InvalidInputException` class — the classification
+/// `CreateInvestigation` and `GetInvestigation` also answer with.
 fn detector_rejection(detector_id: &str) -> ListInvestigationsError {
-    if crate::state::is_detector_id(detector_id) {
-        ListInvestigationsErrorModeled::AccessDeniedException(AccessDeniedException {
-            message: Some(crate::state::not_authorized_message(
-                crate::state::DETECTOR_ID_MEMBER,
-            )),
-            r#type: Some("AccessDeniedException".to_string()),
-        })
-        .into()
-    } else {
-        bad_request(crate::state::invalid_parameter_message(
-            crate::state::DETECTOR_ID_MEMBER,
-        ))
-    }
+    bad_request(crate::state::detector_id_rejection(detector_id))
 }
 
 /// Refuse a sort attribute that is not an `InvestigationSortField` member, naming the

@@ -383,7 +383,16 @@ struct Fixture {
 /// addresses — each through this service's own operations, signed as the account.
 async fn fixture(emulator: &Emulator) -> Fixture {
     let created = emulator
-        .call(ACCOUNT_KEY, "POST", "/detector", Some(&json!({"enable": true})))
+        .call(
+            ACCOUNT_KEY,
+            "POST",
+            "/detector",
+            // The Investigation API is in the table below, and it is served only to
+            // a detector that has ENABLED its opt-in AI_ANALYST feature, so the
+            // fixture's detector asks for it: what this suite judges is the
+            // AUTHORIZATION decision, not a feature prerequisite.
+            Some(&json!({"enable": true, "features": [{"name": "AI_ANALYST", "status": "ENABLED"}]})),
+        )
         .await;
     assert_eq!(
         created.status, 200,

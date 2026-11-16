@@ -31,7 +31,7 @@
 
 use serde_json::{json, Value};
 
-use crate::detector_lifecycle::{call, call_in, enabled_detector, new_router, Router};
+use crate::detector_lifecycle::{call, call_in, investigation_detector, new_router, Router};
 // The detector's own `UpdatedAt` is read through the helper the other timestamp suites
 // already share, so every suite sees that instant the same way.
 use crate::refused_create_clock::detector_updated_at;
@@ -148,7 +148,7 @@ async fn initiating_an_investigation_moves_the_detectors_updated_at() {
         // A router and a detector per row, so a row cannot pass on another row's
         // write.
         let router = new_router();
-        let detector_id = enabled_detector(&router).await;
+        let detector_id = investigation_detector(&router).await;
         let collection = format!("/detector/{detector_id}/investigation");
 
         let before = read_detector(&router, &detector_id, case).await;
@@ -307,7 +307,7 @@ async fn initiating_an_investigation_moves_the_detectors_updated_at() {
 #[tokio::test]
 async fn each_investigation_initiated_on_one_detector_moves_the_instant_again() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     let collection = format!("/detector/{detector_id}/investigation");
 
     let mut previous = detector_updated_at(&router, &detector_id, "the fresh detector").await;

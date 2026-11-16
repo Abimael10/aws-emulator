@@ -15,9 +15,9 @@
 //!    fixed sentence the service words for THAT resource family and operation class,
 //!    with nothing of the request interpolated into it: the uploaded lists (an IPSet,
 //!    a threat list) and a filter READ say no such resource was found, the mutating
-//!    filter paths say the given filter name is invalid, a publishing-destination read
-//!    reports an unusable input parameter while a write says no such destination
-//!    exists, a Malware Protection plan says the plan was not found, and a findings
+//!    filter paths say the given filter name is invalid, the publishing-destination
+//!    operations report an unusable input parameter, a Malware Protection plan says
+//!    the plan was not found, and a findings
 //!    write says an invalid finding identifier was specified.
 //! 2. The account-ownership sentence is the DETECTOR family's own refusal: it answers
 //!    a `detectorId` this account and Region do not hold, and no other family's
@@ -59,13 +59,10 @@ const NO_SUCH_RESOURCE: &str = "The request is rejected since no such resource f
 /// What the mutating filter paths answer for a name they cannot act on.
 const INVALID_FILTER_NAME: &str = "The request is rejected because the given filter name is invalid.";
 
-/// What a publishing-destination READ answers for a destination id that names nothing.
+/// What a publishing-destination operation answers for a destination id that names
+/// nothing — the read and the two writes alike.
 const INVALID_INPUT_PARAMETERS: &str =
     "The request is rejected because the one or more input parameters have invalid values.";
-
-/// What a publishing-destination WRITE answers for the same.
-const DESTINATION_ABSENT: &str =
-    "The request failed because no publishingDestination exists with the provided publishingDestinationId.";
 
 /// What the Malware Protection plan operations answer for a plan id this account and
 /// Region do not hold — absent and foreign collapsed into one wording.
@@ -541,8 +538,8 @@ async fn each_family_words_its_own_absent_resource_refusal() {
         });
     }
 
-    // The publishing-destination family: the READ reports an unusable parameter, the
-    // WRITES report a destination that does not exist.
+    // The publishing-destination family: the read and the two writes all report an
+    // unusable input parameter.
     for (id, why) in [
         (stored.destination.clone(), "an id whose delete was accepted"),
         (ABSENT_ID.to_string(), "an id no create minted"),
@@ -567,7 +564,7 @@ async fn each_family_words_its_own_absent_resource_refusal() {
             })),
             status: 400,
             class: INVALID_INPUT,
-            expected: DESTINATION_ABSENT,
+            expected: INVALID_INPUT_PARAMETERS,
             sent: id.clone(),
         });
         rows.push(Row {
@@ -577,7 +574,7 @@ async fn each_family_words_its_own_absent_resource_refusal() {
             body: None,
             status: 400,
             class: INVALID_INPUT,
-            expected: DESTINATION_ABSENT,
+            expected: INVALID_INPUT_PARAMETERS,
             sent: id.clone(),
         });
     }

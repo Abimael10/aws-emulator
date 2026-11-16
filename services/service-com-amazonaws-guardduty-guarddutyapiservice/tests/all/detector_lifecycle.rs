@@ -242,6 +242,45 @@ pub(crate) async fn enabled_detector(router: &Router) -> String {
         .to_string()
 }
 
+/// The `features` entry that switches the Investigation API's own feature ON.
+///
+/// AI Analyst is OPT-IN (`state::OPT_IN_FEATURES`): a detector created without it
+/// is refused the Investigation API and told to enable the feature, so a suite that
+/// initiates an investigation asks for it in the create.
+pub(crate) fn ai_analyst_features() -> Value {
+    json!([{"name": "AI_ANALYST", "status": "ENABLED"}])
+}
+
+/// [`enabled_detector`], with the AI_ANALYST feature switched on, for the suites
+/// that drive the Investigation API.
+pub(crate) async fn investigation_detector(router: &Router) -> String {
+    investigation_detector_in(router, DEFAULT_SIGNING_REGION).await
+}
+
+/// [`investigation_detector`] created through `region`'s endpoint.
+pub(crate) async fn investigation_detector_in(router: &Router, region: &str) -> String {
+    let (status, body) = call_in(
+        router,
+        region,
+        "POST",
+        "/detector",
+        Some(json!({"enable": true, "features": ai_analyst_features()})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "create-detector in {region}: expected 200, got {status} {body:?}"
+    );
+    body["detectorId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create-detector in {region}: expected a detectorId, got {body:?}"))
+        .to_string()
+}
+
+/// The Region [`AUTH`] signs for, and so the one [`call`] and [`enabled_detector`]
+/// address.
+pub(crate) const DEFAULT_SIGNING_REGION: &str = "us-east-1";
+
 /// The `RuleId`s GuardDuty publishes, read over the wire through
 /// `ListCustomDetectionRules` (`POST /custom-detection-rule/rule` —
 /// `smithy_query(operation="ListCustomDetectionRules")`), so a suite spanning the
@@ -668,13 +707,17 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
 
     // "When you don't specify any features, with an exception to RUNTIME_MONITORING,
     // all the optional features are enabled by default." Runtime Monitoring is that
-    // ONE exception — see `crate::detector_data_sources_projection` for the default
-    // feature set as a whole.
-    assert_eq!(
-        feature_status(&before, "RUNTIME_MONITORING"),
-        "DISABLED",
-        "RUNTIME_MONITORING is opt-in, so a bare create leaves it off: got {before:?}"
-    );
+    // documented exception, and AI Analyst is the other opt-in one — the
+    // Investigation API tells a caller to enable it on the detector — see
+    // `crate::detector_data_sources_projection` for the default feature set as a
+    // whole.
+    for feature in ["RUNTIME_MONITORING", "AI_ANALYST"] {
+        assert_eq!(
+            feature_status(&before, feature),
+            "DISABLED",
+            "feature {feature} is opt-in, so a bare create leaves it off: got {before:?}"
+        );
+    }
     for feature in [
         "S3_DATA_EVENTS",
         "EKS_AUDIT_LOGS",
@@ -683,7 +726,6 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
         "LAMBDA_NETWORK_LOGS",
         "EKS_RUNTIME_MONITORING",
         "AI_PROTECTION",
-        "AI_ANALYST",
     ] {
         assert_eq!(
             feature_status(&before, feature),

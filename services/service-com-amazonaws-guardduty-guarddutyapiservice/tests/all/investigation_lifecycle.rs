@@ -23,11 +23,14 @@
 //!    the first call initiated, a different token initiates another.
 //! 4. The operation is gated on the detector's AI_ANALYST feature — "To use this
 //!    operation, the AI_ANALYST feature must be enabled on your detector" — so the
-//!    stored feature decides the call, whichever call switched it.
-//! 5. A `DetectorId` the account/Region does not hold is an AUTHORIZATION failure
-//!    (HTTP 403 `AccessDeniedException`, disclosing nothing about whether it names
-//!    anything), a value that cannot be a `DetectorId` at all is a parameter failure
-//!    (HTTP 400), and an `InvestigationId` an authorized detector does not hold is
+//!    stored feature decides the call, whichever call switched it, and a detector
+//!    without it is refused as an unacceptable input (HTTP 400) in the service's
+//!    fixed sentence for that prerequisite.
+//! 5. A `DetectorId` the account/Region does not hold is the DETECTOR family's
+//!    ownership refusal and a value that cannot be a `DetectorId` at all is a
+//!    parameter failure — both the service's HTTP 400 under the
+//!    `InvalidInputException` class, as on every other detector-scoped operation —
+//!    and an `InvestigationId` the detector does not hold is
 //!    `ResourceNotFoundException` (HTTP 404).
 //! 6. The feature is served exactly through the Regions its documentation lists.
 //! 7. The documented preview limit — 10 investigations per account per day — refuses
@@ -36,11 +39,13 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call, call_in, create_detector, enabled_detector, error_code, new_router, Router,
+    call, call_in, create_detector, error_code, investigation_detector,
+    investigation_detector_in, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
+use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    INVESTIGATIONS_PER_DAY, INVESTIGATION_REGIONS, INVESTIGATION_TRANSITION_MILLIS,
+    INVESTIGATIONS_PER_DAY, INVESTIGATION_REGIONS,
 };
 
 /// The status a fresh investigation reports, and the one it reaches once the clock
@@ -49,10 +54,10 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
 const RUNNING: &str = "RUNNING";
 const FAILED: &str = "FAILED";
 
-/// Long enough for the clock to owe the terminal status, plus slack.
-fn past_the_transition() -> std::time::Duration {
-    std::time::Duration::from_millis(INVESTIGATION_TRANSITION_MILLIS as u64 + 250)
-}
+/// How long a poll waits for the terminal status the clock owes an investigation
+/// before the test gives up: deliberately generous, since what decides the test is
+/// the CONDITION the poll looks for and not how fast the host runs.
+const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn create_investigation(router: &Router, detector_id: &str, body: Value) -> (u16, Value) {
     call(
@@ -104,6 +109,29 @@ async fn read(router: &Router, detector_id: &str, investigation_id: &str) -> Val
     body["investigation"].clone()
 }
 
+/// Read the investigation until it reports the terminal status the CLOCK owes it,
+/// or fail once [`SETTLE_DEADLINE`] has passed.
+///
+/// The transition is due a fixed span after the create
+/// (`state::INVESTIGATION_TRANSITION_MILLIS`), so this waits for the condition
+/// rather than for a duration: a slower or busier host takes more attempts, not a
+/// different outcome. Each attempt is an ordinary read over the in-process wire, so
+/// the loop also proves that reading does not settle the investigation early.
+async fn settled(router: &Router, detector_id: &str, investigation_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let got = read(router, detector_id, investigation_id).await;
+        if got["status"] != json!(RUNNING) {
+            return got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the investigation never left {RUNNING} within {SETTLE_DEADLINE:?}, last read {got:?}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rule 1: what a create stored is what a read reports.
 // ---------------------------------------------------------------------------
@@ -143,7 +171,7 @@ fn prompt_rows() -> Vec<(String, &'static str)> {
 #[tokio::test]
 async fn an_investigation_reports_back_everything_the_create_stored() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     let account = engine::emulator_account_id();
 
     let mut seen: Vec<String> = Vec::new();
@@ -209,7 +237,7 @@ async fn an_investigation_reports_back_everything_the_create_stored() {
 #[tokio::test]
 async fn an_investigation_settles_only_once_the_clock_owes_it() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     let id = initiated(&router, &detector_id, "summarize suspicious IAM activity").await;
 
     // The transient status is observable: the span is never zero, so a caller
@@ -232,9 +260,7 @@ async fn an_investigation_settles_only_once_the_clock_owes_it() {
         "reading an investigation must not change what a later read sees: first {fresh:?}, second {again:?}"
     );
 
-    tokio::time::sleep(past_the_transition()).await;
-
-    let settled = read(&router, &detector_id, &id).await;
+    let settled = settled(&router, &detector_id, &id).await;
     assert_eq!(
         settled["status"],
         json!(FAILED),
@@ -264,13 +290,15 @@ async fn an_investigation_settles_only_once_the_clock_owes_it() {
         "settling must not rewrite the stored prompt: got {settled:?}"
     );
 
-    // Terminal is terminal: a later read reports the same instant and status.
-    tokio::time::sleep(past_the_transition()).await;
-    let terminal = read(&router, &detector_id, &id).await;
-    assert_eq!(
-        terminal, settled,
-        "a terminal investigation never moves again: first {settled:?}, later {terminal:?}"
-    );
+    // Terminal is terminal: every later read reports the same instant and status,
+    // however many times it is asked.
+    for attempt in 1..=3 {
+        let terminal = read(&router, &detector_id, &id).await;
+        assert_eq!(
+            terminal, settled,
+            "attempt {attempt}: a terminal investigation never moves again: first {settled:?}, later {terminal:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +308,7 @@ async fn an_investigation_settles_only_once_the_clock_owes_it() {
 #[tokio::test]
 async fn a_replayed_client_token_returns_the_first_investigation() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
 
     // The rows differ in the SIZE and ALPHABET of the token: `ClientToken` is
     // `len 0..64` (`smithy_query(operation="CreateInvestigation")`), so both the
@@ -394,13 +422,18 @@ async fn the_stored_ai_analyst_feature_decides_the_call() {
         )
         .await;
         assert_eq!(
-            status, 403,
-            "case {case}: expected 403 without AI_ANALYST, got {status} {denied:?}"
+            status, 400,
+            "case {case}: expected 400 without AI_ANALYST, got {status} {denied:?}"
         );
         assert_eq!(
             error_code(&denied),
-            "AccessDeniedException",
-            "case {case}: expected AccessDeniedException, got {denied:?}"
+            "InvalidInputException",
+            "case {case}: expected InvalidInputException, got {denied:?}"
+        );
+        assert_eq!(
+            denied["message"].as_str(),
+            Some(state::INVESTIGATION_FEATURE_DENIED_MESSAGE),
+            "case {case}: expected the feature prerequisite sentence, got {denied:?}"
         );
 
         // Enabling the feature is all that changes, and the same call is accepted.
@@ -426,7 +459,7 @@ async fn the_stored_ai_analyst_feature_decides_the_call() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 5: how an id the caller is not authorized on, a malformed one and an
+// Rule 5: how a detectorId the account does not hold, a malformed one and an
 // absent sub-resource are each refused.
 // ---------------------------------------------------------------------------
 
@@ -445,14 +478,13 @@ const MALFORMED_DETECTOR_IDS: [(&str, &str); 4] = [
 ];
 
 #[tokio::test]
-async fn an_unauthorized_detector_is_denied_and_a_malformed_one_is_refused() {
+async fn a_foreign_detector_is_refused_and_a_malformed_one_is_refused() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
     let investigation_id = initiated(&router, &detector_id, "a real investigation").await;
 
-    // A well-formed id this account/Region does not hold: the caller's permission
-    // on it is decided before it is resolved, so the answer is 403 and says nothing
-    // about whether it names anything.
+    // A well-formed id this account/Region does not hold: the DETECTOR family's own
+    // ownership refusal, the service's HTTP 400, and it quotes nothing back.
     let created_elsewhere = create_investigation(
         &router,
         ABSENT_DETECTOR_ID,
@@ -465,23 +497,27 @@ async fn an_unauthorized_detector_is_denied_and_a_malformed_one_is_refused() {
         ("GetInvestigation", read_elsewhere),
     ] {
         assert_eq!(
-            status, 403,
-            "{operation} on a detector the account does not hold: expected 403, got {status} {body:?}"
+            status, 400,
+            "{operation} on a detector the account does not hold: expected 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
-            "AccessDeniedException",
+            "InvalidInputException",
             "{operation} on a detector the account does not hold: got {body:?}"
         );
         let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            state::not_owned_message(state::DETECTOR_ID_MEMBER),
+            "{operation} on a detector the account does not hold: got {message:?}"
+        );
         assert!(
             !message.contains(ABSENT_DETECTOR_ID),
-            "{operation}: a denial must not echo the caller's id, got {message:?}"
+            "{operation}: a refusal must not echo the caller's id, got {message:?}"
         );
     }
 
-    // A value that cannot be a detector id at all never named a resource to be
-    // authorized on: that is a parameter failure, HTTP 400.
+    // A value that cannot be a detector id at all is the parameter failure.
     for (malformed, case) in MALFORMED_DETECTOR_IDS {
         let (status, body) = create_investigation(
             &router,
@@ -511,7 +547,7 @@ async fn an_unauthorized_detector_is_denied_and_a_malformed_one_is_refused() {
         );
     }
 
-    // An `InvestigationId` the authorized detector does not hold is the modelled
+    // An `InvestigationId` the detector does hold nothing of is the modelled
     // 404 — the resource, not the permission, is what is missing. The rows are
     // values the member's `^[a-fA-F0-9\-]+$` pattern admits, so each reaches the
     // handler.
@@ -545,8 +581,8 @@ async fn an_unauthorized_detector_is_denied_and_a_malformed_one_is_refused() {
     assert_eq!(status, 200, "delete-detector: got {status} {body:?}");
     let (status, body) = get_investigation(&router, &detector_id, &investigation_id).await;
     assert_eq!(
-        status, 403,
-        "GetInvestigation after the detector was deleted: expected 403, got {status} {body:?}"
+        status, 400,
+        "GetInvestigation after the detector was deleted: expected 400, got {status} {body:?}"
     );
 }
 
@@ -565,13 +601,7 @@ async fn investigations_are_served_exactly_through_the_documented_regions() {
     // call ever used.
     for region in INVESTIGATION_REGIONS {
         let router = new_router();
-        let (status, created) =
-            call_in(&router, region, "POST", "/detector", Some(json!({"enable": true}))).await;
-        assert_eq!(
-            status, 200,
-            "create-detector in {region}: got {status} {created:?}"
-        );
-        let detector_id = created["detectorId"].as_str().unwrap_or_default().to_string();
+        let detector_id = investigation_detector_in(&router, region).await;
 
         let (status, body) = call_in(
             &router,
@@ -651,7 +681,7 @@ async fn investigations_are_served_exactly_through_the_documented_regions() {
 #[tokio::test]
 async fn the_documented_daily_limit_refuses_the_create_past_it() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
+    let detector_id = investigation_detector(&router).await;
 
     let mut ids: Vec<String> = Vec::new();
     for attempt in 1..=INVESTIGATIONS_PER_DAY {

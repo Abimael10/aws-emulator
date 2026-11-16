@@ -96,14 +96,15 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// Enable GuardDuty through `region`'s endpoint and return the detector's id.
+/// Enable GuardDuty through `region`'s endpoint, with the Investigation API's own
+/// opt-in feature switched on, and return the detector's id.
 async fn detector_in(router: &Router, region: &str, case: &str) -> String {
     let (status, body) = call_in(
         router,
         region,
         "POST",
         "/detector",
-        Some(json!({ "enable": true })),
+        Some(json!({ "enable": true, "features": crate::detector_lifecycle::ai_analyst_features() })),
     )
     .await;
     assert_eq!(

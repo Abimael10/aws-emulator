@@ -52,9 +52,11 @@ const GOVERNED_NODES: [(&str, &[&str], &str); 4] = [
 ];
 
 /// The optional features a bare create leaves DISABLED; every other reported
-/// feature starts ENABLED. Runtime Monitoring is the one exception `CreateDetector`
-/// documents to "all the optional features are enabled by default".
-const OPT_IN_FEATURES: [&str; 1] = ["RUNTIME_MONITORING"];
+/// feature starts ENABLED. Runtime Monitoring is the exception `CreateDetector`
+/// documents to "all the optional features are enabled by default", and AI Analyst
+/// is the one the Investigation API documents by telling a caller to enable it on
+/// the detector before using that API.
+const OPT_IN_FEATURES: [&str; 2] = ["RUNTIME_MONITORING", "AI_ANALYST"];
 
 /// The data sources GuardDuty always consumes: no `DetectorFeature` member and no
 /// `DataSourceConfigurations` member names them, so nothing can switch them off.

@@ -1527,13 +1527,23 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 /// The optional features a bare `CreateDetector` leaves DISABLED — the ones a
 /// detector reports only once a request asks for them.
 ///
-/// Runtime Monitoring is the ONE exception `CreateDetector` documents: "When you
-/// don't specify any features, with an exception to RUNTIME_MONITORING, all the
-/// optional features are enabled by default"
-/// (`smithy_query(query="doc",shape="CreateDetector")`). Every other configurable
-/// feature — RDS Protection included — is therefore enabled on a detector created
-/// without a `Features` list, and reports so under both views of its switch.
-pub const OPT_IN_FEATURES: [&str; 1] = [FEATURE_RUNTIME_MONITORING];
+/// Runtime Monitoring is the exception `CreateDetector` documents in those words:
+/// "When you don't specify any features, with an exception to RUNTIME_MONITORING,
+/// all the optional features are enabled by default"
+/// (`smithy_query(query="doc",shape="CreateDetector")`).
+///
+/// AI Analyst is the other one, and its own API says so: a detector that has not
+/// enabled it is refused the Investigation API and told to "enable the AI_ANALYST
+/// feature on your delegated administrator's detector to use the Investigation
+/// API" ([`INVESTIGATION_FEATURE_DENIED_MESSAGE`], the service's own wording for
+/// that refusal) — an instruction that has nothing to ask for on a detector where
+/// the create had already enabled the feature. So a detector created without a
+/// `Features` list holds it DISABLED, and only a request naming it switches it on.
+///
+/// Every other configurable feature — RDS Protection included — is enabled on a
+/// detector created without a `Features` list, and reports so under both views of
+/// its switch.
+pub const OPT_IN_FEATURES: [&str; 2] = [FEATURE_RUNTIME_MONITORING, FEATURE_AI_ANALYST];
 
 /// The three data sources GuardDuty always consumes for a detector — CloudTrail
 /// management events, VPC flow logs and DNS logs.
@@ -1693,18 +1703,14 @@ pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
 /// The wire name of the `DestinationId` member
 /// (`smithy_query(operation="DescribePublishingDestination")` renders it as the
-/// `destinationId` JSON name / URI label). The family's own absence refusals name no
-/// member ([`DESTINATION_NOT_FOUND_MESSAGE`], [`DESTINATION_ABSENT_MESSAGE`]).
+/// `destinationId` JSON name / URI label). The family's own absence refusal names no
+/// member ([`DESTINATION_NOT_FOUND_MESSAGE`]).
 pub const DESTINATION_ID_MEMBER: &str = "destinationId";
 
 /// The wire path of `DestinationProperties.DestinationArn`, as a rejection names
 /// it (`smithy_query(shape="DestinationProperties")` gives the members the JSON
 /// names `destinationArn`, `kmsKeyArn` and `expectedBucketOwner`).
 pub const DESTINATION_ARN_MEMBER: &str = "destinationProperties.destinationArn";
-
-/// The wire path of `DestinationProperties.KmsKeyArn`. See
-/// [`DESTINATION_ARN_MEMBER`].
-pub const KMS_KEY_ARN_MEMBER: &str = "destinationProperties.kmsKeyArn";
 
 /// The wire name of the `DestinationType` member
 /// (`smithy_query(operation="CreatePublishingDestination")`).
@@ -2383,25 +2389,18 @@ pub fn detector_id_rejection(detector_id: &str) -> String {
     minted_id_rejection(DETECTOR_ID_MEMBER, detector_id)
 }
 
-/// The message a publishing-destination READ refuses a `DestinationId` it cannot
-/// resolve with: `DescribePublishingDestination` reports a destination id that names
-/// nothing as an unusable input PARAMETER ([`INVALID_INPUT_PARAMETERS_MESSAGE`])
-/// rather than as an absent resource or a foreign one, and interpolates nothing — so
-/// the one sentence answers an id a delete removed and one that could never have been
-/// minted alike.
-pub const DESTINATION_NOT_FOUND_MESSAGE: &str = INVALID_INPUT_PARAMETERS_MESSAGE;
-
-/// The message the MUTATING publishing-destination paths refuse a `DestinationId`
-/// they cannot resolve with: a write says the destination is not there, where the
-/// read reports a bad parameter ([`DESTINATION_NOT_FOUND_MESSAGE`]) — the same
-/// read-versus-write split the filter family makes
-/// ([`NO_SUCH_RESOURCE_MESSAGE`] against [`INVALID_FILTER_NAME_MESSAGE`]).
+/// The message a publishing-destination operation refuses a `DestinationId` it
+/// cannot resolve with: GuardDuty reports a destination id that names nothing as an
+/// unusable input PARAMETER ([`INVALID_INPUT_PARAMETERS_MESSAGE`]) rather than as an
+/// absent resource or a foreign one, and interpolates nothing — so the one sentence
+/// answers an id a delete removed, one minted under another detector and one that
+/// could never have been minted alike.
 ///
-/// Fixed text: the sentence names the parameter in AWS's own words for this refusal,
-/// which is not the request's wire member name, and nothing of the caller's is
-/// interpolated into it.
-pub const DESTINATION_ABSENT_MESSAGE: &str =
-    "The request failed because no publishingDestination exists with the provided publishingDestinationId.";
+/// It is the sentence for the WHOLE family, the read and the two writes together:
+/// the recorded `DeletePublishingDestination` refusal of an id the detector does not
+/// hold carries exactly the text `DescribePublishingDestination`'s does, so the
+/// family does not word absence two ways.
+pub const DESTINATION_NOT_FOUND_MESSAGE: &str = INVALID_INPUT_PARAMETERS_MESSAGE;
 
 /// The wire name of the `FindingIds` member — `jsonName` `findingIds` on every
 /// operation that addresses findings by id

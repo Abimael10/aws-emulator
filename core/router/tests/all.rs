@@ -968,6 +968,8 @@ mod greengrass_deployment_target_resolution;
 mod greengrass_signing_name_routing;
 #[path = "all/guardduty_malware_protection_plan_role.rs"]
 mod guardduty_malware_protection_plan_role;
+#[path = "all/guardduty_publishing_destination_resource.rs"]
+mod guardduty_publishing_destination_resource;
 #[path = "all/guardduty_runtime_coverage.rs"]
 mod guardduty_runtime_coverage;
 #[path = "all/https_front_door_concurrent_pooled_producer.rs"]
