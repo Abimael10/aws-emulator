@@ -27,6 +27,11 @@
 //! * `ListAccountSettings$maxResults`, `DescribeCapacityProviders$maxResults` — "This value
 //!   can be between 1 and 10."
 //!
+//! A bound the REQUEST crosses is a fault of the request, so it is decided before the
+//! operation looks at anything a stored resource holds: a `RunTask` count outside its range
+//! earns the count sentence whatever capacity its cluster holds, which is what lets a client
+//! tell a count violation from the capacity refusal the same operation also answers.
+//!
 //! Nothing here reaches into the state struct: what a write left is read back through an
 //! implemented read.
 
@@ -311,5 +316,90 @@ async fn an_integer_outside_its_documented_range_is_refused_naming_the_bound_it_
     assert!(
         !string(&tasks[0], "taskArn", "the smallest task count").is_empty(),
         "case \"the smallest task count\": expected the placed task's ARN, got {placed}"
+    );
+}
+
+/// The sentence a placement into a cluster holding no registered capacity earns, which is
+/// what a run of an IN-RANGE count is refused with there — the refusal the count sentence
+/// has to come ahead of.
+const NO_CONTAINER_INSTANCES: &str = "No Container Instances were found in your cluster.";
+
+#[tokio::test]
+async fn a_count_outside_its_range_is_refused_before_the_clusters_capacity_is_considered() {
+    // A cluster with NO registered capacity, so the two refusals a run there can earn are
+    // both live: the count the request named is a fault of the REQUEST, decided before the
+    // placement looks for anywhere to run, so a count outside its range earns the count
+    // sentence whatever the cluster holds, and only a count inside it reaches the capacity.
+    let router = service();
+    let empty = "boundedempty";
+    ok(
+        &router,
+        "CreateCluster",
+        json!({ "clusterName": empty }),
+        "fixture",
+    )
+    .await;
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": FAMILY,
+            "containerDefinitions": [
+                container("app", "public.ecr.aws/nginx/nginx:latest"),
+            ],
+        }),
+        "fixture",
+    )
+    .await;
+
+    // The rows differ along which end of the range the count crosses and how far past it
+    // it is, and include the counts INSIDE the range (each published bound), which are the
+    // ones the capacity then refuses.
+    let rows: [(&str, i64, &str); 6] = [
+        ("one count past the maximum", 11, "Task count can not be greater than 10"),
+        ("far past the maximum", 1_000, "Task count can not be greater than 10"),
+        (
+            "the largest count an integer can carry",
+            i64::from(i32::MAX),
+            "Task count can not be greater than 10",
+        ),
+        ("one count below the minimum", 0, "Task count can not be lesser than 1"),
+        ("the smallest count inside the range", 1, NO_CONTAINER_INSTANCES),
+        ("the largest count inside the range", 10, NO_CONTAINER_INSTANCES),
+    ];
+
+    for (case, count, expected) in rows {
+        let (code, message) = refusal(
+            &router,
+            "RunTask",
+            json!({
+                "cluster": empty,
+                "taskDefinition": FAMILY,
+                "launchType": "EC2",
+                "count": count,
+            }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("InvalidParameterException", expected),
+            "case {case:?}: expected the run to answer {expected:?}, got {code} with \
+             {message:?}"
+        );
+    }
+
+    // No row placed anything: a refused run stores no task, whichever of the two refusals
+    // it earned.
+    let listed = ok(
+        &router,
+        "ListTasks",
+        json!({ "cluster": empty }),
+        "after the refusals",
+    )
+    .await;
+    assert!(
+        list(&listed, "taskArns", "after the refusals").is_empty(),
+        "case \"after the refusals\": a refused run places no task, got {listed}"
     );
 }

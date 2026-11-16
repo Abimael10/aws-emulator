@@ -25,6 +25,8 @@ mod attachment_state_reports;
 // and the stop a task whose logger cannot earns.
 #[path = "all/awslogs_logger_initialisation.rs"]
 mod awslogs_logger_initialisation;
+#[path = "all/awsvpc_configuration_bounds.rs"]
+mod awsvpc_configuration_bounds;
 #[path = "all/awsvpc_configuration_store.rs"]
 mod awsvpc_configuration_store;
 #[path = "all/awsvpc_interface_subnet_and_identity.rs"]

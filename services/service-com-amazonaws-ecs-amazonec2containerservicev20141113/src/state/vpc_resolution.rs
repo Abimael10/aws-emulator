@@ -23,6 +23,29 @@ use super::*;
 /// nothing of the request.
 pub const AWSVPC_SUBNETS_EMPTY_MESSAGE: &str = "subnets can not be empty.";
 
+/// How many subnets ONE `awsvpcConfiguration` may name.
+///
+/// `AwsVpcConfiguration$subnets`: "The IDs of the subnets associated with the task or
+/// service. There's a limit of 16 subnets that can be specified."
+pub const MAX_AWSVPC_SUBNETS: usize = 16;
+
+/// How many security groups ONE `awsvpcConfiguration` may name.
+///
+/// `AwsVpcConfiguration$securityGroups`: "The IDs of the security groups associated with
+/// the task or service ... There's a limit of 5 security groups that can be specified."
+/// The groups govern the ONE elastic network interface an `awsvpc` task is allocated, so a
+/// placement naming more of them than may be associated with that interface describes a
+/// network no task of it could be reached on.
+pub const MAX_AWSVPC_SECURITY_GROUPS: usize = 5;
+
+/// The noun `AwsVpcConfiguration$subnets` names its entries by, for the refusal that states
+/// the bound.
+const AWSVPC_SUBNETS_SUBJECT: &str = "subnets";
+
+/// The noun `AwsVpcConfiguration$securityGroups` names its entries by ("The IDs of the
+/// security groups associated with the task or service").
+const AWSVPC_SECURITY_GROUPS_SUBJECT: &str = "security groups";
+
 /// The refusal a launch earns when its `networkConfiguration` does not agree with the
 /// network mode of the task definition it runs, or `None` when the two agree.
 ///
@@ -34,7 +57,11 @@ pub const AWSVPC_SUBNETS_EMPTY_MESSAGE: &str = "subnets can not be empty.";
 /// configuration is not a thing that launch can carry
 /// ([`NETWORK_CONFIGURATION_NOT_VALID_MESSAGE`]). Saying which subnets the interface takes
 /// means naming at least one of them: an empty list names none, so there is nowhere for the
-/// interface to be created ([`AWSVPC_SUBNETS_EMPTY_MESSAGE`]).
+/// interface to be created ([`AWSVPC_SUBNETS_EMPTY_MESSAGE`]) — and no more of them than the
+/// member's own doc allows, since each of its lists states a limit on what ONE interface can
+/// be given ([`MAX_AWSVPC_SUBNETS`], [`MAX_AWSVPC_SECURITY_GROUPS`]): a list past that bound
+/// configures an interface that could not be created, so the launch is refused and nothing is
+/// stored for it.
 ///
 /// Shared by every operation that launches a task from a stored revision, so `RunTask`
 /// and `CreateService` cannot answer differently about the same pair.
@@ -51,9 +78,23 @@ pub fn network_configuration_violation(
         (false, true) => return Some(NETWORK_CONFIGURATION_NOT_VALID_MESSAGE.to_string()),
         _ => {}
     }
-    awsvpc
-        .is_some_and(|awsvpc| awsvpc.subnets.is_empty())
-        .then(|| AWSVPC_SUBNETS_EMPTY_MESSAGE.to_string())
+    let awsvpc = awsvpc?;
+    if awsvpc.subnets.is_empty() {
+        return Some(AWSVPC_SUBNETS_EMPTY_MESSAGE.to_string());
+    }
+    if awsvpc.subnets.len() > MAX_AWSVPC_SUBNETS {
+        return Some(at_most_items_message(
+            AWSVPC_SUBNETS_SUBJECT,
+            MAX_AWSVPC_SUBNETS,
+        ));
+    }
+    let groups = awsvpc.security_groups.as_deref().unwrap_or_default();
+    (groups.len() > MAX_AWSVPC_SECURITY_GROUPS).then(|| {
+        at_most_items_message(
+            AWSVPC_SECURITY_GROUPS_SUBJECT,
+            MAX_AWSVPC_SECURITY_GROUPS,
+        )
+    })
 }
 
 /// The Amazon EC2 error code for a subnet id no subnet of the account carries, as
