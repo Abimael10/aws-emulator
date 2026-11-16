@@ -363,13 +363,14 @@ fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> Aut
         // The processes the group has suspended, through the one projection of a stored
         // suspension ([`crate::state::StoredGroup::suspended_process_views`]): a list,
         // empty for a group running every process, on the same footing as its attachments
-        // above rather than an absent member. (No metric collection can be enabled in this
-        // emulator yet — `EnableMetricsCollection` is a scaffold stub owned by its own
-        // issue — so every group holds none of those.)
+        // above rather than an absent member.
         suspended_processes: Some(group.suspended_process_views()),
         placement_group: group.placement_group.clone(),
         vpc_zone_identifier: group.vpc_zone_identifier.clone(),
-        enabled_metrics: Some(Vec::new()),
+        // The group metrics the group aggregates to CloudWatch, through the one projection
+        // of a stored entry ([`crate::state::StoredGroup::enabled_metric_views`]): a list
+        // for the same reason, empty for a group collecting none.
+        enabled_metrics: Some(group.enabled_metric_views()),
         status: group.status.clone(),
         // The group's tags as the wire reports them, through the one projection of a
         // stored tag ([`crate::state::tag_description`]), so a tag reads the same here as

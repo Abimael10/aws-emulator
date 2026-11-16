@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableMetricsCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableMetricsCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableMetricsCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts collecting the group metrics a request names — or every metric of the service's
+//! own catalog when it names none — for one Auto Scaling group, at the granularity the
+//! request asks for.
+//!
+//! The collection is the group's own ([`crate::state::metrics_collection`]): this handler
+//! writes into it on the group the request names, `DescribeAutoScalingGroups` reports what
+//! it holds, and `DisableMetricsCollection` takes entries back out of it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableMetricsCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableMetricsCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableMetricsCollection"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(EnableMetricsCollectionErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        let granularity = input.granularity;
+        // "If you specify Granularity and don't specify any metrics, all metrics are
+        // enabled" (`EnableMetricsCollectionQuery$Metrics`), and a request that carries the
+        // member with no entry named none either.
+        let requested = input.metrics.unwrap_or_default();
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, now);
+
+            // Metrics collection belongs to a group, so a name no group answers to is
+            // refused with the wording this service's group-scoped WRITE paths answer
+            // with: the detail field after the dash is left unfilled, so no part of the
+            // request appears in it.
+            let Some(group) = state.groups.get_mut(&group_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                ));
+            };
+
+            // A granularity the service does not aggregate at, or a metric outside its own
+            // catalog, names nothing to collect — which is about what the request carries
+            // rather than about the group, so it is answered `ValidationError`, and
+            // nothing is written.
+            group
+                .enable_metrics_collection(&requested, &granularity)
+                .map_err(|refusal| {
+                    crate::scaffolded::Scaffolded::validation_error(refusal.message())
+                })?;
+        }
+
+        crate::state::audit(
+            ctx.parts(),
+            "EnableMetricsCollection",
+            &group_name,
+            "group metrics collection enabled",
+        );
+        Ok(EnableMetricsCollectionOutput)
     }
 }

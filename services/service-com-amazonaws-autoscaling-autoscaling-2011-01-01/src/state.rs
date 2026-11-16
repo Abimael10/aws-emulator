@@ -138,6 +138,13 @@ pub use suspended_processes::{
     SuspendedProcesses, PROCESS_LAUNCH, PROCESS_TERMINATE,
 };
 
+/// The group metrics a group aggregates to CloudWatch: the collection
+/// `EnableMetricsCollection` writes into, `DisableMetricsCollection` takes out of and
+/// `DescribeAutoScalingGroups` projects from, and what a request may name.
+pub mod metrics_collection;
+
+pub use metrics_collection::{EnabledMetrics, MetricsRefusal};
+
 /// The scaling policies of a group — what `PutScalingPolicy` creates and
 /// `DescribePolicies` reports — and the CloudWatch alarms a target-tracking policy is
 /// driven by, which live in the account's own CloudWatch store.
@@ -728,6 +735,11 @@ pub struct StoredGroup {
     /// collection every reader and writer of a suspension of this group reaches
     /// ([`suspended_processes`]), so deleting the group takes its suspensions with it.
     pub suspended_processes: SuspendedProcesses,
+    /// The group metrics collected for this group, keyed by metric name, each holding the
+    /// granularity it is collected at: the ONE collection every reader and writer of this
+    /// group's metrics collection reaches ([`metrics_collection`]), so deleting the group
+    /// takes its metrics collection with it.
+    pub enabled_metrics: EnabledMetrics,
 }
 
 impl StoredGroup {
@@ -2586,10 +2598,8 @@ pub const METRIC_COLLECTION_TYPES: &[&str] = &[
 ///
 /// The metrics `EnableMetricsCollection` and `DisableMetricsCollection` accept
 /// are the metrics this catalog publishes, so both sides check membership
-/// through here and cannot drift apart. NOT YET IN FORCE on the wire: those two
-/// operations are still scaffolded (each owned by its own issue), so nothing in
-/// `src/ops/` validates a metric name today — this is the seam they are to use
-/// when they are implemented.
+/// through here and cannot drift apart: a request naming a metric this answers
+/// false for is refused and writes nothing ([`metrics_collection`]).
 pub fn is_valid_metric_collection_type(metric: &str) -> bool {
     METRIC_COLLECTION_TYPES.contains(&metric)
 }
@@ -2598,6 +2608,14 @@ pub fn is_valid_metric_collection_type(metric: &str) -> bool {
 /// the model's own documentation for `MetricGranularityType$Granularity`: "The
 /// granularity. The only valid value is 1Minute."
 pub const METRIC_GRANULARITIES: &[&str] = &["1Minute"];
+
+/// Whether `granularity` is one of [`METRIC_GRANULARITIES`].
+///
+/// The granularity `EnableMetricsCollection` accepts is the granularity this
+/// catalog publishes, so both sides read it from here and cannot drift apart.
+pub fn is_valid_metric_granularity(granularity: &str) -> bool {
+    METRIC_GRANULARITIES.contains(&granularity)
+}
 
 /// The units a `DesiredCapacityType` may name, from the model's own documentation
 /// for `CreateAutoScalingGroup$DesiredCapacityType`: "Valid values: units | vcpu |
