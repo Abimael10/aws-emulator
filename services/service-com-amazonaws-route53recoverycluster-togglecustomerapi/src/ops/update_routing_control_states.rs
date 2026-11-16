@@ -12,6 +12,11 @@
 //! `ValidationException` (400); an ARN no control-plane routing control was minted for is
 //! a `ResourceNotFoundException` (404).
 //!
+//! WHO may move the switches is decided first, by [`crate::service::authorization`], over
+//! EVERY routing control the batch would move: a caller whose identity-based policies do
+//! not allow this action on one of them is answered `AccessDeniedException` (403) and
+//! nothing is written.
+//!
 //! The deployed safety rules of the control panels the batch touches are evaluated over
 //! the WHOLE proposed entry set before anything is written
 //! ([`crate::state::DataPlane::safety_rule_violation`]): a batch that would leave a rule's
@@ -180,11 +185,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata; the audit record below reads the caller's
-        // presented access-key id from it.
+        // `ctx` carries request metadata; the authorization decision and the audit records
+        // below both read from it.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         let entries = &input.update_routing_control_state_entries;
+
+        // IAM decides before anything is read or written, and each entry's own routing
+        // control is a resource of its own: a batch is permitted only where every control
+        // it would move is. A batch naming none addresses no single resource. The caller's
+        // documents are read once for the whole batch, and the resources judged are capped
+        // ([`entry_resources`]), so the decision costs the same whatever the request's size.
+        crate::service::authorization::authorize_each(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &entry_resources(entries),
+        )
+        .map_err(UpdateRoutingControlStatesErrorModeled::AccessDeniedException)?;
 
         // The batch cap is a request-shape rule, so it is answered before the
         // registry is even consulted.
@@ -192,12 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateRoutingControlStatesErrorModeled::ServiceLimitExceededException(
                     ServiceLimitExceededException {
-                        message: format!(
-                            "The request can't update {} routing control states at the same \
-                             time. Try again with at most {} routing control states.",
-                            entries.len(),
-                            crate::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES
-                        ),
+                        message: crate::state::batch_quota_exceeded_message(),
                         resource_id: None,
                         resource_type: Some("RoutingControl".to_string()),
                         limit_code: "UpdateRoutingControlStateEntries".to_string(),
@@ -328,6 +341,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled output carries no members: the state changes ARE the result.
         Ok(UpdateRoutingControlStatesOutput {})
     }
+}
+
+/// The resources an authorization decision is taken over for this batch: the routing
+/// control each entry would move, each named once in the order the request listed them.
+///
+/// A batch that names no entry at all addresses no single resource, which IAM writes as
+/// [`crate::service::authorization::ANY_RESOURCE`].
+///
+/// The entry list is a value the CALLER sizes — it carries no modelled `@length` — so only
+/// as many entries as a batch may legally carry, plus the one that puts it over the cap, are
+/// read here: a batch longer than that is refused by the quota whatever the decision would
+/// have been, so the gate in front of the cap does an amount of work that does not grow with
+/// the request. Every entry of a batch the quota ACCEPTS is judged, which is what the
+/// decision has to cover.
+fn entry_resources(entries: &[UpdateRoutingControlStateEntry]) -> Vec<&str> {
+    let judged = crate::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES + 1;
+    let mut resources: Vec<&str> = Vec::with_capacity(judged.min(entries.len()));
+    for entry in entries.iter().take(judged) {
+        let arn = entry.routing_control_arn.as_str();
+        // Bounded by `judged` above, so this scan is a constant number of comparisons.
+        if !resources.contains(&arn) {
+            resources.push(arn);
+        }
+    }
+    if resources.is_empty() {
+        resources.push(crate::service::authorization::ANY_RESOURCE);
+    }
+    resources
 }
 
 /// A modelled `ValidationException` (HTTP 400) naming the member that was wrong, in

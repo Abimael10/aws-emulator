@@ -176,9 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata; the audit record below reads the caller's
-        // presented access-key id from it.
+        // `ctx` carries request metadata; the authorization decision and the audit record
+        // below both read from it.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // IAM decides before anything is read or written, so a caller whose identity-based
+        // policies do not allow this action changes nothing and learns nothing about the
+        // routing control it named.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.routing_control_arn,
+        )
+        .map_err(UpdateRoutingControlStateErrorModeled::AccessDeniedException)?;
 
         // The modelled `RoutingControlState` value set is enforced at the boundary
         // before this handler runs; parsing it again here keeps the stored state a

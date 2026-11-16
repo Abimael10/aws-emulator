@@ -8,6 +8,11 @@
 //! (404), never a state the caller never set. This is the ONLY file to touch for this
 //! operation.
 //!
+//! WHO may read it is decided first, by [`crate::service::authorization`]: a caller whose
+//! identity-based policies do not allow this action is answered `AccessDeniedException`
+//! (403) before the registry is consulted, so the refusal says nothing about whether the
+//! routing control exists.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,8 +170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // IAM decides before the registry is looked at, so a caller whose identity-based
+        // policies do not allow this action is told only that it is not authorized —
+        // never whether the routing control it named exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.routing_control_arn,
+        )
+        .map_err(GetRoutingControlStateErrorModeled::AccessDeniedException)?;
 
         let stores = crate::state::stores(&*self.engine).ok_or_else(|| {
             GetRoutingControlStateError::from(

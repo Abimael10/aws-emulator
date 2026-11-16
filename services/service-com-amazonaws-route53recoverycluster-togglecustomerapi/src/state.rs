@@ -65,6 +65,20 @@ use recovery_control_config::state::{
 /// the same time. Try again with fewer routing control states."
 pub const MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES: usize = 10;
 
+/// The `ServiceLimitExceededException$Message` a batch over that cap is refused with.
+///
+/// The entry list carries no modelled `@length` bound, so the cap is a runtime service
+/// QUOTA rather than a constraint on the request shape, and Route 53 ARC words its refusal
+/// as the quota itself: the limit is the only value in the sentence, and the number of
+/// entries the request submitted does not appear — so the same sentence answers every batch
+/// over the cap, whatever its size.
+pub fn batch_quota_exceeded_message() -> String {
+    format!(
+        "Cannot update more than {MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES} controls in a \
+         single batch"
+    )
+}
+
 /// A routing control's state: the on/off switch itself.
 ///
 /// The wire form is the modelled `RoutingControlState` enum — `On` traffic flows

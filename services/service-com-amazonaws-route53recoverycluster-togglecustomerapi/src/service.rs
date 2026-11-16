@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether IAM lets a request perform the action it asks for: the decision every operation
+/// of this API takes before it reads a routing control or moves a switch.
+pub mod authorization;
+/// How this service words a request the framework refused before any handler ran.
+pub mod refusal;
+
 /// The `com-amazonaws-route53recoverycluster-togglecustomerapi` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +104,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. This API states the refusal of an ARN-bearing member
+        // in its own words, carrying nothing of the request; every other refused
+        // member keeps the framework's wording. Both the code and the message
+        // come from there, so a client never sees one without the other.
+        refusal::reworded(refusal)
     }
 
     fn override_routing_error(

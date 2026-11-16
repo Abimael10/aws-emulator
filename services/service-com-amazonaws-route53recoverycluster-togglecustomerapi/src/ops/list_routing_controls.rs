@@ -13,6 +13,10 @@
 //! a `ResourceNotFoundException` (404); a token this service did not issue is a
 //! `ValidationException` (400).
 //!
+//! WHO may read the set is decided first, by [`crate::service::authorization`]: a caller
+//! whose identity-based policies do not allow this action is answered
+//! `AccessDeniedException` (403) before the registry is consulted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -223,8 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // IAM decides before the registry is looked at: the resource a listing addresses is
+        // the control panel it is filtered by, and every routing control the endpoint
+        // serves when it carries no filter.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input
+                .control_panel_arn
+                .as_deref()
+                .unwrap_or(crate::service::authorization::ANY_RESOURCE),
+        )
+        .map_err(ListRoutingControlsErrorModeled::AccessDeniedException)?;
 
         let stores = crate::state::stores(&*self.engine).ok_or_else(|| {
             ListRoutingControlsError::from(

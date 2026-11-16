@@ -30,6 +30,11 @@ pub const CONTROL_PLANE_SIGNING_NAME: &str = "route53-recovery-control-config";
 /// it never appears in one.
 pub const REGION: &str = "us-east-1";
 
+/// The access key id every call signs with unless a suite names another: a key neither STS
+/// nor IAM holds a record for, which is the position the account's own published credential
+/// is in.
+pub const ACCOUNT_KEY_ID: &str = "AKIDEMULATORTEST";
+
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`, which is
 /// how every signed SDK request routes. Request authentication is off in these tests, so
 /// only the scope matters.
@@ -37,9 +42,15 @@ pub const REGION: &str = "us-east-1";
 /// `pub` because a suite that builds its own request — one addressed at an endpoint the
 /// control plane published, say — signs it the same way.
 pub fn authorization(signing_name: &str) -> String {
+    authorization_as(signing_name, ACCOUNT_KEY_ID)
+}
+
+/// The same header signed with `access_key_id` — the value that names the principal a
+/// request speaks for, which is what an authorization decision is taken about.
+pub fn authorization_as(signing_name: &str, access_key_id: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 \
-         Credential=AKIDEMULATORTEST/20260101/{REGION}/{signing_name}/aws4_request, \
+         Credential={access_key_id}/20260101/{REGION}/{signing_name}/aws4_request, \
          SignedHeaders=host;x-amz-target, \
          Signature=0000000000000000000000000000000000000000000000000000000000000000"
     )
@@ -49,7 +60,15 @@ pub fn authorization(signing_name: &str) -> String {
 /// plane reads is the store the control plane writes, so a test that creates a resource
 /// through one plane addresses it through the other.
 pub fn emulator() -> MultiServiceRouter {
-    mounted(None)
+    mounted(None, false).0
+}
+
+/// The same emulator with the IAM and STS services mounted beside both ARC planes, plus
+/// the shared engine itself — so a suite about WHO is calling seeds the role, the policies
+/// and the session those services hold, and the gate reads the records their own handlers
+/// write.
+pub fn emulator_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    mounted(None, true)
 }
 
 /// The same emulator, reachable at `base` instead of the unserved default
@@ -59,10 +78,10 @@ pub fn emulator() -> MultiServiceRouter {
 /// `crate::published_cluster_endpoint` dials what that publication names, which only an
 /// emulator reachable at a dialable base can be asked for.
 pub fn emulator_at(base: &str) -> MultiServiceRouter {
-    mounted(Some(base))
+    mounted(Some(base), false).0
 }
 
-fn mounted(url_base: Option<&str>) -> MultiServiceRouter {
+fn mounted(url_base: Option<&str>, identity: bool) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -73,19 +92,45 @@ fn mounted(url_base: Option<&str>) -> MultiServiceRouter {
         );
     }
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(ControlPlaneService::new(engine));
-    router
+    router.register_service(ControlPlaneService::new(Arc::clone(&engine)));
+    if identity {
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+    }
+    (router, engine)
 }
 
 /// Call one data-plane operation and return its HTTP status and parsed JSON body.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    call_as(router, ACCOUNT_KEY_ID, operation, body).await
+}
+
+/// Call one data-plane operation signed with `access_key_id`, and return its HTTP status
+/// and parsed JSON body.
+pub async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("host", format!("{DATA_PLANE_SIGNING_NAME}.{REGION}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("ToggleCustomerAPI.{operation}"))
-        .header("authorization", authorization(DATA_PLANE_SIGNING_NAME))
+        .header(
+            "authorization",
+            authorization_as(DATA_PLANE_SIGNING_NAME, access_key_id),
+        )
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),
         ))
