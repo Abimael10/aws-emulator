@@ -123,28 +123,49 @@ pub fn schedule_expression_bus_violation(bus: &str) -> Option<String> {
 /// service.
 const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// What a request naming a key in the reserved namespace is refused with: the
+/// FIXED sentence the service states for one, whichever tag call carried it.
+///
+/// It names neither the key nor the operation nor the resource — the whole
+/// message is this sentence — because what is wrong is the namespace the key
+/// sits in, which the caller already holds, and the same sentence answers a key
+/// being ADDED and a key being REMOVED.
+const SYSTEM_TAGS_REFUSAL: &str = "Add/Remove system tags is not allowed.";
+
+/// Whether `key` reaches into the namespace reserved for Amazon Web Services'
+/// own tags.
+///
+/// Matched without regard to case: the reserved namespace is the prefix itself
+/// rather than one spelling of it, so a key may not reach into it by changing
+/// case.
+fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
 /// Why a submitted tag list carries a key this service will not store, or `None`
 /// when every key is the caller's own.
 ///
 /// One reserved key refuses the whole write, so the tag set a resource carries
-/// never holds half of a request. Matched without regard to case: the reserved
-/// namespace is the prefix itself rather than one spelling of it, so a key may
-/// not reach into it by changing case.
-///
-/// The refusal states the rule AWS states for the namespace — the prefix is
-/// reserved for Amazon Web Services' own use, and a caller can neither create nor
-/// modify a key carrying it — rather than echoing a key back: what is wrong with
-/// the key is the namespace it is in, which the caller already has.
+/// never holds half of a request ([`is_reserved_tag_key`] decides which keys
+/// those are).
 pub fn reserved_tag_key_violation(tags: &[Tag]) -> Option<String> {
     tags.iter()
-        .find(|tag| {
-            tag.key
-                .get(..RESERVED_TAG_KEY_PREFIX.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
-        })
-        .map(|_| {
-            format!("Tag keys starting with '{RESERVED_TAG_KEY_PREFIX}' are reserved for AWS use.")
-        })
+        .any(|tag| is_reserved_tag_key(&tag.key))
+        .then(|| SYSTEM_TAGS_REFUSAL.to_string())
+}
+
+/// Why a submitted list of tag KEYS cannot be removed, or `None` when every key
+/// is the caller's own.
+///
+/// The REMOVE half of the same rule, and so the same sentence: a key in the
+/// reserved namespace is not a caller's to delete any more than it is a
+/// caller's to write, and one such key refuses the whole request so the
+/// resource never loses half of it.
+pub fn reserved_tag_key_removal_violation(keys: &[String]) -> Option<String> {
+    keys.iter()
+        .any(|key| is_reserved_tag_key(key))
+        .then(|| SYSTEM_TAGS_REFUSAL.to_string())
 }
 
 /// Why one target of a `PutTargets` request cannot be installed as given, or

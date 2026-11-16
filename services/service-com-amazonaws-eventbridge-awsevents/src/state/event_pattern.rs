@@ -148,22 +148,24 @@ pub enum Validator {
 /// [`length_violation`], where a rule is written.
 pub const MAX_RULE_PATTERN_CHARS: usize = 2048;
 
-/// Why `pattern` is too long for a rule to carry, or `None` when it is within
-/// the quota.
+/// Why the event pattern of the rule `rule_name` is too long for that rule to
+/// carry, or `None` when it is within the quota.
 ///
-/// What comes back is the WHOLE message of the `InvalidEventPatternException` a
-/// caller answers with, like every other refusal of this module ([`parse`]): the
-/// opening ([`INVALID_PATTERN`]) and then the reason. The reason states the
-/// CONDITION and nothing of the submitted text — a pattern past the bound is as
-/// long as the request, and there is no position in it to report the way a
-/// reader's refusal has one ([`Refusal::message`]).
-pub fn length_violation(pattern: &str) -> Option<String> {
-    (pattern.chars().count() > MAX_RULE_PATTERN_CHARS)
-        .then(|| format!("{INVALID_PATTERN} {PATTERN_TOO_LONG}"))
+/// The refusal names the PARAMETER whose quota was exceeded, the rule it was
+/// given for and the quota itself — the three facts a caller cannot read
+/// anywhere else — and nothing of the submitted text: a pattern past the bound
+/// is as long as the request, and there is no position in it to report the way
+/// a reader's refusal has one ([`Refusal::message`]). It carries no
+/// [`INVALID_PATTERN`] opening either: a size refusal is not the language
+/// refusing the pattern, so it does not reuse the sentence that says it is.
+pub fn length_violation(rule_name: &str, pattern: &str) -> Option<String> {
+    (pattern.chars().count() > MAX_RULE_PATTERN_CHARS).then(|| {
+        format!(
+            "Parameter EventPattern for rule {rule_name} exceeds limit of \
+             {MAX_RULE_PATTERN_CHARS}."
+        )
+    })
 }
-
-/// The reason a pattern past [`MAX_RULE_PATTERN_CHARS`] is refused for.
-const PATTERN_TOO_LONG: &str = "Event pattern is too long.";
 
 /// Parse `pattern` as the pattern COMPILER reads it — the validator every
 /// operation that stores a pattern, and routing itself, goes through.

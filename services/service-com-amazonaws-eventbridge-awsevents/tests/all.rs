@@ -173,6 +173,8 @@ mod publication_identity_authorization;
 mod queue_target_policy_authorization;
 #[path = "all/queue_target_refusal_classification.rs"]
 mod queue_target_refusal_classification;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/regional_bus_namespace.rs"]
 mod regional_bus_namespace;
 #[path = "all/replay_cancellation.rs"]

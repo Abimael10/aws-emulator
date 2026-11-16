@@ -429,8 +429,12 @@ async fn put_rule_refuses_an_event_pattern_past_the_pattern_quota() {
         );
         let actual = message(&body);
         assert_eq!(
-            actual, "Event pattern is not valid. Reason: Event pattern is too long.",
-            "case {case:?}: expected the pattern-length refusal, got {actual:?}"
+            actual,
+            format!(
+                "Parameter EventPattern for rule pattern-rule exceeds limit of \
+                 {DOCUMENTED_PATTERN_MAX}."
+            ),
+            "case {case:?}: expected the pattern-quota refusal, got {actual:?}"
         );
     }
 
@@ -819,7 +823,7 @@ async fn a_tag_write_refuses_a_key_in_the_reserved_namespace() {
             );
             let actual = message(&body);
             assert_eq!(
-                actual, "Tag keys starting with 'aws:' are reserved for AWS use.",
+                actual, "Add/Remove system tags is not allowed.",
                 "case {case:?}: expected the reserved-key refusal, got {actual:?}"
             );
         }

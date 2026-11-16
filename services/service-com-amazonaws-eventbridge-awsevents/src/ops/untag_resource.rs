@@ -171,6 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = crate::state::parse_tagged_resource(&input.resource_arn, &region)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // A key in the namespace reserved for Amazon Web Services' own tags is not
+        // a caller's to REMOVE any more than it is a caller's to write, so the
+        // request is refused before anything is removed and the resource keeps
+        // every tag it carried — the same rule, and the same sentence, the tag
+        // WRITES refuse one with (`crate::state::request_validation`).
+        if let Some(reason) =
+            crate::state::request_validation::reserved_tag_key_removal_violation(&input.tag_keys)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
         // WHO this request speaks for, and the documents in force on that principal,
         // resolved BEFORE this service's store is locked: the IAM store is never
         // reached while this one's guard is held.

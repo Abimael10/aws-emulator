@@ -272,7 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the text the request carried, so a pattern past it is refused
             // whatever it would have compiled to, and the rule keeps the
             // pattern it had.
-            if let Some(reason) = crate::state::event_pattern::length_violation(pattern) {
+            if let Some(reason) =
+                crate::state::event_pattern::length_violation(&input.name, pattern)
+            {
                 return Err(PutRuleErrorModeled::InvalidEventPatternException(
                     InvalidEventPatternException {
                         message: Some(reason),

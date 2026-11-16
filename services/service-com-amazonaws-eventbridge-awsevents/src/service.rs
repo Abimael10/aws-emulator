@@ -24,7 +24,7 @@
 //!   correctly, or serve one THROUGH something of the service's own. This service
 //!   serves `PutEvents` through the wrapper that lets a refusal of its `Entries`
 //!   list state the entries the request carried (see the inline note on
-//!   `QuotingSubmittedEntries`); every other request resolves through the
+//!   `QuotingSubmittedValues`); every other request resolves through the
 //!   generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. This service words one here: the constraint clauses
@@ -140,33 +140,46 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     Some(crate::state::validation_envelope(&clauses))
 }
 
-/// `violation` with the clause's value half replaced by the COLLECTION the caller
-/// submitted, where the framework stored its own summary of one there.
+/// `violation` with the clause's value half replaced by the value the caller
+/// submitted, where the framework stored a rendering of its own there instead.
 ///
-/// A constraint clause of this service states the value that was rejected, and the
-/// value a clause on a collection member rejects is the collection itself. The
-/// framework's constraint walk has no rendering for one — it stores
-/// `<n> items`, read back with the one reader of that rendering
-/// (`service_common::validation_message::list_item_count`) — which is not a value
-/// any caller sent, so that one clause states the list as `echo` renders it. Every
-/// other clause keeps the framework's own rendering, which already states the
-/// bytes the caller submitted, and a collection the echo walk could not render
-/// (one past the bounds it states) keeps the summary rather than losing the
+/// A constraint clause of this service states the value that was rejected,
+/// VERBATIM and in full: the echo is the only place the service reports the
+/// offending input back, so a caller comparing it against what it sent — one of
+/// several names it submitted, say — must read its own bytes. The framework's
+/// constraint walk stores two renderings that are not those bytes, and the tree's
+/// two shared restorers answer them from the echo the collecting walk re-read out
+/// of the same request — the same composition this tree's other services word
+/// their clauses through, so no reading of a stored rendering is spelled twice:
+///
+/// * `validation_message::quoting_the_whole_submitted_value` — a value longer
+///   than the walk's own echo ceiling is stored ELIDED, a prefix plus
+///   `... [<n> bytes]`, which is wire text AWS never emits;
+/// * `validation_message::quoting_the_submitted_collection` — a clause on a
+///   COLLECTION member has no leaf of its own, and the only rendering the walk has
+///   for one is its size.
+///
+/// Every other clause keeps the framework's own rendering, which already states
+/// the bytes the caller submitted, and a value the echo walk could not render
+/// (one past the bounds it states) keeps what was stored rather than losing the
 /// clause.
-fn quoting_the_submitted_collection(violation: Violation, echo: SubmittedEcho) -> Violation {
-    let summarised = violation.value.as_deref().is_some_and(|stored| {
-        matches!(
-            violation.kind,
-            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
-        ) && ::service_common::validation_message::list_item_count(stored).is_some()
-    });
-    match echo {
-        SubmittedEcho::Rendered(value) if summarised => Violation {
-            value: Some(value),
-            ..violation
-        },
-        _ => violation,
+fn quoting_the_submitted_value(violation: Violation, echo: SubmittedEcho) -> Violation {
+    use ::service_common::validation_message::{
+        quoting_the_submitted_collection, quoting_the_whole_submitted_value,
+    };
+
+    // A value the boundary walk WITHHELD — a `@sensitive` member's, which this
+    // model declares for the credential members of a connection
+    // (`smithy_query(query="shape",shape="CreateConnectionApiKeyAuthRequestParameters")`
+    // reports `ApiKeyValue` sensitive) — stays withheld: the clause states the
+    // constraint and no value, so neither restorer is asked to put such a value
+    // into a message. The value half of every other clause is the caller's own
+    // bytes, restored whole.
+    if violation.sensitive {
+        return violation;
     }
+    let violation = quoting_the_whole_submitted_value(violation, &echo);
+    quoting_the_submitted_collection(violation, echo)
 }
 
 /// The member POSITIONS the echo-collecting walk may visit for one request of this
@@ -186,12 +199,13 @@ fn quoting_the_submitted_collection(violation: Violation, echo: SubmittedEcho) -
 /// framework's summary.
 const MAX_ECHO_POSITIONS: usize = 512;
 
-/// One modelled operation, served so that a refusal of a `@length` on one of its
-/// COLLECTION members states the collection the caller submitted.
+/// One modelled operation, served so that a refusal of one of its members states
+/// the value the caller submitted — in full, and for a COLLECTION member the
+/// collection itself.
 ///
 /// Why it exists: [`Service::override_refusal`] is handed the violations alone,
-/// never the request they were found in, so the one clause whose value the
-/// framework could not render ([`quoting_the_submitted_collection`]) cannot be
+/// never the request they were found in, so a clause whose value the framework
+/// elided or could not render ([`quoting_the_submitted_value`]) cannot be
 /// completed there. Here the input can be re-read.
 ///
 /// Nothing is re-implemented and no check is repeated in other words: the
@@ -206,18 +220,18 @@ const MAX_ECHO_POSITIONS: usize = 512;
 /// cost is DELIBERATE: an accepted request's body is read twice, here and in the
 /// operation's own sequence, because the framework hands no already-built input to
 /// an operation.
-struct QuotingSubmittedCollections<Op> {
+struct QuotingSubmittedValues<Op> {
     operation: Op,
 }
 
-impl<Op> QuotingSubmittedCollections<Op> {
+impl<Op> QuotingSubmittedValues<Op> {
     /// Wrap one operation, already constructed from the shared engine.
     fn new(operation: Op) -> Self {
         Self { operation }
     }
 }
 
-impl<Op> ErasedOperation for QuotingSubmittedCollections<Op>
+impl<Op> ErasedOperation for QuotingSubmittedValues<Op>
 where
     Op: Operation + ErasedOperation,
 {
@@ -239,7 +253,7 @@ where
                     crate::ops::put_events::PRINTED_ENTRY_MEMBERS,
                 )
                 .into_iter()
-                .map(|(violation, echo)| quoting_the_submitted_collection(violation, echo))
+                .map(|(violation, echo)| quoting_the_submitted_value(violation, echo))
                 .collect();
             if let Some(message) = constraint_envelope(&refused) {
                 return svc.definition().refusal_response(
@@ -336,14 +350,14 @@ fn claims_route_key_and_root_path(parts: &http::request::Parts) -> bool {
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`QuotingSubmittedCollections`] and keyed by its operation shape name — the routing key
+/// [`QuotingSubmittedValues`] and keyed by its operation shape name — the routing key
 /// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
 macro_rules! wrap_operations {
     ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(QuotingSubmittedCollections::new(
+                ::std::boxed::Box::new(QuotingSubmittedValues::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
@@ -359,11 +373,11 @@ macro_rules! wrap_operations {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
-    /// [`QuotingSubmittedCollections`]. Keyed by the routing key the protocol resolves —
+    /// [`QuotingSubmittedValues`]. Keyed by the routing key the protocol resolves —
     /// the key the generated table uses — and built from the SAME shared engine, so a
     /// wrapped operation reads and writes the one store. Held on the service because
     /// [`Service::override_operation`] hands back a borrow of `self`.
-    quoting_submitted_collections: OperationRoutingTable,
+    quoting_submitted_values: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -371,9 +385,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut quoting_submitted_collections = OperationRoutingTable::new();
+        let mut quoting_submitted_values = OperationRoutingTable::new();
         wrap_operations!(
-            quoting_submitted_collections,
+            quoting_submitted_values,
             engine,
             activate_event_source::ActivateEventSource,
             cancel_replay::CancelReplay,
@@ -435,7 +449,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            quoting_submitted_collections,
+            quoting_submitted_values,
         }
     }
 }
@@ -471,13 +485,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // Serve the operation the generated routing table names, through the
         // wrapper that lets a refusal of a collection member state the collection
-        // the request carried (see [`QuotingSubmittedCollections`]). The routing
+        // the request carried (see [`QuotingSubmittedValues`]). The routing
         // DECISION is not overridden: the key is resolved by the model's own
         // protocol, and a request the table cannot serve is declined here so the
         // framework's routing-error path stays exactly as it was.
         let operation = self.definition().protocol().routing_key(req).ok()?;
         self.definition().routing_table().get(operation)?;
-        self.quoting_submitted_collections.get(operation)
+        self.quoting_submitted_values.get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
