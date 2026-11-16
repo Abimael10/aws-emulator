@@ -60,6 +60,10 @@ aws-sdk-kinesis = { version = "1", default-features = false }
 aws-sdk-kms = { version = "1", default-features = false }
 # A binary message attribute travels as base64 in a record envelope.
 base64 = "0.22"
+# The execution id every record of ONE execution of a pipe carries, in its own execution log
+# (`state::data_plane::execution_log`): minted per execution, in the form AWS reports an
+# execution by.
+uuid = { version = "1", features = ["v4"] }
 # The CloudWatch store a RUNNING pipe publishes its own metrics to (the
 # `AWS/EventBridge/Pipes` namespace, `state::metrics`). CloudWatch refuses a
 # `PutMetricData` into a reserved `AWS/` namespace, so a service's own metrics never
@@ -120,6 +124,11 @@ service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 # on one engine in the metrics suite.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# A pipe's own EXECUTION LOG is written into the CloudWatch Logs group its
+# `LogConfiguration` names, so that service is mounted beside pipes in the execution-log
+# suite: the group is created the way a client creates one and the records are read back
+# with `FilterLogEvents`.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A request signed by an assumed-role session is what the caller-authorization suite drives
 # the identity gate with, so the token service is mounted beside pipes there and the session
 # is minted the way a client mints one (`sts:AssumeRole`).

@@ -43,6 +43,8 @@ mod pipe_dynamodb_stream_source;
 mod pipe_encryption_key;
 #[path = "all/pipe_event_bus_target.rs"]
 mod pipe_event_bus_target;
+#[path = "all/pipe_execution_log.rs"]
+mod pipe_execution_log;
 #[path = "all/pipe_execution_role.rs"]
 mod pipe_execution_role;
 #[path = "all/pipe_filter_body_format.rs"]

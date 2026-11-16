@@ -18260,6 +18260,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
  "service-com-amazonaws-eventbridge-awsevents",
@@ -18275,6 +18276,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "uuid",
  "zip",
 ]
 

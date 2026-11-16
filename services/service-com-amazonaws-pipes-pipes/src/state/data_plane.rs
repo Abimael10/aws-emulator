@@ -116,8 +116,9 @@
 //!
 //! Every call this module makes goes to the emulator it is running inside, over the
 //! in-process callback ([`smithy_server_runtime::EmbeddedEmulator`]): the pipe reaches
-//! the sqs, dynamodbstreams, kinesis, lambda and states surfaces of this same emulator and
-//! nothing else.
+//! the sqs, dynamodbstreams, kinesis, lambda and states surfaces of this same emulator, and
+//! the cloudwatchlogs surface its own execution log is written to
+//! ([`execution_log`]), and nothing else.
 //!
 //! Every one of those calls is made AS THE PIPE'S EXECUTION ROLE, so each stage asks
 //! first whether the policies in force on that role let it make the call it is about to
@@ -137,7 +138,10 @@
 //! What each pass came to is published as the pipe's OWN CloudWatch metrics
 //! ([`super::metrics`]), for every minute the pipe is running: that series is the only
 //! thing that tells a pipe whose stage was refused from a pipe that never ran, because
-//! both leave the target holding nothing.
+//! both leave the target holding nothing. A pipe whose `LogConfiguration` asks for it also
+//! writes the record of each EXECUTION — one id per batch moved, one record per stage its
+//! configured `Level` admits, carrying what that stage was handed when it asked for the
+//! execution data — to the destination that configuration names ([`execution_log`]).
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -150,6 +154,7 @@ use crate::ops::types::{PipeSourceParameters, PipeTargetParameters};
 
 mod dead_letter;
 mod event_bus;
+mod execution_log;
 mod kinesis_source;
 mod state_machine;
 
@@ -1106,7 +1111,20 @@ async fn move_one_batch(
         return Batch::Superseded;
     };
     let decided = &decided;
-    match run_stages(callback, clients, positions, record, decided, &polled, checked_out).await {
+    // The pipe's own record of this execution: one id for every record of it, and the
+    // records its configured `Level` admits as the stages below produce them. A pipe that
+    // configures no logging mints nothing and writes nothing ([`execution_log`]).
+    let mut log = execution_log::Execution::start(decided);
+    let outcome = run_stages(
+        callback, clients, positions, record, decided, &polled, &mut log,
+    )
+    .await;
+    // The verdict is the outcome the poller itself acts on, and the log is written once the
+    // stages are done — outside every store guard, and never a reason a moved batch is
+    // reported as anything else.
+    log.verdict(&outcome);
+    log.write(callback, record).await;
+    match outcome {
         Ok(moved) => {
             if matches!(moved, Batch::Moved { .. }) {
                 // The batch is finished with its source: whatever earlier attempts at it
@@ -1226,6 +1244,10 @@ async fn discarded_or_failed(
 /// MOMENT make this call on this resource? A call it may not make is the stage FAILING
 /// rather than the call happening — and a stage that fails answers the FAILED ATTEMPT it
 /// was, which is what the caller counts against the batch's retries.
+///
+/// `log` is this execution's own record: each stage says what it was handed and what it
+/// answered, and the records that survive the pipe's configured `Level` are written by the
+/// caller once the stages are done.
 async fn run_stages(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
@@ -1233,9 +1255,13 @@ async fn run_stages(
     record: &LiveRecord<'_>,
     decided: &RunningPipe,
     polled: &Polled,
-    checked_out: Option<Instant>,
+    log: &mut execution_log::Execution<'_>,
 ) -> Result<Batch, FailedAttempt> {
     let taken = polled.len();
+    // When the source handed these records over, for a source they are checked OUT of: every
+    // failure below leaves them there, so this is when they come back. Read from the poll
+    // itself rather than passed in, so the stages have ONE source of it.
+    let checked_out = polled.checked_out();
     // The identifier its source names each polled record by: what a target's report of the
     // records it did not process names them by, and what the finish below leaves on the
     // source or moves past.
@@ -1246,6 +1272,8 @@ async fn run_stages(
         Ok(batch) => batch,
         Err(detail) => return Err(FailedAttempt::withheld(Stage::Source, detail)),
     };
+    // The execution took these records from its source and entered the pipe with them.
+    log.started(&batch);
 
     // The filter decides which of the polled records enter the pipe, BEFORE the
     // enrichment: one the pipe's patterns do not admit reaches neither stage. It is still
@@ -1281,8 +1309,12 @@ async fn run_stages(
             {
                 return Err(FailedAttempt::withheld(Stage::Enrichment, detail));
             }
+            log.stage_started(Stage::Enrichment, &handed);
             match invoke_enrichment(callback, clients, enrichment, &handed).await {
-                Ok(events) => events,
+                Ok(events) => {
+                    log.stage_succeeded(Stage::Enrichment, Some(&events));
+                    events
+                }
                 Err(failure) => return Err(FailedAttempt::from_call(Stage::Enrichment, failure)),
             }
         }
@@ -1312,6 +1344,9 @@ async fn run_stages(
     // API carries one payload per call, one call holding every event for a target whose API
     // takes the batch ([`deliver_batch`]). What it ANSWERS is which records of the batch it
     // did not process, for a target whose call answers the caller at all.
+    if !events.is_empty() {
+        log.stage_started(Stage::Target, &events);
+    }
     let report =
         match deliver_batch(callback, clients, &decided.target, &payloads, &identifiers).await {
             Ok(report) => report,
@@ -1333,6 +1368,11 @@ async fn run_stages(
     let processed =
         ::service_common::batch_item_failures::processed_records(&report, &identifiers)
             .unwrap_or_default();
+    if !events.is_empty() {
+        // The target took what it was handed. WHICH of the batch's records it reported as
+        // processed is the finish below; the stage itself answered the caller.
+        log.stage_succeeded(Stage::Target, None);
+    }
 
     // Delivered: the records the target processed may be finished with their source, and the
     // ones it reported it did not stay there to be handed over again.
@@ -3274,6 +3314,9 @@ struct RunningPipe {
     /// `DeadLetterConfig`: where the record of a batch this pipe discarded goes, when the
     /// pipe configures a destination for it.
     dead_letter: Option<dead_letter::Destination>,
+    /// `LogConfiguration`: what this pipe asks to be logged about each execution, and where
+    /// ([`execution_log`]).
+    logging: execution_log::Logging,
 }
 
 /// The source a pipe's records are polled from, by the resource its `Source` names.
@@ -3577,6 +3620,10 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
         target_arn: pipe.target.clone(),
         maximum_retry_attempts,
         dead_letter,
+        // What the pipe asks to be logged about its executions, read from the record with
+        // the rest of the configuration: a `LogConfiguration` an `UpdatePipe` replaced
+        // governs the executions decided after it, exactly as a filter or a target does.
+        logging: execution_log::resolve(pipe.log_configuration.as_ref()),
     })
 }
 
@@ -3916,6 +3963,9 @@ mod test_support {
             target_arn: "arn:aws:sqs:us-east-1:000000000000:results".to_string(),
             maximum_retry_attempts: None,
             dead_letter: None,
+            // A pipe configuring no logging: what such a pipe writes is this module's own
+            // question (`execution_log`), not the source stage's.
+            logging: super::execution_log::Logging::default(),
         }
     }
 }

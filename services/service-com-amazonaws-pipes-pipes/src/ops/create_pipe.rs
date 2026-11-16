@@ -427,6 +427,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The logging configuration AWS reports (`PipeLogConfiguration`) for the one the caller
 /// supplied (`PipeLogConfigurationParameters`): the same destinations, as the read shape.
 ///
+/// The stored value is not only what `DescribePipe` echoes: it is the instruction the pipe's
+/// own data plane logs its executions under
+/// (`crate::state::data_plane::execution_log`), which reads the level, the execution-data
+/// option and the destination off this record.
+///
 /// `pub(crate)` because `UpdatePipe` stores a replacement `LogConfiguration` through the
 /// same conversion; the mapping between the write and read shapes belongs to whichever
 /// handler persists one, and there is only one of it.
