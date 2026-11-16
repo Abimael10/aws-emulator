@@ -10,9 +10,10 @@
 //!
 //! Nothing is minted until the request is admitted: a tag set no resource can carry is
 //! `InvalidTagging`, an `OriginSslProtocols` whose `Quantity` disagrees with its `Items` is
-//! `InconsistentQuantities`, an endpoint `Arn` that is no ARN at all is `InvalidArgument`,
-//! and a store already holding as many VPC origins as this emulator can is
-//! `EntityLimitExceeded`.
+//! `InconsistentQuantities`, an endpoint configuration this service's argument validation does
+//! not accept — an `Arn` naming no resource a VPC origin can front, or a port no origin can be
+//! reached on — is `InvalidArgument`, and a store already holding as many VPC origins as this
+//! emulator can is `EntityLimitExceeded`.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The ARN of the CloudFront VPC origin endpoint configuration" names the resource in
-        // the VPC this origin fronts, so a value that cannot be READ as an ARN at all is
-        // refused on its form — with the one sentence this service answers that condition
-        // with, wherever a parameter takes an ARN. The FORM check is the service's own:
-        // whether the value opens with `arn:` ([`crate::state::ARN_PREFIX`]), the same
-        // question the resource-policy surface asks of its own ARN parameter, because what
-        // follows the prefix belongs to another service's resource and this one states no
-        // rule about it.
-        if !config.arn.starts_with(crate::state::ARN_PREFIX) {
-            return Err(
-                CreateVpcOriginErrorModeled::InvalidArgument(crate::state::malformed_arn()).into(),
-            );
+        // The endpoint configuration's own members are read before anything is minted: the
+        // `Arn` NAMES the resource in the VPC this origin fronts, so a value that names no
+        // such resource fails this service's argument validation and the request is refused on
+        // that member, by its PATH in the request; and the two ports are read with the one rule
+        // this service states for the ports an origin is reached on
+        // ([`crate::state::vpc_origin_endpoint_config_validation`]).
+        if let Some(refusal) = crate::state::vpc_origin_endpoint_config_validation(&config) {
+            return Err(CreateVpcOriginErrorModeled::InvalidArgument(refusal).into());
         }
 
         let now = SystemTime::now();

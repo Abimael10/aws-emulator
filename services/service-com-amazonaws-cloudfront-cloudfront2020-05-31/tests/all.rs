@@ -412,6 +412,8 @@ mod unreadable_path_identifiers;
 mod untag_resource;
 #[path = "all/verify_dns_configuration.rs"]
 mod verify_dns_configuration;
+#[path = "all/vpc_origin_argument_validation.rs"]
+mod vpc_origin_argument_validation;
 #[path = "all/vpc_origin_lifecycle.rs"]
 mod vpc_origin_lifecycle;
 #[path = "all/web_acl_association.rs"]

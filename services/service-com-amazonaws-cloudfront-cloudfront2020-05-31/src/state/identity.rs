@@ -332,6 +332,73 @@ pub fn malformed_arn() -> crate::ops::types::InvalidArgument {
     }
 }
 
+/// Whether `value` can be READ as an ARN at all.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`
+/// ([`cloudfront_arn_resource`] reads one of THIS service), so a value that can be read as one
+/// opens with [`ARN_PREFIX`] and carries all six segments, with a partition, a service and a
+/// resource part that name something; the region and account segments are empty on the ARNs of
+/// a global service, so neither is a value this reading demands.
+///
+/// This is ALL the FORM of an ARN decides — which service it names, and what its resource part
+/// spells, is a question for whoever resolves it ([`resource_policy_resource`]) — and it is
+/// what an operation taking an ARN in one of its members reads that member with before the
+/// value is used for anything.
+pub fn is_readable_arn(value: &str) -> bool {
+    let mut segments = value.splitn(6, ':');
+    segments.next() == Some("arn")
+        && segments.next().is_some_and(|partition| !partition.is_empty())
+        && segments.next().is_some_and(|service| !service.is_empty())
+        && segments.next().is_some()
+        && segments.next().is_some()
+        && segments.next().is_some_and(|resource| !resource.is_empty())
+}
+
+/// The sentence CloudFront refuses an input MEMBER whose value its own argument validation
+/// cannot read with, for `member_path` — the path of that member in the request, spelled from
+/// the enclosing shapes inwards and separated by spaces (`VpcOriginEndpointConfig Arn`).
+///
+/// Fixed text around one variable part: "The parameter " and " ValidationError." are the
+/// service's own words for a member that failed validation, and the member path is taken from
+/// the REQUEST — it is what tells a caller which of its values to fix. Nothing else of the
+/// request reaches the sentence: neither the value that failed nor anything the store holds.
+/// Recorded behaviour.
+pub fn parameter_validation_error_message(member_path: &str) -> String {
+    format!("The parameter {member_path} ValidationError.")
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for an input member whose value fails CloudFront's
+/// argument validation — "An argument is invalid."
+///
+/// Raised BEFORE the request is acted on, so a create that carries such a member mints nothing
+/// and persists nothing: the refusal is a property of the value submitted, decided without
+/// asking what the store holds.
+pub fn parameter_validation_error(member_path: &str) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(parameter_validation_error_message(member_path)),
+    }
+}
+
+/// The sentence CloudFront refuses an input MEMBER whose value is not even in the FORM that
+/// member takes with, for `member_path` — the same member path
+/// [`parameter_validation_error_message`] names.
+///
+/// Two conditions, two sentences: this one says the value could not be READ as what the member
+/// holds (a string that is no ARN at all, in a member that takes an ARN), and the other says a
+/// readable value did not pass that member's validation. Fixed text around the one variable
+/// part, as the other is. Recorded behaviour.
+pub fn parameter_invalid_format_message(member_path: &str) -> String {
+    format!("The parameter {member_path} Invalid Format.")
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for an input member whose value is not in the form
+/// that member takes — "An argument is invalid."
+pub fn parameter_invalid_format(member_path: &str) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(parameter_invalid_format_message(member_path)),
+    }
+}
+
 /// The sentence an ASSOCIATION refuses a web ACL CloudFront may not be put behind with:
 /// the whole text is fixed — it states that the web ACL named is not one for CloudFront and
 /// what to name instead — so nothing of the request reaches it. Recorded behaviour.

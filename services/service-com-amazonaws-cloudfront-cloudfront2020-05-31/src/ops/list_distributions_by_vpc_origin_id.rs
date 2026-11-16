@@ -149,6 +149,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // "The VPC origin ID": the same reading `GetVpcOrigin` gives its own path member —
+        // whether the value is an identifier CloudFront writes a VPC origin under is decided
+        // from the request, before anything is resolved, so a value outside that namespace is
+        // the argument this operation cannot read rather than a VPC origin reported absent.
+        if !crate::state::is_vpc_origin_id(&input.vpc_origin_id) {
+            return Err(ListDistributionsByVpcOriginIdErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("VpcOriginId"),
+            )
+            .into());
+        }
+
         // "MaxItems: the maximum number of items included in the list" — the member BOUNDS
         // the page rather than demanding one, so only a negative size names no page at all,
         // and the size served is bounded above by this emulator's own page ceiling. The same

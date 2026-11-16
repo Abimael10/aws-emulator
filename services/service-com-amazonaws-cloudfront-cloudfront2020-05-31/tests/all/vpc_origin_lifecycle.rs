@@ -17,9 +17,10 @@
 //! 3. a request no VPC origin can be built from is refused and stores nothing: an
 //!    `OriginSslProtocols` whose `Quantity` disagrees with its `Items` is
 //!    `InconsistentQuantities`, an endpoint `Arn` that is no ARN at all is `InvalidArgument`
-//!    with the one sentence this service states for that form, and a tag set no resource can
-//!    carry is refused by the service's one tagging rule;
-//! 4. an `Id` no VPC origin answers to is `EntityNotFound`, whatever its form;
+//!    naming that member's path, and a tag set no resource can carry is refused by the
+//!    service's one tagging rule;
+//! 4. an `Id` of the form CloudFront writes a VPC origin identifier in that no VPC origin
+//!    answers to is `EntityNotFound`;
 //! 5. the tags a create carries are the tags the tagging surface reports for the VPC
 //!    origin's ARN;
 //! 6. the ARN a create mints is an ARN the resource-policy surface attaches a policy to,
@@ -37,8 +38,9 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MALFORMED_ARN_MESSAGE, RESOURCE_POLICY_RESOURCE_TYPE, STATUS_DEPLOYED, VPC_ORIGIN_ID_PREFIX,
-    VPC_ORIGIN_NOT_FOUND_MESSAGE, VPC_ORIGIN_STATUS_DEPLOYING,
+    parameter_invalid_format_message, RESOURCE_POLICY_RESOURCE_TYPE, STATUS_DEPLOYED,
+    VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH, VPC_ORIGIN_ID_PREFIX, VPC_ORIGIN_NOT_FOUND_MESSAGE,
+    VPC_ORIGIN_STATUS_DEPLOYING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -49,7 +51,6 @@ use crate::distribution_tags::{
     list_tags_for_resource, reported_tags, tag, tag_sets_no_resource_can_carry, tags_xml,
     ReportedTags, SubmittedTag,
 };
-use crate::distributions_by_web_acl_id::encode_label;
 use crate::key_value_store_lifecycle::{escape, is_version_token, member};
 use crate::resource_policy_lifecycle::{
     get_resource_policy, policy, put_resource_policy, reported_document, stored,
@@ -133,22 +134,42 @@ impl Endpoint {
 
 /// The ARN of a load balancer in the caller's VPC, as a VPC origin endpoint names one.
 ///
+/// The ARN's name segment is a load balancer NAME, which Elastic Load Balancing states its own
+/// rule for — at most [`MAX_LOAD_BALANCER_NAME_IN_ARN`] characters of alphanumerics and
+/// hyphens, beginning and ending with neither — so an endpoint name of any other shape is
+/// mapped into a name that service could have issued rather than spelled whole into an ARN that
+/// names no load balancer at all (which CloudFront refuses, see
+/// [`crate::vpc_origin_argument_validation`]). The VPC origin's OWN name is unconstrained, so
+/// the two names are not the same string.
+///
 /// `pub(crate)` so a sibling suite that needs a VPC origin names its endpoint the same way
 /// rather than writing a second ARN by hand.
 pub(crate) fn load_balancer_arn(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(MAX_LOAD_BALANCER_NAME_IN_ARN)
+        .collect();
+    let trimmed = mapped.trim_matches('-');
+    let load_balancer = if trimmed.is_empty() { "lb" } else { trimmed };
     format!(
-        "arn:aws:elasticloadbalancing:us-east-1:{ACCOUNT_ID}:loadbalancer/app/{name}/\
+        "arn:aws:elasticloadbalancing:us-east-1:{ACCOUNT_ID}:loadbalancer/app/{load_balancer}/\
          0123456789abcdef"
     )
 }
 
+/// The longest name an Elastic Load Balancing ARN carries, from `CreateLoadBalancer`'s `Name`
+/// documentation ("can have a maximum of 32 characters") — the bound [`load_balancer_arn`]
+/// maps an endpoint name into.
+pub(crate) const MAX_LOAD_BALANCER_NAME_IN_ARN: usize = 32;
+
 /// The creates rules 1, 2, 5 and 6 are asserted over.
 ///
 /// The rows differ along both ports (the defaults the model documents, 80 and 443, and each
-/// published bound of a TCP port), every value `OriginProtocolPolicy` admits, whether the
-/// configuration lists `OriginSslProtocols` and how many protocols it lists, each value
-/// `IpAddressType` admits and its absence, the shape of the endpoint name and ARN, and
-/// whether the create carries tags.
+/// published bound of the ports an origin can be reached on), every value
+/// `OriginProtocolPolicy` admits, whether the configuration lists `OriginSslProtocols` and how
+/// many protocols it lists, each value `IpAddressType` admits and its absence, the shape of the
+/// endpoint name and ARN, and whether the create carries tags.
 fn create_table() -> Vec<Endpoint> {
     vec![
         Endpoint {
@@ -177,11 +198,12 @@ fn create_table() -> Vec<Endpoint> {
             ],
         },
         Endpoint {
-            case: "the lowest port, match-viewer, every SSL protocol, dualstack, one tag",
+            case: "the lowest unprivileged ports, match-viewer, every SSL protocol, dualstack, \
+                   one tag",
             name: "a".to_string(),
             arn: format!("arn:aws:ec2:us-east-1:{ACCOUNT_ID}:instance/i-0123456789abcdef0"),
-            http_port: 1,
-            https_port: 2,
+            http_port: 1_024,
+            https_port: 1_025,
             origin_protocol_policy: "match-viewer",
             // Every value `SslProtocol` admits, so the stored list is not a chosen few.
             ssl_protocols: Some(vec!["SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2"]),
@@ -575,7 +597,8 @@ async fn a_request_no_vpc_origin_can_be_built_from_is_refused() {
     }
 
     // An endpoint `Arn` that cannot be READ as an ARN at all, in each form that failure
-    // takes.
+    // takes: the refusal names the member by its PATH in the request and says the value is not
+    // even in the form that member takes.
     let arn_rows: [(&str, String); 5] = [
         ("the empty string", String::new()),
         ("a bare word", "not-an-arn".to_string()),
@@ -592,6 +615,7 @@ async fn a_request_no_vpc_origin_can_be_built_from_is_refused() {
             "https://orders.internal.example.com".to_string(),
         ),
     ];
+    let unreadable_arn = parameter_invalid_format_message(VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH);
     for (case, value) in &arn_rows {
         let endpoint = Endpoint {
             case: "an endpoint Arn that is no ARN",
@@ -619,8 +643,8 @@ async fn a_request_no_vpc_origin_can_be_built_from_is_refused() {
         );
         assert_eq!(
             refused.root().find_text("Message").unwrap_or_default(),
-            MALFORMED_ARN_MESSAGE,
-            "case {case}: expected message {MALFORMED_ARN_MESSAGE:?}, got {}",
+            unreadable_arn,
+            "case {case}: expected message {unreadable_arn:?}, got {}",
             refused.raw
         );
     }
@@ -670,9 +694,11 @@ async fn a_request_no_vpc_origin_can_be_built_from_is_refused() {
     );
 }
 
-/// RULE 4: an `Id` no VPC origin answers to is `EntityNotFound` with the one sentence this
-/// service states for that condition — whatever the id's form, and even while the service
-/// holds other VPC origins.
+/// RULE 4: an `Id` written the way CloudFront writes a VPC origin identifier that no VPC origin
+/// answers to is `EntityNotFound` with the one sentence this service states for that condition —
+/// even while the service holds other VPC origins. An `Id` of any other form never named a VPC
+/// origin at all, so it is the argument refusal instead
+/// ([`crate::vpc_origin_argument_validation`] is where that form table lives).
 #[tokio::test]
 async fn an_id_no_vpc_origin_answers_to_is_entity_not_found() {
     let router = emulator();
@@ -681,23 +707,27 @@ async fn an_id_no_vpc_origin_answers_to_is_entity_not_found() {
         .next()
         .expect("the create table is not empty");
     let created = create_vpc_origin(&router, &endpoint.xml()).await;
-    let (id, arn) = assert_record(&created, &endpoint, VPC_ORIGIN_STATUS_DEPLOYING, "the create");
+    let (id, _) = assert_record(&created, &endpoint, VPC_ORIGIN_STATUS_DEPLOYING, "the create");
 
-    // Rows differing along the FORM of the identifier: a minted id's namespace with another
-    // body, a bare word, an upper-case id, a very long id, and the VPC origin's own ARN —
-    // which is not the identifier this route addresses one by.
-    let rows: [(&str, String); 5] = [
+    // Rows differing along the BODY of an identifier of the VPC origin namespace that the
+    // store holds nothing under: a body of letters, one of digits, and a known id with its
+    // last character changed.
+    let mut flipped: Vec<char> = id.chars().collect();
+    let last = flipped.len() - 1;
+    flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
+    let rows: [(&str, String); 3] = [
         (
             "a minted namespace with a body no VPC origin holds",
             format!("{VPC_ORIGIN_ID_PREFIX}ABSENT0000000"),
         ),
-        ("a bare word", "absent".to_string()),
-        ("an upper-case id", id.to_uppercase()),
         (
-            "an id of two hundred characters",
-            format!("{VPC_ORIGIN_ID_PREFIX}{}", "0".repeat(200)),
+            "a body of digits no VPC origin holds",
+            format!("{VPC_ORIGIN_ID_PREFIX}0123456789012"),
         ),
-        ("the VPC origin's own ARN", encode_label(&arn)),
+        (
+            "a held id with its last character changed",
+            flipped.into_iter().collect(),
+        ),
     ];
     for (case, identifier) in &rows {
         let answer = get_vpc_origin(&router, identifier).await;

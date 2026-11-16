@@ -476,8 +476,10 @@ async fn a_vpc_origin_nothing_fronts_lists_nothing() {
     );
 }
 
-/// An id the store holds no VPC origin for is `EntityNotFound`, whatever shape the id takes —
-/// never an empty page, which would claim the VPC origin exists.
+/// An id the store holds no VPC origin for is `EntityNotFound` — never an empty page, which
+/// would claim the VPC origin exists. The rows differ along the BODY of an identifier of the
+/// VPC origin namespace, since a value of any OTHER form never named a VPC origin at all and
+/// is the argument refusal instead ([`crate::vpc_origin_argument_validation`]).
 #[tokio::test]
 async fn an_id_no_vpc_origin_holds_is_refused() {
     let router = emulator();
@@ -486,24 +488,19 @@ async fn an_id_no_vpc_origin_holds_is_refused() {
 
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
-    flipped[last] = if flipped[last] == 'a' { 'b' } else { 'a' };
-    let absent: [(&str, String); 5] = [
+    flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
+    let absent: [(&str, String); 3] = [
         (
-            "the minted namespace with a body nothing holds",
-            format!("{VPC_ORIGIN_ID_PREFIX}0000000000000000"),
+            "the minted namespace with a body of digits nothing holds",
+            format!("{VPC_ORIGIN_ID_PREFIX}0000000000000"),
         ),
         (
             "a known id with one character changed",
             flipped.into_iter().collect(),
         ),
-        ("a known id in upper case", known.to_uppercase()),
         (
-            "a token outside the minted namespace",
-            "not-a-vpc-origin-id".to_string(),
-        ),
-        (
-            "the endpoint name rather than the id",
-            "by-vpc-origin-0".to_string(),
+            "the minted namespace with a body of letters nothing holds",
+            format!("{VPC_ORIGIN_ID_PREFIX}ABSENTABSENTX"),
         ),
     ];
 

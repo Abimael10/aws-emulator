@@ -606,10 +606,11 @@ pub fn names_a_certificate(
 }
 
 /// The refusal a submitted configuration carries BY ITSELF, with nothing of the store or of
-/// another service read: the quantity agreements ([`config_quantity_mismatch`]) and then the
-/// per-list quotas ([`config_limit_exceeded`]), in that order.
+/// another service read: the quantity agreements ([`config_quantity_mismatch`]), the ports its
+/// origins name ([`origin_port_refusal`]) and then the per-list quotas
+/// ([`config_limit_exceeded`]), in that order.
 ///
-/// The ONE reading of those two, so the shared create path
+/// The ONE reading of those, so the shared create path
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::create_distribution`]) and a handler
 /// that answers them BEFORE it resolves the configuration's Lambda@Edge associations against
 /// the services that hold the function and its execution role
@@ -619,7 +620,70 @@ pub fn config_refusal_without_state(config: &DistributionConfig) -> Option<Creat
     if let Some(message) = config_quantity_mismatch(config) {
         return Some(CreateRefusal::InconsistentQuantities(message));
     }
+    if let Some(message) = origin_port_refusal(config) {
+        return Some(CreateRefusal::InvalidArgument(message));
+    }
     config_limit_exceeded(config).map(CreateRefusal::ConfigLimit)
+}
+
+/// The two ports every origin of CloudFront's reaches a backend on by DEFAULT, from
+/// `CustomOriginConfig$HTTPPort` and `$HTTPSPort` ("The default value is `80`" and "`443`"),
+/// which are also the two privileged ports an origin may be reached on at all
+/// ([`is_origin_port`]).
+pub const DEFAULT_ORIGIN_PORTS: [i32; 2] = [80, 443];
+
+/// The lowest UNPRIVILEGED port an origin may be reached on: every port from here up to
+/// [`MAX_ORIGIN_PORT`] is one CloudFront connects to an origin on.
+pub const MIN_UNPRIVILEGED_ORIGIN_PORT: i32 = 1024;
+
+/// The highest port a TCP endpoint has, and so the highest an origin can be reached on.
+pub const MAX_ORIGIN_PORT: i32 = 65_535;
+
+/// Whether `port` is a port CloudFront connects to an origin on: one of the two defaults
+/// ([`DEFAULT_ORIGIN_PORTS`]) or an unprivileged port
+/// ([`MIN_UNPRIVILEGED_ORIGIN_PORT`]..=[`MAX_ORIGIN_PORT`]).
+///
+/// The set is the service's own, stated for the ports an origin configuration names — the
+/// documented defaults, 80 and 443, plus the unprivileged range — so every member of a
+/// configuration that carries a port is read with this one predicate, whether the origin is a
+/// custom origin of a distribution or the endpoint of a VPC origin, and a port outside it is
+/// refused with the one sentence this service states for that condition
+/// ([`ORIGIN_PORT_OUT_OF_RANGE_MESSAGE`]).
+pub fn is_origin_port(port: i32) -> bool {
+    DEFAULT_ORIGIN_PORTS.contains(&port)
+        || (MIN_UNPRIVILEGED_ORIGIN_PORT..=MAX_ORIGIN_PORT).contains(&port)
+}
+
+/// The sentence CloudFront refuses a port no origin can be reached on with: the whole text is
+/// fixed — it names the kind of parameter rather than the member that carried it or the value
+/// it carried — so every port of every origin configuration is refused the same way. Recorded
+/// behaviour.
+pub const ORIGIN_PORT_OUT_OF_RANGE_MESSAGE: &str =
+    "The parameter origin port is not within allowed range.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a port no origin can be reached on.
+pub fn origin_port_out_of_range() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(ORIGIN_PORT_OUT_OF_RANGE_MESSAGE.to_string()),
+    }
+}
+
+/// The refusal `config` carries when one of its origins names a port no origin can be reached
+/// on, or `None` when every port it states is one ([`is_origin_port`]).
+///
+/// Only a CUSTOM origin states ports — an S3 origin is reached over the bucket's own endpoint
+/// and a VPC origin names the VPC origin whose own endpoint configuration carries them — so
+/// those are the members walked here, both of them, since the rule is about a port rather than
+/// about which member it arrived in.
+pub fn origin_port_refusal(config: &DistributionConfig) -> Option<String> {
+    config
+        .origins
+        .items
+        .iter()
+        .filter_map(|origin| origin.custom_origin_config.as_ref())
+        .flat_map(|custom| [custom.http_port, custom.https_port])
+        .any(|port| !is_origin_port(port))
+        .then(|| ORIGIN_PORT_OUT_OF_RANGE_MESSAGE.to_string())
 }
 
 /// A count in a submitted configuration that exceeds what this service stores, and the

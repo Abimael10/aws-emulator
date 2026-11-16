@@ -48,18 +48,212 @@ pub const MAX_VPC_ORIGINS: usize = 1_000;
 /// The sentence CloudFront answers an id no VPC origin answers to with.
 ///
 /// It states the CONDITION and echoes no part of the request, as every other not-found
-/// sentence of this service states its own ([`TRUST_STORE_NOT_FOUND_MESSAGE`]), so the same
-/// sentence answers an unknown id and an id of no form this service issues.
+/// sentence of this service states its own ([`TRUST_STORE_NOT_FOUND_MESSAGE`]), so every
+/// operation that resolves a VPC origin answers an id it holds none under the same way. It is
+/// the answer to a READABLE identifier alone ([`is_vpc_origin_id`]): an argument of no form a
+/// VPC origin id takes never named a VPC origin to be absent.
 pub const VPC_ORIGIN_NOT_FOUND_MESSAGE: &str = "The specified VPC origin does not exist.";
 
 /// The modelled `EntityNotFound` (HTTP 404) for an `Id` no stored VPC origin answers to.
 ///
 /// Takes no id: the sentence is fixed ([`VPC_ORIGIN_NOT_FOUND_MESSAGE`]), so every operation
 /// that resolves a VPC origin refuses this condition the same way.
+///
+/// This is the answer a READABLE VPC origin id ([`is_vpc_origin_id`]) the store holds nothing
+/// under gets; a value of no form a VPC origin id is written in is the argument this service
+/// cannot read at all ([`invalid_id_format`]), which is a different condition and a different
+/// code.
 pub fn vpc_origin_not_found() -> EntityNotFound {
     EntityNotFound {
         message: Some(VPC_ORIGIN_NOT_FOUND_MESSAGE.to_string()),
     }
+}
+
+/// Whether `value` is written the way CloudFront writes a VPC origin identifier: the VPC
+/// origin namespace label ([`VPC_ORIGIN_ID_PREFIX`]) followed by a body of the width and
+/// alphabet this service issues one at ([`is_token_body`], the body every token it mints
+/// carries), which is the form the model's own VPC origin examples spell.
+///
+/// This is ALL the request alone decides about such an identifier, and it is what the
+/// operations ADDRESSED by one (`GetVpcOrigin$Id`,
+/// `ListDistributionsByVpcOriginId$VpcOriginId`) read their path member with. The SAME split
+/// [`unresolved_public_key_id`] makes for another resource of this service, over this kind's
+/// own namespace: whether an identifier of this form was ever ISSUED is a property of the
+/// STORE, so a value of this form nothing answers to is a VPC origin that is ABSENT
+/// ([`vpc_origin_not_found`]), while every other value — another resource kind's identifier,
+/// an opaque identifier of the width CloudFront writes ANOTHER kind's body at, this VPC
+/// origin's own ARN, an upper-cased label, a bare word — is the argument the service reports
+/// it cannot read ([`invalid_id_format`]). Recorded behaviour decides the split, since the
+/// model constrains `VpcOrigin$Id` no further than `string`: a `vo_` label carrying a body of
+/// another kind's width is answered the invalid-format refusal rather than the absent-origin
+/// one.
+///
+/// Only an identifier that ADDRESSES the operation is judged this way: a VPC origin id borne by
+/// a submitted DOCUMENT (`VpcOriginConfig$VpcOriginId` on a distribution configuration)
+/// addresses nothing, so it is resolved against the store alone.
+pub fn is_vpc_origin_id(value: &str) -> bool {
+    value
+        .strip_prefix(VPC_ORIGIN_ID_PREFIX)
+        .is_some_and(is_token_body)
+}
+
+/// The path of the `VpcOriginEndpointConfig$Arn` member, as a refusal naming it spells it
+/// ([`parameter_validation_error`]): the enclosing shape and the member, separated by a space.
+pub const VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH: &str = "VpcOriginEndpointConfig Arn";
+
+/// The ARN service namespace of the load balancers a VPC origin endpoint can front.
+pub const LOAD_BALANCER_ARN_NAMESPACE: &str = "elasticloadbalancing";
+
+/// The ARN service namespace of the compute instances a VPC origin endpoint can front.
+pub const INSTANCE_ARN_NAMESPACE: &str = "ec2";
+
+/// The load balancer TYPE CODES an Elastic Load Balancing ARN spells for the two kinds of load
+/// balancer a VPC origin endpoint can front — an Application Load Balancer (`app`) and a
+/// Network Load Balancer (`net`).
+///
+/// An Elastic Load Balancing ARN spells its resource `loadbalancer/<type code>/<name>/<id>`,
+/// and the third code that service mints (`gwy`, a Gateway Load Balancer) is not a kind
+/// CloudFront creates a VPC origin for, so it is not in this table.
+pub const VPC_ORIGIN_LOAD_BALANCER_TYPE_CODES: [&str; 2] = ["app", "net"];
+
+/// The width of the resource id an Elastic Load Balancing ARN ends with: 16 hexadecimal
+/// characters, the id that service mints for every load balancer it creates.
+const LOAD_BALANCER_ID_LEN: usize = 16;
+
+/// The widths of the hexadecimal body an EC2 instance id carries after its `i-` label: the
+/// eight characters of the short form and the seventeen of the long one.
+const INSTANCE_ID_BODY_LENS: [usize; 2] = [8, 17];
+
+/// The longest name a load balancer carries, from `CreateLoadBalancer`'s `Name`
+/// documentation: "can have a maximum of 32 characters".
+const MAX_LOAD_BALANCER_NAME: usize = 32;
+
+/// The prefix a load balancer name may not begin with, from the same documentation: "must not
+/// begin with 'internal-'" — the label Elastic Load Balancing itself puts in front of an
+/// internal load balancer's DNS name.
+const RESERVED_LOAD_BALANCER_NAME_PREFIX: &str = "internal-";
+
+/// Whether `name` is a name Elastic Load Balancing can have issued a load balancer under.
+///
+/// Every clause is one of `CreateLoadBalancerInput$Name`'s own: the name "must be unique per
+/// region per account, can have a maximum of 32 characters, must contain only alphanumeric
+/// characters or hyphens, must not begin or end with a hyphen, and must not begin with
+/// 'internal-'". Uniqueness is a property of that service's store and no part of what a
+/// value says about itself, so the clauses read here are the ones a value alone answers.
+///
+/// A segment that breaks one of them is a name no load balancer of that service could ever
+/// carry, so an ARN carrying it names nothing — which is what makes it readable as a refusal
+/// of the ARN rather than a resource that is merely absent.
+fn is_load_balancer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_LOAD_BALANCER_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.starts_with(RESERVED_LOAD_BALANCER_NAME_PREFIX)
+}
+
+/// Whether `value` is an ARN naming a resource a VPC origin endpoint can front.
+///
+/// `VpcOriginEndpointConfig$Arn` is "The ARN of the CloudFront VPC origin endpoint
+/// configuration" — the resource in the caller's VPC the origin sends requests to — and the
+/// resources a VPC origin is created for are an Application Load Balancer, a Network Load
+/// Balancer and an EC2 instance. So a value that validates is readable as an ARN at all
+/// ([`is_readable_arn`]), names a region and an account — such a resource lives in one region
+/// and is owned by one account — and spells, in the namespace that owns the kind, the resource
+/// form that kind's own ARNs carry:
+///
+/// * `elasticloadbalancing` → `loadbalancer/<type code>/<name>/<id>`, with a type code of a
+///   load balancer CloudFront fronts ([`VPC_ORIGIN_LOAD_BALANCER_TYPE_CODES`]), a name that
+///   service can have issued a load balancer under ([`is_load_balancer_name`]), and the 16
+///   hexadecimal characters of its resource id;
+/// * `ec2` → `instance/i-<hex>`, the instance id form EC2 issues
+///   ([`INSTANCE_ID_BODY_LENS`]).
+///
+/// What it does NOT ask is whether the resource EXISTS: the resource belongs to another
+/// service, and this check is the FORM of the value the request carried, decided without
+/// asking any store what it holds. What it DOES decide is that the value could name a
+/// resource at all — a segment outside the form the owning service issues names one that
+/// could never have been created.
+pub fn is_vpc_origin_endpoint_arn(value: &str) -> bool {
+    if !is_readable_arn(value) {
+        return false;
+    }
+    let segments: Vec<&str> = value.splitn(6, ':').collect();
+    let [_, _, service, region, account, resource] = segments[..] else {
+        return false;
+    };
+    !region.is_empty() && !account.is_empty() && names_vpc_origin_resource(service, resource)
+}
+
+/// Whether `resource` is the resource part of an ARN of `service` naming a resource a VPC
+/// origin endpoint can front — the per-kind forms [`is_vpc_origin_endpoint_arn`] documents.
+fn names_vpc_origin_resource(service: &str, resource: &str) -> bool {
+    match service {
+        LOAD_BALANCER_ARN_NAMESPACE => {
+            let Some(rest) = resource.strip_prefix("loadbalancer/") else {
+                return false;
+            };
+            let [type_code, name, id] = rest.split('/').collect::<Vec<&str>>()[..] else {
+                return false;
+            };
+            VPC_ORIGIN_LOAD_BALANCER_TYPE_CODES.contains(&type_code)
+                && is_load_balancer_name(name)
+                && id.len() == LOAD_BALANCER_ID_LEN
+                && id.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        INSTANCE_ARN_NAMESPACE => {
+            let Some(body) = resource.strip_prefix("instance/i-") else {
+                return false;
+            };
+            INSTANCE_ID_BODY_LENS.contains(&body.len())
+                && body.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
+/// The refusal CloudFront's argument validation answers a `VpcOriginEndpointConfig` it does
+/// not accept, or `None` when the configuration validates.
+///
+/// `Arn` is the member that NAMES a resource, and the two ways that value can fail are two
+/// refusals, told apart as the service tells them apart: a value that is no ARN at all is
+/// refused on the member's FORM ([`parameter_invalid_format`]), and one that reads as an ARN
+/// but names no resource a VPC origin can front ([`is_vpc_origin_endpoint_arn`]) fails that
+/// member's validation ([`parameter_validation_error`]). Either way the member is named by its
+/// PATH in the request. The two PORTS are read with this service's one origin-port rule.
+/// Nothing is minted from a configuration this refuses.
+///
+/// The configuration's other members are judged by the model itself: `Name`, `Arn`,
+/// `HTTPPort`, `HTTPSPort` and `OriginProtocolPolicy` are `@required` and the protocol members
+/// are enumerations, so a request missing one or naming a value outside one never reaches a
+/// handler.
+///
+/// One walk for every operation that takes an endpoint configuration, so a create and a later
+/// update cannot disagree about which configurations this service will store.
+pub fn vpc_origin_endpoint_config_validation(
+    config: &VpcOriginEndpointConfig,
+) -> Option<crate::ops::types::InvalidArgument> {
+    if !is_vpc_origin_endpoint_arn(&config.arn) {
+        // One reading of the value decides which of the two refusals it gets: a value that
+        // could not be read as an ARN at all failed the member's FORM, and one that was read
+        // but names no resource a VPC origin can front failed its validation.
+        return Some(if is_readable_arn(&config.arn) {
+            parameter_validation_error(VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH)
+        } else {
+            parameter_invalid_format(VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH)
+        });
+    }
+    // "The HTTP port for the CloudFront VPC origin endpoint configuration" and its HTTPS
+    // counterpart are ports an ORIGIN is reached on, so they are read with the one rule this
+    // service states for an origin's ports ([`is_origin_port`]) — the same rule a
+    // distribution's custom origin is read with, worded the same way.
+    [config.http_port, config.https_port]
+        .into_iter()
+        .any(|port| !is_origin_port(port))
+        .then(origin_port_out_of_range)
 }
 
 /// The modelled `InconsistentQuantities` message for the one list wrapper a

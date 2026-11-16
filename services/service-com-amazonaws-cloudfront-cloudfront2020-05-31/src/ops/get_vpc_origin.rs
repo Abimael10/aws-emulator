@@ -4,7 +4,8 @@
 //!
 //! "Get the details of an Amazon CloudFront VPC origin": REPORTS the VPC origin the stored
 //! record holds for the `Id` the route names, with the version token of its last mutation.
-//! An id no stored VPC origin answers to is `EntityNotFound`.
+//! An `Id` of no form a VPC origin identifier takes is `InvalidArgument`, read before the
+//! store is consulted; a readable id no stored VPC origin answers to is `EntityNotFound`.
 //!
 //! A read, so it writes nothing of its own: it materialises only the deployment the CLOCK
 //! already owes the store ([`crate::state::StoredVpcOrigin::settle`]), which was owed at the
@@ -137,6 +138,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let _ = ctx;
+
+        // "The VPC origin ID": whether the value is an identifier CloudFront writes a VPC
+        // origin under is a property of the REQUEST, so it is read before the store is
+        // consulted — a value outside that namespace is the argument this operation reports it
+        // cannot read, and only a readable one goes on to be resolved, where the store holding
+        // nothing under it is the VPC origin that is ABSENT.
+        if !crate::state::is_vpc_origin_id(&input.id) {
+            return Err(GetVpcOriginErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("Id"),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // Materialise the deployment the clock already owes, so the status this read reports
         // is the one the VPC origin has at this instant.
