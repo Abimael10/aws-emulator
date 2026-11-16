@@ -1,0 +1,43 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__ec2.metrics-ec2-ecs-monitor-instances-on-terminated-instance-rejected cloudwatch__ec2.metrics-ec2-ecs-stopped-instance-stops-publishing-but-keeps-its-history-and-aggregates cloudwatch__ec2.unmonitor-instances-restores-five-minute-cpu-publication-after-monitor-instances
+Issue-Key: cloudwatch__ec2.metrics-ec2-ecs-monitor-instances-on-terminated-instance-rejected|run#21|AssertionError|assert refusal == want, (
+Issue-Key: cloudwatch__ec2.metrics-ec2-ecs-stopped-instance-stops-publishing-but-keeps-its-history-and-aggregates|_poll_until#17|Timeout|time.sleep(interval_s)
+Issue-Key: cloudwatch__ec2.unmonitor-instances-restores-five-minute-cpu-publication-after-monitor-instances|_poll#32|Timeout|time.sleep(interval_s)
+Issue-Commit: a1915270e40223bfb23a5a7de86fe74aa15a3df0
+
+# cloudwatch__ec2: 2 net-new causes — MonitorInstances on a terminated instance answers IncorrectInstanceState with emulator-authored prose instead of InvalidState, and detailed monitoring never publishes 1-minute CPUUtilization
+
+> _Note: this issue was identified against the code base at commit `a1915270e40223bfb23a5a7de86fe74aa15a3df0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+MonitorInstances
+
+## Description
+Two net-new root causes in the EC2 instance-monitoring path and the AWS/EC2 CPUUtilization cadence it is supposed to change. Both must be closed before submitting.
+
+Cause 1 of 2: MonitorInstances on a terminated instance is refused with the wrong error code and an emulator-authored message.
+AWS: Smithy: MonitorInstances (com.amazonaws.ec2#AmazonEC2) declares errors: [] — EC2 carries no modeled errors, so this is recorded behavior only. The recording shows the call refused with error code `InvalidState` and the message `Instance is not in a supported state.` — that message is entirely fixed text: it names no instance id, no state and no other request value, so nothing in it is substituted from the request or from state. The refusal must also leave the instance's Monitoring.State at `disabled` (a refusal changes no state), while the same call on a running instance succeeds and reports Monitoring.State in {pending, enabled}.
+Emulator: the call is refused with error code `IncorrectInstanceState` and the message `The instance 'i-00000000000000001' is not in a state from which it can be monitored.` — a different error class plus emulator-authored prose that interpolates the instance id AWS does not mention.
+Why: a client that branches on the refusal (retry/ignore vs. propagate) matches on the error code, so `IncorrectInstanceState` routes a terminated-instance refusal down the wrong path, and any log/assertion on AWS's fixed message text fails even though the request was refused.
+Fix: the MonitorInstances handler's state validation in the EC2 service — classify a non-monitorable instance state as `InvalidState` and emit AWS's fixed message verbatim.
+Traces: cloudwatch__ec2.metrics-ec2-ecs-monitor-instances-on-terminated-instance-rejected.
+
+Cause 2 of 2: detailed monitoring never changes the AWS/EC2 CPUUtilization publication cadence, so no 1-minute (off-5-minute-grid) datapoint ever appears and both detailed-monitoring scenarios exhaust their budget without a verdict.
+AWS: recorded behavior only (MonitorInstances/UnmonitorInstances declare errors: [] and the model says nothing about metric cadence). The recordings require: an instance launched with Monitoring.Enabled=true, or one moved to Monitoring.State `enabled` by MonitorInstances, publishes AWS/EC2 CPUUtilization at 1-minute resolution — i.e. datapoints whose timestamps are NOT on the 5-minute grid — under dimension InstanceId; the aggregate series under dimension InstanceType and under dimension ImageId cover the same minutes with SampleCount at least the sum of the contributing instances', Maximum at least their maximum, and Unit `Percent`; after UnmonitorInstances walks Monitoring.State back to `disabled`, the series keeps being published but only on 5-minute boundaries. A sibling check in the same group shows basic (5-minute) publication does work in this emulator, so the gap is specific to the 1-minute cadence and the aggregate dimensions.
+Emulator: neither scenario ever observes an off-5-minute-grid CPUUtilization datapoint; each is cut at the harness's 600 s budget (`Check timed out after 600.0s`) at the poll that waits for it, so the stopped-instance/history and the Unmonitor-restores-5-minute assertions are never graded. Hypothesis: CPUUtilization is emitted on a fixed 5-minute schedule regardless of the instance's Monitoring.State, and the InstanceType/ImageId aggregate series are not rolled up at all.
+Why: a client cannot tell detailed monitoring from basic monitoring — enabling it buys no finer resolution, alarms written against 1-minute periods see INSUFFICIENT_DATA forever, and any roll-up read on the InstanceType or ImageId dimension is empty.
+Fix: the EC2 metric-emission path that feeds AWS/EC2 into CloudWatch — make the publication period follow the instance's Monitoring.State (60 s when enabled, 300 s when disabled, switching when MonitorInstances/UnmonitorInstances settle) and publish the InstanceType and ImageId aggregates for the same periods with Unit Percent.
+Traces: cloudwatch__ec2.metrics-ec2-ecs-stopped-instance-stops-publishing-but-keeps-its-history-and-aggregates, cloudwatch__ec2.unmonitor-instances-restores-five-minute-cpu-publication-after-monitor-instances.
+
+## Evidence
+Cause 1 — AssertionError: "MonitorInstances on terminated instance i-00000000000000001 returned error ('IncorrectInstanceState', \"The instance 'i-00000000000000001' is not in a state from which it can be monitored.\"); real AWS answers ('InvalidState', 'Instance is not in a supported state.')". Expected: error code InvalidState, message exactly "Instance is not in a supported state." (all fixed text). Actual: error code IncorrectInstanceState with the instance id interpolated into the message. (The instance id shown is a per-run value, not part of the requirement.)
+
+Cause 2 — both checks end with "Error: Check timed out after 600.0s". The poll each was sitting in: "both detailed-monitoring instances publishing CPUUtilization for at least two common off-5-minute-grid minutes" (metrics-ec2-ecs-stopped-instance-...), filtered as int(timestamp) % 300 != 0 under dimension InstanceId, plus "the aggregate AWS/EC2 CPUUtilization series [InstanceType=t3.micro] / [ImageId=<ami>] publishing a minute that both of our instances also published"; and for unmonitor-instances-... the first 1-minute off-grid datapoint after MonitorInstances took effect, before UnmonitorInstances is graded for a return to 5-minute-only publication. The sibling check metrics-ec2-ecs-monitor-instances-on-terminated-instance-rejected got past its basic-monitoring first-datapoint poll, so 5-minute publication exists while 1-minute publication never appears.
+
+## Steps to Reproduce
+Replay the behavioral suite and re-run the three checks in trace_ids. Individually:
+1. Launch an instance, wait for running, terminate it and wait for state `terminated`, then call ec2:MonitorInstances(InstanceIds=[<terminated id>]) — expect ('InvalidState', 'Instance is not in a supported state.') and DescribeInstances still reporting Monitoring.State 'disabled'; the same call on a running instance must report pending/enabled.
+2. Launch two t3.micro instances with Monitoring={'Enabled': True}, wait for Monitoring.State 'enabled', then poll cloudwatch:GetMetricStatistics/GetMetricData for AWS/EC2 CPUUtilization under dimension InstanceId and look for two common timestamps with int(ts) % 300 != 0; then read the same metric under dimension InstanceType=t3.micro and under dimension ImageId=<ami> for one of those minutes (SampleCount >= sum of the per-instance SampleCounts, Maximum >= their max, Unit 'Percent').
+3. On a running instance, call MonitorInstances, observe a 1-minute off-grid datapoint, then call UnmonitorInstances, wait for Monitoring.State 'disabled' and verify CPUUtilization keeps being published but only on 5-minute boundaries.
