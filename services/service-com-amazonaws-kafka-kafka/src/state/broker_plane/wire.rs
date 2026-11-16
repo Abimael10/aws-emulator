@@ -12,8 +12,10 @@
 //! The answers are COMPUTED from this service's state: `Metadata` reports the address
 //! the core bound and the topics the cluster holds, `DescribeConfigs` reports the
 //! topic configuration `CreateTopic`/`UpdateTopic` stored over Apache Kafka's
-//! documented defaults, and `Produce`/`Fetch`/`ListOffsets` write and read the
-//! partition log in [`super`]. An API this endpoint does not serve is answered
+//! documented defaults, `Produce`/`Fetch`/`ListOffsets` write and read the
+//! partition log in [`super`], and `CreateTopics`/`DeleteTopics` register and remove
+//! the cluster's own topics ([`topics`]) — the same records the control plane's topic
+//! operations write. An API this endpoint does not serve is answered
 //! `UNSUPPORTED_VERSION` rather than with an invented success, and the versions it
 //! does serve are the ones it advertises in `ApiVersions`.
 //!
@@ -36,7 +38,8 @@ use ::kafka_protocol::messages::{
     metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateAclsRequest,
-    DeleteAclsRequest, DescribeAclsRequest, DescribeConfigsRequest, DescribeConfigsResponse,
+    CreateTopicsRequest, DeleteAclsRequest, DeleteTopicsRequest, DescribeAclsRequest,
+    DescribeConfigsRequest, DescribeConfigsResponse,
     FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse,
     HeartbeatRequest, InitProducerIdRequest, InitProducerIdResponse, JoinGroupRequest,
     LeaveGroupRequest, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
@@ -53,7 +56,7 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::sasl::{self, Authenticated, Mechanism};
-use super::{acls, groups, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES};
+use super::{acls, groups, topics, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES};
 
 /// The resource type a `DescribeConfigs` request names a TOPIC by, and the one it
 /// names a BROKER by (`ConfigResource.Type`, Apache Kafka protocol).
@@ -119,6 +122,11 @@ const SERVED_APIS: &[(ApiKey, i16, i16)] = &[
     (ApiKey::LeaveGroup, 0, 4),
     (ApiKey::OffsetCommit, 0, 7),
     (ApiKey::OffsetFetch, 0, 7),
+    // Topic administration stops at the last version that names a topic by NAME
+    // alone: this endpoint reports no topic ids, so the versions that create and
+    // delete topics by id are not ones it can serve.
+    (ApiKey::CreateTopics, 0, 5),
+    (ApiKey::DeleteTopics, 0, 5),
 ];
 
 /// One access path of one cluster's Apache Kafka endpoint.
@@ -398,6 +406,53 @@ impl Broker {
                 drop(store);
                 self.encode(key, api_version, &header, &response)
             }
+            ApiKey::CreateTopics => {
+                let request = CreateTopicsRequest::decode(&mut body, api_version).ok()?;
+                // The ACL decision is taken BEFORE the store is locked: it reads the
+                // bindings under the same lock, so the two cannot be held at once.
+                let withheld = self.withheld_topics(
+                    session.identity.as_ref(),
+                    request.topics.iter().map(|topic| topic.name.0.to_string()),
+                    super::OPERATION_CREATE,
+                );
+                let mut store = self.state.lock();
+                let response = topics::create(
+                    &mut store,
+                    &self.region,
+                    &self.cluster_arn,
+                    &request,
+                    &withheld,
+                    MAX_REQUEST_ENTRIES,
+                    SystemTime::now(),
+                );
+                drop(store);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::DeleteTopics => {
+                let request = DeleteTopicsRequest::decode(&mut body, api_version).ok()?;
+                let withheld = self.withheld_topics(
+                    session.identity.as_ref(),
+                    request
+                        .topic_names
+                        .iter()
+                        .map(|name| name.0.to_string())
+                        .chain(request.topics.iter().filter_map(|topic| {
+                            topic.name.as_ref().map(|name| name.0.to_string())
+                        })),
+                    super::OPERATION_DELETE,
+                );
+                let mut store = self.state.lock();
+                let response = topics::delete(
+                    &mut store,
+                    &self.cluster_arn,
+                    &request,
+                    &withheld,
+                    MAX_REQUEST_ENTRIES,
+                    SystemTime::now(),
+                );
+                drop(store);
+                self.encode(key, api_version, &header, &response)
+            }
             ApiKey::DeleteAcls => {
                 let request = DeleteAclsRequest::decode(&mut body, api_version).ok()?;
                 let mut store = self.state.lock();
@@ -638,6 +693,24 @@ impl Broker {
                     operation,
                 )
             })
+    }
+
+    /// The topics among `named` an ACL binding this cluster's brokers hold withholds
+    /// from the connection's principal for `operation`.
+    ///
+    /// Resolved for the whole request before the store is written, since the bindings
+    /// are read under the same lock a write to the registry takes. Bounded like every
+    /// other per-request list: at most [`MAX_REQUEST_ENTRIES`] names are decided.
+    fn withheld_topics(
+        &self,
+        identity: Option<&Authenticated>,
+        named: impl Iterator<Item = String>,
+        operation: i8,
+    ) -> BTreeSet<String> {
+        named
+            .take(MAX_REQUEST_ENTRIES)
+            .filter(|name| self.withholds(identity, name, operation))
+            .collect()
     }
 
     /// `Metadata`: the brokers a client reaches this cluster at, and the topics it

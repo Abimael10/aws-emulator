@@ -143,7 +143,6 @@ impl Cluster {
         let config = ServerlessConfig {
             vpc_configs: request.vpc_configs,
             client_authentication: request.client_authentication,
-            bootstrap_host: format!("boot-{dns_suffix}.kafka-serverless.{region}.amazonaws.com"),
         };
 
         Self {

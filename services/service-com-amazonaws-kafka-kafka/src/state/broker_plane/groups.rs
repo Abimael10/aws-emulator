@@ -104,6 +104,16 @@ struct GroupMember {
 }
 
 impl ConsumerGroup {
+    /// Forget every offset this group committed for the topic `topic`.
+    ///
+    /// A topic that has left the cluster took its partitions with it, so the offsets
+    /// committed into them are offsets into nothing: a group reading a name created
+    /// again starts where a group that has committed nothing starts, rather than at a
+    /// position in a log that no longer exists.
+    pub fn release_topic(&mut self, topic: &str) {
+        self.offsets.retain(|(held, _), _| held != topic);
+    }
+
     /// `JoinGroup`: admit the member — minting its id when it joined without one — and
     /// answer the group's generation, its leader and its members.
     ///

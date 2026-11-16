@@ -1922,6 +1922,980 @@ impl Client {
     }
 }
 
+/// How long a probe below waits for a condition the clock owes the cluster — a topic's
+/// removal — before the suite calls it a failure: far longer than the span the service
+/// owes it, so the deadline says nothing about how fast the host runs.
+const TOPIC_CONDITION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long such a probe waits between two looks, a probing cadence rather than a bound
+/// on the transition.
+const TOPIC_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// One topic-level configuration entry a `CreateTopics` request carries.
+type WireConfig<'a> = (&'a str, &'a str);
+
+/// One topic a `CreateTopics` request asks for: its name, the partition count and the
+/// replication factor it names (`-1` asking for the broker's own default), and the
+/// topic-level configuration it sets.
+type WireTopic<'a> = (&'a str, i32, i16, &'a [WireConfig<'a>]);
+
+/// What one `CreateTopics` result says: the topic it is about, the error code, the error
+/// message, and the partitions and replication factor the broker reports it created.
+type CreatedTopic = (String, i16, String, i32, i16);
+
+impl Client {
+    /// `CreateTopics` for each topic, answering one result per topic.
+    ///
+    /// Sent at the highest version this endpoint serves, the one that reports back the
+    /// partitions and the replication factor the broker placed.
+    async fn create_topics(
+        &mut self,
+        case: &str,
+        topics: &[WireTopic<'_>],
+        validate_only: bool,
+    ) -> Vec<CreatedTopic> {
+        let answered: ::kafka_protocol::messages::CreateTopicsResponse = self
+            .call(
+                case,
+                ApiKey::CreateTopics,
+                5,
+                &::kafka_protocol::messages::CreateTopicsRequest::default()
+                    .with_timeout_ms(1_000)
+                    .with_validate_only(validate_only)
+                    .with_topics(
+                        topics
+                            .iter()
+                            .map(|(name, partitions, replication_factor, configs)| {
+                                ::kafka_protocol::messages::create_topics_request::CreatableTopic::default()
+                                    .with_name(TopicName(StrBytes::from_string((*name).to_string())))
+                                    .with_num_partitions(*partitions)
+                                    .with_replication_factor(*replication_factor)
+                                    .with_configs(
+                                        configs
+                                            .iter()
+                                            .map(|(key, value)| {
+                                                ::kafka_protocol::messages::create_topics_request::CreatableTopicConfig::default()
+                                                    .with_name(StrBytes::from_string((*key).to_string()))
+                                                    .with_value(Some(StrBytes::from_string(
+                                                        (*value).to_string(),
+                                                    )))
+                                            })
+                                            .collect(),
+                                    )
+                            })
+                            .collect(),
+                    ),
+            )
+            .await;
+        answered
+            .topics
+            .iter()
+            .map(|result| {
+                (
+                    result.name.0.to_string(),
+                    result.error_code,
+                    result
+                        .error_message
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    result.num_partitions,
+                    result.replication_factor,
+                )
+            })
+            .collect()
+    }
+
+    /// `DeleteTopics` for each name, answering `(topic, error code, error message)` per
+    /// name.
+    async fn delete_topics(
+        &mut self,
+        case: &str,
+        names: &[&str],
+    ) -> Vec<(String, i16, String)> {
+        let answered: ::kafka_protocol::messages::DeleteTopicsResponse = self
+            .call(
+                case,
+                ApiKey::DeleteTopics,
+                // The version that carries a per-topic error MESSAGE, which this
+                // endpoint's highest served version is.
+                5,
+                &::kafka_protocol::messages::DeleteTopicsRequest::default()
+                    .with_timeout_ms(1_000)
+                    .with_topic_names(
+                        names
+                            .iter()
+                            .map(|name| TopicName(StrBytes::from_string((*name).to_string())))
+                            .collect(),
+                    ),
+            )
+            .await;
+        answered
+            .responses
+            .iter()
+            .map(|result| {
+                (
+                    result
+                        .name
+                        .as_ref()
+                        .map(|name| name.0.to_string())
+                        .unwrap_or_default(),
+                    result.error_code,
+                    result
+                        .error_message
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// The topics `Metadata` reports for the cluster, as `name -> partition count`.
+    async fn metadata_topics(&mut self, case: &str) -> BTreeMap<String, usize> {
+        self.metadata(case)
+            .await
+            .topics
+            .iter()
+            .filter_map(|topic| {
+                topic
+                    .name
+                    .as_ref()
+                    .map(|name| (name.0.to_string(), topic.partitions.len()))
+            })
+            .collect()
+    }
+}
+
+/// The address a cluster publishes for one bootstrap member, once it publishes one.
+///
+/// `GetBootstrapBrokers` refuses while the cluster is still `CREATING`, so this LOOKS
+/// AGAIN until the address is published rather than waiting out a span.
+async fn published_address(
+    emulator: &Emulator,
+    cluster: &str,
+    member: &str,
+    case: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + TOPIC_CONDITION_DEADLINE;
+    loop {
+        let reply = emulator.bootstrap_brokers(cluster).await;
+        if let Some(address) = reply.body.get(member).and_then(Value::as_str) {
+            return address.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the cluster never published {member}, last read {} {}",
+            reply.status,
+            reply.body
+        );
+        std::thread::sleep(TOPIC_PROBE_INTERVAL);
+    }
+}
+
+/// An authenticated client on the one address an MSK SERVERLESS cluster publishes: the
+/// SASL/IAM path over TLS, which is the only way a client of such a cluster reaches its
+/// brokers — and so the only way it manages its topics.
+async fn serverless_client(case: &str, authority: &str) -> Client {
+    let mut client = Client::tls(case, authority).await;
+    client.api_versions(case).await;
+    assert_eq!(
+        client.authenticate(case, AWS_MSK_IAM, "a-signature").await,
+        0,
+        "case {case:?}: the IAM exchange must authenticate the connection"
+    );
+    client
+}
+
+/// RULE: topic administration over a published bootstrap address acts on the CLUSTER's
+/// own topics — a topic an admin client creates there is the cluster's topic, carrying
+/// the partitions and the configuration the request named, usable for records at once
+/// and reported by that cluster's own readers.
+///
+/// The rows differ along what the rule generalises over: how many PARTITIONS the request
+/// names (including `-1`, which asks for the broker's own default), what topic-level
+/// CONFIGURATION it sets, and which ACCESS PATH the admin client reached the cluster on
+/// — a provisioned cluster's plaintext path, and the SASL/IAM path that is the only one
+/// an MSK Serverless cluster has, where an admin client is the only way to create a
+/// topic at all.
+#[tokio::test]
+async fn an_admin_client_creates_the_clusters_own_topics_over_the_published_address() {
+    // (case, the topic the request asks for, the partitions the broker must place, the
+    // configuration entries it must report back)
+    let rows: &[(&str, WireTopic, i32, &[WireConfig])] = &[
+        (
+            "a single-partition topic with no configuration of its own",
+            ("admin-plain", 1, 1, &[]),
+            1,
+            &[],
+        ),
+        (
+            "a multi-partition topic",
+            ("admin-partitioned", 3, 1, &[]),
+            3,
+            &[],
+        ),
+        (
+            // `-1` is what a client sends to ask for the broker's own
+            // `num.partitions`/`default.replication.factor`, which this broker reports
+            // as 1 in its own configuration.
+            "a topic that asks for the broker's own defaults",
+            ("admin-defaulted", -1, -1, &[]),
+            1,
+            &[],
+        ),
+        (
+            "a topic that sets its retention and cleanup policy",
+            (
+                "admin-configured",
+                2,
+                1,
+                &[("retention.ms", "60000"), ("cleanup.policy", "compact")],
+            ),
+            2,
+            &[("retention.ms", "60000"), ("cleanup.policy", "compact")],
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    let provisioned = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("PLAINTEXT"),
+            ..ClusterRequest::named("admin-provisioned")
+        })
+        .await;
+    let serverless = emulator
+        .create_serverless_ok("admin-serverless", &[vec!["subnet-0a1b2c3d"]], Some(true))
+        .await;
+    let plaintext =
+        published_address(&emulator, &provisioned, "bootstrapBrokerString", "provisioned").await;
+    let sasl_iam = published_address(
+        &emulator,
+        &serverless,
+        "bootstrapBrokerStringSaslIam",
+        "serverless",
+    )
+    .await;
+
+    // (which cluster, its published address, whether that path authenticates with IAM
+    // over TLS, and whether the control plane's own topic readers serve that kind of
+    // cluster — Amazon MSK Serverless has no control-plane topic management, which the
+    // `topic_apis_serverless_gate` suite is about)
+    let endpoints: &[(&str, &str, &str, bool, bool)] = &[
+        ("a provisioned cluster", &provisioned, &plaintext, false, true),
+        ("a serverless cluster", &serverless, &sasl_iam, true, false),
+    ];
+
+    for (endpoint, cluster, authority, sasl, control_plane_reads) in endpoints {
+        for (row, (topic, partitions, replication_factor, configs), expected, reported) in rows {
+            let case = format!("{endpoint} / {row}");
+            let mut client = match sasl {
+                true => serverless_client(&case, authority).await,
+                false => {
+                    let mut client = Client::plaintext(&case, authority).await;
+                    client.api_versions(&case).await;
+                    client
+                }
+            };
+            let created = client
+                .create_topics(&case, &[(topic, *partitions, *replication_factor, configs)], false)
+                .await;
+            assert_eq!(
+                created.len(),
+                1,
+                "case {case:?}: expected one result per topic, got {created:?}"
+            );
+            let (name, code, message, placed, factor) = created[0].clone();
+            assert_eq!(
+                (name.as_str(), code, message.as_str()),
+                (*topic, 0, ""),
+                "case {case:?}: expected {topic} to be created, got {created:?}"
+            );
+            assert_eq!(
+                placed, *expected,
+                "case {case:?}: expected {expected} partitions placed, got {placed}"
+            );
+            assert_eq!(
+                factor, 1,
+                "case {case:?}: expected the replication factor 1 reported, got {factor}"
+            );
+
+            // The cluster's own brokers report it at once: the topic is there to produce
+            // to as soon as the create is answered.
+            let listed = client.metadata_topics(&case).await;
+            assert_eq!(
+                listed.get(*topic).copied(),
+                Some(usize::try_from(*expected).unwrap_or_default()),
+                "case {case:?}: Metadata must report {topic} with {expected} partitions, got \
+                 {listed:?}"
+            );
+            // And the configuration the request set is the topic's own, over Apache
+            // Kafka's documented defaults.
+            let reported_configs = client
+                .configs(&case, RESOURCE_TYPE_TOPIC, topic, None)
+                .await;
+            for (key, value) in *reported {
+                assert_eq!(
+                    reported_configs.get(*key).map(String::as_str),
+                    Some(*value),
+                    "case {case:?}: expected {key}={value} on the created topic, got \
+                     {reported_configs:?}"
+                );
+            }
+            assert_eq!(
+                reported_configs.get("min.insync.replicas").map(String::as_str),
+                Some("1"),
+                "case {case:?}: an entry the request did not set must be the documented \
+                 default, got {reported_configs:?}"
+            );
+
+            // Records: the topic a client created over this address is one it can
+            // produce to and fetch from straight away.
+            let produced = client
+                .produce(&case, topic, 0, &[(epoch_millis(), Some("k"), "payload")])
+                .await;
+            assert_eq!(
+                produced, 0,
+                "case {case:?}: the first record of a new topic takes offset 0, got {produced}"
+            );
+            let fetched = client.fetch(&case, topic, 0, 0).await;
+            assert_eq!(
+                fetched,
+                vec![(0, Some("k".to_string()), "payload".to_string())],
+                "case {case:?}: the record produced to the new topic must be fetched back, got \
+                 {fetched:?}"
+            );
+
+            // And the control plane reads back the same topic, for a cluster whose
+            // topics it serves at all.
+            if *control_plane_reads {
+                let described = emulator
+                    .call(
+                        "GET",
+                        &format!("/v1/clusters/{}/topics/{}", pct(cluster), pct(topic)),
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    described.status, 200,
+                    "case {case:?}: DescribeTopic must report the topic the wire created, got {} \
+                     {}",
+                    described.status, described.body
+                );
+                assert_eq!(
+                    described.at("/partitionCount").as_i64(),
+                    Some(i64::from(*expected)),
+                    "case {case:?}: DescribeTopic must report {expected} partitions, got {}",
+                    described.body
+                );
+            }
+        }
+    }
+}
+
+/// RULE: a topic-administration request the broker cannot place is REFUSED, with the
+/// Apache Kafka error code and the sentence that error class carries — and it registers
+/// nothing, so the cluster's topics are exactly those it could place.
+///
+/// The rows differ along what the rule generalises over: which part of the request the
+/// broker will not take — the name, the partition count, the replication factor against
+/// the brokers the cluster has, a name the cluster already holds — and a request that
+/// asks only to be VALIDATED, which is answered without creating anything.
+#[tokio::test]
+async fn topic_administration_refuses_what_the_broker_cannot_place() {
+    let invalid_topic = ::kafka_protocol::ResponseError::InvalidTopicException.code();
+    let invalid_partitions = ::kafka_protocol::ResponseError::InvalidPartitions.code();
+    let invalid_replication = ::kafka_protocol::ResponseError::InvalidReplicationFactor.code();
+    let already_exists = ::kafka_protocol::ResponseError::TopicAlreadyExists.code();
+    let invalid_request = ::kafka_protocol::ResponseError::InvalidRequest.code();
+
+    let emulator = Emulator::new();
+    // Three brokers, which is what bounds a topic's replication factor on this cluster.
+    let cluster = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("PLAINTEXT"),
+            ..ClusterRequest::named("admin-refusals")
+        })
+        .await;
+    let authority =
+        published_address(&emulator, &cluster, "bootstrapBrokerString", "refusals").await;
+    let mut client = Client::plaintext("refusals", &authority).await;
+    client.api_versions("refusals").await;
+
+    // The name the cluster already holds, created over the same address.
+    let held = client
+        .create_topics("the held topic", &[("admin-held", 1, 1, &[])], false)
+        .await;
+    assert_eq!(
+        held.first().map(|(_, code, _, _, _)| *code),
+        Some(0),
+        "setup: the first create of a name must be accepted, got {held:?}"
+    );
+
+    // (case, the topic the request asks for, the error code, the message)
+    let rows: &[(&str, WireTopic, i16, &str)] = &[
+        (
+            "a name the cluster already holds",
+            ("admin-held", 1, 1, &[]),
+            already_exists,
+            "Topic 'admin-held' already exists.",
+        ),
+        (
+            "a name with a character no topic name may carry",
+            ("admin bad name", 1, 1, &[]),
+            invalid_topic,
+            "Topic name \"admin bad name\" is illegal, it contains a character other than ASCII \
+             alphanumerics, '.', '_' and '-'",
+        ),
+        (
+            // Apache Kafka reserves both of these names.
+            "the reserved name",
+            ("..", 1, 1, &[]),
+            invalid_topic,
+            "Topic name cannot be \".\" or \"..\"",
+        ),
+        (
+            "no partitions at all",
+            ("admin-zero-partitions", 0, 1, &[]),
+            invalid_partitions,
+            "Number of partitions was set to an invalid non-positive value.",
+        ),
+        (
+            // Past the partitions of one topic this broker serves, so the count is
+            // refused rather than reported as a placement nothing is behind.
+            "more partitions than this broker places",
+            ("admin-over-partitioned", 1_025, 1, &[]),
+            invalid_partitions,
+            "This broker places at most 1024 partitions per topic.",
+        ),
+        (
+            "no replicas at all",
+            ("admin-zero-replicas", 1, 0, &[]),
+            invalid_replication,
+            "Replication factor must be larger than 0, or -1 to use the default value.",
+        ),
+        (
+            // Apache Kafka cannot place more replicas of a partition than the cluster
+            // has brokers to place them on, and this cluster has three.
+            "more replicas than the cluster has brokers",
+            ("admin-over-replicated", 1, 4, &[]),
+            invalid_replication,
+            "Replication factor: 4 larger than available brokers: 3.",
+        ),
+    ];
+    for (case, (topic, partitions, replication_factor, configs), code, message) in rows {
+        let answered = client
+            .create_topics(case, &[(topic, *partitions, *replication_factor, configs)], false)
+            .await;
+        let (name, answered_code, answered_message, _, _) = answered
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateTopics reported no result"));
+        assert_eq!(
+            (name.as_str(), answered_code, answered_message.as_str()),
+            (*topic, *code, *message),
+            "case {case:?}: expected the refusal ({code}, {message:?}), got {answered:?}"
+        );
+    }
+    // Nothing of the refused rows was registered: the cluster holds the one topic it
+    // could place.
+    let listed = client.metadata_topics("the refused rows").await;
+    assert_eq!(
+        listed.keys().cloned().collect::<Vec<String>>(),
+        vec!["admin-held".to_string()],
+        "a refused create must register nothing, got {listed:?}"
+    );
+
+    // A request that asks only to be validated is answered as the create would have
+    // been, and registers nothing either.
+    let validated = client
+        .create_topics("a validated name", &[("admin-validated", 2, 1, &[])], true)
+        .await;
+    assert_eq!(
+        validated.first().map(|(_, code, _, _, _)| *code),
+        Some(0),
+        "a name the broker could place must validate, got {validated:?}"
+    );
+    let validated_conflict = client
+        .create_topics("a validated held name", &[("admin-held", 1, 1, &[])], true)
+        .await;
+    assert_eq!(
+        validated_conflict.first().map(|(_, code, _, _, _)| *code),
+        Some(already_exists),
+        "a name the cluster holds must fail validation too, got {validated_conflict:?}"
+    );
+    let after = client.metadata_topics("after the validation").await;
+    assert_eq!(
+        after.keys().cloned().collect::<Vec<String>>(),
+        vec!["admin-held".to_string()],
+        "a validated create must register nothing, got {after:?}"
+    );
+
+    // And a name the cluster does not hold is nothing to delete.
+    let deleted = client
+        .delete_topics("an absent topic", &["admin-absent"])
+        .await;
+    assert_eq!(
+        deleted,
+        vec![(
+            "admin-absent".to_string(),
+            ::kafka_protocol::ResponseError::UnknownTopicOrPartition.code(),
+            "This server does not host this topic-partition.".to_string(),
+        )],
+        "deleting a name the cluster does not hold must be refused, got {deleted:?}"
+    );
+
+    // A request that names one topic TWICE says two things about one name: every entry
+    // for it is refused and nothing is created, whether the request asks to create or
+    // only to validate.
+    let repeated_entries = "Found multiple entries for this topic.";
+    for (case, validate_only) in [
+        ("a name stated twice", false),
+        ("a name stated twice, validated only", true),
+    ] {
+        let twice = client
+            .create_topics(
+                case,
+                &[("admin-twice", 1, 1, &[]), ("admin-twice", 2, 1, &[])],
+                validate_only,
+            )
+            .await;
+        let answered: Vec<(String, i16, String)> = twice
+            .iter()
+            .map(|(name, code, message, _, _)| (name.clone(), *code, message.clone()))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                (
+                    "admin-twice".to_string(),
+                    invalid_request,
+                    repeated_entries.to_string()
+                ),
+                (
+                    "admin-twice".to_string(),
+                    invalid_request,
+                    repeated_entries.to_string()
+                ),
+            ],
+            "case {case:?}: both entries of a repeated name must be refused, got {twice:?}"
+        );
+    }
+    // The delete side follows the same rule.
+    let deleted_twice = client
+        .delete_topics("a delete naming one topic twice", &["admin-held", "admin-held"])
+        .await;
+    assert_eq!(
+        deleted_twice,
+        vec![
+            (
+                "admin-held".to_string(),
+                invalid_request,
+                repeated_entries.to_string()
+            ),
+            (
+                "admin-held".to_string(),
+                invalid_request,
+                repeated_entries.to_string()
+            ),
+        ],
+        "both entries of a repeated name must be refused on the delete too, got \
+         {deleted_twice:?}"
+    );
+
+    // The two BOUNDS the rows above sit outside of, at the bound and one past it: a
+    // topic name is at most 249 characters (Apache Kafka's own maximum, which this
+    // service reads as `MAX_TOPIC_NAME_LENGTH`), and this broker places at most 1024
+    // partitions of one topic (`MAX_PARTITIONS_PER_TOPIC`).
+    let longest_name = "n".repeat(249);
+    let over_long_name = "n".repeat(250);
+    // (case, the topic the request asks for, the error code, the message)
+    let bounds: &[(&str, (&str, i32), i16, String)] = &[
+        ("the longest name a topic may carry", (&longest_name, 1), 0, String::new()),
+        (
+            "one character past that name length",
+            (&over_long_name, 1),
+            invalid_topic,
+            format!(
+                "Topic name is illegal, it can't be longer than 249 characters, topic name: \
+                 {over_long_name}"
+            ),
+        ),
+        (
+            "the most partitions this broker places",
+            ("admin-at-the-partition-bound", 1_024),
+            0,
+            String::new(),
+        ),
+    ];
+    for (case, (topic, partitions), code, message) in bounds {
+        let answered = client
+            .create_topics(case, &[(topic, *partitions, 1, &[])], false)
+            .await;
+        let (name, answered_code, answered_message, placed, _) = answered
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateTopics reported no result"));
+        assert_eq!(
+            (name.as_str(), answered_code, answered_message.as_str()),
+            (*topic, *code, message.as_str()),
+            "case {case:?}: expected ({code}, {message:?}), got {answered:?}"
+        );
+        if *code == 0 {
+            assert_eq!(
+                placed, *partitions,
+                "case {case:?}: expected {partitions} partitions placed, got {placed}"
+            );
+        }
+    }
+    // So the cluster holds exactly the names it could place: the held one and the two
+    // at the bounds.
+    let held_names = client.metadata_topics("at the bounds").await;
+    assert_eq!(
+        held_names.keys().cloned().collect::<Vec<String>>(),
+        vec![
+            "admin-at-the-partition-bound".to_string(),
+            "admin-held".to_string(),
+            longest_name.clone(),
+        ],
+        "only the names the broker could place may be registered, got {:?}",
+        held_names.keys().collect::<Vec<&String>>()
+    );
+}
+
+impl Client {
+    /// `CreateTopics` for one topic whose replicas are laid out BY HAND: one entry per
+    /// partition, each naming the brokers that partition's replicas sit on.
+    ///
+    /// `partitions` and `replication_factor` are sent as the request states them, so a
+    /// row can show what a request that states both a placement and a count is answered.
+    async fn create_topic_with_assignments(
+        &mut self,
+        case: &str,
+        topic: &str,
+        partitions: i32,
+        replication_factor: i16,
+        assignments: &[&[i32]],
+    ) -> CreatedTopic {
+        let answered: ::kafka_protocol::messages::CreateTopicsResponse = self
+            .call(
+                case,
+                ApiKey::CreateTopics,
+                5,
+                &::kafka_protocol::messages::CreateTopicsRequest::default()
+                    .with_timeout_ms(1_000)
+                    .with_topics(vec![
+                        ::kafka_protocol::messages::create_topics_request::CreatableTopic::default()
+                            .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                            .with_num_partitions(partitions)
+                            .with_replication_factor(replication_factor)
+                            .with_assignments(
+                                assignments
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, brokers)| {
+                                        ::kafka_protocol::messages::create_topics_request::CreatableReplicaAssignment::default()
+                                            .with_partition_index(i32::try_from(index).unwrap_or_default())
+                                            .with_broker_ids(
+                                                brokers
+                                                    .iter()
+                                                    .map(|broker| ::kafka_protocol::messages::BrokerId(*broker))
+                                                    .collect(),
+                                            )
+                                    })
+                                    .collect(),
+                            ),
+                    ]),
+            )
+            .await;
+        let result = answered
+            .topics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateTopics reported no result"));
+        (
+            result.name.0.to_string(),
+            result.error_code,
+            result
+                .error_message
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            result.num_partitions,
+            result.replication_factor,
+        )
+    }
+}
+
+/// One row of the accepted-placement table: the case, the topic, the placement (one
+/// broker list per partition), and the partitions and replication factor the broker must
+/// report for it.
+type PlacedTopic<'a> = (&'a str, &'a str, &'a [&'a [i32]], i32, i16);
+
+/// One row of the refused-placement table: the case, the topic, the partition count and
+/// replication factor the request states beside the placement, the placement itself, and
+/// the error code and message the broker must answer.
+type RefusedPlacement<'a> = (&'a str, &'a str, i32, i16, &'a [&'a [i32]], i16, &'a str);
+
+/// RULE: a manual replica assignment STATES the placement — one entry per partition,
+/// each naming the brokers that partition's replicas sit on — so the topic it creates
+/// carries one partition per entry and is replicated as many times as each entry names;
+/// a placement the cluster cannot make is refused with the Apache Kafka error code for
+/// that class and nothing is created.
+///
+/// The rows differ along what the rule generalises over: how many partitions the
+/// placement lays out, how many replicas each carries, and each way a placement can
+/// name something the cluster cannot do — a count stated beside it, a partition
+/// replicated a different number of times, one partition placed twice on one broker, and
+/// a broker the cluster does not have.
+#[tokio::test]
+async fn a_manual_replica_assignment_states_the_placement_or_is_refused() {
+    let invalid_request = ::kafka_protocol::ResponseError::InvalidRequest.code();
+    let invalid_assignment = ::kafka_protocol::ResponseError::InvalidReplicaAssignment.code();
+
+    let emulator = Emulator::new();
+    // Three brokers, which are the brokers 1, 2 and 3 a placement may name.
+    let cluster = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("PLAINTEXT"),
+            ..ClusterRequest::named("admin-assignments")
+        })
+        .await;
+    let authority =
+        published_address(&emulator, &cluster, "bootstrapBrokerString", "assignments").await;
+    let mut client = Client::plaintext("assignments", &authority).await;
+    client.api_versions("assignments").await;
+
+    // (case, the topic, the placement, the partitions and replication factor the broker
+    // must report)
+    let placed: &[PlacedTopic] = &[
+        (
+            "one partition on one broker",
+            "assigned-single",
+            &[&[1]],
+            1,
+            1,
+        ),
+        (
+            "two partitions, one replica each",
+            "assigned-spread",
+            &[&[1], &[2]],
+            2,
+            1,
+        ),
+        (
+            "three partitions replicated twice",
+            "assigned-replicated",
+            &[&[1, 2], &[2, 3], &[3, 1]],
+            3,
+            2,
+        ),
+    ];
+    for (case, topic, assignments, partitions, replication_factor) in placed {
+        let (name, code, message, placed_partitions, placed_replicas) = client
+            .create_topic_with_assignments(case, topic, -1, -1, assignments)
+            .await;
+        assert_eq!(
+            (name.as_str(), code, message.as_str()),
+            (*topic, 0, ""),
+            "case {case:?}: the placement must be accepted, got ({code}, {message:?})"
+        );
+        assert_eq!(
+            (placed_partitions, placed_replicas),
+            (*partitions, *replication_factor),
+            "case {case:?}: expected {partitions} partitions replicated {replication_factor} \
+             time(s), got {placed_partitions} and {placed_replicas}"
+        );
+        // The partitions the placement laid out are the partitions the cluster serves.
+        let listed = client.metadata_topics(case).await;
+        assert_eq!(
+            listed.get(*topic).copied(),
+            Some(usize::try_from(*partitions).unwrap_or_default()),
+            "case {case:?}: Metadata must report {partitions} partitions, got {listed:?}"
+        );
+    }
+
+    // (case, the topic, the count the request states beside the placement, the
+    // placement, the error code, the message)
+    let refused: &[RefusedPlacement] = &[
+        (
+            "a partition count stated beside the placement",
+            "assigned-and-counted",
+            2,
+            -1,
+            &[&[1], &[2]],
+            invalid_request,
+            "Both numPartitions or replicationFactor and replicasAssignments were set. Both \
+             cannot be used at the same time.",
+        ),
+        (
+            "a replication factor stated beside the placement",
+            "assigned-and-factored",
+            -1,
+            1,
+            &[&[1], &[2]],
+            invalid_request,
+            "Both numPartitions or replicationFactor and replicasAssignments were set. Both \
+             cannot be used at the same time.",
+        ),
+        (
+            "one partition replicated twice and the next once",
+            "assigned-ragged",
+            -1,
+            -1,
+            &[&[1, 2], &[3]],
+            invalid_assignment,
+            "Inconsistent replication factor between partitions, partition 0 has 2 while \
+             partition 1 has 1 replicas.",
+        ),
+        (
+            "both replicas of a partition on one broker",
+            "assigned-duplicated",
+            -1,
+            -1,
+            &[&[1, 1]],
+            invalid_assignment,
+            "Duplicate brokers not allowed in replica assignment for partition 0.",
+        ),
+        (
+            "a broker the cluster does not have",
+            "assigned-unknown-broker",
+            -1,
+            -1,
+            &[&[1], &[9]],
+            invalid_assignment,
+            "Unknown broker(s) in replica assignment for partition 1.",
+        ),
+        (
+            "a partition placed on no broker at all",
+            "assigned-empty",
+            -1,
+            -1,
+            &[&[]],
+            invalid_assignment,
+            "Inconsistent replication factor between partitions, partition 0 has 0 while \
+             partition 0 has 0 replicas.",
+        ),
+    ];
+    for (case, topic, partitions, replication_factor, assignments, code, message) in refused {
+        let (name, answered_code, answered_message, _, _) = client
+            .create_topic_with_assignments(
+                case,
+                topic,
+                *partitions,
+                *replication_factor,
+                assignments,
+            )
+            .await;
+        assert_eq!(
+            (name.as_str(), answered_code, answered_message.as_str()),
+            (*topic, *code, *message),
+            "case {case:?}: expected the refusal ({code}, {message:?}), got ({answered_code}, \
+             {answered_message:?})"
+        );
+    }
+    // Only the placements the cluster could make are registered.
+    let held = client.metadata_topics("the placements").await;
+    assert_eq!(
+        held.keys().cloned().collect::<Vec<String>>(),
+        vec![
+            "assigned-replicated".to_string(),
+            "assigned-single".to_string(),
+            "assigned-spread".to_string(),
+        ],
+        "a refused placement must register nothing, got {held:?}"
+    );
+}
+
+/// RULE: a topic an admin client DELETES over the published address stops being the
+/// cluster's topic — it leaves the brokers' metadata and keeps no records, so a name
+/// created again is a new, empty topic.
+#[tokio::test]
+async fn a_deleted_topic_leaves_the_cluster_and_keeps_no_records() {
+    let case = "a deleted and recreated topic";
+    let emulator = Emulator::new();
+    let cluster = emulator
+        .create_ok(&ClusterRequest {
+            client_broker: Some("PLAINTEXT"),
+            ..ClusterRequest::named("admin-deletion")
+        })
+        .await;
+    let authority = published_address(&emulator, &cluster, "bootstrapBrokerString", case).await;
+    let mut client = Client::plaintext(case, &authority).await;
+    client.api_versions(case).await;
+
+    let created = client
+        .create_topics(case, &[("admin-recycled", 1, 1, &[])], false)
+        .await;
+    assert_eq!(
+        created.first().map(|(_, code, _, _, _)| *code),
+        Some(0),
+        "case {case:?}: the topic must be created, got {created:?}"
+    );
+    client
+        .produce(
+            case,
+            "admin-recycled",
+            0,
+            &[
+                (epoch_millis(), None, "first"),
+                (epoch_millis(), None, "second"),
+            ],
+        )
+        .await;
+    let before = client.fetch(case, "admin-recycled", 0, 0).await;
+    assert_eq!(
+        before.len(),
+        2,
+        "case {case:?}: both records must be in the log, got {before:?}"
+    );
+
+    let deleted = client.delete_topics(case, &["admin-recycled"]).await;
+    assert_eq!(
+        deleted,
+        vec![("admin-recycled".to_string(), 0, String::new())],
+        "case {case:?}: the delete must be accepted, got {deleted:?}"
+    );
+
+    // The removal is a transition the clock owes the topic, so the metadata is read
+    // again until it no longer reports the name.
+    let deadline = std::time::Instant::now() + TOPIC_CONDITION_DEADLINE;
+    loop {
+        let listed = client.metadata_topics(case).await;
+        if !listed.contains_key("admin-recycled") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the deleted topic was still reported, got {listed:?}"
+        );
+        std::thread::sleep(TOPIC_PROBE_INTERVAL);
+    }
+
+    // The name is free again, and the topic created under it is empty: the records of
+    // the topic that held the name are gone with it.
+    let recreated = client
+        .create_topics(case, &[("admin-recycled", 1, 1, &[])], false)
+        .await;
+    assert_eq!(
+        recreated.first().map(|(_, code, _, _, _)| *code),
+        Some(0),
+        "case {case:?}: the name must be free to create again, got {recreated:?}"
+    );
+    let after = client.fetch(case, "admin-recycled", 0, 0).await;
+    assert!(
+        after.is_empty(),
+        "case {case:?}: a recreated topic must hold no records, got {after:?}"
+    );
+    let offset = client
+        .offset(case, "admin-recycled", 0, OFFSET_LATEST)
+        .await;
+    assert_eq!(
+        offset, 0,
+        "case {case:?}: a recreated topic's log must start at offset 0, got {offset}"
+    );
+}
+
 /// A SASL/SCRAM secret, minted through Secrets Manager's own `CreateSecret` and
 /// associated with the cluster, which is where a broker reads the credential from.
 async fn given_secret_associated(

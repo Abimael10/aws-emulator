@@ -33,6 +33,7 @@ use super::*;
 pub mod acls;
 pub mod groups;
 pub mod sasl;
+pub mod topics;
 pub mod wire;
 
 /// The broker node id the endpoint reports itself under in `Metadata`, and the leader
@@ -103,6 +104,11 @@ pub const RETENTION_MS_CONFIG: &str = "retention.ms";
 pub const OPERATION_WRITE: i8 = 4;
 /// See [`OPERATION_WRITE`].
 pub const OPERATION_READ: i8 = 3;
+/// The `AclOperation` creating a topic needs, and the one deleting it needs (the same
+/// enum).
+pub const OPERATION_CREATE: i8 = 5;
+/// See [`OPERATION_CREATE`].
+pub const OPERATION_DELETE: i8 = 6;
 
 /// The most partitions of one topic this endpoint reports and serves.
 ///

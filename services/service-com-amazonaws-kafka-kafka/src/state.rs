@@ -1241,22 +1241,20 @@ pub struct ClusterPolicy {
 }
 
 /// The configuration of a serverless cluster: the VPCs its clients reach it
-/// through, the client authentication it accepts, and the one endpoint they
-/// bootstrap on. Held beside the cluster record for the same reason the
-/// provisioned configuration is: every reader derives its answer from this one
-/// stored copy.
+/// through and the client authentication it accepts. Held beside the cluster
+/// record for the same reason the provisioned configuration is: every reader
+/// derives its answer from this one stored copy.
+///
+/// It holds no bootstrap HOST: the address a client bootstraps this cluster
+/// through is the socket the core bound for its one access path
+/// ([`broker_plane::ensure_cluster_endpoint`]), so the published endpoint is read
+/// from the listener that answers it rather than stored beside the cluster.
 #[derive(Debug, Clone)]
 pub struct ServerlessConfig {
     /// The `VpcConfigs` the create submitted, in the order it listed them.
     pub vpc_configs: Vec<VpcConfig>,
     /// The `ServerlessClientAuthentication` the create submitted, if any.
     pub client_authentication: Option<ServerlessClientAuthentication>,
-    /// The single host a client bootstraps this cluster through:
-    /// `boot-<id>.kafka-serverless.<region>.amazonaws.com`, the form Amazon MSK
-    /// Serverless publishes. Reached on [`PORT_SASL_IAM`], since IAM access
-    /// control is the only client authentication MSK Serverless offers, which is
-    /// why the serverless arm of `GetBootstrapBrokers` reports one string.
-    pub bootstrap_host: String,
 }
 
 impl ServerlessConfig {
@@ -4728,33 +4726,69 @@ pub fn is_configuration_name_length(name: &str) -> bool {
     (MIN_CONFIGURATION_NAME_LENGTH..=MAX_CONFIGURATION_NAME_LENGTH).contains(&name.chars().count())
 }
 
-/// Why `name` is not a legal Apache Kafka topic name, or `None` when it is.
+/// WHICH rule a value breaks as an Apache Kafka topic name — the one reading of
+/// topic-name legality in this crate, which both the surfaces that refuse such a
+/// name render their own sentence from.
 ///
 /// Apache Kafka's own rule (`org.apache.kafka.common.internals.Topic.validate`),
-/// which the MSK topic operations sit in front of: a name is at most
-/// [`MAX_TOPIC_NAME_LENGTH`] characters, is neither `.` nor `..`, and is made up
-/// only of the service's name characters ([`is_resource_name_character`]). The
-/// returned sentence names the member and the constraint it broke, so a refusal
-/// says which part of the request was wrong.
-pub fn topic_name_error(name: &str) -> Option<String> {
+/// which the MSK topic operations sit in front of: a name is not empty, is
+/// neither `.` nor `..`, is at most [`MAX_TOPIC_NAME_LENGTH`] characters, and is
+/// made up only of the service's name characters
+/// ([`is_resource_name_character`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicNameViolation {
+    /// The name carries no characters at all.
+    Empty,
+    /// The name is one of the two Apache Kafka reserves.
+    Reserved,
+    /// The name is longer than [`MAX_TOPIC_NAME_LENGTH`] characters; the count is
+    /// how many it carries.
+    TooLong(usize),
+    /// The name carries a character outside the set, the first of them.
+    IllegalCharacter(char),
+}
+
+/// The rule `name` breaks as a topic name, or `None` when it breaks none.
+///
+/// The DECISION both refusing surfaces take — the control plane's topic
+/// operations and the brokers' own `CreateTopics` — so one name is legal, or not,
+/// in one place.
+pub fn topic_name_violation(name: &str) -> Option<TopicNameViolation> {
     if name.is_empty() {
-        return Some("A topic name must not be empty.".to_string());
+        return Some(TopicNameViolation::Empty);
     }
     if name == "." || name == ".." {
-        return Some(format!("The topic name {name} is reserved and cannot be used."));
+        return Some(TopicNameViolation::Reserved);
     }
     let length = name.chars().count();
     if length > MAX_TOPIC_NAME_LENGTH {
-        return Some(format!(
+        return Some(TopicNameViolation::TooLong(length));
+    }
+    name_character_outside_set(name).map(TopicNameViolation::IllegalCharacter)
+}
+
+/// Why `name` is not a legal Apache Kafka topic name as the CONTROL PLANE words
+/// it, or `None` when it is.
+///
+/// The sentence names the member's constraint and which part of it the value
+/// broke, the register this service's own request validators refuse in. The
+/// brokers' `CreateTopics` refuses the same rule in Apache Kafka's own wording,
+/// since that is the error class a client reads there
+/// ([`broker_plane::topics`]): one rule ([`topic_name_violation`]), one sentence
+/// per surface.
+pub fn topic_name_error(name: &str) -> Option<String> {
+    Some(match topic_name_violation(name)? {
+        TopicNameViolation::Empty => "A topic name must not be empty.".to_string(),
+        TopicNameViolation::Reserved => {
+            format!("The topic name {name} is reserved and cannot be used.")
+        }
+        TopicNameViolation::TooLong(length) => format!(
             "A topic name is at most {MAX_TOPIC_NAME_LENGTH} characters long, but this one is {length}."
-        ));
-    }
-    if let Some(illegal) = name_character_outside_set(name) {
-        return Some(format!(
+        ),
+        TopicNameViolation::IllegalCharacter(illegal) => format!(
             "A topic name may contain only ASCII alphanumerics, '.', '_' and '-', but this one contains {illegal:?}."
-        ));
-    }
-    None
+        ),
+    })
 }
 
 /// Whether `value` could be an Amazon MSK broker type.

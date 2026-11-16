@@ -1068,13 +1068,43 @@ impl ComAmazonawsKafkaKafkaState {
     /// Scoped to the one cluster, which the registry key makes a contiguous
     /// range, so this never walks the whole registry.
     pub(super) fn prune_removed_topics(&mut self, cluster_arn: &str, now: SystemTime) {
-        let removed: Vec<(String, String)> = self
+        let removed: Vec<String> = self
             .topics_in(cluster_arn)
             .filter(|topic| !topic.is_present(now))
-            .map(|topic| (topic.cluster_arn.clone(), topic.name.clone()))
+            .map(|topic| topic.name.clone())
             .collect();
-        for key in removed {
-            self.topics.remove(&key);
+        for name in removed {
+            self.topics.remove(&(cluster_arn.to_string(), name.clone()));
+            self.release_topic_log(cluster_arn, &name);
+        }
+    }
+
+    /// Release what the topic `name` of `cluster_arn` held: the log of every
+    /// partition it served, and the offsets its cluster's consumer groups
+    /// committed into those partitions.
+    ///
+    /// A topic that is gone keeps neither: both belong to the topic, so a name
+    /// created again starts at the first offset — rather than reading the records
+    /// of the topic that held the name before it, or resuming a group at a
+    /// position in a log that no longer exists.
+    ///
+    /// The logs are released by the KEY they are held under — every entry of this
+    /// cluster and this topic, whatever partition index it names — rather than by
+    /// the count the record happens to carry: a count is a mutable field, and a
+    /// sweep sized from it would leave the log of any partition outside it behind
+    /// for as long as the cluster lives. The group sweep is bounded by the groups
+    /// this cluster holds ([`broker_plane::groups::MAX_GROUPS_PER_CLUSTER`]).
+    fn release_topic_log(&mut self, cluster_arn: &str, name: &str) {
+        self.partition_logs
+            .retain(|(log_cluster, log_topic, _), _| {
+                log_cluster != cluster_arn || log_topic != name
+            });
+        for ((_, _), group) in self
+            .consumer_groups
+            .iter_mut()
+            .filter(|((cluster, _), _)| cluster == cluster_arn)
+        {
+            group.release_topic(name);
         }
     }
 
@@ -1099,6 +1129,7 @@ impl ComAmazonawsKafkaKafkaState {
             .is_some_and(|due| now >= due)
         {
             self.topics.remove(&key);
+            self.release_topic_log(cluster_arn, name);
             return None;
         }
         let topic = self.topics.get_mut(&key)?;
@@ -1163,8 +1194,20 @@ impl ComAmazonawsKafkaKafkaState {
         // HOLDS the new total from the instant the call is accepted; what the
         // `UPDATING` span below stands for is the broker-side reassignment that
         // follows it.
+        //
+        // BOUNDED and MONOTONIC where the request value ENTERS the registry, the
+        // way an accepted broker-count change is bounded there
+        // ([`admissible_broker_count`]): Apache Kafka adds partitions to a topic
+        // and never takes one away, and this service serves at most
+        // [`broker_plane::MAX_PARTITIONS_PER_TOPIC`] of them, so neither a value
+        // below the count the topic holds nor one past what it can serve becomes
+        // the count its readers report. The caller refuses both before it gets
+        // here; the invariant is kept on the one path that writes the field.
         if let Some(count) = partition_count {
-            topic.partition_count = count;
+            let held = topic.partition_count;
+            topic.partition_count = count
+                .min(broker_plane::MAX_PARTITIONS_PER_TOPIC)
+                .max(held);
         }
         if configs.is_some() {
             topic.configs = configs;
