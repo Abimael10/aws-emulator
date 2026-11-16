@@ -280,7 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .versions
                     .iter()
                     .next_back()
-                    .map(|version| (public.arn.clone(), version.clone()))
+                    .map(|version| ActivatedPublication {
+                        extension_arn: public.arn.clone(),
+                        configuration_schema: public.configuration_schema.clone(),
+                        version: version.clone(),
+                    })
             });
 
         let existing = store.extension_by_arn_mut(&region, &arn);
@@ -295,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record.original_type_arn = Some(
                     published
                         .as_ref()
-                        .map(|(public_arn, _)| public_arn.clone())
+                        .map(|published| published.extension_arn.clone())
                         .unwrap_or_else(|| {
                             // The ARN of the public extension the activation installed: it
                             // carries the publisher the request named it by, since that is
@@ -311,7 +315,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let version_id = registry::next_public_version_id(&[]);
                 let mut version =
                     registry::StoredTypeVersion::new(&record.arn, &version_id, now);
-                if let Some((_, published)) = &published {
+                if let Some(published) = &published {
+                    let published = &published.version;
                     version.schema = published.schema.clone();
                     version.description = published.description.clone();
                     version.provisioning_type = published.provisioning_type.clone();
@@ -343,6 +348,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // new minor version is published by the extension publisher… The default is true."
         activation.is_activated = Some(true);
         activation.auto_update = Some(input.auto_update.unwrap_or(true));
+        // The document the extension's publisher declares its account-level configuration
+        // against travels with the publication the activation installed, so the activation
+        // reports the configuration schema the public extension does — which is what a
+        // `SetTypeConfiguration` payload for this account's copy is built against. A public
+        // extension neither source holds declares none here, and the record keeps whatever it
+        // already carried rather than losing it to a re-activation.
+        if let Some(configuration_schema) = published
+            .as_ref()
+            .and_then(|published| published.configuration_schema.clone())
+        {
+            activation.configuration_schema = Some(configuration_schema);
+        }
         if let Some(version) = activation.versions.iter_mut().next_back() {
             // "The name of the IAM execution role to use to activate the extension", and the
             // logging configuration the activation was given, both recorded on the version
@@ -361,6 +378,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ActivateTypeOutput { arn: Some(arn) })
     }
+}
+
+/// What the publication an activation was made FROM carries into this account's copy: the
+/// published extension's own ARN, the document its publisher declares its account-level
+/// configuration against, and the version of it the activation installs.
+#[derive(Debug, Clone)]
+struct ActivatedPublication {
+    /// The ARN of the public extension itself, which the activation records as its
+    /// `OriginalTypeArn`.
+    extension_arn: String,
+    /// `ConfigurationSchema`, the document the extension's configuration data is set
+    /// against; `None` for a published extension that takes no configuration.
+    configuration_schema: Option<String>,
+    /// The published version the activation installs, whose schema, description, provisioning
+    /// behaviour and public version number the activation's own version carries.
+    version: registry::StoredTypeVersion,
 }
 
 /// The PUBLIC extension one `ActivateType` request names: its kind, its name, the publisher

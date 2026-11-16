@@ -1036,8 +1036,12 @@ pub struct StoredExtension {
     /// private extensions whose versions this account registered; `None` for a public
     /// extension, which carries none.
     pub default_version_id: Option<String>,
-    /// `ConfigurationSchema`: "a JSON string that represent the current configuration data
-    /// for the extension in this account and Region", written by `SetTypeConfiguration`.
+    /// `ConfigurationSchema`: the document that states which account-level configuration data
+    /// this account and Region can hold for the extension, which its publisher declares along
+    /// with the extension and which `SetTypeConfiguration`'s payload is built against. Held
+    /// per extension rather than per version, the way the configuration itself is, and
+    /// reported whether or not any configuration has been set — an extension that takes none
+    /// carries no such document at all.
     pub configuration_schema: Option<String>,
     /// `PublisherId`, present exactly for a public THIRD-PARTY extension: "extensions
     /// provided by Amazon Web Services are not assigned a publisher ID".
@@ -1140,6 +1144,20 @@ impl StoredExtension {
         self.configurations.iter().find(|held| held.arn == arn)
     }
 
+    /// Whether `arn` addresses the CONFIGURED extension this record is: its own ARN, or the
+    /// ARN of one of the versions it holds.
+    ///
+    /// A version's ARN is this extension's ARN with the version id appended — "the version ID
+    /// is the value at the end of the Amazon Resource Name (ARN) assigned to the extension
+    /// version" — so it names this extension and one of its versions at once. A CONFIGURATION
+    /// belongs to the extension and to no version of it ("you can set the configuration for an
+    /// extension, but not for a specific extension version"), so for a read of an extension's
+    /// configuration the version segment selects nothing further and the ARN addresses this
+    /// record.
+    pub fn configuration_addressed_by(&self, arn: &str) -> bool {
+        self.arn == arn || self.versions.iter().any(|version| version.arn == arn)
+    }
+
     /// Whether this is a private extension — the ones the members documented as applying
     /// "only to private extensions you have registered in your account" are reported for.
     pub fn is_private(&self) -> bool {
@@ -1210,7 +1228,9 @@ impl StoredExtension {
     /// Deactivate this activation: what `DeactivateType` leaves behind.
     ///
     /// "Deactivating an extension deletes the configuration details that are associated with
-    /// it", so the configuration data this account held for the extension goes; `IsActivated`
+    /// it", so every configuration this account held for the extension goes, and with them the
+    /// document those configurations were set against — the extension is no longer configurable
+    /// in this account and Region at all; `IsActivated`
     /// becomes false, since the extension is no longer activated in this account and Region;
     /// "deactivated extensions aren't automatically updated if a new version of the extension
     /// is released", so `AutoUpdate` is false; and "once deactivated, an extension can't be
@@ -1225,6 +1245,7 @@ impl StoredExtension {
         self.is_activated = Some(false);
         self.auto_update = Some(false);
         self.configuration_schema = None;
+        self.configurations.clear();
         self.deprecate_every_version();
     }
 
@@ -1497,6 +1518,15 @@ pub struct PublishedExtension {
     /// `FULLY_MUTABLE`: "the resource type includes an update handler to process updates to
     /// the type during stack update operations".
     pub provisioning_type: Option<&'static str>,
+    /// The ACCOUNT-LEVEL CONFIGURATION the extension's publisher declares: the properties
+    /// `SetTypeConfiguration` holds for it "in the given account and Region", each written as
+    /// the path it occupies in the configuration document (`A.B` is the `B` of `A`). The
+    /// `ConfigurationSchema` a read of the record reports is built out of them
+    /// ([`crate::state::resource_schema::configuration_definition_schema`]).
+    ///
+    /// EMPTY for an extension that takes no configuration at all, which therefore has no
+    /// configuration schema to report.
+    pub configuration_properties: &'static [&'static str],
 }
 
 /// The public extensions this registry holds that are NOT the resource types Amazon Web
@@ -1524,6 +1554,15 @@ pub struct PublishedExtension {
 /// `RegisterTypeInput$TypeName`), so a MODULE record enters this registry when a
 /// registration or an activation writes one — and such a record is listed and described
 /// through the very same code path these are.
+///
+/// Source for each entry's `configuration_properties`: the account-level configuration the
+/// extension's own publisher documents for it — for a Hook, the hook configuration the
+/// CloudFormation Hooks documentation states (`CloudFormationConfiguration`'s
+/// `HookConfiguration`, with the stacks it targets, its failure mode and the properties the
+/// Hook itself reads); for a third party's resource type, the credentials that publisher's
+/// CloudFormation registry documentation says its provider needs to reach the publisher's own
+/// API. An extension taking no configuration declares none, and so reports no
+/// `ConfigurationSchema`.
 pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
     PublishedExtension {
         type_kind: registry_type::HOOK,
@@ -1532,6 +1571,12 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
         description: "Evaluates the targets of a stack operation against a set of \
                       CloudFormation Guard rules.",
         provisioning_type: None,
+        configuration_properties: &[
+            "CloudFormationConfiguration.HookConfiguration.TargetStacks",
+            "CloudFormationConfiguration.HookConfiguration.FailureMode",
+            "CloudFormationConfiguration.HookConfiguration.Properties.RuleLocation",
+            "CloudFormationConfiguration.HookConfiguration.Properties.LogBucket",
+        ],
     },
     PublishedExtension {
         type_kind: registry_type::HOOK,
@@ -1540,6 +1585,11 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
         description: "Invokes a Lambda function to evaluate the targets of a stack \
                       operation.",
         provisioning_type: None,
+        configuration_properties: &[
+            "CloudFormationConfiguration.HookConfiguration.TargetStacks",
+            "CloudFormationConfiguration.HookConfiguration.FailureMode",
+            "CloudFormationConfiguration.HookConfiguration.Properties.LambdaFunction",
+        ],
     },
     PublishedExtension {
         type_kind: registry_type::RESOURCE,
@@ -1548,6 +1598,11 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
         description: "Datadog Monitor resource, which alerts on a metric query crossing a \
                       threshold.",
         provisioning_type: Some(provisioning_type::FULLY_MUTABLE),
+        configuration_properties: &[
+            "DatadogCredentials.ApiKey",
+            "DatadogCredentials.ApplicationKey",
+            "DatadogCredentials.ApiURL",
+        ],
     },
     PublishedExtension {
         type_kind: registry_type::RESOURCE,
@@ -1556,6 +1611,10 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
         description: "MongoDB Atlas Cluster resource, which provisions a cluster in an Atlas \
                       project.",
         provisioning_type: Some(provisioning_type::FULLY_MUTABLE),
+        configuration_properties: &[
+            "MongoDBAtlasAccessKeys.PublicKey",
+            "MongoDBAtlasAccessKeys.PrivateKey",
+        ],
     },
 ];
 
@@ -1626,6 +1685,14 @@ pub fn published_publisher_id(publisher_name: &str) -> String {
 /// package was uploaded here; and a source or documentation URL, which the catalogue does not
 /// record.
 ///
+/// It DOES carry the extension's account-level `ConfigurationSchema`, built from the
+/// configuration its publisher declares for it
+/// ([`PublishedExtension::configuration_properties`]): that document is part of what is
+/// published about the extension rather than data an account wrote, so it is reported before
+/// anybody activates or configures it — which is what lets a client discovering the public
+/// registry tell which extensions take an account-level configuration and build the payload
+/// `SetTypeConfiguration` takes for one.
+///
 /// It is addressed by the ARN the publisher that published it makes it addressable at
 /// ([`published_catalog_arn`]), so the ARN a listing of the public registry reports for it is
 /// the one an activation names it by.
@@ -1662,7 +1729,10 @@ fn published_catalog_record(region: &str, published: &PublishedExtension) -> Sto
         // "For public extensions, both those provided by Amazon Web Services and published
         // by third parties, CloudFormation returns null."
         default_version_id: None,
-        configuration_schema: None,
+        configuration_schema: crate::state::resource_schema::configuration_definition_schema(
+            published.type_name,
+            published.configuration_properties,
+        ),
         publisher_id: Some(published_publisher_id(published.publisher_name)),
         // Nothing was activated under an alias: the local name IS the public name.
         original_type_name: None,

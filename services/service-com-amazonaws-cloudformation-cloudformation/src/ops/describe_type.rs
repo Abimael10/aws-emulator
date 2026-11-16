@@ -473,8 +473,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             documentation_url: version.documentation_url.clone(),
             last_updated: version.last_updated.map(crate::state::timestamp),
             time_created: version.time_created.map(crate::state::timestamp),
-            // The configuration data `SetTypeConfiguration` holds "for the extension in
-            // this account and Region", which is per extension rather than per version.
+            // The document that states which account-level configuration data this account
+            // and Region can hold "for the extension in this account and Region" — declared
+            // with the extension by its publisher, and held per extension rather than per
+            // version, the way the configuration data itself is.
             configuration_schema: extension.configuration_schema.clone(),
             // "This applies only to public third-party extensions. For private registered
             // extensions, and extensions provided by Amazon Web Services, CloudFormation

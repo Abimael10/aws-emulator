@@ -58,6 +58,13 @@
 //! a record without a schema is what an extension whose schema this emulator does not hold
 //! — a private extension registered from a handler package, or a public resource type no
 //! resource provider stands behind, whose defining document is nowhere here — reports.
+//!
+//! The other document the registry holds per extension is its ACCOUNT-LEVEL CONFIGURATION
+//! schema ([`configuration_definition_schema`]): `ConfigurationSchema`, the document that
+//! states which configuration data an account and Region can hold for the extension. It is
+//! built here for the same reason the resource schema is — it is part of what an extension's
+//! publisher declares about it, not something a registry call wrote — and it is reported for
+//! an extension whose publisher declares configuration whether or not any has been set.
 
 use ::serde_json::{json, Map, Value};
 
@@ -65,6 +72,52 @@ use ::serde_json::{json, Map, Value};
 /// which is the `$schema` every published resource schema carries.
 const PROVIDER_DEFINITION_META_SCHEMA: &str =
     "https://schema.cloudformation.us-east-1.amazonaws.com/provider.definition.schema.v1.json";
+
+/// The meta-schema a CloudFormation provider's ACCOUNT-LEVEL CONFIGURATION definition
+/// declares itself against, which is the `$schema` every configuration schema this registry
+/// holds carries.
+const PROVIDER_CONFIGURATION_META_SCHEMA: &str = "https://schema.cloudformation.us-east-1.amazonaws.com/\
+     provider.configuration.definition.schema.v1.json";
+
+/// The ACCOUNT-LEVEL CONFIGURATION SCHEMA of the extension `type_name`, built from the
+/// configuration properties its publisher declares: the document that states which
+/// configuration data an account and Region can hold for the extension, which is what
+/// `DescribeType` reports as `ConfigurationSchema` and what a client reads to build the
+/// payload `SetTypeConfiguration` takes.
+///
+/// It is a property of the extension's published DEFINITION rather than of one account's
+/// data, so a read reports it whether or not any configuration has been set — otherwise a
+/// client enumerating the registry could not tell an extension that takes configuration from
+/// one that takes none.
+///
+/// `properties` carries each declared property as the PATH it occupies in the configuration
+/// document (`A.B` is the `B` of `A`), so the document's shape is the shape of the
+/// configuration rather than a flat list of dotted names — the same spelling
+/// [`define_property`] builds a resource schema's properties from. The document carries what
+/// is known and nothing else: the meta-schema it is declared against, the extension it
+/// configures, and those properties. There is no `required` list and no
+/// `additionalProperties: false`, which would state that a configuration is refused without
+/// one of them or with anything else — nothing here refuses either.
+///
+/// `None` for an extension whose publisher declares no configuration at all: such an
+/// extension has no configuration schema, which is not the same as an empty one.
+pub fn configuration_definition_schema(type_name: &str, properties: &[&str]) -> Option<String> {
+    if properties.is_empty() {
+        return None;
+    }
+    let mut declared = Map::new();
+    for property in properties {
+        define_property(&mut declared, property);
+    }
+    let mut document = Map::new();
+    document.insert(
+        "$schema".to_string(),
+        Value::String(PROVIDER_CONFIGURATION_META_SCHEMA.to_string()),
+    );
+    document.insert("typeName".to_string(), Value::String(type_name.to_string()));
+    document.insert("properties".to_string(), Value::Object(declared));
+    Some(Value::Object(document).to_string())
+}
 
 /// The resource schema of the resource type `type_name`, as the JSON text the registry
 /// holds and `DescribeType` reports as `Schema`; `None` for a type this emulator carries

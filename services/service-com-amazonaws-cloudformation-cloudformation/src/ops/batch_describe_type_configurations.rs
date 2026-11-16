@@ -193,7 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         identifier.r#type.as_deref(),
                         identifier.type_name.as_deref(),
                     ) {
-                        (Some(type_arn), _, _) => extension.arn == type_arn,
+                        // "The ARN for the extension, in this account and Region": the record
+                        // that ARN addresses, whether it names the extension itself or one of
+                        // its versions — a configuration is the extension's, so a version
+                        // segment past its name selects nothing further
+                        // ([`registry::StoredExtension::configuration_addressed_by`]).
+                        (Some(type_arn), _, _) => extension.configuration_addressed_by(type_arn),
                         (None, Some(type_kind), Some(type_name)) => {
                             extension.type_kind == type_kind && extension.type_name == type_name
                         }
