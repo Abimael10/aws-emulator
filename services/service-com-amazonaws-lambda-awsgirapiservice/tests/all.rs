@@ -493,6 +493,8 @@ mod log_level_requires_json_format;
 mod map_value_refusals;
 #[path = "all/missing_policy_refusal.rs"]
 mod missing_policy_refusal;
+#[path = "all/node_caught_error_log.rs"]
+mod node_caught_error_log;
 #[path = "all/node_error_trace_lines.rs"]
 mod node_error_trace_lines;
 #[path = "all/node_error_stack_head.rs"]

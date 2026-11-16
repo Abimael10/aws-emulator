@@ -256,6 +256,7 @@ fn reported(why: String) -> Finished {
     Finished {
         completion: Completion::Internal(why),
         log: String::new(),
+        log_records: Vec::new(),
         elapsed: Duration::ZERO,
         // Nothing ran, so no reading of a run's memory was taken.
         max_memory_bytes: None,

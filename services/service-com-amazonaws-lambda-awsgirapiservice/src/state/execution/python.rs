@@ -758,9 +758,11 @@ fn settled(
         Some(stop) => Completion::Stopped(stop),
         None => completion,
     };
+    let written = captured(capture);
     Finished {
         completion,
-        log: captured(capture).text.clone(),
+        log: written.text.clone(),
+        log_records: written.records(),
         elapsed,
         max_memory_bytes: Some(bounds.max_memory_bytes()),
     }

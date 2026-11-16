@@ -331,7 +331,14 @@ pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) 
 /// ONE `Invoke` request on the function `name`, signed for this suite's Region and carrying
 /// `headers` on top of the ones every invocation of it carries. The signing and host details
 /// live here, so every invocation this suite makes is the same request but for those headers.
-fn invocation_request(name: &str, headers: &[(&str, &str)]) -> http::Request<bytes::Bytes> {
+///
+/// `pub(crate)` for the reason [`emulator`] is: the sibling suite that reads the answer's own
+/// HEADERS beside the log ([`crate::node_caught_error_log`], which asserts that a caught error
+/// is no function error) sends this same request rather than a second copy of it.
+pub(crate) fn invocation_request(
+    name: &str,
+    headers: &[(&str, &str)],
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method("POST")
         .uri(format!("{FUNCTIONS_URI}/{name}/invocations"))

@@ -3,8 +3,10 @@
 //! What a NODE handler reads off an error's own `stack`.
 //!
 //! RULE: a managed `nodejs*` runtime's `stack` is the error's own string representation —
-//! `<name>: <message>`, the name alone for an error carrying no message — followed by one
-//! `    at <function> (<unit>:<line>:<column>)` line per frame of the stack that was taken.
+//! `<name>: <message>`, the name alone for an error carrying no message, with the message the
+//! one the runtime words for that class ([`crate::node_handler_error_wording`] owns that
+//! wording) — followed by one `    at <function> (<unit>:<line>:<column>)` line per frame of
+//! the stack that was taken.
 //! The head line is part of the stack whoever raised the error: the class and the message of
 //! what failed are what code reporting a failure BY its stack passes on, and a handler that
 //! hands that text to another service (a custom resource provider answers CloudFormation with
@@ -103,6 +105,10 @@ struct Row {
     /// The `message` it reports, where this row's own code decides it — `None` where the
     /// wording is the engine's, which this suite does not pin.
     message: Option<&'static str>,
+    /// The line the stack opens with, where the runtime's own wording for the class is what
+    /// it carries rather than the raw text the engine built ([`ROWS`]'s engine rows);
+    /// `None` where the error's own `<name>: <message>` is that line.
+    head: Option<&'static str>,
     /// The whole stack, for the row that ASSIGNED one.
     assigned: Option<&'static str>,
     /// The lines the stack opens with, for a row worth naming them for; empty otherwise,
@@ -118,6 +124,7 @@ const ROWS: &[Row] = &[
         name: "Error",
         message: Some("the provider refused the request"),
         assigned: None,
+        head: None,
         opens_with: &["Error: the provider refused the request"],
     },
     Row {
@@ -126,6 +133,7 @@ const ROWS: &[Row] = &[
         name: "Error",
         message: Some(""),
         assigned: None,
+        head: None,
         opens_with: &["Error"],
     },
     Row {
@@ -134,15 +142,20 @@ const ROWS: &[Row] = &[
         name: "ProviderError",
         message: Some("no such widget"),
         assigned: None,
+        head: None,
         opens_with: &["ProviderError: no such widget"],
     },
     Row {
+        // The one class whose wording the RUNTIME states rather than passing the engine's
+        // through: a property read on `undefined`, which a managed runtime reports the way
+        // the engine it embeds words it.
         case: "a type error the engine itself raised",
         key: "engine type error",
         name: "TypeError",
         message: None,
         assigned: None,
-        opens_with: &[],
+        head: Some("TypeError: Cannot read properties of undefined (reading 'member')"),
+        opens_with: &["TypeError: Cannot read properties of undefined (reading 'member')"],
     },
     Row {
         case: "a syntax error the engine itself raised",
@@ -150,6 +163,7 @@ const ROWS: &[Row] = &[
         name: "SyntaxError",
         message: None,
         assigned: None,
+        head: None,
         opens_with: &[],
     },
     Row {
@@ -160,6 +174,7 @@ const ROWS: &[Row] = &[
         name: "Error",
         message: Some("the handler failed\n\nLogs: /aws/lambda/provider\n\n"),
         assigned: None,
+        head: None,
         opens_with: &[
             "Error: the handler failed",
             "",
@@ -173,6 +188,7 @@ const ROWS: &[Row] = &[
         name: "Error",
         message: Some("the provider refused the request"),
         assigned: Some("a stack of the handler own, whole"),
+        head: None,
         opens_with: &[],
     },
 ];
@@ -254,7 +270,10 @@ async fn an_errors_stack_opens_with_the_error_itself_and_then_its_frames() {
             continue;
         }
 
-        let head = representation(&name, &message);
+        let head = row
+            .head
+            .map(str::to_string)
+            .unwrap_or_else(|| representation(&name, &message));
         assert!(
             stack == head || stack.starts_with(&format!("{head}\n")),
             "case {:?}: expected the stack to open with the error itself ({head:?}), got \

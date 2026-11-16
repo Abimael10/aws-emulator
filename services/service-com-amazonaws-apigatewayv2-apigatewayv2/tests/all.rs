@@ -103,6 +103,8 @@ mod domain_name_pagination;
 mod domain_name_tls_preconditions;
 #[path = "all/empty_answer_framing.rs"]
 mod empty_answer_framing;
+#[path = "all/http_api_access_log_request_path.rs"]
+mod http_api_access_log_request_path;
 #[path = "all/http_api_access_logging.rs"]
 mod http_api_access_logging;
 #[path = "all/http_api_backend_dispatch.rs"]

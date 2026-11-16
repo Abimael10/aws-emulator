@@ -1323,15 +1323,10 @@ fn run_log(request_id: &str, version: &str, memory_size: i32, finished: &Finishe
     let used_mb = max_memory_used_mb(finished.max_memory_bytes, memory_size);
     let mut lines = vec![format!("START RequestId: {request_id} Version: {version}")];
     let opened = lines.len();
-    if !finished.log.is_empty() {
-        let mut written: Vec<&str> = finished.log.split('\n').collect();
-        // A log that ends on a line break closes its last line rather than opening an empty
-        // one, so the piece after that break is not a line of the log.
-        if written.last().is_some_and(|last| last.is_empty()) {
-            written.pop();
-        }
-        lines.extend(written.into_iter().map(str::to_string));
-    }
+    // One line of the log per RECORD the run wrote — the text of one call, line breaks of its
+    // own included ([`outcome::Finished::log_records`]) — so what the handler reported in one
+    // write is one event of the function's log group and not one event per line of it.
+    lines.extend(finished.log_records.iter().cloned());
     lines.push(format!("END RequestId: {request_id}"));
     lines.push(format!(
         "REPORT RequestId: {request_id}\tDuration: {duration_ms:.2} ms\tBilled Duration: \
@@ -1810,6 +1805,7 @@ mod tests {
             let finished = Finished {
                 completion: Completion::Stopped(Stop::Deadline),
                 log: String::new(),
+                log_records: Vec::new(),
                 elapsed: budget.wall_clock,
                 max_memory_bytes: None,
             };
@@ -1869,6 +1865,7 @@ mod tests {
                 let finished = Finished {
                     completion: Completion::Stopped(*stop),
                     log: String::new(),
+                    log_records: Vec::new(),
                     elapsed: budget.wall_clock,
                     max_memory_bytes: None,
                 };
@@ -1936,6 +1933,7 @@ mod tests {
                         stack_trace: Vec::new(),
                     },
                     log: String::new(),
+                    log_records: Vec::new(),
                     elapsed: Duration::ZERO,
                     max_memory_bytes: None,
                 };

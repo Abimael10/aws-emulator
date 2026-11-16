@@ -120,6 +120,13 @@ pub struct Finished {
     pub completion: Completion,
     /// Everything the handler wrote to its output streams, capped.
     pub log: String,
+    /// That same output as the RECORDS the run wrote it in, in order: the text of one write,
+    /// without the line break that closed it ([`Capture::records`]).
+    ///
+    /// A record is what the run wrote in ONE call, so text carrying line breaks of its own —
+    /// the stack of an error written to the console — is one record and not several: that is
+    /// what keeps one log event per thing the handler reported ([`super::log_delivery`]).
+    pub log_records: Vec<String>,
     /// How long the run took.
     pub elapsed: Duration,
     /// The MOST memory this run was measured holding, in bytes, or `None` for a run nothing
@@ -139,6 +146,11 @@ pub struct Finished {
 pub(super) struct Capture {
     /// The text kept so far.
     pub(super) text: String,
+    /// The RECORDS that text was written in, each without the line break that closed it.
+    records: Vec<String>,
+    /// Whether the last of them is still open — written by a call that did not end on a line
+    /// break, so the next write continues it.
+    open: bool,
     /// How many bytes are kept at most.
     limit: usize,
 }
@@ -148,6 +160,8 @@ impl Capture {
     pub(super) fn new(limit: usize) -> Self {
         Self {
             text: String::new(),
+            records: Vec::new(),
+            open: false,
             limit,
         }
     }
@@ -158,16 +172,42 @@ impl Capture {
             return;
         }
         let room = self.limit - self.text.len();
-        if text.len() <= room {
-            self.text.push_str(text);
-            return;
-        }
         // Cut on a character boundary, so the kept log is still text.
-        let mut end = room;
+        let mut end = text.len().min(room);
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }
-        self.text.push_str(&text[..end]);
+        let kept = &text[..end];
+        if kept.is_empty() {
+            return;
+        }
+        self.text.push_str(kept);
+        self.recorded(kept);
+    }
+
+    /// The records the run wrote, in order.
+    pub(super) fn records(&self) -> Vec<String> {
+        self.records.clone()
+    }
+
+    /// Add `kept` to those records: it continues the one still open, and a write that ends on
+    /// a line break CLOSES one — which is what makes the record the unit the run wrote in
+    /// rather than the line the text breaks into.
+    fn recorded(&mut self, kept: &str) {
+        if self.open {
+            if let Some(last) = self.records.last_mut() {
+                last.push_str(kept);
+            }
+        } else {
+            self.records.push(kept.to_string());
+            self.open = true;
+        }
+        if kept.ends_with('\n') {
+            if let Some(last) = self.records.last_mut() {
+                last.pop();
+            }
+            self.open = false;
+        }
     }
 }
 
@@ -204,10 +244,59 @@ mod tests {
         }
     }
 
+    /// A run's output is kept as the RECORDS it was written in: one per write the run closed
+    /// with a line break, and a line break INSIDE one write stays inside its record.
+    #[test]
+    fn the_capture_keeps_one_record_per_write_the_run_closed() {
+        // (case, the writes the run made, the records they leave)
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("one line", &["hello\n"], &["hello"]),
+            (
+                "two lines, each written and closed",
+                &["a\n", "b\n"],
+                &["a", "b"],
+            ),
+            (
+                "a write carrying line breaks of its own",
+                &["TypeError: boom\n    at handler\n"],
+                &["TypeError: boom\n    at handler"],
+            ),
+            (
+                "a line written in pieces, as a print writes its break apart",
+                &["hello", "\n"],
+                &["hello"],
+            ),
+            ("a write the run never closed", &["half"], &["half"]),
+            ("a line of its own with nothing on it", &["\n"], &[""]),
+            ("nothing written at all", &[], &[]),
+        ];
+        for (case, writes, expected) in cases {
+            let capture = Arc::new(Mutex::new(Capture::new(4_096)));
+            for written in *writes {
+                captured(&capture).write(written);
+            }
+            let actual = captured(&capture).records();
+            let expected: Vec<String> = expected.iter().map(|held| (*held).to_string()).collect();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            // The records are the same log: each of them, closed by its own break.
+            if writes.last().is_none_or(|last| last.ends_with('\n')) {
+                let rebuilt: String = actual.iter().map(|held| format!("{held}\n")).collect();
+                let text = captured(&capture).text.clone();
+                assert_eq!(
+                    rebuilt, text,
+                    "case {case:?}: expected the records to rebuild the log, got {rebuilt:?} \
+                     against {text:?}"
+                );
+            }
+        }
+    }
+
     /// A multi-byte character is never cut in half by the cap: what is kept is still text.
     #[test]
-    fn the_capture_cuts_on_a_character_boundary() {
-        for limit in [0_usize, 1, 2, 3, 4, 5] {
+    fn the_capture_cuts_on_a_character_boundary() {        for limit in [0_usize, 1, 2, 3, 4, 5] {
             let capture = Arc::new(Mutex::new(Capture::new(limit)));
             // Three bytes per character, so every cap but a multiple of three has to cut
             // short of it.

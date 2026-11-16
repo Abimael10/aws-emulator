@@ -6,13 +6,15 @@
 //! The rule under test, one level above the recorded case:
 //!
 //! > A stage carrying `AccessLogSettings` — a `DestinationArn` naming a log group and a
-//! > `$context` format — writes ONE record per request it served into THAT group, rendered
-//! > by THAT format: one request is one record, a request the api refused is a request the
-//! > stage answered and so is logged too, and the record's `$context.requestId` is the id
-//! > the response reported, which is what lets a client join the answer it holds to the
-//! > record of it. A variable the plane has no value for renders as the placeholder a field
-//! > with no value carries, so the record is a complete line whatever the format names. A
-//! > stage carrying no `AccessLogSettings` delivers nothing.
+//! > `$context` format — writes ONE record per request a ROUTE of it served into THAT group,
+//! > rendered by THAT format: one served request is one record, whatever it was answered
+//! > with, and the record's `$context.requestId` is the id the response reported, which is
+//! > what lets a client join the answer it holds to the record of it. A request that matched
+//! > no route of the stage's deployment is refused by the api ahead of its routing, so no
+//! > route served it and it leaves no record at all. A variable the plane has no value for
+//! > renders as the placeholder a field with no value carries, so the record is a complete
+//! > line whatever the format names. A stage carrying no `AccessLogSettings` delivers
+//! > nothing.
 //!
 //! Only a cross-service suite can pin this: the api, the stage and its logging configuration
 //! are this service's, the route's answer belongs to a function AWS Lambda holds and runs,
@@ -22,8 +24,9 @@
 //! cannot pass.
 //!
 //! The rows differ along what the rule generalises over: the FORMAT (a JSON one and a
-//! Common-Log-Format one), the OUTCOME (a route the function served and a path no route
-//! matches), the VERB and the path, and the REPETITION of one request.
+//! Common-Log-Format one), the OUTCOME (a route the function served, and a verb and a path
+//! no route matches, which leave no record), the VERB and the path, and the REPETITION of one
+//! request.
 
 use std::sync::Arc;
 
@@ -250,8 +253,8 @@ struct Row {
     /// The status the stage answers with: the function's own, or the api's `404` for a path
     /// no route of it matches.
     status: u16,
-    /// The route key the record names, or `None` for a request that matched no route — where
-    /// the format's reference renders as the placeholder.
+    /// The route key the record names, or `None` for a request that matched no route — which
+    /// is a request no route of the stage served, and so leaves no record at all.
     route_key: Option<&'static str>,
 }
 
@@ -290,8 +293,8 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// Every request a stage serves leaves one record, rendered by the stage's own format, in
-/// the destination it names — and the record names the request the response named.
+/// Every request a ROUTE of the stage serves leaves one record, rendered by the stage's own
+/// format, in the destination it names — and the record names the request the response named.
 #[tokio::test]
 async fn a_stage_writes_one_record_per_request_rendered_by_its_own_format() {
     let (router, engine) = emulator();
@@ -315,7 +318,10 @@ async fn a_stage_writes_one_record_per_request_rendered_by_its_own_format() {
     )
     .await;
 
-    for (index, row) in rows().into_iter().enumerate() {
+    // How many requests a route of the stage has served so far, which is how many records the
+    // destination holds.
+    let mut served = 0_usize;
+    for row in rows() {
         let case = row.case;
         let answered = send(&router, &host, row.verb, row.path, &[]).await;
         assert_eq!(
@@ -331,11 +337,21 @@ async fn a_stage_writes_one_record_per_request_rendered_by_its_own_format() {
         let records = delivered(&router)
             .await
             .unwrap_or_else(|| panic!("case {case:?}: no group {GROUP:?} at all"));
+        // A request no route of the stage served leaves the destination exactly as it was.
+        let Some(route_key) = row.route_key else {
+            assert_eq!(
+                records.len(),
+                served,
+                "case {case:?}: expected a request no route served to leave no record, got \
+                 {records:?}"
+            );
+            continue;
+        };
+        served += 1;
         assert_eq!(
             records.len(),
-            index + 1,
-            "case {case:?}: expected one record per request served ({}), got {records:?}",
-            index + 1
+            served,
+            "case {case:?}: expected one record per request served ({served}), got {records:?}"
         );
         let record = records
             .last()
@@ -347,7 +363,7 @@ async fn a_stage_writes_one_record_per_request_rendered_by_its_own_format() {
             rendered,
             json!({
                 "requestId": request_id,
-                "routeKey": row.route_key.unwrap_or("-"),
+                "routeKey": route_key,
                 "httpMethod": row.verb,
                 "status": row.status.to_string(),
                 "stage": "$default",

@@ -6,9 +6,12 @@
 //! `Stage$AccessLogSettings` carries the `DestinationArn` ("the ARN of the CloudWatch Logs
 //! log group to receive access logs") and the `Format` ("a single line format of the access
 //! logs of data, as specified by selected `$context` variables. The format must include at
-//! least `$context.requestId`"), so a stage carrying both writes ONE record per request it
-//! served — including a request the api itself refused, which is a request the stage served
-//! an answer to — into the group that ARN names.
+//! least `$context.requestId`"), so a stage carrying both writes ONE record per request a
+//! ROUTE of it served — the request's own `$context.routeKey` is part of the record — into
+//! the group that ARN names. A request that matched no route of the deployment the stage
+//! serves is refused by the api ahead of its routing, so no route served it and no record is
+//! written for it; a request a route DID serve is recorded whatever it was answered with,
+//! including one the api itself refused after routing it.
 //!
 //! The rendering and the write are `service_common`'s: the REST plane of API Gateway
 //! configures and renders access logging the same way, so one format cannot be rendered two
@@ -96,8 +99,10 @@ struct Planned {
 /// of this service's is held while another service answers.
 ///
 /// `None` when nothing is logged at all: a request that reached no stage of an api this
-/// service holds, a stage carrying no `AccessLogSettings`, and a destination that names no
-/// log group (a Kinesis Data Firehose delivery stream).
+/// service holds, a stage carrying no `AccessLogSettings`, a destination that names no
+/// log group (a Kinesis Data Firehose delivery stream), and a request that matched no ROUTE
+/// of the deployment the stage serves — the api refused that one ahead of its routing, so no
+/// route of the stage served it and the stage leaves no record of it.
 fn planned<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
@@ -114,8 +119,9 @@ fn planned<Eng: Send + Sync + 'static>(
     let destination = settings.destination_arn.as_deref()?;
     let format = settings.format.as_deref()?;
     let log_group = ::service_common::api_gateway_access_logs::destination_log_group(destination)?;
-    // WHICH route the request matched, where it matched one: `$context.routeKey` is the key
-    // of the route that served it, and a request that matched none carries none.
+    // WHICH route of the deployment served the request, which is both `$context.routeKey`
+    // and the condition for a record existing at all: a record is about a request a route of
+    // the stage SERVED, so a request that matched none leaves none.
     let route_key = stage
         .deployment_id
         .as_deref()
@@ -127,11 +133,18 @@ fn planned<Eng: Send + Sync + 'static>(
                 &route_path,
             )
         })
-        .map(|route| route.route_key.clone());
+        .map(|route| route.route_key.clone())?;
     let context = context_of(
         api,
         &stage.stage_name,
-        route_key.as_deref(),
+        // WHAT the api's own endpoint was addressed at, which is what `$context.path`
+        // reports: the stage's invoke path ([`super::endpoint_path`]), the same value the
+        // invocation's own event carries. The target the request ARRIVED on is not it — a
+        // client that cannot resolve the api's endpoint carries the api id or the local
+        // marker in the path instead ([`super::resolve`]), and none of that is part of the
+        // path the api was addressed at.
+        &super::endpoint_path(stage, &route_path),
+        &route_key,
         req,
         request_id,
         response,
@@ -167,15 +180,18 @@ pub(crate) fn log_stream_name(api_id: &str, stage: &str) -> String {
 /// after `$context.`.
 ///
 /// Only what the api's own records, the request and the ANSWER say about the call: which api
-/// and stage served it, the route key it matched, the path it arrived at and the verb it
-/// used, WHICH REQUEST it is and WHEN it arrived, the account the api belongs to, the
-/// endpoint it was addressed on, the address it came from, and what it was answered with.
+/// and stage served it, the route key it matched, the path the api's own endpoint was
+/// addressed at and the verb it used, WHICH REQUEST it is and WHEN it arrived, the account
+/// the api belongs to, the endpoint it was addressed on, the address it came from, and what
+/// it was answered with.
 /// A member no value here names is one the format renders as the unresolved placeholder,
 /// rather than a value invented for it.
+#[allow(clippy::too_many_arguments)]
 fn context_of(
     api: &crate::state::Api,
     stage: &str,
-    route_key: Option<&str>,
+    path: &str,
+    route_key: &str,
     req: &RtRequest,
     request_id: &str,
     response: &RtResponse,
@@ -191,8 +207,9 @@ fn context_of(
         ("domainName", domain_name),
         ("domainPrefix", api.api_id.clone()),
         ("httpMethod", req.method().to_string()),
-        ("path", super::path_of(req.uri()).to_string()),
+        ("path", path.to_string()),
         ("requestId", request_id.to_string()),
+        ("routeKey", route_key.to_string()),
         ("extendedRequestId", request_id.to_string()),
         (
             "requestTime",
@@ -208,9 +225,6 @@ fn context_of(
     .into_iter()
     .map(|(member, value)| (member.to_string(), value))
     .collect();
-    if let Some(route_key) = route_key {
-        context.insert("routeKey".to_string(), route_key.to_string());
-    }
     if let Some(agent) = req.headers().get(USER_AGENT_HEADER) {
         context.insert("identity.userAgent".to_string(), agent.to_string());
     }

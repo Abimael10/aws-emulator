@@ -878,6 +878,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
         installAbort();
         installErrorStack();
+        installErrorText();
         // "Error.stackTraceLimit ... The default value is 10": the number of frames an
         // error's own stack carries, which `NODE_OPTIONS` can set.
         Error.stackTraceLimit = 10;
@@ -904,11 +905,16 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // The line a stack OPENS with: the error's own string representation — `<name>: <message>`,
     // the name alone for an error carrying no message, and the message alone for one carrying
     // no name.
+    //
+    // The message is the one the RUNTIME words for that error class ([`decorated`]), not the
+    // raw text the engine built: this line is what a handler that CAUGHT the error reads off
+    // its `stack` and writes to its log, and what the error document of one that did not
+    // catch it reports, so both read one wording of one failure.
     function errorHead(error) {
         var name = error.name === undefined || error.name === null ? 'Error' : String(error.name);
         var message = error.message === undefined || error.message === null
             ? ''
-            : String(error.message);
+            : decorated(String(error.message));
         if (name === '') {
             return message;
         }
@@ -957,6 +963,20 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                     enumerable: false,
                     configurable: true
                 });
+            }
+        });
+    }
+
+    // An error AS TEXT — `String(error)`, `` `${error}` `` and `error.toString()`, the three
+    // spellings a handler writes one to its log by: the head line a stack opens with
+    // ([`errorHead`]), which is the `<name>: <message>` an `Error.prototype.toString` answers
+    // and carries the wording this runtime states for the class.
+    function installErrorText() {
+        Object.defineProperty(Error.prototype, 'toString', {
+            configurable: true,
+            writable: true,
+            value: function () {
+                return errorHead(this);
             }
         });
     }

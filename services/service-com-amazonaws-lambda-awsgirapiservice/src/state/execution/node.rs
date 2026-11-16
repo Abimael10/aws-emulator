@@ -225,10 +225,13 @@ pub fn run_against(request: &Run<'_>, clock: &Clock) -> Finished {
         Some(stop) => Completion::Stopped(stop),
         None => completion,
     };
-    let log = captured(&capture).text.clone();
+    let written = captured(&capture);
+    let (log, log_records) = (written.text.clone(), written.records());
+    drop(written);
     Finished {
         completion,
         log,
+        log_records,
         elapsed,
         max_memory_bytes: Some(bounds.max_memory_bytes()),
     }
