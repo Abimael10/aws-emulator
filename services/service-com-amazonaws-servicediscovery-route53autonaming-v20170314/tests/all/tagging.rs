@@ -508,16 +508,21 @@ async fn the_tag_quota_counts_the_merged_set_and_a_refused_call_stores_nothing()
 async fn an_arn_naming_no_stored_resource_is_not_found() {
     let router = emulator();
 
-    // Each unknown ARN is the real one with its resource id swapped, so the test does
-    // not hand-write the ARN format.
+    // Each unknown ARN is the real one with its resource identifier swapped for another
+    // of the SAME minted form, so the test does not hand-write the ARN format and the
+    // call is refused for the resource being absent rather than for the ARN being
+    // malformed (that rule is `tagging_resource_arn_format.rs`).
     let mut unknown: Vec<(String, String)> = Vec::new();
     for (kind, arn) in taggable_arns(&router, "notfound").await {
         let (prefix, id) = arn
             .rsplit_once('/')
             .expect("a Cloud Map ARN names its resource after a '/'");
+        let (id_prefix, body) = id
+            .split_once('-')
+            .expect("a Cloud Map resource id carries its kind prefix");
         unknown.push((
             format!("{kind} ARN naming nothing"),
-            format!("{prefix}/{id}-nosuchresource"),
+            format!("{prefix}/{id_prefix}-{}", "0".repeat(body.len())),
         ));
     }
 

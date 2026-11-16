@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let id = state.next_id("ns", 16);
+        let id = state.next_id("ns", crate::state::RESOURCE_ID_DIGITS);
         // The operation is filed first because the namespace record carries its id:
         // that is what a later create of the same name is refused with.
         let operation_id = state.record_operation(

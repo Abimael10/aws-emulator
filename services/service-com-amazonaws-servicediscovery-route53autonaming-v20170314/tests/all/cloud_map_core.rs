@@ -89,6 +89,27 @@ pub(crate) async fn failure(
     operation: &str,
     body: Value,
 ) -> (u16, String) {
+    let (status, code, message) = refusal(router, operation, body).await;
+    assert_ne!(
+        status, 200,
+        "{operation} must fail, got {status} {code} {message:?}"
+    );
+    (status, code)
+}
+
+/// Dispatch an operation and report how it was REFUSED: its status, the wire error code
+/// its body names, and the text that body carries, if any.
+///
+/// The awsJson error envelope names the class in `__type`, qualified by its namespace, and
+/// carries the text under `Message` (the member this model declares, which a handler's own
+/// error body uses) or `message` (the member the framework's own renderers write), so both
+/// spellings are read HERE rather than once per suite — the same reason the rest of this
+/// harness is shared.
+pub(crate) async fn refusal(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, String, Option<String>) {
     let (status, json) = call(router, operation, body).await;
     let code = json["__type"]
         .as_str()
@@ -97,8 +118,12 @@ pub(crate) async fn failure(
         .next()
         .unwrap_or_default()
         .to_string();
-    assert_ne!(status, 200, "{operation} must fail, got {json}");
-    (status, code)
+    let message = json
+        .get("Message")
+        .or_else(|| json.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (status, code, message)
 }
 
 /// Create a namespace and return `(operation id, namespace id)`.

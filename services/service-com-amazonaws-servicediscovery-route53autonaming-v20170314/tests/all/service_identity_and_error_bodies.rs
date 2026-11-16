@@ -471,8 +471,12 @@ async fn each_refusal_carries_the_body_of_the_operation_that_raised_it() {
         .as_str()
         .expect("GetService reports the service's Arn")
         .to_string();
+    // A resource ARN of the form a tagging call requires — the kind prefix plus an
+    // identifier of the width this service mints — that names no stored resource, so the
+    // refusal is the resource being absent rather than the ARN being malformed (that rule
+    // is `tagging_resource_arn_format.rs`).
     let missing_arn = format!(
-        "arn:aws:servicediscovery:{}:{}:namespace/ns-nothinghere",
+        "arn:aws:servicediscovery:{}:{}:namespace/ns-0000000000000000",
         crate::cloud_map_core::REGION,
         engine::EMULATOR_ACCOUNT_ID
     );

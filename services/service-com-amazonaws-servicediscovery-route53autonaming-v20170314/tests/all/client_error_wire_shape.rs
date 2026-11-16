@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::cloud_map_core::{call, emulator, namespace, ok, service, REGION};
+use super::cloud_map_core::{emulator, namespace, ok, refusal, service, REGION};
 
 /// What a row expects of the refusal's `Message`.
 #[derive(Debug, Clone)]
@@ -47,30 +47,6 @@ fn service_arn_of(reference: &str) -> String {
         "arn:aws:servicediscovery:{REGION}:{}:service/{reference}",
         engine::EMULATOR_ACCOUNT_ID
     )
-}
-
-/// The error code and `Message` of one refused call, plus whether a `Message` member
-/// was present at all.
-async fn refusal(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-) -> (u16, String, Option<String>) {
-    let (status, json) = call(router, operation, body).await;
-    // The awsJson error envelope names the class in `__type`, qualified by namespace.
-    let code = json["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit('#')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let message = json
-        .get("Message")
-        .or_else(|| json.get("message"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    (status, code, message)
 }
 
 /// Assert one row: the status is 400, the class is the expected one, and the `Message`
@@ -172,11 +148,12 @@ async fn every_client_class_refusal_answers_four_hundred() {
             Message::Any,
         ),
         (
-            "a resource ARN nothing minted (modelled 404)",
+            "a resource ARN nothing minted, in the identifier form a tagging call \
+             requires (modelled 404)",
             "ListTagsForResource",
             json!({
                 "ResourceARN": format!(
-                    "arn:aws:servicediscovery:{REGION}:{}:namespace/ns-nothinghere",
+                    "arn:aws:servicediscovery:{REGION}:{}:namespace/ns-0000000000000000",
                     engine::EMULATOR_ACCOUNT_ID
                 ),
             }),

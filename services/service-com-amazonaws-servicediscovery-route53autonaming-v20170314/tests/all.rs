@@ -69,6 +69,8 @@ mod service_summary_page_projection;
 mod state_roundtrip;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/tagging_resource_arn_format.rs"]
+mod tagging_resource_arn_format;
 #[path = "all/update_dns_namespace.rs"]
 mod update_dns_namespace;
 #[path = "all/update_http_namespace.rs"]

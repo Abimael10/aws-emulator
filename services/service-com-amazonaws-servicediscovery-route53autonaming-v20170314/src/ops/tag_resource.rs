@@ -146,6 +146,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The ARN's resource portion is checked BEFORE any lookup: an ARN this service
+        // could never have minted names no resource at any point in time, so it is bad
+        // input rather than a resource that is absent.
+        if let Some(message) =
+            crate::state::tagged_resource_arn::invalid_resource_format(&input.resource_arn)
+        {
+            return Err(TagResourceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(message.to_string()),
+            })
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),

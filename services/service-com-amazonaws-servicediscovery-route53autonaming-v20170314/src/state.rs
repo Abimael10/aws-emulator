@@ -26,6 +26,8 @@
 /// The Route 53 hosted zone a DNS namespace is backed by, and the record sets Cloud Map
 /// publishes into it for the namespace's services and instances.
 pub mod route53_zone;
+/// The form a `ResourceARN` must have for the tagging operations to look it up at all.
+pub mod tagged_resource_arn;
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -391,8 +393,13 @@ fn fold_id_digits(digest: &[u8], digits: usize) -> String {
         .collect()
 }
 
-/// How many characters a service `Id` carries behind its `srv-` prefix.
-const SERVICE_ID_DIGITS: usize = 16;
+/// How many characters the identifier of one of this service's taggable resources
+/// carries behind its kind prefix: `ns-` or `srv-` followed by this many lowercase
+/// alphanumerics.
+///
+/// ONE constant for every resource kind, so the width the creates MINT and the width
+/// [`tagged_resource_arn`] ACCEPTS in a caller-supplied ARN cannot drift apart.
+pub const RESOURCE_ID_DIGITS: usize = 16;
 
 /// How many characters an `OperationId` carries in its leading body segment.
 ///
@@ -426,7 +433,7 @@ pub fn derived_service_id(namespace_id: &str, name: &str) -> String {
     hasher.update(name.as_bytes());
     format!(
         "srv-{}",
-        fold_id_digits(&hasher.finalize(), SERVICE_ID_DIGITS)
+        fold_id_digits(&hasher.finalize(), RESOURCE_ID_DIGITS)
     )
 }
 

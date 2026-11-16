@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let id = state.next_id("ns", 16);
+            let id = state.next_id("ns", crate::state::RESOURCE_ID_DIGITS);
             let arn = crate::state::service_arn(&region, &format!("namespace/{id}"));
             // The operation is filed first because the namespace record carries its id:
             // that is what a later create of the same name is refused with.
