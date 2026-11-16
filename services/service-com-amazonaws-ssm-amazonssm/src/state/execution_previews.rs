@@ -459,17 +459,17 @@ impl ExecutionPreviewRecord {
     }
 }
 
-/// How a read words the miss of an execution preview id this Region holds none of: the id
-/// that was asked for, in the sentence the Automation slice this previews words a missing
-/// execution with ("Automation execution {id} does not exist.",
-/// `crate::ops::get_automation_execution`) — so the two reads of one slice word the same
-/// refusal the same way, and a caller reads back the id whose preview it asked for.
+/// How a read words the miss of an execution preview id this Region holds no live preview
+/// for: Systems Manager names the id asked for, single-quoted, and says of it both things
+/// that lead to the same answer — that no preview of that id exists, or that the one that
+/// did has expired. A read cannot tell those two apart, which is why the one sentence
+/// covers both and carries no terminating period.
 ///
-/// The modelled `ExecutionPreviewId` pattern is enforced before a handler runs, so the
-/// value this refuses is always a well-formed id the Region's endpoint minted no preview
-/// under.
+/// The only variable part is the id, taken from the request. The modelled
+/// `ExecutionPreviewId` pattern is enforced before a handler runs, so the value this
+/// refuses is always a well-formed id the Region's endpoint holds no preview under.
 pub fn execution_preview_not_found_message(preview_id: &str) -> String {
-    format!("Execution preview {preview_id} does not exist.")
+    format!("Execution preview '{preview_id}' does not exist or is expired")
 }
 
 impl ComAmazonawsSsmAmazonssmState {

@@ -678,8 +678,15 @@ async fn a_preview_is_pending_until_the_service_has_worked_it_out() {
     );
 }
 
-/// A read of a preview id this Region holds none of is the modelled miss, and so is a read
-/// through another Region's endpoint of a preview this one started.
+/// A read of a preview id this Region holds no live preview for is the modelled miss, and
+/// so is a read through another Region's endpoint of a preview this one started.
+///
+/// The rows span the ids the modelled `ExecutionPreviewId` pattern admits — lower-case and
+/// upper-case hex, the all-zero id and the all-`f` one — and the one id a preview WAS
+/// minted under, asked for at the wrong Region's endpoint. The refusal of each is the same
+/// sentence, so a client reading it cannot tell a never-minted id from one whose preview is
+/// gone; the positive control at the end is the same preview resolving through the endpoint
+/// it was started at.
 #[tokio::test]
 async fn a_read_of_a_preview_nothing_started_is_the_modelled_miss() {
     let (router, engine) = service();
@@ -688,6 +695,21 @@ async fn a_read_of_a_preview_nothing_started_is_the_modelled_miss() {
 
     for (case, region, preview_id) in [
         ("an id nothing minted", REGION, UNKNOWN_PREVIEW_ID),
+        (
+            "an upper-case hex id nothing minted",
+            REGION,
+            "AABBCCDD-EEFF-1234-5678-9ABCDEF01234",
+        ),
+        (
+            "the all-zero id",
+            REGION,
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        (
+            "the all-f id",
+            REGION,
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ),
         ("another Region's endpoint", OTHER_REGION, id.as_str()),
     ] {
         let (status, response) = call_in_region(
@@ -704,7 +726,7 @@ async fn a_read_of_a_preview_nothing_started_is_the_modelled_miss() {
         );
         assert_eq!(
             error_message(&response),
-            format!("Execution preview {preview_id} does not exist."),
+            format!("Execution preview '{preview_id}' does not exist or is expired"),
             "case {case:?}: expected the refusal to name the id asked for, got {response}"
         );
     }
@@ -712,6 +734,20 @@ async fn a_read_of_a_preview_nothing_started_is_the_modelled_miss() {
         stored(&engine),
         1,
         "a refused read must not persist a preview of its own"
+    );
+
+    // The positive control: the preview those misses were measured against is still
+    // reported through the endpoint it was started at.
+    let case = "the preview's own endpoint";
+    work_out(&engine, REGION);
+    let reported = read(&router, case, &id).await;
+    assert_eq!(
+        (
+            text(&reported, "ExecutionPreviewId"),
+            text(&reported, "Status")
+        ),
+        (id.clone(), "Success".to_string()),
+        "case {case:?}: expected the started preview reported back, got {reported}"
     );
 }
 
