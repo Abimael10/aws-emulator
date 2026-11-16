@@ -55,7 +55,10 @@ fn glue_data_catalog_arn(region: &str, account: &str) -> String {
 /// The ARN of a domain of this account, composed here from the partition, this service's
 /// namespace, the Region the request was signed for and the account this emulator serves,
 /// so an assertion does not ask the service to confirm its own answer.
-fn domain_arn(name: &str) -> String {
+///
+/// `pub(crate)` because the sibling suites for the identities this service DRAWS name a data
+/// source by the same ARN rather than growing a second copy of this composition.
+pub(crate) fn domain_arn(name: &str) -> String {
     format!(
         "arn:aws:es:{REGION}:{}:domain/{name}",
         ::engine::emulator_account_id()

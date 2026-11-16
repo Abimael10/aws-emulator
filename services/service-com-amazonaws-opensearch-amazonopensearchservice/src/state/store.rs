@@ -27,10 +27,12 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// which is what lets `DescribeOutboundConnections` report the same order twice
     /// and page through the set without repeating or skipping a record.
     pub connections: BTreeMap<String, Connection>,
-    /// Drives [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_connection_id`].
+    /// The place in this store's connection history the LAST connection took, which
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::next_connection_sequence`]
+    /// advances: a connection's own identifier is drawn rather than counted, so this is
+    /// what keeps the records in the order they were minted and lets the history release
+    /// the oldest one first.
     pub connection_seq: u64,
-    /// Drives [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_endpoint_suffix`].
-    pub endpoint_suffix_seq: u64,
     /// The Reserved Instance offering catalog this emulator publishes, keyed by
     /// `ReservedInstanceOfferingId`. Seeded by [`seed_reserved_instance_offerings`]
     /// and never written again: an offering is published by the service, so no
@@ -87,21 +89,12 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// is what lets a paged listing resume where the previous page stopped without
     /// repeating or skipping a record. Bounded by [`VPC_ENDPOINT_QUOTA`].
     pub vpc_endpoints: BTreeMap<String, VpcEndpointRecord>,
-    /// Drives
-    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_vpc_endpoint_id`].
-    pub vpc_endpoint_seq: u64,
     /// Every OpenSearch UI application of this account, keyed by its `Id` — unique
     /// per application, so the id IS the key. `CreateApplication` mints one and
     /// `GetApplication` reports it, from THIS one record. Iterating a `BTreeMap` is
     /// order-stable, which is what lets two reads of the set report it in the same
     /// order.
     pub applications: BTreeMap<String, Application>,
-    /// Drives
-    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_application_id`].
-    pub application_seq: u64,
-    /// Drives
-    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_attachment_id`].
-    pub attachment_seq: u64,
     /// Every direct query data source of this account, keyed by its
     /// `DataSourceName` — "a unique, user-defined label to identify the data source
     /// within your OpenSearch Service environment", so the name IS the key.
@@ -116,9 +109,6 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// order-stable, which is what lets two reads of the set report it in the same
     /// order. Bounded per application by [`MIGRATION_QUOTA`].
     pub migrations: BTreeMap<String, Migration>,
-    /// Drives
-    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_migration_id`].
-    pub migration_seq: u64,
     /// The claim on the ONE cluster-metric sampler of this store: the task that observes
     /// every provisioned domain's `AWS/ES` gauges on a cadence
     /// ([`cluster_metrics::drive_metric_sampling`]). It holds no reading of its own — the
@@ -138,7 +128,6 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             domain_planes: BTreeMap::new(),
             connections: BTreeMap::new(),
             connection_seq: 0,
-            endpoint_suffix_seq: 0,
             reserved_instance_offerings: seed_reserved_instance_offerings(),
             default_application_arn: None,
             reserved_instances: BTreeMap::new(),
@@ -147,103 +136,151 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             account_insights: BTreeMap::new(),
             package_vending_entitled: false,
             vpc_endpoints: BTreeMap::new(),
-            vpc_endpoint_seq: 0,
             applications: BTreeMap::new(),
-            application_seq: 0,
-            attachment_seq: 0,
             direct_query_data_sources: BTreeMap::new(),
             migrations: BTreeMap::new(),
-            migration_seq: 0,
             metric_sampling: cluster_metrics::MetricSampling::default(),
         }
     }
 }
 
-/// The characters a domain endpoint's opaque suffix is built from.
-pub(super) const SUFFIX_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+/// The characters an opaque token this service mints is built from.
+pub(super) const TOKEN_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
-/// The length of a domain endpoint's opaque suffix, from `ServiceUrl`'s own example
+/// The length of an opaque token this service mints, from `ServiceUrl`'s own example
 /// `search-imdb-movies-oopcnjfn6ugo.eu-west-1.es.amazonaws.com`.
-pub(super) const SUFFIX_LEN: u32 = 12;
+pub(super) const TOKEN_LEN: u32 = 12;
 
-/// The number of distinct suffixes [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_endpoint_suffix`] can
-/// render: `36^12`.
-pub(super) const SUFFIX_SPACE: u128 = 36u128.pow(SUFFIX_LEN);
+/// The number of characters an OpenSearch UI application's `Id` carries.
+///
+/// `Id` is `^[a-z0-9]{3,30}$`, a bound far wider than the ONE width the service mints
+/// inside it, so the modelled pattern does not settle this. What does is the identity's
+/// own shape: the id IS the host label the application's endpoint is reached on
+/// (`https://<id>.<region>.opensearch.amazonaws.com`), which is the form this account's
+/// OpenSearch collections and their endpoints take too — 20 lowercase alphanumeric
+/// characters. A client, a provider or a test that checks the form of an id (or of an
+/// endpoint built from one) against AWS's own takes this width and no other.
+pub(super) const APPLICATION_ID_LEN: u32 = 20;
 
-/// Scrambles consecutive seeds across [`SUFFIX_SPACE`]. Prime, so it is coprime with
-/// `36^12 = 2^24 * 3^24`, which makes `seed -> seed * MULTIPLIER + OFFSET (mod
-/// SUFFIX_SPACE)` a BIJECTION: distinct seeds can never mint the same suffix.
-pub(super) const SUFFIX_MULTIPLIER: u128 = 1_000_000_007;
+/// The widest token [`drawn_token`] renders: `36^24` is the last power of 36 a `u128`
+/// holds, so one draw renders a whole token up to that width.
+const MAX_TOKEN_LEN: u32 = 24;
 
-/// The bijection's constant term for a domain endpoint's suffix, so the first suffix
-/// minted is not a run of leading `a`s.
-pub(super) const SUFFIX_OFFSET: u128 = 734_291;
+/// How many times [`drawn_id`] draws again when the id it rendered is one this store
+/// already holds a record under. A draw is over `36^len`, so a collision is already
+/// vanishing; the redraw is what makes the id this store hands out unique rather than
+/// only improbable.
+const DRAWS: u8 = 8;
 
-/// The bijection's constant term for a connection id. Different from
-/// [`SUFFIX_OFFSET`], so the nth connection id and the nth endpoint suffix — minted
-/// off two counters that both start at zero — do not carry the same token.
-pub(super) const CONNECTION_ID_OFFSET: u128 = 51_539_607_551;
-
-/// The bijection's constant term for a service-managed VPC endpoint's id. Different
-/// from the two above for the same reason: three counters that start at zero must not
-/// render the same token.
-pub(super) const VPC_ENDPOINT_ID_OFFSET: u128 = 8_589_934_591;
-
-/// The bijection's constant term for an OpenSearch UI application's id. Different
-/// from the three above for the same reason: counters that all start at zero must not
-/// render the same token.
-pub(super) const APPLICATION_ID_OFFSET: u128 = 137_438_953_471;
-
-/// The bijection's constant term for a data source attachment's id. Different from the
-/// four above for the same reason: counters that all start at zero must not render the
-/// same token.
-pub(super) const ATTACHMENT_ID_OFFSET: u128 = 2_199_023_255_551;
-
-/// The bijection's constant term for a saved-object migration job's id. Different from
-/// the five above for the same reason: counters that all start at zero must not render
-/// the same token.
-pub(super) const MIGRATION_ID_OFFSET: u128 = 35_184_372_088_831;
-
-/// The opaque lowercase-alphanumeric token seed `seq` scrambles to, through the
-/// bijection described on [`SUFFIX_MULTIPLIER`]: distinct seeds under one `offset`
-/// can never render the same token.
-pub(super) fn opaque_token(seq: u64, offset: u128) -> String {
-    let mut scrambled = (u128::from(seq) * SUFFIX_MULTIPLIER + offset) % SUFFIX_SPACE;
-    let mut token = Vec::with_capacity(SUFFIX_LEN as usize);
-    for _ in 0..SUFFIX_LEN {
-        let digit = usize::try_from(scrambled % 36).unwrap_or(0);
-        token.push(SUFFIX_ALPHABET[digit]);
-        scrambled /= 36;
+/// ONE freshly drawn opaque lowercase-alphanumeric token of `len` characters.
+///
+/// The entropy is a version-4 UUID's — 122 drawn bits — folded into the `36^len` tokens
+/// of that width, which is what makes the token the resource's OWN identity: it is not a
+/// function of how many resources this store has minted, so the first resource of a fresh
+/// store is not addressed by a constant and no two resources, in one store or across runs,
+/// are handed the same token.
+pub(super) fn drawn_token(len: u32) -> String {
+    debug_assert!(
+        (1..=MAX_TOKEN_LEN).contains(&len),
+        "a token is drawn at a width one draw renders"
+    );
+    let len = len.clamp(1, MAX_TOKEN_LEN);
+    let mut drawn = ::uuid::Uuid::new_v4().as_u128() % 36u128.pow(len);
+    let mut token = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let digit = usize::try_from(drawn % 36).unwrap_or(0);
+        token.push(TOKEN_ALPHABET[digit]);
+        drawn /= 36;
     }
     String::from_utf8(token).unwrap_or_default()
+}
+
+/// The identifier a fresh draw of `len` characters renders, drawn again while this store
+/// already holds a record under it.
+///
+/// `render` builds the id a drawn token is used as — the token alone, or behind the
+/// prefix the resource's own pattern asks for — and `held` answers whether this store
+/// already holds a record under that id. EVERY draw is asked, the last one included, and
+/// the first free one is the answer.
+///
+/// A store is bounded by its own quotas, so it holds a vanishing fraction of the `36^len`
+/// tokens of a width and the first draw is almost always free. All [`DRAWS`] draws landing
+/// on a held record is therefore unreachable in practice; were it reached, the last draw is
+/// what this hands back — a minted identity is not a failure a caller is answered with —
+/// and the insert paths keep the record this store already holds rather than overwriting it,
+/// which is why that draw is logged where an operator can see it.
+pub(super) fn drawn_id(
+    len: u32,
+    render: impl Fn(&str) -> String,
+    held: impl Fn(&str) -> bool,
+) -> String {
+    let mut drawn = render(&drawn_token(len));
+    for _ in 1..DRAWS {
+        if !held(&drawn) {
+            return drawn;
+        }
+        drawn = render(&drawn_token(len));
+    }
+    if held(&drawn) {
+        ::tracing::warn!(
+            draws = DRAWS,
+            "every drawn identifier landed on a record this store already holds"
+        );
+    }
+    drawn
 }
 
 impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Mint the opaque suffix a domain's endpoint host carries, so two domains of
     /// the same name in different runs do not share an endpoint.
     ///
-    /// Derived from a counter through the bijection described on
-    /// [`SUFFIX_MULTIPLIER`], so it is unpredictable-looking yet never repeats.
-    pub fn mint_endpoint_suffix(&mut self) -> String {
-        self.endpoint_suffix_seq = self.endpoint_suffix_seq.wrapping_add(1);
-        opaque_token(self.endpoint_suffix_seq, SUFFIX_OFFSET)
+    /// DRAWN ([`drawn_token`]), so the suffix is this domain's own rather than a
+    /// rendering of how many domains the store has created — and no two hosts of this
+    /// store, in one store or across runs, carry one suffix
+    /// ([`Self::endpoint_suffix_held`]).
+    pub fn mint_endpoint_suffix(&self) -> String {
+        drawn_id(TOKEN_LEN, str::to_string, |suffix| {
+            self.endpoint_suffix_held(suffix)
+        })
+    }
+
+    /// Whether a host of this store already carries `suffix` — the public endpoint a
+    /// domain was created with, the host its VPC-access endpoints carry, or the
+    /// connection endpoint of a service-managed VPC endpoint, which is minted from the
+    /// same draw.
+    ///
+    /// Reads ONLY.
+    fn endpoint_suffix_held(&self, suffix: &str) -> bool {
+        self.domains.values().any(|domain| {
+            domain.endpoint.contains(suffix) || domain.vpc_access_suffix.as_deref() == Some(suffix)
+        }) || self
+            .vpc_endpoints
+            .values()
+            .any(|endpoint| endpoint.endpoint.contains(suffix))
     }
 
     /// Mint the identifier a cross-cluster connection is addressed by, so two
     /// connections never share one.
     ///
     /// `ConnectionId` is `@length(min: 10, max: 256)` with pattern
-    /// `^[a-z][a-z0-9\-]+$` — an opaque lowercase token. It is minted off its own
-    /// counter through the same bijection as [`Self::mint_endpoint_suffix`], behind a
-    /// `cc-` prefix for the cross-cluster resource it names, which is also what
-    /// satisfies the pattern's leading letter and carries the token past the
-    /// 10-character minimum.
-    pub fn mint_connection_id(&mut self) -> String {
-        self.connection_seq = self.connection_seq.wrapping_add(1);
-        format!(
-            "cc-{}",
-            opaque_token(self.connection_seq, CONNECTION_ID_OFFSET)
+    /// `^[a-z][a-z0-9\-]+$` — an opaque lowercase token. The token is DRAWN
+    /// ([`drawn_token`]) behind a `cc-` prefix for the cross-cluster resource it names,
+    /// which is also what satisfies the pattern's leading letter and carries the id past
+    /// the 10-character minimum.
+    pub fn mint_connection_id(&self) -> String {
+        drawn_id(
+            TOKEN_LEN,
+            |token| format!("cc-{token}"),
+            |id| self.connections.contains_key(id),
         )
+    }
+
+    /// The place in this store's connection history the next connection takes: the
+    /// order the record was minted in, which is what lets the history release the
+    /// oldest record first.
+    pub fn next_connection_sequence(&mut self) -> u64 {
+        self.connection_seq = self.connection_seq.wrapping_add(1);
+        self.connection_seq
     }
 
     /// Mint the identifier a service-managed VPC endpoint is addressed by, so two
@@ -251,27 +288,28 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ///
     /// `VpcEndpointId` is `@length(min: 5, max: 256)` with pattern
     /// `^aos-[a-zA-Z0-9]*$`: the `aos-` prefix is the service's own, and the body is
-    /// minted off its own counter through the same bijection as
-    /// [`Self::mint_endpoint_suffix`], so it is unpredictable-looking yet never
-    /// repeats.
-    pub fn mint_vpc_endpoint_id(&mut self) -> String {
-        self.vpc_endpoint_seq = self.vpc_endpoint_seq.wrapping_add(1);
-        format!(
-            "aos-{}",
-            opaque_token(self.vpc_endpoint_seq, VPC_ENDPOINT_ID_OFFSET)
+    /// DRAWN ([`drawn_token`]).
+    pub fn mint_vpc_endpoint_id(&self) -> String {
+        drawn_id(
+            TOKEN_LEN,
+            |token| format!("aos-{token}"),
+            |id| self.vpc_endpoints.contains_key(id),
         )
     }
 
     /// Mint the identifier an OpenSearch UI application is addressed by, so two
     /// applications never share one.
     ///
-    /// `Id` is `^[a-z0-9]{3,30}$` — an opaque lowercase token — so the whole id is
-    /// minted off its own counter through the same bijection as
-    /// [`Self::mint_endpoint_suffix`], which renders exactly that alphabet and never
-    /// repeats.
-    pub fn mint_application_id(&mut self) -> String {
-        self.application_seq = self.application_seq.wrapping_add(1);
-        opaque_token(self.application_seq, APPLICATION_ID_OFFSET)
+    /// `Id` is `^[a-z0-9]{3,30}$` — an opaque lowercase token — so the whole id is the
+    /// DRAWN token ([`drawn_token`]), at the width AWS mints inside that bound
+    /// ([`APPLICATION_ID_LEN`]). The id is the application's OWN identity: it is drawn
+    /// FOR the application rather than rendered from how many applications the store has
+    /// minted, so the first application of a fresh store is not addressed by a constant
+    /// and the ARN built over it addresses that one application alone.
+    pub fn mint_application_id(&self) -> String {
+        drawn_id(APPLICATION_ID_LEN, str::to_string, |id| {
+            self.applications.contains_key(id)
+        })
     }
 
     /// Materialise the status move the clock owes every stored application, for a
@@ -345,9 +383,9 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Store `application` and hand back the stored copy, so a create answers with the
     /// record this service persisted rather than a copy beside it.
     ///
-    /// The id comes from [`Self::mint_application_id`], a bijection over its own
-    /// counter, so the key cannot already be taken; the entry API is used so no path
-    /// can overwrite a record this store already holds under one.
+    /// The id comes from [`Self::mint_application_id`], which draws one this store
+    /// holds no application under, so the key cannot already be taken; the entry API is
+    /// used so no path can overwrite a record this store already holds under one.
     pub fn insert_application(&mut self, application: Application) -> &Application {
         let id = application.id.clone();
         self.applications.entry(id).or_insert(application)
@@ -377,15 +415,14 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ///
     /// `migrationId` is an opaque string the model constrains not at all, and a read is
     /// addressed by it ALONE, so it names the application whose workspace the job
-    /// imports into and then an opaque part minted off its own counter through the same
-    /// bijection as [`Self::mint_endpoint_suffix`]. The application's `Id` carries no
-    /// hyphen (`^[a-z0-9]{3,30}$`), so the hyphen between the two parts is what
-    /// [`migration_application_id`] reads the application back out of.
-    pub fn mint_migration_id(&mut self, application_id: &str) -> String {
-        self.migration_seq = self.migration_seq.wrapping_add(1);
-        format!(
-            "{application_id}-{}",
-            opaque_token(self.migration_seq, MIGRATION_ID_OFFSET)
+    /// imports into and then a DRAWN opaque part ([`drawn_token`]). The application's
+    /// `Id` carries no hyphen (`^[a-z0-9]{3,30}$`), so the hyphen between the two parts
+    /// is what [`migration_application_id`] reads the application back out of.
+    pub fn mint_migration_id(&self, application_id: &str) -> String {
+        drawn_id(
+            TOKEN_LEN,
+            |token| format!("{application_id}-{token}"),
+            |id| self.migrations.contains_key(id),
         )
     }
 
@@ -462,9 +499,9 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Store `migration` and hand back the stored copy, so a start answers with the
     /// record this service persisted rather than a copy beside it.
     ///
-    /// The id comes from [`Self::mint_migration_id`], a bijection over its own counter,
-    /// so the key cannot already be taken; the entry API is used so no path can
-    /// overwrite a record this store already holds under one.
+    /// The id comes from [`Self::mint_migration_id`], which draws one this store holds
+    /// no job under, so the key cannot already be taken; the entry API is used so no
+    /// path can overwrite a record this store already holds under one.
     pub fn insert_migration(&mut self, migration: Migration) -> &Migration {
         let id = migration.migration_id.clone();
         self.migrations.entry(id).or_insert(migration)
@@ -493,16 +530,29 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Mint the identifier a data source attachment is addressed by, so two
     /// attachments never share one.
     ///
-    /// `attachmentId` is an opaque string the model constrains not at all, so it is
-    /// minted off its own counter through the same bijection as
-    /// [`Self::mint_endpoint_suffix`], behind the `dsa-` prefix that names the resource
-    /// it identifies the way `cc-` names a cross-cluster connection.
-    pub fn mint_attachment_id(&mut self) -> String {
-        self.attachment_seq = self.attachment_seq.wrapping_add(1);
-        format!(
-            "dsa-{}",
-            opaque_token(self.attachment_seq, ATTACHMENT_ID_OFFSET)
+    /// `attachmentId` is an opaque string the model constrains not at all, so it is a
+    /// DRAWN token ([`drawn_token`]) behind the `dsa-` prefix that names the resource it
+    /// identifies the way `cc-` names a cross-cluster connection.
+    pub fn mint_attachment_id(&self) -> String {
+        drawn_id(
+            TOKEN_LEN,
+            |token| format!("dsa-{token}"),
+            |id| self.attachment_id_held(id),
         )
+    }
+
+    /// Whether an attachment of any application of this store is already addressed by
+    /// `attachment_id`. An attachment is held ON the application it links, so every
+    /// application is asked.
+    ///
+    /// Reads ONLY.
+    fn attachment_id_held(&self, attachment_id: &str) -> bool {
+        self.applications.values().any(|application| {
+            application
+                .attachments
+                .values()
+                .any(|attachment| attachment.attachment_id == attachment_id)
+        })
     }
 
     /// Materialise the status move the clock owes every data source attachment of every

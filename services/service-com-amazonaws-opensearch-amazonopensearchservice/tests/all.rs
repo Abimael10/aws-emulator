@@ -163,6 +163,8 @@ mod domain_rest_document_update;
 mod domain_server_defaults;
 #[path = "all/domain_vpc_placement.rs"]
 mod domain_vpc_placement;
+#[path = "all/drawn_resource_identities.rs"]
+mod drawn_resource_identities;
 #[path = "all/dry_run_progress.rs"]
 mod dry_run_progress;
 #[path = "all/ebs_volume_size_limit.rs"]

@@ -257,7 +257,10 @@ fn create_rows() -> Vec<Row> {
 
 /// Whether `id` satisfies `ConnectionId`'s own modelled constraint:
 /// `@length(min: 10, max: 256)` with pattern `^[a-z][a-z0-9\-]+$`.
-fn is_connection_id(id: &str) -> bool {
+///
+/// `pub(crate)` because the sibling suite for the identifiers this service DRAWS asserts
+/// the same modelled constraint rather than growing a second copy of it.
+pub(crate) fn is_connection_id(id: &str) -> bool {
     (10..=256).contains(&id.len())
         && id.starts_with(|first: char| first.is_ascii_lowercase())
         && id.chars().all(|character| {

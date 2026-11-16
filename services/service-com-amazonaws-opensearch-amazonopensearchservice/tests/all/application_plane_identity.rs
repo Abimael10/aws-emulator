@@ -176,7 +176,10 @@ fn message(answer: &Answer) -> String {
 
 /// Whether `id` is inside the expression the model declares for `Id`:
 /// `^[a-z0-9]{3,30}$` (`smithy_query(query="shape",shape="Id")`).
-fn is_application_id(id: &str) -> bool {
+///
+/// `pub(crate)` because the sibling suite for the identifiers this service DRAWS asserts
+/// the same modelled expression rather than growing a second copy of it.
+pub(crate) fn is_application_id(id: &str) -> bool {
     (3..=30).contains(&id.chars().count())
         && id
             .chars()

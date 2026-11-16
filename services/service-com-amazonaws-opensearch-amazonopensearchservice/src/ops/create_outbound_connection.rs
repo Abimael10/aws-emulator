@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let connection_id = store.mint_connection_id();
-        let sequence = store.connection_seq;
+        let sequence = store.next_connection_sequence();
         // A connection request is VALIDATED before it can be accepted, and what it is
         // validated against is the domain registry: a reference that resolves to no
         // domain this service holds names a cluster nothing can be connected to, so
