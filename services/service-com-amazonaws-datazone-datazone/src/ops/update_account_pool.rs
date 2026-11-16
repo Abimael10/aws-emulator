@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +171,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountPool"))
+        use crate::state::{caller_principal, date_time, now_ms, validate_account_source};
+
+        // The constraints the model declares INSIDE the `AccountSource` union: the
+        // boundary validator does not walk a union's active member, so an
+        // `accountSource` the request carries is checked here by the same rule
+        // `CreateAccountPool` applies. The refusal names the member and its constraint,
+        // never the value sent.
+        if let Some(account_source) = input.account_source.as_ref() {
+            if let Err(message) = validate_account_source(account_source) {
+                return Err(UpdateAccountPoolErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAccountPoolErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // update is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(UpdateAccountPoolErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // The documented prerequisites, read under the same lock the write takes: a
+        // domain already on its way out holds no pool to update, and a pool this domain
+        // does not hold is as absent as one nothing created.
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            UpdateAccountPoolErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::ResourceKind::Domain.not_found_message(),
+            })
+        })?;
+        if !domain.account_pools.contains_key(&input.identifier) {
+            return Err(UpdateAccountPoolErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::ResourceKind::AccountPool.not_found_message(),
+                },
+            )
+            .into());
+        }
+
+        // Derived from the caller's own credential scope, never from the request body.
+        let principal = caller_principal(ctx);
+        // The pool was found under this same lock just above, so it is still there; an
+        // impossible disappearance is reported as a server fault rather than answered as
+        // though the update had been applied.
+        let pool = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .and_then(|domain| domain.account_pools.get_mut(&input.identifier))
+            .ok_or_else(|| {
+                UpdateAccountPoolErrorModeled::InternalServerException(InternalServerException {
+                    message: "the account pool disappeared while it was being updated"
+                        .to_string(),
+                })
+            })?;
+
+        // PATCH semantics: a member the request carries replaces the stored value, a
+        // member it omits leaves the stored value untouched. `domainUnitId`, `createdBy`
+        // and `createdAt` belong to the create — this operation takes none of them, so
+        // each is reported exactly as stored.
+        if let Some(name) = input.name {
+            pool.name = name;
+        }
+        if let Some(description) = input.description {
+            pool.description = Some(description);
+        }
+        // `ResolutionStrategy` is a modelled enum, so the boundary validator has already
+        // refused anything outside it; a member the request carries is stored as it
+        // stands.
+        if let Some(resolution_strategy) = input.resolution_strategy {
+            pool.resolution_strategy = resolution_strategy;
+        }
+        if let Some(account_source) = input.account_source {
+            pool.account_source = account_source;
+        }
+        // The update is what sets `updatedBy`, which a pool's reader reports as absent
+        // until something updates it, and what moves `lastUpdatedAt`.
+        pool.updated_by = Some(principal);
+        pool.last_updated_at_ms = now;
+
+        Ok(UpdateAccountPoolOutput {
+            domain_id: Some(pool.domain_id.clone()),
+            id: Some(pool.id.clone()),
+            name: Some(pool.name.clone()),
+            description: pool.description.clone(),
+            resolution_strategy: Some(pool.resolution_strategy.clone()),
+            account_source: pool.account_source.clone(),
+            created_by: pool.created_by.clone(),
+            created_at: Some(date_time(pool.created_at_ms)),
+            last_updated_at: Some(date_time(pool.last_updated_at_ms)),
+            updated_by: pool.updated_by.clone(),
+            domain_unit_id: Some(pool.domain_unit_id.clone()),
+        })
     }
 }

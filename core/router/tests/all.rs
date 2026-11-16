@@ -14,9 +14,6 @@
 // and have no prose to duplicate, re-word or mistype, which is what had gone wrong here: this
 // header and the tail of the list had each grown hundreds of re-typed copies of these
 // paragraphs, and no suite of this target ran.
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
-// place its name sorts to. That list holds those pairs and nothing else: no prose between
-// them, no blank line, and nothing at all after the last one.
 //
 // A suite's own module header is where what it covers belongs, beside the test it explains,
 // and a remark about THIS root belongs in one of the comment-only files declared below
@@ -36,18 +33,6 @@
 // crate's own root — so no rule above needs restating anywhere else. The attribute below
 // allows one lint for the suites this root compiles, and being an inner attribute it stands
 // ahead of the first declaration.
-// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
-// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
-// `all/declaration_roots_are_canonical_and_complete.rs`,
-// `all/declaration_roots_end_with_their_last_declaration.rs`,
-// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
-// `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
-// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
-//
-// The lint allowed below is for the suite files this root compiles: a module header that wraps
-// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
-// is a note rather than a build failure. An inner attribute is legal only ahead of the first
-// item, so it stands with this header.
 #![allow(clippy::doc_lazy_continuation)]
 #[path = "all/agent_registry_discovery_routes_probe.rs"]
 mod agent_registry_discovery_routes_probe;

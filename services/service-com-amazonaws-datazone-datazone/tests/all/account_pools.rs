@@ -21,7 +21,7 @@
 //! 5. A request outside a modelled constraint is refused with the modelled validation
 //!    error, not stored.
 
-use crate::harness::{Emulator, SETTLED};
+use crate::harness::{accounts, Emulator, SETTLED};
 use serde_json::{json, Value};
 // The one `ResolutionStrategy` member as the service stores it, so a drift between the
 // constant and the value on the wire fails here.
@@ -131,19 +131,6 @@ fn pool_cases() -> Vec<PoolCase> {
             }),
         },
     ]
-}
-
-/// `count` distinct accounts, each with one supported region: the account ids are
-/// twelve digits (`AwsAccountId`) built from the index.
-fn accounts(count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| {
-            json!({
-                "awsAccountId": format!("{:012}", 100_000_000_000u64 + index as u64),
-                "supportedRegions": ["us-east-1"],
-            })
-        })
-        .collect()
 }
 
 /// An available domain plus the `rootDomainUnitId` it reports: a new pool must belong
