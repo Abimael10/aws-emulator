@@ -926,16 +926,14 @@ async fn a_delete_is_accepted_whatever_a_definition_references_and_settles_on_wh
                 );
                 assert_eq!(
                     settled["error"]["code"].as_str(),
-                    Some("VALIDATION_ERROR"),
+                    Some(crate::asset_model_settle_failures::VALIDATION_ERROR),
                     "case {case:?}: expected a VALIDATION_ERROR diagnosis, got {settled}"
                 );
                 assert_eq!(
                     settled["error"]["message"].as_str(),
-                    Some(
-                        "Attempted to delete an asset model that is referenced by a hierarchy \
-                         in a parent asset model. You must remove hierarchy references before \
-                         you can delete the asset model."
-                    ),
+                    // The sentence is entirely fixed text, read from the suite that
+                    // owns it rather than spelled a second time here.
+                    Some(crate::asset_model_settle_failures::REFERENCED_BY_PARENT),
                     "case {case:?}: unexpected diagnosis in {settled}"
                 );
             }

@@ -21,14 +21,15 @@
 //! here: a crate-local test can only ever see one side of the call.
 //!
 //! However a declaration composes the container image out of the repository, the image the
-//! registered revision carries names that repository through the registry URI AWS publishes
-//! for it (`aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`), with the tag the
-//! declaration asked for: a resource's properties are resolved against the return values
-//! CloudFormation publishes for the resources of the template, which is what a declaration
-//! has to go on before the create that makes one has answered. The stack's OUTPUT is
-//! evaluated after the create, so what it carries is the address Amazon ECR itself reports
-//! for the repository — the endpoint this emulator serves that registry at, which is where a
-//! container client pushes and pulls.
+//! registered revision carries names that repository at the address the registry is SERVED
+//! at, with the tag the declaration asked for. A reference to the repository's own
+//! `RepositoryUri` attribute resolves to that address — the endpoint this emulator serves the
+//! registry at, which is where a container client pushes and pulls, and what the stack's own
+//! `RepositoryUri` output and Amazon ECR's read must agree on. A template that instead spells
+//! the registry host out of the pseudo parameters and the repository's name spells the
+//! STAND-IN CloudFormation derived for that attribute before the create answered, and a
+//! deployment re-points such a value to the identifier the owning service assigned — so that
+//! image addresses the registry that exists rather than a host nothing here answers for.
 //!
 //! The rows differ along what the rule generalises over: how the declaration composes the
 //! image from the repository (an `Fn::Sub` over the repository's `RepositoryUri` attribute, an
@@ -281,6 +282,13 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
 /// can use this URI for container image `push` and `pull` operations"). This suite's router is
 /// served on no port of its own, so that endpoint is the base `smithy_server_runtime` reports
 /// for one.
+///
+/// It is also the URI every row's registered image carries. A declaration that reaches the
+/// repository's `RepositoryUri` attribute resolves to it directly; one that spells the AWS
+/// registry host out of the pseudo parameters and the repository's name spells the STAND-IN
+/// CloudFormation derived for that attribute before the create answered, which the deployment
+/// re-points to the value the owning service assigned — so either way the image addresses the
+/// registry this emulator serves, which is the only address the image can be pulled from here.
 fn published_repository_uri(repository: &str) -> String {
     let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
     let authority = base

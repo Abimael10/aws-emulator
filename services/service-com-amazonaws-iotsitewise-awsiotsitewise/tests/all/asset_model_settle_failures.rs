@@ -40,7 +40,10 @@ use crate::hierarchies_etags_and_refusals::{describe_e_tag, is_modelled_e_tag};
 use crate::support::settled_asset_model_status;
 
 /// The `ErrorCode` every settle-time diagnosis of a definition carries.
-const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
+///
+/// Shared with the sibling suites that read the same settle-time diagnosis, so one
+/// spelling of it stands in this crate's tests.
+pub(crate) const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 
 /// The diagnosis a formula variable reaching through a hierarchy at a property the
 /// child model does not expose settles the model at. Fixed text: it names no value
@@ -65,7 +68,10 @@ const CYCLICAL_HIERARCHY: &str = "A cyclical hierarchy definition exists. \
 
 /// The diagnosis a delete of a model another model's hierarchy still names settles
 /// that model at.
-const REFERENCED_BY_PARENT: &str =
+///
+/// Shared, like [`VALIDATION_ERROR`] above: the sentence is entirely fixed text, so
+/// a second copy of it in another suite could only drift from this one.
+pub(crate) const REFERENCED_BY_PARENT: &str =
     "Attempted to delete an asset model that is referenced by a hierarchy in a parent asset \
      model. You must remove hierarchy references before you can delete the asset model.";
 
@@ -73,22 +79,22 @@ const REFERENCED_BY_PARENT: &str =
 const HIERARCHY: &str = "Children";
 
 /// `POST /asset-models`.
-async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", "/asset-models", Some(body)).await
 }
 
 /// `PUT /asset-models/{label}`.
-async fn update(router: &MultiServiceRouter, label: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn update(router: &MultiServiceRouter, label: &str, body: Value) -> (u16, Value) {
     call(router, "PUT", &format!("/asset-models/{label}"), Some(body)).await
 }
 
 /// `GET /asset-models/{label}`.
-async fn describe(router: &MultiServiceRouter, label: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, label: &str) -> (u16, Value) {
     call(router, "GET", &format!("/asset-models/{label}"), None).await
 }
 
 /// `DELETE /asset-models/{label}`.
-async fn delete(router: &MultiServiceRouter, label: &str) -> (u16, Value) {
+pub(crate) async fn delete(router: &MultiServiceRouter, label: &str) -> (u16, Value) {
     call(router, "DELETE", &format!("/asset-models/{label}"), None).await
 }
 
@@ -107,7 +113,7 @@ async fn listed_status(router: &MultiServiceRouter, model_id: &str) -> Option<Va
 
 /// A measurement property definition: a RAW property, which no metric of a parent
 /// model may consume through a hierarchy.
-fn measurement(name: &str) -> Value {
+pub(crate) fn measurement(name: &str) -> Value {
     json!({"name": name, "dataType": "DOUBLE", "type": {"measurement": {}}})
 }
 

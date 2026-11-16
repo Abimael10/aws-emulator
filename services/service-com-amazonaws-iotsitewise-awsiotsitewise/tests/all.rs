@@ -617,6 +617,8 @@ mod asset_model_absent_version_refusal;
 mod asset_model_composite_model;
 #[path = "all/asset_model_composite_model_delete.rs"]
 mod asset_model_composite_model_delete;
+#[path = "all/asset_model_delete_reference_survival.rs"]
+mod asset_model_delete_reference_survival;
 #[path = "all/asset_model_properties.rs"]
 mod asset_model_properties;
 #[path = "all/asset_model_property_interface_summaries.rs"]
