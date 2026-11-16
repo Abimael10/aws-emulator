@@ -25,6 +25,8 @@ mod authorizer_teardown;
 mod bulk_thing_registration;
 #[path = "all/bulk_thing_registration_reports.rs"]
 mod bulk_thing_registration_reports;
+#[path = "all/caller_authorization.rs"]
+mod caller_authorization;
 #[path = "all/certificate_deletion.rs"]
 mod certificate_deletion;
 #[path = "all/certificate_listing.rs"]

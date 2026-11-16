@@ -963,6 +963,25 @@ pub const APIS: &[Api] = &[
         },
         answer_model: Some(&COGNITO_IDP),
     },
+    // `services/service-com-amazonaws-iot-awsiotservice/smithy-model/
+    // com-amazonaws-iot-awsiotservice.json`: restJson1, sigv4Name `iot`, endpointPrefix `iot`,
+    // sdkId `IoT`. Its requests are bound per operation out of that same model ([`IOT`]).
+    //
+    // A DEVICE REGISTRY is on both sides of a function. A rule of the message broker invokes a
+    // function with the message a device published, and the handler that serves it registers,
+    // reads, lists or re-attributes the thing the message came from (`CreateThing`,
+    // `DescribeThing`, `ListThings`, `UpdateThing`) and asks where the device's own data plane
+    // answers (`DescribeEndpoint`) — so a handler that cannot reach this service can consume a
+    // device's message but record nothing about the device, and the effect of such an
+    // invocation is observable nowhere.
+    Api {
+        sdk_token: "iot",
+        signing_name: "iot",
+        endpoint_prefix: "iot",
+        model: Some(IOT_MODEL),
+        protocol: Protocol::RestJson(&IOT),
+        answer_model: Some(&IOT_ANSWERS),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -1144,6 +1163,10 @@ pub(super) const COGNITO_IDP_MODEL: &str = include_str!(
      awscognitoidentityproviderservice/smithy-model/\
      com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice.json"
 );
+pub(super) const IOT_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-iot-awsiotservice/smithy-model/\
+     com-amazonaws-iot-awsiotservice.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1295,6 +1318,10 @@ static COGNITO_IDP: super::blob_members::ServiceModel = super::blob_members::Ser
     source: COGNITO_IDP_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static IOT_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: IOT_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// The Bedrock Agent runtime plane's own model, which a call to it is bound by — embedded
 /// exactly as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are
@@ -1386,6 +1413,15 @@ static APPCONFIGDATA: super::rest_json::RestApi = super::rest_json::RestApi {
 static APPCONFIG: super::rest_json::RestApi = super::rest_json::RestApi {
     model: APPCONFIG_MODEL,
     namespace: "com.amazonaws.appconfig",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// AWS IoT's own model, which a call to it is bound by — embedded exactly as the models above
+/// are and for the same reason: the wire facts of each of its operations are that model's, so
+/// this seam states none of them.
+static IOT: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: IOT_MODEL,
+    namespace: "com.amazonaws.iot",
     parsed: ::std::sync::OnceLock::new(),
 };
 

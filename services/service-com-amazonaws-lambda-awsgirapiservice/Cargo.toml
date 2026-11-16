@@ -342,6 +342,9 @@ service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # identity, configuration set and message a handler's calls produce are read back through
 # that service's own API, mounted beside lambda on ONE engine.
 service-com-amazonaws-sesv2-simpleemailservice-v2 = { workspace = true }
+# The same for AWS IoT: the thing a handler's own `CreateThing`/`UpdateThing` registers is
+# read back through that service's own registry, with it mounted beside lambda on ONE engine.
+service-com-amazonaws-iot-awsiotservice = { workspace = true }
 # The same table is the sink a handler's OWN outbound call writes to in the stream-driven
 # pipeline test, mounted on that same engine so the item is read back where a client reads
 # it.

@@ -49,9 +49,22 @@ sqlparser = "0.59"
 
 # The IAM store a topic-rule action's `roleArn` is resolved against, to decide whether the
 # rules engine may assume that role and make the action's API call under it
-# (`state::rule_action_role`): the IAM service's own state struct, in the SAME shared
-# engine, read through its own accessors rather than through a second copy of them.
+# (`state::rule_action_role`), and the identity-based policy documents in force on the
+# principal a request speaks for, which is what the authorization decision taken in front of
+# every operation is made from (`service::authorization`): the IAM service's own state struct,
+# in the SAME shared engine, read through its own accessors rather than through a second copy
+# of them.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+
+# The STS store that same decision resolves the caller through (`service::authorization`): the
+# session a request's access key id belongs to is the record `sts:GetCallerIdentity` answers
+# from, read through that service's own accessor in the SAME shared engine.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+
+# `form_urlencoded`: the ONE reader of a query string in this crate — the `resourceArn` a tag
+# READ binds to the query is percent-encoded by an SDK client, and the authorization decision
+# reads that ARN back (`service::authorization`).
+form_urlencoded = "1"
 
 # The Certificate Manager store a domain configuration's server certificate is resolved
 # against (`state::domain_configurations`): whether a certificate exists, and whether a

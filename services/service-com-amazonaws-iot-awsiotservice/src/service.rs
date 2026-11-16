@@ -53,6 +53,17 @@
 //! that owns the resource, and a rule's SQL statement that cannot be parsed — behind
 //! [`ValidationRefusalErrorType`], each with the shape IT is known to qualify, which that
 //! wrapper qualifies on the way out while changing nothing else about the response.
+//!
+//! ## The authorization decision in front of every operation
+//!
+//! AWS answers the IAM decision at the layer in FRONT of a service, before the request's own
+//! shape is looked at, so every request this service serves passes through
+//! [`AuthorizationGate`] first: a caller whose identity-based policies do not allow
+//! `iot:<OperationName>` is refused `AccessDeniedException` (HTTP 403) and the call performs
+//! nothing ([`authorization`]). `override_operation` is the only seam that can run ahead of the
+//! framework's deserialize -> validate -> handle walk, which is why the gate is picked there;
+//! every request it does not refuse is served by the modelled operation the request's own
+//! routing key names.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
@@ -64,6 +75,10 @@ use std::sync::Arc;
 mod validation;
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+
+/// Whether IAM lets the principal a request speaks for perform the action it asks for, taken
+/// in front of every operation of this service ([`AuthorizationGate`]).
+pub mod authorization;
 
 /// The header a restJson1 client resolves an error SHAPE from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
@@ -150,38 +165,117 @@ fn qualified_error_shape(shape: &str) -> String {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// THE AUTHORIZATION GATE every request of this service passes through, which serves the
+    /// modelled operation the request named once IAM permits the action ([`AuthorizationGate`]).
+    gate: AuthorizationGate<Eng>,
     /// The fleet-index reader, served behind [`ValidationRefusalErrorType`]: the
     /// `indexName` this service does not recognise is refused `InvalidRequestException`,
     /// so the refusal names that shape the way this service names it.
-    describe_index: ValidationRefusalErrorType<crate::ops::describe_index::DescribeIndex<Eng>>,
+    describe_index: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
     /// The authorizer delete, served behind [`ValidationRefusalErrorType`] for the same
     /// reason: an authorizer the account still has in service is refused
     /// `InvalidRequestException`.
-    delete_authorizer:
-        ValidationRefusalErrorType<crate::ops::delete_authorizer::DeleteAuthorizer<Eng>>,
+    delete_authorizer: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
     /// The fleet-indexing writer, served behind [`ValidationRefusalErrorType`] for the
     /// same reason: a configuration whose members contradict each other is refused
     /// `InvalidRequestException`.
-    update_indexing_configuration: ValidationRefusalErrorType<
-        crate::ops::update_indexing_configuration::UpdateIndexingConfiguration<Eng>,
-    >,
+    update_indexing_configuration: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
     /// The topic-rule create, served behind [`ValidationRefusalErrorType`] because a
     /// rule whose SQL statement cannot be parsed is refused `SqlParseException`, which
     /// this service names qualified in the same way. Its OTHER refusals keep the bare
     /// shape name: a create refused because the rule already exists names
     /// `ResourceAlreadyExistsException` unqualified.
-    create_topic_rule: ValidationRefusalErrorType<crate::ops::create_topic_rule::CreateTopicRule<Eng>>,
+    create_topic_rule: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
     /// The topic-rule replace, served behind [`ValidationRefusalErrorType`] because it
     /// reads a statement under exactly the same rule as the create.
-    replace_topic_rule:
-        ValidationRefusalErrorType<crate::ops::replace_topic_rule::ReplaceTopicRule<Eng>>,
+    replace_topic_rule: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
     /// The policy create, served behind [`ValidationRefusalErrorType`] because a request
     /// that breaks a modelled constraint — one carrying no `policyDocument` at all — is
     /// refused `InvalidRequestException` by this service's validation layer
     /// (`service::validation`), which names that shape qualified. Its other refusals keep
     /// the bare shape name: a document that is no policy names
     /// `MalformedPolicyException` unqualified.
-    create_policy: ValidationRefusalErrorType<crate::ops::create_policy::CreatePolicy<Eng>>,
+    create_policy: ValidationRefusalErrorType<AuthorizationGate<Eng>>,
+}
+
+/// THE GATE every request this service serves passes through, as an operation the dispatch
+/// path can run: whether IAM permits the ACTION the request named
+/// ([`authorization::authorize`]).
+///
+/// The order is AWS's: authorization is decided by the IAM layer in FRONT of the service, so it
+/// is answered before anything about the request's own resource is resolved, let alone
+/// deserialized or constraint-checked. A request it does not refuse is handed to the modelled
+/// operation the request named, read off this service's own routing table, so it is served by
+/// exactly the centralized deserialize -> validate -> handle walk every other request takes:
+/// the gate changes WHICH refusal comes first, not whether the modelled constraints are
+/// enforced.
+///
+/// It names no operation of its own, because the operation is the routing key the request
+/// carries: ONE gate stands in front of all of this service's operations, and the action it
+/// judges is that key under this service's own IAM prefix.
+pub struct AuthorizationGate<Eng> {
+    /// The same shared engine the entry constructed each operation from, so the decision reads
+    /// the account's own IAM and STS stores rather than a second copy of them.
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> AuthorizationGate<Eng> {
+    /// A gate on the shared engine.
+    fn new(engine: Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r WireRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, WireResponse> {
+        Box::pin(async move {
+            // The operation the request named, read exactly as dispatch reads it: the routing
+            // key this service's protocol resolves from the request line. It is the ACTION the
+            // IAM decision is about, and the key the modelled operation is wired under.
+            let Ok(operation) = svc.definition().protocol().routing_key(req) else {
+                // `override_operation` picks this gate only for a request whose key resolves,
+                // so this is unreachable; answered as the request naming no modelled
+                // operation, which is what it would be.
+                return svc.definition().routing_error_response(req);
+            };
+            // The resource the request ADDRESSES, under the ARN namespace of the identity the
+            // request resolved to — which is this service's `arnNamespace` and `sigv4Name`
+            // alike, so the ARN read out of the request is read as an ARN of THIS service —
+            // and in the Region the request was signed for, which is the Region segment of an
+            // ARN this service mints.
+            let resource = authorization::judged_resource(
+                authorization::action_prefix(ctx),
+                &crate::state::request_region(ctx.parts()),
+                operation,
+                req,
+            );
+            // IAM's decision, taken before the operation reads or writes anything. A refused
+            // request never reaches the delegate, so it mints nothing and reports nothing.
+            if let Err(denial) =
+                authorization::authorize(&*self.engine, ctx, operation, &resource)
+            {
+                return authorization::refusal_response(&denial);
+            }
+            match svc.definition().routing_table().get(operation) {
+                Some(modelled) => modelled.run(svc, req, ctx).await,
+                // Unreachable in practice: the key came from this service's own protocol.
+                // Answer the framework's own no-such-operation response rather than inventing
+                // one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    /// `None`, NOT an empty list: the request is still signed as the operation the MODEL names,
+    /// so wrapping every operation in this gate changes which schemes sign none of them.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -191,32 +285,32 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            // The SAME shared engine the entry's own operations were constructed from,
-            // so the wrapped reader reads the one store.
+            gate: AuthorizationGate::new(Arc::clone(&engine)),
+            // The SAME shared engine the entry's own operations were constructed from, so the
+            // gate behind each wrapper reads the one store — and the operation it hands an
+            // authorized request to is the entry's own, off this service's routing table.
             describe_index: ValidationRefusalErrorType::new(
-                crate::ops::describe_index::DescribeIndex::new(Arc::clone(&engine)),
+                AuthorizationGate::new(Arc::clone(&engine)),
                 &[INVALID_REQUEST_EXCEPTION],
             ),
             delete_authorizer: ValidationRefusalErrorType::new(
-                crate::ops::delete_authorizer::DeleteAuthorizer::new(Arc::clone(&engine)),
+                AuthorizationGate::new(Arc::clone(&engine)),
                 &[INVALID_REQUEST_EXCEPTION],
             ),
             update_indexing_configuration: ValidationRefusalErrorType::new(
-                crate::ops::update_indexing_configuration::UpdateIndexingConfiguration::new(
-                    Arc::clone(&engine),
-                ),
+                AuthorizationGate::new(Arc::clone(&engine)),
                 &[INVALID_REQUEST_EXCEPTION],
             ),
             create_topic_rule: ValidationRefusalErrorType::new(
-                crate::ops::create_topic_rule::CreateTopicRule::new(Arc::clone(&engine)),
+                AuthorizationGate::new(Arc::clone(&engine)),
                 &[SQL_PARSE_EXCEPTION],
             ),
             replace_topic_rule: ValidationRefusalErrorType::new(
-                crate::ops::replace_topic_rule::ReplaceTopicRule::new(Arc::clone(&engine)),
+                AuthorizationGate::new(Arc::clone(&engine)),
                 &[SQL_PARSE_EXCEPTION],
             ),
             create_policy: ValidationRefusalErrorType::new(
-                crate::ops::create_policy::CreatePolicy::new(engine),
+                AuthorizationGate::new(engine),
                 &[INVALID_REQUEST_EXCEPTION],
             ),
         }
@@ -245,10 +339,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
+        // THE AUTHORIZATION GATE, and the only seam it can run in: a request is authorized
+        // before its shape is validated, because the framework's centralized walk is
+        // deserialize -> validate -> handle and a handler therefore runs only AFTER
+        // modelled-constraint enforcement, while AWS answers the IAM decision in front of all
+        // of it ([`AuthorizationGate`]). NOT a re-route: the gate serves the very operation
+        // the model's own routing key names, so a key the model does not name resolves to
+        // `None` here exactly as it does in the generated table.
+        //
         // The operations that refuse with `InvalidRequestException` are served behind
         // `ValidationRefusalErrorType` (see the module docs), which names that shape the
-        // way this service names it: qualified with its API doc namespace. Every other
-        // request resolves through the generated routing table.
+        // way this service names it: qualified with its API doc namespace. The wrapper wraps
+        // the gate, so those operations take the same decision first and their refusal — the
+        // authorization layer's `AccessDeniedException`, which is not one of the shapes this
+        // service qualifies — passes through it untouched.
         let key = self.entry.protocol().routing_key(req).ok()?;
         if key == crate::ops::describe_index::DescribeIndex::<Eng>::NAME {
             return Some(&self.describe_index as &dyn ErasedOperation);
@@ -270,7 +374,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if key == crate::ops::create_policy::CreatePolicy::<Eng>::NAME {
             return Some(&self.create_policy as &dyn ErasedOperation);
         }
-        None
+        Some(&self.gate as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
