@@ -1210,21 +1210,30 @@ pub fn unqualified_container_instance_arn(region: &str, instance_id: &str) -> St
     )
 }
 
-/// The `MISSING` `Failure` a container-instance STATE CHANGE reports for an entry that
-/// resolves to no instance it can move: the id the entry named
-/// ([`container_instance_id_from_reference`], whichever of the member's two forms the
-/// entry took) under [`unqualified_container_instance_arn`].
+/// The `Failure` a container-instance STATE CHANGE reports for an entry it could not act
+/// on: the id the entry named ([`container_instance_id_from_reference`], whichever of the
+/// member's two forms the entry took) under [`unqualified_container_instance_arn`], with
+/// the reason that says WHY the entry was not acted on.
 ///
 /// A state change answers about an instance it did not move, so the entry names that
 /// instance alone and never the cluster the request looked for it in — which is also what
 /// lets a caller draining instances in batches correlate the entry back to the id it
 /// submitted however it spelled it. Distinct from [`unresolved_failure`], which is what a
 /// batch READ echoes: there the identifier is reported exactly as the caller sent it.
-pub fn unresolved_container_instance_state_failure(region: &str, reference: &str) -> Failure {
-    missing_failure(&unqualified_container_instance_arn(
-        region,
-        container_instance_id_from_reference(reference),
-    ))
+///
+/// [`FAILURE_MISSING`] is for an id this service knows nothing about; an instance it HOLDS
+/// but whose status takes it out of the action's reach is reported with that status (a
+/// deregistered one with [`CONTAINER_INSTANCE_INACTIVE`]), which is the one signal that
+/// tells a deregistered host from an identifier that names nothing.
+pub fn container_instance_state_failure(region: &str, reference: &str, reason: &str) -> Failure {
+    Failure {
+        arn: Some(unqualified_container_instance_arn(
+            region,
+            container_instance_id_from_reference(reference),
+        )),
+        reason: Some(reason.to_string()),
+        detail: None,
+    }
 }
 
 /// The deployment configuration a service stores: what the request supplied, with the

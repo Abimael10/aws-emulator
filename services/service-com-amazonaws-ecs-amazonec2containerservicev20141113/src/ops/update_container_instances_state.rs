@@ -320,18 +320,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Only an instance REGISTERED in this cluster is one this call can move: a
             // deregistered one "transitions to an INACTIVE status" and is out of the
-            // cluster, so it is no instance of this cluster to update — reported in the
-            // `failures` channel under the id the entry named, exactly as an id naming
-            // nothing is.
-            let resolved = guard
-                .resolve_container_instance(&region, &cluster_name, reference)
-                .filter(|instance| instance.is_registered())
-                .map(|instance| instance.arn.clone());
-            let Some(arn) = resolved else {
-                failures.push(crate::state::unresolved_container_instance_state_failure(
-                    &region, reference,
-                ));
-                continue;
+            // cluster, so it is no instance of this cluster to update. Which `failures`
+            // reason it earns is what tells the two apart — an id this service holds no
+            // instance of at all is `MISSING`, while an instance it HOLDS whose status
+            // takes it out of this action's reach is reported with that status, so a
+            // client can tell a retired host from a mistyped identifier.
+            let resolved = guard.resolve_container_instance(&region, &cluster_name, reference);
+            let resolved = match resolved {
+                Some(instance) if instance.is_registered() => Ok(instance.arn.clone()),
+                Some(instance) => Err(instance.status.clone()),
+                None => Err(crate::state::FAILURE_MISSING.to_string()),
+            };
+            let arn = match resolved {
+                Ok(arn) => arn,
+                Err(reason) => {
+                    failures.push(crate::state::container_instance_state_failure(
+                        &region, reference, &reason,
+                    ));
+                    continue;
+                }
             };
             let instance = guard.container_instances.get_mut(&arn);
             // `ContainerInstance$version`: "every time a container instance experiences a

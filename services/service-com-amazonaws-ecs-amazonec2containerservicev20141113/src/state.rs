@@ -793,14 +793,21 @@ pub const EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE: &str =
 pub const EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE: &str =
     "The specified container was not found. Specify a valid container name and try again.";
 
-/// `InvalidParameterException$message` for an `ExecuteCommand` on a task whose execute
-/// command agent is not running — the condition the ECS Exec troubleshooting guidance
-/// words, and the one that holds for every task here: a task of this emulator runs no
-/// container, so no managed agent of it is running to open a session on.
-pub const EXECUTE_COMMAND_AGENT_NOT_RUNNING_MESSAGE: &str =
+/// `InvalidParameterException$message` for an `ExecuteCommand` on a task that was NOT run
+/// with `enableExecuteCommand` — the first precondition of a session, which Amazon ECS
+/// states in one fixed sentence carrying nothing of the request.
+pub const EXECUTE_COMMAND_NOT_ENABLED_MESSAGE: &str =
     "The execute command failed because execute command was not enabled when the task was \
      run or the execute command agent isn't running. Wait and try again or run a new task \
      with execute command enabled and try again.";
+
+/// `TargetNotConnectedException$message` for an `ExecuteCommand` on an exec-ENABLED task
+/// whose container is no Systems Manager Session Manager target — the error class whose
+/// documented causes are "the SSM agent is not installed or is not running" and a missing
+/// Session Manager endpoint. The sentence Amazon ECS sends for the class, fixed text
+/// naming nothing of the request.
+pub const EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE: &str =
+    "The execute command failed due to an internal error. Try again later.";
 
 /// `Cluster$attachmentsStatus` while the cluster's capacity-provider association is
 /// being applied — the member's doc: "UPDATE_IN_PROGRESS: The available capacity
@@ -962,13 +969,14 @@ pub const LATEST_CONTAINER_AGENT_VERSION: &str = "1.89.3";
 pub const NO_AGENT_UPDATE_AVAILABLE_MESSAGE: &str =
     "There is no update available for this Amazon ECS container agent.";
 
-/// `MissingVersionException$message` for an instance that reported no agent version when
-/// it registered, as the error's own doc states the condition ("Amazon ECS can't determine
-/// the current version of the Amazon ECS container agent on the container instance and
-/// doesn't have enough information to proceed with an update").
-pub const MISSING_AGENT_VERSION_MESSAGE: &str =
-    "Amazon ECS cannot determine the current version of the Amazon ECS container agent on \
-     the container instance and does not have enough information to proceed with an update.";
+/// `MissingVersionException$message` for an instance this service has recorded no agent
+/// version for.
+///
+/// The sentence Amazon ECS sends for this error class, which is NOT the error shape's
+/// documentation: a shape's doc describes the condition for a reader, while the wire
+/// `message` is the service's own text for it. This one is fixed — there is no version to
+/// name, which is what the refusal says — so nothing of the request reaches it.
+pub const MISSING_AGENT_VERSION_MESSAGE: &str = "Unknown current version";
 
 /// `UpdateInProgressException$message` for an instance whose agent update has not finished
 /// yet, as the error's own doc states the condition.
@@ -1414,6 +1422,19 @@ pub const MANAGED_CAPACITY_PROVIDERS: [&str; 2] = ["FARGATE", "FARGATE_SPOT"];
 pub const CAPACITY_PROVIDER_NOT_FOUND_MESSAGE: &str =
     "The specified capacity provider was not found. Specify a valid capacity provider and \
      try again.";
+
+/// `ClientException$message` for an operation whose TARGET resource is the capacity
+/// provider the request names and that resolves to no provider of this account —
+/// `DeleteCapacityProvider$capacityProvider`, "the capacity provider to delete".
+///
+/// `ClientException` is the class Amazon ECS answers an identifier it cannot resolve in
+/// ("it might be specifying an identifier that isn't valid"), while
+/// `InvalidParameterException` is for a parameter value it will not accept — which is why
+/// a provider named inside an association list or a placement strategy earns
+/// [`CAPACITY_PROVIDER_NOT_FOUND_MESSAGE`] under that other class instead. Fixed text:
+/// the name the request carried is not interpolated.
+pub const CAPACITY_PROVIDER_INFO_UNAVAILABLE_MESSAGE: &str =
+    "Failed to get info for provided CapacityProvider";
 
 /// `InvalidParameterException$message` for a PLACEMENT whose `capacityProviderStrategy`
 /// names a capacity provider that exists but is not one of the cluster's own.

@@ -6,9 +6,11 @@
 //! Three rules, one per suite below:
 //!
 //! * A registration identifies its machine with the instance identity document AND the
-//!   signature of that document the same instance metadata publishes; a document
-//!   presented without that signature vouches for nothing, so it is refused and no
-//!   container instance is registered for it.
+//!   signature of that document the same instance metadata publishes; the two are judged
+//!   as a PAIR, so a document presented without that signature vouches for nothing and is
+//!   refused, no container instance is registered for it, and a value presented as the
+//!   document that is not one at all is refused as the document it was presented as —
+//!   never by naming a field of its JSON body, which is no member of the request.
 //! * A Fargate task definition's `cpu` and `memory` are legal only TOGETHER: each task
 //!   size Fargate offers pairs one `cpu` with the `memory` values it supports (the
 //!   `RegisterTaskDefinition$memory` doc's own list), so a pair outside that catalog is
@@ -40,6 +42,10 @@ const CLIENT_EXCEPTION: &str = "ClientException";
 /// the pair that vouches for one EC2 instance.
 const IDENTITY_NOT_VALID: &str =
     "The identity document and identity document signature were not valid.";
+
+/// What ECS says when a value WAS presented as the identity document but is not one: the
+/// document is refused as a whole, with no field of its body named back.
+const IDENTITY_DOCUMENT_NOT_VALID: &str = "An identity document was provided, but not valid.";
 
 /// A minimal, valid container definition, so every refusal below is reached by the member
 /// under test rather than by an unrunnable container.
@@ -155,24 +161,36 @@ async fn a_registration_whose_identity_is_not_vouched_for_is_refused() {
         );
     }
 
-    // The document is still read BEFORE the signature: a document that leaves a required
-    // member blank is reported on that member, whether or not a signature came with it.
-    let (code, message) = refusal(
-        &router,
-        "RegisterContainerInstance",
-        json!({
+    // A value that is not a DOCUMENT is refused as that instead — the pair cannot be
+    // judged before there is a document to judge it against — and the sentence names
+    // nothing inside the body, whether or not a signature came with it.
+    for (case, document, signature) in [
+        (
+            "a document with no accountId and no signature",
+            json!({ "instanceId": "i-0123456789abcdef0" }).to_string(),
+            None,
+        ),
+        (
+            "a document that is not json, with a signature",
+            "not-a-document".to_string(),
+            Some(signature.clone()),
+        ),
+    ] {
+        let mut request = json!({
             "cluster": CLUSTER,
-            "instanceIdentityDocument": json!({ "instanceId": "i-0123456789abcdef0" }).to_string(),
-        }),
-        "no accountId and no signature",
-    )
-    .await;
-    assert_eq!(
-        (code.as_str(), message.as_str()),
-        (INVALID_PARAMETER, "accountId cannot be blank."),
-        "case \"no accountId and no signature\": expected the blank member to be named, got \
-         {code:?} with {message:?}"
-    );
+            "instanceIdentityDocument": document,
+        });
+        if let Some(signature) = signature {
+            request["instanceIdentityDocumentSignature"] = json!(signature);
+        }
+        let (code, message) = refusal(&router, "RegisterContainerInstance", request, case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (INVALID_PARAMETER, IDENTITY_DOCUMENT_NOT_VALID),
+            "case {case:?}: expected the document refused as a whole, got {code:?} with \
+             {message:?}"
+        );
+    }
 
     // The pair REGISTERS: the instance reads back through `DescribeContainerInstances`
     // carrying the EC2 instance id the document named.

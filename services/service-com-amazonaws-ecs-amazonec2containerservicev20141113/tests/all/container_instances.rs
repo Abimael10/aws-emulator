@@ -567,9 +567,9 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
         .await;
     }
 
-    // An identity document that leaves a required member blank cannot identify an
-    // instance; each row is refused on the first such member (see the member table in
-    // [`crate::error_messages`]).
+    // A value presented as the identity document that is not one cannot identify an
+    // instance; each row is refused as the document it was presented as (see the document
+    // table in [`crate::error_messages`]).
     for (case, bad_document) in [
         ("not json", "not-a-document".to_string()),
         (

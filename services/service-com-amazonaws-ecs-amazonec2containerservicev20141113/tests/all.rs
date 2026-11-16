@@ -59,6 +59,8 @@ mod cluster_projection;
 mod cluster_scoped_capacity_providers;
 #[path = "all/cluster_tombstone.rs"]
 mod cluster_tombstone;
+#[path = "all/container_agent_version_source.rs"]
+mod container_agent_version_source;
 #[path = "all/container_health_checks.rs"]
 mod container_health_checks;
 // The Container Insights metrics a cluster the setting is on for publishes.
@@ -133,6 +135,8 @@ mod error_messages;
 mod essential_container_exit;
 #[path = "all/exec_task_role_resolution.rs"]
 mod exec_task_role_resolution;
+#[path = "all/execute_command_enablement.rs"]
+mod execute_command_enablement;
 #[path = "all/execution_role_trust.rs"]
 mod execution_role_trust;
 #[path = "all/express_gateway_services.rs"]

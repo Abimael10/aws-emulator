@@ -113,19 +113,27 @@ const IDENTITY_DOCUMENT_INSTANCE_ID: &str = "instanceId";
 /// The member of the same document that names the Region the instance runs in.
 const IDENTITY_DOCUMENT_REGION: &str = "region";
 
-/// The members of an identity document a registration must carry, IN THE ORDER they are
-/// validated: a document that leaves more than one blank is reported on the first of
-/// them. `accountId` comes first, which is the member Amazon ECS names for a document it
-/// cannot read at all.
-const IDENTITY_DOCUMENT_REQUIRED_MEMBERS: [&str; 2] =
+/// The members that make a value an instance identity DOCUMENT at all: the machine it
+/// describes is named by its account and its instance id, so a value leaving either out
+/// describes no machine and is not a document Amazon ECS can read.
+const IDENTITY_DOCUMENT_MEMBERS: [&str; 2] =
     [IDENTITY_DOCUMENT_ACCOUNT_ID, IDENTITY_DOCUMENT_INSTANCE_ID];
 
 /// What Amazon ECS says when the identity document a registration presents and the
-/// signature presented with it are not the pair that vouches for one EC2 instance: the
-/// value is not the JSON document the instance metadata publishes, or no signature of
-/// that document accompanies it.
+/// signature presented with it are not the pair that vouches for one EC2 instance: one of
+/// the two is missing, or no signature of that document accompanies it.
+///
+/// The PAIR is what is reported, never a member of the document's JSON body: that body is
+/// not a member of the request, so naming one of its fields would point the caller at
+/// input it never sent.
 const IDENTITY_NOT_VALID: &str =
     "The identity document and identity document signature were not valid.";
+
+/// What Amazon ECS says when a value WAS presented as the identity document but is not an
+/// instance identity document — not the JSON the instance metadata publishes, or JSON that
+/// describes no machine ([`IDENTITY_DOCUMENT_MEMBERS`]). The document is refused as a
+/// whole, with the same fixed text whatever is wrong inside it.
+const IDENTITY_DOCUMENT_NOT_VALID: &str = "An identity document was provided, but not valid.";
 
 /// The characters the instance identity document SIGNATURE is spelled with. The member's
 /// doc reads it from `http://169.254.169.254/latest/dynamic/instance-identity/signature/`,
@@ -187,15 +195,17 @@ fn identity_document_member(document: &::serde_json::Value, member: &str) -> Opt
 ///
 /// "The instance identity document for the EC2 instance to register", and "the instance
 /// identity document signature for the EC2 instance to register": the two together are
-/// what identifies the machine a registration is about, so a registration presents BOTH.
-/// A document whose members a registration must carry is read first, and a blank one is
-/// reported by name — the first of [`IDENTITY_DOCUMENT_REQUIRED_MEMBERS`], and nothing
-/// else about the request.
+/// what identifies the machine a registration is about, so a registration presents BOTH
+/// and they are judged as a UNIT. Nothing of the document's JSON body is named back: that
+/// body is not a member of the request, so a refusal reports the DOCUMENT or the PAIR and
+/// never a field inside it.
 ///
-/// What is not read here is the machine itself: a document that is absent, that describes
-/// an instance of another account or Region, or that comes without a signature of the
-/// published form vouches for no machine this caller could be registering, so the pair is
-/// refused and no instance is registered for it.
+/// Two conditions, each with its own fixed sentence: a value presented as the document
+/// that is not an instance identity document at all is
+/// [`IDENTITY_DOCUMENT_NOT_VALID`], and a document and signature that do not vouch
+/// together for a machine of this caller's account and Region — either of the two absent,
+/// a signature that is not one, or a document describing another account or Region — is
+/// [`IDENTITY_NOT_VALID`].
 ///
 /// The verdict is reached WITHOUT the store: the caller-supplied document is parsed here,
 /// outside the critical section the registration itself takes, and the refusal it earns is
@@ -204,24 +214,33 @@ fn documented_instance_id(input: &RegisterContainerInstanceInput, region: &str) 
     let document = input
         .instance_identity_document
         .as_deref()
+        .map(str::trim)
+        .filter(|document| !document.is_empty())
         .ok_or_else(|| IDENTITY_NOT_VALID.to_string())?;
     let parsed = ::serde_json::from_str::<::serde_json::Value>(document)
         .unwrap_or(::serde_json::Value::Null);
-    for member in IDENTITY_DOCUMENT_REQUIRED_MEMBERS {
-        if identity_document_member(&parsed, member).is_none() {
-            return Err(format!("{member} cannot be blank."));
-        }
+    // Is it a DOCUMENT at all? A value that is not the published JSON, or that names no
+    // machine, is refused as the document it was presented as.
+    if IDENTITY_DOCUMENT_MEMBERS
+        .iter()
+        .any(|member| identity_document_member(&parsed, member).is_none())
+    {
+        return Err(IDENTITY_DOCUMENT_NOT_VALID.to_string());
     }
+    // Does the PAIR vouch for a machine this caller could be registering? What the
+    // signature is OF cannot be checked here — verifying it needs the key that signed the
+    // document — so a document of another account or Region, and one presented without a
+    // signature of the published form, are the one condition: the two do not go together.
     if !describes_this_caller(&parsed, region)
         || !is_presented_signature(input.instance_identity_document_signature.as_deref())
     {
         return Err(IDENTITY_NOT_VALID.to_string());
     }
-    // The loop above has already refused a document whose `instanceId` is blank, so this
+    // The check above has already refused a document whose `instanceId` is blank, so this
     // reads the value it checked. Answered rather than asserted, so no request can make
     // this operation panic.
     identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID)
-        .ok_or_else(|| IDENTITY_NOT_VALID.to_string())
+        .ok_or_else(|| IDENTITY_DOCUMENT_NOT_VALID.to_string())
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -409,7 +428,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|instance| instance.arn.clone()),
         };
 
-        let version_info = input.version_info.clone();
         let registered_resources = input.total_resources.clone().unwrap_or_default();
         let attributes = input.attributes.clone().unwrap_or_default();
         let platform_devices = input.platform_devices.clone().unwrap_or_default();
@@ -428,8 +446,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.status = crate::state::CONTAINER_INSTANCE_ACTIVE.to_string();
             instance.status_reason = None;
             instance.agent_connected = true;
-            instance.version_info = version_info;
-            // The agent that re-registers reports its own version, so any update this
+            // `versionInfo` is NOT written from the request, here or on a first
+            // registration: the agent version a container instance reports is what this
+            // service has recorded of the agent itself, so a re-registration cannot set
+            // it — nor erase a version this service did record.
+            //
+            // The agent that re-registers reports itself afresh, so any update this
             // service was still waiting to materialise is no longer the newest word on it.
             instance.agent_update_status = None;
             instance.agent_update_due_at = None;
@@ -490,7 +512,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // registered instance is connected: "Only instances connected to an agent
             // can accept task placement requests."
             agent_connected: true,
-            version_info,
+            // `ContainerInstance$versionInfo` is "the version information for the Amazon
+            // ECS container agent and Docker daemon RUNNING on the container instance":
+            // what this service has recorded of the agent, not what a caller claims for
+            // it. `RegisterContainerInstance$versionInfo` is therefore not stored — an
+            // instance carries a version only where this emulator provisioned the agent
+            // itself ([`crate::state::ec2_capacity`]) or brought it to one it published
+            // (the update `UpdateContainerAgent` accepts). An instance this service has
+            // recorded no version for is the `MissingVersionException` condition exactly.
+            version_info: None,
             // "If an update wasn't ever requested, this value is NULL": a registration
             // requests none, and a re-registration is the agent reporting itself afresh.
             agent_update_status: None,

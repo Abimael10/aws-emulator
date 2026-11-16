@@ -258,20 +258,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the whole of the write.
         let associated = guard.capacity_provider_is_associated(&name);
 
-        // A name that resolves to no provider of this account names nothing to delete, and
-        // is refused with the one sentence every operation that resolves a provider by name
-        // answers ([`crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE`]).
+        // A name that resolves to no provider of this account names nothing to delete.
+        // Amazon ECS answers an identifier it cannot RESOLVE in `ClientException` — "it
+        // might be specifying an identifier that isn't valid" — keeping
+        // `InvalidParameterException` for a parameter value it will not accept (the
+        // reserved names above, a provider scoped to another cluster below), so a client
+        // branching on the code can tell "no such provider" from "bad request".
         let Some(stored) = guard.capacity_providers.get_mut(&name) else {
-            return Err(
-                DeleteCapacityProviderErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(DeleteCapacityProviderErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        crate::state::CAPACITY_PROVIDER_INFO_UNAVAILABLE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
         };
 
         // `DeleteCapacityProvider$cluster`: "Managed instances capacity providers are

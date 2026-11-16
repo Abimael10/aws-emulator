@@ -13,9 +13,10 @@
 //!   another cluster) and the operation it is sent to, so the sentence is asserted to be a
 //!   constant of the condition and not of the request.
 //! * `UpdateContainerAgent` addresses the agent by the ID of the instance it runs on, so
-//!   the FORM of that id is checked before anything is resolved, and the update it accepts
-//!   is owed by the CLOCK: the instance reports the first stage now and the terminal one
-//!   once the span has passed.
+//!   the FORM of that id is checked before anything is resolved, and the update it would
+//!   accept needs an agent version this service has RECORDED: an instance registered
+//!   through the API has none, however the registration spelled its own `versionInfo`
+//!   ([`crate::container_agent_version_source`]), so the call is refused.
 //! * `DiscoverPollEndpoint` answers the agent with the endpoints of the REGION the request
 //!   was signed for, once the cluster and (when the request names one) the container
 //!   instance it is called for resolve to records this store holds.
@@ -28,8 +29,6 @@
 //! Nothing here reaches into the state struct, so a response that is not computed from
 //! persisted state cannot pass; every write is read back through an implemented describe.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -38,10 +37,6 @@ use crate::ecs_wire::{
     service, string, ACCOUNT, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
-
-/// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
-/// due, with margin for a loaded test machine.
-const ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// The cluster every row below acts in.
 const CLUSTER: &str = "agentplane";
@@ -558,144 +553,69 @@ async fn update_container_agent_checks_the_id_form_before_it_resolves_anything()
 }
 
 #[tokio::test]
-async fn an_agent_update_is_accepted_once_and_lands_on_the_clock() {
+async fn an_agent_update_is_refused_while_no_agent_version_is_recorded() {
     let router = fixture().await;
 
-    // An instance that reported no agent version at all: Amazon ECS cannot tell what to
-    // update from, which is what `MissingVersionException` states.
-    let silent = register_agent(&router, CLUSTER, "i-0a0a0a0a0a0a0a0a0", None, "silent").await;
-    let (code, message) = refusal(
-        &router,
-        "UpdateContainerAgent",
-        json!({ "cluster": CLUSTER, "containerInstance": silent.clone() }),
-        "an instance that reported no agent version",
-    )
-    .await;
-    assert_eq!(
-        code, "MissingVersionException",
-        "case \"no reported version\": expected MissingVersionException, got {code} with \
-         {message:?}"
-    );
-
-    // An instance already running the version this emulator publishes has nothing to
-    // update to.
-    let current = register_agent(
-        &router,
-        CLUSTER,
-        "i-0b0b0b0b0b0b0b0b0",
-        Some(LATEST_AGENT_VERSION),
-        "current",
-    )
-    .await;
-    let (code, message) = refusal(
-        &router,
-        "UpdateContainerAgent",
-        json!({ "cluster": CLUSTER, "containerInstance": current.clone() }),
-        "an instance already at the latest version",
-    )
-    .await;
-    assert_eq!(
-        code, "NoUpdateAvailableException",
-        "case \"already latest\": expected NoUpdateAvailableException, got {code} with \
-         {message:?}"
-    );
-
-    // An instance behind that version accepts the update, by either reference form, and
-    // reports the FIRST stage of it. The stored instance reads the same back.
-    for (case, by_arn) in [("by ARN", true), ("by id", false)] {
+    // An instance registered through this operation has no agent version recorded for it,
+    // whether or not the registration claimed one — `versionInfo` reports what this
+    // service has recorded of the agent, which a caller cannot set
+    // ([`crate::container_agent_version_source`]) — so Amazon ECS cannot tell what an
+    // update would start from, which is what `MissingVersionException` states. The rows
+    // vary what the registration claimed and how the update names the instance.
+    for (index, (case, claimed)) in [
+        ("an instance that claimed no version", None),
+        ("an instance that claimed an older version", Some(OLDER_AGENT_VERSION)),
+        (
+            "an instance that claimed the published version",
+            Some(LATEST_AGENT_VERSION),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let arn = register_agent(
             &router,
             CLUSTER,
-            &format!("i-0c0c0c0c0c0c0c0{}", u8::from(by_arn)),
-            Some(OLDER_AGENT_VERSION),
+            &format!("i-0a0a0a0a0a0a0a0{index}"),
+            claimed,
             case,
         )
         .await;
-        let reference = if by_arn {
-            arn.clone()
-        } else {
-            instance_id_of(&arn)
-        };
-        let accepted = ok(
-            &router,
-            "UpdateContainerAgent",
-            json!({ "cluster": CLUSTER, "containerInstance": reference }),
-            case,
-        )
-        .await;
-        let reported = &accepted["containerInstance"];
-        assert_eq!(
-            string(reported, "containerInstanceArn", case),
-            arn,
-            "case {case:?}: expected the instance the request named, got {accepted}"
-        );
-        assert_eq!(
-            reported["agentUpdateStatus"].as_str(),
-            Some("PENDING"),
-            "case {case:?}: an accepted update reports its first stage, got {accepted}"
-        );
-        assert_eq!(
-            reported["versionInfo"]["agentVersion"].as_str(),
-            Some(OLDER_AGENT_VERSION),
-            "case {case:?}: the agent still reports the version it is on, got {accepted}"
-        );
-
-        // A second call while the first has not landed is refused, and the stored
-        // instance is unchanged by that refusal.
-        let (code, message) = refusal(
-            &router,
-            "UpdateContainerAgent",
-            json!({ "cluster": CLUSTER, "containerInstance": arn.clone() }),
-            case,
-        )
-        .await;
-        assert_eq!(
-            code, "UpdateInProgressException",
-            "case {case:?}: expected UpdateInProgressException, got {code} with {message:?}"
-        );
+        for (form, reference) in [
+            ("by ARN", arn.clone()),
+            ("by id", instance_id_of(&arn)),
+        ] {
+            let case = format!("{case}, {form}");
+            let (code, message) = refusal(
+                &router,
+                "UpdateContainerAgent",
+                json!({ "cluster": CLUSTER, "containerInstance": reference }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                ("MissingVersionException", "Unknown current version"),
+                "case {case:?}: expected the missing-version refusal, got {code} with \
+                 {message:?}"
+            );
+        }
+        // The refusal wrote nothing: no stage of an update is reported for the instance.
         let read = describe_instance(&router, CLUSTER, &arn, case).await;
         assert_eq!(
             read["agentUpdateStatus"].as_str(),
-            Some("PENDING"),
-            "case {case:?}: a refused repeat leaves the stage where it was, got {read}"
-        );
-
-        // The clock owes the rest: once the span has passed the instance reports the
-        // terminal stage and the version it was brought to, with nobody asking again.
-        tokio::time::sleep(ONE_SPAN).await;
-        let settled = describe_instance(&router, CLUSTER, &arn, case).await;
-        assert_eq!(
-            settled["agentUpdateStatus"].as_str(),
-            Some("UPDATED"),
-            "case {case:?}: the clock must settle the update, got {settled}"
-        );
-        assert_eq!(
-            settled["versionInfo"]["agentVersion"].as_str(),
-            Some(LATEST_AGENT_VERSION),
-            "case {case:?}: the updated agent reports the new version, got {settled}"
-        );
-
-        // And once it is there, there is no update left to make.
-        let (code, message) = refusal(
-            &router,
-            "UpdateContainerAgent",
-            json!({ "cluster": CLUSTER, "containerInstance": arn.clone() }),
-            case,
-        )
-        .await;
-        assert_eq!(
-            code, "NoUpdateAvailableException",
-            "case {case:?}: expected NoUpdateAvailableException after the update, got \
-             {code} with {message:?}"
+            None,
+            "case {case:?}: a refused update reports no stage, got {read}"
         );
     }
 
-    // An instance of ANOTHER cluster is not one this request names.
+    // An instance of ANOTHER cluster is not one this request names, and that is resolved
+    // before the agent version is read.
     let elsewhere = register_agent(
         &router,
         OTHER_CLUSTER,
         "i-0d0d0d0d0d0d0d0d0",
-        Some(OLDER_AGENT_VERSION),
+        None,
         "elsewhere",
     )
     .await;

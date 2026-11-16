@@ -20,6 +20,12 @@
 //! namespace.
 //!
 //! It reads files only; it starts no router and reaches no network.
+//!
+//! A crate whose `all` target is rooted at `tests/all/main.rs` declares its suites with
+//! `automod` instead of with such a list, so it holds no declaration root at all — and this
+//! crate is one. Every rule about a declaration list is therefore read for the roots that
+//! EXIST ([`declaration_roots`]), and the rules about this crate's own list stand down when
+//! it has none ([`all_rs`]).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -193,10 +199,10 @@ fn every_suite_is_declared_exactly_once() {
 
 #[test]
 fn every_declaration_names_a_suite_file_that_exists() {
-    let tests = tests_dir();
     let Some(source) = all_rs() else {
         return;
     };
+    let tests = tests_dir();
     let declared = declarations(&source);
     let reports = unreachable_declarations(&tests, &declared);
     assert!(
@@ -249,6 +255,68 @@ pub(crate) fn declaration_roots() -> Vec<PathBuf> {
     }
     roots.sort();
     roots
+}
+
+/// Every crate in the workspace whose `tests/all/` directory holds suites, whether it
+/// declares them with a `tests/all.rs` list or with an `automod` root: this crate and
+/// every service crate.
+///
+/// The two layouts are what [`declaration_roots`] distinguishes, so the set it is taken
+/// from is enumerated once here, and the rule that every one of these crates has one of
+/// the two roots is checked below.
+fn test_directories() -> Vec<PathBuf> {
+    let services = workspace_root().join("services");
+    let entries = fs::read_dir(&services)
+        .unwrap_or_else(|error| panic!("read {}: {error}", services.display()));
+    let mut directories = vec![tests_dir()];
+    for entry in entries {
+        let entry = entry
+            .unwrap_or_else(|error| panic!("read an entry of {}: {error}", services.display()));
+        let candidate = entry.path().join("tests");
+        if candidate.join("all").is_dir() {
+            directories.push(candidate);
+        }
+    }
+    directories.sort();
+    directories
+}
+
+#[test]
+fn every_crate_holding_suites_has_one_of_the_two_roots_that_compile_them() {
+    // A suite under `tests/all/` is compiled only by a root that declares it: a
+    // `tests/all.rs` holding a `#[path]`/`mod` list, or a `tests/all/main.rs` whose
+    // `automod` declares one module per file beside it. A crate with neither compiles none
+    // of its suites, so none of them ever runs — which is also what would make the rules
+    // above stand down for a crate that had simply lost its list.
+    let root = workspace_root();
+    let directories = test_directories();
+    assert!(
+        directories.len() > 100,
+        "expected one tests/ directory holding suites per service crate under {}, read {} of \
+         them",
+        root.display(),
+        directories.len()
+    );
+
+    let mut reports = Vec::new();
+    for tests in &directories {
+        let case = tests.strip_prefix(&root).unwrap_or(tests).display().to_string();
+        let list = tests.join("all.rs");
+        let automod = tests.join("all").join("main.rs");
+        if !list.is_file() && !automod.is_file() {
+            reports.push(format!(
+                "case {case}: expected either an all.rs declaration list or an all/main.rs \
+                 automod root, got neither"
+            ));
+        }
+    }
+    assert!(
+        reports.is_empty(),
+        "expected each of the {} crates holding suites to carry a root that compiles them, \
+         got {} that carry none: {reports:#?}",
+        directories.len(),
+        reports.len()
+    );
 }
 
 /// Every suite file the declaration root `declaration_root` points a module at, as a path

@@ -59,10 +59,14 @@ const RESERVED_REFUSAL: &str =
      You can disassociate them from a cluster using either PutClusterCapacityProviders or \
      by deleting the cluster.";
 
-/// The sentence a name that resolves to no capacity provider of this account earns.
-const NOT_FOUND_REFUSAL: &str =
-    "The specified capacity provider was not found. Specify a valid capacity provider and \
-     try again.";
+/// The sentence a name that resolves to no capacity provider of this account earns, in
+/// the class Amazon ECS answers an identifier it cannot RESOLVE in: `ClientException`
+/// ("it might be specifying an identifier that isn't valid"), as against the
+/// `InvalidParameterException` a parameter value it will not accept earns.
+const UNRESOLVED_PROVIDER_REFUSAL: &str = "Failed to get info for provided CapacityProvider";
+
+/// The error class that refusal carries.
+const UNRESOLVED_PROVIDER_CODE: &str = "ClientException";
 
 /// The sentence a delete of a CLUSTER-SCOPED provider that does not name its own cluster
 /// earns, which is the whole of the `cluster` member's own rule.
@@ -536,14 +540,14 @@ async fn a_delete_outside_the_operations_rules_is_refused_and_writes_nothing() {
         RefusalCase {
             case: "a name that resolves to no provider",
             request: || json!({ "capacityProvider": "nosuchprovider" }),
-            code: "InvalidParameterException",
-            message: NOT_FOUND_REFUSAL,
+            code: UNRESOLVED_PROVIDER_CODE,
+            message: UNRESOLVED_PROVIDER_REFUSAL,
         },
         RefusalCase {
             case: "an ARN that resolves to no provider",
             request: || json!({ "capacityProvider": provider_arn("alsonosuchprovider") }),
-            code: "InvalidParameterException",
-            message: NOT_FOUND_REFUSAL,
+            code: UNRESOLVED_PROVIDER_CODE,
+            message: UNRESOLVED_PROVIDER_REFUSAL,
         },
         RefusalCase {
             case: "a cluster this account never held",
@@ -709,4 +713,87 @@ async fn a_provider_a_services_strategy_names_cannot_be_freed_for_deletion() {
         list(&cluster, "capacityProviders", case).contains(&json!("heldbyservice")),
         "case {case:?}: the cluster still lists the provider, got {cluster}"
     );
+}
+
+#[tokio::test]
+async fn a_provider_the_delete_cannot_resolve_is_a_client_exception() {
+    // The rule: the delete's TARGET is the provider its `capacityProvider` member names,
+    // so a value that resolves to no provider of this account is an identifier Amazon ECS
+    // could not resolve — `ClientException` — and never an `InvalidParameterException`,
+    // which is what an unacceptable parameter value earns (the reserved names, a provider
+    // scoped to another cluster). The rows walk the reference's FORM and SHAPE: a short
+    // name and the ARN form the member documents, names differing in alphabet and length
+    // (including the longest a provider name may be), and a provider of another cluster's
+    // scope named through the cluster that does hold a provider — so the class is a
+    // property of the resolution failing and not of the value's spelling.
+    let router = service();
+    create_cluster(&router, "resolving", "setup").await;
+    create_provider(&router, "resolvable", "asg-resolvable", false, "setup").await;
+
+    let longest = "p".repeat(255);
+    let rows: [(&str, Value, Option<&str>); 7] = [
+        (
+            "a short name nothing was created under",
+            json!("ghostprovider"),
+            None,
+        ),
+        (
+            "the same name in the ARN form",
+            json!(provider_arn("ghostprovider")),
+            None,
+        ),
+        ("a name with digits", json!("ghost42provider"), None),
+        (
+            "a name with the separators a provider name takes",
+            json!("ghost_provider-1"),
+            None,
+        ),
+        (
+            "the longest name a provider may have",
+            json!(longest.clone()),
+            None,
+        ),
+        ("one character", json!("g"), None),
+        (
+            "an unknown name sent with a live cluster",
+            json!("ghostprovider"),
+            Some("resolving"),
+        ),
+    ];
+
+    for (case, reference, cluster) in rows {
+        let mut request = json!({ "capacityProvider": reference });
+        if let Some(cluster) = cluster {
+            request["cluster"] = json!(cluster);
+        }
+        let (code, message) = refusal(&router, "DeleteCapacityProvider", request, case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (UNRESOLVED_PROVIDER_CODE, UNRESOLVED_PROVIDER_REFUSAL),
+            "case {case:?}: expected the unresolved-provider refusal, got {code:?} / \
+             {message:?}"
+        );
+    }
+
+    // The SAME resolution path serves the happy case, so the refusals above are the
+    // provider not being found and not the operation refusing every name: the one provider
+    // this account does hold is retired, by short name and by ARN alike.
+    for (case, reference) in [
+        ("the stored provider by short name", json!("resolvable")),
+        ("the stored provider by ARN", json!(provider_arn("resolvable"))),
+    ] {
+        let answer = ok(
+            &router,
+            "DeleteCapacityProvider",
+            json!({ "capacityProvider": reference }),
+            case,
+        )
+        .await;
+        let deleted = answer["capacityProvider"].clone();
+        assert_eq!(
+            string(&deleted, "status", case),
+            "INACTIVE",
+            "case {case:?}: expected the retired provider back, got {deleted}"
+        );
+    }
 }
