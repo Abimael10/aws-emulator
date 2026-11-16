@@ -123,9 +123,15 @@ fn rows() -> Vec<Row> {
 
 /// The git date form `UserInfo.date` carries: unix seconds, a space, then a signed
 /// four-digit GMT offset. Answers the seconds, or `None` for anything else.
-fn git_date_seconds(date: &str) -> Option<i64> {
+///
+/// `pub(crate)` so the sibling suite that reads the same date off the service's other
+/// faces ([`crate::commit_date_across_faces`]) holds it to this one reading of the form.
+/// The sign is a PREFIX of the offset either way: `-0700` is as well formed as `+0700`.
+pub(crate) fn git_date_seconds(date: &str) -> Option<i64> {
     let (seconds, offset) = date.split_once(' ')?;
-    let digits = offset.strip_prefix('+').or_else(|| offset.strip_suffix('-'))?;
+    let digits = offset
+        .strip_prefix('+')
+        .or_else(|| offset.strip_prefix('-'))?;
     if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -200,7 +206,15 @@ fn assert_date_is_the_commits_own(commit: &Value, case: &str, reader: &str) {
 }
 
 /// The commit `commit_id` as `GetCommit` reports it.
-async fn fetched(router: &MultiServiceRouter, repository: &str, commit_id: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suite that reads the same commit off the other faces
+/// of the service ([`crate::commit_date_across_faces`]) asks for it the one way,
+/// rather than through a second copy of this call.
+pub(crate) async fn fetched(
+    router: &MultiServiceRouter,
+    repository: &str,
+    commit_id: &str,
+) -> Value {
     let payload = ok(
         router,
         "GetCommit",
@@ -213,8 +227,9 @@ async fn fetched(router: &MultiServiceRouter, repository: &str, commit_id: &str)
         .unwrap_or_else(|| panic!("expected a commit in {payload}"))
 }
 
-/// The revision DAG of `path` at `specifier`.
-async fn history(
+/// The revision DAG of `path` at `specifier`. `pub(crate)` for the same reason as
+/// [`fetched`].
+pub(crate) async fn history(
     router: &MultiServiceRouter,
     repository: &str,
     path: &str,

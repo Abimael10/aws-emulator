@@ -83,6 +83,8 @@ mod comment_reactions_read;
 mod comment_replies;
 #[path = "all/comment_thread_traversal.rs"]
 mod comment_thread_traversal;
+#[path = "all/commit_date_across_faces.rs"]
+mod commit_date_across_faces;
 #[path = "all/commit_date_identity.rs"]
 mod commit_date_identity;
 #[path = "all/commit_file_entry_bound.rs"]

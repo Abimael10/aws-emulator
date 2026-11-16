@@ -42,7 +42,7 @@ use crate::repository_lifecycle::{
 const ENDPOINT: &str = "codecommit.us-west-2.amazonaws.com";
 
 /// The all-zero object name: "no object" in a ref update command.
-const NULL_ID: &str = "0000000000000000000000000000000000000000";
+pub(crate) const NULL_ID: &str = "0000000000000000000000000000000000000000";
 
 // ----------------------------------------------------------------- the emulator
 
@@ -52,10 +52,16 @@ fn content_of(payload: &Value) -> Vec<u8> {
 }
 
 /// One git transport response: status, `content-type` and body.
-struct GitReply {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
+///
+/// The git wire builders and parsers in this file are `pub(crate)` where a sibling
+/// suite drives the same transport — [`crate::commit_date_across_faces`] reads the
+/// commit object the transport serves — so there is ONE definition of a push, a
+/// fetch and a packfile in this target rather than a second copy of git's wire
+/// format.
+pub(crate) struct GitReply {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Send a git transport request to `url` exactly as a git client would: no SigV4
@@ -140,7 +146,12 @@ async fn advertise(router: &MultiServiceRouter, clone_url: &str, service: &str) 
     .await
 }
 
-async fn rpc(router: &MultiServiceRouter, clone_url: &str, service: &str, body: Vec<u8>) -> GitReply {
+pub(crate) async fn rpc(
+    router: &MultiServiceRouter,
+    clone_url: &str,
+    service: &str,
+    body: Vec<u8>,
+) -> GitReply {
     git(
         router,
         "POST",
@@ -205,20 +216,20 @@ async fn assert_announced_git_url(
 
 /// A git object as a client builds it: its kind and its payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Object {
-    kind: &'static str,
-    data: Vec<u8>,
+pub(crate) struct Object {
+    pub(crate) kind: &'static str,
+    pub(crate) data: Vec<u8>,
 }
 
 /// git's object name function: `SHA-1("<kind> <len>\0" + payload)`.
-fn id_of(object: &Object) -> String {
+pub(crate) fn id_of(object: &Object) -> String {
     let mut hasher = sha1::Sha1::new();
     hasher.update(format!("{} {}\0", object.kind, object.data.len()).as_bytes());
     hasher.update(&object.data);
     hex::encode(hasher.finalize())
 }
 
-fn blob(content: &[u8]) -> Object {
+pub(crate) fn blob(content: &[u8]) -> Object {
     Object {
         kind: "blob",
         data: content.to_vec(),
@@ -250,20 +261,43 @@ fn tree(entries: &[(String, String, String)]) -> Object {
     }
 }
 
-/// A commit object over a tree, its parents and a message.
-fn commit(tree_id: &str, parents: &[String], message: &str) -> Object {
+/// A commit object over a tree, its parents and a message, with the two identity lines a
+/// client chose for it — each `"<name> <<email>> <seconds> <±hhmm>"`, as git writes one.
+///
+/// `pub(crate)` so the sibling suite that reads WHICH DATE a commit carries on every face of
+/// the service ([`crate::commit_date_across_faces`]) builds its pushed commits with this one
+/// encoder rather than a second copy of git's commit encoding.
+pub(crate) fn commit_with_identities(
+    tree_id: &str,
+    parents: &[String],
+    message: &str,
+    author: &str,
+    committer: &str,
+) -> Object {
     let mut text = format!("tree {tree_id}\n");
     for parent in parents {
         text.push_str(&format!("parent {parent}\n"));
     }
-    text.push_str("author Pusher <pusher@example.com> 1770000000 +0000\n");
-    text.push_str("committer Pusher <pusher@example.com> 1770000060 +0000\n");
+    text.push_str(&format!("author {author}\n"));
+    text.push_str(&format!("committer {committer}\n"));
     text.push('\n');
     text.push_str(message);
     Object {
         kind: "commit",
         data: text.into_bytes(),
     }
+}
+
+/// A commit object over a tree, its parents and a message, authored by the pusher these
+/// cases speak for at the instants they all use.
+fn commit(tree_id: &str, parents: &[String], message: &str) -> Object {
+    commit_with_identities(
+        tree_id,
+        parents,
+        message,
+        "Pusher <pusher@example.com> 1770000000 +0000",
+        "Pusher <pusher@example.com> 1770000060 +0000",
+    )
 }
 
 /// An annotated tag object naming `target`.
@@ -304,7 +338,9 @@ fn commit_tree(data: &[u8]) -> String {
 
 /// Build the tree objects for a whole snapshot, reporting the root's name and
 /// every object (trees and blobs) the snapshot is made of.
-fn snapshot_objects(files: &BTreeMap<String, (String, Vec<u8>)>) -> (String, Vec<Object>) {
+pub(crate) fn snapshot_objects(
+    files: &BTreeMap<String, (String, Vec<u8>)>,
+) -> (String, Vec<Object>) {
     let mut objects: Vec<Object> = Vec::new();
     for (_, content) in files.values() {
         objects.push(blob(content));
@@ -374,7 +410,7 @@ fn pack_with_declared_size(object: &Object, declared: usize) -> Vec<u8> {
 
 /// A packfile carrying `objects`, each whole (no deltas) — the simplest form a
 /// client may send.
-fn pack(objects: &[Object]) -> Vec<u8> {
+pub(crate) fn pack(objects: &[Object]) -> Vec<u8> {
     use std::io::Write as _;
     let mut out: Vec<u8> = b"PACK".to_vec();
     out.extend_from_slice(&2u32.to_be_bytes());
@@ -518,7 +554,7 @@ fn pack_entries(entries: &[Entry]) -> Vec<u8> {
 }
 
 /// Read a packfile the emulator served, reporting its objects.
-fn unpack(bytes: &[u8]) -> Vec<Object> {
+pub(crate) fn unpack(bytes: &[u8]) -> Vec<Object> {
     assert_eq!(&bytes[..4], b"PACK", "a packfile starts with PACK");
     assert_eq!(
         u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
@@ -607,7 +643,7 @@ const FLUSH: &[u8] = b"0000";
 
 /// The pkt-lines at the head of a response, plus the bytes after the first flush
 /// packet (a packfile, when there is one).
-fn parse_pkts(body: &[u8]) -> (Vec<String>, Vec<u8>) {
+pub(crate) fn parse_pkts(body: &[u8]) -> (Vec<String>, Vec<u8>) {
     let mut lines = Vec::new();
     let mut cursor = 0usize;
     while cursor + 4 <= body.len() {
@@ -629,7 +665,7 @@ fn parse_pkts(body: &[u8]) -> (Vec<String>, Vec<u8>) {
 /// and the packfile that follows it. The pack is NOT pkt-line framed — a client
 /// switches to reading the raw stream after that line, which is why this cannot
 /// use [`parse_pkts`].
-fn parse_fetch(body: &[u8]) -> (Vec<String>, Vec<u8>) {
+pub(crate) fn parse_fetch(body: &[u8]) -> (Vec<String>, Vec<u8>) {
     assert!(body.len() >= 4, "a fetch response carries at least one line");
     let header = std::str::from_utf8(&body[..4]).expect("a hex pkt-line length");
     let length = usize::from_str_radix(header, 16).expect("a hex pkt-line length");
@@ -698,7 +734,7 @@ fn parse_advertisement(service: &str, reply: &GitReply) -> (BTreeMap<String, Str
 }
 
 /// One ref update command, as a pushing client frames it.
-fn command(old: &str, new: &str, name: &str, capabilities: &str) -> Vec<u8> {
+pub(crate) fn command(old: &str, new: &str, name: &str, capabilities: &str) -> Vec<u8> {
     if capabilities.is_empty() {
         pkt(format!("{old} {new} {name}\n").as_bytes())
     } else {
@@ -707,7 +743,7 @@ fn command(old: &str, new: &str, name: &str, capabilities: &str) -> Vec<u8> {
 }
 
 /// A whole push request: the commands, a flush, and the packfile.
-fn push_body(commands: &[Vec<u8>], objects: &[Object]) -> Vec<u8> {
+pub(crate) fn push_body(commands: &[Vec<u8>], objects: &[Object]) -> Vec<u8> {
     let mut body: Vec<u8> = commands.concat();
     body.extend_from_slice(FLUSH);
     if !objects.is_empty() {
@@ -717,7 +753,7 @@ fn push_body(commands: &[Vec<u8>], objects: &[Object]) -> Vec<u8> {
 }
 
 /// A whole fetch request: the wants, a flush, and `done`.
-fn fetch_body(wants: &[String], haves: &[String]) -> Vec<u8> {
+pub(crate) fn fetch_body(wants: &[String], haves: &[String]) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
     for (index, want) in wants.iter().enumerate() {
         if index == 0 {
