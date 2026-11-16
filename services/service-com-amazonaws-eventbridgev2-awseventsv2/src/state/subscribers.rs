@@ -822,6 +822,34 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .collect()
     }
 
+    /// How many subscribers of this bus have NOT been revoked.
+    ///
+    /// A subscriber is created on one bus and keeps delivering that bus's
+    /// events until it is deleted or revoked ([`Subscriber::delivers`]), so the
+    /// unrevoked subscribers are the ones still using their bus — which is what
+    /// makes the bus in use for `DeleteEventBus`. A revoked subscriber stays
+    /// readable but delivers nothing, so it holds nothing: revoking is one of
+    /// the two remedies that refusal names, beside deleting
+    /// (`crate::ops::delete_event_bus::SUBSCRIBERS_IN_USE_MESSAGE`). A STOPPED
+    /// subscriber is not one of them — `State` is caller-controlled and
+    /// reversible, so such a subscriber is still the bus's.
+    pub fn unrevoked_subscribers_of_bus(&self, event_bus_arn: &str) -> usize {
+        self.subscribers
+            .values()
+            .filter(|subscriber| subscriber.event_bus_arn == event_bus_arn && !subscriber.revoked)
+            .count()
+    }
+
+    /// Remove the subscriber at this ARN, reporting whether one was there.
+    ///
+    /// The subscriber IS the record of its own client token, so forgetting it
+    /// frees both its name and that token: a later create may take the name
+    /// again, and a retry carrying the token mints a new subscriber instead of
+    /// replaying a deleted one.
+    pub fn remove_subscriber(&mut self, arn: &str) -> bool {
+        self.subscribers.remove(arn).is_some()
+    }
+
     /// Forget the subscribers of a bus that has finished disappearing.
     ///
     /// A subscriber is created ON one bus, so it cannot outlive that bus: one

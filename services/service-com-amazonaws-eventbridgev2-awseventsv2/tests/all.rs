@@ -33,3 +33,5 @@ mod revoke_resource;
 mod state_roundtrip;
 #[path = "all/subscriber_delivery.rs"]
 mod subscriber_delivery;
+#[path = "all/subscriber_removal.rs"]
+mod subscriber_removal;

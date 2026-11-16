@@ -1040,10 +1040,17 @@ async fn create_subscriber_refuses_only_with_the_errors_its_model_declares() {
     // far the clock has carried that deletion — the bus is still there and not
     // ACTIVE, or it is gone — and both are refusals of this operation's
     // modelled set, so the row asserts the pair rather than a race.
+    //
+    // The row retires a bus of its OWN, because a bus a subscriber still holds
+    // cannot be retired at all (`DeleteEventBus` refuses it as in use) and what
+    // is measured here is the create's refusal, not the delete's.
+    let retiring = harness
+        .active_bus("a bus that is no longer ACTIVE", "refusal-retiring-bus")
+        .await;
     DeleteEventBus::new(Arc::clone(&harness.engine))
         .handle(
             DeleteEventBusInput {
-                event_bus_arn: bus.clone(),
+                event_bus_arn: retiring.clone(),
             },
             &harness.ctx(),
         )
@@ -1052,7 +1059,7 @@ async fn create_subscriber_refuses_only_with_the_errors_its_model_declares() {
     let error = harness
         .create(CreateSubscriberInput {
             name: "refusal-deleting".to_string(),
-            event_bus_arn: bus.clone(),
+            event_bus_arn: retiring.clone(),
             invoke_configuration: invoke(TARGET_ARN),
             ..Default::default()
         })

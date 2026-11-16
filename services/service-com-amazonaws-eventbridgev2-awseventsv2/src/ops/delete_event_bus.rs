@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEventBus
-//! Implemented: retires the stored event bus with this ARN.
+//! Implemented: retires the stored event bus with this ARN, unless a subscriber
+//! nobody has revoked still holds it.
 //!
 //! ## Shape of an operation
 //!
@@ -64,6 +65,23 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The whole `Message` of the `ResourceInUseException` this operation answers
+/// while the addressed bus still holds a subscriber nobody has revoked.
+///
+/// `ResourceInUseException` is documented as "The resource is in use and cannot
+/// be deleted. For example, an event bus with subscribers or event sources
+/// cannot be deleted until they are deleted", and this is how that refusal is
+/// worded for the SUBSCRIBER relation: fixed text throughout, naming neither
+/// the bus, nor a subscriber, nor how many are attached. The resource a caller
+/// has to deal with is already identified by the request it sent.
+///
+/// The sentence is also what scopes the refusal, and the gate below reads it
+/// that way: the bus is held by subscribers "that are not revoked", and a caller
+/// clears it by either of the two remedies the sentence names — "Delete or
+/// revoke them and retry".
+pub const SUBSCRIBERS_IN_USE_MESSAGE: &str = "The event bus cannot be deleted because it has \
+     one or more subscribers that are not revoked. Delete or revoke them and retry.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -157,18 +175,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_lifecycles(now);
 
+        let Some(bus) = state.bus(&input.event_bus_arn) else {
+            return Err(DeleteEventBusErrorModeled::ResourceNotFoundException(
+                crate::state::event_bus_not_found(&input.event_bus_arn),
+            )
+            .into());
+        };
+        let already_deleting = bus.state == crate::state::BusLifecycleState::Deleting;
+
+        // "A bus with subscribers or event sources cannot be deleted": while a
+        // subscriber of this bus is still delivering — stored and not revoked —
+        // the bus is in use and the delete is refused, leaving the bus exactly as
+        // it stands.
+        //
+        // WHICH subscribers hold it is decided by this refusal's own wording
+        // ([`SUBSCRIBERS_IN_USE_MESSAGE`]): it says the bus has subscribers "that
+        // are not revoked", and it names BOTH ways to release the bus — delete or
+        // revoke them. A subscriber a caller has revoked has taken the second of
+        // those, so it no longer holds the bus, while it stays readable for the
+        // record; one that is merely stopped has not, because `State` is
+        // caller-controlled and reversible.
+        if state.unrevoked_subscribers_of_bus(&input.event_bus_arn) > 0 {
+            return Err(DeleteEventBusErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(SUBSCRIBERS_IN_USE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent`: a delete repeated against a bus already on its way out
+        // is the same request, so it succeeds without restarting the span.
+        if already_deleting {
+            return Ok(DeleteEventBusOutput {});
+        }
         let Some(bus) = state.event_buses.get_mut(&input.event_bus_arn) else {
             return Err(DeleteEventBusErrorModeled::ResourceNotFoundException(
                 crate::state::event_bus_not_found(&input.event_bus_arn),
             )
             .into());
         };
-
-        // `@idempotent`: a delete repeated against a bus already on its way out
-        // is the same request, so it succeeds without restarting the span.
-        if bus.state == crate::state::BusLifecycleState::Deleting {
-            return Ok(DeleteEventBusOutput {});
-        }
 
         // Deletion is asynchronous, so the bus moves to DELETING and the clock
         // owes its disappearance one span later.
