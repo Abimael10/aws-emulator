@@ -24,6 +24,10 @@
 /// rather than by the values it produced.
 mod projection;
 
+/// The table functions Athena's own language reads rows from that this engine's dialect
+/// has no production for.
+mod table_functions;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -627,6 +631,10 @@ pub fn run_over(
     parameters: &[String],
     scanned_bytes: i64,
 ) -> Completion {
+    // A statement reading its rows from a table function this dialect lacks names those
+    // same rows in a production it has; one carrying none is run exactly as submitted.
+    let expanded = table_functions::expanded(sql);
+    let sql = expanded.as_deref().unwrap_or(sql);
     let mut database = handle.lock().unwrap_or_else(PoisonError::into_inner);
     let guard = Arc::new(RunGuard::default());
     let handler = Arc::clone(&guard);

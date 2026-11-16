@@ -15,7 +15,12 @@
 //! * a failed execution carries the error TYPE Athena publishes for its failure class beside
 //!   the category, so a client branches on the classification rather than on the message —
 //!   including the class of a statement whose `QueryExecutionContext` names a data catalog
-//!   this account has not registered.
+//!   this account has not registered;
+//! * `GetQueryRuntimeStatistics` reports the RUNTIME statistics of that same stored
+//!   execution: the timeline spans the execution's own `Statistics` report, member for
+//!   member, which add up to the whole the query took, and — once its run has reported —
+//!   the rows and bytes it read and returned and the stage it ran as. An id no execution
+//!   was minted under is refused rather than answered.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the kind of
 //! statement, how many rows it reads and returns, whether it succeeded or failed, the
@@ -34,6 +39,8 @@ use service_com_amazonaws_athena_amazonathena::state::{
     QUERY_STATE_FAILED, QUERY_STATE_QUEUED, QUERY_STATE_RUNNING, QUERY_STATE_SUCCEEDED,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{error_code, message};
 
 /// The name Athena reaches the account's AWS Glue Data Catalog by.
 const GLUE_CATALOG: &str = "AwsDataCatalog";
@@ -817,5 +824,385 @@ async fn a_failed_execution_reports_the_error_type_of_its_class() {
         // The flattened view reports the same failure, so a client reading it is not left
         // without the state or the reason.
         assert_detail_mirrors_execution(case.case, &body);
+    }
+}
+
+/// The phases of a run a read of its runtime statistics reports, in the order a query passes
+/// through them, each under the name the execution's own `Statistics` reports it under as
+/// well — the member list the modelled `QueryRuntimeStatisticsTimeline` and
+/// `QueryExecutionStatistics` share.
+const TIMELINE_PHASES: [&str; 5] = [
+    "QueryQueueTimeInMillis",
+    "ServicePreProcessingTimeInMillis",
+    "QueryPlanningTimeInMillis",
+    "EngineExecutionTimeInMillis",
+    "ServiceProcessingTimeInMillis",
+];
+
+/// The span those phases add up to: the whole the query took.
+const TIMELINE_TOTAL: &str = "TotalExecutionTimeInMillis";
+
+/// The `StageId` of the stage whose output is the query's own, which is the first stage of
+/// a run this engine performs as one stage.
+const OUTPUT_STAGE_ID: i64 = 0;
+
+/// The stage state of a run whose work is over.
+const STAGE_STATE_FINISHED: &str = "FINISHED";
+
+/// The error code a read of an execution this account holds none of is refused with, and the
+/// shape that refusal travels as.
+const QUERY_EXECUTION_NOT_FOUND: &str = "QUERY_EXECUTION_NOT_FOUND";
+/// See [`QUERY_EXECUTION_NOT_FOUND`].
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The `QueryRuntimeStatistics` a read of `id` reports.
+async fn runtime_statistics(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+    let body = athena_ok(
+        router,
+        case,
+        "GetQueryRuntimeStatistics",
+        &json!({ "QueryExecutionId": id }),
+    )
+    .await;
+    body["QueryRuntimeStatistics"].clone()
+}
+
+/// A byte counter is a MEASURE of the rows it belongs to: a run that read or returned rows
+/// reports the bytes those rows held, and one that handled none reports no bytes.
+fn assert_bytes_follow_rows(case: &str, member: &str, counters: &Value, rows: i64) {
+    let bytes = counters[member]
+        .as_i64()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a {member} counter, got {counters:?}"));
+    if rows > 0 {
+        assert!(
+            bytes > 0,
+            "case {case:?}: {rows} rows must carry the bytes they held under {member}, got \
+             {bytes}"
+        );
+    } else {
+        assert_eq!(
+            bytes, 0,
+            "case {case:?}: a run that handled no rows must report no bytes under {member}, got \
+             {bytes}"
+        );
+    }
+}
+
+/// One row of the runtime-statistics table: a statement, and what the run of it measured.
+struct RuntimeCase {
+    /// What this row is about.
+    case: &'static str,
+    /// The statement submitted.
+    sql: &'static str,
+    /// Whether the execution must settle SUCCEEDED or FAILED.
+    state: &'static str,
+    /// Whether the run reported counters at all: a run that produced results did, and one
+    /// that failed measured no rows to report.
+    counted: bool,
+    /// The rows the run READ out of the objects its statement named.
+    input_rows: i64,
+    /// The rows it RETURNED.
+    output_rows: i64,
+}
+
+/// The rows: a statement differs from the next along how many rows it reads (none, every row
+/// of a catalog table), how many it returns (none, one, several), whether what it returns is
+/// rows at all (a catalog task returns the engine's text output), and whether it runs.
+fn runtime_cases() -> Vec<RuntimeCase> {
+    vec![
+        RuntimeCase {
+            case: "a projection of one literal row",
+            sql: "SELECT 1 AS one",
+            state: QUERY_STATE_SUCCEEDED,
+            counted: true,
+            input_rows: 0,
+            output_rows: 1,
+        },
+        RuntimeCase {
+            case: "a projection of three literal rows",
+            sql: "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3",
+            state: QUERY_STATE_SUCCEEDED,
+            counted: true,
+            input_rows: 0,
+            output_rows: 3,
+        },
+        RuntimeCase {
+            case: "a read of every row of a catalog table",
+            sql: "SELECT id, name FROM shop.events",
+            state: QUERY_STATE_SUCCEEDED,
+            counted: true,
+            input_rows: TABLE_ROWS,
+            output_rows: TABLE_ROWS,
+        },
+        RuntimeCase {
+            // It READS every row of the table and RETURNS one, so the two counters differ.
+            case: "an aggregate over a catalog table",
+            sql: "SELECT count(*) AS rows_held FROM shop.events",
+            state: QUERY_STATE_SUCCEEDED,
+            counted: true,
+            input_rows: TABLE_ROWS,
+            output_rows: 1,
+        },
+        RuntimeCase {
+            case: "a read of one row of a catalog table",
+            sql: "SELECT id FROM shop.events WHERE id = 1",
+            state: QUERY_STATE_SUCCEEDED,
+            counted: true,
+            input_rows: TABLE_ROWS,
+            output_rows: 1,
+        },
+        RuntimeCase {
+            // A catalog task returns no rows at all: its result is the text the task wrote.
+            case: "a catalog DDL statement",
+            sql: "CREATE DATABASE `statistics_db`",
+            state: QUERY_STATE_SUCCEEDED,
+            counted: true,
+            input_rows: 0,
+            output_rows: 0,
+        },
+        RuntimeCase {
+            case: "a read of a table the catalog does not hold",
+            sql: "SELECT id FROM shop.not_a_table",
+            state: QUERY_STATE_FAILED,
+            counted: false,
+            input_rows: 0,
+            output_rows: 0,
+        },
+    ]
+}
+
+/// A read of an execution's RUNTIME statistics reports what that run measured: the timeline
+/// is the same set of spans the execution's own `Statistics` report, member for member, so
+/// the two reads of one run cannot disagree; the row counters are the rows it read out of the
+/// objects its statement named and the rows it returned, with the bytes each of those held;
+/// and the output stage reports those same measures for the one stage the run performed,
+/// timed by the engine's own span. A run that measured no rows — one whose statement failed —
+/// reports the timeline and no counters. Reading twice reports the same statistics, because a
+/// read derives them rather than moving the execution along.
+#[tokio::test]
+async fn runtime_statistics_report_what_the_run_measured() {
+    let router = emulator();
+    create_bucket(&router).await;
+    create_catalog_table(&router).await;
+
+    // Started together, so the suite waits one completion span rather than one per row.
+    let cases = runtime_cases();
+    let mut started: Vec<(&RuntimeCase, String)> = Vec::new();
+    for case in &cases {
+        let id = start(&router, case.case, case.sql, GLUE_CATALOG, None).await;
+        started.push((case, id));
+    }
+
+    for (case, id) in &started {
+        let body = settled(&router, case.case, id).await;
+        let execution = &body["QueryExecution"];
+        assert_eq!(
+            execution["Status"]["State"], case.state,
+            "case {:?}: the execution must settle {}, got {execution:?}",
+            case.case, case.state
+        );
+
+        let statistics = runtime_statistics(&router, case.case, id).await;
+        let again = runtime_statistics(&router, case.case, id).await;
+        assert_eq!(
+            again, statistics,
+            "case {:?}: two reads of a finished execution must report the same statistics",
+            case.case
+        );
+
+        let timeline = &statistics["Timeline"];
+        let reported = &execution["Statistics"];
+        let mut phases = 0;
+        for span in TIMELINE_PHASES.iter().chain([&TIMELINE_TOTAL]) {
+            let millis = timeline[*span].as_i64().unwrap_or_else(|| {
+                panic!("case {:?}: expected Timeline.{span}, got {timeline:?}", case.case)
+            });
+            assert_eq!(
+                Some(millis),
+                reported[*span].as_i64(),
+                "case {:?}: Timeline.{span} must be the span the execution reports, got \
+                 {timeline:?} beside {reported:?}",
+                case.case
+            );
+            assert!(
+                millis >= 0,
+                "case {:?}: Timeline.{span} must be a span, got {millis}",
+                case.case
+            );
+            if *span != TIMELINE_TOTAL {
+                phases += millis;
+            }
+        }
+        let total = timeline[TIMELINE_TOTAL].as_i64().unwrap_or_default();
+        assert_eq!(
+            phases, total,
+            "case {:?}: the phases the query passed through must add up to the whole it took, \
+             got {timeline:?}",
+            case.case
+        );
+        let engine = timeline["EngineExecutionTimeInMillis"].as_i64().unwrap_or_default();
+        assert!(
+            total >= engine,
+            "case {:?}: the whole execution cannot be shorter than the engine's part of it, \
+             got {total} and {engine}",
+            case.case
+        );
+
+        let counters = &statistics["Rows"];
+        let stage = &statistics["OutputStage"];
+        if !case.counted {
+            assert!(
+                counters.is_null() && stage.is_null(),
+                "case {:?}: a run that measured no rows must report no counters and no stage, \
+                 got {statistics:?}",
+                case.case
+            );
+            continue;
+        }
+
+        assert_eq!(
+            counters["InputRows"].as_i64(),
+            Some(case.input_rows),
+            "case {:?}: expected Rows.InputRows to be the {} rows the run read, got \
+             {counters:?}",
+            case.case,
+            case.input_rows
+        );
+        assert_eq!(
+            counters["OutputRows"].as_i64(),
+            Some(case.output_rows),
+            "case {:?}: expected Rows.OutputRows to be the {} rows the run returned, got \
+             {counters:?}",
+            case.case,
+            case.output_rows
+        );
+        assert_bytes_follow_rows(case.case, "InputBytes", counters, case.input_rows);
+        assert_bytes_follow_rows(case.case, "OutputBytes", counters, case.output_rows);
+
+        assert_eq!(
+            stage["StageId"].as_i64(),
+            Some(OUTPUT_STAGE_ID),
+            "case {:?}: expected the output stage of a single-stage run, got {stage:?}",
+            case.case
+        );
+        assert_eq!(
+            stage["State"].as_str(),
+            Some(STAGE_STATE_FINISHED),
+            "case {:?}: the stage of a run that completed must report its work over, got \
+             {stage:?}",
+            case.case
+        );
+        for member in ["InputRows", "InputBytes", "OutputRows", "OutputBytes"] {
+            assert_eq!(
+                stage[member], counters[member],
+                "case {:?}: OutputStage.{member} must be the measure the run reports, got \
+                 {stage:?} beside {counters:?}",
+                case.case
+            );
+        }
+        assert_eq!(
+            stage["ExecutionTime"], timeline["EngineExecutionTimeInMillis"],
+            "case {:?}: the stage's execution time must be the engine's own span, got \
+             {stage:?}",
+            case.case
+        );
+        assert!(
+            stage["SubStages"].is_null(),
+            "case {:?}: a run performed as one stage feeds no substage, got {stage:?}",
+            case.case
+        );
+    }
+}
+
+/// The TIMELINE is reported from the first read on, before the query is terminal; the
+/// counters and the stage appear once the run has reported, so a poller reading the
+/// statistics of a query that has not finished is answered rather than refused.
+#[tokio::test]
+async fn runtime_statistics_are_reported_before_the_query_is_terminal() {
+    let router = emulator();
+    create_bucket(&router).await;
+
+    let case = "a fresh execution";
+    let id = start(&router, case, "SELECT 1 AS one", GLUE_CATALOG, None).await;
+
+    let fresh = runtime_statistics(&router, case, &id).await;
+    // Read the STATE after the statistics: a query that is still queued or running now was
+    // also one then, so the expectation holds whatever the host's timing is.
+    let state_after = read(&router, case, &id).await["QueryExecution"]["Status"]["State"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        fresh["Timeline"].is_object(),
+        "{case}: the timeline must be reported from the first read on, got {fresh:?}"
+    );
+    if [QUERY_STATE_QUEUED, QUERY_STATE_RUNNING].contains(&state_after.as_str()) {
+        assert!(
+            fresh["Rows"].is_null() && fresh["OutputStage"].is_null(),
+            "{case}: a run that has not reported has no counters to report, got {fresh:?}"
+        );
+    }
+
+    let settled = settled(&router, case, &id).await;
+    assert_eq!(
+        settled["QueryExecution"]["Status"]["State"], QUERY_STATE_SUCCEEDED,
+        "{case}: the query must settle SUCCEEDED, got {settled:?}"
+    );
+    let terminal = runtime_statistics(&router, case, &id).await;
+    assert!(
+        terminal["Rows"].is_object() && terminal["OutputStage"].is_object(),
+        "{case}: once the run has reported, its counters and its stage must be there, got \
+         {terminal:?}"
+    );
+}
+
+/// A read of the runtime statistics of an id this account holds no execution for is REFUSED,
+/// with the class of refusal that says the id names nothing and the sentence Athena states
+/// it with — whatever form the id takes, up to the longest the model admits.
+#[tokio::test]
+async fn runtime_statistics_of_an_unknown_execution_are_refused() {
+    let router = emulator();
+
+    // (case, the id the request names). The rows differ along the FORM of the id: one shaped
+    // like a minted execution id, one that is not, and one of the maximum modelled length
+    // (`QueryExecutionId` is 1 to 128 characters, pattern `^\S+$`).
+    let unknown: Vec<(&str, String)> = vec![
+        (
+            "an id shaped like a minted one",
+            "11111111-2222-4333-8444-555555555555".to_string(),
+        ),
+        ("an id of no particular shape", "not-a-query".to_string()),
+        ("an id of the longest modelled length", "q".repeat(128)),
+    ];
+
+    for (case, id) in &unknown {
+        let (status, body) = athena(
+            &router,
+            "GetQueryRuntimeStatistics",
+            &json!({ "QueryExecutionId": id }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an id naming no execution must be refused, got {status} with \
+             {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INVALID_REQUEST_EXCEPTION,
+            "case {case:?}: expected the refusal Athena states for a bad request, got {body:?}"
+        );
+        for member in ["ErrorCode", "AthenaErrorCode"] {
+            assert_eq!(
+                body[member].as_str(),
+                Some(QUERY_EXECUTION_NOT_FOUND),
+                "case {case:?}: the refusal must carry its class under {member}, got {body:?}"
+            );
+        }
+        assert_eq!(
+            message(&body),
+            format!("QueryExecution {id} was not found"),
+            "case {case:?}: expected the sentence Athena states that miss with, got {body:?}"
+        );
     }
 }

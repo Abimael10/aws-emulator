@@ -37,6 +37,10 @@
 //! field, which is the only thing that tells a NULL from the empty string in the saved text.
 //! Reading delimited text, where the records come from a caller's objects, is the maintained
 //! reader's job and stays there ([`super::catalog_sql::data`]).
+//!
+//! That same rendering is what MEASURES how many bytes a run returned
+//! ([`returned_bytes`]), so the size a read of the run's statistics reports is the size of
+//! what the run actually saved rather than a second estimate of it.
 
 use ::service_com_amazonaws_s3_amazons3::state as s3_state;
 
@@ -193,10 +197,44 @@ fn results_csv(result: &StoredResultSet) -> Vec<u8> {
             result.column_info.iter().map(|column| Some(label_of(column))),
         );
     }
-    for row in &result.rows {
-        push_csv_row(&mut text, values_of(row));
-    }
+    push_csv_rows(&mut text, result);
     text.into_bytes()
+}
+
+/// Just the DATA rows of a result set, rendered as the results object writes them —
+/// everything [`results_csv`] saves except the label line in front of them.
+fn data_rows_csv(result: &StoredResultSet) -> Vec<u8> {
+    let mut text = String::new();
+    push_csv_rows(&mut text, result);
+    text.into_bytes()
+}
+
+/// Append every data row of `result` to `text`, one CSV record each.
+fn push_csv_rows(text: &mut String, result: &StoredResultSet) {
+    for row in &result.rows {
+        push_csv_row(text, values_of(row));
+    }
+}
+
+/// How many BYTES the rows `record`'s run RETURNED hold, as the results it saved write
+/// them: the rendering of the data rows, without the column-label line a results object
+/// puts in front of them — that line is the result set's schema rather than a row the
+/// query returned.
+///
+/// Zero for a run that returned nothing: one that failed, one a caller cancelled and one
+/// that has not reported wrote no rows to measure.
+pub fn returned_bytes(record: &QueryExecutionRecord) -> i64 {
+    let Some(Outcome::Succeeded { result, .. }) = record.outcome.as_ref() else {
+        return 0;
+    };
+    // Rendered exactly as the object the run saved renders them, so the bytes a read
+    // reports and the bytes a client fetches are one measure of one result set.
+    let rendered = if record.writes_text_output() {
+        text_output(result)
+    } else {
+        data_rows_csv(result)
+    };
+    i64::try_from(rendered.len()).unwrap_or(i64::MAX)
 }
 
 /// The text a statement whose result is the engine's TEXT output saves: one line per row

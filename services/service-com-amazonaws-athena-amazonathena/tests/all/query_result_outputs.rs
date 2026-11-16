@@ -530,3 +530,109 @@ async fn only_a_statement_that_reads_stored_data_scans_bytes() {
         }
     }
 }
+
+/// A statement whose FROM clause reads Athena's `UNNEST` table function answers one row per
+/// element of the array it unnests — the array written out, or one `sequence()` generates —
+/// in that array's own order, and the rows of such a factor are read by everything a
+/// statement does with rows: a projection, an aggregate, and a cross join with another
+/// factor beside it.
+#[tokio::test]
+async fn a_statement_reads_the_rows_of_the_table_function_it_unnests() {
+    let router = router();
+    let database = "unnested";
+
+    // (case, the SQL, the rows a read of its output must report — the column-label row
+    // first, as a read of any DML statement's results reports it). The rows differ along
+    // what the array is (written out, of text, counting up, counting down, stepping,
+    // holding one element), how the statement reads it (projected, aggregated, crossed with
+    // another), and whether the factor names its column at all.
+    let cases: Vec<(&str, &str, Vec<Vec<&str>>)> = vec![
+        (
+            "an array written out",
+            "SELECT n FROM UNNEST(ARRAY[10, 20, 30]) AS a(n)",
+            vec![vec!["n"], vec!["10"], vec!["20"], vec!["30"]],
+        ),
+        (
+            "an array of text",
+            "SELECT s FROM UNNEST(ARRAY['north', 'south']) AS a(s)",
+            vec![vec!["s"], vec!["north"], vec!["south"]],
+        ),
+        (
+            "a sequence counting up",
+            "SELECT n FROM UNNEST(SEQUENCE(1, 4)) AS a(n)",
+            vec![
+                vec!["n"],
+                vec!["1"],
+                vec!["2"],
+                vec!["3"],
+                vec!["4"],
+            ],
+        ),
+        (
+            "a sequence counting down",
+            "SELECT n FROM UNNEST(SEQUENCE(3, 1)) AS a(n)",
+            vec![vec!["n"], vec!["3"], vec!["2"], vec!["1"]],
+        ),
+        (
+            "a sequence with a step of its own",
+            "SELECT n FROM UNNEST(SEQUENCE(0, 10, 5)) AS a(n)",
+            vec![vec!["n"], vec!["0"], vec!["5"], vec!["10"]],
+        ),
+        (
+            "a sequence of one element",
+            "SELECT n FROM UNNEST(SEQUENCE(7, 7)) AS a(n)",
+            vec![vec!["n"], vec!["7"]],
+        ),
+        (
+            "a sequence with no column name of its own",
+            "SELECT * FROM UNNEST(SEQUENCE(1, 2))",
+            vec![vec!["_col0"], vec!["1"], vec!["2"]],
+        ),
+        (
+            "a sequence aggregated",
+            "SELECT sum(n) AS s FROM UNNEST(SEQUENCE(1, 100)) AS a(n)",
+            vec![vec!["s"], vec!["5050"]],
+        ),
+        (
+            "two sequences crossed",
+            "SELECT count(*) AS c FROM UNNEST(SEQUENCE(1, 20)) AS a(n) CROSS JOIN \
+             UNNEST(SEQUENCE(1, 30)) AS b(m)",
+            vec![vec!["c"], vec!["600"]],
+        ),
+        (
+            "a sequence narrowed by a predicate",
+            "SELECT n FROM UNNEST(SEQUENCE(1, 6)) AS a(n) WHERE n % 3 = 0",
+            vec![vec!["n"], vec!["3"], vec!["6"]],
+        ),
+    ];
+
+    // Started together, so the suite waits one completion span rather than one per row.
+    let mut started: Vec<(&str, String, &Vec<Vec<&str>>)> = Vec::new();
+    for (case, sql, rows) in &cases {
+        started.push((case, start(&router, &query_in(sql, database)).await, rows));
+    }
+
+    for (case, id, rows) in &started {
+        // Waits for the STATE rather than for a span, so the whole table costs one
+        // completion span rather than one per row.
+        let found = crate::harness::settled(&router, id).await;
+        assert_eq!(
+            found["Status"]["State"].as_str(),
+            Some(state::QUERY_STATE_SUCCEEDED),
+            "case {case:?}: a statement Athena runs must succeed, got {found:?}"
+        );
+        let (status, body) =
+            call(&router, "GetQueryResults", &json!({ "QueryExecutionId": id })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the output must be readable, got {status} with {body:?}"
+        );
+        let expected: Vec<Value> = rows.iter().map(|row| row_of(row)).collect();
+        assert_eq!(
+            body["ResultSet"]["Rows"],
+            json!(expected),
+            "case {case:?}: expected one row per element, in the array's own order, got \
+             {body:?}"
+        );
+    }
+}

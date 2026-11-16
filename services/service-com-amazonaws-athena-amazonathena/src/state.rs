@@ -31,7 +31,8 @@
 //! real SQL engine over the rows the catalog's tables hold ([`catalog_sql`],
 //! [`query_engine`]) — and stores what it produced in a [`QueryExecutionRecord`], and
 //! every later read — `GetQueryExecution`, `GetQueryResults`, `ListQueryExecutions`,
-//! `BatchGetQueryExecution` — answers out of that record. The record's `Status.State`
+//! `BatchGetQueryExecution`, `GetQueryRuntimeStatistics` ([`runtime_statistics`]) —
+//! answers out of that record. The record's `Status.State`
 //! is DERIVED from the clock and the stored outcome
 //! ([`QueryExecutionRecord::state_at`]), so a query a caller reads straight back is
 //! still QUEUED, is RUNNING a moment later and is terminal from its completion instant
@@ -90,6 +91,9 @@ pub mod catalog_sql;
 
 /// The objects a completed run saves its results to, under the resolved output location.
 pub mod query_results;
+
+/// The runtime statistics of one query execution: its timeline, its counters and its stage.
+mod runtime_statistics;
 
 /// The notebooks a Spark enabled workgroup holds, and the ipynb content of each.
 mod notebooks;
@@ -1704,27 +1708,59 @@ impl QueryExecutionRecord {
     /// Measured, not chosen: the engine time is what the engine actually spent, the
     /// scanned bytes are the size of the values it read, and the queue and total times
     /// come from the instants on the record.
+    ///
+    /// The five spans PARTITION the total: Athena's total execution time is the sum of the
+    /// phases a query passed through — the queue, the service's own pre-processing, the
+    /// planning, the engine's run and the publishing of the results — so each phase is laid
+    /// out in that order inside the window from the submission to the completion, every
+    /// measured span reported in full as long as the window still holds it, and the
+    /// publishing span is what the window has left. Two spans that overlapped on the clock
+    /// (the queue the record derives and the run it performed eagerly) cannot both be
+    /// charged for the same millisecond, or the parts would add up past the whole.
     fn statistics_at(&self, now: SystemTime) -> QueryExecutionStatistics {
         let terminal = self.is_terminal_at(now);
-        let queue_until = now.min(self.running_due_at());
         let total_until = self.completion_at(now).unwrap_or(now);
+        // The queue is over when the query starts running, and never later than the query
+        // itself is over: one cancelled while still queued spent its whole life queued.
+        let queue_until = total_until.min(now.min(self.running_due_at()));
+        let total = millis_between(self.submitted_at, total_until);
+        // What is left of the window after the phases laid out so far, which is what the
+        // next phase can be charged.
+        let mut remaining = total;
+        let queue = millis_between(self.submitted_at, queue_until).min(remaining);
+        remaining -= queue;
         // The service's own spans around the engine's, measured between the record's
-        // instants: everything before the engine started is what this service spent
-        // preprocessing the query, and everything from the engine's report to the
-        // completion is what it spent finalising and publishing the results \u2014 which is
-        // exactly when they become readable. Reported once the query is terminal, when
-        // both spans are over; a query whose run never reported has neither.
+        // instants: what this service spent preprocessing the query before the engine
+        // started, beside the planning it did in that same span, and everything from the
+        // engine's report to the completion, which is what it spent finalising and
+        // publishing the results — exactly when they become readable. Reported once the
+        // query is terminal, when both spans are over; a query whose run never reported has
+        // neither.
+        let planning_millis = millis_of(self.planning_time);
         let engine_started_at = self
             .engine_reported_at
             .and_then(|reported| reported.checked_sub(self.engine_time));
-        let pre_processing = engine_started_at
-            .filter(|_| terminal)
-            .map(|started| millis_between(self.submitted_at, started));
+        let pre_processing = engine_started_at.filter(|_| terminal).map(|started| {
+            // The planning is its own phase, so the pre-processing span is what came
+            // before the engine BESIDE it rather than the whole of it.
+            millis_between(self.submitted_at, started)
+                .saturating_sub(planning_millis)
+                .min(remaining)
+        });
+        remaining -= pre_processing.unwrap_or(0);
+        let planning = terminal.then(|| planning_millis.min(remaining));
+        remaining -= planning.unwrap_or(0);
+        let engine = if terminal {
+            millis_of(self.engine_time).min(remaining)
+        } else {
+            0
+        };
+        remaining -= engine;
         let processing = self
             .engine_reported_at
             .filter(|_| terminal)
             .zip(self.completion_at(now))
-            .map(|(reported, completed)| millis_between(reported, completed));
+            .map(|_| remaining);
         let data_scanned = match (self.outcome.as_ref(), terminal) {
             (
                 Some(query_engine::Outcome::Succeeded {
@@ -1738,17 +1774,13 @@ impl QueryExecutionRecord {
             // The engine ran once, when the query was submitted; its cost is reported
             // from the moment the query is terminal, which is when the run is over as
             // far as a caller can see.
-            engine_execution_time_in_millis: Some(if terminal {
-                millis_of(self.engine_time)
-            } else {
-                0
-            }),
+            engine_execution_time_in_millis: Some(engine),
             data_scanned_in_bytes: Some(data_scanned),
             // Written only when a query's results are written as a manifest, which this
             // emulator does not do.
             data_manifest_location: None,
-            total_execution_time_in_millis: Some(millis_between(self.submitted_at, total_until)),
-            query_queue_time_in_millis: Some(millis_between(self.submitted_at, queue_until)),
+            total_execution_time_in_millis: Some(total),
+            query_queue_time_in_millis: Some(queue),
             service_pre_processing_time_in_millis: pre_processing,
             // Athena reports the planning phase separately from the engine's own work:
             // "the number of milliseconds that Athena took to plan the query processing
@@ -1756,7 +1788,7 @@ impl QueryExecutionRecord {
             // source". That is what resolving this statement against the data catalog
             // spent, measured on the run itself, and it is reported from the moment the
             // query is terminal, exactly as the engine's own span is.
-            query_planning_time_in_millis: terminal.then(|| millis_of(self.planning_time)),
+            query_planning_time_in_millis: planning,
             service_processing_time_in_millis: processing,
             // Every query here is RUN: no read of a result set is answered out of an
             // earlier query's results, so no run reused a previous result.
@@ -2250,9 +2282,12 @@ impl ComAmazonawsAthenaAmazonathenaState {
     /// Write what the run of execution `id` produced onto its record.
     ///
     /// Called by the request that started the query, once the engine has reported. The
-    /// completion instant is moved out to `now` when the run took longer than the span
-    /// the record was stored with, so a query is never reported complete while its work
-    /// was still running. Does nothing for an execution the registry no longer holds.
+    /// completion instant is moved out when the run took longer than the span the record
+    /// was stored with, so a query is never reported complete while its work was still
+    /// running, and so the phases a read reports still fit inside the window from the
+    /// submission to the completion: the results are published after the query left the
+    /// queue rather than while it was still in it. Does nothing for an execution the
+    /// registry no longer holds.
     pub fn complete_query_execution(
         &mut self,
         id: &str,
@@ -2262,7 +2297,10 @@ impl ComAmazonawsAthenaAmazonathenaState {
         let Some(record) = self.query_executions.get_mut(id) else {
             return;
         };
-        record.completion_due_at = record.completion_due_at.max(now);
+        record.completion_due_at = record.completion_due_at.max(
+            now.checked_add(QUERY_EXECUTION_QUEUED)
+                .unwrap_or(now),
+        );
         record.engine_time = completion.engine_time;
         record.planning_time = record.planning_time.saturating_add(completion.planning_time);
         record.engine_reported_at = Some(now);
