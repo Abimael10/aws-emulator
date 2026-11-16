@@ -2579,6 +2579,14 @@ pub use guest_user_data::*;
 pub mod instance_status_checks;
 pub use instance_status_checks::*;
 
+/// The credit option for CPU usage ONE instance runs under — resolved from the launch's own
+/// `CreditSpecification` and the account's default for the instance family, and reported by
+/// `DescribeInstanceCreditSpecifications`. A SUBMODULE for the same reason
+/// [`image_usage_reports`] is one, and `pub use` keeps every name reachable as
+/// `crate::state::<name>`.
+pub mod instance_credit_options;
+pub use instance_credit_options::*;
+
 /// What ONE boot of one instance's guest writes to that instance's console: the kernel's and
 /// the init system's own lines, and the output of the user-data program the boot RUNS. A
 /// SUBMODULE for the same reason [`image_usage_reports`] is one.

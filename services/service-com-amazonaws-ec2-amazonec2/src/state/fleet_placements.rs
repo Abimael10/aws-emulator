@@ -523,6 +523,12 @@ impl ComAmazonawsEc2Amazonec2State {
             tags: spec.tags,
             client_token: None,
             spot_instance_request_id: spec.spot_instance_request_id.map(str::to_string),
+            // A launch SPECIFICATION carries no `CreditSpecification` member, so a placed
+            // instance of a burstable type runs under the account's default credit option
+            // for its family in this Region — "instances launch using the default credit
+            // option" (`ModifyDefaultCreditSpecification`) — and an instance of any other
+            // type has no credit option at all.
+            cpu_credits: self.launched_cpu_credits(spec.region, &instance_type, None),
         });
         Some(LaunchedInstance {
             instance_id,

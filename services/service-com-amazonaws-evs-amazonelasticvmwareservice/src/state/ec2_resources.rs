@@ -568,6 +568,11 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         instance_ids: Vec::new(),
     });
     let instance_id = store.mint_instance_id();
+    // The credit option for CPU usage the instance runs under, resolved by EC2's own reading
+    // of a launch ([`ec2::ComAmazonawsEc2Amazonec2State::launched_cpu_credits`]): a bare metal
+    // host is no burstable performance instance, so it has none, and a type that did would
+    // take its family's default in this Region — the same answer `RunInstances` resolves.
+    let cpu_credits = store.launched_cpu_credits(launch.region, launch.instance_type, None);
     store.insert_instance(ec2::InstanceRecord {
         instance_id: instance_id.clone(),
         reservation_id,
@@ -645,6 +650,7 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         client_token: None,
         // Not a Spot Instance: an ESX host is launched on demand.
         spot_instance_request_id: None,
+        cpu_credits,
     });
     // The ENIs. EC2 holds no network interface store yet (every `…NetworkInterface`
     // operation is still a scaffold stub), so the ids are minted from EC2's OWN id

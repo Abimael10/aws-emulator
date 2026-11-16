@@ -117,6 +117,12 @@ struct LaunchParameters {
     /// `LaunchTemplateHibernationOptionsRequest$Configured`, which the instance reports
     /// under `Instance$HibernationOptions`.
     hibernation_configured: bool,
+    /// The credit option for CPU usage the launch source NAMES
+    /// (`LaunchTemplateData$CreditSpecification`), or `None` where it names none — in which
+    /// case the instance takes the account's default for its instance family, exactly as a
+    /// launch naming the same version does. Held as the documented option Amazon EC2 resolved
+    /// the word to ([`ec2::cpu_credits_value`]), never as the version's own text.
+    cpu_credits_requested: Option<&'static str>,
     /// The EBS root block device every instance of this launch is created with: the AMI's
     /// own root device with the entry the launch source's `BlockDeviceMappings` carries for
     /// that device overlaid, resolved by Amazon EC2 itself
@@ -183,6 +189,15 @@ pub fn launch<Eng: Send + Sync + 'static>(
         ec2::MONITORING_STATE_DISABLED
     };
     let launch_time = SystemTime::now();
+    // The credit option every instance of this launch runs under, resolved once by Amazon
+    // EC2's own reading of a launch: the option the launch source named, the account's default
+    // for the instance type's family otherwise, and none at all for a type that is not a
+    // burstable performance type.
+    let cpu_credits = store.launched_cpu_credits(
+        request.region,
+        &instance_type,
+        parameters.cpu_credits_requested,
+    );
     let mut launched = Vec::new();
     for offset in 0..request.count {
         if store.instances.len() >= ec2::MAX_STORED_INSTANCES {
@@ -280,6 +295,7 @@ pub fn launch<Eng: Send + Sync + 'static>(
             // An Auto Scaling group's own capacity is on-demand here: no Spot Instance
             // request is modelled, so the instance fulfills none.
             spot_instance_request_id: None,
+            cpu_credits,
         };
         // The store's byte budget is asked about the record itself, the same charge
         // storing it applies, so a run of capacity changes cannot grow this process's
@@ -540,6 +556,10 @@ fn launch_parameters(
             detail: ec2::InstanceDetail::default(),
             disable_api_termination: false,
             hibernation_configured: false,
+            // For the same reason: no group launches from a launch configuration, and a
+            // launch configuration carries no credit specification either, so an instance of
+            // one would take its instance family's default credit option.
+            cpu_credits_requested: None,
             // For the same reason: no group launches from a launch configuration, and an
             // instance of one would be created with its AMI's own root device.
             root_block_device: None,
@@ -592,6 +612,15 @@ fn launch_parameters(
             .and_then(|data| data.hibernation_options.as_ref())
             .and_then(|options| options.configured)
             .unwrap_or(false),
+        // "The credit option for CPU usage of the instance"
+        // (`LaunchTemplateData$CreditSpecification`) the version declares, resolved to the
+        // documented option by Amazon EC2's own reading of that word: a version naming none,
+        // and one naming a word outside the documented pair, leave the instance on its
+        // family's default.
+        cpu_credits_requested: data
+            .as_ref()
+            .and_then(|data| data.credit_specification.as_ref())
+            .and_then(|specification| ec2::cpu_credits_value(&specification.cpu_credits)),
         image_id,
         instance_type: override_entry
             .and_then(|entry| entry.instance_type.clone())

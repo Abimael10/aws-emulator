@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceCreditSpecifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceCreditSpecifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the credit option for CPU usage of the account's burstable performance instances
+//! in the Region the request was signed for, off each instance's own stored option
+//! ([`crate::state::instance_cpu_credits`]), which its launch resolved from the launch's
+//! `CreditSpecification` and the account's default for the instance family.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceCreditSpecifications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "If you do not specify an instance ID, Amazon EC2 returns burstable performance instances
+//! with the unlimited credit option, as well as instances that were previously configured as
+//! T2, T3, and T3a with the unlimited credit option": a request that NAMES no instance
+//! reports only the instances running `unlimited` — including one that has since been resized
+//! to a type that is not burstable, which still holds the option it was configured with. "If
+//! you specify one or more instance IDs, Amazon EC2 returns the credit option (standard or
+//! unlimited) of those instances", and an instance of a type that has no credit option at all
+//! is reported `standard`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +162,214 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceCreditSpecifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceCreditSpecificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceCreditSpecifications"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, instance_cpu_credits, instance_region, page_from_cursor,
+            request_region, require_decoded_instance_record, require_service_state, CompiledFilter,
+            PageTokenRule, CPU_CREDITS_UNLIMITED, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+        };
+
+        // EC2 is a REGIONAL service: "describes the credit option for CPU usage of the
+        // specified burstable performance instances" means the instances of the Region the
+        // caller is asking in, so the Region this request was signed for is what the store is
+        // read through below.
+        let region = request_region(ctx.parts());
+
+        // "Constraints: Maximum 1000 explicitly specified instance IDs" (`$InstanceIds`),
+        // which is the bound every id list of this service is held to
+        // ([`crate::state::MAX_RESOURCE_IDS`]).
+        let requested_ids = input.instance_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // "You cannot specify this parameter and the instance IDs parameter in the same call"
+        // (`$MaxResults`): a request that NAMES the instances it wants is not walking a
+        // collection, so the two select mutually exclusively and EC2 refuses them together
+        // rather than serving one and ignoring the other. Refused through the one template
+        // this service words that pair with, with the two parameters named as every other
+        // instance-id describe of this crate names them.
+        if !requested_ids.is_empty() && input.max_results.is_some() {
+            return Err(crate::state::parameters_cannot_be_combined(
+                "instancesSet",
+                "maxResults",
+            ));
+        }
+        // The model's own `@range` on `$MaxResults` (5..1000) is enforced by the boundary
+        // before this handler runs, so a page size below the smallest page this operation
+        // serves never reaches here; a value at the top of the range is served as one page of
+        // [`crate::state::MAX_PAGE_SIZE`] with a token for the rest.
+
+        // Matching cost is filters x values x stored instances and the model bounds none of
+        // them, so the two request-controlled factors are capped here, before any work
+        // proportional to them is done — exactly as `DescribeInstances` caps them.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+        let mut filters: Vec<CompiledFilter> = Vec::new();
+        for filter in input.filters.iter().flatten() {
+            // A filter name this operation does not document is refused, never silently
+            // ignored: ignoring it would answer a wider set than the caller asked for. The
+            // refusal is the one every describe of this service words, with the name taken
+            // from the request — and an entry naming NO filter is reported by the name EC2
+            // has for an absent one.
+            let name = filter
+                .name
+                .clone()
+                .unwrap_or_else(|| crate::state::UNNAMED_FILTER.to_string());
+            if name != INSTANCE_ID_FILTER {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.clone().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the \
+                     maximum of {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            filters.push(CompiledFilter::new(name, values));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        // A pure READ: the credit option an instance runs under is resolved by its LAUNCH and
+        // moved only by a modify of it, so nothing about it falls due with the clock and this
+        // report writes nothing at all.
+        let store = state.lock();
+
+        for instance_id in &requested_ids {
+            // A long-form id this service never issued is one it cannot decode, which is the
+            // malformed half; a short-form id it holds no instance for is the not-found half.
+            let instance = require_decoded_instance_record(&store, instance_id)?;
+            // And an instance of ANOTHER Region is not one this request can name: EC2 is
+            // reached through a regional endpoint, so the id names no instance here.
+            if instance_region(instance) != region {
+                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named instance
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let wanted_ids: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+        // Every comparison is charged to one budget, so the PRODUCT of stored instances,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the lock.
+        let mut budget = crate::state::MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<InstanceCreditSpecification> = Vec::new();
+        for (instance_id, instance) in &store.instances {
+            if budget.exhausted() {
+                break;
+            }
+            if !budget.spend() {
+                break;
+            }
+            if !wanted_ids.is_empty() && !wanted_ids.contains(instance_id.as_str()) {
+                continue;
+            }
+            if instance_region(instance) != region {
+                continue;
+            }
+            // The option the instance itself holds, `standard` for one that holds none.
+            let cpu_credits = instance_cpu_credits(instance);
+            // "If you do not specify an instance ID, Amazon EC2 returns burstable performance
+            // instances with the unlimited credit option, as well as instances that were
+            // previously configured as T2, T3, and T3a with the unlimited credit option": a
+            // request that names no instance reports the instances running `unlimited` and
+            // not the rest of the account — a selection that follows from the option each
+            // instance holds, so an instance resized away from a burstable type is still
+            // reported while it holds `unlimited`. A request that NAMES instances gets the
+            // option of each of them, whichever it is.
+            if wanted_ids.is_empty() && cpu_credits != CPU_CREDITS_UNLIMITED {
+                continue;
+            }
+            let matches = filters.iter().all(|filter| {
+                filter
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern.matches_within(instance_id, &mut budget))
+            });
+            if matches {
+                selected.push(InstanceCreditSpecification {
+                    instance_id: Some(instance_id.clone()),
+                    cpu_credits: Some(cpu_credits.to_string()),
+                });
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+        // Id order is the order the page cursor names a position in — an instance id is hex
+        // digits of a counter that only grows — and the store holds its instances by id in a
+        // map whose iteration order is not that order, so the selected set is sorted into it
+        // before it is paged.
+        selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        // "The maximum number of items to return for this request" caps what one page
+        // reports; the token carries, opaquely, the id of the instance the page ends at, so a
+        // caller cannot assemble one. A request that names no page size gets the documented
+        // maximum rather than the whole store.
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            // A token this service did not mint is refused with EC2's own code and sentence
+            // for an unusable pagination token, through the one definition every paged
+            // describe of this service answers it with.
+            Some(token) => Some(
+                decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(page_size),
+            PageTokenRule::WhenAnotherItemFollows,
+            |specification| specification.instance_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeInstanceCreditSpecificationsOutput {
+            instance_credit_specifications: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The ONE filter this operation documents: "instance-id - The ID of the instance"
+/// (`DescribeInstanceCreditSpecificationsRequest$Filters`). Every other name is refused
+/// rather than ignored, so a caller cannot be answered a wider set than it asked for.
+const INSTANCE_ID_FILTER: &str = "instance-id";

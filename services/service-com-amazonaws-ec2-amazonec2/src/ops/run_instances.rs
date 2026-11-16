@@ -868,6 +868,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::ComAmazonawsEc2Amazonec2State::image_imds_support`]), so a launch
         // from an image this store does not hold runs under the requirement the images this
         // crate publishes carry rather than under none.
+        // "The credit option for CPU usage of the burstable performance instance. Valid
+        // values: standard | unlimited" (`CreditSpecificationRequest$CpuCredits`): the member
+        // is a plain `String` in the model with no enum behind it, so this is the only place
+        // a word outside the documented pair can be refused — through the one refusal this
+        // service words that with ([`crate::state::invalid_cpu_credits`]) — and what reaches
+        // the instance is the documented option rather than the request's own text. A launch
+        // that names none, and one of a type that has no credit option at all, are resolved
+        // by the store's ONE reading of a launch's credit option, below.
+        let requested_cpu_credits = match input.credit_specification.as_ref() {
+            Some(specification) => Some(
+                crate::state::cpu_credits_value(&specification.cpu_credits)
+                    .ok_or_else(crate::state::invalid_cpu_credits)?,
+            ),
+            None => None,
+        };
+        // The credit option every instance of this launch runs under, resolved ONCE for the
+        // batch: the option above where the launch named one, the account's default for the
+        // instance type's family in this Region otherwise, and none at all for a type that is
+        // not a burstable performance type.
+        let cpu_credits = store.launched_cpu_credits(&region, &instance_type, requested_cpu_credits);
         let image_imds_support = store.image_imds_support(Some(&image_id));
         let detail: InstanceDetail = InstanceDetail::launched(InstanceDetailSpec {
             metadata_options: input.metadata_options.as_ref(),
@@ -1297,6 +1317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // An on-demand launch fulfills no Spot Instance request, so the instance
                 // carries neither a request id nor the `spot` lifecycle.
                 spot_instance_request_id: None,
+                // The credit option this launch resolved for its burstable instances, which
+                // every instance of the batch runs under; `None` for a type that has no
+                // credit option, reported `standard`.
+                cpu_credits,
                 },
                 &interfaces,
             );

@@ -132,26 +132,6 @@ impl<Eng> ModifyDefaultCreditSpecification<Eng> {
     }
 }
 
-/// The sentence EC2 answers a `CpuCredits` outside the documented pair with: it names the
-/// parameter, the two values it requires and what to do about it, and quotes no value at
-/// fault — which is why [`invalid_cpu_credits`] takes no argument.
-///
-/// A fixed sentence, as EC2 words this refusal; the pair it names is
-/// [`state::CPU_CREDITS_VALUES`], which carries the documentation citation for it.
-const INVALID_CPU_CREDITS_MESSAGE: &str = "The CpuCredits parameter requires a value of \
-                                           either Standard or Unlimited. Change the value \
-                                           and try again.";
-
-/// Refuse a `CpuCredits` outside the documented pair the way EC2 does: HTTP 400
-/// `InvalidParameterValue` with [`INVALID_CPU_CREDITS_MESSAGE`].
-///
-/// It lives here rather than in [`crate::state`] because this is the only operation that
-/// sets a family's default credit option: "each operation's own validation and orchestration
-/// stays in its `src/ops/<operation>.rs` file" (`crate::state`'s module docs).
-fn invalid_cpu_credits<E>() -> crate::scaffolded::Scaffolded<E> {
-    state::invalid_parameter_value(INVALID_CPU_CREDITS_MESSAGE)
-}
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifyDefaultCreditSpecification<Eng>
 {
@@ -186,10 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The credit option for CPU usage of the instance family. Valid Values: standard |
         // unlimited" (`CpuCredits`). The member is a plain `String` with no enum behind it,
-        // so this is the only place that pair can be enforced — and what is stored is the
-        // catalog's own word, never the request's text.
-        let cpu_credits = state::cpu_credits_value(&input.cpu_credits)
-            .ok_or_else(invalid_cpu_credits)?;
+        // so a handler is the only place that pair can be enforced — and what is stored is
+        // the catalog's own word, never the request's text. Refused through the ONE refusal
+        // this service words a `CpuCredits` outside the pair with
+        // ([`state::invalid_cpu_credits`]), which every request carrying one draws.
+        let cpu_credits =
+            state::cpu_credits_value(&input.cpu_credits).ok_or_else(state::invalid_cpu_credits)?;
 
         let store = state::require_service_state(&*self.engine)?;
         let mut store = store.lock();

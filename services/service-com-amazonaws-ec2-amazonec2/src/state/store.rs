@@ -602,6 +602,20 @@ pub struct InstanceRecord {
     /// (`Instance$SpotInstanceRequestId`). `None` for an on-demand launch, which is what
     /// makes the instance's reported `InstanceLifecycle` absent too.
     pub spot_instance_request_id: Option<String>,
+    /// The credit option for CPU usage this instance runs its vCPUs under, for an instance of
+    /// a BURSTABLE PERFORMANCE type, or `None` for an instance of a type that has no credit
+    /// option — which is reported [`CPU_CREDITS_STANDARD`]
+    /// ([`crate::state::instance_cpu_credits`]).
+    ///
+    /// Resolved ONCE, by the launch
+    /// ([`ComAmazonawsEc2Amazonec2State::launched_cpu_credits`]): the launch's own
+    /// `CreditSpecification` where it named one, and the account's default for the type's
+    /// family in the Region otherwise, because "instances launch using the default credit
+    /// option" (`ModifyDefaultCreditSpecification`). Held as a `&'static str` so only one of
+    /// the documented options ([`CPU_CREDITS_VALUES`]) can reach an instance, never a
+    /// request's own text — and held on the instance rather than re-read per request, so a
+    /// later modify of the family's default leaves a running instance where it was.
+    pub cpu_credits: Option<&'static str>,
 }
 
 /// One stored reservation: the unit of state one `RunInstances` call creates.

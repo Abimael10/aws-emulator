@@ -954,6 +954,10 @@ mod default_network;
 // `GetDefaultCreditSpecification`.
 #[path = "all/default_credit_specification.rs"]
 mod default_credit_specification;
+// The credit option for CPU usage ONE instance runs under: what a launch resolves it to and
+// what `DescribeInstanceCreditSpecifications` reports, selects, pages and refuses.
+#[path = "all/instance_credit_specifications.rs"]
+mod instance_credit_specifications;
 #[path = "all/default_network_per_region.rs"]
 mod default_network_per_region;
 // What `DeleteCarrierGateway` removes from the carrier gateway store, what it reports back,
