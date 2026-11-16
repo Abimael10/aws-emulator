@@ -10,7 +10,9 @@
 //! * the ARN is derived from a NORMALIZED form of the name
 //!   (`crate::state::normalized_name`), and that normalized name must be unique in the
 //!   Region — a second create under it is `ResourceAlreadyExistsException`;
-//! * a target Region may appear at most once in `distributions`;
+//! * each entry of `distributions` must name a target Region this service can distribute
+//!   through and must name its output AMI per build, and a target Region may appear at most
+//!   once in the list;
 //! * `clientToken` is an idempotency token: a retry carrying it answers with the ORIGINAL
 //!   response, and the same token carrying different creation parameters is
 //!   `IdempotentParameterMismatchException`;
@@ -114,6 +116,8 @@
 //!   details.
 //! * `InvalidRequestException` (HTTP 400) — The request is malformed or otherwise invalid.
 //!   Verify the request and try again.
+//! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): "The value that you provided for the specified parameter is invalid."
 //! * `ResourceAlreadyExistsException` (HTTP 400) — The resource that you are trying to create
 //!   already exists.
 //! * `ResourceInUseException` (HTTP 400) — The resource that you are trying to operate on is
@@ -140,7 +144,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `CreateDistributionConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#CreateDistributionConfiguration")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE models
+// that shape (a client error, `@httpError` 400 — "The value that you provided for the
+// specified parameter is invalid.") and other operations declare it, while this operation's
+// own error list does not. It is the one class this service refuses a parameter of a request
+// with (`crate::service::parameter_refusal`), including the requirements on `distributions`
+// the model cannot state.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#CreateDistributionConfiguration",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum CreateDistributionConfigurationErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -149,6 +163,7 @@ pub enum CreateDistributionConfigurationErrorModeled {
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidParameterCombinationException(InvalidParameterCombinationException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceInUseException(ResourceInUseException),
@@ -219,6 +234,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Two requirements of a distribution entry live in the model's prose rather than in
+        // a constraint, so the walk cannot refuse them: the entry has to name a target
+        // Region this service can distribute through, and the output AMI it names has to be
+        // named per build ([`crate::state::refused_distribution_entry`]). Each is a value of
+        // ONE member of ONE entry, so both are read per ENTRY, before the list is read as a
+        // set. A target that offers no AMI distribution refuses the entry's AMI settings
+        // TOGETHER with the Region they would apply in — a combination of parameters this
+        // operation does not accept — while a name that does not name each build is that
+        // one member's own value.
+        if let Some(refused) = crate::state::refused_distribution_entry(&input.distributions) {
+            let message = Some(refused.message());
+            return Err(match refused.why {
+                crate::state::RefusedEntryRequirement::UnreachableTarget(_) => {
+                    CreateDistributionConfigurationErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException { message },
+                    )
+                }
+                crate::state::RefusedEntryRequirement::AmiNameWithoutBuildDate => {
+                    CreateDistributionConfigurationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException { message },
+                    )
+                }
+            }
+            .into());
+        }
 
         // `distributions`' own rule: "Each entry defines how output images are distributed
         // in one target Amazon Web Services Region. A Region can appear at most once in the

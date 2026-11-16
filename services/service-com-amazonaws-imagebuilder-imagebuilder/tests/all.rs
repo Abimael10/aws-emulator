@@ -31,8 +31,12 @@ mod component_policy_lifecycle;
 mod container_recipe;
 #[path = "all/dependency_refusal_wording.rs"]
 mod dependency_refusal_wording;
+#[path = "all/distribution_ami_names.rs"]
+mod distribution_ami_names;
 #[path = "all/distribution_configuration.rs"]
 mod distribution_configuration;
+#[path = "all/distribution_target_regions.rs"]
+mod distribution_target_regions;
 #[path = "all/error_response_envelope.rs"]
 mod error_response_envelope;
 #[path = "all/image_creation.rs"]

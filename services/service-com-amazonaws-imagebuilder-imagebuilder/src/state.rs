@@ -174,6 +174,16 @@ mod image;
 mod managed_image;
 pub use managed_image::*;
 
+/// Which target Regions a distribution configuration may name, and how a target this service
+/// cannot distribute through is worded.
+mod distribution_targets;
+pub use distribution_targets::*;
+
+/// What one entry of a distribution configuration has to satisfy, and how an entry this
+/// service cannot accept is refused.
+mod distribution_entries;
+pub use distribution_entries::*;
+
 use crate::ops::types::{
     AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
     ComponentConfiguration, ComponentParameterDetail,
