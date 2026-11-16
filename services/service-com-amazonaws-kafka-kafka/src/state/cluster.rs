@@ -53,8 +53,8 @@ impl Cluster {
             .collect();
 
         Self {
-            // The first version of a cluster is revision 1; each applied update
-            // generates the next one.
+            // The first version of a cluster is revision 1; each update the service
+            // accepts generates the next one.
             current_version: current_version_token(&arn, 1),
             arn,
             name: input.cluster_name,
@@ -328,17 +328,10 @@ impl Cluster {
                 // which records a time of its own (a broker node joining the
                 // cluster) carries.
                 let applied_at = update.due;
-                // Read before the change is consumed: whether this operation
-                // generates a new cluster version is the change's own property.
-                let generates_new_version = update.change.generates_new_version();
                 self.apply_change(update.change, applied_at);
-                // "When this update operation is successful, it generates a new
-                // cluster version" (`CurrentVersion` on every update request),
-                // so the version token follows the new revision.
-                if generates_new_version {
-                    self.revision += 1;
-                    self.current_version = current_version_token(&self.arn, self.revision);
-                }
+                // The version this change generated was minted when the service
+                // ACCEPTED it ([`Self::begin_operation`]), so nothing about the
+                // version moves here: what lands is the configuration.
                 self.state = CLUSTER_STATE_ACTIVE.to_string();
             }
             // Due but no longer this cluster's business: dropped, changing
@@ -713,9 +706,19 @@ impl Cluster {
     /// that produces none ([`ClusterChange::generates_new_version`]) — from the
     /// cluster's own reboot ordinal, so no two operations of one cluster can share
     /// an ARN.
+    ///
+    /// A change that produces a revision GENERATES ITS VERSION HERE: "A successful
+    /// operation will then generate a new version" is what every update request's
+    /// `CurrentVersion` documents, and the operation succeeds when the service
+    /// accepts it — so the version a caller must quote for the NEXT change is the
+    /// one this call mints, and the version this change was accepted from is spent
+    /// the moment it is. What the completion then lands
+    /// ([`Self::apply_change`]) is the configuration, not the version.
     pub(super) fn begin_operation(&mut self, now: SystemTime, change: ClusterChange) -> String {
         let operation_arn = if change.generates_new_version() {
-            self.operation_arn(self.revision + 1)
+            self.revision += 1;
+            self.current_version = current_version_token(&self.arn, self.revision);
+            self.operation_arn(self.revision)
         } else {
             self.reboots += 1;
             self.reboot_operation_arn(self.reboots)

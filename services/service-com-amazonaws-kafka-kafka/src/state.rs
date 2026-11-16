@@ -609,6 +609,17 @@ pub const TOPIC_STATE_UPDATING: &str = "UPDATING";
 /// The state of a topic whose deletion has been accepted but not completed.
 pub const TOPIC_STATE_DELETING: &str = "DELETING";
 
+/// The message Amazon MSK answers a `CreateTopic` for a name the cluster already
+/// holds.
+///
+/// A CONSTANT of the service, not built from the request: it names neither the
+/// cluster nor the topic — the cluster is the one the request addressed and the
+/// name is the one it submitted, so neither is echoed back — and the code
+/// (`TopicExistsException`) is what tells a caller WHICH condition it is. One
+/// wording, so idempotent-create logic that branches on it says one thing about
+/// one condition.
+pub const TOPIC_ALREADY_EXISTS_MESSAGE: &str = "Topic already exists.";
+
 /// How long after `CreateChannel` a new channel becomes `ACTIVE`.
 ///
 /// CHOSEN, not documented: the real service takes a while to stand a channel's
@@ -1140,7 +1151,8 @@ pub struct Cluster {
     pub cluster_type: String,
     pub kafka_version: String,
     /// The `CurrentVersion` token an update call must quote, derived from
-    /// [`Self::revision`] so it changes exactly when the cluster does.
+    /// [`Self::revision`] so it changes exactly when a change the service ACCEPTS
+    /// generates the next one ([`Cluster::begin_operation`]).
     pub current_version: String,
     pub creation_time: SystemTime,
     /// The instant the clock owes this cluster its `CREATING` -> `ACTIVE`
@@ -1183,9 +1195,12 @@ pub struct Cluster {
     /// readers, so it is stored here rather than rendered by `ClusterInfo`,
     /// which models no member for it.
     pub zookeeper_access_enabled: bool,
-    /// Which revision of its configuration the cluster is at.
-    /// [`Cluster::current_version`] is this number's token, so the version
-    /// changes exactly when a completed update changes the cluster.
+    /// Which revision of its configuration the cluster is accepting changes FROM.
+    /// [`Cluster::current_version`] is this number's token, and both advance when
+    /// the service ACCEPTS a change that generates a new version, so the version a
+    /// caller must quote for the next change is the one the accepted call produced
+    /// — while the configuration that change carries lands when the clock owes its
+    /// completion.
     pub revision: u64,
     /// The update this cluster has in flight, if any: the one cluster operation
     /// acting on it, and the change the clock owes it. `Some` is exactly what
@@ -2446,6 +2461,18 @@ fn anchored_topic_pattern(pattern: &str) -> String {
     format!("^(?:{pattern})$")
 }
 
+/// The message Amazon MSK answers a topic-selection pattern that is not a
+/// regular expression at all: fixed text whose one variable part is the pattern
+/// the request submitted, quoted in it, so a caller is told WHICH of the patterns
+/// it sent cannot be compiled.
+///
+/// Built here, from one place, so `CreateReplicator` and `UpdateReplicationInfo`
+/// word one condition one way. The regex crate's own parse detail is deliberately
+/// not reported: the message is the service's, not its compiler's.
+pub fn invalid_regex_message(pattern: &str) -> String {
+    format!("The regex \"{pattern}\" is invalid.")
+}
+
 /// Why `pattern` cannot be used to select topics, or `None` when it compiles.
 ///
 /// The one rule a flow's patterns are admitted by, so `CreateReplicator` and
@@ -2465,7 +2492,7 @@ pub fn topic_pattern_error(pattern: &str) -> Option<String> {
     }
     ::regex::Regex::new(&anchored_topic_pattern(pattern))
         .err()
-        .map(|_| format!("'{pattern}' is not a valid regular expression."))
+        .map(|_| invalid_regex_message(pattern))
 }
 
 /// Why a replication flow's topic-selection pattern lists cannot be stored:
@@ -4108,7 +4135,7 @@ fn uuid_v4_shaped_from_digest(digest: &[u8; 32]) -> String {
 
 /// An MSK `CurrentVersion` token: `K` followed by 13 upper-case alphanumerics,
 /// the form the real service's cluster version takes. It is a function of the
-/// cluster ARN and its revision, so it changes exactly when the cluster does.
+/// resource's ARN and its revision, so it changes exactly when that revision does.
 fn current_version_token(arn: &str, revision: u64) -> String {
     let digest = stable_digest(&format!("{arn}#{revision}"));
     let mut token = String::with_capacity(CURRENT_VERSION_TOKEN_LEN);

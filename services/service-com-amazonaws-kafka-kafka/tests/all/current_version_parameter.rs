@@ -311,9 +311,10 @@ async fn a_token_the_cluster_is_not_at_is_the_stale_version_refusal() {
 
 /// RULE: the parameter refusal pre-empts every refusal about the cluster itself —
 /// the KIND of cluster the request addresses (a serverless cluster, which has no
-/// brokers of its own) and the STATE it is in (a cluster with a change already in
-/// flight) are both answered only for a request whose version this service can
-/// read at all.
+/// brokers of its own), the STATE it is in (a cluster still being provisioned)
+/// and the version it will accept its next change from (a cluster that has
+/// already SPENT its version on a change it accepted) are each answered only for
+/// a request whose version this service can read at all.
 #[tokio::test]
 async fn the_parameter_refusal_pre_empts_the_refusals_about_the_cluster() {
     let emulator = Emulator::new();
@@ -363,12 +364,39 @@ async fn the_parameter_refusal_pre_empts_the_refusals_about_the_cluster() {
         readable.body
     );
 
-    // And over the STATE gate: a cluster with a change in flight is not in a
-    // state a further change is accepted from, but a version this service cannot
-    // read is answered on the request instead.
+    // And over the refusals the cluster's own record decides. A cluster still
+    // being provisioned is in no state a change is accepted from, and one whose
+    // accepted change is still in flight has SPENT the version that change was
+    // accepted from — accepting it generated the cluster's next version — so a
+    // caller quoting the spent one again is told its version is not current. Either
+    // way a version this service cannot read at all is answered on the request
+    // instead.
     let arn = emulator
         .create_ok(&ClusterRequest::named("version-parameter-state"))
         .await;
+    let creating_version = emulator
+        .describe(&arn)
+        .await
+        .at("/clusterInfo/currentVersion")
+        .as_str()
+        .unwrap_or_else(|| panic!("case creating: the cluster reported no currentVersion"))
+        .to_string();
+    let rebalancing = format!("/v1/clusters/{}/rebalancing", pct(&arn));
+    let rebalance = |version: &str| {
+        json!({
+            "currentVersion": version,
+            "rebalancing": { "status": "PAUSED" }
+        })
+    };
+    let unreadable = emulator
+        .call("PUT", &rebalancing, Some(rebalance("1")))
+        .await;
+    assert_refused(&unreadable, "creating/a bare digit", BAD_REQUEST_MESSAGE, "1");
+    let readable = emulator
+        .call("PUT", &rebalancing, Some(rebalance(&creating_version)))
+        .await;
+    assert_cluster_state_refusal(&readable, "creating/the cluster's own version");
+
     let version = poll_until_active(&emulator, &arn, "version parameter state").await;
     let accepted = emulator
         .call(
@@ -382,28 +410,17 @@ async fn the_parameter_refusal_pre_empts_the_refusals_about_the_cluster() {
         "expected the update quoting the cluster's own version to be accepted, got {} {}",
         accepted.status, accepted.body
     );
-    // While that operation is in flight the cluster accepts no further change.
-    let in_flight = format!("/v1/clusters/{}/rebalancing", pct(&arn));
     let unreadable = emulator
-        .call(
-            "PUT",
-            &in_flight,
-            Some(json!({
-                "currentVersion": "1",
-                "rebalancing": { "status": "PAUSED" }
-            })),
-        )
+        .call("PUT", &rebalancing, Some(rebalance("1")))
         .await;
     assert_refused(&unreadable, "updating/a bare digit", BAD_REQUEST_MESSAGE, "1");
     let readable = emulator
-        .call(
-            "PUT",
-            &in_flight,
-            Some(json!({
-                "currentVersion": version,
-                "rebalancing": { "status": "PAUSED" }
-            })),
-        )
+        .call("PUT", &rebalancing, Some(rebalance(&version)))
         .await;
-    assert_cluster_state_refusal(&readable, "updating/the cluster's own version");
+    assert_refused(
+        &readable,
+        "updating/the version the accepted update spent",
+        CLUSTER_VERSION_NOT_CURRENT_MESSAGE,
+        &version,
+    );
 }

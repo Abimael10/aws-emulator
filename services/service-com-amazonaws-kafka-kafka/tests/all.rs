@@ -47,6 +47,8 @@ mod clock_owed_cluster_values;
 mod cluster_arn_refusal;
 #[path = "all/cluster_authorization.rs"]
 mod cluster_authorization;
+#[path = "all/cluster_change_version_precondition.rs"]
+mod cluster_change_version_precondition;
 #[path = "all/cluster_configuration_update.rs"]
 mod cluster_configuration_update;
 #[path = "all/cluster_delete_state_guard.rs"]
@@ -137,6 +139,8 @@ mod placement_subnet_resolution;
 mod rebalancing_update;
 #[path = "all/reference_only_replicator.rs"]
 mod reference_only_replicator;
+#[path = "all/refusal_sentences_carry_no_request_values.rs"]
+mod refusal_sentences_carry_no_request_values;
 #[path = "all/refusal_text_fidelity.rs"]
 mod refusal_text_fidelity;
 #[path = "all/refusal_wording.rs"]

@@ -318,10 +318,12 @@ async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
             "case {case}: the Kafka version must not change before the operation lands, got {}",
             rolling.at("/clusterInfo/currentBrokerSoftwareInfo/kafkaVersion")
         );
-        assert_eq!(
+        // The cluster VERSION, by contrast, has already moved: the accepted
+        // update generated it, which is what a further change must quote.
+        assert_ne!(
             rolling.at("/clusterInfo/currentVersion").as_str(),
             Some(version.as_str()),
-            "case {case}: the version must not change before the operation lands, got {}",
+            "case {case}: an accepted update generates the cluster's next version, got {}",
             rolling.at("/clusterInfo/currentVersion")
         );
 

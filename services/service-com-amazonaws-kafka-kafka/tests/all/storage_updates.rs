@@ -307,10 +307,10 @@ async fn an_accepted_storage_update_lands_on_the_cluster() {
             row.name,
             during.body
         );
-        assert_eq!(
+        assert_ne!(
             during.at("/clusterInfo/currentVersion"),
             &version_before,
-            "case {}: the version must not move before the change lands, got {}",
+            "case {}: an accepted update generates the cluster's next version, got {}",
             row.name,
             during.body
         );

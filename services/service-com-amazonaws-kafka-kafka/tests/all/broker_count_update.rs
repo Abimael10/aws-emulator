@@ -269,10 +269,15 @@ async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
             nodes_before,
             "case {case}: the nodes must not change before the operation lands"
         );
-        assert_eq!(
+        // The VERSION, by contrast, has already moved: "A successful operation
+        // will then generate a new version" is what `CurrentVersion` documents,
+        // and the operation succeeded when the service accepted it — so the
+        // version a caller must quote for the next change is the one this call
+        // generated, while the configuration is still the old one.
+        assert_ne!(
             rolling.at("/clusterInfo/currentVersion").as_str(),
             Some(version.as_str()),
-            "case {case}: the version must not change before the operation lands, got {}",
+            "case {case}: an accepted update generates the cluster's next version, got {}",
             rolling.at("/clusterInfo/currentVersion")
         );
 

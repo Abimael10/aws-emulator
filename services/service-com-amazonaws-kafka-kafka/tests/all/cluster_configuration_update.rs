@@ -206,21 +206,22 @@ async fn an_update_lands_the_named_revision_once_the_clock_owes_it() {
         );
 
         // Still rolling: the operation is the cluster's active one and nothing it
-        // will change has changed yet.
+        // will change has changed yet — except the VERSION, which the accepted
+        // update generated, so it is already the one a further change must quote.
         let rolling = emulator.describe(&arn).await;
         assert_eq!(
             (
                 rolling.at("/clusterInfo/state").as_str(),
                 rolling.at("/clusterInfo/activeOperationArn").as_str(),
-                rolling.at("/clusterInfo/currentVersion").as_str(),
             ),
-            (
-                Some("UPDATING"),
-                Some(operation_arn.as_str()),
-                Some(version.as_str()),
-            ),
-            "case {case}: expected the cluster to read UPDATING on the new operation at its old \
-             version, got {}",
+            (Some("UPDATING"), Some(operation_arn.as_str())),
+            "case {case}: expected the cluster to read UPDATING on the new operation, got {}",
+            rolling.body
+        );
+        assert_ne!(
+            rolling.at("/clusterInfo/currentVersion").as_str(),
+            Some(version.as_str()),
+            "case {case}: an accepted update generates the cluster's next version, got {}",
             rolling.body
         );
         assert_eq!(

@@ -211,10 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Copied out of the record: the checks below are followed by a write, so
-        // the borrow of the registry has to end here.
-        let cluster_state = cluster.state.clone();
-        let current_version = cluster.current_version.clone();
+        // Copied out of the record: the write below ends the borrow of the registry,
+        // so the values the checks in between need are taken here.
         let kafka_version = cluster.kafka_version.clone();
         let is_serverless = cluster.is_serverless();
 
@@ -245,28 +243,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A cluster takes one change at a time, and one that is still being
-        // provisioned, deleted or updated has no settled configuration to update
-        // from. Answered through the gate every update of this service shares, in
-        // the one sentence the service words that condition in.
-        if !crate::state::state_gate::cluster_accepts_change(&cluster_state) {
+        // A cluster takes one change at a time, and the version the caller is
+        // updating FROM is what decides which of the two refusals that implies: a
+        // version an accepted change has already spent is answered as a stale
+        // version, and only a call quoting the version the cluster will accept its
+        // next change from is answered on the state it is in. Both through the one
+        // precondition every update of this service shares.
+        if let Some(refusal) =
+            crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster)
+        {
             return Err(
-                UpdateClusterKafkaVersionErrorModeled::BadRequestException(
-                    crate::state::state_gate::cluster_not_in_accepted_state(),
-                )
-                .into(),
-            );
-        }
-
-        // The version is the one the caller is updating FROM, so a stale one
-        // means the caller has not seen the cluster's current configuration.
-        if input.current_version != current_version {
-            return Err(
-                UpdateClusterKafkaVersionErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some(crate::state::CURRENT_VERSION_MEMBER.to_string()),
-                    message: Some(crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string()),
-                })
-                .into(),
+                UpdateClusterKafkaVersionErrorModeled::BadRequestException(refusal).into(),
             );
         }
 

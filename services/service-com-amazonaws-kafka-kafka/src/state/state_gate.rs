@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The state precondition a call that CHANGES a resource of this service applies,
-//! and the one sentence Amazon MSK refuses such a call with when the resource is
-//! not in a state that call is accepted from.
+//! The preconditions a call that CHANGES a resource of this service applies —
+//! the version it is accepted FROM and the state it is accepted IN — and the one
+//! sentence Amazon MSK refuses such a call with when the resource is not in a
+//! state that call is accepted from.
 //!
 //! The service answers that condition with ONE fixed sentence, which names the set
 //! of states the call IS accepted from and nothing else — not the state the
@@ -49,6 +50,52 @@ pub fn cluster_not_in_accepted_state() -> BadRequestException {
 /// The member a cluster-scoped refusal names as the parameter at fault, as the
 /// model spells it on this service's cluster requests.
 pub const CLUSTER_ARN_PARAMETER: &str = "ClusterArn";
+
+/// The refusal a call that CHANGES a cluster answers when the version it quotes
+/// is not the one the cluster will accept its next change from: a
+/// `BadRequestException` (HTTP 400) carrying the service's one stale-version
+/// sentence ([`CLUSTER_VERSION_NOT_CURRENT_MESSAGE`]) and naming the member the
+/// version travelled in.
+///
+/// It tells the caller something different from the state gate above: read the
+/// cluster's version again and retry with THAT, rather than retry this same
+/// request once the cluster has settled. Built here beside the gate, because the
+/// two conditions are decided together ([`cluster_change_refusal`]).
+pub fn cluster_version_not_current() -> BadRequestException {
+    BadRequestException {
+        invalid_parameter: Some(CURRENT_VERSION_MEMBER.to_string()),
+        message: Some(CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string()),
+    }
+}
+
+/// Why `cluster` does not accept the change a caller quoting `submitted_version`
+/// asks for, or `None` when it does.
+///
+/// The two preconditions every such call applies, in the order the service
+/// applies them: the version the caller is updating FROM is settled FIRST, so a
+/// caller holding a version the cluster has moved past is told to read the
+/// version again ([`cluster_version_not_current`]) rather than to wait — which is
+/// what two callers racing from one version are told, since accepting the
+/// winner's change generates the cluster's next version and leaves the loser
+/// quoting a version the cluster is no longer at. Only a call quoting the version
+/// the cluster IS at is answered on the state it is in
+/// ([`cluster_not_in_accepted_state`]), which is the answer a caller that re-read
+/// the cluster gets while its change rolls out.
+///
+/// One decision, so the two refusals of one condition cannot be ordered one way
+/// by one update operation and the other way by the next.
+pub fn cluster_change_refusal(
+    submitted_version: &str,
+    cluster: &Cluster,
+) -> Option<BadRequestException> {
+    if submitted_version != cluster.current_version {
+        return Some(cluster_version_not_current());
+    }
+    if !cluster_accepts_change(&cluster.state) {
+        return Some(cluster_not_in_accepted_state());
+    }
+    None
+}
 
 /// The one sentence that refusal carries: fixed text around the set of states the
 /// call is accepted from, in the spelling the state enum declares, and nothing

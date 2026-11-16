@@ -315,7 +315,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             topic_name: Some(topic.name.clone()),
             status: Some(topic.state.clone()),
         };
-        let topic_name = topic.name.clone();
         // The registry enforces its own ceiling and its own uniqueness on the one
         // insertion path, so a refused create registers nothing. It is also what
         // materialises a removal the clock already owed this name, so a name whose
@@ -325,10 +324,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TopicRejected::DuplicateName => {
                     CreateTopicErrorModeled::TopicExistsException(TopicExistsException {
                         invalid_parameter: Some("TopicName".to_string()),
-                        message: Some(format!(
-                            "The cluster {} already has a topic named '{topic_name}'.",
-                            input.cluster_arn
-                        )),
+                        // The service's one fixed sentence for this condition:
+                        // the name the request submitted and the cluster it
+                        // addressed are the caller's own, so neither is echoed
+                        // back in the message.
+                        message: Some(crate::state::TOPIC_ALREADY_EXISTS_MESSAGE.to_string()),
                     })
                     .into()
                 }

@@ -246,8 +246,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Copied out of the record: the checks below are followed by a write, so
         // the borrow of the registry has to end here.
-        let cluster_state = cluster.state.clone();
-        let current_version = cluster.current_version.clone();
         let current_volume_size = cluster.volume_size_gb();
 
         // Only now are the VALUES the entry carries judged: the cluster the URI
@@ -305,24 +303,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A cluster reconfigures one change at a time, and one that is still being
-        // provisioned, deleted or updated has no settled configuration to update
-        // from. Answered through the gate every update of this service shares, in
-        // the one sentence the service words that condition in.
-        if !crate::state::state_gate::cluster_accepts_change(&cluster_state) {
-            return Err(UpdateBrokerStorageErrorModeled::BadRequestException(
-                crate::state::state_gate::cluster_not_in_accepted_state(),
-            )
-            .into());
-        }
-        // The optimistic-concurrency check: the version the caller updates from must
-        // be the one the cluster is actually at, so a stale version means the caller
-        // has not seen the cluster's latest state.
-        if input.current_version != current_version {
-            return Err(bad_request(
-                crate::state::CURRENT_VERSION_MEMBER,
-                crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string(),
-            ));
+        // A cluster reconfigures one change at a time, and the version the caller
+        // is updating FROM is what decides which of the two refusals that implies:
+        // a version an accepted change has already spent is answered as a stale
+        // version, and only a call quoting the version the cluster will accept its
+        // next change from is answered on the state it is in. Both through the one
+        // precondition every update of this service shares.
+        if let Some(refusal) =
+            crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster)
+        {
+            return Err(UpdateBrokerStorageErrorModeled::BadRequestException(refusal).into());
         }
         // Amazon MSK documents that broker storage can only be expanded — "you can
         // only increase storage, you cannot decrease it" (Amazon MSK Developer

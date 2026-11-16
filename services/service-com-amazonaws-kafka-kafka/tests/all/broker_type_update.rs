@@ -212,10 +212,13 @@ async fn an_update_lands_on_the_cluster_once_the_clock_owes_it() {
             "case {case}: the instance type must not change before the operation lands, got {}",
             rolling.at("/clusterInfo/brokerNodeGroupInfo/instanceType")
         );
-        assert_eq!(
+        // The VERSION, by contrast, has already moved: the accepted update
+        // generated the cluster's next version, which is what a further change
+        // must quote, while the configuration is still the old one.
+        assert_ne!(
             rolling.at("/clusterInfo/currentVersion").as_str(),
             Some(version.as_str()),
-            "case {case}: the version must not change before the operation lands, got {}",
+            "case {case}: an accepted update generates the cluster's next version, got {}",
             rolling.at("/clusterInfo/currentVersion")
         );
 

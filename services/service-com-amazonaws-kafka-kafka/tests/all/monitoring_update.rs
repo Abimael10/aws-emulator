@@ -463,10 +463,10 @@ async fn a_monitoring_update_lands_once_the_clock_makes_it_due() {
             case.name(),
             member(&mid, "/activeOperationArn")
         );
-        assert_eq!(
+        assert_ne!(
             member(&mid, "/currentVersion"),
             json!(version.clone()),
-            "case {}: an in-flight update must not change the cluster version, got {}",
+            "case {}: an accepted update generates the cluster's next version, got {}",
             case.name(),
             member(&mid, "/currentVersion")
         );

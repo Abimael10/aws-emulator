@@ -28,8 +28,7 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    assert_cluster_state_refusal, pct, sleep_past_activation, sleep_past_update, Emulator, Reply,
-    ACCOUNT, REGION,
+    pct, sleep_past_activation, sleep_past_update, Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// The message Amazon MSK answers a request for a resource it does not hold with,
@@ -37,6 +36,13 @@ use crate::kafka_harness::{
 /// that the implementation's own constant is propagated. Note the typographic
 /// apostrophe (U+2019), which is what the service sends.
 const NOT_FOUND_MESSAGE: &str = "The requested resource doesn’t exist.";
+
+/// The message Amazon MSK answers a call quoting a version the cluster will not
+/// accept its next change from, spelled out here for the same reason as the
+/// sentence above: fixed text end to end, carrying neither the quoted version nor
+/// the cluster's own, with the typographic apostrophe the service sends.
+const VERSION_NOT_CURRENT_MESSAGE: &str =
+    "The version of the cluster isn\u{2019}t current. Check the current version and try again.";
 
 /// Where a cluster's effective EBS volume size is reported, in the `ClusterInfo`
 /// `DescribeCluster` answers with.
@@ -270,10 +276,13 @@ async fn a_storage_update_is_applied_when_its_operation_comes_due() {
                 "case {case}: the volume size must not change before the operation is due, got {}",
                 pending.body
             );
-            assert_eq!(
+            // The VERSION, by contrast, has already moved: the accepted update
+            // generated the cluster's next version, which is what the next
+            // change must quote, while the configuration is still the old one.
+            assert_ne!(
                 pending.at("/clusterInfo/currentVersion").as_str(),
                 Some(version_before.as_str()),
-                "case {case}: the version must not change before the operation is due, got {}",
+                "case {case}: an accepted update generates the cluster's next version, got {}",
                 pending.body
             );
         }
@@ -707,34 +716,37 @@ async fn a_cluster_that_is_not_active_takes_no_storage_update() {
         );
     }
 
-    // And a second update while the first is still in flight.
+    // And a second update quoting the version the first one SPENT.
     let arn = create_active(&emulator, "already-updating", 3, Some(100)).await;
     let version = current_version(&emulator, &arn).await;
     let first = update(&emulator, &arn, &version, json!([target("ALL", Some(200), None)])).await;
-    let started = Instant::now();
     assert_eq!(
         first.status, 200,
         "expected the first update to be accepted, got {} {}",
         first.status, first.body
     );
     let second = update(&emulator, &arn, &version, json!([target("ALL", Some(300), None)])).await;
-    // Refused either way, and for a reason that is this rule: while the first
-    // operation is pending the cluster is UPDATING, and once it has completed the
-    // cluster is at a NEW version, so the version this call quotes is spent. Never
-    // a success — two updates from one version are never both accepted.
+    // Refused on the VERSION whichever side of the span it lands on, so this needs
+    // no clock: accepting the first update spent the version it was accepted from
+    // and generated the cluster's next one, which this call does not quote — never a
+    // success, since two updates from one version are never both accepted.
     assert_eq!(
-        (second.status, second.error_code()),
-        (400, "BadRequestException"),
-        "expected a 400 BadRequestException for a second update from the same version, got {} {}",
+        (
+            second.status,
+            second.error_code(),
+            second.error_message(),
+            second.at("/invalidParameter").as_str(),
+        ),
+        (
+            400,
+            "BadRequestException",
+            VERSION_NOT_CURRENT_MESSAGE,
+            Some("currentVersion"),
+        ),
+        "expected the stale-version refusal for a second update from the same version, got {} {}",
         second.status,
         second.body
     );
-    if started.elapsed() < CLUSTER_UPDATE_DELAY {
-        // While the first operation is still in flight the cluster is UPDATING, so
-        // the refusal is the state one: the service words it in the one sentence
-        // that names the states a change IS accepted from.
-        assert_cluster_state_refusal(&second, "second update while the first is in flight");
-    }
 
     // The update that WAS accepted still lands, unaffected by the refused one.
     sleep_past_update();
@@ -846,16 +858,22 @@ async fn an_owed_change_lands_exactly_at_its_due_instant() {
             (
                 cluster.state.as_str(),
                 cluster.volume_size_gb(),
-                cluster.current_version.as_str(),
                 cluster.to_cluster_info().active_operation_arn.as_deref()
             ),
             (
                 CLUSTER_STATE_UPDATING,
                 Some(100),
-                version_before.1.as_str(),
                 Some(operation_arn.as_str())
             ),
-            "case now={before:?}: nothing the readers report may change before the change is due"
+            "case now={before:?}: nothing the readers report of the CONFIGURATION may change \
+             before the change is due"
+        );
+        // The version is the exception, and not because this reader looked: the
+        // accepted update generated it, so it is already the cluster's at the
+        // call's own instant.
+        assert_ne!(
+            cluster.current_version, version_before.1,
+            "case now={before:?}: an accepted update generates the cluster's next version"
         );
     }
     for at_or_after in [due, due + Duration::from_secs(3_600)] {

@@ -209,22 +209,28 @@ async fn an_accepted_update_applies_the_submitted_status_when_it_falls_due() {
             .to_string();
 
         // While the operation is in flight the cluster is UPDATING at its OLD
-        // status and version, with this operation as its active one.
+        // status, with this operation as its active one — and at the NEW version
+        // the accepted update generated, which is what a further change must
+        // quote.
         let during = described(&emulator, &case.created.name, &arn).await;
         assert_eq!(
             (
                 member(&during, "/state"),
-                member(&during, "/currentVersion"),
                 member(&during, "/activeOperationArn"),
                 member(&during, "/rebalancing/status"),
             ),
             (
                 json!("UPDATING"),
-                json!(version),
                 json!(operation_arn),
                 case.created_status.map_or(Value::Null, |status| json!(status)),
             ),
-            "case {}: expected an UPDATING cluster at its old status and version, got {during}",
+            "case {}: expected an UPDATING cluster at its old status, got {during}",
+            case.created.name
+        );
+        assert_ne!(
+            member(&during, "/currentVersion"),
+            json!(version),
+            "case {}: an accepted update generates the cluster's next version, got {during}",
             case.created.name
         );
 

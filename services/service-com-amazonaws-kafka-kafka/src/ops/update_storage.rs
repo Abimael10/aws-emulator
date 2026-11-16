@@ -205,10 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Copied out of the record: the checks below are followed by a write, so
-        // the borrow of the registry has to end here.
-        let cluster_state = cluster.state.clone();
-        let current_version = cluster.current_version.clone();
+        // Copied out of the record: the write below ends the borrow of the registry,
+        // so the values the checks in between need are taken here.
         let current_volume_size = cluster.volume_size_gb();
 
         // A `CurrentVersion` is a token the SERVICE mints and the caller quotes
@@ -237,31 +235,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A cluster takes one change at a time, and one that is still being
-        // provisioned, deleted or updated has no settled configuration to update
-        // from. Answered through the gate every update of this service shares, in
-        // the one sentence the service words that condition in.
-        if !crate::state::state_gate::cluster_accepts_change(&cluster_state) {
-            return Err(
-                UpdateStorageErrorModeled::BadRequestException(
-                    crate::state::state_gate::cluster_not_in_accepted_state(),
-                )
-                .into(),
-            );
-        }
-
-        // The version is the one the caller is updating FROM, so a stale one
-        // means the caller has not seen the cluster's current configuration.
-        // Answered in the service's one sentence for that condition, which names
-        // no version: the caller reads the current one back from the cluster.
-        if input.current_version != current_version {
-            return Err(
-                UpdateStorageErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some(crate::state::CURRENT_VERSION_MEMBER.to_string()),
-                    message: Some(crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+        // A cluster takes one change at a time, and the version the caller is
+        // updating FROM is what decides which of the two refusals that implies:
+        // a version the cluster has already spent on a change it accepted is
+        // answered as a stale version, and only a call quoting the version the
+        // cluster will accept its next change from is answered on the state it
+        // is in. Both through the one precondition every update of this service
+        // shares.
+        if let Some(refusal) =
+            crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster)
+        {
+            return Err(UpdateStorageErrorModeled::BadRequestException(refusal).into());
         }
 
         let change = crate::state::StorageChange {

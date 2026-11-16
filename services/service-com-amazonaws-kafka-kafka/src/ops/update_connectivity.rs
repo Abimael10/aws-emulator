@@ -276,31 +276,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // A cluster reconfigures one change at a time, and one that is still being
-        // provisioned, deleted or updated has no settled configuration to update.
-        // Answered through the gate every update of this service shares, in the one
-        // sentence the service words that condition in.
-        if !crate::state::state_gate::cluster_accepts_change(&cluster.state) {
-            return Err(
-                UpdateConnectivityErrorModeled::BadRequestException(
-                    crate::state::state_gate::cluster_not_in_accepted_state(),
-                )
-                .into(),
-            );
-        }
-
-        // The submitted version must be the one the cluster is actually at; a
-        // stale one means the caller has not seen the cluster's latest state.
-        // Worded as `DeleteCluster` words the same check, so the service says one
-        // thing about one condition.
-        if input.current_version != cluster.current_version {
-            return Err(
-                UpdateConnectivityErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some(crate::state::CURRENT_VERSION_MEMBER.to_string()),
-                    message: Some(crate::state::CLUSTER_VERSION_NOT_CURRENT_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+        // A cluster reconfigures one change at a time, and the version the caller
+        // is updating FROM is what decides which of the two refusals that implies:
+        // a version an accepted change has already spent is answered as a stale
+        // version, and only a call quoting the version the cluster will accept its
+        // next change from is answered on the state it is in. Both through the one
+        // precondition every update of this service shares.
+        if let Some(refusal) =
+            crate::state::state_gate::cluster_change_refusal(&input.current_version, cluster)
+        {
+            return Err(UpdateConnectivityErrorModeled::BadRequestException(refusal).into());
         }
 
         // The registry starts the operation: it records what changes, moves the
