@@ -92,22 +92,42 @@ pub fn deliver_invocation_logs_to<Eng: Send + Sync + 'static>(
     runtime_logging::install(engine, config.and_then(invocation_log_delivery))
 }
 
-/// The DESTINATION a stored logging configuration is, as the inference plane delivers to
-/// it, or `None` for a configuration that names no object destination at all.
+/// The DESTINATIONS a stored logging configuration names, as the inference plane delivers
+/// to them, or `None` for a configuration that names no destination at all.
 ///
-/// Only `loggingConfig.s3Config` is an object destination for the records themselves;
-/// `cloudWatchConfig.largeDataDeliveryS3Config` is where a CloudWatch Logs destination
-/// spills a record too large for a log event, which is that destination's business rather
-/// than a place the records are delivered.
+/// Both are projected, because a configuration can name either or both and each one it
+/// names receives the records: `loggingConfig.s3Config`, the object destination, and
+/// `loggingConfig.cloudWatchConfig`, the log group the records are put in as log events.
+/// `cloudWatchConfig.largeDataDeliveryS3Config` is neither — it is where a CloudWatch Logs
+/// destination spills a record too large for a log event, which is that destination's
+/// business rather than a place the records are delivered.
 ///
 /// All three per-datatype switches are projected because the configuration carries all
 /// three; which of them the delivered records are gated on is the inference plane's own
 /// business ([`runtime_logging`]).
 fn invocation_log_delivery(config: &LoggingConfig) -> Option<runtime_logging::InvocationLogDelivery> {
-    let s3_config = config.s3_config.as_ref()?;
+    let object_destination =
+        config
+            .s3_config
+            .as_ref()
+            .map(|s3_config| runtime_logging::ObjectDestination {
+                bucket: s3_config.bucket_name.clone(),
+                key_prefix: s3_config.key_prefix.clone(),
+            });
+    let log_group_destination =
+        config
+            .cloud_watch_config
+            .as_ref()
+            .map(|destination| runtime_logging::LogGroupDestination {
+                log_group: destination.log_group_name.clone(),
+                role_arn: destination.role_arn.clone(),
+            });
+    if object_destination.is_none() && log_group_destination.is_none() {
+        return None;
+    }
     Some(runtime_logging::InvocationLogDelivery {
-        bucket: s3_config.bucket_name.clone(),
-        key_prefix: s3_config.key_prefix.clone(),
+        object_destination,
+        log_group_destination,
         text_data_delivery_enabled: config
             .text_data_delivery_enabled
             .unwrap_or(DELIVERY_ENABLED_BY_DEFAULT),

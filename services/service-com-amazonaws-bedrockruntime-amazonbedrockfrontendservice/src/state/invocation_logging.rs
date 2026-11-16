@@ -8,12 +8,19 @@
 //! Model invocation logging is configured in the Bedrock CONTROL plane
 //! (`PutModelInvocationLoggingConfiguration`), and the whole point of it is that
 //! the records show up where the configuration pointed them: while a
-//! configuration naming an object destination is in force, EVERY invocation this
-//! data plane serves writes a record under that destination's prefix, and the
+//! configuration is in force, EVERY invocation this data plane serves writes one
+//! record to EVERY destination that configuration names, and the
 //! record carries what the call did — which model was invoked, by which
 //! operation, the bodies the call carried, and the token counts the API reported
 //! inline. Removing the configuration stops the records: an invocation served
 //! after the delete writes nothing.
+//!
+//! A configuration names its destinations independently — `s3Config`, the object
+//! destination, and `cloudWatchConfig`, the log group — so a record goes to each
+//! one the configuration carries, and the presence of one destination neither
+//! supplies nor suppresses the other: a configuration naming only the log group is
+//! as much a destination as one naming only the bucket, and one naming both gets
+//! the same record in each form.
 //!
 //! So "logging is configured" and "logging works" are two different observable
 //! states, which is what an audit pipeline, a prompt/completion review and a
@@ -32,14 +39,29 @@
 //!
 //! # What is written
 //!
-//! One object per served invocation, the form a reader of a bucket of vended
-//! logs fetches: gzipped newline-delimited JSON under the `AWSLogs` layout
+//! One RECORD per served invocation ([`record`]), in the form each destination is
+//! read in.
+//!
+//! Into an object destination: one object, the form a reader of a bucket of vended
+//! logs fetches — gzipped newline-delimited JSON under the `AWSLogs` layout
 //! ([`record_key`]), below whatever `keyPrefix` the configuration named. That is
 //! what the object IS rather than a transport encoding — a reader lists the
 //! prefix, fetches an object and decompresses it.
 //!
+//! Into a log group destination: one log event whose `message` is that same record
+//! as a JSON document, put in the stream [`LOG_STREAM_NAME`] of the configured
+//! group through the one vended-logs write this tree delivers log events with
+//! ([`::service_common::cloudwatch_logs::delivered_into_held_group`]) — so the
+//! record is in the very store `FilterLogEvents` and `GetLogEvents` read, and a
+//! metric or subscription filter over that group sees it. The group is the
+//! ACCOUNT's, created by whoever owns it and resolved by the control plane before
+//! the configuration was admitted, so the delivery writes into the group
+//! CloudWatch Logs already holds and creates none: a group deleted after the
+//! configuration was installed loses the records rather than being brought back
+//! underneath its owner.
+//!
 //! It is the same vended-logs FORM that `::service_common::trail_log_files`
-//! delivers a trail's events in, and a different layout: a record here is one
+//! delivers a trail's events in, and a different layout: an object here holds one
 //! INVOCATION rather than a batch under a `Records` envelope, it is partitioned by
 //! the hour rather than by the day, and the lines are newline-delimited documents
 //! rather than one JSON array. The two therefore state their own layouts, and
@@ -59,16 +81,16 @@
 //! # Best effort
 //!
 //! Delivery happens after the inference has been served, so nothing about the
-//! answer the caller gets back depends on it: an emulator with no object store
-//! mounted, a bucket the account has since deleted and a write the object store
-//! refuses lose the record and are traced, exactly as every other vended-logs
-//! delivery in this tree is. The object store's guard is taken with NO guard of
-//! this service held.
+//! answer the caller gets back depends on it: an emulator with no object store or
+//! no CloudWatch Logs mounted, a bucket or log group the account has since deleted
+//! and a write the owning service refuses lose the record and are traced, exactly
+//! as every other vended-logs delivery in this tree is. The object store's guard is
+//! taken, and the log event written, with NO guard of this service held.
 //!
 //! One record is bounded by the one call it is of — the bodies it carries are the
 //! request this service already bounded ([`super::context_window`]) and the answer
 //! it served, so a record cannot be larger than the call that produced it — and the
-//! object store's own ceilings refuse a write past what it holds, which is what
+//! owning store's own ceilings refuse a write past what it holds, which is what
 //! bounds a long-running emulator's accumulated records.
 
 use ::std::io::Write;
@@ -103,6 +125,12 @@ const GZIP_MEDIA_TYPE: &str = "application/x-gzip";
 /// record's own `modelId` instead.
 const MODEL_ID_MEMBER: &str = "modelId";
 
+/// The log stream of the configured log group that model invocation log events
+/// are put in: Amazon Bedrock writes the records of a CloudWatch Logs destination
+/// into the one `aws/bedrock/modelinvocations` stream of the group the
+/// configuration named, so every invocation's event is read back from one place.
+pub const LOG_STREAM_NAME: &str = "aws/bedrock/modelinvocations";
+
 /// `operation` — the API operation a record was written for. One constant per
 /// inference surface, so the four surfaces cannot spell the same operation two
 /// ways.
@@ -116,16 +144,19 @@ pub const OPERATION_INVOKE_MODEL_WITH_RESPONSE_STREAM: &str = "InvokeModelWithRe
 ///
 /// This is the DESTINATION rather than the stored configuration: the control
 /// plane keeps the configuration its own `Get` echoes back, and what the
-/// inference path needs is the bucket to write into, the prefix to write under
-/// and which data the configuration allows to travel.
+/// inference path needs is where each record goes and which data the
+/// configuration allows to travel.
+///
+/// A configuration can name either destination or both, and each one it names is
+/// delivered to independently (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InvocationLogDelivery {
-    /// `s3Config.bucketName` — the bucket the records are written into.
-    pub bucket: String,
-    /// `s3Config.keyPrefix` — what the whole layout is written under, or `None`
-    /// for a configuration that named none (the records then land at the
-    /// bucket's root).
-    pub key_prefix: Option<String>,
+    /// `s3Config` — the bucket the records are written into as objects, or `None`
+    /// for a configuration that named no object destination.
+    pub object_destination: Option<ObjectDestination>,
+    /// `cloudWatchConfig` — the log group the records are put in as log events,
+    /// or `None` for a configuration that named no log group destination.
+    pub log_group_destination: Option<LogGroupDestination>,
     /// `textDataDeliveryEnabled` — whether the prompt and completion bodies
     /// travel in the record.
     pub text_data_delivery_enabled: bool,
@@ -136,6 +167,34 @@ pub struct InvocationLogDelivery {
     /// `embeddingDataDeliveryEnabled`, as the configuration carried it. Nothing
     /// is gated on it, for the reason above.
     pub embedding_data_delivery_enabled: bool,
+}
+
+/// The OBJECT destination a configuration names (`S3Config`): where a record is
+/// written as a vended-log object.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObjectDestination {
+    /// `s3Config.bucketName` — the bucket the records are written into.
+    pub bucket: String,
+    /// `s3Config.keyPrefix` — what the whole layout is written under, or `None`
+    /// for a configuration that named none (the records then land at the
+    /// bucket's root).
+    pub key_prefix: Option<String>,
+}
+
+/// The LOG GROUP destination a configuration names (`CloudWatchConfig`): where a
+/// record is put as a log event.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogGroupDestination {
+    /// `cloudWatchConfig.logGroupName` — the group the log events are put in.
+    pub log_group: String,
+    /// `cloudWatchConfig.roleArn` — the role Amazon Bedrock writes the events
+    /// under, as the admitted configuration named it. Whether that role may be
+    /// passed, and whether the pair it describes resolves at all, is settled by
+    /// the control plane before the destination is installed, so the delivery
+    /// carries the value rather than deciding on it a second time: nothing in
+    /// this crate reads it, and a reader must not take it for a permission this
+    /// plane enforces.
+    pub role_arn: String,
 }
 
 /// Put `delivery` in force for this account's invocations, or withdraw whatever
@@ -390,15 +449,23 @@ fn gzipped(records: &[::serde_json::Value]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-/// Deliver `invocation`'s record to the destination this account configured, if it
-/// configured one.
+/// Deliver `invocation`'s record to EVERY destination this account configured, if
+/// it configured any.
 ///
 /// Nothing at all happens while no configuration is in force, which is what makes
-/// an account that enabled logging distinguishable from one that did not. The
-/// record is framed and written with NO guard of this service's store held, and a
-/// write the object store refuses is traced rather than failing the call that was
-/// already served (see the module docs).
-pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, invocation: &LoggedInvocation) {
+/// an account that enabled logging distinguishable from one that did not. ONE
+/// record is composed for the call and then delivered in each destination's own
+/// form — an object for the bucket, a log event for the log group — so the two
+/// readings of one invocation cannot differ.
+///
+/// The record is composed, framed and written with NO guard of this service's
+/// store held, and a write a destination's own service refuses is traced rather
+/// than failing the call that was already served (see the module docs).
+pub async fn deliver<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    invocation: &LoggedInvocation,
+) {
     let Some(state) = super::service_state(engine) else {
         return;
     };
@@ -412,16 +479,33 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, invocation: &LoggedInvo
     // for why it is not the id the response reported.
     let request_id = ::service_common::query_error_envelope::new_request_id();
     let record = record(&delivery, invocation, &request_id);
+    if let Some(destination) = delivery.object_destination.as_ref() {
+        deliver_object(engine, destination, invocation, &record, &request_id);
+    }
+    if let Some(destination) = delivery.log_group_destination.as_ref() {
+        deliver_log_event(ctx, destination, invocation, &record).await;
+    }
+}
+
+/// Write one invocation's `record` into the object destination, as the vended-log
+/// object that destination's reader fetches ([`record_key`]).
+fn deliver_object<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    destination: &ObjectDestination,
+    invocation: &LoggedInvocation,
+    record: &::serde_json::Value,
+    request_id: &str,
+) {
     let key = record_key(
-        delivery.key_prefix.as_deref(),
+        destination.key_prefix.as_deref(),
         ::engine::emulator_account_id(),
         &invocation.region,
         invocation.at_millis,
-        &request_id,
+        request_id,
     );
-    let Some(body) = gzipped(&[record]) else {
+    let Some(body) = gzipped(::std::slice::from_ref(record)) else {
         ::tracing::warn!(
-            bucket = ?delivery.bucket,
+            bucket = ?destination.bucket,
             key = ?key,
             "an invocation's log record could not be framed, so no object was delivered"
         );
@@ -429,7 +513,7 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, invocation: &LoggedInvo
     };
     let Some(store) = s3::state::service_state(engine) else {
         ::tracing::warn!(
-            bucket = ?delivery.bucket,
+            bucket = ?destination.bucket,
             "no Amazon S3 is mounted beside this service, so an invocation's log record could \
              not be delivered"
         );
@@ -438,16 +522,48 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, invocation: &LoggedInvo
     let object = s3::state::Object::stored(body, Some(GZIP_MEDIA_TYPE.to_string()));
     let written = {
         let mut objects = store.lock();
-        objects.put_object(&delivery.bucket, &key, object)
+        objects.put_object(&destination.bucket, &key, object)
     };
     match written {
         Some(s3::state::ObjectWrite::Created | s3::state::ObjectWrite::Replaced) => {}
         refused => ::tracing::warn!(
-            bucket = ?delivery.bucket,
+            bucket = ?destination.bucket,
             key = ?key,
             outcome = ?refused,
             "an invocation's log record could not be written to this emulator's Amazon S3"
         ),
+    }
+}
+
+/// Put one invocation's `record` in the log group destination, as the one log event
+/// a reader of that group filters for.
+///
+/// The event's `message` is the record as a JSON document, written in the stream
+/// [`LOG_STREAM_NAME`] of the group the configuration named, through the one
+/// vended-logs write this tree puts log events with — into the group CloudWatch
+/// Logs already holds, creating none. Call it with no state guard held: it awaits
+/// the write.
+async fn deliver_log_event(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    destination: &LogGroupDestination,
+    invocation: &LoggedInvocation,
+    record: &::serde_json::Value,
+) {
+    let message = record.to_string();
+    let written = ::service_common::cloudwatch_logs::delivered_into_held_group(
+        ctx,
+        &invocation.region,
+        &destination.log_group,
+        LOG_STREAM_NAME,
+        ::std::slice::from_ref(&message),
+    )
+    .await;
+    if !written {
+        ::tracing::warn!(
+            log_group = ?destination.log_group,
+            "the log group this account's invocation logging names did not take an invocation's \
+             log event"
+        );
     }
 }
 
@@ -467,8 +583,11 @@ mod tests {
     /// A destination with text data delivery on, under `key_prefix`.
     fn delivery(key_prefix: Option<&str>) -> InvocationLogDelivery {
         InvocationLogDelivery {
-            bucket: "audit".to_string(),
-            key_prefix: key_prefix.map(str::to_string),
+            object_destination: Some(ObjectDestination {
+                bucket: "audit".to_string(),
+                key_prefix: key_prefix.map(str::to_string),
+            }),
+            log_group_destination: None,
             text_data_delivery_enabled: true,
             image_data_delivery_enabled: true,
             embedding_data_delivery_enabled: true,

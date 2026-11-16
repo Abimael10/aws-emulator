@@ -40,7 +40,12 @@ const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The bucket every destination below delivers into.
-const BUCKET: &str = "bedrock-invocation-logs";
+///
+/// `pub(crate)` with the two helpers over it, so the sibling suite about the
+/// CloudWatch Logs destination ([`crate::model_invocation_log_cloud_watch_delivery`])
+/// reads an object destination through this one reader rather than growing a second
+/// copy of it.
+pub(crate) const BUCKET: &str = "bedrock-invocation-logs";
 
 /// A model both Converse surfaces and both invoke surfaces serve.
 const MODEL: &str = "amazon.nova-lite-v1:0";
@@ -88,7 +93,7 @@ async fn s3_call(router: &MultiServiceRouter, method: &str, path: &str) -> Call 
 
 /// `PUT /<bucket>` — the destination bucket a caller creates before configuring
 /// logging into it.
-async fn given_bucket(router: &MultiServiceRouter, case: &str) {
+pub(crate) async fn given_bucket(router: &MultiServiceRouter, case: &str) {
     let answer = s3_call(router, "PUT", &format!("/{BUCKET}")).await;
     assert_eq!(
         answer.status, 200,
@@ -100,7 +105,11 @@ async fn given_bucket(router: &MultiServiceRouter, case: &str) {
 
 /// Every key the destination bucket holds under `prefix`, as `ListObjectsV2`
 /// reports them.
-async fn delivered_keys(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
+pub(crate) async fn delivered_keys(
+    router: &MultiServiceRouter,
+    case: &str,
+    prefix: &str,
+) -> Vec<String> {
     let answer = s3_call(
         router,
         "GET",
@@ -179,8 +188,11 @@ fn given_logging(
         logging::install(
             &**engine,
             Some(logging::InvocationLogDelivery {
-                bucket: BUCKET.to_string(),
-                key_prefix: key_prefix.map(str::to_string),
+                object_destination: Some(logging::ObjectDestination {
+                    bucket: BUCKET.to_string(),
+                    key_prefix: key_prefix.map(str::to_string),
+                }),
+                log_group_destination: None,
                 text_data_delivery_enabled,
                 image_data_delivery_enabled: true,
                 embedding_data_delivery_enabled: true,

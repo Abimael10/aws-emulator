@@ -10722,6 +10722,7 @@ dependencies = [
  "rustrict",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-comprehend-comprehend-20171127",
  "service-com-amazonaws-s3-amazons3",
  "service-common",

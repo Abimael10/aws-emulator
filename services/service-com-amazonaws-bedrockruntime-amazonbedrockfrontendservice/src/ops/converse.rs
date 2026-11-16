@@ -470,6 +470,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // report inline (see `crate::state::invocation_logging`).
         crate::state::invocation_logging::deliver(
             &*self.engine,
+            ctx,
             &crate::state::invocation_logging::LoggedInvocation {
                 operation: crate::state::invocation_logging::OPERATION_CONVERSE,
                 model_id: model.model_id.clone(),
@@ -487,7 +488,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 output_tokens: turn.output_tokens,
                 at_millis: logged.at_millis,
             },
-        );
+        )
+        .await;
         // The duration this call reports inline, measured over serving the turn.
         let latency_ms = crate::state::latency_ms(started.elapsed());
         // The token volume and the latency this call reports inline are also its

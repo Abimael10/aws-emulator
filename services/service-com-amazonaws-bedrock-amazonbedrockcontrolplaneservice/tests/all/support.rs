@@ -598,6 +598,37 @@ pub fn emulator_with_logs_and_iam() -> Emulator {
     Emulator { router, engine }
 }
 
+/// The same emulator with the Bedrock Runtime DATA plane, CloudWatch Logs and IAM mounted
+/// beside this control plane on the one shared engine, exactly as `core/router` assembles
+/// them.
+///
+/// The form a suite drives when its rule spans the WHOLE path of a model invocation logging
+/// configuration whose destination is a log group: the put resolves the group and the role
+/// against the services that own them, the inference that follows is served by the data
+/// plane, and the record it delivers is read back out of CloudWatch Logs' own store — so one
+/// emulator carries the configuration, the invocation and the log event it produced.
+pub fn emulator_with_inference_logs_and_iam() -> Emulator {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = smithy_server_runtime::MultiServiceRouter::new();
+    router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        ::service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(
+        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    Emulator { router, engine }
+}
+
 /// The same emulator with AWS KMS mounted beside this control plane on the one shared
 /// engine, exactly as `core/router` assembles them.
 ///

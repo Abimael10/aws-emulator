@@ -98,6 +98,12 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The CloudWatch Logs emulator the invocation-logging suite reads a delivered log
+# event back through (`tests/all/model_invocation_log_cloud_watch_delivery.rs`): the
+# event is asserted where a client polls for it, `FilterLogEvents` over the group the
+# configuration named, with that service mounted on the same shared engine the
+# assembled emulator runs it on.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [lints]
 workspace = true

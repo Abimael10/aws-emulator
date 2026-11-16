@@ -9,6 +9,34 @@
 // `tests/all/`, sorted by name, and no other line.
 //
 // Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
+// place its name sorts to. That list holds those pairs and nothing else: no prose between
+// them, no blank line, and nothing at all after the last one. Two branches landing at once
+// then insert two lines in two places and have no prose to duplicate, re-word or mistype,
+// which is what had gone wrong here — this header and the tail of the list had each grown
+// hundreds of re-typed copies of these paragraphs, and no suite of this target ran.
+//
+// What a suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's OWN module header, where it is read beside the test it explains. A
+// note about THIS file belongs in `all/appended_header_notes.rs`, `all/appended_notes.rs`,
+// `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which keep what earlier landings
+// had appended here and are declared below like any other file.
+//
+// EVERY comment in this file is an ordinary `//` one, this header included. A doc comment of
+// the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
+// copy left among or below the declarations compiles no suite of this target at all; with
+// none anywhere in the file, no appended, re-typed or merged copy of one of these lines can
+// be one. A suite file no declaration names is compiled nowhere and its tests never run, a
+// second declaration of one name compiles neither copy, and a suite left at the top level of
+// `tests/` fails the build. This file is a test-target CRATE ROOT, so a bare `mod` would
+// resolve to a sibling of it under `tests/`, which the layout check refuses: the `#[path]`
+// above each declaration is what points it into `tests/all/`. Some of the files declared
+// below are shared harnesses or probes rather than suites, and each is declared for that
+// reason.
+//
+// The `all/all_rs_*.rs` suites, `all/declaration_roots_*.rs` and
+// `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+//
 // place its name sorts to. Past this block the file holds those pairs and nothing else: no
 // prose between them, no blank line, and nothing at all after the last of them — so two
 // branches landing at once insert two lines in two places and have nothing here to duplicate,

@@ -137,11 +137,14 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
     /// `Converse` and `ApplyGuardrail` await it.
     ///
     /// `region` is the Region the request was signed for, which is where this
-    /// account's invocation records are delivered from.
+    /// account's invocation records are delivered from, and `ctx` is the request's
+    /// own context, over which the invocation-logging stage reaches the log group a
+    /// CloudWatch Logs destination names.
     async fn respond(
         &self,
         protocol: &dyn ServerHttpProtocol,
         req: &Request,
+        ctx: &OperationContext<'_>,
         region: &str,
     ) -> Result<Response, ConverseStreamErrorModeled> {
         let started = std::time::Instant::now();
@@ -295,6 +298,7 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
         // (see `crate::state::invocation_logging`).
         crate::state::invocation_logging::deliver(
             &*self.engine,
+            ctx,
             &crate::state::invocation_logging::LoggedInvocation {
                 operation: crate::state::invocation_logging::OPERATION_CONVERSE_STREAM,
                 model_id: model.model_id.clone(),
@@ -312,7 +316,8 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
                 output_tokens: turn.output_tokens,
                 at_millis: logged.at_millis,
             },
-        );
+        )
+        .await;
         // The duration this call reports in its metadata event, measured over
         // serving the turn.
         let latency_ms = crate::state::latency_ms(started.elapsed());
@@ -466,7 +471,7 @@ impl<Eng: Send + Sync + 'static> service_common::event_stream::EventStreamOperat
         Box::pin(async move {
             let protocol = svc.definition().protocol();
             let response = match self
-                .respond(protocol, req, &crate::state::request_region(ctx.parts()))
+                .respond(protocol, req, ctx, &crate::state::request_region(ctx.parts()))
                 .await
             {
                 Ok(response) => response,

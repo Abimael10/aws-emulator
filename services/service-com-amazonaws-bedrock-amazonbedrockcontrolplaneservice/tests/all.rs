@@ -157,6 +157,8 @@ mod model_invocation_job_poll_interval;
 mod model_invocation_job_terminal_status;
 #[path = "all/model_invocation_jobs.rs"]
 mod model_invocation_jobs;
+#[path = "all/model_invocation_log_cloud_watch_destination_delivery.rs"]
+mod model_invocation_log_cloud_watch_destination_delivery;
 #[path = "all/model_invocation_logging.rs"]
 mod model_invocation_logging;
 #[path = "all/model_invocation_logging_destination_validation.rs"]

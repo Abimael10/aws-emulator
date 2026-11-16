@@ -67,6 +67,8 @@ mod inference_token_accounting;
 mod inline_guardrail_error_taxonomy;
 #[path = "all/invoke_model_malformed_body_refusal.rs"]
 mod invoke_model_malformed_body_refusal;
+#[path = "all/model_invocation_log_cloud_watch_delivery.rs"]
+mod model_invocation_log_cloud_watch_delivery;
 #[path = "all/model_invocation_log_delivery.rs"]
 mod model_invocation_log_delivery;
 #[path = "all/resource_reference_refusals.rs"]
