@@ -41,6 +41,7 @@ pub mod simulated_decisions;
 pub mod ssh_public_keys;
 pub mod statement_positions;
 pub mod trust_policy;
+pub mod trust_policy_identity_principals;
 pub mod trust_policy_principals;
 pub mod virtual_mfa_devices;
 mod managed_policy_catalog;
@@ -66,6 +67,7 @@ pub use role_templates::*;
 pub use ssh_public_keys::*;
 pub use statement_positions::*;
 pub use trust_policy::*;
+pub use trust_policy_identity_principals::*;
 pub use trust_policy_principals::*;
 pub use virtual_mfa_devices::*;
 

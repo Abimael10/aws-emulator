@@ -288,6 +288,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         )?;
 
+        // The IDENTITIES of this account the trust document names are RESOLVED against the
+        // account before anything is minted: an `AWS` principal naming an IAM user or role
+        // this account holds no record of names nobody, so the document would state a trust
+        // nothing could exercise. The rule is the shared one every writer of this member
+        // applies (`crate::state::unresolvable_identity_principal`), the sentence is IAM's
+        // own naming the rejected value as the request wrote it, and nothing is created.
+        if let Some(principal) = crate::state::unresolvable_identity_principal(
+            &store,
+            &input.assume_role_policy_document,
+        ) {
+            return Err(CreateRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::invalid_identity_principal(&principal)),
+                },
+            )
+            .into());
+        }
+
         // IAM entity names are unique within the account and "are not distinguished
         // by case", so the case-folded name is the identity: a second create under
         // any casing of a held name is a conflict rather than a second role.

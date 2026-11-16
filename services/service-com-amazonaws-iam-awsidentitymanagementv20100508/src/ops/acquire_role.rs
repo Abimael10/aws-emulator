@@ -504,6 +504,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The rendered document's ACCOUNT IDENTITIES are resolved against the account the same
+        // way every writer of this member resolves them
+        // (`crate::state::unresolvable_identity_principal`): a template whose principal comes
+        // from the request can name an IAM user or role this account holds no record of, and a
+        // role carrying such a trust policy could never be assumed by it.
+        if let Some(principal) = assume_role_policy_document
+            .as_deref()
+            .and_then(|document| crate::state::unresolvable_identity_principal(&store, document))
+        {
+            return Err(AcquireRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::invalid_identity_principal(&principal)),
+                },
+            )
+            .into());
+        }
 
         // "A list of inline policy templates that the service embeds in roles that you
         // create from this template": each one's name and document rendered, each document

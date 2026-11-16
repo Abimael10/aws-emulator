@@ -136,40 +136,59 @@ pub fn assumed_under_another_principal(principal: &str) -> Option<&'static str> 
 /// first.
 #[must_use]
 pub fn unassumable_service_principal(document: &str) -> Option<String> {
+    named_trust_policy_principals(document, SERVICE_PRINCIPAL_TYPE)
+        .into_iter()
+        .find(|named| assumed_under_another_principal(named).is_some())
+}
+
+/// Every principal the statements of `document` name under the principal type
+/// `principal_type` (one of `::service_common::iam_policy_principals::PRINCIPAL_TYPES`), in
+/// the order the document writes them.
+///
+/// The ONE walk of a trust document's principals, shared by every resolution of one — the
+/// service principals here and the account identities beside them
+/// ([`super::trust_policy_identity_principals`]) — so where in the document a name sits
+/// never changes whether it is resolved: every statement is read, both elements that name
+/// principals, and both forms a type's values take (one string or a list of them). A
+/// `document` that is no policy at all names nothing: that is the grammar's own clause
+/// ([`super::trust_policy_document_defect`]), which the operations read first.
+#[must_use]
+pub fn named_trust_policy_principals(document: &str, principal_type: &str) -> Vec<String> {
     let statements = match super::policy_statements(document) {
         Ok(::serde_json::Value::Array(entries)) => entries,
         Ok(single) => vec![single],
-        Err(_) => return None,
+        Err(_) => return Vec::new(),
     };
     statements
         .iter()
         .filter_map(::serde_json::Value::as_object)
-        .flat_map(named_service_principals)
-        .find(|named| assumed_under_another_principal(named).is_some())
+        .flat_map(|statement| named_principals(statement, principal_type))
+        .collect()
 }
 
-/// Every service principal ONE statement names, in the order it wrote them: the values under
-/// the service type of each element a statement names principals in
+/// Every principal of ONE type that ONE statement names, in the order it wrote them: the
+/// values under that type of each element a statement names principals in
 /// (`::service_common::iam_policy_principals::PRINCIPAL_STATEMENT_ELEMENTS`, the tree's one
 /// list of those elements).
-fn named_service_principals(
+fn named_principals(
     statement: &::serde_json::Map<String, ::serde_json::Value>,
+    principal_type: &str,
 ) -> Vec<String> {
     ::service_common::iam_policy_principals::PRINCIPAL_STATEMENT_ELEMENTS
         .into_iter()
         .filter_map(|element| statement.get(element))
         .filter_map(::serde_json::Value::as_object)
-        .filter_map(|types| types.get(SERVICE_PRINCIPAL_TYPE))
-        .flat_map(service_values)
+        .filter_map(|types| types.get(principal_type))
+        .flat_map(principal_values)
         .collect()
 }
 
 /// The values one principal type names: the policy language writes them as one string or as a
-/// list of them, and anything else names no service.
-fn service_values(named: &::serde_json::Value) -> Vec<String> {
+/// list of them, and anything else names no principal.
+fn principal_values(named: &::serde_json::Value) -> Vec<String> {
     match named {
         ::serde_json::Value::String(value) => vec![value.clone()],
-        ::serde_json::Value::Array(entries) => entries.iter().flat_map(service_values).collect(),
+        ::serde_json::Value::Array(entries) => entries.iter().flat_map(principal_values).collect(),
         _ => Vec::new(),
     }
 }
@@ -183,7 +202,23 @@ fn service_values(named: &::serde_json::Value) -> Vec<String> {
 /// written, so a caller that mis-typed a principal is told which name was refused.
 #[must_use]
 pub fn invalid_trust_policy_principal(principal: &str) -> String {
-    format!("Invalid principal in policy: \"{REPORTED_PRINCIPAL_TYPE}\":\"{principal}\"")
+    invalid_policy_principal(REPORTED_PRINCIPAL_TYPE, principal)
+}
+
+/// The sentence above for a value of ANY principal type: the fixed text `Invalid principal in
+/// policy: `, then the TYPE the rejected value sat under in upper case and the value itself,
+/// each in double quotes and separated by a colon.
+///
+/// One spelling for every principal IAM resolves nothing for, whatever its type, so the
+/// service-principal refusal here and the account-identity one beside it
+/// ([`super::trust_policy_identity_principals`]) cannot word the same refusal two ways. The
+/// one variable part stays the rejected value, as the request wrote it.
+#[must_use]
+pub fn invalid_policy_principal(principal_type: &str, principal: &str) -> String {
+    format!(
+        "Invalid principal in policy: \"{}\":\"{principal}\"",
+        principal_type.to_ascii_uppercase()
+    )
 }
 
 #[cfg(test)]

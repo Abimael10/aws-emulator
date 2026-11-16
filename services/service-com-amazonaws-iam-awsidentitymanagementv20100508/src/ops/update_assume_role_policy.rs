@@ -289,6 +289,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The IDENTITIES of this account the document names are resolved against the account
+        // the same way: an `AWS` principal naming an IAM user or role this account holds no
+        // record of names nobody, so the replacement would state a trust nothing could
+        // exercise. The rule is the shared one every writer of this member applies
+        // (`crate::state::unresolvable_identity_principal`), read against the store this
+        // request already holds, and a refused update leaves the document the role already
+        // held.
+        if let Some(principal) =
+            crate::state::unresolvable_identity_principal(&store, &input.policy_document)
+        {
+            return Err(
+                UpdateAssumeRolePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(crate::state::invalid_identity_principal(&principal)),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // "Updates the policy that grants an IAM entity permission to assume a role":
         // the document REPLACES the one the role held, and is stored as the plain JSON
         // text the request carried — the one form this crate holds every policy

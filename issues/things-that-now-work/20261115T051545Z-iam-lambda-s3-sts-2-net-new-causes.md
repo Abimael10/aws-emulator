@@ -1,12 +1,13 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: iam__lambda__s3__sts.assume-role-denied-when-trust-policy-omits-lambda-role iam__lambda__s3__sts.lambda-assumed-role-credential-reads-restricted-bucket
+Issue-Trace-Ids: iam__lambda__s3__sts.assume-role-denied-when-trust-policy-omits-lambda-role
 Issue-Key: iam__lambda__s3__sts.assume-role-denied-when-trust-policy-omits-lambda-role|run#23|AssertionError|assert ghost_code == _UNRESOLVED_PRINCIPAL, (
-Issue-Key: iam__lambda__s3__sts.lambda-assumed-role-credential-reads-restricted-bucket|run#15|AssertionError|assert payload["access_key_prefix"] == "ASIA", (
 Issue-Commit: 5bda3f4959ddaaecd7545612991d55d37567ef10
 
 # iam__lambda__s3__sts: 2 net-new causes — UpdateAssumeRolePolicy accepts a trust document naming an unresolvable role principal, and AssumeRole credentials vended inside a function are EMUL-class not ASIA
+
+> _Cause 1 (UpdateAssumeRolePolicy / CreateRole accepting a trust document whose `AWS` principal names an IAM role or user this account does not hold) is FIXED, and its key and trace are the ones this report now carries. Cause 2 (the `ASIA` access-key class) is NOT fixed: it cannot be served from a service crate, so it was split out with its own replay key into `issues/things-that-do-not-work/20261115T051545Z-sts-assumerole-inside-a-function-still-vends-an-emul-class-accesskeyid.md`, which carries the analysis and the core change it needs. Cause 2 below is kept for context; the split report, not this one, is its filing._
 
 > _Note: this issue was identified against the code base at commit `5bda3f4959ddaaecd7545612991d55d37567ef10`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
