@@ -626,9 +626,12 @@ async fn a_definition_this_service_cannot_render_is_refused() {
             "The parameter MetricWidget.annotations.horizontal.member.1.value is required.",
         ),
         (
+            // A node whose JSON TYPE is not the one the `metrics` structure requires there is
+            // named by its pointer and the type it must have instead
+            // (`metric_widget_structure_refusals`).
             "an entry that is not an array",
             json!({"MetricWidget": json!({"metrics": ["AWS/EC2"]}).to_string()}),
-            "The value \"AWS/EC2\" for parameter MetricWidget.metrics.member.1 is invalid.",
+            "MetricWidget/metrics/0 should be array",
         ),
         (
             "an image format no graph is rendered in",

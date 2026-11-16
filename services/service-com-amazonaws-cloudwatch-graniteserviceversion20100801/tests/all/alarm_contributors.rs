@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What `DescribeAlarmContributors` reports: "the current alarm contributors that are in `ALARM`
-//! state", read off the alarm this store holds rather than recorded beside it.
+//! What `DescribeAlarmContributors` answers, and for WHICH alarms it answers at all.
 //!
-//! The rule under test: an alarm's contributor is the time series the alarm evaluates, and it is
-//! reported exactly while the alarm's own state is `ALARM` — so an alarm of a kind that watches
-//! no time series of its own has no contributor whatever state it is in, and an alarm that is not
-//! in `ALARM` has none either.
+//! The rule under test: only an alarm whose configuration evaluates a query over several time
+//! series has contributors — "Each entry in the vector result represents an alarm contributor"
+//! (`AlarmPromQLCriteria$Query`), and a contributor "Represents an individual contributor to a
+//! multi-timeseries alarm" (`AlarmContributor`) — so a read of such an alarm reports the
+//! contributors that are in `ALARM`, a read of an alarm of any other form is refused for its
+//! TYPE, and a read of a name no alarm carries is refused for its absence. The two refusals are
+//! different classes and are answered as such.
 //!
-//! Every table row is a distinct input along what the rule generalises over (which kind of alarm,
-//! how many dimensions identify its series, which state the alarm is in, and how a requested name
-//! misses), so one recorded call is one row among many.
+//! Every table row is a distinct input along what the rule generalises over (the form the alarm's
+//! configuration identifies what it grades in, which kind of alarm it is, which state it is in,
+//! and how a requested name misses), so one recorded call is one row among many.
 
 use crate::harness::{
-    build_router, call, described_alarm, merged, metric_alarm_request, error_code, error_message,
+    build_router, call, described_alarm, error_code, error_message, merged, metric_alarm_request,
     ok, AlarmKind,
 };
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+/// How CloudWatch states that the alarm a request named has no contributors to report, as this
+/// suite expects it for `name`.
+fn not_multi_time_series(name: &str) -> String {
+    format!("Alarm {name} is not a multi time series alarm")
+}
 
 /// The contributors `DescribeAlarmContributors` reports for `name`, with the whole answer beside
 /// them so an assertion can name what it saw.
@@ -55,253 +63,6 @@ async fn force_state(router: &MultiServiceRouter, name: &str, state: &str) {
     .await;
 }
 
-#[tokio::test]
-async fn an_alarm_in_alarm_state_reports_the_series_that_contributes_to_it() {
-    let router = build_router();
-
-    // (case, the alarm's kind, its name, the dimensions identifying its series, how many
-    //  contributors it owes while it is in ALARM).
-    //
-    // A composite alarm's state comes from other alarms' states and a log alarm's from a
-    // scheduled query, so neither watches a time series of its own and neither owes a
-    // contributor; a metric alarm watches one series whatever dimensions identify it.
-    let cases: Vec<(&str, AlarmKind, &str, Value, usize)> = vec![
-        (
-            "a metric alarm on an undimensioned series",
-            AlarmKind::Metric,
-            "undimensioned-alarm",
-            json!([]),
-            1,
-        ),
-        (
-            "a metric alarm on a series with one dimension",
-            AlarmKind::Metric,
-            "one-dimension-alarm",
-            json!([{"Name": "InstanceId", "Value": "i-0123456789abcdef0"}]),
-            1,
-        ),
-        (
-            "a metric alarm on a series with three dimensions",
-            AlarmKind::Metric,
-            "three-dimension-alarm",
-            json!([
-                {"Name": "InstanceId", "Value": "i-0123456789abcdef0"},
-                {"Name": "AutoScalingGroupName", "Value": "web-asg"},
-                {"Name": "Stage", "Value": "prod"},
-            ]),
-            1,
-        ),
-        (
-            "a composite alarm, whose state comes from other alarms",
-            AlarmKind::Composite,
-            "composite-alarm",
-            json!([]),
-            0,
-        ),
-        (
-            "a log alarm, whose state comes from a scheduled query",
-            AlarmKind::Log,
-            "log-alarm",
-            json!([]),
-            0,
-        ),
-    ];
-
-    let mut ids: Vec<String> = vec![];
-    for (case, kind, name, dimensions, owed) in cases {
-        match kind {
-            AlarmKind::Metric => {
-                let request = merged(
-                    metric_alarm_request(name),
-                    &json!({"Dimensions": dimensions.clone()}),
-                );
-                ok(&router, "PutMetricAlarm", &request).await;
-            }
-            _ => kind.create(&router, name, None).await,
-        }
-
-        // Before anything puts the alarm in ALARM there is no contributor in ALARM state to
-        // report, whatever kind of alarm it is.
-        let (reported, answered) = contributors(&router, name).await;
-        assert!(
-            reported.is_empty(),
-            "case {case:?}: an alarm that is not in ALARM owes no contributor, got {answered}"
-        );
-
-        // A log alarm's state is not one `SetAlarmState` can force ("Temporarily sets the state
-        // of an alarm for testing purposes" refuses a name no metric or composite alarm carries),
-        // so that row stays in the state its write left it in — which is the state its own row
-        // asserts about.
-        let forceable = !matches!(kind, AlarmKind::Log);
-        if forceable {
-            force_state(&router, name, "ALARM").await;
-        }
-        let (reported, answered) = contributors(&router, name).await;
-        let owed = if forceable { owed } else { 0 };
-        assert_eq!(
-            reported.len(),
-            owed,
-            "case {case:?}: expected {owed} contributor(s), got {answered}"
-        );
-        assert!(
-            answered.get("NextToken").is_none(),
-            "case {case:?}: every contributor of the alarm is in this page, so no token is owed, \
-             got {answered}"
-        );
-
-        if let Some(contributor) = reported.first() {
-            let alarm = described_alarm(&router, kind, name)
-                .await
-                .unwrap_or_default();
-            // The series is described by its own dimensions and by nothing this service made up.
-            let expected_attributes: Value = Value::Object(
-                dimensions
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|dimension| {
-                        Some((
-                            text(dimension, "Name")?,
-                            Value::from(text(dimension, "Value")?),
-                        ))
-                    })
-                    .collect(),
-            );
-            assert_eq!(
-                contributor.get("ContributorAttributes"),
-                Some(&expected_attributes),
-                "case {case:?}: expected the series' own dimensions {expected_attributes}, \
-                 got {contributor}"
-            );
-            // Why that series is in ALARM, and when it got there, is what the alarm itself
-            // reports: the series IS what the alarm evaluates.
-            assert_eq!(
-                (
-                    text(contributor, "StateReason"),
-                    contributor.get("StateTransitionedTimestamp"),
-                ),
-                (
-                    text(&alarm, "StateReason"),
-                    alarm.get("StateTransitionedTimestamp"),
-                ),
-                "case {case:?}: expected the alarm's own reason and transition instant, \
-                 got {contributor} beside {alarm}"
-            );
-            // The identifier fits the member's modelled 1..16 length and is stable across reads.
-            let id = text(contributor, "ContributorId").unwrap_or_default();
-            assert!(
-                (1..=16).contains(&id.chars().count()),
-                "case {case:?}: expected an id of 1 to 16 characters, got {id:?}"
-            );
-            let (again, _) = contributors(&router, name).await;
-            assert_eq!(
-                again.first().and_then(|entry| text(entry, "ContributorId")),
-                Some(id.clone()),
-                "case {case:?}: a contributor keeps its id across reads, got {again:?}"
-            );
-            ids.push(id);
-        }
-
-        // Back in OK, the alarm has no contributor in ALARM state again: the read reports the
-        // state the alarm is in now rather than one it was in.
-        if forceable {
-            force_state(&router, name, "OK").await;
-        }
-        let (reported, answered) = contributors(&router, name).await;
-        assert!(
-            reported.is_empty(),
-            "case {case:?}: an alarm that is not in ALARM owes no contributor, got {answered}"
-        );
-    }
-
-    // Two alarms' contributors are two contributors: the identifier distinguishes the series it
-    // names rather than being one fixed value.
-    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
-    assert_eq!(
-        distinct.len(),
-        ids.len(),
-        "the contributors of different alarms must carry different ids, got {ids:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_contributor_read_refuses_a_name_no_alarm_carries_and_a_token_it_did_not_issue() {
-    let router = build_router();
-    ok(&router, "PutMetricAlarm", &metric_alarm_request("present-alarm")).await;
-    ok(&router, "PutMetricAlarm", &metric_alarm_request("deleted-alarm")).await;
-    ok(
-        &router,
-        "DeleteAlarms",
-        &json!({"AlarmNames": ["deleted-alarm"]}),
-    )
-    .await;
-    force_state(&router, "present-alarm", "ALARM").await;
-
-    // Rows differ along HOW the requested name misses the alarms the store holds.
-    for (case, name) in [
-        ("a name nothing was created under", "absent-alarm"),
-        ("an alarm created and then deleted", "deleted-alarm"),
-        ("a stored name in another case", "PRESENT-ALARM"),
-        ("a stored name with a suffix", "present-alarm-2"),
-        ("a stored name with a prefix", "my-present-alarm"),
-    ] {
-        let (status, body) = call(
-            &router,
-            "DescribeAlarmContributors",
-            &json!({"AlarmName": name}),
-        )
-        .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected HTTP 404 ResourceNotFoundException, got {status} with {body}"
-        );
-        let got = error_message(&body);
-        assert_eq!(
-            got,
-            format!("No alarm for name {name} was found"),
-            "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
-        );
-    }
-
-    // No call of this operation issues a token, so every token a request can carry is one this
-    // service did not issue. Rows differ along the form of the token, and along whether the alarm
-    // the request names exists at all — the token is judged on either path.
-    for (case, name, token) in [
-        ("text that is no token", "present-alarm", "not-a-token"),
-        ("a token-looking hex string", "present-alarm", "6162636465"),
-        ("an empty token", "present-alarm", ""),
-        ("a token with a name no alarm carries", "absent-alarm", "not-a-token"),
-    ] {
-        let (status, body) = call(
-            &router,
-            "DescribeAlarmContributors",
-            &json!({"AlarmName": name, "NextToken": token}),
-        )
-        .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "InvalidNextToken"),
-            "case {case:?}: expected HTTP 400 InvalidNextToken, got {status} with {body}"
-        );
-        let got = error_message(&body);
-        assert_eq!(
-            got, "Invalid NextToken",
-            "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
-        );
-    }
-
-    // The refusals changed nothing: the alarm the store holds still reports its contributor.
-    let (reported, answered) = contributors(&router, "present-alarm").await;
-    assert_eq!(
-        reported.len(),
-        1,
-        "case \"after the refusals\": the alarm in ALARM must still report its contributor, \
-         got {answered}"
-    );
-}
-
 /// The members that replace the single-metric form with the `Metrics` array `queries`.
 ///
 /// "If you use the Metrics parameter, you cannot include the Namespace, MetricName, Dimensions,
@@ -337,244 +98,331 @@ fn metric_query(id: &str, dimensions: &[(&str, &str)], returns_data: bool) -> Va
     })
 }
 
-/// The dimensions `dimensions` describe a contributor by: the attribute map a reported
-/// contributor must carry.
-fn attributes(dimensions: &[(&str, &str)]) -> Value {
-    Value::Object(
-        dimensions
-            .iter()
-            .map(|(name, value)| ((*name).to_string(), Value::from(*value)))
-            .collect(),
-    )
+/// The members that make an alarm one whose state comes from a QUERY over several series:
+/// "The PromQL query that the alarm evaluates. The query must return a result of vector type.
+/// Each entry in the vector result represents an alarm contributor."
+/// (`AlarmPromQLCriteria$Query`) — the one configuration of this model that names contributors.
+fn promql_patch(query: &str) -> Value {
+    json!({
+        "Namespace": null,
+        "MetricName": null,
+        "Statistic": null,
+        "Period": null,
+        "EvaluationPeriods": null,
+        "Threshold": null,
+        "ComparisonOperator": null,
+        "EvaluationCriteria": {"PromQLCriteria": {"Query": query}},
+        "EvaluationInterval": 60,
+    })
 }
 
 #[tokio::test]
-async fn a_contributor_describes_the_series_the_alarm_grades_whichever_form_names_it() {
+async fn only_an_alarm_over_several_series_has_contributors_to_report() {
     let router = build_router();
 
-    // (case, the members merged over the static-threshold base request, the attributes the
-    //  contributor must be described by).
+    // (case, the alarm's kind, the members merged over the static-threshold base request,
+    //  whether the alarm has contributors to report).
     //
-    // Rows differ along the FORM the configuration identifies the graded series in — the alarm's
-    // own metric members, a `Metrics` array whose watched query is a metric, a `Metrics` array
-    // whose watched query is an expression computed from one, and a query of another language —
-    // and along how many dimensions that series carries.
-    let cases: Vec<(&str, Value, Value)> = vec![
+    // Rows differ along the FORM the configuration identifies what the alarm grades in — the
+    // alarm's own metric members, a `Metrics` array of a metric, a `Metrics` array computing an
+    // expression, a composite alarm's rule over other alarms, a log alarm's scheduled query, and
+    // a query over a vector of series — because that form is what decides whether the alarm has
+    // contributors at all.
+    let cases: Vec<(&str, AlarmKind, Value, bool)> = vec![
         (
-            "the alarm's own members, undimensioned",
+            "an alarm on the one metric its own members name",
+            AlarmKind::Metric,
             json!({}),
-            attributes(&[]),
+            false,
         ),
         (
-            "the alarm's own members, dimensioned",
-            json!({"Dimensions": [
-                {"Name": "Service", "Value": "api"},
-                {"Name": "Stage", "Value": "prod"},
-            ]}),
-            attributes(&[("Service", "api"), ("Stage", "prod")]),
+            "an alarm on one dimensioned metric",
+            AlarmKind::Metric,
+            json!({"Dimensions": [{"Name": "Service", "Value": "api"}]}),
+            false,
         ),
         (
-            "a query array whose watched query is an undimensioned metric",
-            metrics_patch(json!([metric_query("watched", &[], true)])),
-            attributes(&[]),
+            "an alarm on the one query of a `Metrics` array it watches",
+            AlarmKind::Metric,
+            metrics_patch(json!([metric_query("watched", &[("Service", "api")], true)])),
+            false,
         ),
         (
-            "a query array whose watched query is a dimensioned metric",
-            metrics_patch(json!([metric_query(
-                "watched",
-                &[("Service", "api"), ("Stage", "prod")],
-                true
-            )])),
-            attributes(&[("Service", "api"), ("Stage", "prod")]),
-        ),
-        (
-            "a query array whose watched query is an expression over a metric",
+            "an alarm on an expression computed from one metric",
+            AlarmKind::Metric,
             metrics_patch(json!([
                 metric_query("fed", &[("Service", "api")], false),
                 {"Id": "watched", "Expression": "fed * 2", "ReturnData": true},
             ])),
-            // The graded value is computed rather than stored, so it is no series of this store
-            // and carries no dimensions of its own.
-            attributes(&[]),
+            false,
         ),
         (
-            // "If this is an alarm based on an anomaly detection model, make this value match the
-            // ID of the ANOMALY_DETECTION_BAND function" (`PutMetricAlarmInput$ThresholdMetricId`)
-            // — the band is what the graded value is compared AGAINST, so the metric is still the
-            // series the alarm grades.
-            "a query array whose threshold is a band drawn from the watched metric",
-            merged(
-                metrics_patch(json!([
-                    metric_query("watched", &[("Service", "api")], true),
-                    {"Id": "band", "Expression": "ANOMALY_DETECTION_BAND(watched, 2)"},
-                ])),
-                &json!({
-                    "Threshold": null,
-                    "ThresholdMetricId": "band",
-                    "ComparisonOperator": "GreaterThanUpperThreshold",
-                }),
-            ),
-            attributes(&[("Service", "api")]),
+            "a composite alarm, whose state comes from other alarms",
+            AlarmKind::Composite,
+            json!({}),
+            false,
         ),
         (
-            // "The PromQL query that the alarm evaluates" (`AlarmPromQLCriteria$Query`): such an
-            // alarm names no metric of this store at all.
-            "a query of another language the alarm evaluates",
-            json!({
-                "Namespace": null,
-                "MetricName": null,
-                "Statistic": null,
-                "Period": null,
-                "EvaluationPeriods": null,
-                "Threshold": null,
-                "ComparisonOperator": null,
-                "EvaluationCriteria": {"PromQLCriteria": {"Query": "avg_over_time(latency[5m])"}},
-                "EvaluationInterval": 60,
-            }),
-            attributes(&[]),
+            "a log alarm, whose state comes from a scheduled query",
+            AlarmKind::Log,
+            json!({}),
+            false,
+        ),
+        (
+            "an alarm over a query whose result is a vector of series",
+            AlarmKind::Metric,
+            promql_patch("avg_over_time(latency[5m])"),
+            true,
         ),
     ];
 
-    for (index, (case, patch, expected)) in cases.iter().enumerate() {
-        let name = format!("graded-series-alarm-{index}");
+    for (index, (case, kind, patch, reports)) in cases.into_iter().enumerate() {
+        let name = format!("contributor-kind-{index}");
+        match kind {
+            AlarmKind::Metric => {
+                ok(
+                    &router,
+                    "PutMetricAlarm",
+                    &merged(metric_alarm_request(&name), &patch),
+                )
+                .await;
+            }
+            _ => kind.create(&router, &name, None).await,
+        }
+        // The alarm the row created IS there: whatever this read answers, it answers about an
+        // alarm this store holds.
+        assert!(
+            described_alarm(&router, kind, &name).await.is_some(),
+            "case {case:?}: the row's own alarm must exist before the read is judged"
+        );
+
+        let (status, body) = call(
+            &router,
+            "DescribeAlarmContributors",
+            &json!({"AlarmName": name}),
+        )
+        .await;
+        if reports {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: an alarm over several series is read, got {status} with {body}"
+            );
+            // Nothing has put a contributor of it into ALARM yet, so there is none to report.
+            assert_eq!(
+                body.get("AlarmContributors"),
+                Some(&json!([])),
+                "case {case:?}: no contributor is in ALARM yet, got {body}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected HTTP 400 for an alarm that is not of that kind, \
+                 got {status} with {body}"
+            );
+            let got = error_message(&body);
+            assert_eq!(
+                got,
+                not_multi_time_series(&name),
+                "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
+            );
+        }
+
+        // The refusal is about the alarm's TYPE, not about the state it happens to be in: a row
+        // whose alarm can be forced into ALARM is answered the same way there.
+        if !matches!(kind, AlarmKind::Log) {
+            force_state(&router, &name, "ALARM").await;
+            let (status, body) = call(
+                &router,
+                "DescribeAlarmContributors",
+                &json!({"AlarmName": name}),
+            )
+            .await;
+            let expected = if reports { 200 } else { 400 };
+            assert_eq!(
+                status, expected,
+                "case {case:?}: the answer must not depend on the alarm's state, \
+                 got {status} with {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_contributor_read_refuses_a_name_no_alarm_carries_and_a_token_it_did_not_issue() {
+    let router = build_router();
+    let present = "present-alarm";
+    ok(
+        &router,
+        "PutMetricAlarm",
+        &merged(
+            metric_alarm_request(present),
+            &promql_patch("sum by (host) (rate(errors[1m]))"),
+        ),
+    )
+    .await;
+    ok(&router, "PutMetricAlarm", &metric_alarm_request("deleted-alarm")).await;
+    ok(
+        &router,
+        "DeleteAlarms",
+        &json!({"AlarmNames": ["deleted-alarm"]}),
+    )
+    .await;
+    force_state(&router, present, "ALARM").await;
+
+    // Rows differ along HOW the requested name misses the alarms the store holds.
+    for (case, name) in [
+        ("a name nothing was created under", "absent-alarm"),
+        ("an alarm created and then deleted", "deleted-alarm"),
+        ("a stored name in another case", "PRESENT-ALARM"),
+        ("a stored name with a suffix", "present-alarm-2"),
+        ("a stored name with a prefix", "my-present-alarm"),
+    ] {
+        let (status, body) = call(
+            &router,
+            "DescribeAlarmContributors",
+            &json!({"AlarmName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected HTTP 404 ResourceNotFoundException, got {status} with {body}"
+        );
+        let got = error_message(&body);
+        assert_eq!(
+            got,
+            format!("No alarm for name {name} was found"),
+            "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
+        );
+    }
+
+    // No call of this operation issues a token, so every token a request can carry is one this
+    // service did not issue. Rows differ along the form of the token, and along whether the alarm
+    // the request names exists at all — the token is judged on either path.
+    for (case, name, token) in [
+        ("text that is no token", present, "not-a-token"),
+        ("a token-looking hex string", present, "6162636465"),
+        ("an empty token", present, ""),
+        ("a token with a name no alarm carries", "absent-alarm", "not-a-token"),
+    ] {
+        let (status, body) = call(
+            &router,
+            "DescribeAlarmContributors",
+            &json!({"AlarmName": name, "NextToken": token}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidNextToken"),
+            "case {case:?}: expected HTTP 400 InvalidNextToken, got {status} with {body}"
+        );
+        let got = error_message(&body);
+        assert_eq!(
+            got, "Invalid NextToken",
+            "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
+        );
+    }
+
+    // The refusals changed nothing: the alarm the store holds still reports its contributor.
+    let (reported, answered) = contributors(&router, present).await;
+    assert_eq!(
+        reported.len(),
+        1,
+        "case \"after the refusals\": the alarm in ALARM must still report its contributor, \
+         got {answered}"
+    );
+}
+
+#[tokio::test]
+async fn a_contributor_is_reported_while_it_is_in_alarm_and_keeps_its_identity() {
+    let router = build_router();
+
+    // Rows differ along the query the alarm evaluates, since that is what its contributors come
+    // from, and every row is read in each of the states the alarm can be put into.
+    let queries = [
+        ("a query grouping by one label", "sum by (host) (rate(errors[1m]))"),
+        ("a query over a window", "avg_over_time(latency[5m])"),
+        ("a query comparing two series", "errors / requests"),
+    ];
+
+    let mut ids: Vec<(&str, String)> = vec![];
+    for (index, (case, query)) in queries.into_iter().enumerate() {
+        let name = format!("multi-series-alarm-{index}");
         ok(
             &router,
             "PutMetricAlarm",
-            &merged(metric_alarm_request(&name), patch),
+            &merged(metric_alarm_request(&name), &promql_patch(query)),
         )
         .await;
-        force_state(&router, &name, "ALARM").await;
 
+        // Before anything puts a contributor into ALARM there is none to report.
+        let (reported, answered) = contributors(&router, &name).await;
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: an alarm that is not in ALARM owes no contributor, got {answered}"
+        );
+
+        force_state(&router, &name, "ALARM").await;
         let (reported, answered) = contributors(&router, &name).await;
         assert_eq!(
             reported.len(),
             1,
-            "case {case:?}: the alarm grades one series, so it owes one contributor, \
+            "case {case:?}: expected the contributor the ALARM state accounts for, got {answered}"
+        );
+        assert!(
+            answered.get("NextToken").is_none(),
+            "case {case:?}: every contributor of the alarm is in this page, so no token is owed, \
              got {answered}"
         );
         let contributor = reported.first().cloned().unwrap_or_default();
+        let alarm = described_alarm(&router, AlarmKind::Metric, &name)
+            .await
+            .unwrap_or_default();
+        // Why the contributor is in ALARM, and when it got there, is what the alarm itself
+        // reports: its state IS what the query's entries put it in.
         assert_eq!(
-            contributor.get("ContributorAttributes"),
-            Some(expected),
-            "case {case:?}: expected the graded series' dimensions {expected}, got {contributor}"
+            (
+                text(&contributor, "StateReason"),
+                contributor.get("StateTransitionedTimestamp"),
+            ),
+            (
+                text(&alarm, "StateReason"),
+                alarm.get("StateTransitionedTimestamp"),
+            ),
+            "case {case:?}: expected the alarm's own reason and transition instant, \
+             got {contributor} beside {alarm}"
         );
+        // The identifier fits the member's modelled 1..16 length and is stable across reads.
         let id = text(&contributor, "ContributorId").unwrap_or_default();
         assert!(
             (1..=16).contains(&id.chars().count()),
             "case {case:?}: expected an id of 1 to 16 characters, got {id:?}"
         );
-    }
-
-    // The identifier names the SERIES the alarm grades: a write that moves the alarm onto another
-    // series renames its contributor, while one that changes nothing about the series does not.
-    let moved = "re-pointed-alarm";
-    ok(
-        &router,
-        "PutMetricAlarm",
-        &merged(
-            metric_alarm_request(moved),
-            &json!({"Dimensions": [{"Name": "Service", "Value": "api"}]}),
-        ),
-    )
-    .await;
-    force_state(&router, moved, "ALARM").await;
-    let (reported, _) = contributors(&router, moved).await;
-    let before = reported
-        .first()
-        .and_then(|entry| text(entry, "ContributorId"));
-
-    // (case, the members the re-write carries, whether the contributor keeps the id it had)
-    let rewrites: Vec<(&str, Value, bool)> = vec![
-        (
-            "a write that only changes the description",
-            json!({
-                "Dimensions": [{"Name": "Service", "Value": "api"}],
-                "AlarmDescription": "the same series, described",
-            }),
-            true,
-        ),
-        (
-            "a write that moves the alarm onto another dimension value",
-            json!({"Dimensions": [{"Name": "Service", "Value": "worker"}]}),
-            false,
-        ),
-        (
-            "a write that moves the alarm onto another metric",
-            json!({
-                "MetricName": "Errors",
-                "Dimensions": [{"Name": "Service", "Value": "api"}],
-            }),
-            false,
-        ),
-    ];
-    for (case, patch, keeps) in rewrites {
-        ok(
-            &router,
-            "PutMetricAlarm",
-            &merged(metric_alarm_request(moved), &patch),
-        )
-        .await;
-        force_state(&router, moved, "ALARM").await;
-        let (reported, answered) = contributors(&router, moved).await;
-        let after = reported
-            .first()
-            .and_then(|entry| text(entry, "ContributorId"));
-        assert!(
-            after.is_some(),
-            "case {case:?}: the alarm in ALARM still owes its contributor, got {answered}"
-        );
+        let (again, _) = contributors(&router, &name).await;
         assert_eq!(
-            after == before,
-            keeps,
-            "case {case:?}: expected the contributor id to be kept = {keeps}, \
-             got {after:?} against {before:?}"
+            again.first().and_then(|entry| text(entry, "ContributorId")),
+            Some(id.clone()),
+            "case {case:?}: a contributor keeps its id across reads, got {again:?}"
+        );
+        ids.push((case, id));
+
+        // Back in OK, the alarm has no contributor in ALARM state again: the read reports the
+        // state the alarm is in now rather than one it was in.
+        force_state(&router, &name, "OK").await;
+        let (reported, answered) = contributors(&router, &name).await;
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: an alarm that is not in ALARM owes no contributor, got {answered}"
         );
     }
 
-    // Dimension sets that differ only in where a punctuation character falls are different
-    // series, so they are different contributors: "Dimension names must contain only ASCII
-    // characters, must include at least one non-whitespace character, and cannot start with a
-    // colon" and dimension values are ASCII too (`Dimension$Name`, `Dimension$Value`), so a
-    // name or a value may carry whatever character a joined identity would separate on. Every
-    // row is written under ONE alarm name, so the only thing that differs is the series.
-    let ambiguous = "ambiguous-dimensions-alarm";
-    let sets: Vec<(&str, Value)> = vec![
-        ("the punctuation inside the dimension name", json!([{"Name": "a=b", "Value": "c"}])),
-        ("the punctuation inside the dimension value", json!([{"Name": "a", "Value": "b=c"}])),
-        (
-            "each half as its own dimension",
-            json!([{"Name": "a", "Value": "b"}, {"Name": "b", "Value": "c"}]),
-        ),
-        ("one dimension of the same characters", json!([{"Name": "ab", "Value": "c"}])),
-    ];
-    let mut ambiguous_ids: Vec<(&str, String)> = vec![];
-    for (case, dimensions) in sets {
-        ok(
-            &router,
-            "PutMetricAlarm",
-            &merged(
-                metric_alarm_request(ambiguous),
-                &json!({"Dimensions": dimensions}),
-            ),
-        )
-        .await;
-        force_state(&router, ambiguous, "ALARM").await;
-        let (reported, answered) = contributors(&router, ambiguous).await;
-        let id = reported
-            .first()
-            .and_then(|entry| text(entry, "ContributorId"));
-        assert!(
-            id.is_some(),
-            "case {case:?}: the alarm in ALARM owes its contributor, got {answered}"
-        );
-        ambiguous_ids.push((case, id.unwrap_or_default()));
-    }
-    let distinct: std::collections::BTreeSet<&String> =
-        ambiguous_ids.iter().map(|(_, id)| id).collect();
+    // Two alarms' contributors are two contributors: the identifier distinguishes what it names
+    // rather than being one fixed value.
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().map(|(_, id)| id).collect();
     assert_eq!(
         distinct.len(),
-        ambiguous_ids.len(),
-        "two dimension sets that identify different series must identify different \
-         contributors, got {ambiguous_ids:?}"
+        ids.len(),
+        "the contributors of different alarms must carry different ids, got {ids:?}"
     );
 }

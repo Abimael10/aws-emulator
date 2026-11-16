@@ -181,7 +181,9 @@ impl MetricWidget {
     /// Every refusal names the member path inside the definition that has to change, in the
     /// sentences this service refuses a value in ([`super::value_is_invalid_message`] and the
     /// parameter sentences beside it), because that path is what locates the node a caller
-    /// repairs.
+    /// repairs. A node whose JSON TYPE is not the one the structure requires at its position is
+    /// named by its pointer and the type it must have instead ([`should_be`]): for an array of
+    /// arrays, WHERE the wrong-shaped node sits is the whole of what the caller repairs from.
     pub fn parse(document: &str, now: f64) -> Result<Self, String> {
         let widget = ::serde_json::from_str::<Value>(document)
             .ok()
@@ -210,7 +212,7 @@ impl MetricWidget {
         let entries = match widget.get(METRICS_MEMBER).filter(|value| !value.is_null()) {
             None => return Err(super::parameter_required_message(&path(METRICS_MEMBER))),
             Some(value) => value.as_array().ok_or_else(|| {
-                super::value_is_invalid_message(&value.to_string(), &path(METRICS_MEMBER))
+                should_be(&pointer(&[METRICS_MEMBER]), JSON_ARRAY)
             })?,
         };
         if entries.is_empty() {
@@ -261,6 +263,43 @@ impl MetricWidget {
 fn path(member: &str) -> String {
     format!("{WIDGET_MEMBER}.{member}")
 }
+
+/// The JSON pointer a refusal names a NODE of the definition by: the request member, then the
+/// members and array positions that lead to the node, joined by `/` with each position written
+/// as its ZERO-based index — `MetricWidget/metrics/0/0` for the first element of the first
+/// `metrics` entry.
+///
+/// A node whose JSON TYPE is not the one the widget structure requires at that position is
+/// refused by this pointer rather than by the member-path sentences beside it
+/// ([`should_be`]): what such a refusal has to say is where in the submitted document the
+/// wrong-shaped node sits, which no member path can state for an array of arrays.
+fn pointer(segments: &[&str]) -> String {
+    let mut pointer = WIDGET_MEMBER.to_string();
+    for segment in segments {
+        pointer.push('/');
+        pointer.push_str(segment);
+    }
+    pointer
+}
+
+/// How a refusal states that the node at `pointer` is of the wrong JSON type: the type the
+/// widget structure requires there, named as JSON names its types.
+fn should_be(pointer: &str, json_type: &str) -> String {
+    format!("{pointer} should be {json_type}")
+}
+
+/// The JSON type a `metrics` entry, and the `metrics` array itself, must have: "metrics — …
+/// Each item in the array is itself an array that defines one metric or expression" (the metric
+/// widget structure reference).
+const JSON_ARRAY: &str = "array";
+
+/// The JSON type the OPTIONS of an entry must have — the object the entry's last element is,
+/// and the only element a one-element entry can carry.
+const JSON_OBJECT: &str = "object";
+
+/// The JSON type each element naming part of a metric must have: the namespace, the metric name
+/// and the dimension name/value pairs are all names.
+const JSON_STRING: &str = "string";
 
 /// The string member `member` of the object at path `at` carries, `None` when it is left out,
 /// or the refusal for a member that is not a string.
@@ -484,9 +523,13 @@ fn read_entry(
     widget_stat: &str,
 ) -> Result<(MetricDataQuery, Plot), String> {
     let at = super::list_element_path(&path(METRICS_MEMBER), index + 1);
+    // The node this entry sits at inside the submitted document, for the refusals that state
+    // the TYPE a node must have ([`pointer`]).
+    let position = index.to_string();
+    let node = pointer(&[METRICS_MEMBER, &position]);
     let elements = entry
         .as_array()
-        .ok_or_else(|| super::value_is_invalid_message(&entry.to_string(), &at))?;
+        .ok_or_else(|| should_be(&node, JSON_ARRAY))?;
     // The options object is the entry's LAST element when it has one; everything before it
     // names the metric.
     let (named, options) = match elements.split_last() {
@@ -494,10 +537,13 @@ fn read_entry(
         _ => (&elements[..], Map::new()),
     };
     let mut names: Vec<&str> = Vec::with_capacity(named.len());
-    for element in named {
-        let name = element
-            .as_str()
-            .ok_or_else(|| super::value_is_invalid_message(&element.to_string(), &at))?;
+    for (at_element, element) in named.iter().enumerate() {
+        let name = element.as_str().ok_or_else(|| {
+            should_be(
+                &format!("{node}/{at_element}"),
+                JSON_STRING,
+            )
+        })?;
         names.push(name);
     }
 
@@ -549,6 +595,12 @@ fn read_entry(
             )));
         }
         None
+    } else if names.len() < METRIC_NAMES {
+        // "a metric is uniquely defined by a name, a namespace, and zero or more dimensions", so
+        // an entry carrying fewer names than those two names NO metric. The only other structure
+        // an entry can have is the options object an expression is written as, so what the
+        // document has at that position is a node that should have been that object.
+        return Err(should_be(&format!("{node}/0"), JSON_OBJECT));
     } else {
         Some(metric_stat_of(&names, &at, period, &options, widget_stat)?)
     };
@@ -573,6 +625,11 @@ fn read_entry(
     ))
 }
 
+/// How many names of an entry name the METRIC itself: "a metric is uniquely defined by a name,
+/// a namespace, and zero or more dimensions" — the namespace and the metric name, with every
+/// further pair of names a dimension.
+const METRIC_NAMES: usize = 2;
+
 /// The `MetricStat` the entry's names and options define.
 ///
 /// "a metric is uniquely defined by a name, a namespace, and zero or more dimensions", so the
@@ -585,7 +642,7 @@ fn metric_stat_of(
     options: &Map<String, Value>,
     widget_stat: &str,
 ) -> Result<MetricStat, String> {
-    let pairs = names.get(2..).unwrap_or_default();
+    let pairs = names.get(METRIC_NAMES..).unwrap_or_default();
     let (Some(namespace), Some(metric_name)) = (names.first(), names.get(1)) else {
         return Err(super::value_is_invalid_message(
             &Value::from(names.to_vec()).to_string(),

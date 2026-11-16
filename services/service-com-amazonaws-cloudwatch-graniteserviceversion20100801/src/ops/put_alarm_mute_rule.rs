@@ -206,6 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::state::alarm_mute_rule_schedule_error(&input.rule.schedule) {
             return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
+        // What the schedule and the window boundaries say TOGETHER is a second rule the model
+        // cannot express: a one-time schedule carries its own window, and a window that closes no
+        // later than it opens mutes nothing ([`crate::state::alarm_mute_rule_window_error`]).
+        if let Some(message) = crate::state::alarm_mute_rule_window_error(
+            &input.rule.schedule,
+            input.start_date.as_ref().map(crate::state::from_timestamp),
+            input.expire_date.as_ref().map(crate::state::from_timestamp),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
         // "You can use tags to categorize and manage your mute rules."
         // (`PutAlarmMuteRuleInput$Tags`) — as many as the 50 tags every taggable resource of this
         // service takes (`crate::state::tag_count_error`).

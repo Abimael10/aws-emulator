@@ -53,6 +53,8 @@ mod alarm_m_of_n_directions;
 mod alarm_mute_rule_action_muting;
 #[path = "all/alarm_mute_rule_creation_identity.rs"]
 mod alarm_mute_rule_creation_identity;
+#[path = "all/alarm_mute_rule_window_rules.rs"]
+mod alarm_mute_rule_window_rules;
 #[path = "all/alarm_mute_rules.rs"]
 mod alarm_mute_rules;
 #[path = "all/alarm_period_windows.rs"]
@@ -237,6 +239,8 @@ mod metric_streams;
 mod metric_widget_image;
 #[path = "all/metric_widget_image_freshness.rs"]
 mod metric_widget_image_freshness;
+#[path = "all/metric_widget_structure_refusals.rs"]
+mod metric_widget_structure_refusals;
 #[path = "all/metrics_and_alarms.rs"]
 mod metrics_and_alarms;
 #[path = "all/metrics_scalar_exclusion.rs"]

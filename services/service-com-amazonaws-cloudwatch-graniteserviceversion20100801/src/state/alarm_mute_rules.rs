@@ -472,29 +472,55 @@ pub const MIN_MUTE_DURATION_SECS: f64 = 60.0;
 /// The other end of that published range (`Schedule$Duration`).
 pub const MAX_MUTE_DURATION_SECS: f64 = 15.0 * 24.0 * 60.0 * 60.0;
 
-/// The request member path a refusal of the expression names.
-const SCHEDULE_EXPRESSION_PARAMETER: &str = "Rule.Schedule.Expression";
-
 /// The request member path a refusal of the window's length names.
 const SCHEDULE_DURATION_PARAMETER: &str = "Rule.Schedule.Duration";
 
 /// The request member path a refusal of the time zone names.
 const SCHEDULE_TIMEZONE_PARAMETER: &str = "Rule.Schedule.Timezone";
 
-/// Why `schedule` names no mute window this service can run, as the sentence CloudWatch states an
-/// unusable parameter value in ([`super::value_is_invalid_message`]), or `None` when it names one.
+/// How CloudWatch states that a schedule's expression is in neither form a mute window may be
+/// stated in: one sentence about the SCHEDULE, carrying nothing of the expression the request
+/// submitted.
+///
+/// "You can use one of two expression formats: Cron expressions […] At expressions"
+/// (`Schedule$Expression`) — an expression in neither form leaves the schedule unreadable rather
+/// than merely out of range, which is what this sentence says and why it names no value.
+pub const SCHEDULE_MALFORMED_MESSAGE: &str = "Schedule is malformed.";
+
+/// How CloudWatch states that a mute window would stay open longer than the longest published:
+/// one sentence naming that published maximum, carrying nothing of the duration submitted.
+///
+/// "with a minimum of 1 minute (`PT1M`) and maximum of 15 days (`P15D`)" (`Schedule$Duration`) —
+/// the cap the sentence states is that published maximum ([`MAX_MUTE_DURATION_SECS`]).
+pub const MUTE_DURATION_TOO_LONG_MESSAGE: &str =
+    "The Alarm Mute Rule Duration cannot exceed 15 days.";
+
+/// How CloudWatch states that the rule a write asks for is expired before it ever mutes
+/// anything — its window closes no later than the instant it takes effect.
+pub const MUTE_RULE_EXPIRED_MESSAGE: &str = "The Alarm Mute Rule is expired.";
+
+/// How CloudWatch states that a ONE-TIME schedule cannot be given window boundaries of its own.
+pub const AT_EXPRESSION_DATES_MESSAGE: &str =
+    "Can not set start or expire dates for At expressions";
+
+/// Why `schedule` names no mute window this service can run, in the sentence CloudWatch states
+/// that refusal in, or `None` when it names one.
 ///
 /// Three rules the model cannot express, so the boundary walk lets all three through: the
 /// expression must be in one of the two documented forms, the time zone must be a zone, and the
 /// duration must name a fixed span inside the published range
 /// ([`MIN_MUTE_DURATION_SECS`]..[`MAX_MUTE_DURATION_SECS`]). Stated here rather than in the
 /// handler so every operation that stores or reads a schedule is judged by one rule.
+///
+/// Two of those have a sentence of their own, which is fixed text of their class and interpolates
+/// nothing: an unreadable expression ([`SCHEDULE_MALFORMED_MESSAGE`]) and a window longer than the
+/// published maximum ([`MUTE_DURATION_TOO_LONG_MESSAGE`]). Every other unusable value — a zone no
+/// zone answers to, a duration that names no fixed span or one shorter than the published minimum
+/// — is refused in the sentence this service states an unusable parameter value in
+/// ([`super::value_is_invalid_message`]), naming the member that has to change.
 pub fn alarm_mute_rule_schedule_error(schedule: &Schedule) -> Option<String> {
     if schedule_form(&schedule.expression).is_none() {
-        return Some(super::value_is_invalid_message(
-            &schedule.expression,
-            SCHEDULE_EXPRESSION_PARAMETER,
-        ));
+        return Some(SCHEDULE_MALFORMED_MESSAGE.to_string());
     }
     if schedule_timezone(schedule.timezone.as_deref()).is_none() {
         return Some(super::value_is_invalid_message(
@@ -502,10 +528,50 @@ pub fn alarm_mute_rule_schedule_error(schedule: &Schedule) -> Option<String> {
             SCHEDULE_TIMEZONE_PARAMETER,
         ));
     }
-    let within_range = schedule_duration_secs(&schedule.duration).is_some_and(|span| {
-        (MIN_MUTE_DURATION_SECS..=MAX_MUTE_DURATION_SECS).contains(&span)
-    });
-    (!within_range).then(|| {
-        super::value_is_invalid_message(&schedule.duration, SCHEDULE_DURATION_PARAMETER)
-    })
+    match schedule_duration_secs(&schedule.duration) {
+        Some(span) if span > MAX_MUTE_DURATION_SECS => {
+            Some(MUTE_DURATION_TOO_LONG_MESSAGE.to_string())
+        }
+        Some(span) if span >= MIN_MUTE_DURATION_SECS => None,
+        _ => Some(super::value_is_invalid_message(
+            &schedule.duration,
+            SCHEDULE_DURATION_PARAMETER,
+        )),
+    }
+}
+
+/// Why the mute window a write asks for can never mute anything, in the sentence CloudWatch
+/// states that refusal in, or `None` when the request's schedule and its window boundaries hold
+/// together.
+///
+/// Two rules BETWEEN members, which no single member's constraint can express:
+///
+/// * a ONE-TIME schedule states the instant its single window opens inside the expression itself
+///   ("At expressions - For one-time mute windows. Format: `at(yyyy-MM-ddThh:mm)`",
+///   `Schedule$Expression`), so there is no window for a `StartDate` to let in or an `ExpireDate`
+///   to cut short: a request carrying either beside such an expression is refused
+///   ([`AT_EXPRESSION_DATES_MESSAGE`]);
+/// * the window a rule mutes in runs from the instant it takes effect ("The date and time after
+///   which the mute rule takes effect", `PutAlarmMuteRuleInput$StartDate`) to the instant it is
+///   "no longer evaluated" (`PutAlarmMuteRuleInput$ExpireDate`), so a request whose `ExpireDate`
+///   is no later than its `StartDate` asks for a rule that is already expired when it is written
+///   ([`MUTE_RULE_EXPIRED_MESSAGE`]).
+///
+/// A request naming only an `ExpireDate` states no instant to compare it against — such a rule
+/// "takes effect immediately upon creation" (`PutAlarmMuteRuleInput$StartDate`) — so it is stored
+/// and the clock decides its `Status` ([`alarm_mute_rule_status`]) rather than being refused here.
+pub fn alarm_mute_rule_window_error(
+    schedule: &Schedule,
+    start_date: Option<f64>,
+    expire_date: Option<f64>,
+) -> Option<String> {
+    if matches!(schedule_form(&schedule.expression), Some(ScheduleForm::Once(_)))
+        && (start_date.is_some() || expire_date.is_some())
+    {
+        return Some(AT_EXPRESSION_DATES_MESSAGE.to_string());
+    }
+    let (Some(start), Some(expires)) = (start_date, expire_date) else {
+        return None;
+    };
+    (expires <= start).then(|| MUTE_RULE_EXPIRED_MESSAGE.to_string())
 }

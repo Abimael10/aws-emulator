@@ -23,6 +23,15 @@ const REGION: &str = "us-east-1";
 /// Another Region, for the rows that assert a mute rule belongs to the Region it was written in.
 const OTHER_REGION: &str = "us-west-2";
 
+/// How CloudWatch words a refusal of a schedule whose expression is in neither documented form:
+/// one sentence about the SCHEDULE, carrying nothing of the submitted expression.
+pub(crate) const SCHEDULE_MALFORMED: &str = "Schedule is malformed.";
+
+/// How CloudWatch words a refusal of a window longer than the published maximum: one sentence
+/// naming that maximum ("maximum of 15 days (`P15D`)", `Schedule$Duration`), carrying nothing of
+/// the submitted duration.
+pub(crate) const DURATION_TOO_LONG: &str = "The Alarm Mute Rule Duration cannot exceed 15 days.";
+
 /// A `PutAlarmMuteRule` request with only the members the model makes required.
 pub(crate) fn put_request(name: &str, expression: &str, duration: &str) -> Value {
     json!({
@@ -390,107 +399,105 @@ async fn a_mute_rules_status_is_what_the_clock_makes_of_its_window() {
 async fn a_schedule_naming_no_mute_window_is_refused_and_stores_nothing() {
     let router = build_router();
 
-    // (case, the schedule, the member path the refusal names, the value it names).
+    // (case, the schedule, the sentence the refusal is worded in).
     //
     // Rows differ along WHICH of the three unmodelled rules the schedule breaks and how: an
     // expression in neither documented form (prose, the wrong number of cron fields, a cron field
     // the grammar does not read, an instant that is no instant, another API's expression form), a
     // duration outside the published range or naming no fixed span, and a time zone no IANA zone
     // answers to.
-    let cases: Vec<(&str, Value, &str, &str)> = vec![
+    //
+    // Two of those classes CloudWatch words in a sentence of their own, fixed text that
+    // interpolates nothing from the request — an expression it cannot read at all, and a window
+    // longer than the published maximum — and every other unusable value is refused in the
+    // sentence this service states an unusable parameter value in, naming the member path.
+    let unusable = |value: &str, parameter: &str| {
+        format!("The value {value} for parameter {parameter} is invalid.")
+    };
+    let cases: Vec<(&str, Value, String)> = vec![
         (
             "an expression that is prose",
             schedule("every minute", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "every minute",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "a cron expression one field short",
             schedule("cron(0 2 * *)", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "cron(0 2 * *)",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "a cron expression one field long",
             schedule("cron(0 2 * * * *)", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "cron(0 2 * * * *)",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "a cron field the grammar does not read",
             schedule("cron(0 nope * * *)", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "cron(0 nope * * *)",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "an at expression naming no instant",
             schedule("at(2024-13-45T99:99)", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "at(2024-13-45T99:99)",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "an at expression without the date-time separator",
             schedule("at(2024-05-10 14:00)", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "at(2024-05-10 14:00)",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "the rate expression another schedule member takes",
             schedule("rate(5 minutes)", "PT1H", None),
-            "Rule.Schedule.Expression",
-            "rate(5 minutes)",
+            SCHEDULE_MALFORMED.to_string(),
         ),
         (
             "a window one second shorter than the shortest published",
             schedule("cron(0 2 * * *)", "PT59S", None),
-            "Rule.Schedule.Duration",
-            "PT59S",
+            unusable("PT59S", "Rule.Schedule.Duration"),
         ),
         (
             "a window one second longer than the longest published",
             schedule("cron(0 2 * * *)", "P15DT1S", None),
-            "Rule.Schedule.Duration",
-            "P15DT1S",
+            DURATION_TOO_LONG.to_string(),
         ),
         (
             "a window a day longer than the longest published",
             schedule("cron(0 2 * * *)", "P16D", None),
-            "Rule.Schedule.Duration",
-            "P16D",
+            DURATION_TOO_LONG.to_string(),
+        ),
+        (
+            "a window a year long",
+            schedule("cron(0 2 * * *)", "P365D", None),
+            DURATION_TOO_LONG.to_string(),
         ),
         (
             "a duration of no length at all",
             schedule("cron(0 2 * * *)", "PT0S", None),
-            "Rule.Schedule.Duration",
-            "PT0S",
+            unusable("PT0S", "Rule.Schedule.Duration"),
         ),
         (
             "a duration whose length depends on the calendar",
             schedule("cron(0 2 * * *)", "P1Y", None),
-            "Rule.Schedule.Duration",
-            "P1Y",
+            unusable("P1Y", "Rule.Schedule.Duration"),
         ),
         (
             "a duration written as prose",
             schedule("cron(0 2 * * *)", "4 hours", None),
-            "Rule.Schedule.Duration",
-            "4 hours",
+            unusable("4 hours", "Rule.Schedule.Duration"),
         ),
         (
             "a time zone no zone answers to",
             schedule("cron(0 2 * * *)", "PT1H", Some("Mars/Phobos")),
-            "Rule.Schedule.Timezone",
-            "Mars/Phobos",
+            unusable("Mars/Phobos", "Rule.Schedule.Timezone"),
         ),
         (
             "a time zone misspelled",
             schedule("cron(0 2 * * *)", "PT1H", Some("Europe/Londonn")),
-            "Rule.Schedule.Timezone",
-            "Europe/Londonn",
+            unusable("Europe/Londonn", "Rule.Schedule.Timezone"),
         ),
     ];
 
-    for (index, (case, broken, parameter, value)) in cases.into_iter().enumerate() {
+    for (index, (case, broken, expected)) in cases.into_iter().enumerate() {
         let name = format!("refused-row-{index}");
         let request = json!({"Name": name, "Rule": {"Schedule": broken}});
         let (status, body) = call(&router, "PutAlarmMuteRule", &request).await;
@@ -503,7 +510,7 @@ async fn a_schedule_naming_no_mute_window_is_refused_and_stores_nothing() {
             (400, "ValidationException"),
             "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
-        let expected = format!("The value {value} for parameter {parameter} is invalid.");
+        let expected = expected.as_str();
         let got = error_message(&body);
         assert_eq!(
             got, expected,

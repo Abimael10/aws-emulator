@@ -4,7 +4,9 @@
 //!
 //! The read of what contributes to an alarm's state: the time series of the alarm a request
 //! names that are themselves in `ALARM`, derived from the alarm this store holds rather than
-//! recorded beside it.
+//! recorded beside it. Only an alarm whose configuration evaluates a query over SEVERAL series
+//! has contributors at all; a name no alarm carries and an alarm of any other kind are two
+//! distinct refusals.
 //!
 //!
 //! ## Shape of an operation
@@ -175,17 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
 
         let store = state.lock();
-        let Some(stored) = store.alarms.get(&input.alarm_name) else {
-            if store.alarm_kind(&input.alarm_name).is_some() {
-                // An alarm of a kind that watches no metric time series of its own: a composite
-                // alarm's state comes from other alarms' states and a log alarm's from a
-                // scheduled query, so neither has a time series contributing to it. The answer is
-                // the empty list rather than a refusal: the alarm exists and has no contributor.
-                return Ok(DescribeAlarmContributorsOutput {
-                    alarm_contributors: Vec::new(),
-                    next_token: None,
-                });
-            }
+        // Which alarm the name answers to is the first question, and whether that alarm has
+        // contributors at all is the second: the two refusals are different classes, so they are
+        // judged in that order and never collapsed into one.
+        if store.alarm_kind(&input.alarm_name).is_none() {
             // The recorded refusal of a name no alarm of this account and Region answers to: one
             // sentence carrying the name the request asked for, which is what a client repairs
             // the request from, and neither of the shape's other members.
@@ -199,6 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+        // The alarm EXISTS, so what is left to decide is whether it is the kind of alarm that
+        // has contributors to report ([`multi_time_series`]) — an alarm that is not is refused
+        // for its TYPE rather than reported as having none.
+        let Some(stored) = store
+            .alarms
+            .get(&input.alarm_name)
+            .filter(|stored| multi_time_series(&stored.alarm))
+        else {
+            return Err(DescribeAlarmContributorsError::validation_error(
+                not_a_multi_time_series_alarm(&input.alarm_name),
+            ));
         };
 
         Ok(DescribeAlarmContributorsOutput {
@@ -208,6 +215,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token: None,
         })
     }
+}
+
+/// Whether `alarm` is an alarm whose state is contributed to by SEVERAL time series — the kind
+/// of alarm this operation reports on.
+///
+/// A contributor "Represents an individual contributor to a multi-timeseries alarm, containing
+/// information about a specific time series and its contribution to the alarm's state"
+/// (`AlarmContributor`), and the model says where such contributors come from in one place: the
+/// alarm's evaluation criteria carry a query whose "query must return a result of vector type.
+/// Each entry in the vector result represents an alarm contributor."
+/// (`AlarmPromQLCriteria$Query`). So an alarm configured with `EvaluationCriteria` has
+/// contributors, and an alarm graded on ONE series — the single metric its own members name, the
+/// one query of its `Metrics` array the evaluation watches, a composite alarm's rule over other
+/// alarms, a log alarm's scheduled query — has none to report at all.
+fn multi_time_series(alarm: &MetricAlarm) -> bool {
+    alarm.evaluation_criteria.is_some()
+}
+
+/// How CloudWatch states that the alarm a request named is not of that kind: one sentence
+/// carrying the name the request asked for.
+fn not_a_multi_time_series_alarm(alarm_name: &str) -> String {
+    format!("Alarm {alarm_name} is not a multi time series alarm")
 }
 
 /// How CloudWatch states that no alarm of this account and Region answers to the name a request
@@ -220,27 +249,24 @@ fn no_alarm_for_name(alarm_name: &str) -> String {
 /// paginating reads of this service answer with (`crate::ops::list_metric_streams`).
 const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid NextToken";
 
-/// The contributors of one metric alarm: "the current alarm contributors that are in `ALARM`
-/// state" (`DescribeAlarmContributors`).
+/// The contributors of one multi-time-series alarm: "the current alarm contributors that are in
+/// `ALARM` state" (`DescribeAlarmContributors`).
 ///
-/// A metric alarm of this store watches ONE time series — the metric its own members name, or the
-/// one query of its `Metrics` array the evaluation watches — so that series is the only thing
-/// that can contribute to its state, and it contributes exactly when the alarm's evaluated state
-/// is `ALARM`: an alarm in `OK` or `INSUFFICIENT_DATA` has no contributor in `ALARM` state, which
-/// is what this read reports from. Nothing is recorded per contributor: every member below is
-/// read off the alarm this store holds.
+/// Such an alarm's contributors are the entries of its query's result vector
+/// ([`multi_time_series`]), and a contributor is reported exactly while it is in `ALARM` — an
+/// alarm in `OK` or `INSUFFICIENT_DATA` has no contributor in `ALARM` state, which is what this
+/// read reports from. Nothing is recorded per contributor: every member below is read off the
+/// alarm this store holds.
 fn contributors_of(alarm: &MetricAlarm) -> Vec<AlarmContributor> {
     if alarm.state_value.as_deref() != Some(crate::state::ALARM_STATE_ALARM) {
         return Vec::new();
     }
     // WHICH series the alarm evaluates is read from the same resolution the evaluation itself
-    // reads it by, so the contributor describes the series that is graded whichever form the
-    // configuration identified it in — the alarm's own metric members, or the `MetricStat` of
-    // the query of its `Metrics` array the evaluation watches. An alarm whose graded value is
-    // COMPUTED rather than stored still has a contributor: what is in `ALARM` is the one value
-    // the alarm evaluates, so the contributor is reported and the identity this store can name
-    // for it is the alarm's own — unlike a composite or log alarm above, which evaluates no
-    // value of this kind at all and so has no contributor to report.
+    // reads it by, so a contributor describes the series the configuration identified, whichever
+    // form identified it. An alarm whose query names no series of this store — the query language
+    // of its `EvaluationCriteria` is resolved by no engine of this emulator — still has the one
+    // contributor its own `ALARM` state accounts for, described by the identity this store can
+    // name for it, which is the alarm's own.
     let series = crate::state::alarm_evaluation::graded_series_key(alarm);
     vec![AlarmContributor {
         contributor_id: contributor_id(alarm, series.as_ref()),
