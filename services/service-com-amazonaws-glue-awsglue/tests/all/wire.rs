@@ -155,6 +155,30 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> V
     parsed
 }
 
+/// Register one usage profile, with the smallest `Configuration` `CreateUsageProfile` admits
+/// and the `Description` the caller names, if any.
+///
+/// One copy, shared: every suite that reads usage profiles back stages them the same way, so
+/// the request shape the create is driven with is maintained in one place.
+pub async fn given_usage_profile(
+    router: &MultiServiceRouter,
+    name: &str,
+    description: Option<&str>,
+) {
+    let mut body = serde_json::json!({
+        "Name": name,
+        "Configuration": {
+            "JobConfiguration": {
+                "numberOfWorkers": { "DefaultValue": "5", "MinValue": "1", "MaxValue": "10" },
+            },
+        },
+    });
+    if let Some(description) = description {
+        body["Description"] = serde_json::json!(description);
+    }
+    ok(router, "CreateUsageProfile", &body).await;
+}
+
 /// The awsJson error code of a failure body (`__type`), which may carry a namespace.
 pub fn error_code(body: &Value) -> String {
     body.get("__type")

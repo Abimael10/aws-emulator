@@ -433,6 +433,8 @@ mod unfiltered_metadata;
 mod unfiltered_table_metadata;
 #[path = "all/update_partition.rs"]
 mod update_partition;
+#[path = "all/usage_profile_listing.rs"]
+mod usage_profile_listing;
 #[path = "all/usage_profiles.rs"]
 mod usage_profiles;
 #[path = "all/wire.rs"]

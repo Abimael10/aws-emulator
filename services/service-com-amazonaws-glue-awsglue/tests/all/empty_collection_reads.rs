@@ -29,7 +29,9 @@ use service_com_amazonaws_glue_awsglue::state::messages::INCLUDE_ROOT_NEEDS_THE_
 use service_com_amazonaws_glue_awsglue::state::TERMINAL_DATA_QUALITY_RUN_STATES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID, REGION};
+use crate::wire::{
+    call, emulator, error_code, error_message, given_usage_profile, ok, ACCOUNT_ID, REGION,
+};
 
 /// The IAM role a data quality run names: "The IAM role that Glue assumes to access
 /// resources for the run."
@@ -138,22 +140,6 @@ async fn a_collection_read_of_an_empty_account_reports_its_items_member_empty() 
 // ---------------------------------------------------------------------------
 // Usage profiles
 // ---------------------------------------------------------------------------
-
-/// Create one usage profile, and answer the body the create was sent.
-async fn given_usage_profile(router: &MultiServiceRouter, name: &str, description: Option<&str>) {
-    let mut body = json!({
-        "Name": name,
-        "Configuration": {
-            "JobConfiguration": {
-                "numberOfWorkers": { "DefaultValue": "5", "MinValue": "1", "MaxValue": "10" },
-            },
-        },
-    });
-    if let Some(description) = description {
-        body["Description"] = json!(description);
-    }
-    ok(router, "CreateUsageProfile", &body).await;
-}
 
 /// The `Name` of every profile one page reports, in the order the service returned them.
 fn listed_profile_names(case: &str, page: &Value) -> Vec<String> {
