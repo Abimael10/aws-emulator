@@ -1987,6 +1987,11 @@ mod token_vault_secrets;
 /// `crate::state::…` for it exactly as it does for the object-storage and IAM
 /// resolutions beside it.
 pub mod runtime_logs;
+/// The capacity provider this account holds: the record `CreateCapacityProvider`
+/// persists, the ARN and id forms it is addressed by, and the status the clock
+/// owes it. Re-exported, so a handler names `crate::state::…` for it exactly as
+/// it does for the resources beside it.
+pub mod capacity_providers;
 /// The payment manager this account holds: the record `CreatePaymentManager`
 /// persists, the ARN and id forms it is addressed by and the status the clock owes
 /// it. Re-exported, so a handler names `crate::state::…` for it exactly as it does
@@ -2013,6 +2018,7 @@ pub mod oauth2_credential_providers;
 /// `crate::state::…` for them exactly as it does for the records themselves.
 mod listings;
 pub use api_key_credential_providers::*;
+pub use capacity_providers::*;
 pub use datasets::*;
 pub use gateway_rate_limits::*;
 pub use gateway_rules::*;
@@ -3346,6 +3352,8 @@ impl ConfigurationBundleRecord {
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates,
 /// [`MAX_PAYMENT_MANAGERS`] the payment managers,
+/// [`MAX_CAPACITY_PROVIDERS`] the capacity providers (and with them their 1:1
+/// name index),
 /// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY)
 /// the rate limits one gateway holds,
 /// [`MAX_POLICY_ENGINES`](policies::MAX_POLICY_ENGINES) the policy engines and
@@ -3569,6 +3577,23 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::dataset_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     dataset_idempotency_order: VecDeque<String>,
+    /// Every capacity provider, keyed by `capacityProviderId` — the identifier
+    /// every capacity-provider route addresses it by. The key order is the
+    /// deterministic list order `ListCapacityProviders` pages over.
+    pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
+    /// `name` -> `capacityProviderId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The capacity provider name must be unique within
+    /// your account"). One entry per stored capacity provider.
+    pub capacity_provider_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the capacity provider that token first
+    /// produced, so a replayed `CreateCapacityProvider` answers with its first
+    /// result instead of minting a second provider. The key carries the
+    /// operation for the same reason as the maps above.
+    capacity_provider_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::capacity_provider_idempotency`] in the order they
+    /// were first recorded, so the oldest record is the one evicted at the
+    /// ceiling.
+    capacity_provider_idempotency_order: VecDeque<String>,
     /// Every payment manager, keyed by `paymentManagerId` — the identifier every
     /// payment-manager route addresses it by. The key order is the deterministic
     /// list order a payment-manager listing pages over.

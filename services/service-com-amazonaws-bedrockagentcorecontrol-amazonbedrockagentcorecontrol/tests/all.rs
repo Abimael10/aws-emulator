@@ -33,6 +33,10 @@ mod browser_listing_pagination;
 mod browser_profile_lifecycle;
 #[path = "all/browser_profile_listing.rs"]
 mod browser_profile_listing;
+#[path = "all/capacity_provider_lifecycle.rs"]
+mod capacity_provider_lifecycle;
+#[path = "all/capacity_provider_refusal_wording.rs"]
+mod capacity_provider_refusal_wording;
 #[path = "all/capacity_provider_runtime_versions.rs"]
 mod capacity_provider_runtime_versions;
 #[path = "all/code_artifact_object.rs"]

@@ -39,6 +39,13 @@
 //!    by one of the backends listed in [`VALUE_LESS_FAMILIES`], whose clause states the
 //!    member and the requirement alone. See that constant for the evidence and for why the
 //!    family, not the member, decides.
+//! 6. the FORM: rules 1, 2 and 5 are the form all but one of this endpoint's backends state
+//!    a refusal in. The family served by the backend listed in [`pointer_form::FAMILIES`]
+//!    states the other one: no violation count, the member addressed as the JSON pointer
+//!    that names it in the request, no value at all, and a `@range` or `@length` violation
+//!    stated as the WINDOW the model declares rather than the single bound the value fell
+//!    outside ([`pointer_form`]). Which of the two an operation is worded in is read off
+//!    the same modelled `@http` URI rule 5's policy is.
 //!
 //! Rule 4's constraint set is read off the MODEL, not off the refusal: the structured
 //! refusal carries only the constraints that failed, so the ones a value satisfied would
@@ -62,6 +69,8 @@ use aws_smithy_schema_server::constraints::{
 };
 use service_common::validation::{list_of_element, unanchored};
 use smithy_server_runtime::Refused;
+
+pub(super) mod pointer_form;
 
 /// The error code a constraint failure is named by: the shape
 /// `com.amazonaws.bedrockagentcorecontrol#ValidationException`, which every operation of
@@ -90,13 +99,46 @@ pub(super) const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// value, which is equally attested: `/runtimes` (`CreateAgentRuntime`),
 /// `/browser-profiles` (`ListBrowserProfiles`), `/payments` (`CreatePaymentManager`), and
 /// `/harnesses` + `/gateways` through this crate's own suite.
-const VALUE_LESS_FAMILIES: &[&str] = &["memories", "configuration-bundles", "identities"];
+pub(super) const VALUE_LESS_FAMILIES: &[&str] = &["memories", "configuration-bundles", "identities"];
 
 /// The clause a collection states around its element shape's constraint set (rule 4).
 const ELEMENT_SET_OPEN: &str = "Member must satisfy constraint: [";
 
 /// The text that separates a clause's subject from its requirement.
 const CLAUSE_MARKER: &str = "failed to satisfy constraint: ";
+
+/// Whether the backend serving an operation states its refusals in the counted clause rules
+/// 1, 2 and 5 state, or in the pointer form [`pointer_form`] states (rule 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// `N validation error(s) detected: ` over clauses naming a dotted member path.
+    Counted,
+    /// `validation error detected. ` over clauses naming a JSON pointer.
+    Pointer,
+}
+
+/// The clause form the operation whose input is `input_schema` is worded in (rule 6):
+/// decided by the resource family the FIRST segment of that operation's modelled `@http` URI
+/// names, the way rule 5's echo policy is.
+fn form_of(input_schema: &Schema) -> Form {
+    match family_of(input_schema) {
+        Some(family) if pointer_form::FAMILIES.contains(&family) => Form::Pointer,
+        _ => Form::Counted,
+    }
+}
+
+/// The resource family an operation belongs to: the first segment of the `@http` URI its own
+/// model declares, which is what both family-keyed rules (5 and 6) are read off.
+///
+/// `None` for an operation whose input schema carries no HTTP binding, or whose URI has no
+/// first segment — which is in no listed family and so keeps the wording every other family
+/// shows.
+fn family_of(input_schema: &Schema) -> Option<&str> {
+    input_schema
+        .http()
+        .map(|http| http.uri())
+        .and_then(|uri| service_common::nth_path_segment(uri, 0))
+}
 
 /// Whether the backend serving an operation quotes the value a refused member held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,11 +155,7 @@ pub(super) enum Echo {
 /// An operation whose input schema carries no HTTP binding, or whose URI has no first
 /// segment, is not in a listed family and so keeps the echo every other family shows.
 pub(super) fn echo_of(input_schema: &Schema) -> Echo {
-    let family = input_schema
-        .http()
-        .map(|http| http.uri())
-        .and_then(|uri| service_common::nth_path_segment(uri, 0));
-    match family {
+    match family_of(input_schema) {
         Some(family) if VALUE_LESS_FAMILIES.contains(&family) => Echo::Suppressed,
         _ => Echo::Submitted,
     }
@@ -172,8 +210,8 @@ pub(crate) fn handler_refusal_message(
     )
 }
 
-/// The `message` for a set of violations: the count, then one clause per failing
-/// (member, requirement) in the order the walk found them.
+/// The `message` for a set of violations: one clause per failing (member, requirement) in
+/// the order the walk found them, inside the envelope the serving backend states (rule 6).
 fn message(
     violations: &[Violation],
     input_schema: Option<&Schema>,
@@ -183,6 +221,10 @@ fn message(
     if violations.is_empty() {
         return None;
     }
+    // Rule 6: the form is the serving backend's, read off the operation's own input schema.
+    // A refusal that reached no operation (`None`) is worded the way every family but one
+    // words it, which is the conservative choice where the backend is unknown.
+    let form = input_schema.map_or(Form::Counted, form_of);
     // Resolved once per collection member, before the clauses are built: the set a clause
     // states is the element shape's whole set, and reading it per violation would resolve
     // it once per failing ELEMENT — a count the caller chooses.
@@ -192,19 +234,28 @@ fn message(
     for violation in violations {
         let element = list_of_element(&violation.path);
         let path = element.unwrap_or(violation.path.as_str());
-        let requirement = match element {
+        let requirement = match (element, form) {
             // Built from these same violations, so a collection named by one of them is
             // always in the map.
-            Some(_) => nested(element_sets.get(path)?),
-            None => requirement_of(&violation.kind)?,
+            (Some(_), _) => nested(element_sets.get(path)?),
+            (None, Form::Counted) => requirement_of(&violation.kind)?,
+            (None, Form::Pointer) => pointer_form::requirement(path, &violation.kind)?,
         };
         if !stated.insert((path.to_string(), requirement.clone())) {
             continue;
         }
-        let subject = subject(echo, violation, element.and_then(|list| lists.get(list)));
-        clauses.push(format!("{subject} at '{path}' {CLAUSE_MARKER}{requirement}"));
+        clauses.push(match form {
+            Form::Counted => {
+                let subject = subject(echo, violation, element.and_then(|list| lists.get(list)));
+                format!("{subject} at '{path}' {CLAUSE_MARKER}{requirement}")
+            }
+            Form::Pointer => pointer_form::clause(path, &requirement),
+        });
     }
-    envelope(&clauses)
+    match form {
+        Form::Counted => envelope(&clauses),
+        Form::Pointer => pointer_form::envelope(&clauses),
+    }
 }
 
 /// AWS's envelope over the clauses of one refusal: `1 validation error detected: <clause>`

@@ -305,22 +305,17 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     /// Whether this account holds a capacity provider that
     /// `capacity_provider_id` names.
     ///
-    /// The only record of a capacity provider this service persists today is the
-    /// association an agent-runtime version carries: `CreateCapacityProvider` is
-    /// still scaffolded (see its own `src/ops/create_capacity_provider.rs`), so
-    /// an id no stored version is configured with names nothing in this account.
-    ///
-    /// KNOWN DEVIATION, which that stub owns and this read resolves the day it
-    /// lands: a capacity provider that exists with NO associated runtime version
-    /// is answered `AccessDeniedException` (403) here, where the real service
-    /// answers 200 with an empty `agentRuntimes` list — the listing is documented
-    /// as naming "the runtimes you must disassociate before you can delete the
-    /// capacity provider", so an empty page is a legitimate answer for a provider
-    /// nothing uses. Nothing in this emulator can mint or hold such a provider
-    /// yet, so there is no state from which to tell it apart from an id that
-    /// names nothing; when `CreateCapacityProvider` is implemented, its store
-    /// becomes the authority this reads and the empty-provider case answers 200.
+    /// The authority is the capacity-provider store
+    /// ([`CapacityProviderRecord`](super::CapacityProviderRecord)): a provider
+    /// this account created exists whether or not any agent-runtime version is
+    /// configured with it, which is what the listing of the runtime versions on
+    /// it reports as an empty page. A provider named only by a stored runtime
+    /// version counts too — a version carries the association, and the runtime
+    /// plane accepts one whose provider was never created through this service.
     pub fn holds_capacity_provider(&self, capacity_provider_id: &str) -> bool {
+        if self.capacity_providers.contains_key(capacity_provider_id) {
+            return true;
+        }
         self.agent_runtimes.values().any(|record| {
             record
                 .versions

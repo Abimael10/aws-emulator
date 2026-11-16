@@ -15,11 +15,11 @@
 //! `crate::service::EmulatedService::override_operation`, which hoists exactly this check
 //! ahead of the framework's constraint walk; the rule itself lives here.
 //!
-//! What "this account holds" means today, and the one deviation it carries, are stated on
+//! What "this account holds" means is stated once on
 //! [`crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::holds_capacity_provider`]:
-//! a provider is known by the association a stored runtime version carries, because
-//! `CreateCapacityProvider` is still scaffolded, so a provider that exists with no
-//! associated version is denied here where the real service answers an empty page.
+//! a provider the account created, and a provider named by the configuration of a stored
+//! runtime version. A provider that exists with no associated version is therefore served
+//! here — an empty page — rather than denied.
 //!
 //! The denial's MESSAGE is the service's own, stated once in
 //! [`crate::state::CAPACITY_PROVIDER_DENIAL`] and shared with that seam, and it echoes

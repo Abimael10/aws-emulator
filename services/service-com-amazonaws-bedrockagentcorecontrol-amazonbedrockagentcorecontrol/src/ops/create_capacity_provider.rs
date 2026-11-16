@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a capacity provider — the Amazon EC2 compute configuration AgentCore Runtime
+//! launches instances from, and the IAM role it manages them with — and persists it in
+//! [`crate::state`], where every later read of the provider answers from.
+//!
+//! The name "must be unique within your account", so a name this account already holds is
+//! the modelled `ConflictException` (409) rather than a second provider. A repeated
+//! `clientToken` answers with the provider that token first produced, and a fresh provider
+//! enters `CREATING` and reaches `READY` when the clock owes the transition
+//! ([`crate::state::CAPACITY_PROVIDER_SETTLE_DELAY`]) — nothing here sleeps for it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +191,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCapacityProviderErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the capacity provider store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the provider
+        // that token first produced, rather than minting a second one: "If this token
+        // matches a previous request, the service ignores the request, but doesn't return
+        // an error."
+        if let Some(capacity_provider_id) =
+            store.replayed_capacity_provider_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_capacity_provider_result` answers only for a provider the store
+            // still holds, so this lookup cannot miss.
+            if let Some(record) = store.capacity_providers.get(&capacity_provider_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // "The capacity provider name must be unique within your account", so a name this
+        // account already holds is a conflict and not a second provider.
+        if store.capacity_provider_names.contains_key(&input.name) {
+            return Err(CreateCapacityProviderErrorModeled::ConflictException(
+                crate::state::capacity_provider_name_conflict(&input.name),
+            )
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on create meets
+        // the modelled quota instead of this process's memory limit.
+        if store.capacity_providers.len() >= crate::state::MAX_CAPACITY_PROVIDERS {
+            return Err(
+                CreateCapacityProviderErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} capacity providers",
+                            crate::state::MAX_CAPACITY_PROVIDERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let capacity_provider_id = store.mint_capacity_provider_id(&input.name, now);
+        let record = crate::state::CapacityProviderRecord {
+            capacity_provider_arn: crate::state::capacity_provider_arn(
+                &region,
+                &capacity_provider_id,
+            ),
+            capacity_provider_id: capacity_provider_id.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            permissions_configuration: input.permissions_configuration,
+            compute_configuration: input.compute_configuration,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+            // A new provider is created, not ready: "it enters a CREATING state and
+            // transitions to READY when it is available for use", a transition the clock
+            // owes rather than this call.
+            transient_status: crate::state::CAPACITY_PROVIDER_STATUS_CREATING.to_string(),
+            settled_status: crate::state::CAPACITY_PROVIDER_STATUS_READY.to_string(),
+            settles_at: now + crate::state::CAPACITY_PROVIDER_SETTLE_DELAY,
+        };
+        let output = record.create_output(now);
+
+        store.remember_capacity_provider_client_token(
+            Self::NAME,
+            input.client_token,
+            &capacity_provider_id,
+        );
+        store
+            .capacity_provider_names
+            .insert(input.name, capacity_provider_id.clone());
+        store.capacity_providers.insert(capacity_provider_id, record);
+
+        Ok(output)
     }
 }
