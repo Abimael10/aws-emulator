@@ -173,6 +173,8 @@ mod lambda_task_alias_version_and_payload;
 mod lambda_task_control_flow;
 #[path = "all/lambda_task_function_metrics.rs"]
 mod lambda_task_function_metrics;
+#[path = "all/lambda_task_result_data_flow.rs"]
+mod lambda_task_result_data_flow;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
 #[path = "all/logging_role_trust.rs"]
