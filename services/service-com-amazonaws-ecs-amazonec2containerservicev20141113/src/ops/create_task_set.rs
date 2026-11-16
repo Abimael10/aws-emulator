@@ -272,8 +272,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The platform version that the tasks in the task set uses ... If one isn't
-        // specified, the LATEST platform version is used": a version this service does
-        // not know names no platform.
+        // specified, the LATEST platform version is used": a version Fargate once published
+        // and has since RETIRED is no longer one any account may place tasks on, which is
+        // the entitlement `AccessDeniedException` is modelled for
+        // ([`crate::state::names_retired_platform_version`]).
+        if crate::state::names_retired_platform_version(input.platform_version.as_deref()) {
+            return Err(CreateTaskSetErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::PLATFORM_ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // Every other value outside the published list names no platform.
         if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
             return Err(CreateTaskSetErrorModeled::PlatformUnknownException(
                 PlatformUnknownException {
@@ -463,6 +474,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // A revision is placed on the infrastructure it was validated against
+        // (`TaskDefinition$compatibilities`), whichever way the request named it — its
+        // `launchType` or the capacity providers its strategy names — and it is refused for
+        // THAT whatever else the request pairs with the revision, so the check stands ahead
+        // of the other rules keyed on it
+        // ([`crate::state::validate_placement_launch_type`]).
+        if let Err(message) = crate::state::validate_placement_launch_type(
+            &definition,
+            input.launch_type.as_deref(),
+            &requested_strategy,
+        ) {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // An `awsvpc` task gets its own elastic network interface, so the task set has to
         // say which subnets and security groups it takes — the same cross-field rule
         // `CreateService` and `RunTask` check against the REGISTERED revision.
@@ -496,22 +525,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(&definition),
             &requested_registries,
             &registry_dns_records,
-        ) {
-            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-        // A revision is placed on the infrastructure it was validated against
-        // (`TaskDefinition$compatibilities`), whichever way the request named it — its
-        // `launchType` or the capacity providers its strategy names
-        // ([`crate::state::validate_placement_launch_type`]).
-        if let Err(message) = crate::state::validate_placement_launch_type(
-            &definition,
-            input.launch_type.as_deref(),
-            &requested_strategy,
         ) {
             return Err(CreateTaskSetErrorModeled::InvalidParameterException(
                 InvalidParameterException {

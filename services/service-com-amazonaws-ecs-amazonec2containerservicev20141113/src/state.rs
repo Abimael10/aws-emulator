@@ -1351,9 +1351,11 @@ const DOCUMENTED_STATISTICS_LAUNCH_TYPES: usize = 2;
 /// specified, the LATEST platform version is used").
 ///
 /// The earlier Linux versions (`1.3.0` and below) are RETIRED — that page keeps them only
-/// under its deprecation notice — so a request that names one names no platform a task can
-/// be placed on, which is what `PlatformUnknownException` ("The specified platform version
-/// doesn't exist.") is modelled for, exactly as a value that was never a version is.
+/// under its deprecation notice — so a request that names one asks for a platform no account
+/// may place a task on any more ([`RETIRED_PLATFORM_VERSIONS`],
+/// [`PLATFORM_ACCESS_DENIED_MESSAGE`]), while a value that was never a version at all names
+/// no platform, which is what `PlatformUnknownException` ("The specified platform version
+/// doesn't exist.") is modelled for.
 pub const PLATFORM_VERSIONS: [&str; 3] = [
     PLATFORM_VERSION_LATEST,
     LATEST_LINUX_PLATFORM_VERSION,
@@ -1461,6 +1463,15 @@ pub fn capacity_provider_not_found_message(reference: &str) -> String {
 pub const LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE: &str =
     "Specifying both a launch type and capacity provider strategy is not supported. Remove one \
      and try again.";
+
+/// `InvalidParameterException$message` for the same conflict in a request that places a
+/// STANDALONE task (`RunTask`), which Amazon ECS words in its own sentence: the member pair
+/// is the same — "If a `launchType` is specified, the `capacityProviderStrategy` parameter
+/// must be omitted" — and the recorded refusal of a standalone run states the choice rather
+/// than the remediation [`LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE`] closes on.
+/// One fixed sentence, naming neither member's value.
+pub const RUN_TASK_LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE: &str =
+    "You may choose a capacity provider or a launch type but not both.";
 
 /// The inclusive range `CapacityProviderStrategyItem$base` admits, from the member's own
 /// `@range` trait and its doc ("The valid range is 0 to 100,000").

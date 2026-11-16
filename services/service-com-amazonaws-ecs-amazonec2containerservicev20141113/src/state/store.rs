@@ -1221,6 +1221,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                             // from the instant the rollout reached the stage.
                             expires_at: minutes_from(due, stop.timeout_minutes),
                             timeout_action: stop.timeout_action,
+                            // Nobody has acted on a hook the rollout has only just reached.
+                            taken_action: None,
                         });
                     }
                 }
@@ -1294,10 +1296,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// `ContinueServiceDeployment` asks: "Use this API to either continue the deployment to
     /// the next stage or roll back to the previous service revision."
     ///
-    /// Only a hook the rollout has REACHED and that is still waiting can be acted on
+    /// The action is taken on the hook that rollout is WAITING at
     /// (`ContinueServiceDeployment$hookId`: "The ID of the PAUSED lifecycle hook to act
-    /// on"), so a rollout that stands at no hook, a hook that is not the one waiting and a
-    /// hook whose action was already taken are each refused and change nothing.
+    /// on"). A hookId naming a hook of that rollout that already took THIS action asks the
+    /// rollout to leave a stage it has already left: that call has had its effect, so it is
+    /// answered and changes nothing. Every other request is refused and changes nothing: a
+    /// rollout that stands at no hook, a hook id that rollout holds none of, a hook whose
+    /// wait was taken away or ran out, a hook that took the OTHER action — which this one
+    /// cannot undo — and a rollback the service has no earlier revision for.
     pub fn act_on_lifecycle_hook(
         &mut self,
         arn: &str,
@@ -1313,7 +1319,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .awaiting_hook()
             .is_none_or(|hook| hook.hook_id != hook_id)
         {
-            return Err(LifecycleHookRefusal::NotAwaitingAction);
+            return if record.lifecycle_hooks.iter().any(|hook| {
+                hook.hook_id == hook_id && hook.taken_action.as_deref() == Some(action)
+            }) {
+                Ok(())
+            } else {
+                Err(LifecycleHookRefusal::NotAwaitingAction)
+            };
         }
         // The action is taken BEFORE the hook is marked, so a rollback that cannot be
         // carried out leaves the hook waiting for one that can.
@@ -1325,6 +1337,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .find(|hook| hook.hook_id == hook_id)
             {
                 hook.status = LIFECYCLE_HOOK_SUCCEEDED.to_string();
+                // The action this hook took, so a repeat of it is answered as the call that
+                // has already had its effect and a different one is refused.
+                hook.taken_action = Some(action.to_string());
             }
         }
         Ok(())

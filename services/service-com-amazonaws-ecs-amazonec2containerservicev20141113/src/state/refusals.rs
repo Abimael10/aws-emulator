@@ -1434,14 +1434,20 @@ pub fn lifecycle_hook_id(hook_type: &str, id: &str) -> String {
 }
 
 /// Whether `hook_id` has the [`LIFECYCLE_HOOK_ID_FORMAT`] form: the `ecs` segment, then a
-/// non-empty hook type, then a non-empty id. The id segment keeps any hyphen of its own, so
-/// an id spelled as a UUID is one value and not three.
+/// non-empty hook type, then the id of the hook — which Amazon ECS spells as a UUID
+/// ([`is_uuid`]), so the id segment keeps the hyphens of its own groups and is ONE value and
+/// not five.
+///
+/// A `hookId` whose id segment is not spelled that way is not an id this service could have
+/// minted, so it names no hook at all and is refused for its FORMAT — before any rollout or
+/// hook of one is looked up, which is what tells that refusal apart from the one a
+/// well-formed id that is not the waiting hook earns.
 pub fn is_lifecycle_hook_id(hook_id: &str) -> bool {
     hook_id
         .strip_prefix(LIFECYCLE_HOOK_ID_PREFIX)
         .and_then(|rest| rest.strip_prefix('-'))
         .and_then(|rest| rest.split_once('-'))
-        .is_some_and(|(hook_type, id)| !hook_type.is_empty() && !id.is_empty())
+        .is_some_and(|(hook_type, id)| !hook_type.is_empty() && is_uuid(id))
 }
 
 /// The `InvalidParameterException` message for a `hookId` that is not of the form

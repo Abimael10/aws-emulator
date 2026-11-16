@@ -1219,9 +1219,14 @@ async fn naming_both_a_launch_type_and_a_strategy_is_refused_with_one_sentence()
     )
     .await;
 
-    /// The sentence a request naming both earns.
+    /// The sentence a request that places a SERVICE naming both earns.
     const BOTH: &str = "Specifying both a launch type and capacity provider strategy is not \
                         supported. Remove one and try again.";
+
+    /// The sentence a request that places a STANDALONE TASK naming both earns: the same
+    /// conflict, worded as that operation words it.
+    const BOTH_FOR_A_TASK: &str =
+        "You may choose a capacity provider or a launch type but not both.";
 
     // The rows differ along the launch type, the provider the strategy names and how many
     // entries it has — and along the operation, since both operations that place work take
@@ -1248,9 +1253,10 @@ async fn naming_both_a_launch_type_and_a_strategy_is_refused_with_one_sentence()
     ];
 
     for (index, (case, launch_type, strategy)) in rows.iter().enumerate() {
-        for (operation, request) in [
+        for (operation, expected, request) in [
             (
                 "CreateService",
+                BOTH,
                 json!({
                     "cluster": SERVICE_CLUSTER,
                     "serviceName": format!("bothways{index}"),
@@ -1262,6 +1268,7 @@ async fn naming_both_a_launch_type_and_a_strategy_is_refused_with_one_sentence()
             ),
             (
                 "RunTask",
+                BOTH_FOR_A_TASK,
                 json!({
                     "cluster": SERVICE_CLUSTER,
                     "taskDefinition": SERVICE_FAMILY,
@@ -1277,8 +1284,8 @@ async fn naming_both_a_launch_type_and_a_strategy_is_refused_with_one_sentence()
                 "case {case:?}: expected an {INVALID_PARAMETER}, got {code} with {message:?}"
             );
             assert_eq!(
-                message, BOTH,
-                "case {case:?}: expected the refusal to read {BOTH:?}, got {message:?}"
+                message, expected,
+                "case {case:?}: expected the refusal to read {expected:?}, got {message:?}"
             );
         }
     }

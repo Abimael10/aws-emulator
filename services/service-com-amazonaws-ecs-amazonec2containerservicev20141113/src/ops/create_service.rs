@@ -442,9 +442,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The platform version that your tasks in the service are running on ... If one
-        // isn't specified, the LATEST platform version is used": a version this service
-        // does not know names no platform, which is what `PlatformUnknownException` is
-        // modelled for.
+        // isn't specified, the LATEST platform version is used": a version Fargate once
+        // published and has since RETIRED is no longer one any account may place tasks on,
+        // which is the entitlement `AccessDeniedException` is modelled for
+        // ([`crate::state::names_retired_platform_version`]).
+        if crate::state::names_retired_platform_version(input.platform_version.as_deref()) {
+            return Err(CreateServiceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::PLATFORM_ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // Every other value outside the published list names no platform, which is what
+        // `PlatformUnknownException` is modelled for.
         if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
             return Err(CreateServiceErrorModeled::PlatformUnknownException(
                 PlatformUnknownException {
@@ -785,7 +796,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // definition this service runs, which is state an earlier call wrote, so none of
         // them can be expressed in the model and all of them have to be checked here —
         // before the service is stored, since AWS creates nothing when it refuses.
+        //
+        // WHERE the tasks would run comes first: "Amazon ECS validates the task definition
+        // parameters with those supported by the launch type", so a revision that was never
+        // validated against the infrastructure this service names cannot be placed on it at
+        // all — which it is refused for whatever else the request pairs with the revision
+        // ([`crate::state::validate_placement_launch_type`]). Decided on the RESOLVED
+        // placement: the `launchType`, the capacity providers its strategy names, or the
+        // cluster's default strategy, which is what a service naming neither runs on.
+        let placement_strategy: &[CapacityProviderStrategyItem] = if requested_strategy.is_empty() {
+            &cluster_default_strategy
+        } else {
+            &requested_strategy
+        };
         if let Some(definition) = definition.as_ref() {
+            if let Err(message) = crate::state::validate_placement_launch_type(
+                definition,
+                input.launch_type.as_deref(),
+                placement_strategy,
+            ) {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             // An `awsvpc` task gets its own elastic network interface, so the service has
             // to say which subnets and security groups it takes.
             if let Some(message) = crate::state::network_configuration_violation(
@@ -854,32 +890,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateServiceErrorModeled::PlatformUnknownException(
                     PlatformUnknownException {
                         message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
-        }
-
-        // A revision is placed on the infrastructure it was validated against
-        // (`TaskDefinition$compatibilities`), whichever way the placement named that
-        // infrastructure — its `launchType`, the capacity providers its strategy names, or
-        // the cluster's default strategy, which is what a service naming neither runs on —
-        // so a service that asks for one the stored revision does not support is refused
-        // before anything is stored ([`crate::state::validate_placement_launch_type`]).
-        let placement_strategy: &[CapacityProviderStrategyItem] = if requested_strategy.is_empty() {
-            &cluster_default_strategy
-        } else {
-            &requested_strategy
-        };
-        if let Some(found) = &definition {
-            if let Err(message) = crate::state::validate_placement_launch_type(
-                found,
-                input.launch_type.as_deref(),
-                placement_strategy,
-            ) {
-                return Err(CreateServiceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
                     },
                 )
                 .into());

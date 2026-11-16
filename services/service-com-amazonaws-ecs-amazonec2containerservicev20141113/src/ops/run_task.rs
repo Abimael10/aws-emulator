@@ -326,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(
-                        crate::state::LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE
+                        crate::state::RUN_TASK_LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE
                             .to_string(),
                     ),
                 },
@@ -346,9 +346,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A platform version is only specified for tasks hosted on Fargate. If one
-        // isn't specified, the LATEST platform version is used" — and one that names no
-        // platform version this service knows names no platform at all, which is what
-        // `PlatformUnknownException` is modelled for.
+        // isn't specified, the LATEST platform version is used" — and a version Fargate
+        // once published and has since RETIRED is no longer one any account may place a
+        // task on, which is the entitlement `AccessDeniedException` is modelled for
+        // ([`crate::state::names_retired_platform_version`]), told apart from a value
+        // that never named a platform at all.
+        if crate::state::names_retired_platform_version(input.platform_version.as_deref()) {
+            return Err(RunTaskErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::PLATFORM_ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // Every other value outside the published list names no platform at all, which is
+        // what `PlatformUnknownException` is modelled for.
         if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
             return Err(RunTaskErrorModeled::PlatformUnknownException(
                 PlatformUnknownException {
@@ -477,10 +489,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Both rules below are cross-field: each is keyed on the REGISTERED task
-        // definition this call runs, which the model cannot express, so both are checked
-        // here — before any task is stored, since AWS runs nothing when it refuses.
+        // The rules below are cross-field: each is keyed on the REGISTERED task
+        // definition this call runs, which the model cannot express, so all of them are
+        // checked here — before any task is stored, since AWS runs nothing when it refuses.
         //
+        // WHERE the tasks would run comes first: "Amazon ECS validates the task definition
+        // parameters with those supported by the launch type", so a revision that was never
+        // validated against the infrastructure this placement names cannot be placed on it
+        // at all — which it is refused for whatever else the request pairs with the
+        // revision ([`crate::state::validate_placement_launch_type`]). Decided on the
+        // RESOLVED placement: the launch type the request named, else the capacity providers
+        // of its strategy, else the cluster's own default.
+        let effective_strategy = if strategy.is_empty() {
+            cluster_default_strategy
+        } else {
+            strategy
+        };
+        if let Err(message) = crate::state::validate_placement_launch_type(
+            &definition,
+            input.launch_type.as_deref(),
+            &effective_strategy,
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // An `awsvpc` task gets its own elastic network interface, so the run has to say
         // which subnets and security groups it takes.
         if let Some(message) = crate::state::network_configuration_violation(
@@ -522,10 +558,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A revision is placed on the infrastructure it was validated against
-        // (`TaskDefinition$compatibilities`), which is decided on the RESOLVED placement
-        // below, once the cluster's default strategy has been applied.
-
         let requested = usize::try_from(count).unwrap_or(usize::MAX);
         if guard.tasks.len() + requested > crate::state::MAX_TASKS {
             return Err(RunTaskErrorModeled::ClientException(ClientException {
@@ -539,12 +571,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If no capacityProviderStrategy or launchType is specified, the
         // defaultCapacityProviderStrategy for the cluster is used" — and when the
-        // cluster has none either, the task runs on the EC2 capacity registered to it.
-        let effective_strategy = if strategy.is_empty() {
-            cluster_default_strategy
-        } else {
-            strategy
-        };
+        // cluster has none either, the task runs on the EC2 capacity registered to it
+        // (`effective_strategy`, resolved above where the placement was first judged).
         let (launch_type, capacity_provider_name) = match input.launch_type.clone() {
             Some(launch_type) => (Some(launch_type), None),
             None => match effective_strategy.first() {
@@ -552,26 +580,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()), None),
             },
         };
-
-        // A revision is placed on the infrastructure it was validated against
-        // (`TaskDefinition$compatibilities`), whichever way the placement named that
-        // infrastructure — its `launchType`, the capacity providers its strategy names, or
-        // the cluster's default strategy, which is what a placement naming neither runs on
-        // — so a placement the stored revision does not support is refused before any task
-        // is created ([`crate::state::validate_placement_launch_type`]). Decided on the
-        // resolved placement below, where the cluster's default has been applied.
-        if let Err(message) = crate::state::validate_placement_launch_type(
-            &definition,
-            input.launch_type.as_deref(),
-            &effective_strategy,
-        ) {
-            return Err(RunTaskErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
 
         // A public IP is attached to the task's OWN elastic network interface, which only
         // the Fargate infrastructure does — so whether this run may ask for one is decided

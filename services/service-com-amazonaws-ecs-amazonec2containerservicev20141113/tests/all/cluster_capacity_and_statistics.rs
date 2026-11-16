@@ -48,7 +48,8 @@ const LAUNCH_TYPES: [(&str, &str); 4] = [
 /// The platform versions AWS Fargate PUBLISHES, from the `platformVersion` doc's "Fargate
 /// platform versions" page: the newest Linux one (`1.4.0`) and the newest Windows one
 /// (`1.0.0`), plus the `LATEST` alias the member's own doc names. The earlier Linux
-/// versions (`1.3.0` and below) are retired, so they are rows of the REFUSED table below.
+/// versions (`1.3.0` and below) are retired, which the entitlement table in
+/// `refusal_classes_and_validation_order.rs` holds.
 const KNOWN_PLATFORM_VERSIONS: [&str; 3] = ["LATEST", "1.4.0", "1.0.0"];
 
 /// The `PlatformUnknownException` sentence (`state`'s `PLATFORM_UNKNOWN_MESSAGE`): a
@@ -370,11 +371,11 @@ async fn a_platform_version_outside_the_published_list_is_refused() {
     }
 
     // Rows past the list: a version that does not exist, one just past the newest, a
-    // partial version, the alias in the wrong case, and the retired Linux versions — the
-    // member is a string the service matches exactly against what Fargate publishes.
-    for version in [
-        "9.9.9", "1.5.0", "1.4", "latest", "FARGATE", "1.3.0", "1.2.0", "1.1.0",
-    ] {
+    // partial version and the alias in the wrong case — the member is a string the service
+    // matches exactly against what Fargate publishes. The RETIRED Linux versions are a
+    // table of their own below: a version Fargate published and withdrew is a different
+    // condition from a value that never named one.
+    for version in ["9.9.9", "1.5.0", "1.4", "latest", "FARGATE"] {
         let case = format!("unknown platformVersion {version}");
         let (code, message) = refusal(
             &router,

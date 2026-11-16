@@ -279,6 +279,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `managedScaling` is a RANGE: its minimum scaling step size is the floor and its
+        // maximum the ceiling of one scale-out step, so a block whose minimum is above its
+        // maximum describes no step at all. It is the same class of fault as a name no
+        // provider may carry — a value the client got wrong — which is the `ClientException`
+        // ("it might be specifying an identifier that isn't valid") this operation answers
+        // its other request-shape faults in. Judged on the values the request carried, each
+        // one it left out standing at the default its own member documents, and BEFORE the
+        // request is weighed against what the account already holds — the group it would
+        // bind, the name it would take — since a block that describes no step is a bad
+        // parameter whatever else the request would conflict with
+        // ([`crate::state::managed_scaling_step_size_violation`]).
+        if let Some(message) = crate::state::managed_scaling_step_size_violation(
+            input
+                .auto_scaling_group_provider
+                .as_ref()
+                .and_then(|provider| provider.managed_scaling.as_ref()),
+        ) {
+            return Err(
+                CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // An ARN is a WHOLE identifier, Region and account included, so both segments are
         // checked before the identifier is resolved
         // ([`crate::state::request_arn_violation`]).

@@ -213,6 +213,10 @@ mod primary_task_set;
 // follows its file, as the layout rule requires.
 #[path = "all/probe_monitoring.rs"]
 mod probe_monitoring;
+// Which refusal a request earns when more than one rule could refuse it, and which
+// modelled error class each condition is answered in.
+#[path = "all/refusal_classes_and_validation_order.rs"]
+mod refusal_classes_and_validation_order;
 #[path = "all/registration_credential_rules.rs"]
 mod registration_credential_rules;
 #[path = "all/reserved_tag_prefix.rs"]

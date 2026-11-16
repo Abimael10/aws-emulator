@@ -42,10 +42,6 @@ use crate::ecs_wire::{
     SIGNED_REGION,
 };
 
-/// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
-/// due, with margin for a loaded test machine.
-const ONE_SPAN: Duration = Duration::from_millis(900);
-
 /// The cluster every service below is created in.
 const CLUSTER: &str = "demo";
 
@@ -111,7 +107,13 @@ async fn paused_service(
 }
 
 /// The stored rollout `arn` names, as `DescribeServiceDeployments` reports it.
-async fn describe_deployment(router: &MultiServiceRouter, arn: &str, case: &str) -> Value {
+///
+/// Shared with the sibling suites that read a rollout back through the same operation.
+pub(crate) async fn describe_deployment(
+    router: &MultiServiceRouter,
+    arn: &str,
+    case: &str,
+) -> Value {
     let body = ok(
         router,
         "DescribeServiceDeployments",
@@ -128,7 +130,9 @@ async fn describe_deployment(router: &MultiServiceRouter, arn: &str, case: &str)
 }
 
 /// The hook of `deployment` that is waiting for an action.
-fn awaiting_hook(deployment: &Value, case: &str) -> Value {
+///
+/// Shared with the sibling suites that act on the hook a rollout stands at.
+pub(crate) fn awaiting_hook(deployment: &Value, case: &str) -> Value {
     let waiting: Vec<Value> = list(deployment, "lifecycleHookDetails", case)
         .into_iter()
         .filter(|hook| hook["status"] == json!(AWAITING_ACTION))
@@ -147,7 +151,9 @@ fn awaiting_hook(deployment: &Value, case: &str) -> Value {
 /// The stage a rollout stops at is one the CLOCK brings it to, so the wait is for that
 /// CONDITION rather than for a span: each read materialises what the clock has made due, so
 /// this looks again until a hook is waiting or a generous deadline passes.
-async fn deployment_awaiting_a_hook(
+///
+/// Shared with the sibling suites that wait for a rollout to reach a PAUSE hook.
+pub(crate) async fn deployment_awaiting_a_hook(
     router: &MultiServiceRouter,
     arn: &str,
     case: &str,
@@ -219,8 +225,7 @@ async fn a_hook_id_outside_the_minted_form_is_refused_by_shape() {
         "hook id shapes",
     )
     .await;
-    tokio::time::sleep(ONE_SPAN).await;
-    let deployment = describe_deployment(&router, &arn, "hook id shapes").await;
+    let deployment = deployment_awaiting_a_hook(&router, &arn, "hook id shapes").await;
     let waiting_hook_id = string(
         &awaiting_hook(&deployment, "hook id shapes"),
         "hookId",
@@ -229,7 +234,8 @@ async fn a_hook_id_outside_the_minted_form_is_refused_by_shape() {
 
     // The rows differ along WHAT about the form is wrong: the leading segment, the
     // separator, an empty segment, a missing segment, the letter case of the literal
-    // segment, and a bare id of the kind the format wraps.
+    // segment, an id segment that is not spelled as a UUID, and a bare id of the kind the
+    // format wraps.
     let malformed = [
         ("no segment of the form at all", "not-a-paused-hook"),
         ("an empty hookId", ""),
@@ -242,6 +248,15 @@ async fn a_hook_id_outside_the_minted_form_is_refused_by_shape() {
             "ecs--00000000-0000-0000-0000-000000000001",
         ),
         ("the literal segment in upper case", "ECS-pause-0001"),
+        ("an id segment that is not a UUID", "ecs-p-1"),
+        (
+            "an id segment of a UUID's groups in the wrong widths",
+            "ecs-pause-0000000-0000-0000-0000-000000000001",
+        ),
+        (
+            "an id segment whose groups are not hexadecimal",
+            "ecs-pause-0000000g-0000-0000-0000-000000000001",
+        ),
         (
             "a bare id with no literal segment",
             "00000000-0000-0000-0000-000000000001",
@@ -272,7 +287,10 @@ async fn a_hook_id_outside_the_minted_form_is_refused_by_shape() {
             "a well-formed id of another hook type",
             unminted_hook_id("aws_lambda"),
         ),
-        ("the shortest well-formed id", "ecs-p-1".to_string()),
+        (
+            "a well-formed id spelled in upper-case hexadecimal",
+            "ecs-pause-ABCDEF00-0000-0000-0000-0000000000FF".to_string(),
+        ),
     ] {
         let (code, message) = refused_continue(&router, &arn, &hook_id, case).await;
         assert_eq!(
@@ -344,8 +362,7 @@ async fn a_reported_hook_id_carries_the_hook_type_of_the_hook_it_names() {
             case,
         )
         .await;
-        tokio::time::sleep(ONE_SPAN).await;
-        let deployment = describe_deployment(&router, &arn, case).await;
+        let deployment = deployment_awaiting_a_hook(&router, &arn, case).await;
         let hook = awaiting_hook(&deployment, case);
         let hook_id = string(&hook, "hookId", case);
         let target_type = string(&hook, "targetType", case);

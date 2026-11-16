@@ -375,9 +375,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The platform version that your tasks in the service run on ... If one isn't
-        // specified, the LATEST platform version is used": a version this service does
-        // not know names no platform, which is what `PlatformUnknownException` is
-        // modelled for.
+        // specified, the LATEST platform version is used": a version Fargate once published
+        // and has since RETIRED is no longer one any account may place tasks on, which is
+        // the entitlement `AccessDeniedException` is modelled for
+        // ([`crate::state::names_retired_platform_version`]).
+        if crate::state::names_retired_platform_version(input.platform_version.as_deref()) {
+            return Err(UpdateServiceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::PLATFORM_ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // Every other value outside the published list names no platform, which is what
+        // `PlatformUnknownException` is modelled for.
         if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
             return Err(UpdateServiceErrorModeled::PlatformUnknownException(
                 PlatformUnknownException {
@@ -777,7 +788,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let effective_execute_command = input
             .enable_execute_command
             .unwrap_or(snapshot.enable_execute_command);
+        // A revision is placed on the infrastructure it was validated against
+        // (`TaskDefinition$compatibilities`), so an update that moves the service onto a
+        // revision its placement does not support is refused, as its create was — and it is
+        // refused for THAT whatever else the request pairs with the revision, so the check
+        // stands ahead of the other rules keyed on it. A request that moves the service onto
+        // a capacity-provider strategy takes the launch type off it, and the strategy it
+        // moves to is where the tasks then run
+        // ([`crate::state::validate_placement_launch_type`]).
+        let (effective_launch_type, effective_strategy) =
+            match input.capacity_provider_strategy.as_deref() {
+                Some(strategy) if !strategy.is_empty() => (None, strategy),
+                _ => (snapshot.launch_type.as_deref(), [].as_slice()),
+            };
         if let Some(definition) = definition.as_ref() {
+            if let Err(message) = crate::state::validate_placement_launch_type(
+                definition,
+                effective_launch_type,
+                effective_strategy,
+            ) {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             if let Some(message) = crate::state::network_configuration_violation(
                 &definition.network_mode,
                 effective_network_configuration,
@@ -848,32 +884,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-
-        // A revision is placed on the infrastructure it was validated against
-        // (`TaskDefinition$compatibilities`), so an update that moves the service onto a
-        // revision its placement does not support is refused, as its create was. A request
-        // that moves the service onto a capacity-provider strategy takes the launch type
-        // off it, and the strategy it moves to is where the tasks then run
-        // ([`crate::state::validate_placement_launch_type`]).
-        let (effective_launch_type, effective_strategy) =
-            match input.capacity_provider_strategy.as_deref() {
-                Some(strategy) if !strategy.is_empty() => (None, strategy),
-                _ => (snapshot.launch_type.as_deref(), [].as_slice()),
-            };
-        if let Some(found) = &definition {
-            if let Err(message) = crate::state::validate_placement_launch_type(
-                found,
-                effective_launch_type,
-                effective_strategy,
-            ) {
-                return Err(UpdateServiceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-                .into());
-            }
         }
 
         // A public IP is attached to the task's OWN elastic network interface, which only

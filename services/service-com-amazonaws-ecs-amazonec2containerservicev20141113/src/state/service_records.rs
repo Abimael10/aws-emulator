@@ -498,6 +498,13 @@ pub struct LifecycleHookRecord {
     /// `DeploymentLifecycleHookDetail$timeoutAction`: "The action Amazon ECS takes when the
     /// lifecycle hook times out."
     pub timeout_action: String,
+    /// The `DeploymentLifecycleHookAction` a caller took on this hook, once one has been
+    /// taken — what makes a REPEAT of that same action a call that has already had its
+    /// effect, and an action that differs from it one the rollout can no longer take
+    /// ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::act_on_lifecycle_hook`]).
+    /// `None` for a hook nobody has acted on, and for one the clock's timeout action
+    /// resumed.
+    pub taken_action: Option<String>,
 }
 
 /// A PAUSE stop a rollout has ahead of it: the stage it will pause at, with the timeout
@@ -1401,6 +1408,31 @@ pub(super) struct DeploymentCounters {
 /// Defined once, so every member whose id AWS spells as a UUID takes the same shape.
 pub(super) fn uuid_from_sequence(sequence: u64) -> String {
     format!("{sequence:08x}-0000-0000-0000-{sequence:012x}")
+}
+
+/// The widths of the five hyphen-separated groups of a UUID, in order — the shape
+/// [`uuid_from_sequence`] spells and the one a value is read back against.
+const UUID_GROUP_WIDTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `value` is spelled as a UUID: five hyphen-separated groups of hexadecimal digits
+/// of the widths [`UUID_GROUP_WIDTHS`] names, in either case.
+///
+/// The check of a value a client sends back for an identifier this service spells as a UUID,
+/// so a value it minted always reads as one. The HYPHENATED form is the only one accepted,
+/// because it is the only one AWS mints such an id in: a general UUID parser would also take
+/// the simple and braced spellings, which no identifier of this service is ever handed out
+/// in and which a refusal would then have to accept.
+pub(super) fn is_uuid(value: &str) -> bool {
+    let mut groups = value.split('-');
+    for width in UUID_GROUP_WIDTHS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
 }
 
 /// The `Scale` a deployment is reported with: the share of the service's `desiredCount`
