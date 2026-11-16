@@ -295,24 +295,38 @@ impl Denial {
         }
     }
 
-    /// The transitions the denied resource goes through: the update of it opened, and then
-    /// failed carrying the policy's verdict. It keeps the identifier it has, nothing having
-    /// been done to it.
-    pub fn transitions(&self) -> Vec<ResourceTransition> {
-        let opening = ResourceTransition {
+    /// The transitions the denied resource goes through: the update of it FAILED carrying
+    /// the policy's verdict, and — where the failed update is rolled back — the rollback
+    /// SKIPPING it.
+    ///
+    /// Nothing was done to the resource: CloudFormation denied the action by the policy in
+    /// force before it asked the service that owns the resource for anything, so there is no
+    /// update in progress to report and the resource keeps the identifier it has. What the
+    /// ROLLBACK then does with it is nothing either — there is no change of this update's to
+    /// put back — which is the resource reaching `UPDATE_COMPLETE` carrying the sentence that
+    /// says why it is complete without having been put back
+    /// ([`super::stack::RESOURCE_SKIPPED_DURING_UPDATE_ROLLBACK`]), the same event a rollback
+    /// records for every resource it skips. `rolled_back` is whether the failed update is
+    /// rolled back at all: a caller that asked for the failed state to be kept
+    /// (`DisableRollback`) gets no rollback, and so no such event.
+    pub fn transitions(&self, rolled_back: bool) -> Vec<ResourceTransition> {
+        let failed = ResourceTransition {
             logical_id: self.logical_id.clone(),
             resource_type: self.resource_type.clone(),
             physical_resource_id: self.physical_resource_id.clone(),
-            status: resource_status::UPDATE_IN_PROGRESS.to_string(),
-            reason: None,
-            resource_properties: None,
-        };
-        let failed = ResourceTransition {
             status: resource_status::UPDATE_FAILED.to_string(),
             reason: Some(self.reason()),
-            ..opening.clone()
+            resource_properties: None,
         };
-        vec![opening, failed]
+        if !rolled_back {
+            return vec![failed];
+        }
+        let skipped = ResourceTransition {
+            status: resource_status::UPDATE_COMPLETE.to_string(),
+            reason: Some(super::stack::RESOURCE_SKIPPED_DURING_UPDATE_ROLLBACK.to_string()),
+            ..failed.clone()
+        };
+        vec![failed, skipped]
     }
 }
 

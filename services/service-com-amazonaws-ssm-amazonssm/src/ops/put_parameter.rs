@@ -269,6 +269,13 @@ struct Existing {
     type_: Option<String>,
     /// Its current `Tier`, which an update may raise but not lower.
     tier: Option<String>,
+    /// Its current `DataType`, `Description` and `AllowedPattern`: the attributes an
+    /// update that names none inherits, exactly as it inherits the type above.
+    data_type: Option<String>,
+    description: Option<String>,
+    allowed_pattern: Option<String>,
+    /// The KMS key its value is sealed under, which only a `SecureString` carries.
+    key_id: Option<String>,
     /// How many versions are retained right now.
     retained: usize,
     /// The oldest retained version's number when that version carries a label, which
@@ -527,13 +534,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let data_type = input
             .data_type
             .clone()
-            .filter(|data_type| !data_type.is_empty())
-            .unwrap_or_else(|| crate::state::DEFAULT_DATA_TYPE.to_string());
-        if !crate::state::PARAMETER_DATA_TYPES.contains(&data_type.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "DataType '{data_type}' isn't supported; the supported data type values are {}",
-                crate::state::PARAMETER_DATA_TYPES.join(" ")
-            )));
+            .filter(|data_type| !data_type.is_empty());
+        if let Some(data_type) = data_type.as_deref() {
+            if !crate::state::PARAMETER_DATA_TYPES.contains(&data_type) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "DataType '{data_type}' isn't supported; the supported data type values are {}",
+                    crate::state::PARAMETER_DATA_TYPES.join(" ")
+                )));
+            }
         }
         // The `aws:ec2:image` data type's own validation — "that the specified AMI is
         // available in your Amazon Web Services account" — is the asynchronous one the
@@ -614,6 +622,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let existing = store.parameter(&region, name).map(|record| Existing {
                 type_: record.latest().map(|latest| latest.type_.clone()),
                 tier: record.latest().map(|latest| latest.tier.clone()),
+                data_type: record.latest().map(|latest| latest.data_type.clone()),
+                description: record.latest().and_then(|latest| latest.description.clone()),
+                allowed_pattern: record
+                    .latest()
+                    .and_then(|latest| latest.allowed_pattern.clone()),
+                key_id: record.latest().and_then(|latest| latest.key_id.clone()),
                 retained: record.versions.len(),
                 labelled_oldest: record
                     .oldest()
@@ -667,6 +681,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         };
+        // ...and so is every other attribute of the parameter the request does not carry:
+        // a put that OVERWRITES one changes what it states, and what it states nothing about
+        // is the parameter's already — the same inheritance the type above goes through
+        // ("specifying a parameter type isn't required when updating a parameter"), which a
+        // parameter's `Tier` is held to as well ([`crate::state::resolve_tier`]). A CREATE
+        // has nothing to inherit, so it takes the documented default of each.
+        let data_type = data_type
+            .or_else(|| existing.as_ref().and_then(|held| held.data_type.clone()))
+            .unwrap_or_else(|| crate::state::DEFAULT_DATA_TYPE.to_string());
+        let description = input
+            .description
+            .clone()
+            .or_else(|| existing.as_ref().and_then(|held| held.description.clone()));
+        let allowed_pattern = input.allowed_pattern.clone().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|held| held.allowed_pattern.clone())
+        });
 
         // A `KeyId` only means anything for a `SecureString`: "To use a custom KMS key,
         // choose the SecureString data type with the Key ID parameter." The type under
@@ -711,13 +743,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::value_limit_message(&tier),
             ));
         }
-        // The value is matched against the request's `AllowedPattern` only now that it
-        // is known to be within the tier's content size limit, so the haystack a
-        // caller-supplied expression is matched against is bounded. A value that fails a
-        // well-formed pattern is the VALUE's fault; a pattern that is no regular
-        // expression is the PATTERN's, and the two are reported as the different
-        // refusals they are.
-        match allowed_pattern_rejection(input.allowed_pattern.as_deref(), &type_, &input.value) {
+        // The value is matched against the `AllowedPattern` IN FORCE — the request's, else
+        // the one the parameter already carries — only now that it is known to be within the
+        // tier's content size limit, so the haystack a caller-supplied expression is matched
+        // against is bounded. A value that fails a well-formed pattern is the VALUE's fault;
+        // a pattern that is no regular expression is the PATTERN's, and the two are reported
+        // as the different refusals they are.
+        match allowed_pattern_rejection(allowed_pattern.as_deref(), &type_, &input.value) {
             None => {}
             Some(PatternRejection::Pattern(why)) => {
                 return Err(PutParameterErrorModeled::InvalidAllowedPatternException(
@@ -781,10 +813,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If you don't specify a key ID, the system uses the default key associated with
         // your Amazon Web Services account", which Parameter Store reaches through this
-        // alias; a type that is not encrypted carries none.
+        // alias; an OVERWRITE that names none keeps the key the parameter is already sealed
+        // under, as it keeps every other attribute it states nothing about, and a type that
+        // is not encrypted carries none.
         let key_id = match (secure, input.key_id) {
             (true, Some(key_id)) => Some(key_id),
-            (true, None) => Some(crate::state::DEFAULT_SECURE_STRING_KEY_ID.to_string()),
+            (true, None) => Some(
+                existing
+                    .as_ref()
+                    .and_then(|held| held.key_id.clone())
+                    .unwrap_or_else(|| {
+                        crate::state::DEFAULT_SECURE_STRING_KEY_ID.to_string()
+                    }),
+            ),
             (false, _) => None,
         };
         // A `SecureString` is "the KMS ID that you want to use to encrypt a parameter"
@@ -845,8 +886,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             type_,
             data_type,
             tier: tier.clone(),
-            description: input.description,
-            allowed_pattern: input.allowed_pattern,
+            description,
+            allowed_pattern,
             key_id,
             policies: input.policies,
             last_modified_date: now,

@@ -196,6 +196,12 @@ pub struct StoredStack {
     /// ([`reused_client_request_token`]).
     pub client_request_tokens: ::std::collections::VecDeque<StoredRequestToken>,
     pub events: ::std::collections::VecDeque<StoredEvent>,
+    /// The operation whose own WALK already reported the stack's CLEANUP PHASE
+    /// ([`StoredStack::walk_with_cleanup_phase`]), so the conclusion of that operation
+    /// reports no second copy of it. `None` for a stack none of whose operations had a
+    /// cleanup to open, and retired by the next operation that has one — the id is the
+    /// operation's, so a later one is never mistaken for it.
+    pub cleanup_phase_reported_for: Option<String>,
     /// The bytes of caller-sized `ResourceProperties` the event log is holding right now,
     /// kept alongside it so [`StoredStack::push_event`] can honour
     /// [`MAX_EVENT_PROPERTIES_BYTES_PER_STACK`] without walking the log.
@@ -319,6 +325,7 @@ impl StoredStack {
             client_request_token: None,
             client_request_tokens: ::std::collections::VecDeque::new(),
             events: ::std::collections::VecDeque::new(),
+            cleanup_phase_reported_for: None,
             retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
             imports: BTreeMap::new(),
@@ -500,6 +507,16 @@ impl StoredStack {
             stack_outputs: stack_output_values,
         };
         let mut resources = template::provision(&declared, &scope, &mut budget);
+        // The PROCESSED stage is the document CloudFormation deploys, so a resource ATTRIBUTE
+        // written as an intrinsic function carries the value it resolved to there — the same
+        // value the records above carry, resolved out of the same scope, so what
+        // `GetTemplate(TemplateStage=Processed)` serves and what the teardown reads cannot
+        // disagree. A template whose attributes are all written out carries the stage it had,
+        // down to the bytes it was submitted in, so nothing is installed for it below.
+        let resolved_attributes = match self.processed_stage_body() {
+            Some(stage) => template::resolved_resource_attributes(stage, &scope, &mut budget),
+            None => None,
+        };
         let by_logical_id: BTreeMap<String, StoredResource> = resources
             .iter()
             .map(|resource| (resource.logical_id.clone(), resource.clone()))
@@ -621,6 +638,11 @@ impl StoredStack {
         // that id creates a resource of its own.
         self.adopted
             .retain(|logical_id, _| resources.iter().any(|resource| resource.logical_id == *logical_id));
+        // The stage with its resource attributes resolved, installed now that nothing is
+        // reading the scope it was resolved out of.
+        if let Some(resolved) = resolved_attributes {
+            self.processed_template = template::Processed::Applied(resolved);
+        }
         self.pending_deployment = Some(PendingDeployment {
             resources,
             outputs,
@@ -1111,6 +1133,10 @@ impl StoredStack {
             .pending
             .as_ref()
             .map_or_else(SystemTime::now, |pending| pending.started_at);
+        // ...and the stack's own CLEANUP PHASE belongs to the walk where this one has that
+        // phase, ahead of the removals it covers ([`Self::walk_with_cleanup_phase`]).
+        let walked = self.walk_with_cleanup_phase(transitions);
+        let transitions = walked.as_slice();
         // Whatever an earlier walk of this stack still owed happened before this one: it is
         // recorded rather than dropped, and never after what follows it.
         self.flush_resource_timeline(started_at);
@@ -1719,10 +1745,12 @@ impl StoredStack {
     /// rollback owed the owning services), and what is left is the removal this phase reports.
     ///
     /// `terminal` is the status the operation is settling into, so nothing is recorded for an
-    /// operation that is neither an update nor the rollback of one. A stack ALREADY reporting
-    /// the phase has had the event recorded as that cleanup began
-    /// ([`Self::report_update_cleanup`], which a replaced resource's own removal drives), and
-    /// one phase is reported once.
+    /// operation that is neither an update nor the rollback of one. An operation whose own
+    /// WALK already reported the phase — one that really had old physical resources to take
+    /// down, which the phase OPENS ([`Self::walk_with_cleanup_phase`]) — records no second
+    /// copy of it, and neither does a stack already reporting the phase as its status
+    /// ([`Self::report_update_cleanup`], which a replaced resource held for its provider's
+    /// answer drives): one phase is reported once.
     ///
     /// The phase is an EVENT of the operation and not a status the stack rests in: the
     /// terminal status falls due at the same instant, and it is what a client reading the
@@ -1734,15 +1762,75 @@ impl StoredStack {
         operation_id: Option<String>,
         client_request_token: Option<String>,
     ) {
-        let phase = match terminal {
-            status::UPDATE_ROLLBACK_COMPLETE => status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS,
-            status::UPDATE_COMPLETE => status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS,
-            _ => return,
+        let Some(phase) = cleanup_phase_of(terminal) else {
+            return;
         };
         if self.status == phase {
             return;
         }
+        if self.cleanup_phase_reported_for.is_some()
+            && self.cleanup_phase_reported_for == operation_id
+        {
+            return;
+        }
         self.record_event(at, phase, None, operation_id, client_request_token);
+    }
+
+    /// `transitions` with the stack's own CLEANUP PHASE event where the walk that recorded
+    /// them HAS that phase.
+    ///
+    /// "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS — the stack update was successful, and
+    /// CloudFormation is deleting the old resources" is a phase the update ENTERS before it
+    /// takes those resources down, so the phase's event comes before their own: a client
+    /// driving a progress display off the event stream reads that the change landed and that
+    /// what follows is the cleanup, rather than deletions with nothing to account for them.
+    /// The rollback of an update has the same phase of its own, under its own status, and
+    /// enters it the same way.
+    ///
+    /// A walk the phase does not apply to is answered unchanged: one belonging to an
+    /// operation that is neither an update nor the rollback of one, and one that has nothing
+    /// to take down after the change — whose phase is its conclusion's to report
+    /// ([`Self::record_cleanup_phase`]), since there is no removal for it to open. The two
+    /// cannot both report it: this records WHICH operation's phase the walk carries.
+    fn walk_with_cleanup_phase(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+    ) -> Vec<provisioning::ResourceTransition> {
+        let mut walked = transitions.to_vec();
+        let Some(pending) = self.pending.as_ref() else {
+            return walked;
+        };
+        let (Some(phase), operation_id) = (
+            cleanup_phase_of(&pending.status),
+            pending.operation_id.clone(),
+        ) else {
+            return walked;
+        };
+        let removing = |transition: &provisioning::ResourceTransition| {
+            transition.status.starts_with(DELETE_STATUS_PREFIX)
+        };
+        let Some(cleanup) = walked.iter().position(removing) else {
+            return walked;
+        };
+        // A walk that ONLY removes resources is not a change followed by a cleanup: the
+        // removals are the change, so the phase that follows it is the conclusion's.
+        if walked.iter().all(removing) {
+            return walked;
+        }
+        walked.insert(
+            cleanup,
+            provisioning::ResourceTransition {
+                logical_id: self.stack_name.clone(),
+                resource_type: STACK_RESOURCE_TYPE.to_string(),
+                physical_resource_id: Some(self.stack_id.clone()),
+                status: phase.to_string(),
+                reason: None,
+                // The stack is not a resource the template declared properties for.
+                resource_properties: None,
+            },
+        );
+        self.cleanup_phase_reported_for = operation_id;
+        walked
     }
 
     /// The instant the LAST resource the walk in flight acted on finished, if it has one.
@@ -3826,6 +3914,29 @@ pub(crate) fn failed_status_of(in_progress: &str) -> &'static str {
         status::ROLLBACK_IN_PROGRESS => status::ROLLBACK_FAILED,
         status::UPDATE_ROLLBACK_IN_PROGRESS => status::UPDATE_ROLLBACK_FAILED,
         _ => status::CREATE_FAILED,
+    }
+}
+
+/// The `ResourceStatus` prefix of every event of a resource being DELETED, which is what
+/// tells the removals of a walk from the change that precedes them
+/// ([`StoredStack::walk_with_cleanup_phase`]).
+const DELETE_STATUS_PREFIX: &str = "DELETE_";
+
+/// The stack's own CLEANUP PHASE status for an operation settling into `terminal`, or `None`
+/// for an operation that has no such phase — one that is neither an update nor the rollback
+/// of one.
+///
+/// The one reading of that mapping: the walk that enters the phase
+/// ([`StoredStack::walk_with_cleanup_phase`]) and the conclusion that reports it for an
+/// operation with nothing to take down ([`StoredStack::record_cleanup_phase`]) name the same
+/// status for the same operation.
+fn cleanup_phase_of(terminal: &str) -> Option<&'static str> {
+    match terminal {
+        status::UPDATE_ROLLBACK_COMPLETE => {
+            Some(status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS)
+        }
+        status::UPDATE_COMPLETE => Some(status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS),
+        _ => None,
     }
 }
 

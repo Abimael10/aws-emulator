@@ -69,6 +69,13 @@ const IN_PROGRESS: &str = super::IN_PROGRESS_SUFFIX;
 /// the walk that runs against the dependency relation rather than along it.
 const DELETE: &str = "DELETE_";
 
+/// Whether a status is one of the stack's own CLEANUP PHASES rather than a resource status:
+/// the phase a deployment enters before it takes down what its change replaced.
+fn is_cleanup_phase(status: &str) -> bool {
+    status == super::status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS
+        || status == super::status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS
+}
+
 /// How far apart the records a step makes at its START are stamped.
 ///
 /// Every event of a step but the last reports work the service that owns the resource has
@@ -140,6 +147,11 @@ pub struct Step {
     /// Whether this step DELETES its resource, which is what decides the direction it reads
     /// the dependency relation in.
     pub deleting: bool,
+    /// Whether this step is the stack's own CLEANUP PHASE rather than one of its resources:
+    /// the phase OPENS the removals a deployment makes after its change is in force
+    /// ([`crate::state::StoredStack::walk_with_cleanup_phase`]), so it belongs to the same
+    /// pass as they do and is scheduled ahead of them.
+    pub cleanup: bool,
     /// Whether what ENDS this step is owed by a resource signal rather than by the clock:
     /// a wait condition the operation is waiting at finishes when its signals arrive.
     pub gated: bool,
@@ -256,14 +268,18 @@ fn steps_of(transitions: &[ResourceTransition], gated: &BTreeSet<String>) -> Vec
             after: BTreeSet::new(),
             waits_for: Vec::new(),
             deleting: transition.status.starts_with(DELETE),
+            cleanup: is_cleanup_phase(&transition.status),
             pass: 0,
         });
     }
     // A removal the deployment made because the new template replaced the resource happens
-    // after everything that deployment CREATED: a second pass of the same walk.
-    let creates = steps.iter().any(|step| !step.deleting);
+    // after everything that deployment CREATED: a second pass of the same walk. The stack's
+    // own cleanup phase is what OPENS that pass, so it is scheduled with it.
+    let creates = steps
+        .iter()
+        .any(|step| !step.deleting && !step.cleanup);
     for step in &mut steps {
-        if step.deleting && creates {
+        if (step.deleting || step.cleanup) && creates {
             step.pass = 1;
         }
     }

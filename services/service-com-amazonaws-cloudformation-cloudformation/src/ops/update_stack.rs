@@ -1054,8 +1054,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             // The resource's own events come before the stack's terminal one, exactly as a
             // deployment's do: the denial is what the event stream reports about the
-            // protected resource.
-            stack.schedule_resource_events(&denial.transitions());
+            // protected resource, and the rollback that follows a failed update is what then
+            // skips it ([`crate::state::stack_policy::Denial::transitions`]).
+            let rolls_back = !disables_rollback(&input).unwrap_or(stack.disable_rollback);
+            stack.schedule_resource_events(&denial.transitions(rolls_back));
             let failed_at = ::std::time::SystemTime::now();
             // What the STACK reports it failed for is the policy's verdict itself, not the
             // summary of which resources failed ([`crate::state::resource_failure_summary`],
@@ -1071,7 +1073,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whether the stack RESTS in `UPDATE_FAILED`, and so whether an event of its
             // own reports that status
             // ([`crate::state::StoredStack::fail_transition_superseded`]).
-            if disables_rollback(&input).unwrap_or(stack.disable_rollback) {
+            if !rolls_back {
                 stack.fail_transition(failed_at, status::UPDATE_FAILED, reason);
             } else {
                 stack.fail_transition_superseded(failed_at, status::UPDATE_FAILED, reason.clone());
@@ -1250,9 +1252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(disable_rollback) = disables_rollback(&input) {
                 stack.disable_rollback = disable_rollback;
             }
-            if let Some(retain_except_on_create) = input.retain_except_on_create {
-                stack.retain_except_on_create = Some(retain_except_on_create);
-            }
+            // `RetainExceptOnCreate` is THIS operation's, and its documented default is
+            // `false`: "when set to true, newly created resources are deleted when the
+            // operation rolls back […] Default: false" — so an update that states it nowhere
+            // runs under that default rather than under whatever an earlier operation of the
+            // same stack asked for. Recorded on the stack for the same reason the setting
+            // above is: the rollback this update may owe is driven by the clock, with no call
+            // of the client's to consult
+            // ([`crate::state::StoredStack::rolled_back_resource_policies`]).
+            stack.retain_except_on_create = input.retain_except_on_create;
             // "All events triggered by a given stack operation are assigned the same
             // client request token": the caller's token when it named one, otherwise the
             // one CloudFormation assigns the operation itself.

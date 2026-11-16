@@ -694,13 +694,16 @@ pub struct ResourceTransition {
 
 impl ResourceTransition {
     /// The transition a resource is STARTING: `*_IN_PROGRESS`, reporting the identifier the
-    /// resource has at that point — the one it already carries for a change to a resource
-    /// that exists, and none for a create, where the owning service has not answered yet.
+    /// resource has at that point — the one it already carries for a change to, or the
+    /// removal of, a resource that exists.
+    ///
+    /// The walk opens a transition this way only for a resource that IS there: a create's own
+    /// opening transition names no instance yet ([`Self::creating`]).
     fn starting(resource: &StoredResource, status: &str) -> Self {
         Self {
             logical_id: resource.logical_id.clone(),
             resource_type: resource.resource_type.clone(),
-            physical_resource_id: None,
+            physical_resource_id: super::physical_resource_id(resource),
             status: status.to_string(),
             reason: None,
             resource_properties: resource.properties_blob(),
@@ -3950,7 +3953,15 @@ async fn delete_pass(
             }
             continue;
         }
-        if opened.insert(resource.logical_id.clone()) {
+        // The deletion of this record is OPENED only where there is a resource to delete: a
+        // record whose create never produced one in the service that owns the type has no
+        // deletion in progress to report, so its disposal is reported by its completion
+        // alone — which is what the rollback of a FAILED create records for the resource it
+        // failed on. A type this emulator provisions nowhere is the stack's own record of a
+        // resource, and goes through the pair exactly as a resource that exists does.
+        if opened.insert(resource.logical_id.clone())
+            && (resource.materialised || owner.is_none())
+        {
             outcome.transitions.push(ResourceTransition::starting(
                 resource,
                 super::resource_status::DELETE_IN_PROGRESS,

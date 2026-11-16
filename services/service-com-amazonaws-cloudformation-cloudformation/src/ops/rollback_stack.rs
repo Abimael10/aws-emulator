@@ -249,9 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(config) = input.deployment_config.as_ref() {
                 stack.deployment_config = crate::state::stored_deployment_config(Some(config));
             }
-            if let Some(retain_except_on_create) = input.retain_except_on_create {
-                stack.retain_except_on_create = Some(retain_except_on_create);
-            }
+            // `RetainExceptOnCreate` is THIS rollback's, under its documented default of
+            // `false` for a request that states it nowhere.
+            stack.retain_except_on_create = input.retain_except_on_create;
             stack.client_request_token = Some(client_request_token.clone());
             // The rollback starts now and settles into its own terminal status once the clock
             // makes that due; what it has to ask the owning services for comes back here.

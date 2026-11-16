@@ -365,9 +365,13 @@ async fn a_history_read_reports_every_version_a_put_created_oldest_first() {
     }
 }
 
-/// Each entry reports the members ITS OWN put carried, not the newest version's: a
-/// description, an allowed pattern, a data type, a tier and a policy document belong to
-/// the version they were written with.
+/// Each entry reports the members IN FORCE when its own put ran: what that put stated, and
+/// what it inherited from the version before it — a description, an allowed pattern, a data
+/// type, a tier and a policy document belong to the version they were stored with.
+///
+/// A put that OVERWRITES a parameter changes what it states; an attribute it states nothing
+/// about is the parameter's already, exactly as its `Type` and its `Tier` are ("specifying a
+/// parameter type isn't required when updating a parameter").
 #[tokio::test]
 async fn each_entry_reports_the_members_its_own_put_carried() {
     let router = router();
@@ -413,8 +417,10 @@ async fn each_entry_reports_the_members_its_own_put_carried() {
             "a bare second version",
             json!({ "Name": name, "Value": "20", "Overwrite": true }),
             Expected {
-                description: None,
-                allowed_pattern: None,
+                // Stated by neither this put nor the request's own members, so the
+                // parameter's own are what this version carries.
+                description: Some("the first value"),
+                allowed_pattern: Some("^[0-9]+$"),
                 data_type: "text",
                 tier: "Standard",
                 policy_types: vec![],
@@ -432,23 +438,25 @@ async fn each_entry_reports_the_members_its_own_put_carried() {
             }),
             Expected {
                 description: Some("with a policy"),
-                allowed_pattern: None,
+                allowed_pattern: Some("^[0-9]+$"),
                 data_type: "text",
                 tier: "Advanced",
                 policy_types: vec!["Expiration"],
             },
         ),
         (
-            "a version naming another data type",
+            "a version naming another data type and another pattern",
             json!({
                 "Name": name,
                 "Value": "ami-0abcdef1234567890",
                 "Overwrite": true,
+                "AllowedPattern": "^ami-[0-9a-f]+$",
                 "DataType": "aws:ec2:image"
             }),
             Expected {
-                description: None,
-                allowed_pattern: None,
+                description: Some("with a policy"),
+                // A pattern the put STATES is the one in force for its value.
+                allowed_pattern: Some("^ami-[0-9a-f]+$"),
                 data_type: "aws:ec2:image",
                 // An advanced parameter can't be reverted, so a put naming no tier
                 // stays in the one the parameter has.

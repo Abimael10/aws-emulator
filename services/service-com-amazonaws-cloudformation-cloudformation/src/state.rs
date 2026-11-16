@@ -3958,6 +3958,17 @@ pub fn parameters_in_force(
     // parameters are masked, so the flag is recorded here, off the parse this function
     // already did.
     mark_no_echo(&template, &mut in_force);
+    // ...and the one that says each parameter's TYPE, which is what decides the value in
+    // force for the one type whose members are documented to be space trimmed
+    // ([`template::parameter_text_in_force`]): a stack reports the value it really deploys
+    // with rather than the spelling the request happened to use.
+    let declared_types = template.parameter_types();
+    for parameter in &mut in_force {
+        parameter.value = template::parameter_text_in_force(
+            declared_types.get(&parameter.key).map(String::as_str),
+            &parameter.value,
+        );
+    }
     in_force
 }
 

@@ -547,6 +547,12 @@ mod ssm_association_resources;
 mod ssm_document_resources;
 #[path = "all/ssm_maintenance_windows.rs"]
 mod ssm_maintenance_windows;
+// The provisioning and update path of a stack of `AWS::SSM::Parameter` resources: intrinsic
+// resource attributes, a property that resolves to `AWS::NoValue`, what a failed update's
+// rollback gives up, a denied update's events, a replacement's cleanup phase, the effective
+// value of a `CommaDelimitedList` parameter and a create under a taken identifier.
+#[path = "all/ssm_provisioning_update_path.rs"]
+mod ssm_provisioning_update_path;
 #[path = "all/ssm_typed_parameters.rs"]
 mod ssm_typed_parameters;
 #[path = "all/stack_bucket_website_configuration.rs"]

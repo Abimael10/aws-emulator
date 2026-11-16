@@ -1725,8 +1725,8 @@ pub fn provision(
                 // service has created the resource.
                 properties: Value::Null,
                 materialised: false,
-                deletion_policy: declared_deletion_policy(declared),
-                update_replace_policy: declared_update_replace_policy(declared),
+                deletion_policy: declared_deletion_policy(declared, scope, budget),
+                update_replace_policy: declared_update_replace_policy(declared, scope, budget),
             },
         );
         names.push((declared, name));
@@ -2247,7 +2247,8 @@ fn declared_metadata(declared: &DeclaredResource) -> Option<String> {
     Some(metadata.to_string())
 }
 
-/// The `DeletionPolicy` resource attribute a declaration carries, as written.
+/// The `DeletionPolicy` resource attribute a declaration carries, as the deployment reads
+/// it.
 ///
 /// `DeletionPolicy` is the attribute that says "what to do with the resource when its stack
 /// is deleted" — one of the resource attributes CloudFormation defines on a template's
@@ -2257,32 +2258,35 @@ fn declared_metadata(declared: &DeclaredResource) -> Option<String> {
 /// resources ([`super::provisioning::delete`]) reads the attribute of the template that
 /// deployed the resource.
 ///
+/// An attribute written as an INTRINSIC FUNCTION is resolved against the deployment's scope
+/// like any other template expression ([`resolved_attribute`]), so a conditional policy
+/// resolves per stack.
+///
 /// `None` for a declaration that states none — the documented default
-/// ([`super::deletion_policy::DELETE`]) — and for one whose value is not a string, which
-/// names no policy.
-fn declared_deletion_policy(declared: &DeclaredResource) -> Option<String> {
-    declared
-        .declaration
-        .get("DeletionPolicy")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+/// ([`super::deletion_policy::DELETE`]) — and for one whose expression this service cannot
+/// resolve, which names no policy.
+fn declared_deletion_policy(
+    declared: &DeclaredResource,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Option<String> {
+    resolved_attribute(declared, DELETION_POLICY, scope, budget)
 }
 
-/// The `UpdateReplacePolicy` resource attribute a declaration carries, as written: the
-/// attribute that says "how CloudFormation handles the OLD physical resource" when a
-/// deployment REPLACES it, read for the same reason and in the same way as the
-/// `DeletionPolicy` beside it ([`declared_deletion_policy`]) — the record keeps it so the
-/// walk that takes the replaced resource down reads the attribute of the template that
-/// deployed that resource.
+/// The `UpdateReplacePolicy` resource attribute a declaration carries: the attribute that
+/// says "how CloudFormation handles the OLD physical resource" when a deployment REPLACES
+/// it, read for the same reason and in the same way as the `DeletionPolicy` beside it
+/// ([`declared_deletion_policy`]) — the record keeps it so the walk that takes the replaced
+/// resource down reads the attribute of the template that deployed that resource.
 ///
 /// `None` for a declaration that states none — the documented default, which deletes the old
-/// resource — and for one whose value is not a string, which names no policy.
-fn declared_update_replace_policy(declared: &DeclaredResource) -> Option<String> {
-    declared
-        .declaration
-        .get("UpdateReplacePolicy")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+/// resource — and for one whose expression this service cannot resolve.
+fn declared_update_replace_policy(
+    declared: &DeclaredResource,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Option<String> {
+    resolved_attribute(declared, UPDATE_REPLACE_POLICY, scope, budget)
 }
 
 /// Whether a declared resource is one this deployment creates.
@@ -3788,8 +3792,33 @@ fn reference(name: &str, scope: &Scope<'_>) -> Option<Resolved> {
 /// any of the `List<…>` types ("List<Number>", "List<AWS::EC2::Subnet::Id>", …).
 fn is_list_type(declared_type: Option<&str>) -> bool {
     declared_type.is_some_and(|declared| {
-        declared == "CommaDelimitedList" || declared.starts_with("List<")
+        declared == COMMA_DELIMITED_LIST || declared.starts_with("List<")
     })
+}
+
+/// The one parameter type whose VALUE is documented to be normalised: "CommaDelimitedList:
+/// An array of literal strings that are separated by commas. […] Also, each member string
+/// is space trimmed."
+pub const COMMA_DELIMITED_LIST: &str = "CommaDelimitedList";
+
+/// The value in force for a parameter declared `declared_type` and supplied `value`: the
+/// text the request carried, with the one normalisation the parameter types document
+/// applied.
+///
+/// A `CommaDelimitedList`'s members are "space trimmed", so the value in force is its
+/// members with that whitespace gone, written back as the comma-separated list the type is —
+/// which is what every expression reading the parameter resolves against ([`reference`]) and
+/// therefore what the stack reports as that parameter's value. Every other type carries the
+/// text as it was supplied: nothing else the parameter types document normalises a value.
+pub fn parameter_text_in_force(declared_type: Option<&str>, value: &str) -> String {
+    if declared_type != Some(COMMA_DELIMITED_LIST) {
+        return value.to_string();
+    }
+    value
+        .split(LIST_ATTRIBUTE_SEPARATOR)
+        .map(str::trim)
+        .collect::<Vec<&str>>()
+        .join(",")
 }
 
 /// `{"Fn::GetAtt": ["<logical id>", "<attribute>"]}`, or the short form's
@@ -3989,6 +4018,9 @@ fn substitute(
 // deployed) does not depend on the spelling it was submitted in. It is SERVED as JSON:
 // `Original` is the submitted bytes, `Processed` is the expanded document.
 // ---------------------------------------------------------------------------
+
+/// The template section a resource is declared in.
+const RESOURCES_SECTION: &str = "Resources";
 
 /// The template member that declares the transforms to apply.
 const TRANSFORM: &str = "Transform";
@@ -4861,6 +4893,8 @@ mod tests;
 mod return_values;
 mod conditions;
 mod naming_rules;
+mod resource_attributes;
 pub(crate) use naming_rules::*;
+pub(crate) use resource_attributes::*;
 use conditions::chosen_branch;
 pub use return_values::*;

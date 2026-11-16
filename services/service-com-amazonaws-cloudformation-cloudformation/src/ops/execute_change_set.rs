@@ -588,7 +588,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(operation_id),
                     Some(client_request_token),
                 );
-                stack.schedule_resource_events(&denial.transitions());
+                let rolls_back = !disable_rollback.unwrap_or(stack.disable_rollback);
+                stack.schedule_resource_events(&denial.transitions(rolls_back));
                 let failed_at = ::std::time::SystemTime::now();
                 let reason = denial.reason();
                 // The flag in force on THIS execution: the request's, the change set's
@@ -596,7 +597,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the deploying path below gives that member. It decides whether the stack
                 // RESTS in `UPDATE_FAILED`, and so whether an event of its own reports that
                 // status ([`crate::state::StoredStack::fail_transition_superseded`]).
-                if disable_rollback.unwrap_or(stack.disable_rollback) {
+                if !rolls_back {
                     stack.fail_transition(failed_at, status::UPDATE_FAILED, reason);
                 } else {
                     stack.fail_transition_superseded(
@@ -655,9 +656,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(disable_rollback) = disable_rollback {
                 stack.disable_rollback = disable_rollback;
             }
-            if let Some(retain_except_on_create) = input.retain_except_on_create {
-                stack.retain_except_on_create = Some(retain_except_on_create);
-            }
+            // `RetainExceptOnCreate` is THIS execution's, under its documented default of
+            // `false` for an execution that states it nowhere — the same reading
+            // `UpdateStack` gives the member.
+            stack.retain_except_on_create = input.retain_except_on_create;
             // "All events triggered by a given stack operation are assigned the same
             // client request token": the caller's token when it named one, otherwise the
             // one CloudFormation assigns the operation this execution starts.

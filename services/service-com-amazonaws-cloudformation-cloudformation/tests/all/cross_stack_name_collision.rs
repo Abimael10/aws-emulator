@@ -146,10 +146,15 @@ async fn assert_disposed(router: &MultiServiceRouter, case: &str, stack: &str) {
          event, got {statuses:?}"
     );
     assert!(
-        statuses.contains(&resource_status::DELETE_IN_PROGRESS.to_string())
-            && statuses.contains(&resource_status::CREATE_FAILED.to_string()),
-        "case {case:?}: expected the create's failure and the delete that followed it, got \
-         {statuses:?}"
+        statuses.contains(&resource_status::CREATE_FAILED.to_string()),
+        "case {case:?}: expected the create's failure to be reported, got {statuses:?}"
+    );
+    // Nothing was created in the service that owns the type, so there was no deletion to
+    // open: the disposal of the record is its completion alone.
+    assert!(
+        !statuses.contains(&resource_status::DELETE_IN_PROGRESS.to_string()),
+        "case {case:?}: expected no deletion in progress for a resource nothing created, \
+         got {statuses:?}"
     );
 }
 

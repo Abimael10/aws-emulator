@@ -432,6 +432,28 @@ pub(super) const EVENTS_TARGET_PREFIX: &str = "AWSEvents";
 /// create as an UPSERT and so refuses nothing itself.
 pub(super) const ALREADY_EXISTS: &str = "AlreadyExists";
 
+/// The refusal a CREATE answers when the identifier the declaration asks for is ALREADY IN
+/// USE: CloudFormation's own sentence for it ([`super::super::early_validation::already_exists`],
+/// the one wording of that sentence this crate has — the same one the pre-deployment
+/// existence check reports before anything is provisioned), under the `AlreadyExists` class
+/// that sentence belongs to.
+///
+/// What CloudFormation quotes in the failed resource's `ResourceStatusReason` is the resource
+/// HANDLER's message ([`super::super::provisioning`]), and for a collision the handler's own
+/// message is this sentence rather than the owning service's report about its own namespace
+/// — which names no resource type and, for an upsert API, is not refused at all. Every
+/// provider whose type is identified by a name it probes or whose owning API refuses the
+/// second create answers it from here, so the two cannot drift apart.
+pub(super) fn already_in_use(resource: &StoredResource) -> Refusal {
+    Refusal {
+        code: ALREADY_EXISTS.to_string(),
+        message: super::super::early_validation::already_exists(
+            &resource.resource_type,
+            &resource.physical_resource_id,
+        ),
+    }
+}
+
 /// The `AWS::Events::Rule` properties `PutRule` takes under the SAME member name.
 ///
 /// Source: AWS's CloudFormation resource reference for the type against
@@ -518,13 +540,7 @@ pub(super) async fn put_rule(
     resource: &StoredResource,
 ) -> Result<Created, Refusal> {
     if describe_rule(ctx, region, resource).await?.is_some() {
-        return Err(Refusal {
-            code: ALREADY_EXISTS.to_string(),
-            message: format!(
-                "Resource of type '{}' with identifier '{}' already exists.",
-                resource.resource_type, resource.physical_resource_id
-            ),
-        });
+        return Err(already_in_use(resource));
     }
     let reported = put_rule_configuration(
         ctx,
@@ -891,6 +907,11 @@ pub(super) const SSM_TARGET_PREFIX: &str = "AmazonSSM";
 /// again").
 pub(super) const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
 
+/// The error code Systems Manager answers for a put of a parameter it already holds that did
+/// not ask to overwrite it (`ParameterAlreadyExists`: "The parameter already exists. You
+/// can't create duplicate parameters").
+pub(super) const PARAMETER_ALREADY_EXISTS: &str = "ParameterAlreadyExists";
+
 /// The Systems Manager operations the `AWS::SSM::Parameter` provider asks for, by name: the
 /// one call that "create[s] or update[s] a parameter in Parameter Store" and the one that
 /// removes it.
@@ -957,6 +978,11 @@ pub(super) const SSM_PARAMETER_MEMBERS: &[&str] = &[
 ///
 /// The parameter carries the tags the declaration asks for plus the ones CloudFormation
 /// gives the resource ([`tags_of`]), as the list Systems Manager's own `Tag` shape spells.
+///
+/// The put carries no `Overwrite`, so a parameter Parameter Store ALREADY holds is one this
+/// create does not take over: that refusal is the resource's identifier being already in
+/// use, which the handler reports in CloudFormation's own words ([`already_in_use`]) exactly
+/// as the `AWS::Events::Rule` provider beside it does.
 pub(super) async fn put_parameter(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -970,7 +996,12 @@ pub(super) async fn put_parameter(
     }
     call_ssm(ctx, region, PUT_PARAMETER, &Value::Object(request))
         .await
-        .map_err(|refusal| handler_refusal(PUT_PARAMETER, refusal))?;
+        .map_err(|refusal| {
+            if refusal.code == PARAMETER_ALREADY_EXISTS {
+                return already_in_use(resource);
+            }
+            handler_refusal(PUT_PARAMETER, refusal)
+        })?;
     Ok(Created::default())
 }
 

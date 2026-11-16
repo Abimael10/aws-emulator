@@ -96,10 +96,9 @@ const RESOURCES_SECTION: &str = "Resources";
 /// exists, whose variable parts are the declared type and the identifier the declaration
 /// asked for.
 ///
-/// The same sentence is what a resource handler answers at EXECUTION time for the same
-/// collision (`super::provisioner`'s own `AlreadyExists` wording): the two want to be one
-/// helper, which the file-length rule keeps out of reach for now — collapse them here when
-/// that file is split.
+/// The ONE wording of that sentence this crate has: the same sentence is what a resource
+/// HANDLER answers at EXECUTION time for the same collision, which the providers report it
+/// with through `super::provisioner`'s own `already_in_use`.
 pub fn already_exists(resource_type: &str, identifier: &str) -> String {
     format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
 }
