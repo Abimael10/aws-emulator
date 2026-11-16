@@ -187,6 +187,17 @@ pub use step_events::*;
 mod sessions;
 pub use sessions::*;
 
+/// The bootstrap actions a cluster was launched with — what `ListBootstrapActions`
+/// reports, and the page token it pages on — split out and re-exported the same way.
+mod bootstrap_actions;
+pub use bootstrap_actions::*;
+
+/// The application user interfaces served ON a cluster — which of them a cluster serves,
+/// and the one composition of an application-UI address — split out and re-exported the
+/// same way.
+mod on_cluster_app_ui;
+pub use on_cluster_app_ui::*;
+
 /// The SESSION CREDENTIALS a cluster with fine-grained access control issues — which security
 /// configuration activates that, and what the pair it hands out is — split out and
 /// re-exported the same way.
@@ -792,8 +803,14 @@ pub fn termination_protected_message() -> String {
         .to_string()
 }
 
-/// How `GetClusterSessionCredentials` refuses a cluster id it holds no cluster for: the
-/// same statement as [`unknown_cluster_message`] with no id in it.
+/// How an operation that cannot resolve the cluster a request is ABOUT refuses it without
+/// naming the value it was given: the same statement as [`unknown_cluster_message`] with
+/// no id in it.
+///
+/// Recorded behavior: the two operations that word it this way are the ones whose request
+/// does not name a cluster by its id alone — `GetClusterSessionCredentials`, and
+/// `CreatePersistentAppUI`, which names its target by ARN — so Amazon EMR states the rule
+/// and echoes nothing back.
 pub fn unknown_cluster_without_id_message() -> String {
     "Cluster id is not valid.".to_string()
 }
@@ -822,15 +839,27 @@ pub fn runtime_roles_not_enabled_message() -> String {
 ///
 /// Recorded behavior for the text, and it is one template rather than one per operation:
 /// the Studio and notebook-execution surfaces are served by the same backend, so each of
-/// their refusals carries the same parenthesised service detail — the backend's name
-/// ([`STUDIO_BACKEND_SERVICE`]), the status and error code of the refusal, and this
-/// response's own request id
-/// ([`::service_common::query_error_envelope::new_request_id`]). Nothing of the request
-/// is interpolated: a caller matching the sentence sees the same text for every instance
-/// of the class, and an operator reads from the detail which backend refused.
+/// their refusals carries the same parenthesised service detail — which is what
+/// [`backend_refusal_message`] renders for every backend that words its refusals this
+/// way. Nothing of the request is interpolated here: a caller matching the sentence sees
+/// the same text for every instance of the class, and an operator reads from the detail
+/// which backend refused.
 pub fn editors_refusal_message(sentence: &str) -> String {
+    backend_refusal_message(STUDIO_BACKEND_SERVICE, sentence)
+}
+
+/// How a BACKEND of Amazon EMR words a refusal it raises: the sentence, then the
+/// parenthesised detail of the error it raised — the backend's own service name, the
+/// status and error code of the refusal, and this response's own request id
+/// ([`::service_common::query_error_envelope::new_request_id`]).
+///
+/// Recorded behavior for the form, and ONE template for every backend that answers this
+/// way — the Studio and notebook surfaces ([`editors_refusal_message`]) and the
+/// persistent-application-UI surface ([`unknown_persistent_app_ui_message`]) — so two
+/// surfaces cannot come to render the same detail differently.
+fn backend_refusal_message(backend: &str, sentence: &str) -> String {
     format!(
-        "{sentence} (Service: {STUDIO_BACKEND_SERVICE}; Status Code: 400; Error Code: \
+        "{sentence} (Service: {backend}; Status Code: 400; Error Code: \
          InvalidRequestException; Request ID: {}; Proxy: null)",
         ::service_common::query_error_envelope::new_request_id()
     )
@@ -859,6 +888,12 @@ pub fn unknown_notebook_execution_message() -> String {
 /// The service name the EMR Studio backend reports in the refusals it wraps.
 const STUDIO_BACKEND_SERVICE: &str = "AWSEditors";
 
+/// The service name the backend that serves Amazon EMR's application user interfaces
+/// reports in the refusals it wraps — the profiler backend behind the persistent
+/// application UI surface, which is a different backend from the Studio one above and
+/// names itself in its own refusals.
+const PROFILERS_BACKEND_SERVICE: &str = "EMRProfilers";
+
 /// How an operation refuses a value that names no resource it can resolve: the value,
 /// quoted, and that it is not valid.
 ///
@@ -873,11 +908,15 @@ pub fn not_valid_message(value: &str) -> String {
 /// How a persistent-application-UI operation refuses a `PersistentAppUIId` the service
 /// holds no UI for.
 ///
-/// AWS does not document the wording, so the text is built from the request: it names
-/// the id the caller asked for. What IS the contract is the refusal itself — HTTP 400
-/// with the error code `InvalidRequestException` — rather than an empty success.
+/// Recorded behavior for the text: the surface is served by its own backend, so the
+/// refusal is that backend's wrapper ([`backend_refusal_message`]) around the statement
+/// that no such user interface exists — which NAMES the id the caller asked for, in the
+/// spelling the wire member uses for it.
 pub fn unknown_persistent_app_ui_message(persistent_app_ui_id: &str) -> String {
-    format!("Persistent application user interface id '{persistent_app_ui_id}' is not valid.")
+    backend_refusal_message(
+        PROFILERS_BACKEND_SERVICE,
+        &format!("PersistentAppUI with ID '{persistent_app_ui_id}' does not exist"),
+    )
 }
 
 /// How an instance-group-scoped operation that models no client error refuses an
@@ -4361,25 +4400,12 @@ impl PersistentAppUIRecord {
         application_id: Option<&str>,
         session_token: &str,
     ) -> String {
-        let mut url = format!(
-            "https://{}.emrappui-prod.{}.amazonaws.com/{}/",
-            self.id,
-            self.region,
-            ui_type.to_lowercase()
-        );
         // "The application ID associated with the presigned URL."
         // (`GetPersistentAppUIPresignedURL$ApplicationId` doc): it selects WHICH
-        // application's interface the URL opens, so it is part of the path.
-        if let Some(application_id) = application_id {
-            url.push_str("history/");
-            url.push_str(application_id);
-            url.push('/');
-        }
-        url.push('?');
-        url.push_str(PRESIGNED_URL_TOKEN_PARAMETER);
-        url.push('=');
-        url.push_str(session_token);
-        url
+        // application's interface the URL opens, so it is part of the path — which is
+        // the composition [`app_ui_presigned_url`] makes for every application-UI
+        // address this service answers, on-cluster interfaces included.
+        app_ui_presigned_url(&self.id, &self.region, ui_type, application_id, session_token)
     }
 }
 

@@ -60,7 +60,8 @@ fn assert_code(case: &str, status: u16, payload: &Value, expected: &str) {
 /// error, naming `cluster_id`, paired with the discriminator its surface answers.
 ///
 /// Rows span the whole family, so the rule is asserted where it holds rather than only
-/// where it was observed: the cluster reads, the step reads and the step cancellation,
+/// where it was observed: the cluster reads — including the instance and bootstrap-action
+/// listings — the step reads and the step cancellation,
 /// the cluster modification, the session read, the session-credentials read that states
 /// the refusal without the id and under its own code, both tag operations — reached by
 /// `ResourceId` alone and with the `ClusterId` that scopes them — and the instance-fleet
@@ -83,6 +84,16 @@ fn cluster_id_cases(cluster_id: &str) -> Vec<(&'static str, Value, &'static str)
         ),
         (
             "ListInstanceFleets",
+            json!({ "ClusterId": cluster_id }),
+            MALFORMED_CLUSTER_ID,
+        ),
+        (
+            "ListInstances",
+            json!({ "ClusterId": cluster_id }),
+            MALFORMED_CLUSTER_ID,
+        ),
+        (
+            "ListBootstrapActions",
             json!({ "ClusterId": cluster_id }),
             MALFORMED_CLUSTER_ID,
         ),
@@ -282,7 +293,13 @@ async fn an_id_carries_the_code_only_once_its_cluster_is_gone() {
     let cluster = emr.run_job_flow(kept_alive_request("doomed")).await;
 
     // While it exists, the reads are served: no refusal and no discriminator.
-    for operation in ["DescribeCluster", "ListSteps", "ListInstanceGroups"] {
+    for operation in [
+        "DescribeCluster",
+        "ListSteps",
+        "ListInstanceGroups",
+        "ListInstances",
+        "ListBootstrapActions",
+    ] {
         let payload = emr.ok(operation, json!({ "ClusterId": &cluster })).await;
         assert_eq!(
             error_code(&payload),

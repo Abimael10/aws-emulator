@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOnClusterAppUIPresignedURL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOnClusterAppUIPresignedURL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOnClusterAppUIPresignedURL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the address of an application user interface served ON a cluster, and whether
+//! there is one to open. Both facts are read off the cluster the request names: a cluster
+//! whose primary node is not up serves no interface at all and the call is REFUSED, a
+//! cluster that does not run the application serving the interface the request asked for
+//! has none to open (`PresignedURLReady` false), and a cluster that does is answered a URL
+//! composed from its own id ([`crate::state::ClusterRecord::on_cluster_app_ui_url`])
+//! carrying a session token minted for this one call. A `ClusterId` the service resolves
+//! no cluster for is refused as a bad request. A dry run reports the readiness and mints
+//! nothing. It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOnClusterAppUIPresignedURL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOnClusterAppUIPresignedURLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::DEFAULT_ON_CLUSTER_APP_UI_TYPE;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // A rejected input on this operation is answered with HTTP 400
+        // `ValidationException`: the error code Amazon EMR gives it, which this
+        // operation's own model does not declare (it carries only
+        // `InvalidRequestException`), so it goes through the channel that can render it —
+        // the same channel the other application-UI operations refuse an unusable target
+        // through.
+        let refuse =
+            |message: String| -> Self::Error { crate::scaffolded::Scaffolded::validation(message) };
+
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller has
+        // to fix — rather than looked up.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(refuse(crate::state::malformed_cluster_id_message(
+                &input.cluster_id,
+            )));
+        }
+
+        // "The execution role ARN associated with the cluster's application user interface
+        // presigned URL." (`GetOnClusterAppUIPresignedURL$ExecutionRoleArn` doc.) An
+        // execution role is an IAM role of this account, read through the tree's shared
+        // IAM-ARN reading, so a value naming no such role names nothing to assume and is
+        // refused rather than ignored — exactly as the persistent user interface's own
+        // presigned-URL read settles the same member.
+        if let Some(role_arn) = input.execution_role_arn.as_deref() {
+            if !crate::state::is_this_accounts_role_arn(role_arn) {
+                return Err(refuse(format!(
+                    "ExecutionRoleArn '{role_arn}' must be the ARN of an IAM role of this \
+                     account."
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetOnClusterAppUIPresignedURLErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // What this answers depends on the state the cluster has REACHED, so every
+        // transition the clock already made due is materialised first: a cluster whose
+        // start-up spans have passed is up, and one whose termination came due is gone.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOnClusterAppUIPresignedURL"))
+        // An id the store resolves no cluster for is a bad request, not an empty answer:
+        // it is refused with the cluster-id sentence the one place that builds it renders,
+        // which is what tells an unresolvable id apart from a cluster that is merely not
+        // serving yet below.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(refuse(crate::state::unknown_cluster_message(
+                &input.cluster_id,
+            )));
+        };
+
+        // A cluster that is not up serves no web interface at all — the interfaces are
+        // served from its primary node — so the call is refused through the client error
+        // this operation MODELS, naming the state the cluster is in. A caller can retry
+        // once the cluster is up, which is what keeps this apart from the unresolvable id
+        // above.
+        if !crate::state::serves_app_ui_in_state(&cluster.status.state) {
+            return Err(
+                GetOnClusterAppUIPresignedURLErrorModeled::InvalidRequestException(
+                    crate::state::cluster_not_running_for_app_ui(
+                        &input.cluster_id,
+                        &cluster.status.state,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The interface the request names, or the one a request that names none asks for.
+        let ui_type = input
+            .on_cluster_app_ui_type
+            .as_deref()
+            .unwrap_or(DEFAULT_ON_CLUSTER_APP_UI_TYPE);
+
+        // "Used to determine if the presigned URL is ready."
+        // (`GetOnClusterAppUIPresignedURLOutput$PresignedURLReady` doc.) An interface is
+        // served by an APPLICATION of the cluster, so a cluster whose launch installed no
+        // application serving the one asked for has no interface to open — that is what
+        // the member reports, rather than a URL that opens nothing. Nothing is minted for
+        // it either.
+        if !cluster.serves_on_cluster_app_ui(ui_type) {
+            return Ok(GetOnClusterAppUIPresignedURLOutput {
+                presigned_url_ready: Some(false),
+                presigned_url: None,
+            });
+        }
+
+        // "Determines if the user interface presigned URL is for a dry run."
+        // (`GetOnClusterAppUIPresignedURL$DryRun` doc.) A dry run asks whether the URL
+        // would be ready, not for the URL: it answers the readiness above and mints no
+        // credential, so probing an interface vends nothing.
+        if input.dry_run == Some(true) {
+            return Ok(GetOnClusterAppUIPresignedURLOutput {
+                presigned_url_ready: Some(true),
+                presigned_url: None,
+            });
+        }
+
+        // Every call PRESIGNS the URL afresh: the session token in it is minted for this
+        // call, so two calls for one interface never hand back the same credential and a
+        // URL that was cached or shared carries a token of its own. The cluster record is
+        // only read here — nothing about the token is stored, which is what keeps the
+        // answer un-cacheable by construction.
+        let Some(session_token) = crate::state::mint_presigned_url_token(ctx.credential_store())
+        else {
+            return Err(GetOnClusterAppUIPresignedURLErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let url = cluster.on_cluster_app_ui_url(
+            &region,
+            ui_type,
+            input.application_id.as_deref(),
+            &session_token,
+        );
+        drop(store);
+
+        Ok(GetOnClusterAppUIPresignedURLOutput {
+            presigned_url_ready: Some(true),
+            presigned_url: Some(url),
+        })
     }
 }

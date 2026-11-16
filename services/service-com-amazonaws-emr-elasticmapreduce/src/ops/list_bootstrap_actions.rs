@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBootstrapActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBootstrapActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBootstrapActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the bootstrap actions a cluster was LAUNCHED with — the
+//! `BootstrapActionConfig` list `RunJobFlow` persisted onto the cluster
+//! ([`crate::state::ClusterRecord::bootstrap_actions`]), projected onto the wire `Command`
+//! ([`crate::state::bootstrap_action_command`]) in launch order and paginated on `Marker`.
+//! A cluster the service holds no record for is REFUSED through the shared cluster-id
+//! refusal every cluster read of this service answers, so nothing here is built from the
+//! reading request. It is the ONLY file to touch for `ListBootstrapActions`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBootstrapActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBootstrapActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::LIST_BOOTSTRAP_ACTIONS_PAGE_SIZE;
+
+        let _ = ctx;
+
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — the request-validation
+        // envelope, HTTP 400, naming the member — rather than looked up. The same reading
+        // every cluster-scoped listing of this service makes.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBootstrapActionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Reporting only, and a plain read: a bootstrap action is a fact about the LAUNCH,
+        // so nothing the clock owes a cluster can change what this answers and no
+        // transition is materialised here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBootstrapActions"))
+        // An id the store holds no cluster under is refused the way every cluster read of
+        // this service refuses one — the modelled client error, the cluster surface's
+        // discriminator and its sentence, all rendered by the one place that builds them
+        // ([`crate::state::unknown_cluster`]) — rather than answered with an empty list,
+        // which would say the cluster exists and was launched with no bootstrap actions.
+        let Some(cluster) = store.clusters.get(&input.cluster_id) else {
+            return Err(ListBootstrapActionsErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        // The marker names the POSITION the previous page stopped at, bound to this
+        // cluster, because a bootstrap action carries no id of its own; a token this
+        // listing did not mint for this cluster resumes nothing and is refused the way
+        // every `Marker`-paged listing of this service refuses one.
+        let start = match input.marker.as_deref() {
+            Some(marker) => {
+                match crate::state::decode_bootstrap_action_marker(marker, &input.cluster_id)
+                    .filter(|cursor| *cursor <= cluster.bootstrap_actions.len())
+                {
+                    Some(cursor) => cursor,
+                    None => {
+                        return Err(ListBootstrapActionsErrorModeled::InvalidRequestException(
+                            crate::state::malformed_marker(marker),
+                        )
+                        .into())
+                    }
+                }
+            }
+            None => 0,
+        };
+        let end = cluster
+            .bootstrap_actions
+            .len()
+            .min(start + LIST_BOOTSTRAP_ACTIONS_PAGE_SIZE);
+        // The page's configurations are taken under the lock and PROJECTED after it is
+        // released: building the wire shapes is caller-driven work that no other request
+        // should wait on.
+        let page = cluster.bootstrap_actions[start..end].to_vec();
+        let marker = (end < cluster.bootstrap_actions.len())
+            .then(|| crate::state::encode_bootstrap_action_marker(&input.cluster_id, end));
+        drop(store);
+
+        let bootstrap_actions: Vec<Command> = page
+            .iter()
+            .map(crate::state::bootstrap_action_command)
+            .collect();
+
+        Ok(ListBootstrapActionsOutput {
+            bootstrap_actions: Some(bootstrap_actions),
+            marker,
+        })
     }
 }

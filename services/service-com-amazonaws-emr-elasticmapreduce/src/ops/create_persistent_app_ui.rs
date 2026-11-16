@@ -237,9 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An EMR on EC2 target is a cluster this account holds: a UI cannot be attached
         // to a cluster that does not exist, so the id is resolved rather than taken on
         // trust.
+        //
+        // The sentence is the cluster-id one stated WITHOUT the id
+        // ([`crate::state::unknown_cluster_without_id_message`]): this operation names its
+        // target by ARN rather than by cluster id, and Amazon EMR does not echo a value
+        // back here — so neither the id read out of the ARN nor the ARN itself is
+        // interpolated into it.
         if let Some(cluster_id) = cluster_id.as_deref() {
             if !store.clusters.contains_key(cluster_id) {
-                return Err(refuse(crate::state::unknown_cluster_message(cluster_id)));
+                return Err(refuse(crate::state::unknown_cluster_without_id_message()));
             }
         }
 

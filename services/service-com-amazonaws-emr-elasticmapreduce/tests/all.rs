@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/app_ui_target_refusals.rs"]
+mod app_ui_target_refusals;
 #[path = "all/auto_scaling_policy.rs"]
 mod auto_scaling_policy;
 #[path = "all/auto_termination_policy.rs"]
@@ -19,6 +21,8 @@ mod auto_termination_policy;
 mod auto_termination_policy_convergence;
 #[path = "all/block_public_access.rs"]
 mod block_public_access;
+#[path = "all/cluster_bootstrap_actions.rs"]
+mod cluster_bootstrap_actions;
 #[path = "all/cluster_defaults.rs"]
 mod cluster_defaults;
 #[path = "all/cluster_id_refusal_code.rs"]
@@ -91,6 +95,8 @@ mod notebook_execution_run;
 mod notebook_execution_start_pacing;
 #[path = "all/notebook_executions.rs"]
 mod notebook_executions;
+#[path = "all/on_cluster_app_ui.rs"]
+mod on_cluster_app_ui;
 #[path = "all/persistent_app_ui.rs"]
 mod persistent_app_ui;
 #[path = "all/presigned_url_freshness.rs"]
