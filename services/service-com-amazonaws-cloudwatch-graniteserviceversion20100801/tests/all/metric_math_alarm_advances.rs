@@ -951,6 +951,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// both of its verdicts to be reached while the period the datapoints land in is OPEN.
 const OPEN_PERIOD_ROOM_SECS: f64 = 20.0;
 
+/// The granularity a regular-resolution series has values at, in seconds: "Setting this to 60
+/// specifies this metric as regular resolution, which CloudWatch stores at 1-minute resolution."
+/// (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`) — so the periods
+/// an alarm over such a series is graded on begin on one of those instants.
+const MINUTE_SECS: f64 = 60.0;
+
 /// Poll `DescribeAlarms` the way a client waiting for an alarm does, until the alarm reports
 /// `state` or [`CADENCE_BUDGET`] runs out; answers the alarm and the instant it was read at.
 async fn await_state(
@@ -1059,11 +1065,42 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
             },
         );
         let document = reason_data(&alarm, case);
+        // The period the verdict names is the one the alarm's own grid laid over the datapoint it
+        // graded: a rolling range's periods are counted back from the end that range has advanced
+        // to, so the instant it reports is the start of the period the published datapoint falls
+        // in on THAT grid rather than a multiple of the period.
+        let graded = graded_instants(&document);
+        let graded_start = match graded.as_slice() {
+            [only] => *only,
+            other => panic!(
+                "case {case:?}: expected the verdict to name exactly the one period it graded, \
+                 got {other:?} in {document}"
+            ),
+        };
+        assert!(
+            graded_start <= published_at && published_at < graded_start + period,
+            "case {case:?}: expected the verdict to name the {period}-second period the datapoint \
+             published at {published_at} falls in, got {graded_start} in {document}"
+        );
+        // And WHERE that period was laid is pinned too: its start is a minute granule — the
+        // granularity a regular-resolution series has values at — and it opens no more than one
+        // period before the instant the evaluation queried the series at, so a range reaching
+        // further back than the alarm's own look-back would be reported here.
+        let query_date = document
+            .get("queryDate")
+            .and_then(Value::as_str)
+            .and_then(document_instant_secs)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a queryDate, got {document}"));
         assert_eq!(
-            graded_instants(&document),
-            vec![open_window_start],
-            "case {case:?}: expected the verdict to name the open period it graded \
-             ({open_window_start}), got {document}"
+            graded_start.rem_euclid(MINUTE_SECS),
+            0.0,
+            "case {case:?}: expected the graded period to begin on a minute granule, got \
+             {graded_start} in {document}"
+        );
+        assert!(
+            graded_start < query_date && query_date - graded_start <= period + MINUTE_SECS,
+            "case {case:?}: expected the graded period ({graded_start}) to open at most one \
+             {period}-second look-back before the query instant ({query_date}), got {document}"
         );
         let first_updated = alarm_stamp(&alarm, "StateUpdatedTimestamp")
             .unwrap_or_else(|| panic!("case {case:?}: no state stamp in {alarm}"));

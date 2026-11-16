@@ -35,6 +35,8 @@ mod alarm_configuration_refusal_messages;
 mod alarm_configuration_update_summaries;
 #[path = "all/alarm_contributors.rs"]
 mod alarm_contributors;
+#[path = "all/alarm_decision_span_start.rs"]
+mod alarm_decision_span_start;
 #[path = "all/alarm_delete_semantics.rs"]
 mod alarm_delete_semantics;
 #[path = "all/alarm_document_timestamps.rs"]

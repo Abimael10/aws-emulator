@@ -11,15 +11,17 @@
 //!
 //! The rule, as `PutMetricAlarm` and the CloudWatch alarm documentation state it:
 //!
-//! * the metric is aggregated into periods of `Period` seconds each, ANCHORED at multiples of
-//!   the period — "CloudWatch aggregates all data points with time stamps that fall within
-//!   each one-hour period" — so which period a datapoint belongs to is decided by its own time
-//!   stamp and not by the instant the evaluation runs, while WHICH of those periods an
-//!   evaluation grades is decided by its evaluated range — the range of the window the alarm's
-//!   `EvaluationWindow` names ([`EvaluationGrid`]): a rolling one that "advances each time the
-//!   alarm is evaluated" (`SlidingWindow`), which is also the window an alarm naming none uses,
-//!   or one aligned to the clock boundaries the alarm's period repeats at, which grades only
-//!   the periods that have CLOSED (`WallClockWindow`);
+//! * the metric is aggregated into periods of `Period` seconds each, ANCHORED on the grid the
+//!   alarm's own evaluation window lays — "CloudWatch aggregates all data points with time
+//!   stamps that fall within each one-hour period" — so which period a datapoint belongs to is
+//!   decided by its own time stamp against that grid and not by where in a period the evaluation
+//!   happens to run, while WHICH of those periods an evaluation grades is decided by its
+//!   evaluated range — the range of the window the alarm's `EvaluationWindow` names
+//!   ([`EvaluationGrid`]): a rolling one that "advances each time the alarm is evaluated"
+//!   (`SlidingWindow`), which is also the window an alarm naming none uses and whose periods are
+//!   counted back from the end that range has advanced to, or one aligned to the clock
+//!   boundaries the alarm's period repeats at, which grades only the periods that have CLOSED
+//!   (`WallClockWindow`);
 //! * each window yields one datapoint — the alarm's `Statistic` or `ExtendedStatistic` over
 //!   the datapoints in it — or no datapoint at all when the window holds none;
 //! * the evaluation looks over a RANGE of windows wider than `EvaluationPeriods`, and
@@ -160,10 +162,10 @@ const MAX_EVALUATED_PERIODS: usize = 1_440;
 /// and the range covers one storage span instead ([`evaluation_range_periods`]), which is
 /// bounded too.
 ///
-/// The periods are anchored at multiples of the period and the newest of them is the one the end
-/// of the rolling range falls in ([`EvaluationGrid::newest_graded_period`]), so the range reaches further back
-/// than a span measured from the evaluation instant would, which is why this factor leaves room
-/// for more periods than the look-back plus the sparse-series margin.
+/// The periods are anchored on the grid the alarm's window lays and the newest of them is the one
+/// the end of the rolling range falls in ([`EvaluationGrid::newest_graded_period`]), so the range
+/// reaches further back than a span measured from the evaluation instant would, which is why this
+/// factor leaves room for more periods than the look-back plus the sparse-series margin.
 const EVALUATION_RANGE_FACTOR: usize = 3;
 
 /// The most action notifications the store holds waiting for delivery.
@@ -1401,11 +1403,13 @@ impl State {
         // Which window of the evaluation range a datapoint falls in, or `None` for one this
         // alarm does not grade at all.
         //
-        // A datapoint belongs to the period its OWN time stamp falls in, so which window it is
-        // aggregated into is decided by the datapoint and not by the instant the evaluation
-        // runs — the same fold this store's readers make over a series
-        // ([`super::windows_by_unit`]), down to the granularity the datapoint's own
-        // `StorageResolution` stores it at ([`StoredDatum::aggregated_instant`]). A period
+        // A datapoint belongs to the period of the alarm's own grid its OWN time stamp falls in,
+        // so which window it is aggregated into is decided by the datapoint and by the grid
+        // ([`EvaluationGrid`]) rather than by where in a period the evaluation happens to run —
+        // the same fold this store's readers make over a series
+        // ([`super::windows_by_unit`]), laid from this grid's boundaries instead of from a
+        // requested start, and down to the granularity the datapoint's own `StorageResolution`
+        // stores it at ([`StoredDatum::aggregated_instant`]). A period
         // FINER than that granularity still grades the datapoint, in the window its stored
         // instant falls in: an alarm "accepts" a sub-minute period over a regular-resolution
         // series and buckets it by the minute, which is what the recorded evaluation of such an
@@ -1762,8 +1766,11 @@ impl State {
             ),
             reason_data: state_reason_data(
                 graded.statistic.as_ref(),
-                grid,
-                period,
+                GradedWindows {
+                    grid,
+                    period,
+                    evaluation_periods,
+                },
                 predicate.fixed_threshold(),
                 now_secs,
                 &evaluated,
@@ -2401,6 +2408,50 @@ pub(crate) fn decimal_text(value: f64) -> String {
     format!("{value}")
 }
 
+/// The windows ONE evaluation graded, as its decision record reports them: the grid their
+/// boundaries fell on ([`EvaluationGrid`]), how wide one of them is, and how many of them the
+/// alarm's look-back covered.
+///
+/// The three together are what every instant a record names is resolved from, so a record cannot
+/// report an instant of one grid beside a span of another.
+#[derive(Debug, Clone, Copy)]
+struct GradedWindows {
+    /// Where the boundaries between the periods fall, and whether the period the clock is in was
+    /// graded at all.
+    grid: EvaluationGrid,
+    /// How wide one of those periods is, in seconds.
+    period: f64,
+    /// How many of them the verdict was made over — the alarm's `EvaluationPeriods`.
+    evaluation_periods: usize,
+}
+
+impl GradedWindows {
+    /// The instant the span ONE evaluation read BEGINS at, as its decision record reports it.
+    ///
+    /// The start of the range the alarm's evaluation window selected
+    /// ([`EvaluationGrid::look_back_start`]) — a clock boundary for an aligned window, and the
+    /// look-back's own width behind the query instant for a rolling one — reaching back FURTHER
+    /// where a datapoint the verdict rests on is older than that: the range an evaluation
+    /// searches is deliberately wider than the look-back ([`evaluation_range_periods`]), so a
+    /// verdict may rest on a datapoint of a period before it, and the span a record opens at
+    /// covers every datapoint it names.
+    ///
+    /// `None` for an evaluation that graded no real datapoint at all: it read no window of the
+    /// series, so there is no span over the series to report.
+    fn span_start(self, now_secs: f64, evaluated: &[Evaluated]) -> Option<f64> {
+        let oldest_graded = evaluated
+            .iter()
+            .filter_map(|slot| slot.window)
+            .map(|index| self.grid.window_start(now_secs, index, self.period))
+            .reduce(f64::min)?;
+        Some(oldest_graded.min(self.grid.look_back_start(
+            now_secs,
+            self.evaluation_periods,
+            self.period,
+        )))
+    }
+}
+
 /// The `StateReasonData` an evaluated state reports: the query the evaluation made, the values
 /// of the window it graded, and the datapoints the verdict RESTS ON — the ones that satisfied
 /// the direction the state was decided in, as many as that direction needed, each with the
@@ -2424,21 +2475,22 @@ pub(crate) fn decimal_text(value: f64) -> String {
 ///
 /// Every instant it names is the start of the period it belongs to on the grid the evaluation
 /// graded ([`EvaluationGrid::window_start`]), so an alarm with an aligned window reports the
-/// clock boundaries its range was aligned to.
+/// clock boundaries its range was aligned to, while an alarm with a rolling one opens its span
+/// wherever that range has rolled to ([`GradedWindows::span_start`]).
 fn state_reason_data(
     statistic: Option<&AlarmStatistic<'_>>,
-    grid: EvaluationGrid,
-    period: f64,
+    windows: GradedWindows,
     threshold: Option<f64>,
     now_secs: f64,
     evaluated: &[Evaluated],
     verdict: Option<Verdict>,
 ) -> String {
+    let GradedWindows { grid, period, .. } = windows;
     let mut document = Map::new();
     document.insert("version".to_string(), Value::from(HISTORY_DATA_VERSION));
-    // The instant the evaluation queried the series at, and the start of the OLDEST period it
-    // graded: together they say which span of the series the state was decided over. Both are
-    // written in the form this service's JSON documents stamp an instant with
+    // The instant the evaluation queried the series at, and the start of the span it read the
+    // series over: together they say which span of the series the state was decided over. Both
+    // are written in the form this service's JSON documents stamp an instant with
     // ([`super::document_instant`]). The query instant is at or after the END of the newest
     // period the document reports for a high-resolution alarm, whose rolling range lags the
     // clock by its own period, and for every alarm with an ALIGNED window, which grades only
@@ -2446,11 +2498,9 @@ fn state_reason_data(
     if let Some(at) = super::document_instant(now_secs) {
         document.insert("queryDate".to_string(), Value::from(at));
     }
-    if let Some(at) = evaluated
-        .iter()
-        .filter_map(|slot| slot.window)
-        .max()
-        .and_then(|index| super::document_instant(grid.window_start(now_secs, index, period)))
+    if let Some(at) = windows
+        .span_start(now_secs, evaluated)
+        .and_then(super::document_instant)
     {
         document.insert("startDate".to_string(), Value::from(at));
     }
