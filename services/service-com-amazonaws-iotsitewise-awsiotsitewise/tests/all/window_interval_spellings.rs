@@ -49,9 +49,13 @@ enum Expect {
     /// The span is inside the published limits: the write is accepted and the
     /// stored model reports the interval as it was sent.
     Accepted,
-    /// The span is outside them, or the value names no span at all: the write is
-    /// refused, naming the expression and the interval as the request spelled it.
+    /// The span is outside them: the write is refused, naming the expression and
+    /// the interval as the request spelled it.
     Refused,
+    /// The value names no span at all, so there is nothing to hold against the
+    /// limits: the write is refused naming the text the reading could not read
+    /// (the rule in full: `super::unreadable_window_interval`).
+    Unreadable,
 }
 
 /// The request body one row sends: a measurement, a `metric` over it whose window
@@ -160,8 +164,8 @@ async fn a_window_interval_names_its_span_whatever_the_case_of_its_unit_letter()
         ("the floor in ISO 8601", "PT1M", Expect::Accepted),
         ("the ceiling in ISO 8601 hours", "PT168H", Expect::Accepted),
         ("below the floor in ISO 8601", "PT30S", Expect::Refused),
-        ("a unit letter outside the catalog, lowercase", "5y", Expect::Refused),
-        ("a unit letter outside the catalog, uppercase", "5Y", Expect::Refused),
+        ("a unit letter outside the catalog, lowercase", "5y", Expect::Unreadable),
+        ("a unit letter outside the catalog, uppercase", "5Y", Expect::Unreadable),
     ];
 
     for (at, (case, interval, expected)) in rows.into_iter().enumerate() {
@@ -174,7 +178,7 @@ async fn a_window_interval_names_its_span_whatever_the_case_of_its_unit_letter()
         )
         .await;
         match expected {
-            Expect::Refused => {
+            Expect::Refused | Expect::Unreadable => {
                 assert_eq!(
                     status, 400,
                     "case {case:?}: the interval {interval:?} names no span inside the \
@@ -185,8 +189,11 @@ async fn a_window_interval_names_its_span_whatever_the_case_of_its_unit_letter()
                     INVALID_REQUEST,
                     "case {case:?}: expected {INVALID_REQUEST}, got {body}"
                 );
-                let expected_message =
-                    format!("`{EXPRESSION}`: Window time interval '{interval}' is not within limits");
+                let expected_message = if expected == Expect::Unreadable {
+                    format!("`{interval}`: Unable to parse window time interval {interval}")
+                } else {
+                    format!("`{EXPRESSION}`: Window time interval '{interval}' is not within limits")
+                };
                 assert_eq!(
                     body["message"].as_str(),
                     Some(expected_message.as_str()),

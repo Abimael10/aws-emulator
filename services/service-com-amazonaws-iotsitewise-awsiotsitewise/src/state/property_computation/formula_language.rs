@@ -16,6 +16,12 @@
 //!   ([`formula_context`]), and its aggregations reduce the data points of a window
 //!   rather than one number.
 //!
+//! The names the language PUBLISHES are a wider set ([`PUBLISHED_FUNCTIONS`]),
+//! and the two answer two different questions: a WRITE asks whether the language
+//! has a function by that name ([`is_formula_function`]) and refuses a formula
+//! applying one it does not publish, while a READ computes only what this
+//! evaluator reduces.
+//!
 //! Nothing here reaches anything of the host: one bounded expression is reduced to
 //! one number over the values bound into a context, with no statement, no loop and
 //! no binding to a file, a process, a socket, the environment or the clock. A
@@ -177,17 +183,129 @@ pub(super) fn bind_nothing(context: &mut ::evalexpr::HashMapContext, name: &str)
         .is_ok()
 }
 
-/// The functions a formula may apply, each with how it reduces the numbers it is
-/// handed.
+/// Whether `name` is a function of the formula language: one of the names it
+/// PUBLISHES ([`PUBLISHED_FUNCTIONS`]), whether or not this evaluator reduces it.
+///
+/// The question a WRITE asks of a formula is the language's — does the language
+/// have a function by this name — and not this evaluator's: a published function
+/// this evaluator does not reduce computes no data point (see the module docs),
+/// while a name the language does not publish is no function at all and the
+/// definition naming it is refused.
+pub(in crate::state) fn is_formula_function(name: &str) -> bool {
+    PUBLISHED_FUNCTIONS.contains(&name)
+}
+
+/// The function names the formula language publishes.
+///
+/// Source: the IoT SiteWise User Guide's formula-expression reference ("Use
+/// formula expressions"), group by group as that page sections them — marked
+/// below, so each entry can be re-read against the section it came from:
+/// aggregation, temporal, comparison and logical, conditional, the elementary
+/// arithmetic a transform maps a data point with, text, and conversion. The
+/// Smithy model carries no list of them, so this is REFERENCE DATA transcribed
+/// from that page rather than a shape of the model.
+///
+/// The set is deliberately WIDE, because it is load-bearing in the refusing
+/// direction: an applied name it does not hold is refused, so a name the guide
+/// publishes and this transcription missed would refuse a definition the service
+/// stores. Every group is therefore taken whole, including the entries this
+/// evaluator does not reduce, and the set has to be re-read against that page as
+/// AWS adds to the language.
+///
+/// It is a SUPERSET of [`FORMULA_FUNCTIONS`], the names this evaluator reduces
+/// (pinned by the test below): what a write accepts is what the language has, and
+/// what a read computes is what the evaluator implements — two different
+/// questions, and conflating them would either refuse formulas the service
+/// computes or store formulas naming nothing.
+const PUBLISHED_FUNCTIONS: &[&str] = &[
+    // Aggregation: the data points of one window reduced to one number.
+    "avg",
+    "count",
+    "max",
+    "min",
+    "stdev",
+    "sum",
+    // Temporal: what a window or a stream held, and for how long.
+    "first",
+    "last",
+    "latest",
+    "pretrigger",
+    "statetime",
+    "timeweightedavg",
+    "timeweightedavg_forward_fill",
+    "timeweightedavg_linear_interpolation",
+    // Comparison and logical, the function spellings of the operators.
+    "and",
+    "eq",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "ne",
+    "not",
+    "or",
+    // Conditional, and the tests a condition is written over.
+    "coalesce",
+    "if",
+    "isnan",
+    // Arithmetic over one number, or two.
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "cbrt",
+    "ceil",
+    "cos",
+    "cosh",
+    "exp",
+    "floor",
+    "hypot",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "mod",
+    "pow",
+    "round",
+    "signum",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+    "trunc",
+    // Text, and the JSON path reading over a text value.
+    "concat",
+    "contains",
+    "endswith",
+    "index",
+    "jp",
+    "length",
+    "lower",
+    "ltrim",
+    "rtrim",
+    "startswith",
+    "substring",
+    "trim",
+    "upper",
+    // Conversion between a number and its text.
+    "num2str",
+    "str2num",
+];
+
+/// The functions a formula may apply AND THIS EVALUATOR REDUCES, each with how it
+/// reduces the numbers it is handed.
 ///
 /// Source: the formula-expression functions the IoT SiteWise User Guide publishes
 /// for transforms and metrics — the aggregation functions a metric reduces a
 /// window's data points with (`avg`, `count`, `max`, `min`, `stdev`, `sum`,
 /// `first`, `last`) and the arithmetic functions a transform maps a data point with
 /// (`abs`, `ceil`, `exp`, `floor`, `ln`, `log10`, `pow`, `round`, `sqrt`). The
-/// Smithy model carries no list of them, and AWS adds to it, so a formula naming a
-/// function that is not here computes nothing rather than being refused: the
-/// catalogue bounds what this evaluator computes, not what the service accepts.
+/// Smithy model carries no list of them. This catalogue bounds what this
+/// evaluator COMPUTES; what a write accepts is the wider published surface
+/// ([`PUBLISHED_FUNCTIONS`]), so a published function this evaluator does not
+/// reduce yields no data point rather than a refused write.
 ///
 /// Each aggregation reduces EVERY number it is handed, so one implementation serves
 /// both halves of the language: `min(a, b)` of a transform's two numbers and
@@ -346,6 +464,38 @@ fn collect_numbers(value: &::evalexpr::Value, into: &mut Vec<f64>) {
                 pending.extend(items.iter().rev());
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: every function this evaluator reduces is a function the language
+    /// publishes, so nothing the evaluator implements is refused at the write
+    /// boundary and no accepted formula names a function a read cannot reach.
+    #[test]
+    fn every_reduced_function_is_a_published_one() {
+        for (name, _) in FORMULA_FUNCTIONS {
+            assert!(
+                is_formula_function(name),
+                "case {name:?}: a function this evaluator reduces must be published"
+            );
+        }
+    }
+
+    /// RULE: a name the language does not publish is no function of it. Driven
+    /// over names outside the catalogue, a near-miss spelling of one in it
+    /// included. Case is NOT among the rows: nothing in the model or the
+    /// recordings states how the language reads the case of a function name.
+    #[test]
+    fn a_name_the_language_does_not_publish_is_no_function() {
+        for name in ["average", "mystery", "avg2", "", "sumx"] {
+            assert!(
+                !is_formula_function(name),
+                "case {name:?}: must not be a function of the language"
+            );
         }
     }
 }

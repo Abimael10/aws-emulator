@@ -659,6 +659,8 @@ mod list_bulk_import_jobs;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and four appends there collided in a row with this one.
+#[path = "all/child_model_association_refusal.rs"]
+mod child_model_association_refusal;
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
 // In its alphabetical place inside the sorted list, rather than at the head of this
@@ -809,6 +811,8 @@ mod time_series;
 mod time_series_disassociation;
 #[path = "all/time_series_ingestion.rs"]
 mod time_series_ingestion;
+#[path = "all/unreadable_window_interval.rs"]
+mod unreadable_window_interval;
 #[path = "all/update_asset.rs"]
 mod update_asset;
 #[path = "all/update_asset_model.rs"]

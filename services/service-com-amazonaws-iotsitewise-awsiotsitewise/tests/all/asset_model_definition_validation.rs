@@ -24,12 +24,14 @@
 //!   service settles the write on rather than answering the call with, so it is
 //!   pinned here as the FAILED state it settles at;
 //! * a formula names an identifier that is neither a declared variable nor a
-//!   function applied to arguments, or declares a variable the formula never
+//!   function the language publishes, or declares a variable the formula never
 //!   names (`Metric.variables` / `Transform.variables`: "The list of variables
 //!   used in the expression");
 //! * a tumbling window's interval names a span outside the published limits
 //!   (`smithy_query(query="doc", shape="TumblingWindow", member="interval")`:
-//!   "The interval time must be between 1 minute and 1 week");
+//!   "The interval time must be between 1 minute and 1 week") — an interval no
+//!   span can be read from at all is its own refusal, pinned in
+//!   `super::unreadable_window_interval`;
 //! * an id-less property definition carries the NAME of a property the model
 //!   already holds, which would re-create that property under a new id
 //!   (`AssetModelProperty.id`: "If you are calling UpdateAssetModel to modify an
@@ -116,7 +118,7 @@ async fn described_names(router: &MultiServiceRouter, model_id: &str) -> Vec<Str
 }
 
 /// Whether the account holds an asset model named `name`.
-async fn holds_name(router: &MultiServiceRouter, name: &str) -> bool {
+pub(crate) async fn holds_name(router: &MultiServiceRouter, name: &str) -> bool {
     let (status, body) = call(router, "GET", "/asset-models?maxResults=250", None).await;
     assert_eq!(status, 200, "ListAssetModels: got {status} {body}");
     body["assetModelSummaries"]
@@ -798,10 +800,118 @@ async fn a_transforms_expression_is_parsed_by_the_same_rule() {
     }
 }
 
+/// RULE: an identifier a formula APPLIES to arguments names a function, so it has
+/// to be one the formula language publishes; a name it does not publish is
+/// neither a function nor a variable, and the write is refused naming it and
+/// where in the expression it starts. A published function this emulator does not
+/// itself reduce is accepted, because what the write asks about is the language's
+/// catalogue and not this emulator's arithmetic.
+///
+/// The catalogue is the function set the IoT SiteWise User Guide publishes for
+/// formula expressions (the Smithy model carries no list of it); the accepted
+/// rows below name entries from three of its sections, including ones this issue
+/// did not cite.
+#[tokio::test]
+async fn a_formula_applying_a_name_the_language_does_not_publish_is_refused() {
+    let router = router();
+
+    // The rows differ, on the refused side, along WHERE the unpublished name sits
+    // (the whole formula, after an operand, nested inside a published call, applied
+    // across whitespace) and how it misses — a near-miss spelling of a published
+    // name, a name of nothing — and, on the accepted side, which section of the
+    // catalogue the applied name comes from: aggregation, conditional and
+    // elementary arithmetic.
+    let accepted: [(&str, &str); 4] = [
+        ("an aggregation the catalogue publishes", "avg(power)"),
+        (
+            "two published aggregations over one variable",
+            "sum(power) + max(power)",
+        ),
+        ("the conditional", "if(power > 0, 1, 0)"),
+        (
+            "a published function this emulator does not reduce",
+            "sin(power)",
+        ),
+    ];
+    // `(case, expression, the name that is no function, where it starts)`.
+    let refused: [(&str, &str, &str, usize); 4] = [
+        (
+            "a near-miss spelling of a published aggregation",
+            "average(power)",
+            "average",
+            0,
+        ),
+        (
+            "an unpublished name applied across whitespace",
+            "nope (power)",
+            "nope",
+            0,
+        ),
+        (
+            "an unpublished name after an operand",
+            "power + mystery(power)",
+            "mystery",
+            8,
+        ),
+        (
+            "an unpublished name nested inside a published call",
+            "avg(sumx(power))",
+            "sumx",
+            4,
+        ),
+    ];
+
+    for (at, (case, expression)) in accepted.into_iter().enumerate() {
+        let name = format!("Compressor-{at}");
+        let (status, body) = create(&router, definition(&name, expression)).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: a formula over published functions must be accepted, \
+             got {status} {body}"
+        );
+    }
+
+    for (at, (case, expression, token, position)) in refused.into_iter().enumerate() {
+        let name = format!("Pipeline-{at}");
+        let (status, body) = create(&router, definition(&name, expression)).await;
+        assert_refused(
+            case,
+            status,
+            &body,
+            &format!(
+                "`{expression}`: Unknown function or variable '{token}' at pos \
+                 {position} in expression '{expression}'"
+            ),
+        );
+        assert!(
+            !holds_name(&router, &name).await,
+            "case {case:?}: a refused create must leave no asset model behind"
+        );
+    }
+}
+
+/// The request body the suite above sends: a measurement and a metric over it
+/// whose expression is `expression`.
+fn definition(name: &str, expression: &str) -> Value {
+    json!({
+        "assetModelName": name,
+        "assetModelProperties": [
+            measurement("Power"),
+            metric(
+                "Computed",
+                expression,
+                json!([{"name": "power", "value": {"propertyId": "Power"}}]),
+                "1h",
+            ),
+        ],
+    })
+}
+
 /// RULE: a tumbling window's interval names a span between 1 minute and 1 week,
-/// in either spelling the shape documents; outside that range — and in a spelling
-/// that names no span at all — the write is refused, naming the metric's
-/// expression and the interval as the request spelled it.
+/// in either spelling the shape documents; a span outside that range is refused
+/// naming the metric's expression and the interval as the request spelled it,
+/// while text no span can be read from at all is refused as the text it is (the
+/// reading refusal, pinned in full in `super::unreadable_window_interval`).
 #[tokio::test]
 async fn a_tumbling_interval_outside_the_published_limits_is_refused() {
     let router = router();
@@ -823,7 +933,7 @@ async fn a_tumbling_interval_outside_the_published_limits_is_refused() {
         ("one second below the floor", "59s", false),
         ("past the ceiling", "8d", false),
         ("below the floor in ISO 8601", "PT30S", false),
-        ("an interval naming no span", "later", false),
+        ("the ceiling doubled", "2w", false),
     ];
 
     for (at, (case, interval, accepted)) in rows.into_iter().enumerate() {

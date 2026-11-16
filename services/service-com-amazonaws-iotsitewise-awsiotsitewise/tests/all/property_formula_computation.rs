@@ -675,15 +675,17 @@ async fn a_formula_the_evaluator_cannot_reduce_holds_no_data_point() {
         json!([
             {"name": "Temperature", "dataType": "DOUBLE", "type": {"measurement": {}}},
             transform("Nested", &nested, &[("temp", "Temperature")]),
-            // No function catalogue reaches a write — the formula language's own
-            // lives in the IoT SiteWise User Guide and AWS adds to it — so a
-            // formula naming one this evaluator does not implement is stored and
-            // computes nothing, rather than being answered with an invented value.
-            transform("Unknown", "mystery(temp)", &[("temp", "Temperature")]),
-            // The same holds for a name the expression ENGINE offers under its own
-            // builtins (`len` is one of them): the formula language's functions are
-            // the only ones a formula can reach, so this computes nothing too.
-            transform("Builtin", "len(temp)", &[("temp", "Temperature")]),
+            // A write asks whether the LANGUAGE has a function by that name, not
+            // whether this evaluator reduces it: `sin` is one the IoT SiteWise
+            // User Guide publishes and this evaluator does not implement, so the
+            // definition is stored and the property computes nothing, rather than
+            // being answered with an invented value.
+            transform("Unknown", "sin(temp)", &[("temp", "Temperature")]),
+            // The same holds for a published name the expression ENGINE also
+            // offers under its own builtins (`contains` is one of them): the
+            // formula language's own functions are the only ones a formula can
+            // reach, so this computes nothing too.
+            transform("Builtin", "contains(temp)", &[("temp", "Temperature")]),
             // Two metrics that read each other: a dependency the stored
             // definitions allow and no series can come out of.
             metric("PingPong", "avg(pong)", &[("pong", "Pong")]),
@@ -714,12 +716,12 @@ async fn a_formula_the_evaluator_cannot_reduce_holds_no_data_point() {
             TEMPERATURES.to_vec(),
         ),
         (
-            "a function the evaluator does not implement",
+            "a published function the evaluator does not implement",
             "Unknown",
             Vec::new(),
         ),
         (
-            "a function the expression engine offers as a builtin",
+            "a published function the expression engine offers as a builtin",
             "Builtin",
             Vec::new(),
         ),

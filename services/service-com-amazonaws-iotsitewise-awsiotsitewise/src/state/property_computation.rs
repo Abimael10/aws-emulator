@@ -46,6 +46,12 @@ use formula_language::{
 };
 use window_grid::WindowGrid;
 
+// The language's function catalogue answers one question outside this module too:
+// an asset-model write refuses a formula applying a name the language does not
+// have (`super::property_formulas`), rather than storing one that would compute
+// nothing. Re-exported rather than copied, so there is one catalogue.
+pub(in crate::state) use formula_language::is_formula_function;
+
 /// How deep a chain of formula properties one read follows.
 ///
 /// DOCUMENTED, not chosen: `Metric` states "The maximum number of

@@ -310,10 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
         if child_model_id != child_asset_model_id {
-            return Err(invalid_request(format!(
-                "The asset {child_id} is an instance of the asset model {child_model_id}, \
-                 but the hierarchy {hierarchy_id} accepts only instances of the asset \
-                 model {child_asset_model_id}."
+            return Err(invalid_request(child_model_not_in_the_parents_model(
+                &child_model_id,
+                &parent_model_id,
+                &input.asset_id,
             )));
         }
 
@@ -407,6 +407,27 @@ const CHILD_ALREADY_HAS_A_PARENT: &str = "Child asset already has a parent";
 /// echoed as the request wrote it.
 fn hierarchy_not_on_the_asset(hierarchy_id: &str, asset_id: &str) -> String {
     format!("Given HierarchyId {hierarchy_id} not present in the Asset {asset_id}")
+}
+
+/// The `InvalidRequestException` message for a child asset whose asset model is
+/// not the one the parent's model groups under the requested hierarchy.
+///
+/// The refusal is stated about the MODELS, not about the two assets: a hierarchy
+/// is a grouping the parent's model declares over one child asset model, so what
+/// the request got wrong is that the child's model is not the model the parent's
+/// model holds there. The three variable parts are the asset model the child
+/// instantiates, the asset model the parent asset instantiates — both read off
+/// the store, because no member of the request carries a model id — and the
+/// parent asset as the request addressed it.
+fn child_model_not_in_the_parents_model(
+    child_asset_model_id: &str,
+    parent_asset_model_id: &str,
+    parent_asset_label: &str,
+) -> String {
+    format!(
+        "Child AssetModel {child_asset_model_id} is not present in the AssetModel \
+         {parent_asset_model_id} of the given parent asset {parent_asset_label}"
+    )
 }
 
 /// HTTP 500 `InternalFailureException`: the store this operation needs is not there.

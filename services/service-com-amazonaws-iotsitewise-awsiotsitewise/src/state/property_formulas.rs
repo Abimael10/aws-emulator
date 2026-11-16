@@ -26,12 +26,14 @@
 //!   definition, which the service settles the write on rather than answering the
 //!   call with (`asset_model_settle`);
 //! * a formula is PARSED: every identifier in it is a declared variable or a
-//!   function applied to arguments, and every declared variable appears in it
+//!   function the language HAS, and every declared variable appears in it
 //!   (`Metric.expression` / `Transform.expression` are the expressions, and
 //!   `.variables` "the list of variables used in the expression");
-//! * a tumbling window's interval names a span inside the published limits
-//!   (`TumblingWindow.interval`: "The interval time must be between 1 minute and 1
-//!   week").
+//! * a tumbling window's interval is READ as a span and that span lies inside the
+//!   published limits (`TumblingWindow.interval`: "The interval time must be
+//!   between 1 minute and 1 week") — two rules in that order, so an interval no
+//!   span can be read from is refused as the text it is and only an interval that
+//!   does name one is held against the limits.
 //!
 //! Every refusal here is a message the calling operation lifts into its own
 //! modelled `InvalidRequestException` (HTTP 400), and every one of them is decided
@@ -51,15 +53,16 @@
 //! identifier tokens and where each one starts, which is what the two formula
 //! rules ask about.
 //!
-//! What that reading deliberately does NOT decide is whether a FUNCTION the
-//! formula applies exists. The language's function catalogue lives only in the
-//! IoT SiteWise User Guide — the Smithy model carries no list of it, and AWS adds
-//! to it — so a hand-kept copy here would refuse formulas the real service
-//! computes, which is the worse failure of the two: an identifier applied to
-//! arguments is therefore read as a function reference, and only an identifier
-//! that is NOT applied has to be a variable the formula declares. Checking a
-//! function name needs that catalogue as a modelled input, not as a list written
-//! from one sample.
+//! An identifier the formula APPLIES to arguments names a function, and the name
+//! has to be one the formula language PUBLISHES
+//! (`super::property_computation::is_formula_function`), which is a WIDER set than
+//! the functions this emulator's evaluator reduces: what a write asks is whether
+//! the language has a function by that name, and what a read computes is what the
+//! evaluator implements. So a published function the evaluator does not reduce is
+//! stored and computes no data point, exactly as before, while a name the language
+//! does not publish is refused with the sentence an identifier that is no declared
+//! variable is refused with, because the service states both the same way: it names
+//! neither a function nor a variable.
 
 use super::*;
 
@@ -371,9 +374,27 @@ pub fn variable_quota_message(expression: &str, declared: usize) -> String {
 /// The message an interval outside the published window limits is refused with:
 /// the formula the window belongs to, then the interval as the request spelled
 /// it.
+///
+/// Asked only of an interval a span WAS read from: the limits are a statement
+/// about a span, so an interval that named none is refused as the text it is
+/// ([`unreadable_window_interval_message`]) rather than as a span outside them.
 #[must_use]
 pub fn window_interval_message(expression: &str, interval: &str) -> String {
     format!("`{expression}`: Window time interval '{interval}' is not within limits")
+}
+
+/// The message an interval whose text names NO span at all is refused with: the
+/// text the reading could not take a span from, quoted as the input that was
+/// read and then stated plainly.
+///
+/// A value the service cannot READ and a span it read and found outside the
+/// published limits are two different refusals, because the second is a judgment
+/// on a span and the first never got one: the context a reading refusal quotes is
+/// therefore the text that was read, not the formula the window belongs to, which
+/// the reading never looked at.
+#[must_use]
+pub fn unreadable_window_interval_message(interval: &str) -> String {
+    format!("`{interval}`: Unable to parse window time interval {interval}")
 }
 
 /// The message an id-less property definition whose NAME an existing property
@@ -876,16 +897,19 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             self.check_variable(&variable.value, definition, formula)?;
         }
         let named = formula_identifiers(expression);
-        // An identifier the expression applies to arguments is a function of the
-        // formula language; every other one has to be a variable this formula
-        // declares, or one of the language's literals.
+        // An identifier the expression applies to arguments names a FUNCTION, so it
+        // has to be one the formula language has; every other one has to be a
+        // variable this formula declares, or one of the language's literals.
         for identifier in &named {
-            if identifier.applied
-                || FORMULA_LITERALS.contains(&identifier.text.as_str())
-                || variables
-                    .iter()
-                    .any(|variable| variable.name == identifier.text)
-            {
+            let known = if identifier.applied {
+                super::property_computation::is_formula_function(&identifier.text)
+            } else {
+                FORMULA_LITERALS.contains(&identifier.text.as_str())
+                    || variables
+                        .iter()
+                        .any(|variable| variable.name == identifier.text)
+            };
+            if known {
                 continue;
             }
             return Err(unknown_identifier_message(
@@ -968,19 +992,21 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 }
 
-/// Refuse a metric window whose tumbling interval names a span outside the
-/// published limits — or no span at all, which is a span the limits cannot hold
-/// either.
+/// Refuse a metric window whose tumbling interval the service cannot read a span
+/// from, and one whose span sits outside the published limits — two refusals, in
+/// that order, because reading the value comes before judging the span it names.
 ///
-/// The refusal names the metric's own expression, because the window belongs to
-/// that formula.
+/// The limits refusal names the metric's own expression, because the window
+/// belongs to that formula; the reading refusal names the text it could not read,
+/// which is all it has.
 pub fn check_metric_window(expression: &str, window: &MetricWindow) -> Result<(), String> {
     let Some(tumbling) = window.tumbling.as_ref() else {
         return Ok(());
     };
-    let within = window_span(&tumbling.interval)
-        .is_some_and(|span| (MIN_TUMBLING_INTERVAL..=MAX_TUMBLING_INTERVAL).contains(&span));
-    if within {
+    let Some(span) = window_span(&tumbling.interval) else {
+        return Err(unreadable_window_interval_message(&tumbling.interval));
+    };
+    if (MIN_TUMBLING_INTERVAL..=MAX_TUMBLING_INTERVAL).contains(&span) {
         Ok(())
     } else {
         Err(window_interval_message(expression, &tumbling.interval))
