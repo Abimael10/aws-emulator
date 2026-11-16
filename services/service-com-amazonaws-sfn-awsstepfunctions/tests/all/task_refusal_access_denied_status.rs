@@ -15,8 +15,10 @@
 //! and the client-error status where the invoked service's front door answers one as that
 //! (Step Functions' own `states:…` calls) — and where the invoked OPERATION models an
 //! access-denied error of its own, the status and code are that error's modelled ones
-//! (`sns:Publish`'s `AuthorizationError`) rather than the unmodelled
-//! `AccessDeniedException` pair.
+//! (`sns:Publish`'s `AuthorizationError`) rather than the service's own unmodelled pair.
+//! That pair is the service's too: most answer the AWS-common `AccessDeniedException`, and
+//! the ones whose front door answers the bare `AccessDenied` (Amazon SQS, Amazon S3) carry
+//! that code.
 //!
 //! The rows differ along what the rule generalises over: which service the refused call
 //! was to and therefore which status and client name the metadata carries, whether the

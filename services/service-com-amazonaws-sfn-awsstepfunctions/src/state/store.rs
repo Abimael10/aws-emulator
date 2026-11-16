@@ -194,7 +194,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             self.discard_activity_task(&token);
         }
         for (token, due) in timed_out {
-            self.time_out_activity_task(&token, due);
+            self.time_out_activity_task(&token, due, now);
         }
     }
 
@@ -550,14 +550,16 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// the outcome it computed is owed to the clock.
     ///
     /// The one place a continuation reaches an execution, whatever the execution was
-    /// waiting at — a worker's reply to an activity task, or the job a run-a-job
-    /// integration started — so both are admitted against the store's ceiling the
-    /// same way: `extra_bytes` is what the walk's own next task and Map Runs will
-    /// retain, and a continuation the store has no room for changes nothing.
+    /// waiting at — a worker's reply to an activity task, the job a run-a-job
+    /// integration started, or the callback task whose own bound ran out
+    /// ([`super::callback_timeout`], which has already taken that task's record) — so
+    /// each is admitted against the store's ceiling the same way: `extra_bytes` is what
+    /// the walk's own next task and Map Runs will retain, and a continuation the store
+    /// has no room for changes nothing.
     ///
     /// `stopped_at` is the step a later `RedriveExecution` continues the execution
     /// from, for an attempt that STOPPED at the state it was waiting at.
-    fn continue_execution(
+    pub fn continue_execution(
         &mut self,
         execution_arn: &str,
         events: Vec<HistoryEvent>,
@@ -605,11 +607,14 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 
     /// Close `token`'s task at `due`, the instant its own bound made it due, and fail
     /// the execution waiting at it with the error the Amazon States Language names
-    /// for a task that ran out of time — unless the scheduling state RETRIES it.
+    /// for a task that ran out of time — unless the scheduling state ANSWERS that
+    /// error itself.
     ///
     /// `due` is the instant the bound was reached, not the instant somebody looked:
-    /// two callers reading afterwards see the same `stopDate`.
-    fn time_out_activity_task(&mut self, token: &str, due: SystemTime) {
+    /// two callers reading afterwards see the same `stopDate`. `now` is when this
+    /// settle is running, which is what the span a continuation is still owed in is
+    /// measured against.
+    fn time_out_activity_task(&mut self, token: &str, due: SystemTime, now: SystemTime) {
         // "If the task runs longer than the specified seconds, this state fails with a
         // States.Timeout error name": the state's own `Retry` answers for that error
         // before the execution does, and the attempt it schedules is a task a worker
@@ -617,10 +622,111 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         if self.retry_activity_task(token, TASK_TIMEOUT_ERROR, EVENT_ACTIVITY_TIMED_OUT, due) {
             return;
         }
+        // A CALLBACK task's next attempt — and the `Catch` that carries its execution
+        // past the failure — are a WALK of the definition, which no settle can run: the
+        // task is left for [`super::callback_timeout`] to claim and continue, which is
+        // where the state's own error handling is applied. Past the span that
+        // continuation is allowed, nothing continued it, and the bound the clock reached
+        // is the execution's failure after all.
+        if self.awaits_timeout_continuation(token, due, now) {
+            return;
+        }
         let Some(task) = self.discard_activity_task(token) else {
             return;
         };
+        self.fail_timed_out_task(&task, due);
+    }
+
+    /// Whether the task `token` names is a CALLBACK task whose own state answers
+    /// [`TASK_TIMEOUT_ERROR`], and whose continuation is still owed at `now` — the span
+    /// a timed-out callback task waits to be continued in, measured from the instant
+    /// `due` its bound ran out.
+    fn awaits_timeout_continuation(
+        &self,
+        token: &str,
+        due: SystemTime,
+        now: SystemTime,
+    ) -> bool {
+        let Some(task) = self.activity_tasks.get(token) else {
+            return false;
+        };
+        // An ACTIVITY's task needs no walk: what its state does with the timeout is the
+        // `Retry` this store schedules itself, and its failure is the execution's.
+        if task.activity_arn.is_some() {
+            return false;
+        }
+        if after(due, callback_timeout::MAX_CONTINUATION_DELAY) <= now {
+            return false;
+        }
+        let Some(definition) = self.definition_of_execution(&task.execution_arn) else {
+            return false;
+        };
+        asl::state_answers_error(
+            &definition,
+            &task.state_name,
+            TASK_TIMEOUT_ERROR,
+            &task.retries_taken,
+        )
+    }
+
+    /// CLAIM the callback task whose bound the clock has made due and whose state
+    /// answers that timeout itself, for the continuation that applies the state's own
+    /// error handling: the task as it stood, the instant its bound ran out, and why the
+    /// clock closed it.
+    ///
+    /// The record is DISCARDED in the same critical section it is read in, so exactly
+    /// one caller continues one timed-out task however many look at once — and the token
+    /// answers nothing from here on, exactly as it answers nothing once the clock has
+    /// closed it any other way.
+    ///
+    /// `None` when this store holds no such task, which is every store where nothing is
+    /// owed.
+    pub fn claim_timed_out_callback(
+        &mut self,
+        now: SystemTime,
+    ) -> Option<(ActivityTask, SystemTime, String)> {
+        let claimed = self.activity_tasks.values().find_map(|task| {
+            let due = task.closes_at().filter(|due| *due <= now)?;
+            let live = self
+                .executions
+                .get(&task.execution_arn)
+                .is_some_and(|execution| !execution.is_terminal());
+            (live && self.awaits_timeout_continuation(&task.token, due, now))
+                .then(|| (task.token.clone(), due))
+        });
+        let (token, due) = claimed?;
+        let task = self.discard_activity_task(&token)?;
         let cause = task_timeout_cause(&task);
+        Some((task, due, cause))
+    }
+
+    /// Whether the task `token` names has run out of the time its state allowed it, so
+    /// the token answers nothing from that instant on.
+    ///
+    /// The bound is the CLOCK's, and a task whose state answers the timeout ITSELF is
+    /// left in place for the continuation that applies that answer
+    /// ([`Self::awaits_timeout_continuation`]) — so this is what keeps such a task closed
+    /// to replies while it waits: a `SendTask*` quoting its token names a task that has
+    /// already been closed, exactly as it does once the record is gone, and no heartbeat
+    /// can re-open a bound the clock has already reached.
+    #[must_use]
+    pub fn task_bound_has_passed(&self, token: &str, now: SystemTime) -> bool {
+        self.activity_tasks
+            .get(token)
+            .and_then(ActivityTask::closes_at)
+            .is_some_and(|due| due <= now)
+    }
+
+    /// Fail the execution `task` was waiting at with [`TASK_TIMEOUT_ERROR`] at `due`:
+    /// the bound the clock reached is the state's failure and the execution's.
+    ///
+    /// The task's own record is already out of the store, so this writes the two events
+    /// the failure owes, the step a later redrive continues from, and the terminal
+    /// status — and queues what the execution publishes about having ended. Public for the
+    /// claim that could not be continued ([`super::callback_timeout`]), which owes the
+    /// same failure this store's own settle records.
+    pub fn fail_timed_out_task(&mut self, task: &ActivityTask, due: SystemTime) {
+        let cause = task_timeout_cause(task);
         // The event the language names this closure with is the one for the kind of
         // work that ran out of time: an activity's task times out as an activity,
         // while a callback task's work is the `Task` state's own integration.
@@ -672,7 +778,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .retained_bytes
             .saturating_add(after)
             .saturating_sub(before);
-        let execution_arn = task.execution_arn;
+        let execution_arn = task.execution_arn.clone();
         self.pending_executions
             .retain(|pending| pending != &execution_arn);
         // The bound the clock reached is this execution's TERMINAL status, reached

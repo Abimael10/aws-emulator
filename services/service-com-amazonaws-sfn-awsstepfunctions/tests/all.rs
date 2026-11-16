@@ -43,6 +43,8 @@ mod backup_task_integration;
 mod bounded_activity_task_outcomes;
 #[path = "all/callback_service_integration.rs"]
 mod callback_service_integration;
+#[path = "all/callback_timeout_error_handling.rs"]
+mod callback_timeout_error_handling;
 #[path = "all/caller_identity_authorization.rs"]
 mod caller_identity_authorization;
 #[path = "all/choice_and_wait_evaluation.rs"]
@@ -61,6 +63,8 @@ mod concurrent_activity_bound_isolation;
 mod control_plane_pass_role;
 #[path = "all/control_plane_refusal_classes.rs"]
 mod control_plane_refusal_classes;
+#[path = "all/cross_region_task_targets.rs"]
+mod cross_region_task_targets;
 #[path = "all/definition_decides_the_outcome.rs"]
 mod definition_decides_the_outcome;
 #[path = "all/definition_field_schema.rs"]

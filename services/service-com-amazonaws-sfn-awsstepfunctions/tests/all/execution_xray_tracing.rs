@@ -76,6 +76,11 @@ const SUPPLIED_SPAN: &str = "53995c3f42cd8ad8";
 const DEADLINE: Duration = Duration::from_secs(30);
 const LOOK: Duration = Duration::from_millis(50);
 
+/// How many pages of `GetTraceSummaries` one listing of this suite's window follows: the
+/// window is a little over an hour and the read answers it a slice at a time, so a handful
+/// covers it and a reader that never ran out of pages would be a defect of its own.
+const MAX_SUMMARY_PAGES: usize = 16;
+
 /// One emulator: Step Functions and X-Ray mounted on ONE shared engine.
 ///
 /// X-Ray is mounted BESIDE Step Functions because a run's segments are submitted through the
@@ -199,6 +204,12 @@ impl Emulator {
 
     /// The trace ids `GetTraceSummaries` lists over the window the runs of this suite
     /// happened in, narrowed by `filter` where one is given.
+    ///
+    /// The read is PAGED — a window is answered one slice at a time, with `NextToken`
+    /// naming the next — so this follows that token to the end of the window, as a client
+    /// of the API does: the trace of a run that happened a moment ago sits in the LAST
+    /// slice of a window that opens an hour back, and a reader that took the first page
+    /// for the whole answer would see none of it.
     async fn listed_traces(&self, filter: Option<&str>) -> Vec<Value> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -211,16 +222,25 @@ impl Emulator {
         if let (Some(filter), Some(object)) = (filter, request.as_object_mut()) {
             object.insert("FilterExpression".to_string(), json!(filter));
         }
-        let summaries = self.xray("/TraceSummaries", &request).await;
-        summaries
-            .get("TraceSummaries")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row.get("Id").cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut ids: Vec<Value> = Vec::new();
+        for _page in 0..MAX_SUMMARY_PAGES {
+            let summaries = self.xray("/TraceSummaries", &request).await;
+            if let Some(rows) = summaries.get("TraceSummaries").and_then(Value::as_array) {
+                ids.extend(rows.iter().filter_map(|row| row.get("Id").cloned()));
+            }
+            let next = summaries
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string);
+            let Some(next) = next else {
+                return ids;
+            };
+            if let Some(object) = request.as_object_mut() {
+                object.insert("NextToken".to_string(), json!(next));
+            }
+        }
+        panic!("expected the window to be listed in at most {MAX_SUMMARY_PAGES} page(s)");
     }
 
     /// The segment X-Ray holds for the execution `execution_arn`, out of the documents in the

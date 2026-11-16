@@ -1942,6 +1942,38 @@ impl TargetNaming {
             }
         }
     }
+
+    /// The Region the call acting on `named` is ADDRESSED to, for an addressing form
+    /// that carries the service's own ENDPOINT; `None` for one that does not.
+    ///
+    /// A queue url is the endpoint the call is made to — "the URL of the Amazon SQS
+    /// queue to which a message is sent" is both the queue's name and its address, so
+    /// the request goes to the host that url names and is signed for the Region that
+    /// host carries, which is how a client reaches a queue of another Region without
+    /// changing anything else. Every OTHER form carries only a resource's name or its
+    /// ARN, which names no endpoint: such a call is made against the Region the caller
+    /// itself is in, and a resource of another Region is then the invoked operation's
+    /// own business to refuse.
+    fn addressed_region(self, named: &str) -> Option<String> {
+        match self {
+            Self::QueueUrl => endpoint_region(named),
+            Self::Arn | Self::Named { .. } | Self::FunctionName => None,
+        }
+    }
+}
+
+/// The Region ONE integration call is addressed to: the Region the resource its
+/// request names carries its own endpoint in ([`TargetNaming::addressed_region`]), or
+/// `None` for a call whose request addresses its target by a form that names no
+/// endpoint — which is made in the Region the caller runs in.
+///
+/// Read off the invoked operation's own input ([`Call::operation_input`]), exactly as
+/// the access request over the same target is ([`access_request`]), so both families of
+/// an integration address the same endpoint.
+pub fn addressed_region(call: &Call, request: &Value) -> Option<String> {
+    let targets = call.targets?;
+    let named = targets.named_in(&call.operation_input(request))?;
+    targets.named.addressed_region(&named)
 }
 
 /// The Region the endpoint host of `url` names, for a url addressed to one of a
@@ -4098,6 +4130,10 @@ pub async fn call_api(
             })
         }
     };
+    // The call goes to the endpoint the request's own target names when that target
+    // carries one ([`addressed_region`]), and to the caller's own Region otherwise.
+    let addressed = addressed_region(call, request);
+    let region = addressed.as_deref().unwrap_or(region);
     match dispatch(callback, api, region, built).await {
         Ok(answered) => {
             let read = match call.rest {
@@ -4691,6 +4727,10 @@ pub async fn call_answered(
     request: &Value,
 ) -> Result<Answered, String> {
     let built = wired(call, request)?;
+    // Addressed exactly as [`call_api`] addresses it: the endpoint the request's own
+    // target names, where that target carries one.
+    let addressed = addressed_region(call, request);
+    let region = addressed.as_deref().unwrap_or(region);
     dispatch(callback, call.api, region, built).await
 }
 

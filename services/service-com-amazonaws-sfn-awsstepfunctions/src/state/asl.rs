@@ -3966,6 +3966,45 @@ pub fn activity_retry(
     None
 }
 
+/// Whether the state `state_name` of `definition` ANSWERS `error` ITSELF: a `Retry`
+/// whose retrier names it with an attempt left, or a `Catch` whose catcher names it.
+///
+/// "Task states […] can have a field named Catch. […] When a state reports an error and
+/// it matches a catcher, the state's output is the error output" — so such a failure is
+/// not the execution's: the state makes its work's next attempt, or the execution
+/// carries on at the catcher's `Next`. A state that answers neither way fails the
+/// execution with the error.
+///
+/// `taken` is how many attempts each retrier of that state has already spent, read
+/// exactly as [`activity_retry`] reads it, and the matching is the one rule every
+/// retrier and catcher of this service is decided by ([`errors_match`]) — so this
+/// answers the same question the walk itself would, without walking.
+pub fn state_answers_error(
+    definition: &str,
+    state_name: &str,
+    error: &str,
+    taken: &[u64],
+) -> bool {
+    if activity_retry(definition, state_name, error, taken).is_some() {
+        return true;
+    }
+    let Ok(document) = serde_json::from_str::<Value>(definition) else {
+        return false;
+    };
+    let state = document
+        .get("States")
+        .and_then(Value::as_object)
+        .and_then(|states| states.get(state_name))
+        .and_then(Value::as_object);
+    let Some(state) = state else {
+        return false;
+    };
+    retry_entries(state, "Catch")
+        .iter()
+        .filter_map(Value::as_object)
+        .any(|catcher| errors_match(catcher, error))
+}
+
 /// Whether a retrier's or catcher's `ErrorEquals` names `error`.
 ///
 /// "States.ALL — A wildcard that matches any known error name", with one documented

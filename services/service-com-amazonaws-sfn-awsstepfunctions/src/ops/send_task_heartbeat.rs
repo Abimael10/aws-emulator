@@ -198,7 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(SendTaskHeartbeatOutput {});
         }
 
-        let Some(task) = store.activity_tasks.get(&input.task_token) else {
+        // A task whose own bound the clock has already reached answers nothing, whether
+        // its record is gone or is still held for the continuation that applies its
+        // state's error handling ([`crate::state::callback_timeout`]): the token names a
+        // task that has been closed, so no heartbeat re-opens its window.
+        let Some(task) = store
+            .activity_tasks
+            .get(&input.task_token)
+            .filter(|_| !store.task_bound_has_passed(&input.task_token, now))
+        else {
             return Err(SendTaskHeartbeatErrorModeled::TaskTimedOut(TaskTimedOut {
                 message: Some(crate::state::task_timed_out_message(&input.task_token)),
             })

@@ -446,8 +446,32 @@ pub async fn publish<Eng: Send + Sync + 'static>(
     let Some(state) = super::service_state(&**engine) else {
         return;
     };
+    // A callback task whose bound the clock has made due owes its state's own error
+    // handling, which is a WALK and so cannot be run inside a settle: it is handed to a
+    // task of its own here, because this call has a caller to answer
+    // ([`super::callback_timeout`]).
+    super::callback_timeout::drive(engine, callback);
     hand_over(engine, &state, callback).await;
     drive(engine, &state, callback);
+}
+
+/// Hand over everything the transitions this store has materialised owe, for a driver
+/// that SETTLED the store itself and is already a task of its own
+/// ([`super::callback_timeout`]).
+///
+/// The same hand-over [`publish`] makes, without the clock that call starts: a settle
+/// QUEUES what the transitions it materialised owe — the status changes, the
+/// observations, the traces — so whoever settles has to hand them over, or a transition
+/// nobody asks about again leaves them queued. Starting another driver from inside one
+/// would start one per pass, which is why this is not [`publish`] itself.
+pub(super) async fn hand_over_settled<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+) {
+    let Some(state) = super::service_state(&**engine) else {
+        return;
+    };
+    let _published = hand_over(engine, &state, callback).await;
 }
 
 /// Hand over everything the transitions this store has materialised owe another
@@ -652,7 +676,12 @@ fn drive<Eng: Send + Sync + 'static>(
             // a due transition from costing a CPU-bound spin, and it hands the runtime
             // back between wake-ups.
             ::tokio::time::sleep(wait(next_due, idle_shift)).await;
-            let published = hand_over(&engine, &driven, &callback).await;
+            // The clock is background work already, so the continuation a timed-out
+            // callback task owes is interpreted on this wake-up rather than handed on:
+            // it is owed whether or not anybody calls this service again.
+            let continued =
+                super::callback_timeout::continue_due(&engine, &callback).await;
+            let published = continued + hand_over(&engine, &driven, &callback).await;
             idle_shift = match published {
                 0 => (idle_shift + 1).min(MAX_IDLE_SHIFT),
                 _ => 0,
