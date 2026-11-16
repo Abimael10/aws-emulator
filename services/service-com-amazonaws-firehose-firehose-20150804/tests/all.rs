@@ -71,6 +71,8 @@ mod encryption_change_not_found_message;
 mod encryption_conflict_messages;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/enum_value_set_order_across_types.rs"]
+mod enum_value_set_order_across_types;
 #[path = "all/error_output_prefix_resolution.rs"]
 mod error_output_prefix_resolution;
 #[path = "all/format_conversion_delivery.rs"]

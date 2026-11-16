@@ -15,7 +15,9 @@
 //! reason as the run before them.
 //!
 //! A second such run grew back inside that header while the first repair was being reviewed,
-//! and was reduced the same way.
+//! and was reduced the same way. So did a third, which had left seven more copies and several
+//! lines truncated mid-sentence; it was reduced to the one copy of each paragraph that stands
+//! there now, for the same reason as the runs before it.
 //!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.
