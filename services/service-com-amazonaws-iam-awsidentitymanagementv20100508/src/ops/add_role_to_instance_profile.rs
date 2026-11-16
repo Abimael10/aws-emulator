@@ -269,42 +269,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The profile was resolved above, so this read answers; a store that no longer
-        // holds it carries no binding either, so the two refusals below are reached from
-        // what it HOLDS and nothing here can panic on what the request supplied. The read
-        // borrows rather than copies the bindings: what the refusals need is whether this
-        // role is among them and how many there are.
-        let (carries_the_role, held_roles) = store
+        // holds it carries no binding either, so the refusal below is reached from what it
+        // HOLDS and nothing here can panic on what the request supplied. The read borrows
+        // rather than copies the bindings: what the refusal needs is how many there are.
+        let held_roles = store
             .instance_profiles
             .get(&profile_key)
-            .map_or((false, 0), |profile| {
-                (
-                    profile.role_keys.contains(&role_key),
-                    profile.role_keys.len(),
-                )
-            });
-
-        // A repeated add of the role the profile already carries attempted "to create
-        // a resource that already exists" (`EntityAlreadyExistsException` doc) rather
-        // than a second association.
-        if carries_the_role {
-            return Err(
-                AddRoleToInstanceProfileErrorModeled::EntityAlreadyExistsException(
-                    EntityAlreadyExistsException {
-                        message: Some(format!(
-                            "Role {} is already associated with Instance Profile {}.",
-                            input.role_name, input.instance_profile_name
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+            .map_or(0, |profile| profile.role_keys.len());
 
         // "An instance profile can contain only one role, and this quota cannot be
         // increased. You can remove the existing role and then add a different role to
-        // an instance profile." (`AddRoleToInstanceProfile` doc.) The refusal names the
-        // quota IAM names for it, in the one place this crate words that sentence
-        // (`crate::state::instance_profile_role_quota_exceeded`).
+        // an instance profile." (`AddRoleToInstanceProfile` doc.) That quota is the
+        // BINDING rule on every add to a profile that already holds a role, so it is
+        // taken before anything is said about WHICH role the request named: a profile at
+        // the quota can hold no further role, the one it already holds included, so a
+        // repeated add of that role is past the quota exactly as a different role is.
+        // The refusal names the quota IAM names for it, in the one place this crate words
+        // that sentence (`crate::state::instance_profile_role_quota_exceeded`).
+        //
+        // `EntityAlreadyExistsException` is MODELLED for this operation but has no
+        // condition left to fire on: with a quota of one role, any add to a profile that
+        // already carries the named role is an add to a profile at its quota, and the
+        // quota is what IAM answers it with.
         if held_roles >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
             return Err(AddRoleToInstanceProfileErrorModeled::LimitExceededException(
                 LimitExceededException {

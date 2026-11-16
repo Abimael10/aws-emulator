@@ -828,6 +828,21 @@ pub fn service_with_credentials(service_name: &str) -> Option<&'static ServiceWi
         .find(|service| service.service_name.eq_ignore_ascii_case(service_name))
 }
 
+/// The message IAM refuses a `ServiceName` its catalog of credential-issuing services
+/// holds no entry for with: the fixed text `No such service ` and ` is supported for
+/// Service Specific Credentials` around the name the request supplied.
+///
+/// A name the catalog does not carry names NO service that issues such credentials, so
+/// what IAM reports is a missing entity rather than a service that merely declines the
+/// form — "the error message describes the resource" (`NoSuchEntityException`), and the
+/// resource described here is the service the request asked for, in the spelling it was
+/// asked for (the catalog has no entry to take a spelling from). Stated ONCE so the
+/// operations resolving a `ServiceName` against that catalog cannot word the miss two
+/// ways.
+pub fn service_without_credentials_message(service_name: &str) -> String {
+    format!("No such service {service_name} is supported for Service Specific Credentials")
+}
+
 /// The handle IAM generates for a service-specific credential: the IAM user's name joined
 /// to the account id (see [`SERVICE_USER_NAME_INFIX`]).
 ///
@@ -1698,6 +1713,11 @@ pub fn open_id_connect_provider_arn(url: &str) -> String {
     ::engine::emulator_arn("iam", "", &format!("oidc-provider/{host_and_path}"))
 }
 
+/// The resource type an IAM SAML 2.0 identity provider's ARN carries:
+/// [`saml_provider_arn`] writes it and [`parse_saml_provider_arn`] reads it back, so the
+/// two cannot disagree about which resource type the provider family addresses.
+pub const SAML_PROVIDER_RESOURCE_TYPE: &str = "saml-provider";
+
 /// The ARN of an IAM SAML 2.0 identity provider:
 /// `arn:aws:iam::<account>:saml-provider/<name>`.
 ///
@@ -1707,7 +1727,34 @@ pub fn open_id_connect_provider_arn(url: &str) -> String {
 /// the provider a role's trust policy trusts. IAM is a global service, so the region
 /// segment is empty, exactly as it is for [`user_arn`].
 pub fn saml_provider_arn(name: &str) -> String {
-    ::engine::emulator_arn("iam", "", &format!("saml-provider/{name}"))
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("{SAML_PROVIDER_RESOURCE_TYPE}/{name}"),
+    )
+}
+
+/// The provider NAME `arn` carries when it is a SAML provider's ARN, or `None` when the
+/// value names a resource of any OTHER type — which is what lets the operations taking a
+/// `SAMLProviderArn` tell an ARN they can address from one they cannot before the store is
+/// consulted at all.
+///
+/// Such an ARN is `arn:<partition>:iam::<account>:saml-provider/<name>`, read through the
+/// same [`iam_arn_parts`] envelope as every other IAM ARN this crate parses
+/// ([`parse_delegation_request_arn`]); the name is the whole resource body, since
+/// `SAMLProviderNameType`'s pattern (`^[\w._-]+$`) admits no `/` and so no path. A value
+/// that misses that envelope in any field — another service, a region where an IAM ARN has
+/// none, no account — names no SAML provider either, so the callers report every miss as the
+/// one refusal they all state ([`ARN_WRONG_RESOURCE_TYPE`]).
+pub fn parse_saml_provider_arn(arn: &str) -> Option<&str> {
+    let (_account, resource) = iam_arn_parts(arn)?;
+    let name = resource
+        .strip_prefix(SAML_PROVIDER_RESOURCE_TYPE)?
+        .strip_prefix('/')?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name)
 }
 
 /// The ARN of an IAM instance profile:
@@ -2851,15 +2898,21 @@ const ARN_FIELDS: usize = 6;
 /// Whether `value` is an ARN AT ALL — the `arn:` frame and its [`ARN_FIELDS`] fields —
 /// whatever service, account or resource it goes on to name.
 ///
-/// A member that must BE an ARN is taken in TWO layers, and this is the first of them.
-/// A value that is not an ARN never gets as far as naming a resource: it is refused as a
-/// value whose FORM is wrong for the member it was supplied for, with the error code IAM
-/// answers such a refusal with (`ValidationError`,
-/// [`crate::scaffolded::Scaffolded::validation_error`]). An ARN that IS one, but names another
-/// service, another resource type or a resource body IAM's own grammar does not admit,
-/// is read by the parser the member's operation uses ([`parse_policy_arn`],
-/// [`parse_entity_arn`]) and refused as the "invalid … value … supplied for an input
-/// parameter" that operation MODELS — the same sentence under the operation's own code.
+/// A member that must BE an ARN is taken in TWO layers, and this is the first of them: a
+/// value that is not an ARN never gets as far as naming a resource, and only one that is
+/// goes on to be read for the resource it names ([`parse_policy_arn`],
+/// [`parse_entity_arn`], [`parse_saml_provider_arn`]).
+///
+/// WHICH refusal each layer carries goes by the member's own recorded answers, and the two
+/// families this crate serves split it the two opposite ways. A managed policy's ARN is
+/// refused `ValidationError` for a value that is not an ARN at all
+/// ([`crate::scaffolded::Scaffolded::validation_error`], the code IAM answers a value whose
+/// FORM is wrong for its member with) and with the operation's modelled "invalid … value …
+/// supplied for an input parameter" for an ARN naming another service or resource type
+/// ([`arn_not_valid`]). A SAML provider's ARN is recorded the other way about: the value that
+/// is no ARN carries that family's modelled invalid-input sentence, while an ARN whose
+/// resource type the member cannot address is the `ValidationError` IAM states as
+/// [`ARN_WRONG_RESOURCE_TYPE`]. Read the member's own family before writing a new one.
 ///
 /// ONE reading of the frame, so no two members of this service disagree about what is an
 /// ARN.

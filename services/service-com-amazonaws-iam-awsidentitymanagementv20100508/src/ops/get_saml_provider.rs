@@ -162,11 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The only input member is an ARN, so the modelled `InvalidInputException` is the
-        // refusal of a value that is not one: an ARN "begins with arn:" (Amazon Resource
-        // Names, Amazon Web Services General Reference). A well-formed ARN naming no held
-        // provider is a different answer — the entity does not exist.
-        if !input.saml_provider_arn.starts_with("arn:") {
+        // The only input member is an ARN, and the value has to BE one that names a SAML
+        // provider: both readings happen before the store is consulted, in the two layers
+        // this crate takes an ARN member's form in. A value that is not an ARN at all —
+        // one "begins with arn:" and carries the six fields of the name (Amazon Resource
+        // Names, Amazon Web Services General Reference), which is what
+        // `crate::state::is_arn` reads — is the modelled `InvalidInputException`, while an
+        // ARN whose RESOURCE TYPE this member cannot address is refused on that type with
+        // the code and the sentence IAM answers it with
+        // (`crate::state::ARN_WRONG_RESOURCE_TYPE`). A well-formed SAML provider ARN
+        // naming no held provider is a third answer — the entity does not exist.
+        if !crate::state::is_arn(&input.saml_provider_arn) {
             return Err(GetSAMLProviderErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(format!(
@@ -176,6 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        if crate::state::parse_saml_provider_arn(&input.saml_provider_arn).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ARN_WRONG_RESOURCE_TYPE,
+            ));
         }
 
         // A pure read: nothing is written, so two calls report the same provider. The

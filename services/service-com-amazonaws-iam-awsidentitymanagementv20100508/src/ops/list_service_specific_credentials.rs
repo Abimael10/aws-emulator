@@ -186,19 +186,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A `ServiceName` filter names a service, so a name no service supporting
-        // service-specific credentials carries selects nothing that could exist.
+        // A `ServiceName` filter names a service, and it is resolved against the same
+        // catalog of credential-issuing services the create resolves it against: a name
+        // that catalog holds no entry for names no such service at all, so the refusal is
+        // the entity-absent one, in the crate's one wording for that miss
+        // (`crate::state::service_without_credentials_message`).
         let service_filter = match &input.service_name {
             Some(service_name) => match crate::state::service_with_credentials(service_name) {
                 Some(service) => Some(service.service_name),
                 None => {
                     return Err(
-                        ListServiceSpecificCredentialsErrorModeled::ServiceNotSupportedException(
-                            ServiceNotSupportedException {
-                                message: Some(format!(
-                                    "The service {service_name} does not support \
-                                     service-specific credentials."
-                                )),
+                        ListServiceSpecificCredentialsErrorModeled::NoSuchEntityException(
+                            NoSuchEntityException {
+                                message: Some(
+                                    crate::state::service_without_credentials_message(
+                                        service_name,
+                                    ),
+                                ),
                             },
                         )
                         .into(),

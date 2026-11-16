@@ -287,6 +287,8 @@ mod published_policy_families;
 mod published_role_template_acquisition;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
+#[path = "all/refusal_code_classification.rs"]
+mod refusal_code_classification;
 #[path = "all/refused_call_audit_parameters.rs"]
 mod refused_call_audit_parameters;
 #[path = "all/request_condition_context.rs"]

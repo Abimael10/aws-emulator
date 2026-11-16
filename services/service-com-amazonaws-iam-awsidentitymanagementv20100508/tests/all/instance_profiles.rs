@@ -433,8 +433,9 @@ async fn add_role_to_instance_profile_puts_the_single_role_on_the_profile() {
         );
 
         // "An instance profile can contain only one role, and this quota cannot be
-        // increased." A repeat of the SAME role is a conflict; a DIFFERENT role is
-        // past the quota. Either way the profile still holds exactly the first role.
+        // increased." The quota is the binding rule on every add to a profile that
+        // already holds a role, so the role the profile already holds is past it exactly
+        // as a different role is. Either way the profile still holds the first role.
         let (status, body) = call(
             &router,
             "AddRoleToInstanceProfile",
@@ -451,8 +452,8 @@ async fn add_role_to_instance_profile_puts_the_single_role_on_the_profile() {
         );
         let code = error_code(&body);
         assert_eq!(
-            code, "EntityAlreadyExists",
-            "case {:?}: expected EntityAlreadyExists, got {code:?}: {body}",
+            code, "LimitExceeded",
+            "case {:?}: expected LimitExceeded, got {code:?}: {body}",
             case.name
         );
 

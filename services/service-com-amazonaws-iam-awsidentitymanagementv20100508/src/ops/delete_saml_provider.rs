@@ -175,12 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `arnType` asks only for a 20..2048 character string, so the value still has to
-        // BE an ARN — one "begins with arn:" (Amazon Resource Names, Amazon Web Services
-        // General Reference) — and anything else is an "invalid … value … supplied for an
-        // input parameter". A well-formed ARN naming no held provider is the DIFFERENT
-        // answer the entity-absent error carries, the same split `GetSAMLProvider` and
-        // `ListSAMLProviderTags` make on this member.
-        if !input.saml_provider_arn.starts_with("arn:") {
+        // BE an ARN, and an ARN naming a resource of another TYPE is as unusable for this
+        // member as a value that is no ARN at all. Both are read before the store is
+        // consulted, in the two layers this crate takes an ARN member's form in: a value
+        // that is not an ARN — one "begins with arn:" and carries the six fields of the
+        // name (Amazon Resource Names, Amazon Web Services General Reference), which is
+        // what `crate::state::is_arn` reads — is the "invalid … value … supplied for an
+        // input parameter" this operation models, while an ARN whose RESOURCE TYPE this
+        // member cannot address is refused on that type with the code and the sentence IAM
+        // answers it with (`crate::state::ARN_WRONG_RESOURCE_TYPE`). Only an ARN that
+        // names a SAML provider reaches the lookup, so a provider the account does not
+        // hold is the DIFFERENT answer the entity-absent error carries — the same split
+        // `GetSAMLProvider` and `ListSAMLProviderTags` make on this member.
+        if !crate::state::is_arn(&input.saml_provider_arn) {
             return Err(DeleteSAMLProviderErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(format!(
@@ -190,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        if crate::state::parse_saml_provider_arn(&input.saml_provider_arn).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ARN_WRONG_RESOURCE_TYPE,
+            ));
         }
 
         // The provider is keyed by the ARN `CreateSAMLProvider` derived from its name, so

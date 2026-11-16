@@ -178,15 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // quota is counted against what the user holds.
         store.expire_service_specific_credentials(now);
 
-        // The credentials are usable "only for the specified service", so a service
-        // that issues no service-specific credentials at all has none to generate.
+        // The credentials are usable "only for the specified service", so the request's
+        // `ServiceName` is resolved against the catalog of services that issue them. A
+        // name that catalog holds no entry for names no such service at all, which is a
+        // reference to an entity that does not exist rather than a service that merely
+        // declines the form, and it is worded in the one place this crate states that
+        // miss (`crate::state::service_without_credentials_message`). The modelled
+        // `ServiceNotSupportedException` (awsQuery code `NotSupportedService`) would say
+        // that a service IAM knows cannot issue the credential — every entry of the
+        // catalog issues one of the two forms, so no such condition arises here.
         let Some(service) = crate::state::service_with_credentials(&input.service_name) else {
             return Err(
-                CreateServiceSpecificCredentialErrorModeled::ServiceNotSupportedException(
-                    ServiceNotSupportedException {
-                        message: Some(format!(
-                            "The service {} does not support service-specific credentials.",
-                            input.service_name
+                CreateServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(crate::state::service_without_credentials_message(
+                            &input.service_name,
                         )),
                     },
                 )

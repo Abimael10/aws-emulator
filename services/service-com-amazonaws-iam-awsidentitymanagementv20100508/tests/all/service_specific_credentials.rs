@@ -340,10 +340,9 @@ async fn creating_past_the_per_service_quota_is_refused() {
     }
 }
 
-/// RULE: only a service that supports service-specific credentials has any to
-/// generate, so a create naming any other service is refused with
-/// `NotSupportedService` (HTTP 404) and persists nothing — and so is a listing
-/// filtered by such a service.
+/// RULE: a `ServiceName` the catalog of credential-issuing services holds no entry for
+/// names no such service at all, so a create naming one is refused with `NoSuchEntity`
+/// (HTTP 404) and persists nothing — and so is a listing filtered by such a service.
 #[tokio::test]
 async fn a_service_that_issues_no_credentials_is_not_supported() {
     let router = router();
@@ -360,6 +359,10 @@ async fn a_service_that_issues_no_credentials_is_not_supported() {
         "notcassandra.amazonaws.com",
         "",
     ] {
+        // The sentence IAM words the catalog miss with names the service the request
+        // asked for, in the spelling it asked for.
+        let expected =
+            format!("No such service {service} is supported for Service Specific Credentials");
         let (status, body) = create_credential(&router, "unsupported.caller", service).await;
         assert_eq!(
             status, 404,
@@ -367,9 +370,14 @@ async fn a_service_that_issues_no_credentials_is_not_supported() {
         );
         assert_eq!(
             error_code(&body),
-            "NotSupportedService",
-            "case {service:?}: expected NotSupportedService, got {:?}",
+            "NoSuchEntity",
+            "case {service:?}: expected NoSuchEntity, got {:?}",
             error_code(&body)
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            expected,
+            "case {service:?}: expected IAM's catalog-miss sentence, got {body}"
         );
 
         let (status, body) = call(
@@ -384,9 +392,14 @@ async fn a_service_that_issues_no_credentials_is_not_supported() {
         );
         assert_eq!(
             error_code(&body),
-            "NotSupportedService",
-            "case {service:?}: expected NotSupportedService, got {:?}",
+            "NoSuchEntity",
+            "case {service:?}: expected NoSuchEntity, got {:?}",
             error_code(&body)
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            expected,
+            "case {service:?}: expected IAM's catalog-miss sentence, got {body}"
         );
     }
 
