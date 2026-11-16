@@ -105,6 +105,8 @@ mod db_instance_read_replica_promotion;
 mod db_instance_read_replicas;
 #[path = "all/db_instance_refused_change_publishes_no_event.rs"]
 mod db_instance_refused_change_publishes_no_event;
+#[path = "all/db_instance_role_association_messages.rs"]
+mod db_instance_role_association_messages;
 #[path = "all/db_instance_stop.rs"]
 mod db_instance_stop;
 #[path = "all/db_instance_storage_encryption_key.rs"]
@@ -333,6 +335,8 @@ mod parameter_group_apply_method;
 mod parameter_refusal_codes;
 #[path = "all/pending_modified_values.rs"]
 mod pending_modified_values;
+#[path = "all/postgres_aws_s3_import_export.rs"]
+mod postgres_aws_s3_import_export;
 #[path = "all/postgres_rds_namespace_parameters.rs"]
 mod postgres_rds_namespace_parameters;
 #[path = "all/provisioned_network_snapshot_export.rs"]

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The Amazon RDS half of the SDK seam a RUNNING handler calls another service through: the
-//! DB instance or cluster a handler reads, and the MASTER CREDENTIAL it changes on one.
+//! DB instance or cluster a handler reads, the MASTER CREDENTIAL it changes on one, and the
+//! Amazon S3 EXPORT of a snapshot it starts, reads and cancels together with the IAM role
+//! associations that gate a database's S3 integration.
 //!
 //! CHANGING A DATABASE'S OWN CREDENTIAL is what a handler at the end of a credential
 //! rotation does: the rotation function AWS Secrets Manager invokes stages a new password in
@@ -10,6 +12,12 @@
 //! secret belongs to, the one way to change that credential without a database connection of
 //! its own. A handler that cannot reach this service cannot carry out that step at all, so
 //! the rotation it is driven through never finishes.
+//!
+//! EXPORTING A DATABASE'S DATA TO AMAZON S3 is the other shape, and the one a CloudFormation
+//! custom resource's provider takes: the handler starts an export task for a snapshot, polls it
+//! to a terminal status, cancels one that is no longer wanted, and associates or drops the IAM
+//! role under which the engine reaches Amazon S3. A handler that cannot reach this service can
+//! drive none of it.
 //!
 //! Most services a handler reaches bind their requests with an AWS JSON protocol, where the
 //! request body IS the operation's input document, so one code path serves every operation of
@@ -36,9 +44,9 @@
 //!   make a call that did something other than what the handler asked for.
 //! * The answer's own status and document are what Amazon RDS answered: a success carries the
 //!   output members this module reads off it ([`db_instance_document`],
-//!   [`db_cluster_document`] name every one of them), and a refusal is that service's own
-//!   error code, message and status, which the SDK the guest calls raises as `ClientError`
-//!   ([`super::aws_sdk_guest`]).
+//!   [`db_cluster_document`] and the export task's own arms name every one of them), and a
+//!   refusal is that service's own error code, message and status, which the SDK the guest
+//!   calls raises as `ClientError` ([`super::aws_sdk_guest`]).
 //!
 //! How one call's input is read, what the answer carried and how a refusal is handed back are
 //! the same for every service reached through an SDK client, so they are [`super::sdk_call`]'s
@@ -59,14 +67,21 @@ const SERVICE: &str = "Amazon RDS";
 /// One entry per operation [`call`] builds a request for: the surface a handler that manages
 /// a database credential uses — reading the DB instance or DB cluster the credential belongs
 /// to, and changing that resource's own configuration, which is how the master credential is
-/// put in force (`MasterUserPassword` / `RotateMasterUserPassword` on either modify). A
-/// handler naming any other operation of the service is told the call was not made and why,
-/// because a request this module cannot bind is one it would otherwise be guessing at.
+/// put in force (`MasterUserPassword` / `RotateMasterUserPassword` on either modify) — and the
+/// surface a handler that drives the database's Amazon S3 integration uses: the export task it
+/// starts, reads and cancels, and the role associations that let the engine reach Amazon S3 at
+/// all. A handler naming any other operation of the service is told the call was not made and
+/// why, because a request this module cannot bind is one it would otherwise be guessing at.
 pub const BOUND_OPERATIONS: &[&str] = &[
     "DescribeDBInstances",
     "ModifyDBInstance",
     "DescribeDBClusters",
     "ModifyDBCluster",
+    "StartExportTask",
+    "DescribeExportTasks",
+    "CancelExportTask",
+    "AddRoleToDBInstance",
+    "RemoveRoleFromDBInstance",
 ];
 
 /// Make ONE Amazon RDS call: `operation`, with `body` as the operation's input document (the
@@ -86,6 +101,13 @@ pub async fn call(
         Some("ModifyDBInstance") => modify_db_instance(&client, &input, &observed).await,
         Some("DescribeDBClusters") => describe_db_clusters(&client, &input, &observed).await,
         Some("ModifyDBCluster") => modify_db_cluster(&client, &input, &observed).await,
+        Some("StartExportTask") => start_export_task(&client, &input, &observed).await,
+        Some("DescribeExportTasks") => describe_export_tasks(&client, &input, &observed).await,
+        Some("CancelExportTask") => cancel_export_task(&client, &input, &observed).await,
+        Some("AddRoleToDBInstance") => add_role_to_db_instance(&client, &input, &observed).await,
+        Some("RemoveRoleFromDBInstance") => {
+            remove_role_from_db_instance(&client, &input, &observed).await
+        }
         _ => Err(Refusal::NotMade(format!(
             "the AWS SDK this runtime supplies binds no {operation} call on {SERVICE}; the \
              operations it binds are {}",
@@ -144,6 +166,265 @@ fn client(
         None => config.credentials_provider(callback.aws_credentials_provider()),
     };
     Client::from_conf(config.build())
+}
+
+/// `StartExportTask`: the snapshot or cluster data a task exports to an Amazon S3 bucket.
+async fn start_export_task(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "ExportTaskIdentifier",
+        "SourceArn",
+        "S3BucketName",
+        "IamRoleArn",
+        "KmsKeyId",
+        "S3Prefix",
+        "ExportOnly",
+    ])?;
+    let started = client
+        .start_export_task()
+        .export_task_identifier(input.required_text("ExportTaskIdentifier")?)
+        .source_arn(input.required_text("SourceArn")?)
+        .s3_bucket_name(input.required_text("S3BucketName")?)
+        .iam_role_arn(input.required_text("IamRoleArn")?)
+        .kms_key_id(input.required_text("KmsKeyId")?)
+        .set_s3_prefix(input.text("S3Prefix")?)
+        .set_export_only(some_list(input.text_list("ExportOnly")?))
+        .send()
+        .await;
+    let started = match started {
+        Ok(started) => started,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(
+        &mut document,
+        "ExportTaskIdentifier",
+        started.export_task_identifier(),
+    );
+    insert_text(&mut document, "SourceArn", started.source_arn());
+    insert_list(&mut document, "ExportOnly", started.export_only());
+    insert_timestamp(&mut document, "SnapshotTime", started.snapshot_time());
+    insert_timestamp(&mut document, "TaskStartTime", started.task_start_time());
+    insert_timestamp(&mut document, "TaskEndTime", started.task_end_time());
+    insert_text(&mut document, "S3Bucket", started.s3_bucket());
+    insert_text(&mut document, "S3Prefix", started.s3_prefix());
+    insert_text(&mut document, "IamRoleArn", started.iam_role_arn());
+    insert_text(&mut document, "KmsKeyId", started.kms_key_id());
+    insert_text(&mut document, "Status", started.status());
+    insert_number(
+        &mut document,
+        "PercentProgress",
+        started.percent_progress().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "TotalExtractedDataInGB",
+        started.total_extracted_data_in_gb().map(i64::from),
+    );
+    insert_text(&mut document, "FailureCause", started.failure_cause());
+    insert_text(&mut document, "WarningMessage", started.warning_message());
+    insert_text(
+        &mut document,
+        "SourceType",
+        started.source_type().map(|kind| kind.as_str()),
+    );
+    observed.answer(document)
+}
+
+/// `DescribeExportTasks`: the export tasks of this account, and what each one has reached.
+async fn describe_export_tasks(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "ExportTaskIdentifier",
+        "SourceArn",
+        "Marker",
+        "MaxRecords",
+        "SourceType",
+    ])?;
+    let described = client
+        .describe_export_tasks()
+        .set_export_task_identifier(input.text("ExportTaskIdentifier")?)
+        .set_source_arn(input.text("SourceArn")?)
+        .set_marker(input.text("Marker")?)
+        .set_max_records(input.integer("MaxRecords")?)
+        .set_source_type(
+            input
+                .text("SourceType")?
+                .map(|kind| ::aws_sdk_rds::types::ExportSourceType::from(kind.as_str())),
+        )
+        .send()
+        .await;
+    let described = match described {
+        Ok(described) => described,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Marker", described.marker());
+    let tasks: Vec<Value> = described
+        .export_tasks()
+        .iter()
+        .map(|task| {
+            let mut reported = Map::new();
+            insert_text(
+                &mut reported,
+                "ExportTaskIdentifier",
+                task.export_task_identifier(),
+            );
+            insert_text(&mut reported, "SourceArn", task.source_arn());
+            insert_list(&mut reported, "ExportOnly", task.export_only());
+            insert_timestamp(&mut reported, "SnapshotTime", task.snapshot_time());
+            insert_timestamp(&mut reported, "TaskStartTime", task.task_start_time());
+            insert_timestamp(&mut reported, "TaskEndTime", task.task_end_time());
+            insert_text(&mut reported, "S3Bucket", task.s3_bucket());
+            insert_text(&mut reported, "S3Prefix", task.s3_prefix());
+            insert_text(&mut reported, "IamRoleArn", task.iam_role_arn());
+            insert_text(&mut reported, "KmsKeyId", task.kms_key_id());
+            insert_text(&mut reported, "Status", task.status());
+            insert_number(
+                &mut reported,
+                "PercentProgress",
+                task.percent_progress().map(i64::from),
+            );
+            insert_number(
+                &mut reported,
+                "TotalExtractedDataInGB",
+                task.total_extracted_data_in_gb().map(i64::from),
+            );
+            insert_text(&mut reported, "FailureCause", task.failure_cause());
+            insert_text(&mut reported, "WarningMessage", task.warning_message());
+            insert_text(
+                &mut reported,
+                "SourceType",
+                task.source_type().map(|kind| kind.as_str()),
+            );
+            Value::Object(reported)
+        })
+        .collect();
+    document.insert("ExportTasks".to_string(), Value::Array(tasks));
+    observed.answer(document)
+}
+
+/// `CancelExportTask`: the export task a handler stops before it finished.
+async fn cancel_export_task(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["ExportTaskIdentifier"])?;
+    let cancelled = client
+        .cancel_export_task()
+        .export_task_identifier(input.required_text("ExportTaskIdentifier")?)
+        .send()
+        .await;
+    let cancelled = match cancelled {
+        Ok(cancelled) => cancelled,
+        Err(error) => return observed.refused(&error),
+    };
+    let mut document = Map::new();
+    insert_text(
+        &mut document,
+        "ExportTaskIdentifier",
+        cancelled.export_task_identifier(),
+    );
+    insert_text(&mut document, "SourceArn", cancelled.source_arn());
+    insert_list(&mut document, "ExportOnly", cancelled.export_only());
+    insert_timestamp(&mut document, "SnapshotTime", cancelled.snapshot_time());
+    insert_timestamp(&mut document, "TaskStartTime", cancelled.task_start_time());
+    insert_timestamp(&mut document, "TaskEndTime", cancelled.task_end_time());
+    insert_text(&mut document, "S3Bucket", cancelled.s3_bucket());
+    insert_text(&mut document, "S3Prefix", cancelled.s3_prefix());
+    insert_text(&mut document, "IamRoleArn", cancelled.iam_role_arn());
+    insert_text(&mut document, "KmsKeyId", cancelled.kms_key_id());
+    insert_text(&mut document, "Status", cancelled.status());
+    insert_number(
+        &mut document,
+        "PercentProgress",
+        cancelled.percent_progress().map(i64::from),
+    );
+    insert_number(
+        &mut document,
+        "TotalExtractedDataInGB",
+        cancelled.total_extracted_data_in_gb().map(i64::from),
+    );
+    insert_text(&mut document, "FailureCause", cancelled.failure_cause());
+    insert_text(&mut document, "WarningMessage", cancelled.warning_message());
+    insert_text(
+        &mut document,
+        "SourceType",
+        cancelled.source_type().map(|kind| kind.as_str()),
+    );
+    observed.answer(document)
+}
+
+/// `AddRoleToDBInstance`: the IAM role a DB instance's engine acts under for one feature.
+///
+/// The operation answers no output members at all, so a served call reports the empty
+/// document the SDK gives a handler for one.
+async fn add_role_to_db_instance(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["DBInstanceIdentifier", "RoleArn", "FeatureName"])?;
+    let added = client
+        .add_role_to_db_instance()
+        .db_instance_identifier(input.required_text("DBInstanceIdentifier")?)
+        .role_arn(input.required_text("RoleArn")?)
+        .feature_name(input.required_text("FeatureName")?)
+        .send()
+        .await;
+    match added {
+        Ok(_) => observed.answer(Map::new()),
+        Err(error) => observed.refused(&error),
+    }
+}
+
+/// `RemoveRoleFromDBInstance`: the same association, dropped.
+async fn remove_role_from_db_instance(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["DBInstanceIdentifier", "RoleArn", "FeatureName"])?;
+    let removed = client
+        .remove_role_from_db_instance()
+        .db_instance_identifier(input.required_text("DBInstanceIdentifier")?)
+        .role_arn(input.required_text("RoleArn")?)
+        .feature_name(input.required_text("FeatureName")?)
+        .send()
+        .await;
+    match removed {
+        Ok(_) => observed.answer(Map::new()),
+        Err(error) => observed.refused(&error),
+    }
+}
+
+/// A list member as the SDK's setter takes it: `None` where the call carried none, so a
+/// member the handler left out is left out of the request rather than sent empty.
+fn some_list(values: Vec<String>) -> Option<Vec<String>> {
+    (!values.is_empty()).then_some(values)
+}
+
+/// Put a list-of-text member on an answer's document, where the answer carried entries.
+fn insert_list(document: &mut Map<String, Value>, name: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    document.insert(
+        name.to_string(),
+        Value::Array(
+            values
+                .iter()
+                .map(|value| Value::String(value.clone()))
+                .collect(),
+        ),
+    );
 }
 
 /// `DescribeDBInstances`: the DB instances the account holds, or the one the call names.

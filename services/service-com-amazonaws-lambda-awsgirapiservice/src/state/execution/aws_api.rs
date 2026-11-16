@@ -176,8 +176,9 @@ pub enum Protocol {
     /// ([`super::aws_sts`]).
     StsQuery,
     /// Amazon RDS's `awsQuery`: the same binding, for the service a handler reads a database
-    /// through and puts a new master credential in force on, built by the client this crate
-    /// holds for it ([`super::aws_rds`]).
+    /// through, puts a new master credential in force on, and drives that database's Amazon S3
+    /// export and its role associations through, built by the client this crate holds for it
+    /// ([`super::aws_rds`]).
     RdsQuery,
 }
 
@@ -609,7 +610,10 @@ pub const APIS: &[Api] = &[
     // `ModifyDBInstance` (or `ModifyDBCluster`) on the instance the secret belongs to, and
     // reads that instance back to find the address and the status it reports — so a handler
     // that cannot reach this service cannot carry out the one step a credential rotation
-    // exists for.
+    // exists for. EXPORTING that database's data to Amazon S3, and associating the IAM role the
+    // engine reaches Amazon S3 under, are the other calls a function drives — very often as a
+    // CloudFormation custom resource's provider, which starts the export and reports the result
+    // back to the stack.
     Api {
         sdk_token: "rds",
         signing_name: "rds",

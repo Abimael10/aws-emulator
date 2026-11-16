@@ -183,6 +183,10 @@ pub struct SessionContext {
     /// reachable from this engine, which such a statement is refused for rather than served
     /// from nothing.
     pub objects: Option<super::mysql_s3_load::ObjectStore>,
+    /// The IAM store on that same engine, where the policies of the role an S3 statement
+    /// acts under live ([`super::engine_s3_role`]). `None` when no IAM is reachable from
+    /// this engine, which is evidence of nothing and refuses nothing.
+    pub iam: Option<::engine::ServiceState<super::engine_s3_role::IamState>>,
     /// The engine's run: a session ends when this changes (a reboot, a stop).
     pub generation: watch::Receiver<u64>,
     /// The connection ids this endpoint has handed out.
@@ -305,8 +309,12 @@ impl SessionContext {
         }
     }
 
-    /// The IAM role ARNs the resource this listener serves has associated with it right
-    /// now, in the order the resource reports them.
+    /// The ASSOCIATIONS the resource this listener serves carries right now, each as its
+    /// `(RoleArn, FeatureName, Status)`.
+    ///
+    /// The one place the session's TARGET decides which record the associations are read off,
+    /// so the two readings below differ only in what they project out of it and a further kind
+    /// of target is handled here alone.
     ///
     /// Read fresh for each statement that needs them, for the same reason
     /// [`Self::engine_now`] is: an association a caller makes — or drops — under a live
@@ -314,7 +322,7 @@ impl SessionContext {
     /// capability the association gates cannot be decided from what the login happened to
     /// find.
     #[must_use]
-    pub fn associated_role_arns(&self) -> Vec<String> {
+    fn associations(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
         let store = self.state.lock();
         match &self.target {
             SessionTarget::DbInstance {
@@ -326,7 +334,13 @@ impl SessionContext {
                     record
                         .associated_roles
                         .iter()
-                        .filter_map(|role| role.role_arn.clone())
+                        .map(|role| {
+                            (
+                                role.role_arn.clone(),
+                                role.feature_name.clone(),
+                                role.status.clone(),
+                            )
+                        })
                         .collect()
                 }),
             SessionTarget::DbCluster {
@@ -338,11 +352,49 @@ impl SessionContext {
                     record
                         .associated_roles
                         .iter()
-                        .filter_map(|role| role.role_arn.clone())
+                        .map(|role| {
+                            (
+                                role.role_arn.clone(),
+                                role.feature_name.clone(),
+                                role.status.clone(),
+                            )
+                        })
                         .collect()
                 }),
         }
         .unwrap_or_default()
+    }
+
+    /// The IAM role ARNs the resource this listener serves has associated with it right
+    /// now, in the order the resource reports them.
+    #[must_use]
+    pub fn associated_role_arns(&self) -> Vec<String> {
+        self.associations()
+            .into_iter()
+            .filter_map(|(role_arn, _, _)| role_arn)
+            .collect()
+    }
+
+    /// The IAM role ARN the resource this listener serves has associated for the feature
+    /// `feature_name`, where that association is ACTIVE.
+    ///
+    /// This is WHICH role an engine statement that needs a feature acts under: an engine
+    /// capability is gated on the association for its own `FeatureName`
+    /// ([`super::engine_s3_role`]), so an association for another feature is none for this
+    /// one.
+    ///
+    /// Only an association whose status is ACTIVE is one the engine can act under: a role
+    /// association still coming up is not yet credentials.
+    #[must_use]
+    pub fn associated_role_for_feature(&self, feature_name: &str) -> Option<String> {
+        self.associations()
+            .into_iter()
+            .find(|(role_arn, feature, status)| {
+                role_arn.is_some()
+                    && feature.as_deref() == Some(feature_name)
+                    && status.as_deref() == Some(crate::state::DB_CLUSTER_ROLE_STATUS_ACTIVE)
+            })
+            .and_then(|(role_arn, _, _)| role_arn)
     }
 
     /// Whether this login could be an IAM-authenticated one, read BEFORE the credential it
@@ -1894,6 +1946,9 @@ fn server_command(
         (_, "DROP", "DATABASE") | (EngineWire::MySql, "DROP", "SCHEMA") => {
             server_statements::drop_database(database, facts, words, tokens).map(Some)
         }
+        // Emptying a table: both engines define `TRUNCATE` and the embedded engine has no
+        // grammar for it, so the server performs it with the engine's own row delete.
+        (_, "TRUNCATE", _) => server_statements::truncate(database, facts, tokens).map(Some),
         (EngineWire::Postgres, "SHOW", _) => Ok(Some(postgres_show(facts, tokens)?)),
         (EngineWire::Postgres, "SET", _) => Ok(Some(postgres_set(facts, tokens)?)),
         (EngineWire::MySql, "SHOW", _) => mysql_show(database, facts, words, tokens).map(Some),

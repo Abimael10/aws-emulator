@@ -892,10 +892,24 @@ async fn run_statement(
     let engine = Arc::clone(database);
     let session = facts.clone();
     let statement = sql.clone();
-    let answer = tokio::task::spawn_blocking(move || {
-        wire_session::run_statement(&engine, &session, &statement, &params)
-    })
-    .await
+    // A call to a function of the `aws_s3` extension is not a statement the SQL engine runs:
+    // the rows come from — or go to — an Amazon S3 object the engine reaches under the role
+    // this resource has associated for the feature ([`super::pg_aws_s3`]).
+    let answer = match super::pg_aws_s3::aws_s3_call(facts, &sql) {
+        Some(call) => {
+            let context = context.clone();
+            tokio::task::spawn_blocking(move || {
+                super::pg_aws_s3::serve(&context, &engine, &session, &call?)
+            })
+            .await
+        }
+        None => {
+            tokio::task::spawn_blocking(move || {
+                wire_session::run_statement(&engine, &session, &statement, &params)
+            })
+            .await
+        }
+    }
     .map_err(|error| EngineError::new(EngineErrorKind::Internal, error.to_string()));
     context.sessions.idle(facts.connection_id);
     let answer = answer??;

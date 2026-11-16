@@ -203,10 +203,13 @@ pub fn holds_feature(roles: &[(String, Option<String>)], feature_name: &str) -> 
 
 /// Whether `roles` already carries an association of `role_arn`, for any feature or none.
 ///
-/// A DB CLUSTER's associations are keyed by the ROLE: its already-exists fault reports
-/// that the role ARN "is already associated with DB Cluster: …" and names no feature at
-/// all ([`cluster_role_already_associated_message`]), so one role is associated with one
-/// cluster once.
+/// The associations of BOTH resources are keyed by the ROLE as well as by the feature: the
+/// already-exists fault of each reports the role ARN the request carried
+/// ([`cluster_role_already_associated_message`],
+/// [`instance_role_already_associated_message`]), which is what the modelled
+/// `DBInstanceRoleAlreadyExistsFault` / `DBClusterRoleAlreadyExistsFault` is for — "the
+/// specified RoleArn or FeatureName value is already associated with the DB instance" — so
+/// one role is associated with one resource once, whichever feature the second request names.
 #[must_use]
 pub fn holds_role(roles: &[(String, Option<String>)], role_arn: &str) -> bool {
     roles.iter().any(|(held_arn, _)| held_arn == role_arn)
@@ -240,12 +243,12 @@ pub fn one_arn_per_feature_message(engine: &str, feature_name: &str) -> String {
 }
 
 /// How Amazon RDS words the already-exists fault of a DB CLUSTER's association: it names
-/// the role ARN the request carried and the cluster it is already associated with, and
-/// tells the caller which value to look at.
+/// the role ARN the request carried and the cluster it is already associated with, and tells
+/// the caller which value to look at.
 ///
 /// `identifier` is the value the REQUEST named rather than the key the store folded it to,
 /// so a caller matching the sentence against what it sent finds it there — the same reason
-/// the cluster not-found wordings name the request's spelling.
+/// the not-found wordings name the request's spelling.
 #[must_use]
 pub fn cluster_role_already_associated_message(role_arn: &str, identifier: &str) -> String {
     format!(
@@ -254,8 +257,54 @@ pub fn cluster_role_already_associated_message(role_arn: &str, identifier: &str)
     )
 }
 
-/// How Amazon RDS words the role-not-found fault of a disassociation: the role the request
-/// named is not associated with that resource, so there is nothing to remove.
+/// How Amazon RDS words the already-exists fault of a DB INSTANCE's association, which the
+/// instance side words differently: the fault is "the specified RoleArn OR FeatureName value
+/// is already associated with the DB instance", and the sentence says exactly that — it names
+/// the role ARN, the feature name and the instance of the request, in that order, and ends in
+/// the instruction to check them.
+///
+/// The same family as the disassociation's not-found sentence
+/// ([`role_not_associated_message`]), which names the same three values of the request in the
+/// same order.
+#[must_use]
+pub fn instance_role_already_associated_message(
+    role_arn: &str,
+    feature_name: &str,
+    identifier: &str,
+) -> String {
+    format!(
+        "The {role_arn} IAM role or {feature_name} feature is already associated with the \
+         {identifier} DB instance. Check the name and try again."
+    )
+}
+
+/// How Amazon RDS words the role-not-found fault of a DB INSTANCE's disassociation: the
+/// (role, feature) pair the request named is not one the instance carries, so there is nothing
+/// to remove.
+///
+/// The sentence names the three values the request carried — the role ARN, the feature name and
+/// the instance identifier, in that order — and ends in the instruction to check them: "The
+/// &lt;role-arn&gt; IAM role doesn't match with the &lt;FeatureName&gt; feature for the
+/// &lt;identifier&gt; DB instance. Check and try again." The pair is the identity of the
+/// association ([`holds_association`]), so a role associated under ANOTHER feature does not
+/// match the one the request named, which is what that wording says.
+#[must_use]
+pub fn instance_role_not_matched_message(
+    identifier: &str,
+    role_arn: &str,
+    feature_name: &str,
+) -> String {
+    format!(
+        "The {role_arn} IAM role doesn't match with the {feature_name} feature for the \
+         {identifier} DB instance. Check and try again."
+    )
+}
+
+/// How a DB CLUSTER's disassociation words the same fault: the role the request named is not
+/// associated with that cluster, for the feature it named or for any.
+///
+/// A cluster's `FeatureName` is optional on that member, so the sentence reports the feature
+/// only where the request carried one.
 #[must_use]
 pub fn role_not_associated_message(
     resource: &str,

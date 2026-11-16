@@ -150,7 +150,8 @@ mod aws_sts;
 
 /// The Amazon RDS half of it, for the same reason: that service's model declares `awsQuery`
 /// too, and it is what a handler holding a database credential puts a new one in force
-/// through.
+/// through, and what one driving a database's Amazon S3 export and its role associations
+/// calls.
 mod aws_rds;
 
 /// What every half of that seam bound by an AWS SDK CLIENT shares: how a call's input document

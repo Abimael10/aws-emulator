@@ -143,6 +143,78 @@ pub fn load(
             format!("the copy data is larger than this endpoint serves ({MAX_COPY_BYTES} bytes)"),
         ));
     }
+    let rows = text_records(b'\t', NULL_STRING, false, data);
+    load_rows(database, facts, target, &rows)
+}
+
+/// `\N` — "the default string used to indicate a NULL value" in `COPY`'s text format, and the
+/// one unquoted field of it that is not text.
+const NULL_STRING: &str = "\\N";
+
+/// The records one bulk load carries: one entry per row, one field per column of the row, and
+/// `None` for a field the format spelled as a NULL.
+pub(super) type Records = Vec<Vec<Option<String>>>;
+
+/// The records `body` carries in `COPY`'s TEXT format: one row per line, the fields separated
+/// by `delimiter`, `null` standing for a NULL, the backslash escapes resolved
+/// ([`unescaped`]) and the `\.` line ending the data.
+///
+/// `pub(super)` and parameterised by the delimiter, the NULL string and whether the first line
+/// is a header because the Amazon S3 import of the `aws_s3` extension reads that same format
+/// out of an object's bytes with the options its call named ([`super::pg_aws_s3`]): one
+/// reading of the format, whichever statement asked for it.
+pub(super) fn text_records(
+    delimiter: u8,
+    null: &str,
+    header: bool,
+    body: &[u8],
+) -> Records {
+    let text = String::from_utf8_lossy(body);
+    let separator = char::from(delimiter);
+    let mut rows: Records = Vec::new();
+    for (at, line) in text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // The end-of-data marker, and the empty tail a trailing newline leaves.
+        if line == "\\." {
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        // A header line names the columns rather than carrying a row.
+        if at == 0 && header {
+            continue;
+        }
+        rows.push(
+            line.split(separator)
+                .map(|field| match field == null {
+                    true => None,
+                    false => Some(unescaped(field)),
+                })
+                .collect(),
+        );
+    }
+    rows
+}
+
+/// Load `rows` — records already read out of whatever format carried them — into `target`,
+/// and answer with how many were loaded.
+///
+/// This is the load itself, shared by every bulk load of this wire: the client's
+/// `COPY … FROM STDIN` above, and the Amazon S3 import of the `aws_s3` extension
+/// ([`super::pg_aws_s3`]), which differ in the FORMAT they read and not in what loading a
+/// record means. The columns are the ENGINE's for the table, so a column the statement names
+/// that the table does not have is refused by it rather than by a list kept here.
+///
+/// Every row is loaded inside ONE transaction, so a row the table refuses leaves none of
+/// the load behind: `COPY` "stops operation at the first error", and the rows it had
+/// already read are rolled back with it.
+pub(super) fn load_rows(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    target: &CopyTarget,
+    rows: &Records,
+) -> Result<u64, EngineError> {
     // The columns the rows are loaded into, and the type each one is declared with: the
     // ENGINE reports them for the table, so a column the statement names that the table
     // does not have is refused by it rather than by a list kept here.
@@ -183,7 +255,6 @@ pub fn load(
             .join(", ")
     );
 
-    let text = String::from_utf8_lossy(data);
     let mut loaded = 0u64;
     // A `COPY` the client sent INSIDE a transaction of its own loads into that transaction:
     // the rows are the client's to commit or roll back, so each row is loaded for the
@@ -196,16 +267,8 @@ pub fn load(
         database.begin_transaction(facts.connection_id);
     }
     let outcome = (|| -> Result<u64, EngineError> {
-        for line in text.split('\n') {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            // The end-of-data marker, and the empty tail a trailing newline leaves.
-            if line == "\\." {
-                break;
-            }
-            if line.is_empty() {
-                continue;
-            }
-            let values = row_values(line, &columns)?;
+        for row in rows {
+            let values = row_values(row, &columns)?;
             database.execute_for(
                 facts.connection_id,
                 &facts.database,
@@ -237,13 +300,12 @@ pub fn load(
     }
 }
 
-/// The values one line of copy data carries, refused the way PostgreSQL refuses a row that
-/// does not fit the columns it is being loaded into.
+/// The values one record carries, refused the way PostgreSQL refuses a row that does not
+/// fit the columns it is being loaded into.
 fn row_values(
-    line: &str,
+    fields: &[Option<String>],
     columns: &[(String, Option<String>)],
 ) -> Result<Vec<Option<String>>, EngineError> {
-    let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() > columns.len() {
         return Err(EngineError::new(
             EngineErrorKind::DataError,
@@ -262,15 +324,12 @@ fn row_values(
     }
     let mut values = Vec::with_capacity(fields.len());
     for (field, (_, declared)) in fields.iter().zip(columns) {
-        // `\N` — "the default string used to indicate a NULL value" — is the NULL, and is
-        // the one unquoted field that is not text.
-        if *field == "\\N" {
+        let Some(value) = field else {
             values.push(None);
             continue;
-        }
-        let value = unescaped(field);
-        check_input_syntax(declared.as_deref(), &value)?;
-        values.push(Some(value));
+        };
+        check_input_syntax(declared.as_deref(), value)?;
+        values.push(Some(value.clone()));
     }
     Ok(values)
 }
@@ -349,7 +408,11 @@ fn check_input_syntax(declared: Option<&str>, value: &str) -> Result<(), EngineE
 /// Source: the `COPY` reference's "Text Format" section, which lists the escapes the
 /// format recognises (`\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\\`) and states that "any other
 /// backslashed character that is not mentioned above will be taken to represent itself".
-fn unescaped(field: &str) -> String {
+///
+/// `pub(super)` because the Amazon S3 import of the `aws_s3` extension reads the same text
+/// format out of the object's bytes ([`super::pg_aws_s3`]), and one copy of these escapes is
+/// what keeps the two readings of that format identical.
+pub(super) fn unescaped(field: &str) -> String {
     if !field.contains('\\') {
         return field.to_string();
     }

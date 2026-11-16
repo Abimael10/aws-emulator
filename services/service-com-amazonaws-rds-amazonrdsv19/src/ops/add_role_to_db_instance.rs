@@ -5,16 +5,15 @@
 //! the role and feature `DBInstance$AssociatedRoles` then reports — and is the ONLY file to
 //! touch for this operation.
 //!
-//! One refusal of this operation is worth stating up front, because it decides which of two
-//! modelled answers an association already in place gets. A FEATURE of a DB instance's
+//! Two refusals of this operation are worth stating up front, because they decide which of
+//! the modelled answers an association already in place gets. A FEATURE of a DB instance's
 //! engine acts under ONE role ARN, and that engine rule is decided FIRST: a request naming a
 //! feature the instance already has a role for is refused `InvalidParameterValue` naming the
-//! engine and the feature, whether it names the role already there or another one. So the
-//! wider modelled `DBInstanceRoleAlreadyExistsFault` ("the specified RoleArn or FeatureName
-//! value is already associated with the DB instance") has no case left to answer on this
-//! front door — every association this service holds names a feature, so the engine rule
-//! covers them all — and the variant stays on the error enum unconstructed rather than
-//! answering a refusal Amazon RDS words the other way.
+//! engine and the feature, whether it names the role already there or another one. What is
+//! left for the modelled `DBInstanceRoleAlreadyExistsFault` ("the specified RoleArn or
+//! FeatureName value is already associated with the DB instance") is the OTHER half of its
+//! sentence: a request naming a role this instance is already associated with under another
+//! feature, which is that fault rather than a second entry for the same role.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -316,6 +315,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AddRoleToDBInstanceError::invalid_parameter_value(
                 crate::state::one_arn_per_feature_message(&engine, &input.feature_name),
             ));
+        }
+        // And one ROLE is associated with one DB instance once: the modelled
+        // `DBInstanceRoleAlreadyExistsFault` is "the specified RoleArn or FeatureName value is
+        // already associated with the DB instance", so a role this instance already acts
+        // under for ANOTHER feature is that fault rather than a second entry naming the same
+        // role. The engine rule above is decided first, because a request naming a feature
+        // that already has a role is refused for the feature whichever role it names.
+        if crate::state::holds_role(&held, &input.role_arn) {
+            return Err(
+                AddRoleToDBInstanceErrorModeled::DBInstanceRoleAlreadyExistsFault(
+                    DBInstanceRoleAlreadyExistsFault {
+                        message: Some(crate::state::instance_role_already_associated_message(
+                            &input.role_arn,
+                            &input.feature_name,
+                            &input.db_instance_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
         // The published per-resource quota, which is what the modelled quota fault reports
         // having reached — and what bounds the list this record stores.

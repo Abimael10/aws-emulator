@@ -411,6 +411,23 @@ pub fn write_objects<Eng: Send + Sync + 'static>(
         );
         return ExportWrite::default();
     };
+    write_objects_into(&state, bucket, objects)
+}
+
+/// The same write, through an object store already resolved rather than through the engine
+/// it lives on.
+///
+/// This is the write itself, so there is ONE place an object of this service is recorded in
+/// Amazon S3's store: a caller that already holds the store — a DB instance's engine
+/// endpoint, whose `aws_s3` export writes its object from a session rather than from a
+/// request ([`super::data_plane::pg_aws_s3`]) — hands it here.
+pub fn write_objects_into(
+    state: &::engine::ServiceState<
+        ::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
+    >,
+    bucket: &str,
+    objects: &[ExportedObject],
+) -> ExportWrite {
     let mut store = state.lock();
     let mut written = ExportWrite::default();
     for object in objects {

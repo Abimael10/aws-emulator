@@ -114,6 +114,12 @@ hex = { workspace = true }
 # recorded through Amazon S3's own store on the same engine (`src/state/export_objects.rs`),
 # so a bucket this service writes to is a bucket that service holds.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# An engine statement that reaches Amazon S3 does it under an IAM role the resource has
+# ASSOCIATED, and whether that role may read or write the object is what IAM's own policies
+# say: the role records and their policy documents are read off IAM's store on the same
+# engine (`src/state/data_plane/engine_s3_role.rs`), so a session is judged by the very
+# policies that service's `PutRolePolicy` wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # Every lifecycle change this service records is also published onto the account's DEFAULT
 # EventBridge bus as an `aws.rds` event, the way Amazon RDS publishes one with no opt-in:
 # this is the EventBridge client that publication goes out over the in-process callback with
@@ -171,7 +177,6 @@ tokio-rustls = "0.26"
 # the in-process callback.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The managed-master-password suite mounts Secrets Manager (and KMS, which encrypts a
 # secret's value) beside this service on one engine, exactly as the assembled router
 # mounts them, so the secret a cluster or instance reports is a real secret of this

@@ -15820,6 +15820,7 @@ dependencies = [
  "service-com-amazonaws-opensearch-amazonopensearchservice",
  "service-com-amazonaws-opensearchserverless-opensearchserverless",
  "service-com-amazonaws-pipes-pipes",
+ "service-com-amazonaws-rds-amazonrdsv19",
  "service-com-amazonaws-rdsdata-rdsdataservice",
  "service-com-amazonaws-rekognition-rekognitionservice",
  "service-com-amazonaws-s3-amazons3",

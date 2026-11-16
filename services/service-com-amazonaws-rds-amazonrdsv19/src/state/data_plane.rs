@@ -45,6 +45,10 @@
 //!   in;
 //! * [`mysql_s3_load`] — `LOAD DATA FROM S3`, the Amazon S3 import the MySQL engines serve
 //!   under the IAM role their parameter group names;
+//! * [`pg_aws_s3`] — the `aws_s3` extension's import and export, the Amazon S3 integration
+//!   the PostgreSQL engines serve;
+//! * [`engine_s3_role`] — WHICH associated role either of those acts under, and whether its
+//!   policies allow the object operation;
 //! * [`iam_auth_token`] — the authentication token an IAM-authenticated login presents in
 //!   place of a password;
 //! * [`read_only`] — the statements an endpoint that serves no writes refuses, and how each
@@ -67,11 +71,13 @@ use super::snapshot_data_bytes;
 pub mod cluster_endpoint;
 pub mod constraint_names;
 pub mod dialect;
+pub mod engine_s3_role;
 pub mod iam_auth_token;
 pub mod lock_plan;
 pub mod mysql_accounts;
 pub mod mysql_s3_load;
 pub mod mysql_wire;
+pub mod pg_aws_s3;
 pub mod pg_copy;
 pub mod pg_grants;
 pub mod pg_numeric;
@@ -619,6 +625,9 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             // this service is mounted on: what Amazon S3's own `PutObject` wrote is what
             // such a statement loads.
             objects: mysql_s3_load::object_store(engine),
+            // And the IAM store the role those statements act under is resolved against, on
+            // that same engine.
+            iam: engine_s3_role::iam_store(engine),
             generation: generation_rx.clone(),
             next_connection_id: Arc::clone(&next_connection_id),
         })

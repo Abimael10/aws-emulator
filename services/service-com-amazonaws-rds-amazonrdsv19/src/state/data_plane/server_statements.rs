@@ -179,6 +179,17 @@ pub fn open_extension_catalog(
     Ok(())
 }
 
+/// Whether the extension `name` is installed in the session's database, which is what
+/// decides whether the objects it brings — its schema and the functions in it — exist for a
+/// statement at all ([`super::pg_aws_s3`]).
+pub fn extension_is_installed(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    name: &str,
+) -> Result<bool, EngineError> {
+    Ok(installed(database, facts)?.iter().any(|known| known == name))
+}
+
 /// The extensions installed in the session's database, in the order they were installed.
 fn installed(database: &InstanceDatabase, facts: &SessionFacts) -> Result<Vec<String>, EngineError> {
     database.execute_in(facts.connection_id, &facts.database, PG_EXTENSION_SCHEMA, &[])?;
@@ -216,6 +227,112 @@ fn record_catalog_change(facts: &SessionFacts, outcome: &'static str, object: &s
         object = %object,
         "a statement changed what a DB instance's engine holds"
     );
+}
+
+/// `TRUNCATE [TABLE] <name> [, …] [RESTART IDENTITY | CONTINUE IDENTITY]
+/// [CASCADE | RESTRICT]` — the statement that empties a table.
+///
+/// Both engines define it and the embedded engine has no grammar for it, so it is served
+/// here: each table the statement names is emptied through the engine's own unqualified row
+/// delete, which is exactly what "removes all rows from a set of tables" does. The rows go
+/// inside whatever transaction the session has open, as `TRUNCATE` is transactional on
+/// PostgreSQL, and the statement reports the command tag the server reports for it.
+///
+/// MySQL's own grammar takes ONE table ("TRUNCATE [TABLE] tbl_name"), so a list on that wire
+/// is a statement its parser does not accept; PostgreSQL's takes a list.
+///
+/// The identity a table's generated column is at is left to the engine, which assigns the
+/// next value above the rows the table holds — so an emptied table's next row starts over,
+/// which is what `RESTART IDENTITY` and MySQL's own `TRUNCATE` do. A `CONTINUE IDENTITY`
+/// clause is read and changes nothing.
+pub fn truncate(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    tokens: &[Token],
+) -> Result<StatementAnswer, EngineError> {
+    let tables = truncated_tables(facts, tokens)?;
+    if tables.is_empty() {
+        return Err(syntax_error_at_end());
+    }
+    if facts.wire == EngineWire::MySql && tables.len() > 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::Syntax,
+            "You have an error in your SQL syntax; TRUNCATE takes one table".to_string(),
+        )
+        // `ER_PARSE_ERROR`, which is what MySQL answers a statement outside its grammar.
+        .with_mysql_error(1064, "42000"));
+    }
+    for table in &tables {
+        database.execute_for(
+            facts.connection_id,
+            &facts.database,
+            &super::wire_session::server_view(facts),
+            &format!("DELETE FROM {}", super::pg_copy::quoted(table)),
+            &[],
+        )?;
+    }
+    // The command tag each server reports for it, which is also the name the read-only
+    // refusal and the replication catalogue know the command by
+    // ([`super::read_only::verb_writes`]).
+    Ok(StatementAnswer::new(
+        "TRUNCATE TABLE",
+        ResultSet::changed(0, 0),
+    ))
+}
+
+/// The tables a `TRUNCATE` names, in the order the statement names them.
+///
+/// The names are the identifiers between the leading keywords and the trailing clauses:
+/// `TABLE` and PostgreSQL's `ONLY` are read and dropped, a qualified name is the relation
+/// inside its qualifier (the engine has one namespace per database), and the words of a
+/// trailing `RESTART IDENTITY`-style clause end the list rather than naming a table.
+fn truncated_tables(facts: &SessionFacts, tokens: &[Token]) -> Result<Vec<String>, EngineError> {
+    let mut tables: Vec<String> = Vec::new();
+    let mut at = 1usize;
+    while let Some(token) = tokens.get(at) {
+        match token {
+            Token::Comma => at += 1,
+            Token::Mul => at += 1,
+            Token::Word(word) => {
+                let upper = word.value.to_ascii_uppercase();
+                // The keywords of the statement itself, not names of tables.
+                if word.quote_style.is_none()
+                    && matches!(upper.as_str(), "TABLE" | "ONLY")
+                    && tables.is_empty()
+                {
+                    at += 1;
+                    continue;
+                }
+                if word.quote_style.is_none()
+                    && matches!(
+                        upper.as_str(),
+                        "RESTART" | "CONTINUE" | "IDENTITY" | "CASCADE" | "RESTRICT"
+                    )
+                {
+                    break;
+                }
+                // A qualified name (`<schema>.<table>`, `<database>.<table>`) names the
+                // relation its last label is.
+                let mut name = word.value.clone();
+                while matches!(tokens.get(at + 1), Some(Token::Period)) {
+                    match tokens.get(at + 2) {
+                        Some(Token::Word(label)) => {
+                            name = label.value.clone();
+                            at += 2;
+                        }
+                        _ => return Err(syntax_error_at_end()),
+                    }
+                }
+                tables.push(name);
+                at += 1;
+            }
+            _ => {
+                let _ = facts;
+                return Err(syntax_error_at_end());
+            }
+        }
+    }
+    Ok(tables)
 }
 
 /// `CREATE EXTENSION [IF NOT EXISTS] <name> [WITH] [SCHEMA s] [VERSION v] [CASCADE]`.

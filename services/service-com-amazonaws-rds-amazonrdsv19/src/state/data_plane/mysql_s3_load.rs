@@ -537,27 +537,38 @@ pub fn import_role(facts: &SessionFacts, associated: &[String]) -> Option<String
 ///
 /// Every refusal here is the server's S3 API error ([`ER_S3_API_ERROR`]), because each one is
 /// the engine's own call to Amazon S3 not happening or not answering with an object: no role
-/// to call it under, and nothing found under the URI.
+/// to call it under, a role whose permissions do not cover the read, and nothing found under
+/// the URI.
 ///
-/// WHAT the role may read is deliberately not modelled: the role is resolved and the object
-/// is read, and the per-bucket and per-key authorization real Amazon RDS performs as that
-/// role — the access-denied half of the integration — belongs with the other role-permission
-/// causes of this surface, which the open `rds__s3` integration issue owns. So the check
-/// above is the resource's CONFIGURATION, not an authorization decision, and a reader must
-/// not take it for one.
+/// WHAT the role may read is the same question the other wire's Amazon S3 import asks, and it
+/// is answered in the one place both ask it ([`super::engine_s3_role`]): the engine reads the
+/// object only where the policies in force on the resolved role allow the object read, and a
+/// role nothing is known about is refused nothing.
 pub fn objects_to_load(
     context: &SessionContext,
     facts: &SessionFacts,
     load: &S3Load,
 ) -> Result<Vec<(String, Vec<u8>)>, EngineError> {
-    if import_role(facts, &context.associated_role_arns()).is_none() {
+    let Some(role_arn) = import_role(facts, &context.associated_role_arns()) else {
         return Err(missing_credentials());
-    }
+    };
     // A URI that names no bucket and key is one the engine's S3 call resolves to no object,
     // which is the same condition as a key the bucket has not got.
     let Some((bucket, key)) = split_s3_uri(&load.uri) else {
         return Err(not_found());
     };
+    // The object the statement named is the resource the read is authorized on: a role whose
+    // policies do not allow it gets Amazon S3's own access-denied answer, under the same
+    // server error number every other failure of the engine's S3 call carries.
+    let object_arn = super::engine_s3_role::object_arn(&bucket, &key);
+    if super::engine_s3_role::role_withholds_object_action(
+        context.iam.as_ref(),
+        &role_arn,
+        super::engine_s3_role::S3Capability::Import.object_action(),
+        &object_arn,
+    ) {
+        return Err(access_denied(&object_arn));
+    }
     let Some(store) = &context.objects else {
         // Nothing was read and nothing is claimed: this emulator has no object store to
         // read through, which is a failure of the emulator rather than of the statement.
@@ -735,6 +746,20 @@ pub fn split_s3_uri(uri: &str) -> Option<(String, String)> {
 #[must_use]
 pub fn missing_credentials() -> EngineError {
     s3_error("S3 API returned error: Missing Credentials: Cannot instantiate S3 Client")
+}
+
+/// What the engine answers when the role it loads under may not read the object: Amazon S3's
+/// own error code and message for that class, with the action and the object the role was
+/// refused — the same answer the other wire's import reports for the same condition
+/// ([`super::pg_aws_s3::access_denied`]), under this server's error number for a failed S3
+/// call.
+#[must_use]
+pub fn access_denied(object_arn: &str) -> EngineError {
+    s3_error(format!(
+        "S3 API returned error: AccessDenied: Access Denied. The IAM role the engine loads \
+         under may not perform {} on {object_arn}",
+        super::engine_s3_role::S3Capability::Import.object_action()
+    ))
 }
 
 /// What the engine answers when its Amazon S3 call resolves no object: `Not Found`, the

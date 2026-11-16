@@ -225,11 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RemoveRoleFromDBInstanceErrorModeled::DBInstanceRoleNotFoundFault(
                     DBInstanceRoleNotFoundFault {
-                        message: Some(crate::state::role_not_associated_message(
-                            "DB instance",
+                        message: Some(crate::state::instance_role_not_matched_message(
                             &identifier,
                             &input.role_arn,
-                            Some(&input.feature_name),
+                            &input.feature_name,
                         )),
                     },
                 )

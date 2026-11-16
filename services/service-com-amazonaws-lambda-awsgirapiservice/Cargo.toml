@@ -163,8 +163,10 @@ aws-sdk-sts = { version = "1", default-features = false }
 # Amazon RDS's model declares `awsQuery` as well, so a handler's `boto3.client("rds")` call
 # is built, signed and parsed by this client (`state::execution::aws_rds`), over the same
 # in-process callback. A credential-rotation function that puts the new master password in
-# force on the DB instance the secret belongs to (`ModifyDBInstance`) is the shape that needs
-# it. Only the generated client is needed: the emulator supplies the transport.
+# force on the DB instance the secret belongs to (`ModifyDBInstance`), and one that EXPORTS a
+# database snapshot to Amazon S3 — the shape a CloudFormation custom resource's provider takes
+# for that integration — are the shapes that need it. Only the generated client is needed: the
+# emulator supplies the transport.
 aws-sdk-rds = { version = "1", default-features = false }
 # A function whose environment variables are encrypted with a customer managed key can
 # only be invoked while that key can decrypt them, and the key's state belongs to the key
@@ -331,6 +333,11 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 # rows a handler's statements write are read back through that service's own endpoint, with
 # it mounted beside lambda on ONE engine.
 service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
+# And for Amazon RDS itself, the `awsQuery` service a handler drives a database's Amazon S3
+# export and its role associations through: the refusal a handler's call reads is held against
+# the one that service answers the SAME call made directly, with it mounted beside lambda on
+# ONE engine.
+service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # The same for Amazon SES API v2, the other REST-bound service a handler's SDK reaches: the
 # identity, configuration set and message a handler's calls produce are read back through
 # that service's own API, mounted beside lambda on ONE engine.
