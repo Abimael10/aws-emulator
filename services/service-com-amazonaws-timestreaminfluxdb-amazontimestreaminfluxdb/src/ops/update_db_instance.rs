@@ -242,6 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
+        // `port` carries a constraint the model documents without declaring it, so the
+        // framework's boundary walk admits values InfluxDB does not accept connections on
+        // (see [`crate::state::UNAVAILABLE_PORT_SPANS`]). Checked before the store is
+        // touched, so a refused update moves neither the record nor the socket it is
+        // served on.
+        if let Some(port) = input.port.filter(|port| st::port_is_unavailable(*port)) {
+            return Err(
+                UpdateDbInstanceErrorModeled::ValidationException(st::unavailable_port(port))
+                    .into(),
+            );
+        }
+
         // The whole store-locked section is a BLOCK, so the guard is released at its end
         // and no non-`Send` guard is held across the socket bind that may follow.
         let moves_the_port = {

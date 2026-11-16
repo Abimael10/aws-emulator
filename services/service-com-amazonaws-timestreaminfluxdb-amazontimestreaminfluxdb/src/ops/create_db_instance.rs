@@ -280,6 +280,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = st::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // `port` carries a constraint the model documents without declaring it, so the
+        // framework's boundary walk admits values InfluxDB does not accept connections on
+        // (see [`crate::state::UNAVAILABLE_PORT_SPANS`]). Checked before anything is
+        // minted, stored or served, so a refused create persists no instance.
+        if st::port_is_unavailable(input.port) {
+            return Err(CreateDbInstanceErrorModeled::ValidationException(st::unavailable_port(
+                input.port,
+            ))
+            .into());
+        }
+
         // The initial InfluxDB admin user this instance's own data plane authenticates,
         // built from the request before the record takes the rest of it. The password is
         // reduced to its digest here and held nowhere else: no output shape carries it and

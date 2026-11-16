@@ -32,6 +32,10 @@ mod clusters;
 /// behind, and the refusal a create gets without one.
 mod marketplace;
 
+/// The ports the service does not accept for InfluxDB, and the refusal a request naming
+/// one gets — the one check every operation that takes a `port` shares.
+mod ports;
+
 /// How an `Arn` resolves to one of the records above, and the tag set that record
 /// carries — the slice the three tagging operations share.
 mod tags;
@@ -43,6 +47,7 @@ pub mod influx_data_plane;
 pub use backups::*;
 pub use clusters::*;
 pub use marketplace::*;
+pub use ports::*;
 pub use tags::*;
 
 /// `Status` values this service's records use, each one a member of

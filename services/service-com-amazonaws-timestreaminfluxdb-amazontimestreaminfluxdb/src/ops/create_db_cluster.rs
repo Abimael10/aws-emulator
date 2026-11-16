@@ -229,6 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = st::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // `port` carries a constraint the model documents without declaring it, so the
+        // framework's boundary walk admits values InfluxDB does not accept connections on
+        // (see [`crate::state::UNAVAILABLE_PORT_SPANS`]). Checked here, before the id is
+        // minted and before any record is written, so a refused create leaves behind
+        // neither a cluster nor one of its nodes.
+        if let Some(port) = input.port.filter(|port| st::port_is_unavailable(*port)) {
+            return Err(
+                CreateDbClusterErrorModeled::ValidationException(st::unavailable_port(port)).into(),
+            );
+        }
+
         let mut state = state.lock();
 
         // The deployment type this cluster will have: the request's, else the only member
