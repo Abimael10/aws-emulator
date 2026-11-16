@@ -6,9 +6,9 @@
 //!
 //! * resuming is the inverse of pausing: it is legal from `Paused` and from
 //!   `Paused` only, and it leaves the campaign `Running` for every later read;
-//! * from any other state the call is refused with HTTP 409
-//!   `InvalidCampaignStateException`, whose `state` member names the state the
-//!   campaign is actually in, and the stored state is left exactly where it was;
+//! * from any other state the call is refused with HTTP 409 `ConflictException`,
+//!   whose message names the campaign asked about and the state it is actually in,
+//!   in upper case, and the stored state is left exactly where it was;
 //! * an id the store does not hold is HTTP 404 `ResourceNotFoundException`,
 //!   whatever the id looks like;
 //! * resume/pause cycles are not limited in number: each cycle moves the stored
@@ -56,7 +56,7 @@ fn resume_moves_only_a_paused_campaign() {
 
 /// Over a TABLE of states reachable through the API — each reached by a different
 /// sequence of lifecycle calls — `ResumeCampaign` succeeds exactly from `Paused`
-/// and is refused with 409 `InvalidCampaignStateException` everywhere else, and in
+/// and is refused with 409 `ConflictException` everywhere else, and in
 /// both cases `GetCampaignState` afterwards reports the expected state.
 #[tokio::test]
 async fn resume_succeeds_only_from_paused_over_every_reachable_state() {
@@ -137,15 +137,17 @@ async fn resume_succeeds_only_from_paused_over_every_reachable_state() {
         );
         if *expected_status == 409 {
             assert!(
-                error_code(&body).ends_with("InvalidCampaignStateException"),
-                "case {case:?}: expected InvalidCampaignStateException, got {}",
+                error_code(&body).ends_with("ConflictException"),
+                "case {case:?}: expected ConflictException, got {}",
                 error_code(&body)
             );
+            let expected_message =
+                format!("Campaign: {id} is in invalid state: {}", before.to_uppercase());
             assert_eq!(
-                body["state"].as_str(),
-                Some(*before),
-                "case {case:?}: expected the refusal to name state {before:?}, got {:?}",
-                body["state"]
+                body["message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {case:?}: expected the refusal to read {expected_message:?}, got {:?}",
+                body["message"]
             );
         }
 

@@ -220,7 +220,7 @@ fn tag_key_violation_kind(key: &str) -> Option<::smithy_server_runtime::Violatio
 /// place the shape of such a refusal is decided — which keys are reported, in which
 /// order, how an offending key is named and how much of it is echoed. The sentence is
 /// built from the framework's own [`::smithy_server_runtime::Violation`] and rendered by
-/// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
+/// [`crate::service::validation::stated`] — the one place that wording
 /// lives — so a handler refusal and a boundary refusal read identically.
 fn map_keys_violation<'k>(
     member: &str,
@@ -258,7 +258,7 @@ fn map_keys_violation<'k>(
         .take(MAX_REPORTED_VIOLATIONS)
         .collect();
 
-    ::aws_smithy_schema_server::constraints::envelope(&violations)
+    crate::service::validation::stated(&violations)
 }
 
 /// Why the tag keys of the MAP at `member` are a bad request, or `None` when every one
@@ -309,7 +309,7 @@ pub fn tag_key_list_violation(member: &str, keys: &[String]) -> Option<String> {
         .take(MAX_REPORTED_VIOLATIONS)
         .collect();
 
-    ::aws_smithy_schema_server::constraints::envelope(&violations)
+    crate::service::validation::stated(&violations)
 }
 
 /// Why leaving the resource at `member` holding `count` tags is a bad request, or
@@ -330,7 +330,7 @@ pub fn tag_count_violation(member: &str, count: usize) -> Option<String> {
         value: Some(format!("{count} entries")),
         sensitive: false,
     };
-    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+    crate::service::validation::stated(std::slice::from_ref(&violation))
 }
 
 /// The campaign id an `/v2/tags/{arn}` ARN names, or `None` when `arn` does not name
@@ -378,7 +378,7 @@ pub const MAX_COMMUNICATION_LIMITS: usize = 2;
 /// is the request path the refusal names, so the message is built from the request
 /// rather than fixed text, and the sentence itself is built from the framework's own
 /// [`::smithy_server_runtime::Violation`] and rendered by
-/// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
+/// [`crate::service::validation::stated`] — the one place that wording
 /// lives — so this handler refusal and a boundary refusal of the same `@length` read
 /// identically.
 ///
@@ -409,7 +409,7 @@ pub fn communication_limits_violation(
         value: Some(format!("{count} items")),
         sensitive: false,
     };
-    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+    crate::service::validation::stated(std::slice::from_ref(&violation))
 }
 
 /// Why the keys of the MAP at `member` are a bad request, or `None` when every one of
@@ -449,7 +449,7 @@ pub fn enum_map_keys_violation<'k>(
 /// modelled enum, so the boundary walk refuses an off-catalog value before a handler
 /// runs. Because the sentence here is built from the framework's own
 /// [`::smithy_server_runtime::Violation`] and rendered by
-/// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
+/// [`crate::service::validation::stated`] — the one place that wording
 /// lives — the two layers refuse the same value with the same sentence, so which of
 /// them answered is not something a caller can tell.
 pub fn enum_value_violation(member: &str, allowed: &[&str], value: Option<&str>) -> Option<String> {
@@ -467,7 +467,7 @@ pub fn enum_value_violation(member: &str, allowed: &[&str], value: Option<&str>)
         value: Some(elided(value)),
         sensitive: false,
     };
-    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+    crate::service::validation::stated(std::slice::from_ref(&violation))
 }
 
 /// Why a communication-time config is a bad request, or `None` when every day its
@@ -606,7 +606,7 @@ static SEGMENT_ARN_SCHEMA: LazyLock<::aws_smithy_schema::Schema> = LazyLock::new
 /// `member` — the request path the walk below was started beneath, so the clause names
 /// the member as the CALLER spelled it rather than as the sub-walk saw it.
 ///
-/// Rendered by `aws_smithy_schema_server::constraints::envelope` — the one place that
+/// Rendered by [`crate::service::validation::stated`] — the one place that
 /// wording lives — so a refusal from inside a handler reads exactly like one from the
 /// boundary.
 fn union_member_refusal(
@@ -617,7 +617,7 @@ fn union_member_refusal(
     for violation in &mut violations {
         violation.path = format!("{member}.{}", violation.path);
     }
-    ::aws_smithy_schema_server::constraints::envelope(&violations)
+    crate::service::validation::stated(&violations)
 }
 
 /// The refusal for the bare string `value` that arrived at `member`, judged against
@@ -1135,27 +1135,34 @@ impl CampaignState {
         }
     }
 
+    /// The UPPER-CASE spelling of this state, which is how a refusal that names the
+    /// state a campaign is at spells it (see [`campaign_invalid_state_message`]) — the
+    /// same catalog value as [`Self::as_wire`], raised rather than restated, so the two
+    /// cannot drift as the catalog grows.
+    pub fn as_upper(self) -> String {
+        self.as_wire().to_ascii_uppercase()
+    }
+
     /// The state this one moves to under `action`, or `None` when `action` is not
-    /// legal from here (which the caller answers with
-    /// `InvalidCampaignStateException`).
+    /// legal from here (which the caller answers with the state-conflict refusal
+    /// [`campaign_invalid_state_message`] words).
     ///
     /// Start is the only action a campaign that has never entered its run takes:
     /// every other verb acts on a run already under way, so Pause (which suspends
     /// a running campaign), Resume (which puts a suspended one back to work, legal
     /// from `Paused` and nowhere else) and Stop (which ends a run before it
     /// finishes, legal from `Running` and `Paused`) are all refused from
-    /// `Initialized`. Nothing moves out of a terminal state (`Completed`,
-    /// `Failed`), and no action is a no-op: repeating one is refused rather than
-    /// silently accepted.
+    /// `Initialized`. Nothing moves out of a TERMINAL state, and `Stopped` is one of
+    /// them: stopping ends the campaign's run for good, so it is not startable again,
+    /// as `Completed` and `Failed` are not. No action is a no-op either: repeating one
+    /// is refused rather than silently accepted.
     ///
     /// A call is judged against the state the campaign is at NOW, which the clock
     /// has a say in — see [`StoredCampaign::state_at`], the one place a caller reads
     /// a campaign's state from.
     pub fn after(self, action: CampaignAction) -> Option<Self> {
         match (self, action) {
-            (Self::Initialized | Self::Paused | Self::Stopped, CampaignAction::Start) => {
-                Some(Self::Running)
-            }
+            (Self::Initialized | Self::Paused, CampaignAction::Start) => Some(Self::Running),
             (Self::Running, CampaignAction::Pause) => Some(Self::Paused),
             (Self::Paused, CampaignAction::Resume) => Some(Self::Running),
             (Self::Running | Self::Paused, CampaignAction::Stop) => Some(Self::Stopped),
@@ -1187,9 +1194,9 @@ impl CampaignState {
     /// A campaign reaches out to anyone only while its run is actually under way, which
     /// is `Running`: a campaign that has not started yet, one suspended, one whose run
     /// was ended and one in a terminal state are all placing nothing, so a batch
-    /// submitted to any of them is refused with `InvalidCampaignStateException` — the
-    /// error the model declares for both batch operations — rather than buffered for a
-    /// run that is not happening.
+    /// submitted to any of them is refused as the state conflict it is (see
+    /// [`campaign_invalid_state_message`]) rather than buffered for a run that is not
+    /// happening.
     ///
     /// Shared by the batch operations through [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::dialable_campaign`],
     /// so two of them cannot disagree about which states take requests.
@@ -1206,19 +1213,6 @@ pub enum CampaignAction {
     Pause,
     Resume,
     Stop,
-}
-
-impl CampaignAction {
-    /// The verb this action is refused with, for the
-    /// `InvalidCampaignStateException` message.
-    pub fn verb(self) -> &'static str {
-        match self {
-            Self::Start => "started",
-            Self::Pause => "paused",
-            Self::Resume => "resumed",
-            Self::Stop => "stopped",
-        }
-    }
 }
 
 /// A configuration structure every one of whose modelled members is optional, so a
@@ -1584,32 +1578,47 @@ impl StoredCampaign {
     ///
     /// Only the named channel's block goes: every other channel keeps the block it
     /// was configured with, so [`Self::channel_subtypes`] still reports those. A
-    /// config left holding no channel at all holds nothing, so the record carries no
-    /// `channelSubtypeConfig` rather than an empty one — the member is optional on
-    /// both `Campaign` and `CampaignSummary`'s projection. A campaign that held no
-    /// block for the named channel, and one carrying no channel subtype config at
-    /// all, are left exactly as they were, which is what makes the operation
-    /// idempotent, as the model declares.
-    pub fn clear_channel_subtype_config(&mut self, channel_subtype: &str) {
+    /// campaign that held no block for the named channel, and one carrying no channel
+    /// subtype config at all, are left exactly as they were, which is what makes the
+    /// operation idempotent, as the model declares.
+    ///
+    /// A campaign always keeps at least ONE configured channel subtype, so a removal
+    /// that would leave it configured for no channel at all is refused
+    /// ([`Err`]) and NOTHING is written: the record cannot come to hold the empty
+    /// channel-subtype config that would leave every later read of it describing a
+    /// campaign that can reach nobody. The emptiness test is the one every writer of the
+    /// member decides by ([`OptionalMembersOnly`]).
+    pub fn clear_channel_subtype_config(
+        &mut self,
+        channel_subtype: &str,
+    ) -> Result<(), LastChannelSubtype> {
+        if self.channel_subtype_config.is_none() {
+            return Ok(());
+        }
+        // Judged BEFORE anything is taken out, so a refusal leaves the config exactly
+        // as it was: the campaign keeps this block when it is the only one it holds.
+        if self.channel_subtypes() == [channel_subtype] {
+            return Err(LastChannelSubtype);
+        }
         let Some(config) = self.channel_subtype_config.as_mut() else {
-            return;
+            return Ok(());
         };
-        let removed = match channel_subtype {
-            "EMAIL" => config.email.take().is_some(),
-            "SMS" => config.sms.take().is_some(),
-            "TELEPHONY" => config.telephony.take().is_some(),
-            "WHATSAPP" => config.whats_app.take().is_some(),
+        match channel_subtype {
+            "EMAIL" => config.email = None,
+            "SMS" => config.sms = None,
+            "TELEPHONY" => config.telephony = None,
+            "WHATSAPP" => config.whats_app = None,
             // A catalog value with no block on `ChannelSubtypeConfig` is a channel
             // this emulator cannot be configured for, so it holds nothing to remove.
-            _ => false,
-        };
-        // Only a removal collapses the config: a call that removed nothing writes
-        // nothing at all. The emptiness test is the one every writer of the member
-        // decides by ([`OptionalMembersOnly`]), so the record is left in the same one
-        // representation of "configured for no channel" whichever path wrote it.
-        if removed && config.holds_no_member() {
+            _ => {}
+        }
+        // The guard above leaves a removal with a channel still configured, so this
+        // keeps the one representation of "configured for no channel" the writers of
+        // the member share rather than ever being reached.
+        if config.holds_no_member() {
             self.channel_subtype_config = None;
         }
+        Ok(())
     }
 
     /// Remove the communication-time window this campaign holds for the channel
@@ -1811,12 +1820,37 @@ pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
 /// on or to delete: the region holds no record of one, because the instance was never
 /// onboarded there or its job has since been deleted.
 ///
-/// Composed from the request, so the refusal names the instance the caller asked
-/// about. The one text the two operations whose own resource IS that job
+/// Composed from the request AND from who is asking: an onboarding record belongs to
+/// one AWS account's instance, so the refusal names the account the call was made in
+/// ([`::engine::emulator_account_id`], the one account every emulated call is made
+/// in) beside the instance it asked about — which is how a caller tells "this
+/// instance was never onboarded in THIS account" from a cross-account mistake. No
+/// trailing period: the sentence ends on the id.
+///
+/// The one text the two operations whose own resource IS that job
 /// (`GetInstanceOnboardingJobStatus` and `DeleteInstanceOnboardingJob`) share, so the
 /// two cannot disagree about a request they both refuse.
 pub fn onboarding_job_not_found_message(connect_instance_id: &str) -> String {
-    format!("No onboarding job found for Connect instance {connect_instance_id}")
+    format!(
+        "Instance onboarding record does not exist for aws account id {} and instance id {connect_instance_id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// What this service answers when a campaign's own `CampaignState` does not permit
+/// the action a request asks of it — a lifecycle transition
+/// ([`CampaignState::after`]) or a batch of outbound requests
+/// ([`CampaignState::takes_outbound_requests`]) — at HTTP 409 under the modelled
+/// `ConflictException`.
+///
+/// Composed from the request and the store: the campaign id the request addressed and
+/// the state the campaign is at NOW, spelled as [`CampaignState::as_upper`] spells it.
+/// The one text every state gate of a campaign action shares, so two of them cannot
+/// disagree about a request they both refuse, and a caller that parses the state out of
+/// the refusal to decide whether to start or to resume reads the same token whichever
+/// call it made.
+pub fn campaign_invalid_state_message(id: &str, state: CampaignState) -> String {
+    format!("Campaign: {id} is in invalid state: {}", state.as_upper())
 }
 
 /// What this service answers when a well-formed campaign id names no campaign.
@@ -1828,6 +1862,144 @@ pub fn onboarding_job_not_found_message(connect_instance_id: &str) -> String {
 /// (`PutOutboundRequestBatch` keeps its own recorded wording, which does name the
 /// campaign: that operation's message is composed from the request.)
 pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
+
+/// What `DeleteCampaign` answers when the id it was asked to delete names no
+/// campaign: the same `CampaignId not found` sentence as the lookups above, NAMING the
+/// id, and ended with a period.
+///
+/// Composed from the request: a caller deleting many campaigns at once learns from the
+/// refusal WHICH id was missing, which is the whole purpose of the id in this message.
+/// The id-less [`CAMPAIGN_NOT_FOUND_MESSAGE`] stays what the reading operations answer,
+/// as their own recorded refusals carry it — the two paths genuinely differ.
+pub fn delete_campaign_not_found_message(id: &str) -> String {
+    format!("CampaignId not found {id}.")
+}
+
+/// What this service answers when a request FILTERS by a Connect instance that is not
+/// onboarded to Campaigns in the region it was signed for, at HTTP 400 under the
+/// modelled `ValidationException`: the filtered instance is resolved before anything is
+/// listed, so an instance with no campaigns and one that is no campaign target at all
+/// are not answered alike.
+///
+/// A FIXED service string: it names no instance and carries nothing from the request,
+/// so every refusal of this kind reads the same.
+pub const INSTANCE_NOT_ONBOARDED_MESSAGE: &str = "Instance is not onboarded";
+
+/// What `DeleteConnectInstanceConfig` answers when the instance whose configuration it
+/// was asked to remove still owns at least one campaign and the request named no
+/// `campaignDeletionPolicy`, at HTTP 409 under the modelled `InvalidStateException`:
+/// the campaigns of an instance depend on its configuration, so the un-forced delete is
+/// blocked rather than leaving them pointing at a configuration that is gone.
+///
+/// A FIXED service string: it names neither the instance nor how many campaigns hold
+/// it, so every refusal of this kind reads the same.
+pub const INSTANCE_HAS_CAMPAIGNS_MESSAGE: &str = "This instance still has campaigns";
+
+/// What a `DeleteConnectInstanceConfig` request's `campaignDeletionPolicy` decides for
+/// the campaigns of the instance whose configuration it removes.
+///
+/// The member is optional, and its ABSENCE is not one of the policies: a caller that
+/// has not said what is to become of the instance's campaigns gets the delete refused
+/// while there are any ([`INSTANCE_HAS_CAMPAIGNS_MESSAGE`]) rather than one of the two
+/// outcomes chosen for it — which is why the parameter exists at all. A caller that
+/// names a policy has decided, so the delete goes through either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CampaignDeletionPolicy {
+    /// The request named no policy.
+    Unspecified,
+    /// [`CAMPAIGN_DELETION_POLICY_RETAIN_ALL`]: the configuration goes, the campaigns
+    /// stay exactly as they are.
+    RetainAll,
+    /// [`CAMPAIGN_DELETION_POLICY_DELETE_ALL`]: the campaigns go with the
+    /// configuration.
+    DeleteAll,
+}
+
+impl CampaignDeletionPolicy {
+    /// The policy a request carrying `policy` asks for — the value of its
+    /// `campaignDeletionPolicy` member, already weighed against the model's catalog by
+    /// the caller, and `None` when the request carries none.
+    ///
+    /// Each catalog value is named: a value outside the catalog never reaches here (the
+    /// boundary walk and the handler's own check refuse it first), so one that did is this
+    /// service's own mistake rather than a caller's, and the conservative reading of it is
+    /// the one a request that decided nothing gets.
+    pub fn of_request(policy: Option<&str>) -> Self {
+        match policy {
+            None => Self::Unspecified,
+            Some(CAMPAIGN_DELETION_POLICY_DELETE_ALL) => Self::DeleteAll,
+            Some(CAMPAIGN_DELETION_POLICY_RETAIN_ALL) => Self::RetainAll,
+            Some(_) => Self::Unspecified,
+        }
+    }
+
+    /// Whether the campaigns of the instance go with its configuration.
+    fn deletes_campaigns(self) -> bool {
+        matches!(self, Self::DeleteAll)
+    }
+
+    /// Whether a campaign the instance still owns BLOCKS the delete: only a request
+    /// that named no policy at all leaves that decision unmade.
+    fn blocked_by_campaigns(self) -> bool {
+        matches!(self, Self::Unspecified)
+    }
+}
+
+/// What `DeleteCampaignChannelSubtypeConfig` answers when the channel subtype it was
+/// asked to remove is the only one the campaign has configured, at HTTP 400 under the
+/// modelled `ValidationException`: a campaign always keeps at least one channel
+/// subtype, so the removal that would leave it with none is refused and nothing is
+/// written.
+///
+/// A FIXED service string: it names neither the campaign nor the channel, so every
+/// refusal of this kind reads the same.
+pub const LAST_CHANNEL_SUBTYPE_MESSAGE: &str = "At least one channel subtype needs to be configured.";
+
+/// The shortest campaign id this service accepts.
+///
+/// Source: the `@length` of `CampaignId`, the shape every campaign-id member and
+/// `CampaignIdList`'s member target, whose minimum is 1 and maximum 256
+/// (`smithy_query(query="shape", shape="CampaignId")`).
+pub const CAMPAIGN_ID_MIN_LENGTH: i64 = 1;
+/// See [`CAMPAIGN_ID_MIN_LENGTH`].
+pub const CAMPAIGN_ID_MAX_LENGTH: i64 = 256;
+/// `CampaignId`'s modelled `@pattern`, quoted exactly as the model states it.
+pub const CAMPAIGN_ID_PATTERN: &str = "^[-:/a-zA-Z0-9]+$";
+
+/// `timestamp` at the precision this service keeps a `date-time` instant to:
+/// MILLISECONDS, with the sub-millisecond remainder of a submitted value dropped.
+///
+/// The service stores and echoes a caller-supplied instant to the millisecond, so a
+/// value submitted with a finer remainder comes back without it: truncating on the way
+/// IN is what makes that so for every later read of the record, rather than leaving two
+/// readers to round the same stored value differently. Truncation and not rounding — the
+/// instant a value names never moves forward.
+///
+/// The one place that precision lives, so every writer of a `date-time` member
+/// (a campaign's schedule window, an outbound request's expiration) keeps records to
+/// the same one.
+pub fn millisecond_precision(
+    timestamp: ::aws_smithy_types::DateTime,
+) -> ::aws_smithy_types::DateTime {
+    const NANOS_PER_MILLI: u32 = 1_000_000;
+    let nanos = timestamp.subsec_nanos() / NANOS_PER_MILLI * NANOS_PER_MILLI;
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(timestamp.secs(), nanos)
+}
+
+/// `schedule` as the campaign record holds it: its run window at the precision
+/// [`millisecond_precision`] keeps a `date-time` to.
+///
+/// The one place a schedule is prepared for the store, shared by `CreateCampaign` and
+/// `UpdateCampaignSchedule`, so a campaign born with a window and one given a new one
+/// hold it at the same precision and `DescribeCampaign` projects it the same way
+/// whichever call wrote it.
+pub fn stored_schedule(schedule: Schedule) -> Schedule {
+    Schedule {
+        start_time: millisecond_precision(schedule.start_time),
+        end_time: millisecond_precision(schedule.end_time),
+        refresh_frequency: schedule.refresh_frequency,
+    }
+}
 
 /// What this service answers when a write is refused because the campaign name it
 /// asks for is already held by another campaign of the same Connect instance, at
@@ -2381,6 +2553,16 @@ pub enum RenameRejected {
     NameTaken,
 }
 
+/// Why the store refused to remove a campaign's channel-subtype config block, as
+/// [`StoredCampaign::clear_channel_subtype_config`] reports it: the block named is the
+/// only one the campaign holds, and a campaign always keeps at least one configured
+/// channel subtype. Nothing is written.
+///
+/// The caller answers this with the modelled `ValidationException` (HTTP 400) carrying
+/// [`LAST_CHANNEL_SUBTYPE_MESSAGE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastChannelSubtype;
+
 /// Why the store refused a lifecycle action on a campaign, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::act_on_campaign`]
 /// reports it. The stored lifecycle state is unchanged in either case.
@@ -2388,32 +2570,26 @@ pub enum RenameRejected {
 /// [`Self::message`] carries the sentence the refusal is worded with, so the four
 /// lifecycle operations refuse alike while each maps the rejection to the error
 /// variant its own model declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleRejected {
     /// The region holds no campaign under that id, so there is no lifecycle to move.
     /// The caller answers this with the modelled `ResourceNotFoundException`
     /// (HTTP 404).
     NotFound,
-    /// The campaign is at `state` at the instant the call was judged and `action` is
-    /// not legal from there (see [`CampaignState::after`]). The caller answers this
-    /// with the modelled `InvalidCampaignStateException` (HTTP 409), whose `state`
-    /// member carries `state.as_wire()`.
-    IllegalAction {
-        state: CampaignState,
-        action: CampaignAction,
-    },
+    /// The campaign is at `state` at the instant the call was judged and the action
+    /// asked for is not legal from there (see [`CampaignState::after`]). Carries the
+    /// id judged, so [`Self::message`] can name the campaign the request did. The
+    /// caller answers this as the state conflict it is: the modelled
+    /// `ConflictException` (HTTP 409) carrying [`campaign_invalid_state_message`].
+    IllegalAction { id: String, state: CampaignState },
 }
 
 impl LifecycleRejected {
     /// The sentence this refusal is reported with.
-    pub fn message(self) -> String {
+    pub fn message(&self) -> String {
         match self {
             Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
-            Self::IllegalAction { state, action } => format!(
-                "A campaign in state {} cannot be {}",
-                state.as_wire(),
-                action.verb()
-            ),
+            Self::IllegalAction { id, state } => campaign_invalid_state_message(id, *state),
         }
     }
 }
@@ -2503,8 +2679,8 @@ pub enum DialRejected {
     /// The campaign is at `state` at the instant the call was judged and that state
     /// takes no outbound requests (see [`CampaignState::takes_outbound_requests`]).
     /// Carries the id judged, so [`Self::message`] can name the campaign. The caller
-    /// answers this with the modelled `InvalidCampaignStateException` (HTTP 409), whose
-    /// `state` member carries `state.as_wire()`.
+    /// answers this as the state conflict it is: the modelled `ConflictException`
+    /// (HTTP 409) carrying [`campaign_invalid_state_message`].
     NotDialable { id: String, state: CampaignState },
 }
 
@@ -2513,10 +2689,7 @@ impl DialRejected {
     pub fn message(&self) -> String {
         match self {
             Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
-            Self::NotDialable { id, state } => format!(
-                "Campaign {id} is {} and takes outbound requests only while Running",
-                state.as_wire()
-            ),
+            Self::NotDialable { id, state } => campaign_invalid_state_message(id, *state),
         }
     }
 }
@@ -2805,8 +2978,8 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         let current = stored.state_at(now);
         let Some(next) = current.after(action) else {
             return Err(LifecycleRejected::IllegalAction {
+                id: campaign.id.to_string(),
                 state: current,
-                action,
             });
         };
         stored.lifecycle_state = next;
@@ -3294,32 +3467,57 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// which belong to the configured instance, so an instance onboarded again later
     /// starts out holding none.
     ///
-    /// `delete_campaigns` is what the request's campaign deletion policy decided for
-    /// the campaigns of the instance: `true` removes them with the configuration,
-    /// `false` retains them exactly as they are.
+    /// `policy` is what the request's `campaignDeletionPolicy` decided for the
+    /// campaigns of the instance (see [`CampaignDeletionPolicy`]):
+    /// [`CampaignDeletionPolicy::DeleteAll`] removes them with the configuration and
+    /// [`CampaignDeletionPolicy::RetainAll`] retains them exactly as they are.
+    ///
+    /// An instance that still OWNS a campaign, where the request named NO policy for
+    /// those campaigns, keeps its configuration:
+    /// [`InstanceConfigDeletion::HeldByCampaigns`] is the whole answer and nothing is
+    /// written, since a campaign depends on the configuration of the instance it
+    /// belongs to and removing it would leave that campaign pointing at a
+    /// configuration no reader can resolve. Once its last campaign is deleted, or the
+    /// request says what is to become of them, the identical call goes through.
     pub fn delete_instance_config(
         &mut self,
         region: &str,
         connect_instance_id: &str,
-        delete_campaigns: bool,
+        policy: CampaignDeletionPolicy,
         now: SystemTime,
-    ) -> bool {
+    ) -> InstanceConfigDeletion {
         if self
             .onboarded_instance(region, connect_instance_id, now)
             .is_none()
         {
-            return false;
+            return InstanceConfigDeletion::NotConfigured;
         }
-        if delete_campaigns {
+        if policy.blocked_by_campaigns()
+            && self.instance_campaign_count(region, connect_instance_id) > 0
+        {
+            return InstanceConfigDeletion::HeldByCampaigns;
+        }
+        if policy.deletes_campaigns() {
             self.remove_instance_campaigns(region, connect_instance_id);
         }
         // The region holds the record the check above resolved, so it is in the map.
         let Some(store) = self.regions.get_mut(region) else {
-            return false;
+            return InstanceConfigDeletion::NotConfigured;
         };
         store.instance_onboarding.remove(connect_instance_id);
         store.instance_integrations.remove(connect_instance_id);
-        true
+        InstanceConfigDeletion::Deleted
+    }
+
+    /// How many campaigns `region` stores for `connect_instance_id`.
+    ///
+    /// The one place "does this instance still own campaigns?" is answered, read off
+    /// the campaign store itself ([`Self::campaigns_in_order`]) rather than from a
+    /// count kept beside it, so it cannot drift from the records a listing projects.
+    pub fn instance_campaign_count(&self, region: &str, connect_instance_id: &str) -> usize {
+        self.campaigns_in_order(region)
+            .filter(|(_, campaign)| campaign.connect_instance_id == connect_instance_id)
+            .count()
     }
 
     /// Put `config` as an integration `region` holds for `connect_instance_id`, and
@@ -3436,6 +3634,24 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         integrations.remove(at);
         true
     }
+}
+
+/// What [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::delete_instance_config`]
+/// did with a delete request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceConfigDeletion {
+    /// The configuration, and everything held on it, is gone.
+    Deleted,
+    /// The region holds no configuration for the instance at the instant the call was
+    /// judged, so there was none to delete. The caller answers this with the modelled
+    /// `ResourceNotFoundException` (HTTP 404) carrying
+    /// [`instance_config_not_found_message`].
+    NotConfigured,
+    /// The instance still owns at least one campaign and the request asked for no
+    /// campaign deletion, so the configuration those campaigns depend on is left in
+    /// place. The caller answers this with the modelled `InvalidStateException`
+    /// (HTTP 409) carrying [`INSTANCE_HAS_CAMPAIGNS_MESSAGE`].
+    HeldByCampaigns,
 }
 
 /// What [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::delete_instance_onboarding`]

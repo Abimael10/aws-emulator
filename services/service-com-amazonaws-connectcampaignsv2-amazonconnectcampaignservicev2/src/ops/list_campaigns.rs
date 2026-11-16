@@ -6,6 +6,12 @@
 //! sequence number the page just returned ended at, so paging walks every campaign
 //! exactly once even if one is deleted mid-walk.
 //!
+//! A FILTERED listing resolves the Connect instance its `filters.instanceIdFilter`
+//! names before listing anything: an instance that is not onboarded to Campaigns in the
+//! region the request was signed for is no campaign target, so the call is refused with
+//! the modelled `ValidationException` (HTTP 400) rather than answered with an empty
+//! page that would read as "this instance has no campaigns".
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,6 +171,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through another region's endpoint is not in it.
         let region = crate::state::request_region(ctx);
         let store = state.lock();
+
+        // A FILTERED listing resolves the instance it filters by BEFORE listing
+        // anything: an instance that is not onboarded to Campaigns in this region is no
+        // campaign target, so there is no set of its campaigns to report — not even an
+        // empty one, which would tell a caller probing for campaigns that the instance
+        // is a target and merely has none. The store's own onboarding predicate answers
+        // it (`is_onboarded`), the same one `CreateCampaign`'s gate and
+        // `GetConnectInstanceConfig`'s projection read, so the three cannot disagree
+        // about which instances those are.
+        if let Some(wanted) = instance_id.as_deref() {
+            if !store.is_onboarded(&region, wanted, ::std::time::SystemTime::now()) {
+                return Err(ListCampaignsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::INSTANCE_NOT_ONBOARDED_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         let matching: Vec<(u64, &crate::state::StoredCampaign)> = store
             .campaigns_in_order(&region)
             .filter(|(_, campaign)| {

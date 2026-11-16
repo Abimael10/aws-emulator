@@ -6,7 +6,9 @@
 //! this service answers HTTP 404 `ResourceNotFoundException` with its FIXED
 //! not-found text — a constant that carries nothing from the request, so the answer
 //! is the same whatever id was asked for, and a client that matches or logs on that
-//! text matches it.
+//! text matches it. `DeleteCampaign` is the one operation that NAMES the id it was
+//! asked to delete, so a caller deleting many campaigns learns which one was missing;
+//! its sentence is the same text with the id and a period after it.
 //!
 //! Asserted over a table: every operation that resolves a campaign by `{id}`
 //! (`DescribeCampaign`, `DeleteCampaign`, `GetCampaignState`, `StartCampaign`,
@@ -16,10 +18,10 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CAMPAIGN_NOT_FOUND_MESSAGE, ONBOARDING_JOB_DURATION,
+    delete_campaign_not_found_message, CAMPAIGN_NOT_FOUND_MESSAGE,
 };
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, onboard_instance, router, Harness};
 
 /// The region every case here signs for.
 const REGION: &str = "us-east-1";
@@ -30,22 +32,7 @@ const INSTANCE: &str = "not-found-control-instance";
 /// Onboard `INSTANCE` so `CreateCampaign` has a campaign target, then create one
 /// campaign and hand back its id.
 async fn a_stored_campaign(router: &Harness) -> String {
-    // Onboarding resolves the `connectInstanceId` against the account's Connect
-    // instance registry, so the instance is registered there first.
-    router.register_connect_instance(REGION, INSTANCE);
-    let (status, body) = call(
-        router,
-        REGION,
-        "PUT",
-        &format!("/v2/connect-instance/{INSTANCE}/onboarding"),
-        &json!({"encryptionConfig": {"enabled": false}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case \"onboard the control instance\": expected HTTP 200, got {status} {body}"
-    );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
+    onboard_instance(router, REGION, INSTANCE).await;
 
     let (status, body) = call(
         router,
@@ -110,6 +97,16 @@ fn unknown_ids() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The not-found sentence `operation` answers for the id `id`: the service's fixed
+/// text, which `DeleteCampaign` alone states with the id it was asked to delete.
+fn expected_not_found(operation: &str, id: &str) -> String {
+    if operation == "DeleteCampaign" {
+        delete_campaign_not_found_message(id)
+    } else {
+        CAMPAIGN_NOT_FOUND_MESSAGE.to_string()
+    }
+}
+
 #[tokio::test]
 async fn every_campaign_id_lookup_answers_the_services_fixed_not_found_text() {
     let router = router();
@@ -153,9 +150,9 @@ async fn every_campaign_id_lookup_answers_the_services_fixed_not_found_text() {
             );
             assert_eq!(
                 body.get("message").and_then(Value::as_str),
-                Some(CAMPAIGN_NOT_FOUND_MESSAGE),
-                "case {case:?}: expected the service's fixed not-found text — the same one \
-                 whatever the id asked for — got {body}"
+                Some(expected_not_found(operation, &id).as_str()),
+                "case {case:?}: expected the service's not-found text for this operation — \
+                 the same one whatever the id asked for — got {body}"
             );
         }
     }
@@ -211,8 +208,8 @@ async fn a_deleted_campaign_answers_the_same_fixed_not_found_text() {
         );
         assert_eq!(
             body.get("message").and_then(Value::as_str),
-            Some(CAMPAIGN_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the service's fixed not-found text, got {body}"
+            Some(expected_not_found(operation, &stored).as_str()),
+            "case {case:?}: expected the service's not-found text for this operation, got {body}"
         );
     }
 }

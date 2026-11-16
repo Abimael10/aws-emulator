@@ -17,8 +17,10 @@
 //!   be usable by Campaigns (`CreateCampaign`, the three instance-integration
 //!   operations, `StartInstanceOnboardingJob`) answer the service's FIXED sentence
 //!   about the instance, which carries nothing from the request;
-//! * the two whose own resource is the onboarding JOB report that job as not found,
-//!   naming the instance asked about;
+//! * the two whose own resource is the onboarding JOB report that record as not
+//!   existing, naming the AWS account the call was made in beside the instance asked
+//!   about — an onboarding record belongs to one account's instance, so that is how a
+//!   caller tells "never onboarded in THIS account" from a cross-account mistake;
 //!
 //! so two operations of one class cannot disagree about a request they both refuse.
 //!
@@ -68,7 +70,11 @@ impl Refusal {
             Refusal::Instance => {
                 "Connect Instance does not exist or is not enabled to use Campaigns.".to_string()
             }
-            Refusal::Job => format!("No onboarding job found for Connect instance {instance}"),
+            Refusal::Job => format!(
+                "Instance onboarding record does not exist for aws account id {} and \
+                 instance id {instance}",
+                ::engine::emulator_account_id()
+            ),
         }
     }
 }

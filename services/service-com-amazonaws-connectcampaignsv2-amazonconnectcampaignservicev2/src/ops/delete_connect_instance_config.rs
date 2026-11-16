@@ -12,10 +12,13 @@
 //!
 //! The request's `campaignDeletionPolicy` decides what the delete enacts on the
 //! campaigns of that instance, as the model documents the enum: `DELETE_ALL` removes
-//! them along with the configuration, `RETAIN_ALL` leaves them exactly as they are,
-//! and a request naming no policy enacts nothing on them either — a caller that did
-//! not ask for its campaigns to go keeps them. Campaigns of every OTHER instance are
-//! untouched whichever policy is named.
+//! them along with the configuration and `RETAIN_ALL` leaves them exactly as they are.
+//! A request naming NO policy has not decided, and the campaigns of an instance depend
+//! on its configuration, so while the instance still owns one the delete is refused
+//! with the modelled `InvalidStateException` (HTTP 409) and the configuration is left
+//! in place — which is what the parameter exists for; once the campaigns go, the
+//! identical call succeeds. Campaigns of every OTHER instance are untouched whichever
+//! policy is named.
 //!
 //! ## Shape of an operation
 //!
@@ -210,8 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // Only the one policy that names a deletion removes the instance's campaigns;
-        // `RETAIN_ALL` and a request carrying no policy both retain them.
-        let delete_campaigns = policy == Some(crate::state::CAMPAIGN_DELETION_POLICY_DELETE_ALL);
+        // `RETAIN_ALL` retains them, and a request carrying no policy at all has not
+        // decided, which is what the store answers while the instance owns any.
+        let policy = crate::state::CampaignDeletionPolicy::of_request(policy);
 
         // The attempt to change what this service holds for the instance is recorded
         // on this exit as on every other, named by the modelled error it answers with.
@@ -239,33 +243,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deleted = state.lock().delete_instance_config(
             &region,
             &input.connect_instance_id,
-            delete_campaigns,
+            policy,
             now,
         );
 
-        if !deleted {
-            // The instance holds no configuration at `now` — the same predicate
-            // `GetConnectInstanceConfig` projects through, so the two cannot disagree
-            // about an instance this service holds no config for — and a refusal wrote
-            // nothing. The refusal is audited all the same: what the audit trail
-            // records is the attempt and how it ended, not whether anything changed.
-            crate::state::audit_onboarding_change(
-                ctx.parts(),
-                Self::NAME,
-                &input.connect_instance_id,
-                "ResourceNotFoundException",
-            );
-            return Err(
-                DeleteConnectInstanceConfigErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::instance_config_not_found_message(
-                            &input.connect_instance_id,
-                        ),
-                        x_amz_error_type: None,
-                    },
-                )
-                .into(),
-            );
+        match deleted {
+            crate::state::InstanceConfigDeletion::Deleted => {}
+            crate::state::InstanceConfigDeletion::NotConfigured => {
+                // The instance holds no configuration at `now` — the same predicate
+                // `GetConnectInstanceConfig` projects through, so the two cannot
+                // disagree about an instance this service holds no config for — and a
+                // refusal wrote nothing. The refusal is audited all the same: what the
+                // audit trail records is the attempt and how it ended, not whether
+                // anything changed.
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "ResourceNotFoundException",
+                );
+                return Err(
+                    DeleteConnectInstanceConfigErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::instance_config_not_found_message(
+                                &input.connect_instance_id,
+                            ),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::InstanceConfigDeletion::HeldByCampaigns => {
+                // The instance still owns campaigns and the request asked for none of
+                // them to go, so the configuration they depend on stays: the refusal is
+                // the modelled `InvalidStateException` (HTTP 409) — the error that
+                // exists for a conflict with the current state — and the stored
+                // configuration is untouched, so a later read still projects it. The
+                // attempt is audited as every other exit is.
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "InvalidStateException",
+                );
+                return Err(
+                    DeleteConnectInstanceConfigErrorModeled::InvalidStateException(
+                        InvalidStateException {
+                            message: crate::state::INSTANCE_HAS_CAMPAIGNS_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // The call changed what this service holds for the instance, so it leaves the

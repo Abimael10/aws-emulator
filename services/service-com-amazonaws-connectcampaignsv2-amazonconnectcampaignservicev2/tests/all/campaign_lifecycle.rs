@@ -20,52 +20,23 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignAction, CampaignState, ONBOARDING_JOB_DURATION,
+    CampaignAction, CampaignState,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, onboard_instance, router, Harness};
 
 /// Onboard the Connect instance a `CreateCampaign` body names, so the create has a
 /// campaign target: `CreateCampaign` mints a campaign only for an instance whose
-/// onboarding job has SUCCEEDED, and that job settles one
-/// [`ONBOARDING_JOB_DURATION`] after `StartInstanceOnboardingJob`. Idempotent and
-/// cheap to repeat: an instance already onboarded is left alone, so the wait is paid
-/// once per instance rather than once per create.
+/// onboarding job has SUCCEEDED, which the shared fixture waits for by POLLING the
+/// job's reported status. Idempotent and cheap to repeat: an instance already
+/// onboarded is left alone, so the wait is paid once per instance rather than once per
+/// create.
 async fn onboard_for(router: &Harness, region: &str, body: &Value) {
     let Some(instance) = body.get("connectInstanceId").and_then(Value::as_str) else {
         return;
     };
-    let (status, status_body) = call(
-        router,
-        region,
-        "GET",
-        &format!("/v2/connect-instance/{instance}/onboarding"),
-        &Value::Null,
-    )
-    .await;
-    if status == 200
-        && status_body
-            .pointer("/connectInstanceOnboardingJobStatus/status")
-            .and_then(Value::as_str)
-            == Some("SUCCEEDED")
-    {
-        return;
-    }
-    router.register_connect_instance(region, instance);
-    let (status, started) = call(
-        router,
-        region,
-        "PUT",
-        &format!("/v2/connect-instance/{instance}/onboarding"),
-        &json!({"encryptionConfig": {"enabled": false}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "StartInstanceOnboardingJob {instance}: expected 200, got {status} {started}"
-    );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(100)).await;
+    onboard_instance(router, region, instance).await;
 }
 
 /// `CreateCampaign`, asserting it succeeded, and returning the response body. The
@@ -187,11 +158,9 @@ fn the_transition_table_moves_only_on_a_legal_action() {
             CampaignAction::Start,
             Some(CampaignState::Running),
         ),
-        (
-            CampaignState::Stopped,
-            CampaignAction::Start,
-            Some(CampaignState::Running),
-        ),
+        // `Stopped` is terminal: stopping ends the run for good, so the campaign is
+        // not startable again.
+        (CampaignState::Stopped, CampaignAction::Start, None),
         (CampaignState::Running, CampaignAction::Start, None),
         (CampaignState::Completed, CampaignAction::Start, None),
         (CampaignState::Failed, CampaignAction::Start, None),
@@ -443,9 +412,9 @@ async fn list_derives_channel_subtypes_from_the_stored_config() {
 }
 
 /// A campaign starts `Initialized`, and each legal action is reported by
-/// `GetCampaignState`; each illegal one answers 409 `InvalidCampaignStateException`
-/// and leaves the state exactly where it was. The sequence covers every legal
-/// transition and every refusal reachable through the API.
+/// `GetCampaignState`; each illegal one answers 409 `ConflictException` naming the
+/// campaign and the state it is at, and leaves the state exactly where it was. The
+/// sequence covers every legal transition and every refusal reachable through the API.
 #[tokio::test]
 async fn get_campaign_state_reports_what_the_lifecycle_calls_wrote() {
     let region = "ap-south-1";
@@ -498,7 +467,9 @@ async fn get_campaign_state_reports_what_the_lifecycle_calls_wrote() {
         ("stop", 200, "Stopped"),
         ("stop", 409, "Stopped"),
         ("pause", 409, "Stopped"),
-        ("start", 200, "Running"),
+        // `Stopped` is terminal: the run is over for good, so nothing moves out of it.
+        ("start", 409, "Stopped"),
+        ("resume", 409, "Stopped"),
     ];
 
     for (action, expected_status, expected_state) in steps {
@@ -517,15 +488,19 @@ async fn get_campaign_state_reports_what_the_lifecycle_calls_wrote() {
         );
         if *expected_status == 409 {
             assert!(
-                error_code(&body).ends_with("InvalidCampaignStateException"),
-                "case {case:?}: expected InvalidCampaignStateException, got {}",
+                error_code(&body).ends_with("ConflictException"),
+                "case {case:?}: expected ConflictException, got {}",
                 error_code(&body)
             );
+            let expected_message = format!(
+                "Campaign: {id} is in invalid state: {}",
+                expected_state.to_uppercase()
+            );
             assert_eq!(
-                body["state"].as_str(),
-                Some(*expected_state),
-                "case {case:?}: expected the refusal to name state {expected_state:?}, got {:?}",
-                body["state"]
+                body["message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {case:?}: expected the refusal to read {expected_message:?}, got {:?}",
+                body["message"]
             );
         }
         let actual = state(&router, region, &id, &case).await;
@@ -830,13 +805,16 @@ async fn the_instance_id_filter_selects_only_that_instance() {
         }
     }
 
-    // An instance with no campaigns is an empty page, not an error.
+    // An ONBOARDED instance with no campaigns is an empty page, not an error: the
+    // filter resolves, and the instance simply owns nothing.
+    let empty_instance = "instance-none";
+    onboard_instance(&router, region, empty_instance).await;
     let (status, body) = call(
         &router,
         region,
         "POST",
         "/v2/campaigns-summary",
-        &json!({"filters": {"instanceIdFilter": {"value": "instance-none", "operator": "Eq"}}}),
+        &json!({"filters": {"instanceIdFilter": {"value": empty_instance, "operator": "Eq"}}}),
     )
     .await;
     assert_eq!(
@@ -848,6 +826,33 @@ async fn the_instance_id_filter_selects_only_that_instance() {
         Some(0),
         "case \"instance-none\": expected no summaries, got {}",
         body["campaignSummaryList"]
+    );
+
+    // An instance that is NOT onboarded is refused before anything is listed: a
+    // filtered listing resolves its instance first, so a caller is never told that an
+    // instance which is no campaign target merely owns nothing.
+    let (status, body) = call(
+        &router,
+        region,
+        "POST",
+        "/v2/campaigns-summary",
+        &json!({"filters": {"instanceIdFilter": {"value": "instance-unknown", "operator": "Eq"}}}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"instance-unknown\": expected 400, got {status} {body}"
+    );
+    assert!(
+        error_code(&body).ends_with("ValidationException"),
+        "case \"instance-unknown\": expected ValidationException, got {}",
+        error_code(&body)
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some("Instance is not onboarded"),
+        "case \"instance-unknown\": expected the fixed sentence, got {:?}",
+        body["message"]
     );
 }
 

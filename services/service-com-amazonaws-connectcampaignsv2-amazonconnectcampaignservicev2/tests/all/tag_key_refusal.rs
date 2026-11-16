@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::service::validation::unanchored;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
     ONBOARDING_JOB_DURATION, TAG_KEY_MAX_LENGTH, TAG_KEY_MIN_LENGTH, TAG_KEY_PATTERN,
 };
@@ -184,9 +185,12 @@ impl Failed {
     /// constraint refusal this emulator answers is built from.
     fn requirement(self) -> String {
         match self {
-            Self::Pattern => {
-                format!("Member must satisfy regular expression pattern: {TAG_KEY_PATTERN}")
-            }
+            Self::Pattern => format!(
+                "Member must satisfy regular expression pattern: {}",
+                // The pattern BODY: this service states a `@pattern` without the
+                // anchors the model writes around it (`service::validation::unanchored`).
+                unanchored(TAG_KEY_PATTERN)
+            ),
             Self::TooShort => format!(
                 "Member must have length greater than or equal to {TAG_KEY_MIN_LENGTH}"
             ),

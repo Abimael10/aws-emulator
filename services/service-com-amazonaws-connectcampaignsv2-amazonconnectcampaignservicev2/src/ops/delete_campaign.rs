@@ -2,7 +2,10 @@
 
 //! @op DeleteCampaign
 //! Removes the stored campaign, so a later `DescribeCampaign` / `GetCampaignState`
-//! answers 404 and `ListCampaigns` no longer carries it.
+//! answers 404 and `ListCampaigns` no longer carries it. An id this region holds no
+//! campaign under is the modelled `ResourceNotFoundException` (HTTP 404) whose sentence
+//! NAMES the id it was asked to delete, so a caller deleting many campaigns learns
+//! which one was missing.
 //!
 //! ## Shape of an operation
 //!
@@ -174,7 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.lock().remove_campaign(&region, &input.id).is_none() {
             return Err(DeleteCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                    // This operation's refusal NAMES the id it was asked to delete, so
+                    // a caller deleting many campaigns at once learns which one was
+                    // missing; the reading operations keep their own id-less wording.
+                    message: crate::state::delete_campaign_not_found_message(&input.id),
                     x_amz_error_type: None,
                 },
             )

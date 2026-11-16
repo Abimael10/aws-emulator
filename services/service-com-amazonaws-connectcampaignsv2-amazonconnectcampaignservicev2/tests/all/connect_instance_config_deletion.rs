@@ -13,8 +13,12 @@
 //!   so afterwards every instance-scoped read of it is HTTP 404
 //!   `ResourceNotFoundException` and the instance is no longer a campaign target;
 //! * the request's `campaignDeletionPolicy` decides what the delete enacts on the
-//!   campaigns of that instance: `DELETE_ALL` removes them, `RETAIN_ALL` retains
-//!   them, and a request naming no policy retains them too;
+//!   campaigns of that instance: `DELETE_ALL` removes them and `RETAIN_ALL` retains
+//!   them;
+//! * a request that names NO policy has not decided, so while the instance still owns
+//!   a campaign the delete is refused with HTTP 409 `InvalidStateException` and the
+//!   configuration is left in place — once the campaigns go, the identical call
+//!   succeeds;
 //! * the delete reaches one instance: another instance's configuration, integrations
 //!   and campaigns are untouched whichever policy is named;
 //! * an instance with no configuration at the instant of the call — never onboarded,
@@ -27,10 +31,10 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops::types::CAMPAIGN_DELETION_POLICY_VALUES;
-use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::INSTANCE_HAS_CAMPAIGNS_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, onboard_instance, router, Harness};
 
 /// The region every case here signs for; nothing in an instance configuration is
 /// region-dependent — the ARNs it holds are the caller's — so one is enough.
@@ -43,23 +47,8 @@ const REGION: &str = "us-east-1";
 /// to let the clock pass it.
 async fn onboard_all(router: &Harness, instances: &[&str]) {
     for instance in instances {
-        // Onboarding resolves the `connectInstanceId` against the account's Connect
-        // instance registry, so each instance is registered there first.
-        router.register_connect_instance(REGION, instance);
-        let (status, body) = call(
-            router,
-            REGION,
-            "PUT",
-            &format!("/v2/connect-instance/{instance}/onboarding"),
-            &json!({"encryptionConfig": {"enabled": false}}),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {instance:?}: expected onboarding to start, got {status} {body}"
-        );
+        onboard_instance(router, REGION, instance).await;
     }
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
 }
 
 /// `DeleteConnectInstanceConfig` for `instance`, with `policy` carried as the
@@ -232,8 +221,9 @@ fn assert_not_found(case: &str, what: &str, status: u16, body: &Value) {
 }
 
 /// The policy a row names, the campaigns of the instance that row expects to survive
-/// the delete, and nothing else: the table spans the whole `CampaignDeletionPolicy`
-/// catalog plus the request that names no policy at all.
+/// an ACCEPTED delete, and nothing else: the table spans the whole
+/// `CampaignDeletionPolicy` catalog plus the request that names no policy at all — the
+/// one the service refuses while the instance owns campaigns.
 ///
 /// Catalog source: `CAMPAIGN_DELETION_POLICY_VALUES`, the model's own
 /// `CampaignDeletionPolicy` catalog
@@ -256,6 +246,11 @@ fn policy_cases() -> Vec<(&'static str, Option<&'static str>, bool)> {
 /// judged on the SET of them, and a bystander instance with a configuration, an
 /// integration and a campaign of its own, so the delete is shown to reach one
 /// instance.
+///
+/// A request that names NO policy has not said what is to become of those campaigns,
+/// so it is refused while the instance still owns any and the configuration is left
+/// in place; once they are deleted the identical call goes through, which is the row
+/// that carries on into the assertions below.
 #[tokio::test]
 async fn the_campaign_deletion_policy_decides_the_instances_campaigns() {
     // The table spans the model's catalog: every declared policy has a row.
@@ -281,6 +276,60 @@ async fn the_campaign_deletion_policy_decides_the_instances_campaigns() {
             owned.push(create_campaign(&router, instance, name, case).await);
         }
         let other = create_campaign(&router, bystander, "bystander-wave", case).await;
+
+        if policy.is_none() {
+            // The campaigns of the instance hold its configuration: a request that
+            // named no policy for them is refused, and nothing is written.
+            let (status, body) = delete_config(&router, instance, policy).await;
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected HTTP 409 while the instance owns campaigns, \
+                 got {status} {body}"
+            );
+            assert!(
+                error_code(&body).ends_with("InvalidStateException"),
+                "case {case:?}: expected InvalidStateException, got {}",
+                error_code(&body)
+            );
+            assert_eq!(
+                body.get("message").and_then(Value::as_str),
+                Some(INSTANCE_HAS_CAMPAIGNS_MESSAGE),
+                "case {case:?}: expected the fixed dependency text, got {body}"
+            );
+            // The refusal wrote nothing: the configuration and the campaigns are both
+            // still there.
+            let (status, body) = get_config(&router, instance).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the refusal to leave the configuration, \
+                 got {status} {body}"
+            );
+            for id in &owned {
+                let (status, body) = describe_campaign(&router, id).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected campaign {id} to survive the refusal, \
+                     got {status} {body}"
+                );
+            }
+
+            // Once the blocking campaigns are deleted, the identical call succeeds.
+            for id in &owned {
+                let (status, body) = call(
+                    &router,
+                    REGION,
+                    "DELETE",
+                    &format!("/v2/campaigns/{id}"),
+                    &Value::Null,
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected campaign {id} to be deleted, got {status} {body}"
+                );
+            }
+            owned.clear();
+        }
 
         let (status, body) = delete_config(&router, instance, policy).await;
         assert_eq!(

@@ -2,8 +2,9 @@
 
 //! @op StartCampaign
 //! Moves the stored campaign into `Running`. The transition is written to the campaign
-//! record `GetCampaignState` reads; an illegal one is refused with
-//! `InvalidCampaignStateException` (HTTP 409).
+//! record `GetCampaignState` reads; an illegal one is refused with `ConflictException`
+//! (HTTP 409) naming the campaign and the state it is at — a state that does not
+//! permit the transition is a conflict with the current state of the resource.
 //!
 //! The lifecycle rule every campaign action is judged by lives once as
 //! `act_on_campaign` on this service's state, so this handler names its action and
@@ -199,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         match moved {
             Ok(_) => Ok(StartCampaignOutput),
-            Err(rejected) => Err(match rejected {
+            Err(rejected) => Err(match &rejected {
                 // This region holds no campaign under that id: there is no lifecycle
                 // to move, and nothing was written.
                 crate::state::LifecycleRejected::NotFound => {
@@ -213,15 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The action is not legal from the state the campaign is at NOW, which
                 // the refusal names — a campaign whose scheduled run window has closed
                 // is `Completed`, so that is the state reported rather than the one the
-                // last call wrote.
-                crate::state::LifecycleRejected::IllegalAction { state: current, .. } => {
-                    StartCampaignErrorModeled::InvalidCampaignStateException(
-                        InvalidCampaignStateException {
-                            state: current.as_wire().to_string(),
-                            message: rejected.message(),
-                            x_amz_error_type: None,
-                        },
-                    )
+                // last call wrote. A state that does not permit the transition is a
+                // conflict with the current state of the resource, so the refusal is
+                // the `ConflictException` this operation's model declares, worded by
+                // the shared state-gate sentence.
+                crate::state::LifecycleRejected::IllegalAction { .. } => {
+                    StartCampaignErrorModeled::ConflictException(ConflictException {
+                        message: rejected.message(),
+                        x_amz_error_type: None,
+                    })
                 }
             }
             .into()),

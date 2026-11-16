@@ -4,7 +4,9 @@
 //! Reports the onboarding job status the instance's stored onboarding record is at:
 //! `IN_PROGRESS` until the job `StartInstanceOnboardingJob` began is due to have
 //! finished, `SUCCEEDED` from then on. Writes nothing; an instance with no record is
-//! `ResourceNotFoundException` (HTTP 404).
+//! `ResourceNotFoundException` (HTTP 404), whose sentence names the AWS account the
+//! call was made in beside the instance it asked about — an onboarding record belongs
+//! to one account's instance.
 //!
 //! ## Shape of an operation
 //!

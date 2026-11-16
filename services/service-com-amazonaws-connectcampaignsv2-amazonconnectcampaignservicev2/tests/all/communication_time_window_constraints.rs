@@ -33,6 +33,7 @@
 //! can be asserting a rule the model no longer declares.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::service::validation::unanchored;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::common::{call, create_campaign_with, describe_campaign, error_code, router, Harness};
@@ -65,9 +66,14 @@ const CHANNEL_MEMBERS: [&str; 4] = ["telephony", "sms", "email", "whatsApp"];
 /// refusal must state for it.
 type BadValue = (&'static str, String, String);
 
-/// The requirement clause a refusal states for a value outside a `@pattern`.
+/// The requirement clause a refusal states for a value outside a `@pattern`: the
+/// expression BODY, since this service states a `@pattern` without the anchors the
+/// model writes around it (`service::validation::unanchored`).
 fn pattern(expression: &str) -> String {
-    format!("Member must satisfy regular expression pattern: {expression}")
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(expression)
+    )
 }
 
 /// The requirement clause a refusal states for a value below a `@length` minimum.

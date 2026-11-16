@@ -13,6 +13,10 @@
 //! Idempotent, as the model declares: a channel that holds no block, and a campaign
 //! carrying no channel subtype config at all, are a 200 that removes nothing.
 //!
+//! A campaign always keeps at least ONE configured channel subtype, so the one removal
+//! this operation refuses is the one that would leave it configured for no channel at
+//! all: the modelled `ValidationException` (HTTP 400), with nothing written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -234,8 +238,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The whole of the operation's effect: the campaign no longer holds a channel
         // subtype config for the channel the request named. A channel that held none is
         // left as it was, which is what makes the operation idempotent, as the model
-        // declares.
-        campaign.clear_channel_subtype_config(&input.channel_subtype);
+        // declares. The one removal the store refuses is the one that would leave the
+        // campaign configured for no channel at all — a campaign always keeps at least
+        // one — which is a bad request, answered with the `ValidationException` this
+        // operation's model declares and with nothing written.
+        if campaign
+            .clear_channel_subtype_config(&input.channel_subtype)
+            .is_err()
+        {
+            return Err(
+                DeleteCampaignChannelSubtypeConfigErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::LAST_CHANNEL_SUBTYPE_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
 
         Ok(DeleteCampaignChannelSubtypeConfigOutput)
     }

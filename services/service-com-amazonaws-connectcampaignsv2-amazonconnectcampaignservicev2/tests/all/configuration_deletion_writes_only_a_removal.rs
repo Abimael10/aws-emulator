@@ -261,13 +261,14 @@ async fn a_limits_deletion_collapses_the_override_only_when_it_removed_a_block()
     }
 }
 
-/// The same rule on the sibling deletion: `DeleteCampaignChannelSubtypeConfig` drops the
-/// campaign's `channelSubtypeConfig` only when it REMOVED the last channel block that
-/// config held.
+/// The same rule on the sibling deletion: `DeleteCampaignChannelSubtypeConfig` writes
+/// only the removal of the block the request names, and only when the config held one.
 ///
 /// The rows differ along which channel the config holds, which channel the request
 /// names and whether the config holds that channel at all; the channels come from the
-/// model's `ChannelSubtype` catalog (`CHANNEL_SUBTYPE_VALUES`).
+/// model's `ChannelSubtype` catalog (`CHANNEL_SUBTYPE_VALUES`). The removal of the
+/// campaign's LAST block is refused and writes nothing, which is the one row that is
+/// not a 200.
 #[tokio::test]
 async fn a_channel_subtype_deletion_drops_the_config_only_when_it_removed_a_block() {
     let region = "eu-central-1";
@@ -283,36 +284,40 @@ async fn a_channel_subtype_deletion_drops_the_config_only_when_it_removed_a_bloc
         .find(|subtype| **subtype == "SMS")
         .expect("SMS is a ChannelSubtype value");
 
-    // (case, the config stored at create, the channel the request names, what the record
-    // must hold afterwards)
-    let rows: Vec<(&str, Value, &str, Value)> = vec![
+    // (case, the config stored at create, the channel the request names, the expected
+    // status, what the record must hold afterwards)
+    let rows: Vec<(&str, Value, &str, u16, Value)> = vec![
         (
             "a config with no channel block at all",
             json!({}),
             telephony,
+            200,
             Value::Null,
         ),
         (
             "a config holding another channel's block",
             json!({"telephony": channel_block("TELEPHONY")}),
             sms,
+            200,
             json!({"telephony": channel_block("TELEPHONY")}),
         ),
         (
             "a config holding only the named channel's block",
             json!({"telephony": channel_block("TELEPHONY")}),
             telephony,
-            Value::Null,
+            400,
+            json!({"telephony": channel_block("TELEPHONY")}),
         ),
         (
             "a config holding the named channel beside another",
             json!({"telephony": channel_block("TELEPHONY"), "sms": channel_block("SMS")}),
             sms,
+            200,
             json!({"telephony": channel_block("TELEPHONY")}),
         ),
     ];
 
-    for (row, (shape, stored, target, expected)) in rows.iter().enumerate() {
+    for (row, (shape, stored, target, expected_status, expected)) in rows.iter().enumerate() {
         let case = format!("{shape}, delete {target}");
         let name = format!("subtype-{row}-{target}");
         let id = create_campaign_with(
@@ -330,8 +335,8 @@ async fn a_channel_subtype_deletion_drops_the_config_only_when_it_removed_a_bloc
         for attempt in ["the deletion", "a repeated deletion"] {
             let (status, body) = delete_subtype(&router, region, &id, target).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: {attempt} expected 200, got {status} {body}"
+                status, *expected_status,
+                "case {case:?}: {attempt} expected {expected_status}, got {status} {body}"
             );
             let after = describe_campaign(&router, region, &id, &case).await;
             assert_member(&after, "channelSubtypeConfig", expected, &case);

@@ -11,8 +11,9 @@
 //!   channel's block stays as it was, and so does every other member of the campaign
 //!   — which is what every later read (`DescribeCampaign`, and `ListCampaigns`'
 //!   derived `channelSubtypes`) projects;
-//! * a config left holding no channel at all is no config: the campaign carries no
-//!   `channelSubtypeConfig` once its last block goes;
+//! * a campaign always keeps at least ONE configured channel subtype, so a removal
+//!   that would leave it configured for no channel at all is refused with HTTP 400
+//!   `ValidationException` and writes nothing;
 //! * the operation is idempotent (`@idempotent` in the model, "This API is
 //!   idempotent" in its documentation): a channel that holds no block, and a campaign
 //!   carrying no channel subtype config at all, are a 200 that removes nothing;
@@ -27,11 +28,11 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops::types::CHANNEL_SUBTYPE_VALUES;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignState, CAMPAIGN_NOT_FOUND_MESSAGE, ONBOARDING_JOB_DURATION,
+    CampaignState, CAMPAIGN_NOT_FOUND_MESSAGE, LAST_CHANNEL_SUBTYPE_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, stored_config, Harness};
+use super::common::{call, error_code, onboard_instance, router, stored_config, Harness};
 
 /// The `ChannelSubtypeConfig` member that carries the block of one `ChannelSubtype`
 /// value.
@@ -138,27 +139,12 @@ fn subtype_config(channels: &[&str]) -> Value {
     config
 }
 
-/// Onboard `instance` and wait out the span the clock owes its onboarding job, so the
-/// instance is a campaign target by the time this returns: `CreateCampaign` mints a
-/// campaign only for an instance whose job has SUCCEEDED. Nothing in the emulator
-/// sleeps for that span — only a caller that wants the settled state does.
+/// Onboard `instance` so it is a campaign target by the time this returns:
+/// `CreateCampaign` mints a campaign only for an instance whose job has SUCCEEDED,
+/// which the shared fixture waits for by POLLING the job's reported status. Nothing in
+/// the emulator sleeps for that span — only a caller that wants the settled state does.
 async fn onboard(router: &Harness, region: &str, instance: &str) {
-    // Onboarding resolves the `connectInstanceId` against the account's Connect
-    // instance registry, so the instance is registered there first.
-    router.register_connect_instance(region, instance);
-    let (status, body) = call(
-        router,
-        region,
-        "PUT",
-        &format!("/v2/connect-instance/{instance}/onboarding"),
-        &json!({"encryptionConfig": {"enabled": false}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {instance:?}: expected onboarding to start, got {status} {body}"
-    );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
+    onboard_instance(router, region, instance).await;
 }
 
 /// Create a campaign on an onboarded `instance`, optionally carrying
@@ -221,9 +207,9 @@ async fn describe(router: &MultiServiceRouter, region: &str, id: &str, case: &st
 }
 
 /// What the campaign SHOULD now project for `channelSubtypeConfig`: the created
-/// config minus the deleted channels' blocks, and nothing at all once no block is
-/// left — a config holding no channel configures nothing, so no writer puts one on the
-/// record and no deletion leaves one behind.
+/// config minus the deleted channels' blocks. A config holding no channel configures
+/// nothing, so no writer puts one on the record — and no deletion reaches that state
+/// either, since the removal of the last block is refused.
 fn expected_config(created: &Value, deleted: &[&str]) -> Value {
     let mut expected = created.clone();
     let members = expected
@@ -237,6 +223,32 @@ fn expected_config(created: &Value, deleted: &[&str]) -> Value {
     } else {
         expected
     }
+}
+
+/// Whether removing `target` from a campaign configured for `configured` would leave
+/// it configured for no channel at all — the one removal the service refuses.
+fn is_the_last_block(configured: &[&str], target: &str) -> bool {
+    configured == [target]
+}
+
+/// Assert `response` is the refusal of a removal that would leave the campaign with no
+/// channel subtype configured.
+fn assert_last_subtype_refusal(status: u16, response: &Value, case: &str) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 for the last channel subtype, got {status} {response}"
+    );
+    assert!(
+        error_code(response).ends_with("ValidationException"),
+        "case {case:?}: expected ValidationException, got {}",
+        error_code(response)
+    );
+    assert_eq!(
+        response["message"].as_str(),
+        Some(LAST_CHANNEL_SUBTYPE_MESSAGE),
+        "case {case:?}: expected the fixed last-subtype text, got {:?}",
+        response["message"]
+    );
 }
 
 /// Assert the campaign projects `expected` for `channelSubtypeConfig` — `Value::Null`
@@ -294,6 +306,20 @@ async fn deleting_one_channel_subtype_leaves_every_other_part_of_the_campaign() 
             let before = describe(&router, region, &id, &case).await;
             assert_config(&before, &stored_config(&created), &case);
 
+            // The one removal the service refuses: the campaign's only configured
+            // channel. It writes nothing, so the config is still the one it was
+            // created with, and repeating the call is refused the same way.
+            if is_the_last_block(channels, target) {
+                for attempt in ["first", "repeated"] {
+                    let case = format!("{case} ({attempt} attempt)");
+                    let (status, body) = delete_subtype(&router, region, &id, target).await;
+                    assert_last_subtype_refusal(status, &body, &case);
+                    let after = describe(&router, region, &id, &case).await;
+                    assert_config(&after, &stored_config(&created), &case);
+                }
+                continue;
+            }
+
             let (status, body) = delete_subtype(&router, region, &id, target).await;
             assert_eq!(
                 status, 200,
@@ -335,8 +361,9 @@ async fn deleting_one_channel_subtype_leaves_every_other_part_of_the_campaign() 
 
 /// `ListCampaigns`' `channelSubtypes` is derived from the stored config, so a
 /// deletion is visible there too: the catalog minus the channels deleted so far, in
-/// catalog order. Deleting every channel in turn ends with a campaign that carries no
-/// channel subtype config and lists no channel subtype.
+/// catalog order. Deleting the catalog one channel at a time stops at the LAST block,
+/// which the service refuses — the campaign keeps one configured channel whichever
+/// order the others went in.
 #[tokio::test]
 async fn the_summary_lists_only_the_channel_subtypes_still_configured() {
     let region = "eu-west-1";
@@ -360,12 +387,21 @@ async fn the_summary_lists_only_the_channel_subtypes_still_configured() {
         let mut deleted: Vec<&str> = Vec::new();
         for target in order.iter() {
             let case = format!("deleted {deleted:?} then {target}");
+            let surviving: Vec<&str> = CHANNEL_SUBTYPE_VALUES
+                .iter()
+                .copied()
+                .filter(|channel| !deleted.contains(channel))
+                .collect();
             let (status, body) = delete_subtype(&router, region, &id, target).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected 200, got {status} {body}"
-            );
-            deleted.push(target);
+            if is_the_last_block(&surviving, target) {
+                assert_last_subtype_refusal(status, &body, &case);
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200, got {status} {body}"
+                );
+                deleted.push(target);
+            }
 
             let (status, listed) =
                 call(&router, region, "POST", "/v2/campaigns-summary", &json!({})).await;
@@ -390,6 +426,13 @@ async fn the_summary_lists_only_the_channel_subtypes_still_configured() {
             let campaign = describe(&router, region, &id, &case).await;
             assert_config(&campaign, &expected_config(&created, &deleted), &case);
         }
+
+        // One channel is always left: the campaign is never configured for none.
+        assert_eq!(
+            deleted.len(),
+            CHANNEL_SUBTYPE_VALUES.len() - 1,
+            "order {order:?}: expected the last block to survive, got {deleted:?}"
+        );
     }
 }
 
@@ -556,12 +599,14 @@ async fn every_state_the_lifecycle_reaches_takes_the_deletion() {
     let id = create_campaign(&router, region, instance, "stateful", Some(&created)).await;
 
     // Each lifecycle action the emulator's state machine offers, the state it leaves
-    // the campaign in, and the channel deleted there.
+    // the campaign in, and the channel deleted there. The last row deletes a channel
+    // whose block has already gone, which is the idempotent no-op — the campaign keeps
+    // the one block it must always have.
     let walk: &[(&str, CampaignState, &str)] = &[
         ("", CampaignState::Initialized, "EMAIL"),
         ("start", CampaignState::Running, "SMS"),
         ("pause", CampaignState::Paused, "TELEPHONY"),
-        ("stop", CampaignState::Stopped, "WHATSAPP"),
+        ("stop", CampaignState::Stopped, "EMAIL"),
     ];
     let mut deleted: Vec<&str> = Vec::new();
     for (action, state, target) in walk {
@@ -605,17 +650,14 @@ async fn every_state_the_lifecycle_reaches_takes_the_deletion() {
             status, 200,
             "case {case:?}: expected the deletion to be accepted, got {status} {body}"
         );
-        deleted.push(target);
+        if !deleted.contains(target) {
+            deleted.push(target);
+        }
         let campaign = describe(&router, region, &id, &case).await;
         assert_config(&campaign, &expected_config(&created, &deleted), &case);
     }
 
-    // Every channel's block is gone, so the campaign carries no channel subtype
-    // config at all rather than an empty one.
-    let campaign = describe(&router, region, &id, "every channel deleted").await;
-    assert!(
-        campaign.get("channelSubtypeConfig").is_none(),
-        "expected no channelSubtypeConfig after every channel went, got {:?}",
-        campaign.get("channelSubtypeConfig")
-    );
+    // The campaign kept the one block the service never lets go: its last channel.
+    let campaign = describe(&router, region, &id, "the last channel kept").await;
+    assert_config(&campaign, &expected_config(&created, &deleted), "the last channel kept");
 }

@@ -8,10 +8,11 @@
 //!   campaign reaches by having been started (`Running`, `Paused`) and is refused
 //!   from a campaign that has never run, from one whose run is already over and
 //!   from a terminal state;
-//! * a refused stop answers HTTP 409 `InvalidCampaignStateException`, whose `state`
-//!   member names the state the campaign is actually in, and writes nothing: every
-//!   later read reports the state the refusal named and the campaign still takes
-//!   the actions that state allows;
+//! * a refused stop answers HTTP 409 `ConflictException` — a state that does not
+//!   permit the transition is a conflict with the current state of the resource —
+//!   whose message names the campaign asked about and the state it is actually in,
+//!   in upper case, and writes nothing: every later read reports the state the
+//!   refusal named and the campaign still takes the actions that state allows;
 //! * a legal stop leaves the campaign `Stopped` for every projection of the record.
 
 use aws_smithy_types::date_time::Format;
@@ -67,7 +68,7 @@ fn stop_moves_only_a_campaign_whose_run_is_under_way() {
 /// Over a TABLE of states reachable through the API — each reached by a different
 /// sequence of lifecycle calls, and one reached by the clock closing the campaign's
 /// run window — `StopCampaign` succeeds exactly where a run is under way and is
-/// refused with 409 `InvalidCampaignStateException` everywhere else, and in both
+/// refused with 409 `ConflictException` everywhere else, and in both
 /// cases `GetCampaignState` afterwards reports the expected state.
 #[tokio::test]
 async fn stop_succeeds_only_from_a_run_under_way_over_every_reachable_state() {
@@ -118,9 +119,9 @@ async fn stop_succeeds_only_from_a_run_under_way_over_every_reachable_state() {
             "Stopped",
         ),
         (
-            "stop a campaign restarted after a stop",
+            "stop a campaign resumed after a pause, twice over",
             None,
-            &["start", "stop", "start"],
+            &["start", "pause", "resume", "pause", "resume"],
             "Running",
             200,
             "Stopped",
@@ -173,15 +174,17 @@ async fn stop_succeeds_only_from_a_run_under_way_over_every_reachable_state() {
         );
         if *expected_status == 409 {
             assert!(
-                error_code(&body).ends_with("InvalidCampaignStateException"),
-                "case {case:?}: expected InvalidCampaignStateException, got {}",
+                error_code(&body).ends_with("ConflictException"),
+                "case {case:?}: expected ConflictException, got {}",
                 error_code(&body)
             );
+            let expected_message =
+                format!("Campaign: {id} is in invalid state: {}", before.to_uppercase());
             assert_eq!(
-                body["state"].as_str(),
-                Some(*before),
-                "case {case:?}: expected the refusal to name state {before:?}, got {:?}",
-                body["state"]
+                body["message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {case:?}: expected the refusal to read {expected_message:?}, got {:?}",
+                body["message"]
             );
         }
 
@@ -246,11 +249,12 @@ async fn a_refused_stop_leaves_the_campaign_startable() {
                 status, 409,
                 "case {step:?}: expected HTTP 409, got {status} {body}"
             );
+            let expected_message = format!("Campaign: {id} is in invalid state: INITIALIZED");
             assert_eq!(
-                body["state"].as_str(),
-                Some("Initialized"),
-                "case {step:?}: expected the refusal to name state \"Initialized\", got {:?}",
-                body["state"]
+                body["message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {step:?}: expected the refusal to read {expected_message:?}, got {:?}",
+                body["message"]
             );
             let actual = state(&router, region, &id, &step).await;
             assert_eq!(

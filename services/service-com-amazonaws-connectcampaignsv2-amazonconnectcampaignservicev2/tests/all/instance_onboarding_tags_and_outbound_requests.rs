@@ -662,7 +662,7 @@ async fn tagging_merges_into_the_one_map_every_reader_sees() {
 /// `PutOutboundRequestBatch` resolves the campaign before anything else, then its
 /// state, and only then takes the batch: an unknown id is HTTP 404
 /// `ResourceNotFoundException`, a campaign that is not `Running` is HTTP 409
-/// `InvalidCampaignStateException` naming that state.
+/// `ConflictException` naming the campaign and that state.
 ///
 /// The rows differ along the id (ids no store holds, of several shapes) and along the
 /// state a stored campaign is in at the time of the call.
@@ -759,11 +759,13 @@ async fn an_outbound_batch_resolves_the_campaign_and_its_state_first() {
             "case {case:?}: expected HTTP {expected}, got {status} {body}"
         );
         if *expected == 409 {
+            let expected_message =
+                format!("Campaign: {id} is in invalid state: {}", state.to_uppercase());
             assert_eq!(
-                (error_code(&body), body.get("state")),
-                ("InvalidCampaignStateException", Some(&json!(state))),
-                "case {case:?}: the refusal must name the state the campaign is in, got \
-                 {body}"
+                (error_code(&body), body.get("message")),
+                ("ConflictException", Some(&json!(expected_message))),
+                "case {case:?}: the refusal must name the campaign and the state it is in, \
+                 got {body}"
             );
         }
     }

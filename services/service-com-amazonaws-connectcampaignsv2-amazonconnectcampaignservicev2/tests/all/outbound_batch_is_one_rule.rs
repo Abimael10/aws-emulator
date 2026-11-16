@@ -9,8 +9,8 @@
 //! both of them to that rule rather than to one copy of it:
 //!
 //! * a campaign the clock has in any state other than `Running` is refused with HTTP
-//!   409 `InvalidCampaignStateException` naming that state, with the same sentence from
-//!   either operation, and the campaign's buffer is left empty;
+//!   409 `ConflictException` naming the campaign and that state in upper case, with
+//!   the same sentence from either operation, and the campaign's buffer is left empty;
 //! * a campaign that IS `Running` at the instant of the call takes the batch, however
 //!   it got there;
 //! * an id the request's region holds no campaign under is HTTP 404
@@ -90,8 +90,8 @@ fn pending_profile(engine: &engine::InMemoryEngine, region: &str, campaign: &str
 }
 
 /// Both operations that take a batch of outbound requests into a campaign's buffer —
-/// the two whose model declares `InvalidCampaignStateException` beside
-/// `ResourceNotFoundException` for a batch.
+/// the two whose model declares `ConflictException` beside `ResourceNotFoundException`
+/// for a batch.
 const BATCH_OPERATIONS: &[Batch] = &[
     Batch {
         operation: "PutOutboundRequestBatch",
@@ -196,7 +196,7 @@ const ROWS: &[Row] = &[
     Row {
         state: "Running",
         window: None,
-        setup: &["start", "stop", "start"],
+        setup: &["start", "pause", "resume", "pause", "resume"],
         takes_requests: true,
     },
     // Started inside a run window that is still OPEN: the clock has not finished this
@@ -297,20 +297,13 @@ async fn both_batch_operations_judge_a_campaign_by_one_rule() {
                 "case {case:?}: expected HTTP 409, got {status} {body}"
             );
             assert!(
-                error_code(&body).ends_with("InvalidCampaignStateException"),
-                "case {case:?}: expected InvalidCampaignStateException, got {}",
+                error_code(&body).ends_with("ConflictException"),
+                "case {case:?}: expected ConflictException, got {}",
                 error_code(&body)
             );
-            assert_eq!(
-                body["state"].as_str(),
-                Some(row.state),
-                "case {case:?}: expected the refusal to name state {:?}, got {:?}",
-                row.state,
-                body["state"]
-            );
             let expected_message = format!(
-                "Campaign {id} is {} and takes outbound requests only while Running",
-                row.state
+                "Campaign: {id} is in invalid state: {}",
+                row.state.to_uppercase()
             );
             assert_eq!(
                 body["message"].as_str(),

@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod validation;
+
 /// Whether this service serves the request these `parts` came from.
 ///
 /// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
@@ -131,16 +133,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. This service DOES word those refusals itself — the pattern it
+        // states, the instance id it withholds, the way it reports a list element and
+        // the JSON document one operation nests the clause in — and the wording lives
+        // once in [`validation`], where a handler weighing a leaf the boundary walk
+        // cannot reach reads it too, so the two layers refuse a value with the one
+        // sentence. The code goes with it: this service's own `ValidationException`,
+        // which every operation of the model declares.
+        validation::refusal(refusal)
     }
 
     fn override_routing_error(

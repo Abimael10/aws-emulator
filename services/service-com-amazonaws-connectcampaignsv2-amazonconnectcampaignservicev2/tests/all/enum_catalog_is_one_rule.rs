@@ -33,7 +33,9 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops
 };
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::enum_value_violation;
 
-use super::common::{call, create_campaign, error_code, onboard_instance, router, Harness};
+use super::common::{
+    call, create_campaign, create_campaign_with, error_code, onboard_instance, router, Harness,
+};
 
 /// The region every case signs for; nothing in this rule is region-dependent, so one
 /// is enough.
@@ -327,6 +329,11 @@ async fn a_value_outside_its_catalog_is_refused_with_one_sentence() {
 /// an instance whose onboarding job has finished for the configuration deletion, and a
 /// Connect instance the account holds for the onboarding start — which is what there is
 /// to onboard.
+///
+/// The campaign the channel-subtype deletion is driven against is configured for TWO
+/// channels, so removing either of them is served: a campaign always keeps at least one
+/// channel subtype, and the removal of its last block is a rule of its own
+/// (`campaign_channel_subtype_config_deletion`) rather than anything about the catalog.
 async fn served_fixture(member: &EnumMember) -> (Harness, String) {
     let router = router();
     let instance = "enum-catalog-served";
@@ -338,6 +345,33 @@ async fn served_fixture(member: &EnumMember) -> (Harness, String) {
         _ if member.resource == Resource::ConnectInstance => {
             onboard_instance(&router, REGION, instance).await;
             instance.to_string()
+        }
+        "DeleteCampaignChannelSubtypeConfig" => {
+            create_campaign_with(
+                &router,
+                REGION,
+                instance,
+                "enum-catalog-served",
+                // The fixture's own telephony block, beside an SMS one: the required
+                // members of `SmsOutboundConfig` are its source phone number and its
+                // template ARN.
+                json!({"channelSubtypeConfig": {
+                    "telephony": {
+                        "outboundMode": {"agentless": {}},
+                        "defaultOutboundConfig": {"connectContactFlowId": "flow-0001"},
+                    },
+                    "sms": {
+                        "outboundMode": {"agentless": {}},
+                        "defaultOutboundConfig": {
+                            "connectSourcePhoneNumberArn":
+                                "arn:aws:connect:us-west-2:000000000000:phone-number/p-1",
+                            "wisdomTemplateArn":
+                                "arn:aws:wisdom:us-west-2:000000000000:template/t-1",
+                        },
+                    },
+                }}),
+            )
+            .await
         }
         _ => create_campaign(&router, REGION, instance, "enum-catalog-served", None).await,
     };

@@ -5,7 +5,7 @@
 //! campaign is resolved first — an id the store does not hold is the modelled
 //! `ResourceNotFoundException` (HTTP 404) — then its lifecycle state: a campaign takes
 //! outbound requests only while it is `Running`, and any other state is the modelled
-//! `InvalidCampaignStateException` (HTTP 409) carrying that state. Both are the rules
+//! `ConflictException` (HTTP 409) naming the campaign and that state. Both are the rules
 //! `PutOutboundRequestBatch` applies to a dial batch, and both are decided once on the
 //! store (`dialable_campaign`) rather than in either handler; the two differ only in
 //! which buffer they write, in the per-request failure catalog they report through, and
@@ -214,10 +214,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into()
                 }
-                crate::state::DialRejected::NotDialable { state, .. } => {
-                    PutProfileOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
-                        InvalidCampaignStateException {
-                            state: state.as_wire().to_string(),
+                crate::state::DialRejected::NotDialable { .. } => {
+                    // A campaign whose state takes no outbound requests is a conflict
+                    // with the current state of the resource, so the refusal is the
+                    // `ConflictException` this operation's model declares, worded by
+                    // the shared state-gate sentence — the same one the lifecycle
+                    // calls and the dial batch answer with.
+                    PutProfileOutboundRequestBatchErrorModeled::ConflictException(
+                        ConflictException {
                             message: rejected.message(),
                             x_amz_error_type: None,
                         },
@@ -240,7 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 &request.client_token,
                 &request.profile_id,
-                request.expiration_time,
+                // A `date-time` instant is kept to the millisecond, as every member of
+                // that format this service stores is (`crate::state::millisecond_precision`).
+                request.expiration_time.map(crate::state::millisecond_precision),
                 request.event_trigger_context.as_ref(),
                 now,
             );

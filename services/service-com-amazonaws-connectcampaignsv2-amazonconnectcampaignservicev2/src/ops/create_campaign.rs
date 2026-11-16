@@ -336,7 +336,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             campaign_type: input.r#type,
             source: input.source,
             connect_campaign_flow_arn: input.connect_campaign_flow_arn,
-            schedule: input.schedule,
+            // The run window is stored at the precision this service keeps a
+            // `date-time` to (`crate::state::stored_schedule`), the same as the one
+            // `UpdateCampaignSchedule` writes.
+            schedule: input.schedule.map(crate::state::stored_schedule),
             entry_limits_config: input.entry_limits_config,
             communication_time_config: input.communication_time_config,
             communication_limits_override: input.communication_limits_override,

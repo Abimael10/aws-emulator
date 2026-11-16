@@ -5,10 +5,15 @@
 //! resolved first — an id the store does not hold is the modelled
 //! `ResourceNotFoundException` (HTTP 404) — then its lifecycle state: a campaign takes
 //! outbound requests only while it is `Running`, and any other state is the modelled
-//! `InvalidCampaignStateException` (HTTP 409) carrying that state. Both are the store's
-//! own decision (`dialable_campaign`), shared with `PutProfileOutboundRequestBatch`, so
-//! this handler keeps only the mapping to the error variants its model declares, its
-//! own recorded not-found wording and its own per-request failure catalog.
+//! `ConflictException` (HTTP 409) naming the campaign and that state. Both are the
+//! store's own decision (`dialable_campaign`), shared with
+//! `PutProfileOutboundRequestBatch`, so this handler keeps only the mapping to the error
+//! variants its model declares, its own recorded not-found wording and its own
+//! per-request failure catalog.
+//!
+//! A refusal of the REQUEST's own values — a constraint the model declares on a member
+//! of the batch — arrives nested in the `{ "message": … }` JSON document this
+//! operation's refusal body is double-encoded in (`crate::service::validation`).
 //!
 //! Each request of the batch is then reported on its own, as the response's two lists
 //! say: a request for a channel subtype the campaign is not configured for, or one
@@ -191,6 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutOutboundRequestBatchErrorModeled::ValidationException(
                 ValidationException {
+                    // Worded by this service's validation layer, which is also what
+                    // nests this operation's clause in the JSON document its refusal
+                    // body is double-encoded in (see `crate::service::validation`), so
+                    // a client decodes `Error.Message` the same way whichever layer
+                    // refused the batch.
                     message,
                     x_amz_error_type: None,
                 },
@@ -244,10 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                         .into()
                     }
-                    crate::state::DialRejected::NotDialable { state, .. } => {
-                        PutOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
-                            InvalidCampaignStateException {
-                                state: state.as_wire().to_string(),
+                    crate::state::DialRejected::NotDialable { .. } => {
+                        // A campaign whose state takes no outbound requests is a
+                        // conflict with the current state of the resource, so the
+                        // refusal is the `ConflictException` this operation's model
+                        // declares, worded by the shared state-gate sentence — the
+                        // same one the lifecycle calls answer with.
+                        PutOutboundRequestBatchErrorModeled::ConflictException(
+                            ConflictException {
                                 message: rejected.message(),
                                 x_amz_error_type: None,
                             },
@@ -295,7 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 &request.client_token,
                 &request.channel_subtype_parameters,
-                request.expiration_time,
+                // A `date-time` instant is kept to the millisecond, as every member of
+                // that format this service stores is (`crate::state::millisecond_precision`).
+                crate::state::millisecond_precision(request.expiration_time),
                 now,
             );
             match outcome {

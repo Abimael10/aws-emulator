@@ -12,6 +12,10 @@
 //! reaches, so the rule holds wherever such a map arrives rather than only where the
 //! walk descends.
 //!
+//! The refusal body of this operation is double-encoded: the clause arrives nested in
+//! a `{ "message": … }` JSON document, as it does when the boundary walk refuses a
+//! member of the same batch, which is what [`expected_message`] builds.
+//!
 //! The maps under test are the four the batch accepts, each targeting the model's
 //! `Attributes` and so keyed by `AttributeName` (source:
 //! `smithy_query(query="shape", shape="Attributes,AttributeName")` — `@length` 0..32767
@@ -24,6 +28,9 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::service::validation::{
+    in_json_document, unanchored,
+};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
     ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, ATTRIBUTE_NAME_MAX_LEN,
     ATTRIBUTE_NAME_MIN_LEN, ATTRIBUTE_NAME_PATTERN,
@@ -180,9 +187,14 @@ fn buffered(engine: &engine::InMemoryEngine, id: &str) -> BTreeSet<String> {
 }
 
 /// The requirement clause a refusal states for a key outside the key shape's
-/// `@pattern`, naming the expression as the model spells it.
+/// `@pattern`, naming the expression BODY — this service states a `@pattern` without
+/// the anchors the model writes around it
+/// (`service::validation::unanchored`).
 fn pattern_requirement() -> String {
-    format!("Member must satisfy regular expression pattern: {ATTRIBUTE_NAME_PATTERN}")
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(ATTRIBUTE_NAME_PATTERN)
+    )
 }
 
 /// The requirement clause a refusal states for a key past the key shape's `@length`
@@ -208,13 +220,13 @@ fn expected_message(member: &str, offenders: &[&str], requirement: &str) -> Stri
         })
         .collect();
     if clauses.len() == 1 {
-        format!("1 validation error detected: {}", clauses[0])
+        in_json_document(&format!("1 validation error detected: {}", clauses[0]))
     } else {
-        format!(
+        in_json_document(&format!(
             "{} validation errors detected: {}",
             clauses.len(),
             clauses.join("; ")
-        )
+        ))
     }
 }
 

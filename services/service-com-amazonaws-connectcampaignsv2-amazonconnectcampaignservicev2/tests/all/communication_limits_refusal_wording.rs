@@ -3,14 +3,16 @@
 //! How this service WORDS a refusal of the `communicationLimitsList` `@length`, end to
 //! end over the wire.
 //!
-//! The rule under test: a refusal of a modelled constraint carries the framework's one
-//! validation envelope — the `<n> validation error(s) detected: ` count prefix wrapping
-//! one clause per violation, each clause opening with the value it refused, naming the
-//! member path it arrived at and the requirement it failed — whichever layer caught the
-//! violation. A bound a handler has to weigh itself (a `@length` sitting on a union
-//! member, which the centralized constraint walk does not reach) is therefore worded
-//! exactly like a bound the boundary catches, so a client comparing two refusals of the
-//! same class gets two sentences of the same shape.
+//! The rule under test: a refusal of a modelled constraint carries the one validation
+//! envelope — the `<n> validation error(s) detected: ` count prefix wrapping one clause
+//! per violation, each clause naming the member path it arrived at and the requirement it
+//! failed, and echoing the value it refused where that value has a rendering to echo —
+//! whichever layer caught the violation. A bound a handler has to weigh itself (a
+//! `@length` sitting on a union member, which the centralized constraint walk does not
+//! reach) is therefore worded exactly like a bound the boundary catches, so a client
+//! comparing two refusals of the same class gets two sentences of the same shape. A LIST
+//! is the case with no rendering to echo: its clause states the member and the requirement
+//! alone.
 //!
 //! The rows span what the rule generalises over: every operation that accepts a
 //! `CommunicationLimits` (`CreateCampaign`, `UpdateCampaignCommunicationLimits` and
@@ -73,13 +75,16 @@ fn telephony_config() -> Value {
     })
 }
 
-/// The whole message a list of `count` entries at `member` is refused with: the
-/// framework's envelope around one clause that echoes the length it refused in the
-/// `<n> items` form a list's own length is displayed with, names the member and states
-/// the published maximum.
-fn expected_message(member: &str, count: usize) -> String {
+/// The whole message a list past the maximum at `member` is refused with: this service's
+/// envelope around one clause that names the member and states the published maximum.
+///
+/// A LIST has no scalar rendering, so the clause states NO value at all — the rule the
+/// fleet's one validation-message home gives every collection whose own `@length` was
+/// broken (`service_common::validation_message`), whichever layer caught it, so the
+/// sentence is the same whatever length the case sent.
+fn expected_message(member: &str) -> String {
     format!(
-        "{ENVELOPE_PREFIX}Value '{count} items' at '{member}'{CLAUSE_MARKER}Member must have \
+        "{ENVELOPE_PREFIX}Value at '{member}'{CLAUSE_MARKER}Member must have \
          length less than or equal to {MAX_COMMUNICATION_LIMITS}"
     )
 }
@@ -94,7 +99,7 @@ fn message_of(response: &Value) -> &str {
 
 /// Assert `response` is the bad request a list past the maximum is refused with, worded
 /// as [`expected_message`].
-fn assert_refused(case: &str, status: u16, response: &Value, member: &str, count: usize) {
+fn assert_refused(case: &str, status: u16, response: &Value, member: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} {response}"
@@ -106,15 +111,15 @@ fn assert_refused(case: &str, status: u16, response: &Value, member: &str, count
     );
     assert_eq!(
         message_of(response),
-        expected_message(member, count),
+        expected_message(member),
         "case {case:?}: the refusal was worded {:?}",
         message_of(response)
     );
 }
 
-/// Assert `message` has the shape the framework gives every constraint refusal: the
-/// count prefix, then a clause that opens with the refused value, names a member and
-/// ends in the requirement that member failed.
+/// Assert `message` has the shape every constraint refusal of this service has: the count
+/// prefix, then a clause that names a member and ends in the requirement that member
+/// failed, opening with the value refused where there is one to state.
 fn assert_envelope_shape(case: &str, message: &str) {
     assert!(
         message.starts_with(ENVELOPE_PREFIX),
@@ -122,7 +127,9 @@ fn assert_envelope_shape(case: &str, message: &str) {
     );
     let clause = &message[ENVELOPE_PREFIX.len()..];
     assert!(
-        clause.starts_with("Value '") || clause.starts_with("Value null at '"),
+        clause.starts_with("Value '")
+            || clause.starts_with("Value null at '")
+            || clause.starts_with("Value at '"),
         "case {case:?}: expected the clause to open with the refused value, got {clause:?}"
     );
     let Some((path, requirement)) = clause.split_once(CLAUSE_MARKER) else {
@@ -242,7 +249,7 @@ async fn an_over_long_list_is_refused_in_the_validation_envelope_at_create() {
                 campaign["communicationLimitsOverride"]
             );
         } else {
-            assert_refused(&case, status, &body, CAMPAIGN_MEMBER, count);
+            assert_refused(&case, status, &body, CAMPAIGN_MEMBER);
         }
     }
 }
@@ -281,7 +288,7 @@ async fn an_over_long_list_is_refused_in_the_validation_envelope_at_the_campaign
             );
             stored = config.clone();
         } else {
-            assert_refused(&case, status, &body, CAMPAIGN_MEMBER, count);
+            assert_refused(&case, status, &body, CAMPAIGN_MEMBER);
         }
 
         let campaign = describe_campaign(&router, REGION, &id, &case).await;
@@ -316,7 +323,7 @@ async fn an_over_long_list_is_refused_in_the_validation_envelope_at_the_instance
             stored = config.clone();
         } else {
             // The SAME requirement, reported at this operation's own member path.
-            assert_refused(&case, status, &body, INSTANCE_MEMBER, count);
+            assert_refused(&case, status, &body, INSTANCE_MEMBER);
         }
 
         let reported = instance_limits(&router, instance, &case).await;

@@ -14,6 +14,11 @@
 //! Idempotent, as the model declares: the same schedule sent twice leaves the
 //! campaign exactly as the first call left it.
 //!
+//! The window is stored at the precision this service keeps a `date-time` to — the
+//! MILLISECOND (`crate::state::stored_schedule`) — so the sub-millisecond remainder of
+//! a submitted instant is dropped on the way in and every later read projects what the
+//! store holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -237,8 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request carried, replacing whatever it held. The schedule is one
         // structure, so this is a replacement and not a merge — a schedule carrying no
         // `refreshFrequency` leaves the campaign with none — and the run window every
-        // later read derives the campaign's state from is the new one.
-        campaign.schedule = Some(input.schedule);
+        // later read derives the campaign's state from is the new one. The window is
+        // stored at the precision this service keeps a `date-time` to (see
+        // `crate::state::stored_schedule`), so what a later read projects is what the
+        // store holds and not the finer value the request happened to carry.
+        campaign.schedule = Some(crate::state::stored_schedule(input.schedule));
 
         Ok(UpdateCampaignScheduleOutput)
     }

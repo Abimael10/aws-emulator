@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCampaign
-//! Ends a campaign's run: the stored campaign moves into `Stopped`, which is legal
-//! only while its run is under way (`Running` or `Paused`). The transition is written
-//! to the campaign record `GetCampaignState` reads; from any other state — including
-//! a campaign that has never been started — the call is refused with
-//! `InvalidCampaignStateException` (HTTP 409) and nothing is written.
+//! Ends a campaign's run FOR GOOD: the stored campaign moves into the terminal
+//! `Stopped`, which is legal only while its run is under way (`Running` or `Paused`).
+//! The transition is written to the campaign record `GetCampaignState` reads; from any
+//! other state — including a campaign that has never been started, and one already
+//! stopped — the call is refused with `ConflictException` (HTTP 409) naming the
+//! campaign and the state it is at, and nothing is written.
 //!
 //! The lifecycle rule every campaign action is judged by lives once as
 //! `act_on_campaign` on this service's state, so this handler names its action and
@@ -201,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         match moved {
             Ok(_) => Ok(StopCampaignOutput),
-            Err(rejected) => Err(match rejected {
+            Err(rejected) => Err(match &rejected {
                 // This region holds no campaign under that id: there is no lifecycle
                 // to move, and nothing was written.
                 crate::state::LifecycleRejected::NotFound => {
@@ -215,15 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The action is not legal from the state the campaign is at NOW, which
                 // the refusal names — a campaign whose scheduled run window has closed
                 // is `Completed`, so that is the state reported rather than the one the
-                // last call wrote.
-                crate::state::LifecycleRejected::IllegalAction { state: current, .. } => {
-                    StopCampaignErrorModeled::InvalidCampaignStateException(
-                        InvalidCampaignStateException {
-                            state: current.as_wire().to_string(),
-                            message: rejected.message(),
-                            x_amz_error_type: None,
-                        },
-                    )
+                // last call wrote. A state that does not permit the transition is a
+                // conflict with the current state of the resource, so the refusal is
+                // the `ConflictException` this operation's model declares, worded by
+                // the shared state-gate sentence.
+                crate::state::LifecycleRejected::IllegalAction { .. } => {
+                    StopCampaignErrorModeled::ConflictException(ConflictException {
+                        message: rejected.message(),
+                        x_amz_error_type: None,
+                    })
                 }
             }
             .into()),

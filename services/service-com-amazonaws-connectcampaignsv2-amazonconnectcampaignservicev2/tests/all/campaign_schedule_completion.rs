@@ -16,8 +16,10 @@
 //! * every operation gated on the campaign's state judges the clock-derived one, so
 //!   a campaign whose run window has closed is past dialling
 //!   (`PutOutboundRequestBatch`), past reconfiguration (the `Update*`/`Delete*`
-//!   configuration operations) and past every lifecycle action — each HTTP 409
-//!   `InvalidCampaignStateException` naming `Completed`.
+//!   configuration operations) and past every lifecycle action — each HTTP 409, under
+//!   the error the model gives that gate: `ConflictException` naming the campaign and
+//!   `COMPLETED` for a campaign ACTION, and `InvalidCampaignStateException` naming
+//!   `Completed` for a CONFIGURATION change.
 
 use std::time::{Duration, SystemTime};
 
@@ -26,11 +28,11 @@ use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops::types::Schedule;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignState, StoredCampaign, ONBOARDING_JOB_DURATION,
+    CampaignState, StoredCampaign,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, onboard_instance, router, Harness};
 
 /// Now, as seconds since the Unix epoch.
 fn unix_secs() -> f64 {
@@ -71,26 +73,11 @@ fn telephony_request(client_token: &str) -> Value {
     })
 }
 
-/// Onboard `instance` and wait out the span the clock owes its onboarding job, so the
-/// instance is a campaign target by the time this returns: `CreateCampaign` mints a
-/// campaign only for an instance whose job has SUCCEEDED.
+/// Onboard `instance` so it is a campaign target by the time this returns:
+/// `CreateCampaign` mints a campaign only for an instance whose job has SUCCEEDED,
+/// which the shared fixture waits for by POLLING the job's reported status.
 async fn onboard(router: &Harness, region: &str, instance: &str) {
-    // Onboarding resolves the `connectInstanceId` against the account's Connect
-    // instance registry, so the instance is registered there first.
-    router.register_connect_instance(region, instance);
-    let (status, body) = call(
-        router,
-        region,
-        "PUT",
-        &format!("/v2/connect-instance/{instance}/onboarding"),
-        &json!({"encryptionConfig": {"enabled": false}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {instance:?}: expected onboarding to start, got {status} {body}"
-    );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + Duration::from_millis(150)).await;
+    onboard_instance(router, region, instance).await;
 }
 
 /// Create a campaign on an onboarded `instance`, carrying the run `window` as its
@@ -181,6 +168,46 @@ async fn describe(router: &MultiServiceRouter, region: &str, id: &str, case: &st
 /// or `None` for a campaign carrying no schedule at all.
 type Window = Option<(f64, f64)>;
 
+/// A run window that closes shortly after the call that starts the run, so a row using
+/// it crosses the `endTime` with NOTHING calling in between — the campaign is completed
+/// by the clock, not by a call.
+const SHORT_WINDOW_SECS: f64 = 0.4;
+
+/// Wait until a run window of [`SHORT_WINDOW_SECS`] opened a moment ago has CLOSED.
+///
+/// The wait is on the condition, not on a span of the clock: a sentinel campaign is
+/// created with that same window and started, and its reported state is read again
+/// until the clock has moved it to `Completed`. The sentinel is created AFTER the
+/// campaign under test, so its window closes no earlier — once it reads `Completed`,
+/// the window of the campaign under test has closed too. The deadline is generous
+/// enough for a loaded host to reach it.
+async fn wait_out_the_short_window(router: &Harness, region: &str, instance: &str, case: &str) {
+    let sentinel = create_campaign(
+        router,
+        region,
+        instance,
+        &format!("{case} sentinel"),
+        Some((-1.0, SHORT_WINDOW_SECS)),
+    )
+    .await;
+    let (status, started) = act(router, region, &sentinel, "start").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the sentinel campaign to start, got {status} {started}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if state_of(router, region, &sentinel, case).await == "Completed" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the sentinel campaign's run window never closed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// One row of the derivation table: a window and whether it has closed by now.
 struct WindowCase {
     case: &'static str,
@@ -189,21 +216,79 @@ struct WindowCase {
 }
 
 /// One row of the `GetCampaignState` table: a campaign created with `window`, put
-/// through `actions`, read `wait` later.
+/// through `actions`, read after the run window has closed when `wait_out_window`.
 struct StateCase {
     case: &'static str,
     window: Window,
     actions: &'static [&'static str],
-    wait: Duration,
+    wait_out_window: bool,
     expected: &'static str,
 }
 
-/// One state-gated operation: how it is addressed and the body it takes.
+/// One state-gated operation: how it is addressed, the body it takes and which of
+/// this service's two state refusals it answers with.
 struct Gated {
     operation: &'static str,
     method: &'static str,
     suffix: &'static str,
     body: fn() -> Value,
+    refusal: StateRefusal,
+}
+
+/// Which refusal a state gate answers with.
+///
+/// The two gates are different rules, and the model gives each operation the error for
+/// the rule it applies: a campaign ACTION the state does not permit — a lifecycle
+/// transition, a batch of outbound requests — is a conflict with the current state of
+/// the resource, while a CONFIGURATION change to a campaign that will never run again
+/// is the campaign-state error whose `state` member carries that state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateRefusal {
+    /// HTTP 409 `ConflictException`, whose message names the campaign and the state it
+    /// is at in upper case.
+    Conflict,
+    /// HTTP 409 `InvalidCampaignStateException`, whose `state` member names the state.
+    CampaignState,
+}
+
+/// Assert that `response` is the refusal `refusal` describes, about the campaign `id`
+/// being at `state`.
+fn assert_state_refusal(
+    refusal: StateRefusal,
+    response: &Value,
+    id: &str,
+    state: &str,
+    case: &str,
+) {
+    match refusal {
+        StateRefusal::Conflict => {
+            assert!(
+                error_code(response).ends_with("ConflictException"),
+                "case {case:?}: expected ConflictException, got {}",
+                error_code(response)
+            );
+            let expected = format!("Campaign: {id} is in invalid state: {}", state.to_uppercase());
+            assert_eq!(
+                response["message"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: expected the refusal to read {expected:?}, got {:?}",
+                response["message"]
+            );
+        }
+        StateRefusal::CampaignState => {
+            assert!(
+                error_code(response).ends_with("InvalidCampaignStateException"),
+                "case {case:?}: expected InvalidCampaignStateException, got {}",
+                error_code(response)
+            );
+            assert_eq!(
+                response["state"].as_str(),
+                Some(state),
+                "case {case:?}: expected the refusal to name state {state:?}, got {:?}",
+                response["state"]
+            );
+        }
+    }
 }
 
 /// A stored campaign in `lifecycle_state`, carrying `window` (offsets in seconds
@@ -335,102 +420,96 @@ async fn get_campaign_state_reports_completed_once_the_run_window_has_closed() {
     let instance = "schedule-completion-instance";
     onboard(&router, region, instance).await;
 
-    // A window that closes shortly after the call that starts the run, so the rows
-    // below cross the `endTime` with NOTHING calling in between — the campaign is
-    // completed by the clock, not by a call.
-    const SHORT_WINDOW_SECS: f64 = 0.4;
-    const WAIT_OUT_SHORT_WINDOW: Duration = Duration::from_millis(600);
-
     let cases: &[StateCase] = &[
         StateCase {
             case: "no schedule, started",
             window: None,
             actions: &["start"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Running",
         },
         StateCase {
             case: "window open for an hour, never started",
             window: Some((-60.0, 3_600.0)),
             actions: &[],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Initialized",
         },
         StateCase {
             case: "window open for an hour, started",
             window: Some((-60.0, 3_600.0)),
             actions: &["start"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Running",
         },
         StateCase {
             case: "window open for an hour, started then paused",
             window: Some((-60.0, 3_600.0)),
             actions: &["start", "pause"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Paused",
         },
         StateCase {
             case: "window open for an hour, started then stopped",
             window: Some((-60.0, 3_600.0)),
             actions: &["start", "stop"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Stopped",
         },
         StateCase {
             case: "window closed a second ago, started",
             window: Some((-3_600.0, -1.0)),
             actions: &["start"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Completed",
         },
         StateCase {
             case: "window closed an hour ago, started",
             window: Some((-7_200.0, -3_600.0)),
             actions: &["start"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Completed",
         },
         StateCase {
             case: "window closed thirty days ago, started",
             window: Some((-2_595_600.0, -2_592_000.0)),
             actions: &["start"],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Completed",
         },
         StateCase {
             case: "window closed an hour ago, never started",
             window: Some((-7_200.0, -3_600.0)),
             actions: &[],
-            wait: Duration::ZERO,
+            wait_out_window: false,
             expected: "Initialized",
         },
         StateCase {
             case: "window closes while the campaign runs",
             window: Some((-1.0, SHORT_WINDOW_SECS)),
             actions: &["start"],
-            wait: WAIT_OUT_SHORT_WINDOW,
+            wait_out_window: true,
             expected: "Completed",
         },
         StateCase {
             case: "window closes while the campaign is paused",
             window: Some((-1.0, SHORT_WINDOW_SECS)),
             actions: &["start", "pause"],
-            wait: WAIT_OUT_SHORT_WINDOW,
+            wait_out_window: true,
             expected: "Completed",
         },
         StateCase {
             case: "window closes after the caller stopped the run",
             window: Some((-1.0, SHORT_WINDOW_SECS)),
             actions: &["start", "stop"],
-            wait: WAIT_OUT_SHORT_WINDOW,
+            wait_out_window: true,
             expected: "Stopped",
         },
         StateCase {
             case: "window still open after the same wait, started",
             window: Some((-1.0, 3_600.0)),
             actions: &["start"],
-            wait: WAIT_OUT_SHORT_WINDOW,
+            wait_out_window: true,
             expected: "Running",
         },
     ];
@@ -439,7 +518,7 @@ async fn get_campaign_state_reports_completed_once_the_run_window_has_closed() {
         case,
         window,
         actions,
-        wait,
+        wait_out_window,
         expected,
     } in cases
     {
@@ -452,8 +531,8 @@ async fn get_campaign_state_reports_completed_once_the_run_window_has_closed() {
                 "case {case:?}: expected {action:?} to be accepted, got {status} {body}"
             );
         }
-        if !wait.is_zero() {
-            tokio::time::sleep(*wait).await;
+        if *wait_out_window {
+            wait_out_the_short_window(&router, region, instance, case).await;
         }
 
         let actual = state_of(&router, region, &id, case).await;
@@ -497,6 +576,7 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
             method: "PUT",
             suffix: "/outbound-requests",
             body: || json!({"outboundRequests": [telephony_request("token-1")]}),
+            refusal: StateRefusal::Conflict,
         },
         Gated {
             operation: "UpdateCampaignCommunicationLimits",
@@ -509,6 +589,7 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
                     ]
                 }}})
             },
+            refusal: StateRefusal::CampaignState,
         },
         Gated {
             operation: "UpdateCampaignCommunicationTime",
@@ -521,6 +602,7 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
                     "localTimeZoneConfig": {"defaultTimeZone": "America/New_York"}
                 }})
             },
+            refusal: StateRefusal::CampaignState,
         },
         Gated {
             operation: "DeleteCampaignCommunicationLimits",
@@ -529,12 +611,14 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
             // (source: `COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES`).
             suffix: "/communication-limits?config=ALL_CHANNEL_SUBTYPES",
             body: || Value::Null,
+            refusal: StateRefusal::CampaignState,
         },
         Gated {
             operation: "DeleteCampaignCommunicationTime",
             method: "DELETE",
             suffix: "/communication-time?config=TELEPHONY",
             body: || Value::Null,
+            refusal: StateRefusal::CampaignState,
         },
         Gated {
             operation: "UpdateCampaignFlowAssociation",
@@ -544,30 +628,35 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
                 json!({"connectCampaignFlowArn":
                     "arn:aws:connect:eu-west-1:000000000000:instance/i-1/flow/f-1"})
             },
+            refusal: StateRefusal::CampaignState,
         },
         Gated {
             operation: "StartCampaign",
             method: "POST",
             suffix: "/start",
             body: || Value::Null,
+            refusal: StateRefusal::Conflict,
         },
         Gated {
             operation: "PauseCampaign",
             method: "POST",
             suffix: "/pause",
             body: || Value::Null,
+            refusal: StateRefusal::Conflict,
         },
         Gated {
             operation: "ResumeCampaign",
             method: "POST",
             suffix: "/resume",
             body: || Value::Null,
+            refusal: StateRefusal::Conflict,
         },
         Gated {
             operation: "StopCampaign",
             method: "POST",
             suffix: "/stop",
             body: || Value::Null,
+            refusal: StateRefusal::Conflict,
         },
     ];
 
@@ -576,6 +665,7 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
         method,
         suffix,
         body,
+        refusal,
     } in gated
     {
         // A campaign started while its window was open, whose window has since
@@ -612,17 +702,7 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
             status, 409,
             "case {case:?}: expected HTTP 409, got {status} {refused}"
         );
-        assert!(
-            error_code(&refused).ends_with("InvalidCampaignStateException"),
-            "case {case:?}: expected InvalidCampaignStateException, got {}",
-            error_code(&refused)
-        );
-        assert_eq!(
-            refused["state"].as_str(),
-            Some("Completed"),
-            "case {case:?}: expected the refusal to name state \"Completed\", got {:?}",
-            refused["state"]
-        );
+        assert_state_refusal(*refusal, &refused, &closed, "Completed", &case);
         // The refusal wrote nothing: the campaign is still Completed.
         assert_eq!(
             state_of(&router, region, &closed, &case).await,
@@ -666,12 +746,7 @@ async fn a_campaign_past_its_window_refuses_every_state_gated_operation() {
             "case {open_case:?}: expected HTTP {expected_status}, got {status} {served}"
         );
         if expected_status == 409 {
-            assert_eq!(
-                served["state"].as_str(),
-                Some("Running"),
-                "case {open_case:?}: expected the refusal to name state \"Running\", got {:?}",
-                served["state"]
-            );
+            assert_state_refusal(*refusal, &served, &open, "Running", &open_case);
         }
     }
 }

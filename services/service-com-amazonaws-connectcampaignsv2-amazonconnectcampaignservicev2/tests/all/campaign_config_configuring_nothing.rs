@@ -411,26 +411,39 @@ async fn a_config_configuring_nothing_leaves_the_record_holding_no_member() {
     }
 }
 
-/// The update and the removal leave the SAME record: a config emptied by an update that
-/// carried no member and one emptied by the deletion of its last block are
-/// indistinguishable, member for member, through `DescribeCampaign` and `ListCampaigns`.
+/// The update and the removal leave the SAME record: a config reduced by an update
+/// that carries only the blocks that are to survive and one reduced by the deletion of
+/// a block are indistinguishable, member for member, through `DescribeCampaign` and
+/// `ListCampaigns`.
 ///
 /// Driven over every entry of the model's `ChannelSubtype` catalog and of
 /// `CommunicationLimitsConfigType`, so each removal the service models is compared with
-/// the update that reaches the same meaning.
+/// the update that reaches the same meaning. A channel-subtype row keeps a second
+/// channel configured: a campaign always keeps at least one channel subtype, so the
+/// removal of the LAST block is refused rather than emptying the config (which
+/// `campaign_channel_subtype_config_deletion` owns), while an override emptied of its
+/// last member is the rule above.
 #[tokio::test]
 async fn an_emptied_config_is_the_same_record_whichever_call_emptied_it() {
     let region = "eu-central-1";
     let router = router();
     let instance = "emptied-config-instance";
 
-    // (case, the member and its removal, the config the campaign is created with)
-    let mut rows: Vec<(String, ConfigMember, Value)> = Vec::new();
+    // (case, the member and its removal, the config the campaign is created with, the
+    //  config an update writes to reach what the removal leaves)
+    let mut rows: Vec<(String, ConfigMember, Value, Value)> = Vec::new();
     for channel in CHANNEL_SUBTYPE_VALUES {
+        // A second channel, so the removal is not of the campaign's last block.
+        let survivor = CHANNEL_SUBTYPE_VALUES
+            .iter()
+            .copied()
+            .find(|other| other != channel)
+            .expect("the catalog holds more than one channel");
         rows.push((
-            format!("the only channel block, {channel}"),
+            format!("one channel block of two, {channel}"),
             channel_subtype_member(channel),
-            subtype_config(&[channel]),
+            subtype_config(&[channel, survivor]),
+            subtype_config(&[survivor]),
         ));
     }
     for config_type in COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES {
@@ -438,12 +451,13 @@ async fn an_emptied_config_is_the_same_record_whichever_call_emptied_it() {
             format!("the only override member, {config_type}"),
             communication_limits_member(config_type),
             json!({"allChannelSubtypes": {"communicationLimitsList": [limit(4, 3)]}}),
+            json!({}),
         ));
     }
 
-    for (index, (case, member, config)) in rows.iter().enumerate() {
+    for (index, (case, member, config, reduced)) in rows.iter().enumerate() {
         let extra = request_for(member, config);
-        let emptied_by_update = create_campaign_with(
+        let reduced_by_update = create_campaign_with(
             &router,
             region,
             instance,
@@ -451,7 +465,7 @@ async fn an_emptied_config_is_the_same_record_whichever_call_emptied_it() {
             extra.clone(),
         )
         .await;
-        let emptied_by_removal = create_campaign_with(
+        let reduced_by_removal = create_campaign_with(
             &router,
             region,
             instance,
@@ -460,31 +474,33 @@ async fn an_emptied_config_is_the_same_record_whichever_call_emptied_it() {
         )
         .await;
 
-        // One campaign is emptied by a config carrying no member, the other by the
-        // deletion of the last block it held.
-        update_member(
-            &router,
-            region,
-            &emptied_by_update,
-            member,
-            &json!({}),
-            case,
-        )
-        .await;
-        delete_block(&router, region, &emptied_by_removal, member, case).await;
+        // One campaign is reduced by an update carrying what is to survive, the other
+        // by the deletion of the block that is to go.
+        update_member(&router, region, &reduced_by_update, member, reduced, case).await;
+        delete_block(&router, region, &reduced_by_removal, member, case).await;
 
-        let mut from_update = describe_campaign(&router, region, &emptied_by_update, case).await;
-        let mut from_removal = describe_campaign(&router, region, &emptied_by_removal, case).await;
+        let mut from_update = describe_campaign(&router, region, &reduced_by_update, case).await;
+        let mut from_removal = describe_campaign(&router, region, &reduced_by_removal, case).await;
+        let expected = stored_config(reduced);
         for projection in [&mut from_update, &mut from_removal] {
             let members = projection
                 .as_object_mut()
                 .expect("a campaign projection is an object");
-            assert!(
-                members.get(member.campaign_member).is_none(),
-                "case {case:?}: expected no {}, got {:?}",
-                member.campaign_member,
-                members.get(member.campaign_member)
-            );
+            let held = members.get(member.campaign_member).cloned();
+            if expected.is_null() {
+                assert!(
+                    held.is_none(),
+                    "case {case:?}: expected no {}, got {held:?}",
+                    member.campaign_member
+                );
+            } else {
+                assert_eq!(
+                    held.as_ref(),
+                    Some(&expected),
+                    "case {case:?}: expected {} to hold {expected}, got {held:?}",
+                    member.campaign_member
+                );
+            }
             // The server-owned identity differs between the two campaigns by
             // construction; everything else must agree.
             for identity in ["id", "arn", "name"] {
@@ -498,9 +514,9 @@ async fn an_emptied_config_is_the_same_record_whichever_call_emptied_it() {
         );
 
         let listed_after_update =
-            listed_channel_subtypes(&router, region, &emptied_by_update, case).await;
+            listed_channel_subtypes(&router, region, &reduced_by_update, case).await;
         let listed_after_removal =
-            listed_channel_subtypes(&router, region, &emptied_by_removal, case).await;
+            listed_channel_subtypes(&router, region, &reduced_by_removal, case).await;
         assert_eq!(
             listed_after_update, listed_after_removal,
             "case {case:?}: expected the same channelSubtypes, got {listed_after_update:?} \

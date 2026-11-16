@@ -9,7 +9,7 @@
 //!
 //! * a batch is taken only by a campaign the store holds (an unknown id is
 //!   `ResourceNotFoundException`, HTTP 404) that is `Running` at the instant it is
-//!   served (any other state is `InvalidCampaignStateException`, HTTP 409, carrying
+//!   served (any other state is `ConflictException`, HTTP 409, naming the campaign and
 //!   that state);
 //! * a request whose `expirationTime` the clock has already passed is reported on the
 //!   per-request failure channel under the modelled
@@ -536,14 +536,15 @@ async fn only_a_running_campaign_takes_a_profile_batch() {
         }
         assert_eq!(
             error_code(&body),
-            "InvalidCampaignStateException",
-            "case {case:?}: expected the modelled campaign-state refusal, got {body}"
+            "ConflictException",
+            "case {case:?}: expected the modelled state-conflict refusal, got {body}"
         );
-        let reported = body.get("state").and_then(Value::as_str);
+        let expected_message =
+            format!("Campaign: {id} is in invalid state: {}", state.to_uppercase());
         assert_eq!(
-            reported,
-            Some(*state),
-            "case {case:?}: the refusal names the state the campaign is in, got {reported:?}"
+            body.get("message").and_then(Value::as_str),
+            Some(expected_message.as_str()),
+            "case {case:?}: the refusal names the campaign and the state it is in, got {body}"
         );
         assert_eq!(
             pending_count(&engine, region, &id),

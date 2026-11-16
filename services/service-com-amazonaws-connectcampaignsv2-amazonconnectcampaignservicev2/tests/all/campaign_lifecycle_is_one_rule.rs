@@ -12,8 +12,9 @@
 //!   legal action writes the state the transition table names, which
 //!   `GetCampaignState` then reports;
 //! * an action that is not legal from that state is refused with HTTP 409
-//!   `InvalidCampaignStateException` naming the state it was judged at, with the same
-//!   sentence from every one of the four, and the stored state is left alone;
+//!   `ConflictException` naming the campaign and the state it was judged at, in upper
+//!   case, with the same sentence from every one of the four, and the stored state is
+//!   left alone;
 //! * an id the request's region holds no campaign under is HTTP 404
 //!   `ResourceNotFoundException` with the same sentence from every one of the four,
 //!   and a campaign of another region is exactly that: absent, and untouched.
@@ -28,13 +29,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::common::{call, campaign_state, create_campaign, drive_lifecycle, error_code, router};
 
-/// One lifecycle operation: the route segment it is addressed by and the verb its
-/// refusal names it with.
+/// One lifecycle operation: the route segment it is addressed by.
 #[derive(Debug, Clone, Copy)]
 struct Action {
     operation: &'static str,
     segment: &'static str,
-    verb: &'static str,
 }
 
 /// The four operations that move a campaign's lifecycle, each as the route the model
@@ -43,22 +42,18 @@ const ACTIONS: &[Action] = &[
     Action {
         operation: "StartCampaign",
         segment: "start",
-        verb: "started",
     },
     Action {
         operation: "PauseCampaign",
         segment: "pause",
-        verb: "paused",
     },
     Action {
         operation: "ResumeCampaign",
         segment: "resume",
-        verb: "resumed",
     },
     Action {
         operation: "StopCampaign",
         segment: "stop",
-        verb: "stopped",
     },
 ];
 
@@ -115,10 +110,11 @@ const ORIGINS: &[Origin] = &[
 /// the table instead of to whatever the code computes: Start is the only action a
 /// campaign that has never entered its run takes, Pause suspends a running campaign,
 /// Resume puts a suspended one back to work, Stop ends a run already under way, no
-/// action is a no-op, and nothing moves out of a terminal state.
+/// action is a no-op, and nothing moves out of a terminal state — `Stopped` among
+/// them, since stopping ends the run for good.
 fn expected_next(from: &str, operation: &str) -> Option<&'static str> {
     match (from, operation) {
-        ("Initialized" | "Paused" | "Stopped", "StartCampaign") => Some("Running"),
+        ("Initialized" | "Paused", "StartCampaign") => Some("Running"),
         ("Running", "PauseCampaign") => Some("Paused"),
         ("Paused", "ResumeCampaign") => Some("Running"),
         ("Running" | "Paused", "StopCampaign") => Some("Stopped"),
@@ -208,20 +204,13 @@ async fn all_four_actions_move_a_campaign_by_one_rule() {
                         "case {case:?}: expected HTTP 409, got {status} {body}"
                     );
                     assert!(
-                        error_code(&body).ends_with("InvalidCampaignStateException"),
-                        "case {case:?}: expected InvalidCampaignStateException, got {}",
+                        error_code(&body).ends_with("ConflictException"),
+                        "case {case:?}: expected ConflictException, got {}",
                         error_code(&body)
                     );
-                    assert_eq!(
-                        body["state"].as_str(),
-                        Some(origin.state),
-                        "case {case:?}: expected the refusal to name state {:?}, got {:?}",
-                        origin.state,
-                        body["state"]
-                    );
                     let expected_message = format!(
-                        "A campaign in state {} cannot be {}",
-                        origin.state, action.verb
+                        "Campaign: {id} is in invalid state: {}",
+                        origin.state.to_uppercase()
                     );
                     assert_eq!(
                         body["message"].as_str(),
