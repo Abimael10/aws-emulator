@@ -13,6 +13,11 @@
 //!
 //! * an access token names a sign-in exactly when the emulator's own OIDC service issued
 //!   it and it is still inside its own lifetime;
+//! * WHICH sign-in session it names is the mint's record too, because a sign-in session is
+//!   what a whole chain of tokens belongs to rather than any one of them: every token a
+//!   rotation or an exchange puts in another's place belongs to the session its
+//!   predecessor did, so anything this service scopes to a sign-in rather than to one
+//!   token is bound to that identifier ([`SignedIn::sign_in_session`]);
 //! * the accounts that sign-in may see, and the roles in each, are the account assignments
 //!   IAM Identity Center holds whose grant has completed — a role being the NAME of the
 //!   permission set the assignment grants, which is what the access portal offers a user;
@@ -52,8 +57,9 @@ use ::service_com_amazonaws_organizations_awsorganizationsv20161128 as organizat
 /// presents, and its record of that token is what makes the token a sign-in.
 use ::service_com_amazonaws_ssooidc_awsssooidcservice as oidc;
 
-/// The sign-in a presented access token names: who it is, when it stops being usable, and
-/// the accounts (with the roles assigned in each) it may report.
+/// The sign-in a presented access token names: who it is, which sign-in session the token
+/// is one token OF, when it stops being usable, and the accounts (with the roles assigned
+/// in each) it may report.
 ///
 /// OWNED rather than borrowed from a store, because a sign-in is assembled from the
 /// records of the services that hold the two events behind it, and a handler must not hold
@@ -64,6 +70,17 @@ pub struct SignedIn {
     /// Center identity a role credential minted for this sign-in speaks for (see
     /// [`ComAmazonawsSsoSwbportalserviceState::signed_in_subject`]).
     pub subject: String,
+    /// WHICH sign-in session the presented token belongs to, as the record that holds the
+    /// token's chain names it. Reported by no operation; it is what anything this service
+    /// scopes to a sign-in rather than to one token is bound to — the page cursors a
+    /// listing hands out ([`super::cursor_scope`]).
+    ///
+    /// A sign-in session is not a token: it is what a whole chain of tokens belongs to,
+    /// so this is the mint's own session identifier for a sign-in the emulator minted
+    /// ([`minted_sign_in`]) — stable across the rotation that supersedes an access token
+    /// — and the presenting token itself for a sign-in this store was GIVEN, which is
+    /// held under that one token and has no chain.
+    pub sign_in_session: String,
     /// When the sign-in stops being usable, whether or not anyone logs out.
     pub expires_at: SystemTime,
     /// The accounts this sign-in may see, by account id, ascending — the order a listing
@@ -102,10 +119,11 @@ pub fn federated_sign_in<Eng: Send + Sync + 'static>(
     access_token: &str,
     now: SystemTime,
 ) -> Option<SignedIn> {
-    let (subject, expires_at) = minted_sign_in(engine, access_token, now)?;
+    let minted = minted_sign_in(engine, access_token, now)?;
     Some(SignedIn {
-        subject,
-        expires_at,
+        subject: minted.subject,
+        sign_in_session: minted.sign_in_session,
+        expires_at: minted.expires_at,
         accounts: assigned_accounts(engine, now).unwrap_or_default(),
     })
 }
@@ -137,8 +155,20 @@ pub fn end_minted_sign_in<Eng: Send + Sync + 'static>(engine: &Eng, access_token
     tokens.end_sign_in_session(access_token)
 }
 
+/// What the emulator's own token mint records about the sign-in a presented access token
+/// belongs to.
+struct MintedSignIn {
+    /// The identity the sign-in is attributed to; see [`minted_sign_in`].
+    subject: String,
+    /// The mint's identifier for the sign-in session this token is one token OF, the same
+    /// for every token of the chain.
+    sign_in_session: String,
+    /// When the presented token stops being usable.
+    expires_at: SystemTime,
+}
+
 /// The sign-in the emulator's own token mint made for `access_token`: who it is attributed
-/// to, and when the token stops being usable.
+/// to, which sign-in session the token belongs to, and when the token stops being usable.
 ///
 /// IAM Identity Center attributes a sign-in to the identity-store user who approved it at
 /// the access portal, and that approval is made at the portal page rather than through any
@@ -154,11 +184,18 @@ fn minted_sign_in<Eng: Send + Sync + 'static>(
     engine: &Eng,
     access_token: &str,
     now: SystemTime,
-) -> Option<(String, SystemTime)> {
+) -> Option<MintedSignIn> {
     let tokens = oidc::state::service_state(engine)?;
     let tokens = tokens.lock();
     let issued = tokens.access_tokens.get(access_token)?;
-    (!issued.is_expired(now)).then(|| (issued.client_id.clone(), issued.expires_at()))
+    (!issued.is_expired(now)).then(|| MintedSignIn {
+        subject: issued.client_id.clone(),
+        // The session the token is a token of, which is the SAME identifier on every
+        // token of the chain: the pair a refresh rotation mints belongs to the session the
+        // pair it superseded belonged to.
+        sign_in_session: issued.sign_in_session.clone(),
+        expires_at: issued.expires_at(),
+    })
 }
 
 /// The accounts IAM Identity Center's assignments put in force at `now`, with the roles
@@ -300,7 +337,7 @@ impl ComAmazonawsSsoSwbportalserviceState {
                 Some(sign_in) => Some(sign_in.clone()),
                 None => recorded
                     .filter(|session| !session.federated)
-                    .map(|session| self.seeded_sign_in(session)),
+                    .map(|session| self.seeded_sign_in(access_token, session)),
             },
         };
         if resolved.is_none() {
@@ -317,9 +354,14 @@ impl ComAmazonawsSsoSwbportalserviceState {
 
     /// A sign-in held in THIS store, with the accounts its own assignments name and, in
     /// each, the roles those assignments grant its subject.
-    fn seeded_sign_in(&self, session: &Session) -> SignedIn {
+    ///
+    /// Such a sign-in is the record held under the ONE token it was seeded with — no mint
+    /// elsewhere holds a chain for it — so that token is what names the sign-in session
+    /// ([`SignedIn::sign_in_session`]).
+    fn seeded_sign_in(&self, access_token: &str, session: &Session) -> SignedIn {
         SignedIn {
             subject: session.subject.clone(),
+            sign_in_session: access_token.to_string(),
             expires_at: session.expires_at,
             accounts: session
                 .assignments

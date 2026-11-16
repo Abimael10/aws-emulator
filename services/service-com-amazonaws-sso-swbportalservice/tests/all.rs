@@ -17,6 +17,8 @@ mod authentication_precedes_reading;
 mod bearer_token_gate;
 #[path = "all/credential_expiry.rs"]
 mod credential_expiry;
+#[path = "all/cursor_spans_the_token_chain.rs"]
+mod cursor_spans_the_token_chain;
 #[path = "all/endpoint_agnostic_routing.rs"]
 mod endpoint_agnostic_routing;
 #[path = "all/endpoint_host_claiming.rs"]

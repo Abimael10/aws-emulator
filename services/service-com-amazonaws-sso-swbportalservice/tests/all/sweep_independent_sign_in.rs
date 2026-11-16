@@ -48,6 +48,9 @@ const RECORD_ROLE: &str = "RecordedAccess";
 /// role, so an answer that came from the mint cannot be confused with one that came from
 /// the record.
 const MINT_SUBJECT: &str = "minted@example.com";
+/// The sign-in session identifier the mint's record carries for [`TOKEN`] — a value of the
+/// mint's own, so it is neither the token nor anything this store holds.
+const MINT_SIGN_IN_SESSION: &str = "sign-in-session-of-the-mint";
 const MINT_ACCOUNT: &str = "222222222222";
 const MINT_ROLE: &str = "MintedAccess";
 
@@ -152,6 +155,9 @@ fn federated(minted: Minted, now: SystemTime) -> Option<SignedIn> {
     roles.insert(MINT_ROLE.to_string());
     Some(SignedIn {
         subject: MINT_SUBJECT.to_string(),
+        // The sign-in session the mint would name for a token of its own chain; this suite
+        // never paginates, so only its presence matters here.
+        sign_in_session: MINT_SIGN_IN_SESSION.to_string(),
         expires_at,
         accounts: [(
             MINT_ACCOUNT.to_string(),

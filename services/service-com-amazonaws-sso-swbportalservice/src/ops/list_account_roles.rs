@@ -198,14 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         });
-        // The cursor is scoped to this account's role listing AND to this session, so a
-        // token issued for another account's roles, or to another sign-in, cannot be
-        // continued here.
+        // The cursor is scoped to this account's role listing AND to the sign-in SESSION
+        // the presented token belongs to, so a token issued for another account's roles,
+        // or to another sign-in, cannot be continued here — while every token of this
+        // sign-in's own chain can, the pair a refresh rotation issues included (see
+        // `crate::state::cursor_scope`).
         let page = crate::state::page_of(
             assigned,
             &crate::state::cursor_scope(
                 &format!("roles:{}", account.account_id),
-                &input.access_token,
+                &signed_in.sign_in_session,
             ),
             input.next_token.as_deref(),
             input.max_results,

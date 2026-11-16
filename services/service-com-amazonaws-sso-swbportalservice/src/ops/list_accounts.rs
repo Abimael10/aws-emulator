@@ -195,9 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         });
+        // The cursor is scoped to this account listing AND to the SIGN-IN SESSION the
+        // presented token belongs to, never to that one token: a refresh rotation
+        // supersedes an access token while the sign-in continues, so the token the client
+        // must present afterwards continues the walk the token before it began (see
+        // `crate::state::cursor_scope`).
         let page = crate::state::page_of(
             assigned,
-            &crate::state::cursor_scope("accounts", &input.access_token),
+            &crate::state::cursor_scope("accounts", &signed_in.sign_in_session),
             input.next_token.as_deref(),
             input.max_results,
         )

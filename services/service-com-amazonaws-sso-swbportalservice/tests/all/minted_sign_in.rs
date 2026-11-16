@@ -158,7 +158,12 @@ impl Emulator {
 
     /// Send one portal request, presenting `token` as the bearer credential the model binds
     /// the access token to.
-    async fn portal(&self, method: Method, uri: &str, token: &str) -> (StatusCode, Value) {
+    pub(crate) async fn portal(
+        &self,
+        method: Method,
+        uri: &str,
+        token: &str,
+    ) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(method)
             .uri(format!("https://{PORTAL_HOST}{uri}"))
@@ -310,7 +315,7 @@ impl Emulator {
 
     /// The same flow, reporting everything it minted — for a case that goes on to spend the
     /// refresh token the mint issued beside the access token.
-    async fn minted_sign_in(&self, identity_store_id: &str) -> MintedToken {
+    pub(crate) async fn minted_sign_in(&self, identity_store_id: &str) -> MintedToken {
         let (status, body) = self
             .oidc(
                 "/client/register",
@@ -378,7 +383,7 @@ impl Emulator {
 
     /// Spend `minted`'s refresh token and answer the whole PAIR the rotation issued, for a
     /// case that goes on spending the chain the mint keeps re-issuing.
-    async fn rotated(&self, minted: &MintedToken) -> MintedToken {
+    pub(crate) async fn rotated(&self, minted: &MintedToken) -> MintedToken {
         let (status, body) = self.refresh(minted).await;
         assert_eq!(
             status, 200,
@@ -532,11 +537,11 @@ impl Emulator {
 
 /// Everything one walk of the device flow minted: the access token a portal request
 /// presents, the refresh token beside it, and the registration both belong to.
-struct MintedToken {
-    access_token: String,
-    refresh_token: String,
-    client_id: String,
-    client_secret: String,
+pub(crate) struct MintedToken {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: String,
 }
 
 /// The status and parsed body of a response; a body that is not JSON fails the case rather

@@ -665,14 +665,24 @@ pub fn invalid_cursor() -> crate::ops::types::InvalidRequestException {
 /// refused rather than silently misread.
 const CURSOR_VERSION: &str = "v1";
 
-/// The scope a cursor is bound to: the listing it walks, and the session that asked
-/// for it. A cursor presented to another listing or by another session is refused.
+/// The scope a cursor is bound to: the listing it walks, and the SIGN-IN SESSION that
+/// asked for it. A cursor presented to another listing or by another sign-in is refused.
 ///
-/// The session is identified by a digest of its access token, never the token itself:
-/// the token is `@sensitive` and a cursor travels back out in a response and into a
-/// client's next URL, so the token must not be recoverable from it.
-pub fn cursor_scope(listing: &str, access_token: &str) -> String {
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(access_token.as_bytes());
+/// The sign-in session is named by its own identifier ([`SignedIn::sign_in_session`]) and
+/// never by the token that happened to present it, because a sign-in session is what a
+/// whole chain of tokens belongs to rather than any one of them: the pair a refresh
+/// rotation issues supersedes the access token it rotates while the sign-in itself
+/// continues, so the token a client must present after a rotation continues the walk the
+/// token before it began. Scoping to the presented token instead would strand the rest of
+/// a listing at every rotation — the cursor refused for the one token that can still be
+/// presented — while buying nothing: the items a continuation reports are built from the
+/// sign-in's own assignments either way.
+///
+/// The identifier is digested rather than carried, and only its first half is kept: a
+/// cursor travels back out in a response and into a client's next URL, so neither the
+/// session identifier nor anything else the store holds may be recoverable from it.
+pub fn cursor_scope(listing: &str, sign_in_session: &str) -> String {
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(sign_in_session.as_bytes());
     format!("{listing}:{}", hex::encode(&digest[..16]))
 }
 
