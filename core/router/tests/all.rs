@@ -1337,6 +1337,8 @@ mod sfn_management_events;
 mod sfn_parallel_branch_cancellation;
 #[path = "all/sfn_relayed_dynamodb_request_id.rs"]
 mod sfn_relayed_dynamodb_request_id;
+#[path = "all/sfn_session_audit_lookup_attributes.rs"]
+mod sfn_session_audit_lookup_attributes;
 #[path = "all/sfn_sns_publish_task.rs"]
 mod sfn_sns_publish_task;
 #[path = "all/sfn_task_target_authorization.rs"]

@@ -36,26 +36,30 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{block_of, element, form_encode};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+///
+/// The harness below is `pub(crate)` where a sibling suite over the SAME rule reaches it
+/// (`sfn_session_audit_lookup_attributes.rs`), so there is one statement of how a call of
+/// this suite's four services is driven and how a record is read back, rather than two.
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Step Functions' `X-Amz-Target` prefix, from that service's own model (service shape
 /// `AWSStepFunctions`).
 const TARGET_PREFIX: &str = "AWSStepFunctions";
 
 /// The Region every call of this suite is signed for, and so the Region its records live in.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The long-term access key id the SETUP calls carry — the roles and the state machine —
 /// so the caller's own calls are the only ones made with a session.
-const SETUP_KEY_ID: &str = "AKIDTEST";
+pub(crate) const SETUP_KEY_ID: &str = "AKIDTEST";
 
 /// The `eventSource` CloudTrail stamps on a Step Functions management event
 /// (`smithy_query(query="service_info")` ->
 /// `awsService.cloudTrailEventSource: states.amazonaws.com`).
-const SFN_EVENT_SOURCE: &str = "states.amazonaws.com";
+pub(crate) const SFN_EVENT_SOURCE: &str = "states.amazonaws.com";
 
 /// The `eventCategory` of a control-plane call's record.
-const MANAGEMENT: &str = "Management";
+pub(crate) const MANAGEMENT: &str = "Management";
 
 /// The header AWS reports a response's request id in, lowercased as HTTP compares it.
 const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
@@ -65,7 +69,7 @@ const MACHINE: &str = "sfn-audited-session";
 const EXECUTION: &str = "sfn-audited-run";
 
 /// The caller's role session name, which the envelope reports as the event's `Username`.
-const SESSION_NAME: &str = "sfn-caller-session";
+pub(crate) const SESSION_NAME: &str = "sfn-caller-session";
 
 /// A one-`Pass`-state STANDARD state machine.
 const DEFINITION: &str =
@@ -83,21 +87,21 @@ const CALLER_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"A
 
 /// The emulator this suite drives: the whole router over one engine, and the runtime its
 /// requests are blocked on.
-struct Audited {
+pub(crate) struct Audited {
     router: MultiServiceRouter,
     runtime: tokio::runtime::Runtime,
 }
 
 /// One answer as its caller reads it: the status, the body, and the id the response named
 /// the request by — which is what the record of that call must carry.
-struct Answered {
-    status: u16,
-    body: Value,
-    request_id: String,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
+    pub(crate) request_id: String,
 }
 
 impl Audited {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         let mut router = build_router(engine);
         router.set_request_authentication(false);
@@ -177,7 +181,7 @@ impl Audited {
     }
 
     /// One Step Functions operation (`awsJson1_0`), signed with `access_key_id`.
-    fn sfn(&self, access_key_id: &str, operation: &str, body: &Value) -> Answered {
+    pub(crate) fn sfn(&self, access_key_id: &str, operation: &str, body: &Value) -> Answered {
         let (status, payload, request_id) = self.send(
             access_key_id,
             "states",
@@ -202,7 +206,7 @@ impl Audited {
     }
 
     /// One Step Functions operation that has to succeed.
-    fn sfn_ok(&self, access_key_id: &str, operation: &str, body: &Value) -> Answered {
+    pub(crate) fn sfn_ok(&self, access_key_id: &str, operation: &str, body: &Value) -> Answered {
         let answered = self.sfn(access_key_id, operation, body);
         assert_eq!(
             answered.status, 200,
@@ -213,7 +217,7 @@ impl Audited {
     }
 
     /// Create a role with `policy` as its trust policy; answer its ARN.
-    fn role(&self, name: &str, policy: &str) -> String {
+    pub(crate) fn role(&self, name: &str, policy: &str) -> String {
         let (status, body) = self.query(
             SETUP_KEY_ID,
             "iam",
@@ -229,7 +233,7 @@ impl Audited {
     }
 
     /// Put an inline policy on `role`.
-    fn put_role_policy(&self, role: &str, name: &str, document: &str) {
+    pub(crate) fn put_role_policy(&self, role: &str, name: &str, document: &str) {
         let (status, body) = self.query(
             SETUP_KEY_ID,
             "iam",
@@ -251,7 +255,7 @@ impl Audited {
     /// and the SESSION's own ARN as the assume reported it (`AssumedRoleUser.Arn`), so the
     /// assertions below compare the record against what the emulator actually minted
     /// rather than against a second statement of the ARN form.
-    fn assume(&self, role_arn: &str, session_name: &str) -> (String, String) {
+    pub(crate) fn assume(&self, role_arn: &str, session_name: &str) -> (String, String) {
         let (status, body) = self.query(
             SETUP_KEY_ID,
             "sts",
@@ -272,7 +276,7 @@ impl Audited {
     /// `cloudtrail:LookupEvents` filtered on one attribute over a window around now,
     /// answering each event's envelope paired with its parsed `CloudTrailEvent` document,
     /// most recent first and paged to exhaustion.
-    fn lookup(&self, attribute_key: &str, attribute_value: &str) -> Vec<(Value, Value)> {
+    pub(crate) fn lookup(&self, attribute_key: &str, attribute_value: &str) -> Vec<(Value, Value)> {
         let mut found: Vec<(Value, Value)> = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
@@ -325,7 +329,11 @@ impl Audited {
     /// The records of the calls to `event_name` that the session `session_arn` made, as the
     /// check that filed this issue finds them: a lookup by event name, kept to the records
     /// whose `userIdentity.arn` is that session's.
-    fn session_records(&self, event_name: &str, session_arn: &str) -> Vec<(Value, Value)> {
+    pub(crate) fn session_records(
+        &self,
+        event_name: &str,
+        session_arn: &str,
+    ) -> Vec<(Value, Value)> {
         self.lookup("EventName", event_name)
             .into_iter()
             .filter(|(_, document)| {
@@ -336,7 +344,7 @@ impl Audited {
 }
 
 /// A string member of a record or an envelope, or `None` when it does not carry it.
-fn at(event: &Value, pointer: &str) -> Option<String> {
+pub(crate) fn at(event: &Value, pointer: &str) -> Option<String> {
     event
         .pointer(pointer)
         .and_then(Value::as_str)
@@ -344,7 +352,7 @@ fn at(event: &Value, pointer: &str) -> Option<String> {
 }
 
 /// The SHAPE name of an `awsJson1_0` error answer, whose `__type` may carry the namespace.
-fn shape_name(body: &Value) -> String {
+pub(crate) fn shape_name(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_else(|| panic!("expected an error body, got {body}"))
@@ -356,7 +364,7 @@ fn shape_name(body: &Value) -> String {
 
 /// Assert the facts every record of a Step Functions call carries, and the envelope the
 /// lookup reports it in.
-fn assert_sfn_record(
+pub(crate) fn assert_sfn_record(
     case: &str,
     envelope: &Value,
     document: &Value,
@@ -405,7 +413,7 @@ fn assert_sfn_record(
 /// Assert that `document` attributes the call to the caller's SESSION and to the role that
 /// issued it — and to neither the state machine's execution role nor the long-term setup
 /// key.
-fn assert_session_attribution(
+pub(crate) fn assert_session_attribution(
     case: &str,
     envelope: &Value,
     document: &Value,
