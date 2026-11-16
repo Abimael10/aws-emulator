@@ -41,10 +41,11 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     CreateApiKeyCredentialProviderOutput, GetApiKeyCredentialProviderOutput,
-    ResourceNotFoundException, Secret,
+    ResourceNotFoundException, Secret, SecretReference, UpdateApiKeyCredentialProviderOutput,
+    ValidationException,
 };
 
-use super::{timestamp, DEFAULT_REGION};
+use super::{field_validation_failed, timestamp, DEFAULT_REGION};
 
 /// The ARN path segment an API key credential provider of a token vault is
 /// addressed under: `ApiKeyCredentialProviderArnType` nests the provider under
@@ -56,18 +57,43 @@ pub const API_KEY_CREDENTIAL_PROVIDER_ARN_TYPE: &str = "apikeycredentialprovider
 /// service could not resolve for a provider.
 pub const RESOURCE_SECRET: &str = "secret";
 
-/// How this service words the 404 for an API key credential provider this
-/// account does not hold: the resource type and the name the request addressed it
-/// by ("ApiKeyCredentialProvider not found for <name>").
+/// How the READ and the DELETE route word the 404 for an API key credential
+/// provider this account does not hold: the resource type and the name the
+/// request addressed it by ("ApiKeyCredentialProvider not found for <name>").
 ///
 /// The credential-provider routes do NOT take the shared
 /// [`super::resource_not_found`] sentence — they name the resource type and echo
 /// the `name` the caller asked for, which is the identifier those routes address
-/// a provider by. Shared by every operation that resolves a provider, so one
-/// missing provider cannot be reported in two sentences.
+/// a provider by. Shared by the routes that word it this way, so one missing
+/// provider cannot be reported in two sentences by two of them; the UPDATE
+/// route words it differently
+/// ([`api_key_credential_provider_not_found_on_update`]).
 pub fn api_key_credential_provider_not_found(name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("ApiKeyCredentialProvider not found for {name}")),
+    }
+}
+
+/// How the UPDATE route words the same miss: the resource type spelled as that
+/// route spells it, and that it is not there.
+///
+/// Entirely fixed text — nothing of the request is echoed, because the remedy
+/// does not depend on which name was asked for: the caller creates the provider
+/// or corrects the name. The routes of this service do not share one sentence
+/// for a missing resource — the read and the delete above echo the `name` they
+/// could not resolve, while this one states the resource type alone, as the
+/// payment credential provider's routes do
+/// ([`super::PAYMENT_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE`]) — so each route's
+/// wording lives beside the resource it is about rather than being guessed from
+/// another's.
+pub const API_KEY_CREDENTIAL_PROVIDER_NOT_FOUND_ON_UPDATE_MESSAGE: &str =
+    "ApiKey CredentialProvider not found";
+
+/// The modelled not-found error the UPDATE route answers with for an API key
+/// credential provider this account does not hold.
+pub fn api_key_credential_provider_not_found_on_update() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(API_KEY_CREDENTIAL_PROVIDER_NOT_FOUND_ON_UPDATE_MESSAGE.to_string()),
     }
 }
 
@@ -103,7 +129,7 @@ const MANAGED_SECRET_KIND: &str = "apikey";
 /// own. That name is the layout of a secret this SERVICE manages rather than a
 /// secret reference the caller supplied, so it is NOT what the provider reports
 /// as its `apiKeySecretJsonKey` — see
-/// [`ApiKeyCredentialProviderRecord::api_key_secret_json_key`].
+/// [`StoredApiKeySecret::json_key`].
 pub const MANAGED_SECRET_JSON_KEY: &str = "apiKey";
 
 /// The value the secret holding a `MANAGED` provider's key is stored with: the
@@ -160,17 +186,8 @@ pub fn api_key_credential_provider_arn(
 pub struct ApiKeyCredentialProviderRecord {
     pub name: String,
     pub credential_provider_arn: String,
-    /// The ARN of the secret the key lives in: the one this create minted for a
-    /// `MANAGED` provider, or the one Secrets Manager reported for the secret an
-    /// `EXTERNAL` provider references.
-    pub api_key_secret_arn: String,
-    /// The JSON key the API key is extracted from that secret with, as every
-    /// response reporting this provider carries it: the one the caller's own
-    /// `SecretReference` named, and NONE for a secret the service manages, whose
-    /// document layout the caller never named.
-    pub api_key_secret_json_key: Option<String>,
-    /// The effective [`SECRET_SOURCE_MANAGED`] / [`SECRET_SOURCE_EXTERNAL`].
-    pub api_key_secret_source: String,
+    /// The secret the provider's API key lives in, as its owner reported it.
+    pub secret: StoredApiKeySecret,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -181,10 +198,10 @@ impl ApiKeyCredentialProviderRecord {
     pub fn create_output(&self) -> CreateApiKeyCredentialProviderOutput {
         CreateApiKeyCredentialProviderOutput {
             api_key_secret_arn: Secret {
-                secret_arn: self.api_key_secret_arn.clone(),
+                secret_arn: self.secret.secret_arn.clone(),
             },
-            api_key_secret_json_key: self.api_key_secret_json_key.clone(),
-            api_key_secret_source: Some(self.api_key_secret_source.clone()),
+            api_key_secret_json_key: self.secret.json_key.clone(),
+            api_key_secret_source: Some(self.secret.source.clone()),
             name: self.name.clone(),
             credential_provider_arn: self.credential_provider_arn.clone(),
         }
@@ -203,6 +220,159 @@ impl ApiKeyCredentialProviderRecord {
             credential_provider_arn: created.credential_provider_arn,
             created_time: timestamp(self.created_at),
             last_updated_time: timestamp(self.updated_at),
+        }
+    }
+
+    /// Replace the secret this provider's API key lives in with the one an
+    /// update supplied, and record the instant it happened.
+    ///
+    /// An update carries the whole secret configuration — the new key "replaces
+    /// the existing API key", and the source and the reference describe where it
+    /// is to live — so the provider afterwards carries exactly the secret the
+    /// update asked for, with nothing of the previous one left mixed in. What
+    /// the update does NOT touch is what identifies the provider rather than
+    /// configures it: the name it is addressed by, the ARN minted from that
+    /// name, the tags it carries and the instant it was created.
+    pub fn apply_update(&mut self, secret: StoredApiKeySecret, at: SystemTime) {
+        self.secret = secret;
+        self.updated_at = at;
+    }
+
+    /// This provider as `UpdateApiKeyCredentialProvider`'s response envelope —
+    /// the same members the read reports, off the one record the update has just
+    /// written, so the update and a later read cannot disagree.
+    pub fn update_output(&self) -> UpdateApiKeyCredentialProviderOutput {
+        let read = self.get_output();
+        UpdateApiKeyCredentialProviderOutput {
+            api_key_secret_arn: read.api_key_secret_arn,
+            api_key_secret_json_key: read.api_key_secret_json_key,
+            api_key_secret_source: read.api_key_secret_source,
+            name: read.name,
+            credential_provider_arn: read.credential_provider_arn,
+            created_time: read.created_time,
+            last_updated_time: read.last_updated_time,
+        }
+    }
+}
+
+/// The API key secret of one provider, as every response that reports the
+/// provider carries it: who manages it, the ARN its owner holds it at and the
+/// JSON key the value is extracted under. The KEY itself is not here — it is in
+/// Secrets Manager.
+#[derive(Debug, Clone)]
+pub struct StoredApiKeySecret {
+    /// The ARN Secrets Manager answered with: the secret this service minted for
+    /// a `MANAGED` provider, or the one it resolved for the secret an `EXTERNAL`
+    /// provider references.
+    pub secret_arn: String,
+    /// The JSON key the API key is extracted from that secret with, as every
+    /// response reporting this provider carries it: the one the caller's own
+    /// `SecretReference` named, and NONE for a secret the service manages, whose
+    /// document layout the caller never named.
+    pub json_key: Option<String>,
+    /// The EFFECTIVE [`SECRET_SOURCE_MANAGED`] / [`SECRET_SOURCE_EXTERNAL`].
+    pub source: String,
+}
+
+/// The API key secret ONE request asks a provider to carry: where the key is to
+/// live, and therefore what the request has to do about it.
+///
+/// Shared by the create and the update, which describe the secret with the same
+/// three members and so decide it by the same rule: neither can accept a secret
+/// configuration the other would refuse, and a provider's secret is reported one
+/// way whichever operation wrote it.
+#[derive(Debug, Clone)]
+pub enum RequestedApiKeySecret {
+    /// The service manages the secret, so the request's own key is what goes
+    /// into it.
+    Managed(String),
+    /// The caller manages the secret, which the request references by id and
+    /// extracts the key from under `json_key`.
+    External { secret_id: String, json_key: String },
+}
+
+impl RequestedApiKeySecret {
+    /// What the request asks for the provider's secret, or the modelled
+    /// validation failure its members are refused for.
+    ///
+    /// Two rules the model states in PROSE on the members themselves, so the
+    /// framework's constraint walk cannot refuse them and this must: the secret
+    /// reference "is required when apiKeySecretSource is set to EXTERNAL"
+    /// (`smithy_query doc shape=CreateApiKeyCredentialProviderRequest
+    /// member=apiKeySecretConfig`), and a service-managed secret is the place
+    /// the key is "encrypted and stored securely" — the value member has a
+    /// modelled default of `""`, so a request that leaves it out is
+    /// indistinguishable from one that sends it empty, and either way there is
+    /// nothing to store.
+    pub fn from_input(
+        api_key: Option<&str>,
+        requested_source: Option<&str>,
+        config: Option<&SecretReference>,
+    ) -> Result<Self, ValidationException> {
+        let source = effective_secret_source(requested_source, config.is_some());
+        if source == SECRET_SOURCE_EXTERNAL {
+            let reference = config.ok_or_else(|| {
+                field_validation_failed(
+                    API_KEY_SECRET_CONFIG_MEMBER,
+                    &format!("is required when apiKeySecretSource is {SECRET_SOURCE_EXTERNAL}"),
+                )
+            })?;
+            return Ok(Self::External {
+                secret_id: reference.secret_id.clone(),
+                json_key: reference.json_key.clone(),
+            });
+        }
+        let api_key = api_key.unwrap_or_default();
+        if api_key.is_empty() {
+            return Err(field_validation_failed(
+                API_KEY_MEMBER,
+                &format!("is required when apiKeySecretSource is {SECRET_SOURCE_MANAGED}"),
+            ));
+        }
+        Ok(Self::Managed(api_key.to_string()))
+    }
+
+    /// Carry out what the request asked for, against the service that owns the
+    /// secrets, and report the secret the provider is to carry.
+    ///
+    /// An EXTERNAL provider's secret is the CALLER's: nothing is written into
+    /// it, so an `apiKey` sent alongside the reference is not stored anywhere.
+    /// The model states no rule making the two members exclusive, so a request
+    /// carrying both is served rather than refused over it.
+    ///
+    /// Call it with NO state guard held — it awaits.
+    pub async fn resolve(
+        self,
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        token_vault_id: &str,
+        provider_name: &str,
+    ) -> Result<StoredApiKeySecret, ApiKeySecretProblem> {
+        match self {
+            Self::Managed(api_key) => Ok(StoredApiKeySecret {
+                secret_arn: store_managed_api_key(
+                    ctx,
+                    region,
+                    token_vault_id,
+                    provider_name,
+                    &api_key,
+                )
+                .await?,
+                // A secret the SERVICE manages carries the key under a JSON key
+                // of the service's own choosing, which no `SecretReference` of
+                // the request named: there is no caller-supplied JSON key to
+                // report, so the optional member is omitted.
+                json_key: None,
+                source: SECRET_SOURCE_MANAGED.to_string(),
+            }),
+            Self::External {
+                secret_id,
+                json_key,
+            } => Ok(StoredApiKeySecret {
+                secret_arn: referenced_external_secret_arn(ctx, region, &secret_id).await?,
+                json_key: Some(json_key),
+                source: SECRET_SOURCE_EXTERNAL.to_string(),
+            }),
         }
     }
 }

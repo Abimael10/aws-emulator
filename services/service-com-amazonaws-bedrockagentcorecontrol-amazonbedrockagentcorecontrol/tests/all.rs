@@ -25,6 +25,8 @@ mod agent_runtime_lifecycle;
 mod api_key_credential_provider_deletion;
 #[path = "all/api_key_credential_provider_lifecycle.rs"]
 mod api_key_credential_provider_lifecycle;
+#[path = "all/api_key_credential_provider_update.rs"]
+mod api_key_credential_provider_update;
 #[path = "all/browser_lifecycle.rs"]
 mod browser_lifecycle;
 #[path = "all/browser_listing_pagination.rs"]

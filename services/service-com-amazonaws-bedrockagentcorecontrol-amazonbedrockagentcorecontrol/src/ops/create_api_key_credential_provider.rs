@@ -194,48 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which secret the provider's key lives in, and therefore what this
         // create has to do about it: the service manages the secret it stores
         // the caller's `apiKey` in, or the caller manages their own and the
-        // request references it.
-        let source = crate::state::effective_secret_source(
+        // request references it. Decided by the rule the update beside this
+        // create shares, and decided BEFORE anything is minted, so a refused
+        // request stores nothing.
+        let requested = crate::state::RequestedApiKeySecret::from_input(
+            input.api_key.as_deref(),
             input.api_key_secret_source.as_deref(),
-            input.api_key_secret_config.is_some(),
+            input.api_key_secret_config.as_ref(),
         )
-        .to_string();
-        let api_key = input.api_key.as_deref().unwrap_or_default();
-
-        // Two rules the model states in prose on the members themselves, so the
-        // framework's constraint walk cannot refuse them: the secret reference
-        // "is required when apiKeySecretSource is set to EXTERNAL", and a
-        // service-managed secret is the place the `apiKey` is "encrypted and
-        // stored securely" — there is nothing to store without one.
-        let external_reference = if source == crate::state::SECRET_SOURCE_EXTERNAL {
-            let Some(reference) = input.api_key_secret_config.clone() else {
-                return Err(CreateApiKeyCredentialProviderErrorModeled::ValidationException(
-                    crate::state::field_validation_failed(
-                        crate::state::API_KEY_SECRET_CONFIG_MEMBER,
-                        &format!(
-                            "is required when apiKeySecretSource is {}",
-                            crate::state::SECRET_SOURCE_EXTERNAL
-                        ),
-                    ),
-                )
-                .into());
-            };
-            Some(reference)
-        } else {
-            None
-        };
-        if external_reference.is_none() && api_key.is_empty() {
-            return Err(CreateApiKeyCredentialProviderErrorModeled::ValidationException(
-                crate::state::field_validation_failed(
-                    crate::state::API_KEY_MEMBER,
-                    &format!(
-                        "is required when apiKeySecretSource is {}",
-                        crate::state::SECRET_SOURCE_MANAGED
-                    ),
-                ),
-            )
-            .into());
-        }
+        .map_err(CreateApiKeyCredentialProviderErrorModeled::ValidationException)?;
 
         // The name this account already holds a provider under, and this
         // emulator's own ceiling, are both decided before anything is minted:
@@ -271,46 +238,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provider is not recorded — and no success is reported — when there is no
         // secret to name.
         //
-        // WHERE THAT SECRET LIVES. Both calls below go through this request's own
-        // in-process callback (`crate::state::secrets_manager_client`, built on
-        // `ctx.callback()`), which dispatches back into this same emulator's
-        // Secrets Manager service over the in-memory engine: no socket is opened,
-        // nothing leaves this process, and no real account is reached. Only ids
-        // this process holds resolve, so the request cannot learn anything about
-        // any secret outside this emulator.
+        // WHERE THAT SECRET LIVES. The resolution below goes through this
+        // request's own in-process callback (`crate::state::secrets_manager_client`,
+        // built on `ctx.callback()`), which dispatches back into this same
+        // emulator's Secrets Manager service over the in-memory engine: no socket
+        // is opened, nothing leaves this process, and no real account is reached.
+        // Only ids this process holds resolve, so the request cannot learn
+        // anything about any secret outside this emulator.
         //
         // An external provider's secret is the CALLER's: nothing is written into
         // it, so an `apiKey` sent alongside the reference is not stored anywhere.
         // The model states no rule making the two members exclusive, so the
         // request is served rather than refused over it.
-        let (api_key_secret_arn, api_key_secret_json_key) = match external_reference {
-            Some(reference) => {
-                let arn = crate::state::referenced_external_secret_arn(
-                    ctx,
-                    &region,
-                    &reference.secret_id,
-                )
-                .await
-                .map_err(|problem| secret_problem(problem, &reference.secret_id))?;
-                (arn, Some(reference.json_key))
-            }
-            None => {
-                let arn = crate::state::store_managed_api_key(
-                    ctx,
-                    &region,
-                    vault,
-                    &input.name,
-                    api_key,
-                )
-                .await
-                .map_err(|problem| secret_problem(problem, &input.name))?;
-                // A secret the SERVICE manages carries the key under a JSON key
-                // of the service's own choosing, which no `SecretReference` of
-                // the request named: there is no caller-supplied JSON key to
-                // report, so the optional member is omitted.
-                (arn, None)
-            }
-        };
+        let secret = requested
+            .resolve(ctx, &region, vault, &input.name)
+            .await
+            .map_err(|problem| secret_problem(problem, &input.name))?;
 
         let record = crate::state::ApiKeyCredentialProviderRecord {
             credential_provider_arn: crate::state::api_key_credential_provider_arn(
@@ -319,9 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.name,
             ),
             name: input.name,
-            api_key_secret_arn,
-            api_key_secret_json_key,
-            api_key_secret_source: source,
+            secret,
             tags: crate::state::sorted_map(input.tags),
             created_at: now,
             updated_at: now,

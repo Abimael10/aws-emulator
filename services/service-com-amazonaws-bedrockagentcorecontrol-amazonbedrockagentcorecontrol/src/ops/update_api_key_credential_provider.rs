@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApiKeyCredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApiKeyCredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApiKeyCredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +177,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApiKeyCredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiKeyCredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApiKeyCredentialProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApiKeyCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the credential provider store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let vault = crate::state::DEFAULT_TOKEN_VAULT_ID;
+
+        // The secret an update asks the provider to carry is decided exactly as
+        // a create's is — the same three members describe it, so the same rule
+        // decides it — and decided BEFORE anything is written, so a refused
+        // update leaves the provider and its secret as they were.
+        let requested = crate::state::RequestedApiKeySecret::from_input(
+            input.api_key.as_deref(),
+            input.api_key_secret_source.as_deref(),
+            input.api_key_secret_config.as_ref(),
+        )
+        .map_err(UpdateApiKeyCredentialProviderErrorModeled::ValidationException)?;
+
+        // This operation "Updates an existing API key credential provider", and
+        // the store is keyed by the `name` every credential-provider route
+        // addresses a provider by, so a name naming no stored provider is the
+        // modelled 404 rather than a provider minted by an update. The guard is
+        // dropped before the await below.
+        {
+            let store = state.lock();
+            if !store.api_key_credential_providers.contains_key(&input.name) {
+                return Err(provider_not_found().into());
+            }
+        }
+
+        // The secret the updated provider reports is a secret this emulator's
+        // OWN Secrets Manager really holds: the one this update puts the
+        // caller's new key into for a managed provider, or the one the request
+        // references for an external one. The ARN is `@required` on this
+        // operation's own answer, so the provider is left untouched — and no
+        // success reported — when there is no secret to name.
+        let secret = requested
+            .resolve(ctx, &region, vault, &input.name)
+            .await
+            .map_err(|problem| secret_problem(problem, &input.name))?;
+
+        let mut store = state.lock();
+        // The provider was there when this request started and the secret
+        // resolution above awaited: one deleted in the meantime is gone, so the
+        // update is refused rather than re-creating it.
+        let record = store
+            .api_key_credential_providers
+            .get_mut(&input.name)
+            .ok_or_else(provider_not_found)?;
+
+        record.apply_update(secret, now);
+
+        Ok(record.update_output())
+    }
+}
+
+/// The refusal of an update whose `name` resolves to no provider of this
+/// account, worded as the UPDATE route words it: the resource type and that it
+/// is not there, with nothing of the request echoed.
+fn provider_not_found() -> UpdateApiKeyCredentialProviderErrorModeled {
+    UpdateApiKeyCredentialProviderErrorModeled::ResourceNotFoundException(
+        crate::state::api_key_credential_provider_not_found_on_update(),
+    )
+}
+
+/// How an update answers when the secret the provider's key lives in could not
+/// be reported, on the same rule the create beside it follows: a reference
+/// naming no secret of this account is the modelled 404 for "a resource
+/// referenced by the operation does not exist"; a secret whose own KMS key will
+/// not decrypt it is the modelled `DecryptionFailure`, the one failure the
+/// caller recovers from by fixing the key rather than the request; anything else
+/// is this emulator's in-process Secrets Manager not answering, which is a
+/// server failure rather than a statement about the request.
+fn secret_problem(
+    problem: crate::state::ApiKeySecretProblem,
+    provider: &str,
+) -> UpdateApiKeyCredentialProviderError {
+    match problem {
+        crate::state::ApiKeySecretProblem::Absent => {
+            UpdateApiKeyCredentialProviderErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_SECRET),
+            )
+            .into()
+        }
+        crate::state::ApiKeySecretProblem::Undecryptable => {
+            UpdateApiKeyCredentialProviderErrorModeled::DecryptionFailure(DecryptionFailure {
+                message: crate::state::SECRET_UNDECRYPTABLE_MESSAGE.to_string(),
+            })
+            .into()
+        }
+        crate::state::ApiKeySecretProblem::Unavailable(detail) => {
+            ::tracing::warn!(
+                %provider,
+                %detail,
+                "the API key credential provider's secret could not be stored in or resolved \
+                 against Secrets Manager, so the provider was left unchanged",
+            );
+            UpdateApiKeyCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the API key could not be stored in Secrets Manager".to_string(),
+                    ),
+                },
+            )
+            .into()
+        }
     }
 }
