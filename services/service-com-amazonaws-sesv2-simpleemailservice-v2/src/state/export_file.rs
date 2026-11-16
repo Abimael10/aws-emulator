@@ -178,18 +178,10 @@ pub struct ExportFile {
     /// run read, before the export's own filters and limits.
     pub processed_records: i32,
     /// `ExportStatistics$ExportedRecordsCount`: "the number of records that were
-    /// exported to the final export file".
+    /// exported to the final export file". Whether the job's source type REPORTS this
+    /// count is the job's own question ([`ExportJobRecord::statistics`]); the run
+    /// counts the records it wrote either way.
     pub exported_records: i32,
-}
-
-impl ExportFile {
-    /// The modelled `ExportStatistics` view of the run that wrote this file.
-    pub fn statistics(&self) -> crate::ops::types::ExportStatistics {
-        crate::ops::types::ExportStatistics {
-            processed_records_count: Some(self.processed_records),
-            exported_records_count: Some(self.exported_records),
-        }
-    }
 }
 
 /// The file the run of `job` writes from `store`.

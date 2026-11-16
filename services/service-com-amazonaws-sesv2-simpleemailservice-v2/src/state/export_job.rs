@@ -96,15 +96,15 @@ pub fn export_destination_s3_url_is_set_by_ses() -> String {
 }
 
 /// How this service words `NotFoundException` for a `JobId` the account holds no export
-/// job for, stated once for every operation that reads an export job by its id.
+/// job for, stated once for every operation that addresses an export job by its id.
 ///
 /// `NotFoundException` is documented only as "the resource you attempted to access
-/// doesn't exist", which names no resource, so the sentence names the resource kind and
-/// the requested id, which is its only variable part, taken from the request — the same
-/// wording this service gives every other resource it is asked for by id
-/// ([`import_job_not_found`]).
+/// doesn't exist", which names no resource, so the fixed text is the one a recording of
+/// this surface answers an unknown export-job id with — `Job ID: <` and `> not found`,
+/// the angle brackets around the id included — and its single variable part is the
+/// `JobId` the request asked for, taken from the request's own URI label.
 pub fn export_job_not_found(job_id: &str) -> String {
-    format!("Export job {job_id} does not exist.")
+    format!("Job ID: <{job_id}> not found")
 }
 
 /// How this service words `BadRequestException` for a request to cancel an export job
@@ -121,6 +121,18 @@ pub fn export_job_not_cancellable(status: ExportJobStatus) -> String {
         "Cannot cancel an export job that has a <{}> status.",
         status.as_str()
     )
+}
+
+/// Whether an export of `source_type` has an `ExportStatistics$ExportedRecordsCount`
+/// to report.
+///
+/// "The number of records that were exported to the final export file. This value
+/// might not be available for all export source types": the count is a property of the
+/// export SOURCE rather than of one run, so it is reported for the source types that
+/// have one — the metrics export — and left unset for a source type that has none,
+/// which is how the model says a count is unavailable.
+pub fn reports_exported_records(source_type: &str) -> bool {
+    source_type == EXPORT_SOURCE_METRICS_DATA
 }
 
 /// One export job: the data the export draws on, the format it is written in, how far
@@ -238,6 +250,24 @@ impl ExportJobRecord {
         // completing run would have written is never written.
         self.completed_at = None;
         self.file = None;
+    }
+
+    /// The modelled `ExportStatistics` view of this job's run.
+    ///
+    /// "Statistics about the execution of an export job" is a member of every read of a
+    /// job, so the STRUCTURE is reported for every job; each COUNT inside it is
+    /// reported only where there is one, because an unset count is how the model says a
+    /// count is not available. A run that has not written its file has counted nothing
+    /// yet, so both counts are unset until it has; and `ExportedRecordsCount` is
+    /// reported only for a source type that has one ([`reports_exported_records`]).
+    pub fn statistics(&self) -> crate::ops::types::ExportStatistics {
+        let file = self.file.as_ref();
+        crate::ops::types::ExportStatistics {
+            processed_records_count: file.map(|file| file.processed_records),
+            exported_records_count: file
+                .filter(|_| reports_exported_records(&self.source_type))
+                .map(|file| file.exported_records),
+        }
     }
 
     /// This job's position in a listing of the account's export jobs: the instant it

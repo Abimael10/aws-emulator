@@ -16,8 +16,11 @@
 //!   the create asked for, and when the job was created and completed;
 //! * "when the job status is COMPLETED, the response includes a pre-signed URL in
 //!   `ExportDestination.S3Url` that you use to download the export file" — so a run
-//!   that has not completed reports no URL and no statistics, and one that has reports
-//!   both;
+//!   that has not completed reports no URL, and one that has reports one;
+//! * every read carries the `Statistics` structure, and a COUNT inside it only where
+//!   there is one: a run that has written no file has counted nothing, and
+//!   `ExportedRecordsCount` — "this value might not be available for all export source
+//!   types" — is reported for the metrics export only;
 //! * the URL leads back to this emulator and serves the file the run wrote: the
 //!   records the job's data source selects, rendered in the data format it asks for,
 //!   with the statistics counting exactly those records;
@@ -147,20 +150,25 @@ impl Reply {
             .to_string()
     }
 
-    /// `(ProcessedRecordsCount, ExportedRecordsCount)`, or `None` when the answer
-    /// carries no statistics at all.
-    fn statistics(&self) -> Option<(i64, i64)> {
-        let statistics = self.body.get("Statistics")?;
+    /// The `Statistics` structure the answer carries, if any.
+    fn statistics(&self) -> Option<Value> {
+        self.body.get("Statistics").cloned()
+    }
+
+    /// `(ProcessedRecordsCount, ExportedRecordsCount)` as the statistics carry them —
+    /// each `None` when the structure leaves that count unset, which is how the model
+    /// says a count is not available.
+    fn counts(&self) -> (Option<i64>, Option<i64>) {
         let count = |member: &str| {
-            statistics
-                .get(member)
+            self.body
+                .get("Statistics")
+                .and_then(|statistics| statistics.get(member))
                 .and_then(Value::as_i64)
-                .unwrap_or_default()
         };
-        Some((
+        (
             count("ProcessedRecordsCount"),
             count("ExportedRecordsCount"),
-        ))
+        )
     }
 }
 
@@ -340,6 +348,16 @@ impl Ses {
     async fn get(&self, job_id: &str) -> Reply {
         self.call("GET", &format!("/v2/email/export-jobs/{job_id}"), None)
             .await
+    }
+
+    /// Cancel one export job, so a case can read a job whose run was stopped.
+    async fn cancel(&self, job_id: &str) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/v2/email/export-jobs/{job_id}/cancel"),
+            None,
+        )
+        .await
     }
 
     /// Fetch one URL this emulator handed out, exactly as it was handed out.
@@ -677,12 +695,24 @@ async fn a_read_reports_the_stored_job_and_its_destination_once_the_run_wrote_a_
              completed, got {:?}",
             reply.s3_url()
         );
-        assert_eq!(
+        assert!(
             reply.statistics().is_some(),
+            "case {case:?}: every read of a job carries the statistics structure, got \
+             {:?}",
+            reply.body
+        );
+        let counted = reply.counts();
+        assert_eq!(
+            counted.0.is_some(),
             finished,
-            "case {case:?}: the statistics appear exactly when the run has written a \
-             file, got {:?}",
-            reply.statistics()
+            "case {case:?}: the processed count appears exactly when the run has \
+             written a file, got {counted:?}"
+        );
+        assert_eq!(
+            counted.1.is_some(),
+            finished && row.source_type == METRICS_DATA,
+            "case {case:?}: the exported count appears exactly when a run of a source \
+             type that reports it has written a file, got {counted:?}"
         );
         assert_eq!(
             reply.member("CompletedTimestamp").is_some(),
@@ -709,6 +739,147 @@ async fn a_read_reports_the_stored_job_and_its_destination_once_the_run_wrote_a_
                 "case {case:?}: expected the media type the data format is served as, \
                  got {:?}",
                 fetched.media_type
+            );
+        }
+    }
+}
+
+/// Where a job's run stands when a case reads its statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The clock has taken the run as far as `Run` says.
+    Reached(Run),
+    /// A request cancelled the run before it completed.
+    Cancelled,
+}
+
+impl Stage {
+    /// The modelled `JobStatus` a job at this stage reports.
+    fn status(self) -> &'static str {
+        match self {
+            Self::Reached(run) => run.status(),
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+}
+
+/// One row of the statistics table: a job of this source type, read with its run at
+/// this stage.
+struct StatisticsRow {
+    case: &'static str,
+    source_type: &'static str,
+    stage: Stage,
+}
+
+/// Every source type met at every stage a run can be read at, cancellation included.
+///
+/// The rows differ along what the rule generalises over: which export source the job
+/// draws on, and whether its run has counted anything yet — nothing at all, part way
+/// through, finished, or stopped for good.
+const STATISTICS_ROWS: &[StatisticsRow] = &[
+    StatisticsRow {
+        case: "metrics data, run not started",
+        source_type: METRICS_DATA,
+        stage: Stage::Reached(Run::Created),
+    },
+    StatisticsRow {
+        case: "metrics data, run in progress",
+        source_type: METRICS_DATA,
+        stage: Stage::Reached(Run::Processing),
+    },
+    StatisticsRow {
+        case: "metrics data, run finished",
+        source_type: METRICS_DATA,
+        stage: Stage::Reached(Run::Completed),
+    },
+    StatisticsRow {
+        case: "metrics data, run cancelled",
+        source_type: METRICS_DATA,
+        stage: Stage::Cancelled,
+    },
+    StatisticsRow {
+        case: "message insights, run not started",
+        source_type: MESSAGE_INSIGHTS,
+        stage: Stage::Reached(Run::Created),
+    },
+    StatisticsRow {
+        case: "message insights, run in progress",
+        source_type: MESSAGE_INSIGHTS,
+        stage: Stage::Reached(Run::Processing),
+    },
+    StatisticsRow {
+        case: "message insights, run finished",
+        source_type: MESSAGE_INSIGHTS,
+        stage: Stage::Reached(Run::Completed),
+    },
+    StatisticsRow {
+        case: "message insights, run cancelled",
+        source_type: MESSAGE_INSIGHTS,
+        stage: Stage::Cancelled,
+    },
+];
+
+#[tokio::test]
+async fn every_read_carries_the_statistics_structure_and_only_the_counts_it_has() {
+    // The log holds the three messages of the one logged day, so a run that has
+    // finished READ three records whichever source it draws on, and the metrics export
+    // selected here WROTE the one day-and-provider combination that activity falls
+    // into.
+    const PROCESSED: i64 = 3;
+    const METRICS_EXPORTED: i64 = 1;
+
+    for row in STATISTICS_ROWS {
+        for data_format in [CSV, JSON] {
+            let case = format!("{} as {data_format}", row.case);
+            let ses = with_logged_day().await;
+            let data_source = if row.source_type == METRICS_DATA {
+                metrics_source(json!({"ISP": ["gmail"]}), json!([metric("SEND", "VOLUME")]))
+            } else {
+                insights_source(json!({}))
+            };
+            let job_id = ses.create(data_source, data_format).await;
+            match row.stage {
+                Stage::Reached(run) => ses.drive(&job_id, run),
+                Stage::Cancelled => {
+                    let cancelled = ses.cancel(&job_id).await;
+                    assert_eq!(
+                        cancelled.status, 200,
+                        "case {case:?}: expected 200 from the cancellation, got {} {:?}",
+                        cancelled.status, cancelled.body
+                    );
+                }
+            }
+
+            let reply = ses.get(&job_id).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected 200 from the read, got {} {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.text("JobStatus"),
+                row.stage.status(),
+                "case {case:?}: expected the status the job's run reached, got {:?}",
+                reply.body
+            );
+
+            // The structure is part of every read; a count inside it is there only
+            // where the run has one and the source type reports it.
+            let expected = match (row.stage, row.source_type) {
+                (Stage::Reached(Run::Completed), METRICS_DATA) => json!({
+                    "ProcessedRecordsCount": PROCESSED,
+                    "ExportedRecordsCount": METRICS_EXPORTED,
+                }),
+                (Stage::Reached(Run::Completed), _) => {
+                    json!({"ProcessedRecordsCount": PROCESSED})
+                }
+                _ => json!({}),
+            };
+            assert_eq!(
+                reply.statistics(),
+                Some(expected.clone()),
+                "case {case:?}: expected the statistics {expected}, got {:?}",
+                reply.statistics()
             );
         }
     }
@@ -797,12 +968,13 @@ async fn a_metrics_export_file_derives_its_shape_from_the_request_and_its_values
             ses.drive(&job_id, Run::Completed);
 
             let reply = ses.get(&job_id).await;
+            let (processed, exported) = row.statistics;
             assert_eq!(
-                reply.statistics(),
-                Some(row.statistics),
+                reply.counts(),
+                (Some(processed), Some(exported)),
                 "case {case:?}: expected the counts of the records the run read and \
                  wrote, got {:?}",
-                reply.statistics()
+                reply.counts()
             );
             let url = reply.s3_url().unwrap_or_else(|| {
                 panic!("case {case:?}: a completed run must hand out a URL, got {:?}", reply.body)
@@ -874,8 +1046,10 @@ struct InsightsRow {
     filters: fn() -> Value,
     /// The recipients the file must hold a record for, in order.
     destinations: &'static [&'static str],
-    /// `(ProcessedRecordsCount, ExportedRecordsCount)` the run must report.
-    statistics: (i64, i64),
+    /// `ProcessedRecordsCount` the run must report. The records it WROTE are the
+    /// recipients above, which the file itself is asserted to hold: a Message
+    /// Insights export reports no `ExportedRecordsCount`.
+    processed: i64,
 }
 
 /// The Message Insights exports these cases ask for.
@@ -889,25 +1063,25 @@ const INSIGHTS_ROWS: &[InsightsRow] = &[
         case: "no filter at all",
         filters: || json!({}),
         destinations: &["first@gmail.com", "second@gmail.com", "third@yahoo.com"],
-        statistics: (3, 3),
+        processed: 3,
     },
     InsightsRow {
         case: "a destination suffix match",
         filters: || json!({"Include": {"Destination": ["*@gmail.com"]}}),
         destinations: &["first@gmail.com", "second@gmail.com"],
-        statistics: (3, 2),
+        processed: 3,
     },
     InsightsRow {
         case: "a subject prefix match",
         filters: || json!({"Include": {"Subject": ["Weekly*"]}}),
         destinations: &["first@gmail.com", "third@yahoo.com"],
-        statistics: (3, 2),
+        processed: 3,
     },
     InsightsRow {
         case: "an exact from address, of two values joined by OR",
         filters: || json!({"Include": {"FromEmailAddress": ["other@example.com", "nobody@example.com"]}}),
         destinations: &["third@yahoo.com"],
-        statistics: (3, 1),
+        processed: 3,
     },
     InsightsRow {
         case: "two filters joined by AND",
@@ -915,25 +1089,25 @@ const INSIGHTS_ROWS: &[InsightsRow] = &[
             json!({"Include": {"Destination": ["*gmail*"], "Subject": ["*digest"]}})
         },
         destinations: &["first@gmail.com"],
-        statistics: (3, 1),
+        processed: 3,
     },
     InsightsRow {
         case: "an excluded provider, named without its public suffix",
         filters: || json!({"Exclude": {"Isp": ["Gmail"]}}),
         destinations: &["third@yahoo.com"],
-        statistics: (3, 1),
+        processed: 3,
     },
     InsightsRow {
         case: "the delivery event every accepted message carries",
         filters: || json!({"Include": {"LastDeliveryEvent": ["SEND"]}}),
         destinations: &["first@gmail.com", "second@gmail.com", "third@yahoo.com"],
-        statistics: (3, 3),
+        processed: 3,
     },
     InsightsRow {
         case: "a result limit under what the interval holds",
         filters: || json!({"MaxResults": 2}),
         destinations: &["first@gmail.com", "second@gmail.com"],
-        statistics: (3, 2),
+        processed: 3,
     },
 ];
 
@@ -950,11 +1124,11 @@ async fn a_message_insights_export_file_holds_the_records_its_filters_select() {
 
         let reply = ses.get(&job_id).await;
         assert_eq!(
-            reply.statistics(),
-            Some(row.statistics),
-            "case {case:?}: expected the counts of the records the run read and wrote, \
-             got {:?}",
-            reply.statistics()
+            reply.counts(),
+            (Some(row.processed), None),
+            "case {case:?}: expected the count of the records the run read, and no \
+             exported count for this source type, got {:?}",
+            reply.counts()
         );
         let url = reply.s3_url().unwrap_or_else(|| {
             panic!(
@@ -1206,15 +1380,27 @@ async fn a_job_id_the_account_holds_no_export_job_for_is_not_found() {
     let stored = ses
         .create(insights_source(json!({})), CSV)
         .await;
-    for case in [
-        "an id no create ever minted",
-        "the stored id with one character more",
-    ] {
-        let job_id = if case.starts_with("an id no") {
-            "00000000-0000-4000-8000-000000000000".to_string()
-        } else {
-            format!("{stored}0")
-        };
+    // Ids of several forms, none of which a stored job carries: the refusal is the
+    // same whatever the id looks like, and the one part of it that varies is the id
+    // the request asked for.
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "an id no create ever minted",
+            "00000000-0000-4000-8000-000000000000".to_string(),
+        ),
+        ("the stored id with one character more", format!("{stored}0")),
+        (
+            "the stored id with one character fewer",
+            stored[..stored.len() - 1].to_string(),
+        ),
+        ("the shortest id the model admits", "x".to_string()),
+        (
+            "an id of another form entirely",
+            "EXPORT-JOB-0000000001".to_string(),
+        ),
+        ("an id far longer than a minted one", "j".repeat(256)),
+    ];
+    for (case, job_id) in cases {
         let reply = ses.get(&job_id).await;
         assert_eq!(
             reply.status, 404,
@@ -1229,7 +1415,7 @@ async fn a_job_id_the_account_holds_no_export_job_for_is_not_found() {
         );
         assert_eq!(
             reply.message(),
-            format!("Export job {job_id} does not exist."),
+            format!("Job ID: <{job_id}> not found"),
             "case {case:?}: expected the not-found wording to name the requested id, \
              got {:?}",
             reply.message()
@@ -1298,9 +1484,9 @@ async fn the_file_a_run_wrote_does_not_change_when_the_records_do() {
          {after:?}"
     );
     assert_eq!(
-        again.statistics(),
-        first.statistics(),
+        again.counts(),
+        first.counts(),
         "the statistics of a completed run count the records it wrote, got {:?}",
-        again.statistics()
+        again.counts()
     );
 }

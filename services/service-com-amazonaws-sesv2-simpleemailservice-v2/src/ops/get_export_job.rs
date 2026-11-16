@@ -225,9 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The failure details about an export job": an emulated run is bookkeeping
             // and cannot fail, so no job has failure details to report.
             failure_info: None,
-            // "The statistics about the export job": the counts of the run that wrote
-            // the file, which exist once it has written one.
-            statistics: job.file.as_ref().map(crate::state::ExportFile::statistics),
+            // "The statistics about the export job": the structure is part of every
+            // read of a job, and the counts inside it are the stored run's — unset
+            // while there is no count to report.
+            statistics: Some(job.statistics()),
         })
     }
 }

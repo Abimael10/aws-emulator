@@ -395,7 +395,8 @@ async fn a_cancellation_stops_a_run_that_has_not_ended() {
 
             // The cancellation is reported by the stored job: every later read of it
             // reports the terminal status, and the run it stopped never completed, so
-            // there is no completion instant, no statistics and no file to download.
+            // there is no completion instant, no count in its statistics and no file
+            // to download.
             let read = ses.get(&job_id).await;
             assert_eq!(
                 read.status, 200,
@@ -428,8 +429,9 @@ async fn a_cancellation_stops_a_run_that_has_not_ended() {
             );
             assert_eq!(
                 read.body.get("Statistics"),
-                None,
-                "case {case:?}: a stopped run counted no records, got {:?}",
+                Some(&json!({})),
+                "case {case:?}: a stopped run counted no records, so the statistics \
+                 carry no count at all, got {:?}",
                 read.body
             );
             assert_eq!(
@@ -591,7 +593,7 @@ async fn a_job_id_the_account_holds_no_job_for_is_not_found() {
         );
         assert_eq!(
             reply.message(),
-            format!("Export job {job_id} does not exist."),
+            format!("Job ID: <{job_id}> not found"),
             "case {job_id:?}: expected the refusal to name the requested id, got {:?}",
             reply.message()
         );
