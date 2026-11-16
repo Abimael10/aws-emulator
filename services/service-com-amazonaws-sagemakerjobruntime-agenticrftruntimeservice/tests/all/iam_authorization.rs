@@ -37,7 +37,7 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    create_job, job_arn, minted_job_arn, mounted_service, send_as, Reply, ACCOUNT,
+    create_job, job_arn, minted_job_arn, mounted_with_identity, send_as, Reply, ACCOUNT,
     COMPLETE_ROLLOUT_PATH, DEFAULT_ACCESS_KEY_ID, JOB_ARN_HEADER, REGION, SAMPLE_PATH,
     SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER, UPDATE_REWARD_PATH,
 };
@@ -76,22 +76,11 @@ const OPERATIONS: [(&str, &str); 4] = [
 const ACTION_PREFIX: &str = "sagemaker";
 
 /// A router carrying this service beside the IAM and STS services over ONE shared engine,
-/// so the policies and the session the rows seed are the ones those services hold. This
-/// service itself is mounted by the shared harness, so there is one mounting of it.
+/// so the policies and the session the rows seed are the ones those services hold — the
+/// shared harness's own assembly (`tests/all/harness.rs`), which every suite about WHO may
+/// call an operation drives.
 fn router_with_identity() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
-    let (engine, mut router) = mounted_service();
-    router
-        .register_service(
-            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
-                Arc::clone(&engine),
-            ),
-        )
-        .register_service(
-            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
-                Arc::clone(&engine),
-            ),
-        );
-    (engine, router)
+    mounted_with_identity()
 }
 
 /// The principal ARN the seeded session speaks for — what a refusal must name.

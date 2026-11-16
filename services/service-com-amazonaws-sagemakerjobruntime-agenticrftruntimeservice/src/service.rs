@@ -261,20 +261,15 @@ fn worded(violations: &[Violation]) -> Option<String> {
 /// `violations` worded again with every quoted value held to its share of what the carrying
 /// member leaves after the clauses' own prose, for a sentence that did not fit it.
 ///
-/// Why a share rather than a per-clause ceiling: the clauses of one refusal are joined into
-/// ONE `Message`, so what they may quote is bounded TOGETHER — a ceiling that fits one
-/// clause fits two of them twice over. The prose is read off the sentence just worded (its
-/// length less the echoes interpolated into it), so no count of clause text is
-/// kept by hand, and what is left is handed out shortest echo first: a clause that needs
-/// less than an equal share leaves the rest to the clauses that quote more, so the sentence
-/// states as much of each value as the member admits.
+/// The holding itself is the service's one ([`each_held_within_the_message_maximum`]): the
+/// clauses of one refusal are joined into ONE `Message`, so what they may quote is bounded
+/// TOGETHER. The only thing this reads off the violations is the PROSE the clauses state
+/// around their values — the sentence just worded, less the echoes interpolated into it — so
+/// no count of clause text is kept by hand.
 ///
-/// Holding an echo keeps the byte count it names
-/// ([`service_common::validation::echo_held_to`]), so every clause still reports how much
-/// was sent. Where the clauses' own prose alone fills the member — which takes more clauses
-/// than this model's four input members can break at once — there is nothing caller-sized
-/// left to hold, and the unheld sentence stands rather than one with clauses missing from
-/// it.
+/// Where the clauses' own prose alone fills the member — which takes more clauses than this
+/// model's four input members can break at once — there is nothing caller-sized left to
+/// hold, and the unheld sentence stands rather than one with clauses missing from it.
 ///
 /// The held clauses are worded through the same renderer as the unheld ones ([`worded`]), so
 /// a clause this service words itself is not lost by holding the value it quotes.
@@ -282,48 +277,82 @@ fn held_within_the_message_maximum(
     violations: &[Violation],
     rendered: &str,
 ) -> Option<String> {
-    // The clauses that quote a value, shortest echo first, so an unspent share reaches the
-    // clauses that quote more.
-    let mut quoting: Vec<usize> = (0..violations.len())
+    // The clauses that quote a value: the only part of this sentence that is the caller's
+    // to size.
+    let quoting: Vec<usize> = (0..violations.len())
         .filter(|at| violations[*at].value.is_some())
         .collect();
     if quoting.is_empty() {
         return None;
     }
-    quoting.sort_by_key(|at| violations[*at].value.as_deref().unwrap_or_default().len());
 
     let echoed: usize = violations
         .iter()
         .filter_map(|violation| violation.value.as_deref())
         .map(str::len)
         .sum();
+    // What the clauses STATE around the values, read off the sentence just worded rather
+    // than counted by hand.
     let prose = rendered.len().saturating_sub(echoed);
-    let mut budget = LARGEST_MESSAGE_BYTES.saturating_sub(prose);
-    let mut room = vec![0_usize; violations.len()];
-    let mut left = quoting.len();
-    for at in quoting {
-        let share = budget / left;
-        let echo = violations[at].value.as_deref().unwrap_or_default();
-        let spent = service_common::validation::echo_held_to(echo, share).len();
-        budget -= spent.min(budget);
-        room[at] = share;
-        left -= 1;
-    }
+    let quoted: Vec<&str> = quoting
+        .iter()
+        .map(|at| violations[*at].value.as_deref().unwrap_or_default())
+        .collect();
+    let mut held_values = each_held_within_the_message_maximum(prose, &quoted).into_iter();
 
+    // The held values are handed back in the order they were collected, so each clause that
+    // quoted one takes the next.
     let held: Vec<Violation> = violations
         .iter()
-        .enumerate()
-        .map(|(at, violation)| Violation {
+        .map(|violation| Violation {
             path: violation.path.clone(),
             kind: violation.kind.clone(),
-            value: violation
-                .value
-                .as_deref()
-                .map(|echo| service_common::validation::echo_held_to(echo, room[at]).into_owned()),
+            value: match violation.value {
+                Some(_) => held_values.next(),
+                None => None,
+            },
             sensitive: violation.sensitive,
         })
         .collect();
     worded(&held)
+}
+
+/// Each of `quoted` held to its share of what the member a refusal is CARRIED in leaves once
+/// `prose` bytes of that refusal's own wording are in it
+/// ([`service_common::validation::echo_held_to`]).
+///
+/// THE ONE place a refusal of this service holds a caller-sized value, whichever path words
+/// it: the values the framework's clauses quote ([`held_within_the_message_maximum`]) and the
+/// principal and resource the authorization gate's own sentence names
+/// ([`authorization`]) — whose principal ARN is read out of the IAM store and is therefore
+/// bounded by THAT model rather than by this one, so a sentence carrying it is not inside
+/// this member by construction the way one interpolating only this model's own members is.
+///
+/// Why a SHARE rather than a per-value ceiling: the parts of one refusal are joined into ONE
+/// `Message`, so what they may state together is bounded TOGETHER — a ceiling that fits one
+/// of them fits two of them twice over. What the prose leaves is handed out shortest value
+/// first, so a value needing less than an equal share leaves the rest to the values that
+/// state more and the sentence carries as much of each as the member admits. Holding a value
+/// keeps the byte count it names, so every part still reports how much there was.
+///
+/// Where the prose ALONE fills the member there is nothing caller-sized left to hold: each
+/// value is then stated by its byte count alone, which is the one thing a caller can read
+/// nowhere else.
+pub(crate) fn each_held_within_the_message_maximum(prose: usize, quoted: &[&str]) -> Vec<String> {
+    let mut shortest_first: Vec<usize> = (0..quoted.len()).collect();
+    shortest_first.sort_by_key(|at| quoted[*at].len());
+
+    let mut budget = LARGEST_MESSAGE_BYTES.saturating_sub(prose);
+    let mut held: Vec<String> = quoted.iter().map(|value| (*value).to_string()).collect();
+    let mut left = shortest_first.len();
+    for at in shortest_first {
+        let share = budget / left;
+        let value = service_common::validation::echo_held_to(quoted[at], share);
+        budget -= value.len().min(budget);
+        held[at] = value.into_owned();
+        left -= 1;
+    }
+    held
 }
 
 /// The names that identify THIS service to the router: its SigV4 signing name — shared

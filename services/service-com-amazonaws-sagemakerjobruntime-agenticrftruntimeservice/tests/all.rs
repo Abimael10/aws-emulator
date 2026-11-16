@@ -13,6 +13,9 @@
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/authorization_refusal_fits_the_modelled_message_member.rs"]
+mod authorization_refusal_fits_the_modelled_message_member;
+
 #[path = "all/enum_refusal_echo_is_bounded.rs"]
 mod enum_refusal_echo_is_bounded;
 

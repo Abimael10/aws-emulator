@@ -195,6 +195,15 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// Every value in either sentence comes from the request and from the stored policies: the
 /// principal from the credential the request presented, the action from the operation it
 /// named, the resource from the ARN it addressed.
+///
+/// Both sentences are held to the member that has to CARRY them, through the one holding
+/// this service words any refusal with ([`crate::service::each_held_within_the_message_maximum`]).
+/// The parts a sentence here interpolates are not bounded by THIS model the way the clauses
+/// a handler words are: the resource is the `JobArn` the request named, but the principal is
+/// an ARN read out of the IAM store, whose length is the IAM model's business — an IAM user's
+/// own `Path` and `UserName` maxima alone admit an ARN longer than half this member — so the
+/// prose each form states around its values is read off that form itself and what is left is
+/// what the values may state.
 fn not_authorized(
     caller: &Caller,
     action: &str,
@@ -202,14 +211,70 @@ fn not_authorized(
     reason: &str,
 ) -> AccessDeniedException {
     let message = if caller.addresses_another_account(resource) {
-        format!("User: {} is not authorized to access this resource", caller.arn)
+        let held = held_to_what_the_member_leaves(
+            &inaccessible_resource_message(""),
+            &[caller.arn.as_str()],
+        );
+        inaccessible_resource_message(held.first())
     } else {
-        format!(
-            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
-            caller.arn
-        )
+        let held = held_to_what_the_member_leaves(
+            &unauthorized_message("", action, "", reason),
+            &[caller.arn.as_str(), resource],
+        );
+        unauthorized_message(held.first(), action, held.second(), reason)
     };
     AccessDeniedException { message }
+}
+
+/// IAM's identity-based denial sentence: who was refused, which action, on which resource,
+/// and which of IAM's rules refused it.
+fn unauthorized_message(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         {reason}"
+    )
+}
+
+/// The sentence a request for a resource of ANOTHER account is refused with, which names the
+/// principal alone.
+fn inaccessible_resource_message(principal: &str) -> String {
+    format!("User: {principal} is not authorized to access this resource")
+}
+
+/// The values of one refusal sentence, each held to what the member carrying it leaves.
+///
+/// Read back by POSITION rather than by index, so a sentence is re-worded with the values it
+/// was held for and a refusal can neither panic nor be refused for want of one: a position
+/// the holding answered nothing for states nothing, which cannot happen for a value that was
+/// handed in.
+#[derive(Debug)]
+struct HeldValues(Vec<String>);
+
+impl HeldValues {
+    /// The first value the sentence interpolates — the principal, in both of its forms.
+    fn first(&self) -> &str {
+        self.at(0)
+    }
+
+    /// The second value the sentence interpolates: the resource, in the form that names one.
+    fn second(&self) -> &str {
+        self.at(1)
+    }
+
+    fn at(&self, position: usize) -> &str {
+        self.0.get(position).map_or("", String::as_str)
+    }
+}
+
+/// `values` held to what the member carrying this refusal leaves once the sentence's own
+/// prose is in it, where `worded_without_values` is that same sentence worded with nothing
+/// interpolated — so the prose is read off the wording rather than counted by hand, and a
+/// re-worded sentence cannot leave the count behind.
+fn held_to_what_the_member_leaves(worded_without_values: &str, values: &[&str]) -> HeldValues {
+    HeldValues(crate::service::each_held_within_the_message_maximum(
+        worded_without_values.len(),
+        values,
+    ))
 }
 
 /// The account the ARN `arn` names, or `None` when it carries none — read through the
@@ -596,6 +661,74 @@ mod tests {
                 "case {case:?}: a cross-account refusal must name neither the resource nor the \
                  action, got {stated:?}"
             );
+        }
+    }
+
+    /// The maximum the model declares for the member an `AccessDeniedException` is carried
+    /// in: `Message` targets `FailureReason`, `@length` min 0 max 1024
+    /// (`smithy_query(query="shape",shape="AccessDeniedException,FailureReason")`).
+    const LARGEST_MESSAGE_BYTES: usize = 1024;
+
+    /// RULE: either refusal wording is held to the member that has to CARRY it, whatever the
+    /// principal ARN the credential store hands this gate — a length the IAM model governs,
+    /// not this one — while the prose around it stays IAM's.
+    ///
+    /// The rows go past what the IAM model itself admits (an ARN of 30 bytes of prefix plus a
+    /// `Path` of at most 512 and a `UserName` of at most 64), so the bound rests on the
+    /// member rather than on a length another model happens to declare.
+    #[test]
+    fn a_refusal_naming_any_principal_fits_the_carrying_member() {
+        let mine = account();
+        let action = format!("{ACTION_PREFIX}:SampleWithResponseStream");
+        let reason = format!("because no identity-based policy allows the {action} action");
+        // The longest resource this model admits: `JobArn`, `@length` max 256
+        // (`smithy_query(query="shape",shape="JobArn")`).
+        let own = job_arn(&mine, &"r".repeat(62));
+        let foreign = job_arn("999999999999", &"r".repeat(62));
+
+        for (case, principal_bytes) in [
+            ("a principal of a handful of bytes", 32),
+            ("the longest ARN the IAM model admits", 606),
+            ("one byte past it", 607),
+            ("a kilobyte of principal", 1024),
+            ("eight kilobytes of principal", 8 * 1024),
+        ] {
+            let mut caller = session_caller(&mine);
+            // The ARN keeps its account segment, so the row still turns on the resource's
+            // account rather than on an unreadable principal.
+            caller.arn = format!(
+                "arn:aws:iam::{mine}:user/{}",
+                "u".repeat(principal_bytes - format!("arn:aws:iam::{mine}:user/").len())
+            );
+
+            for (form, resource) in [("the caller's own account", &own), ("another account", &foreign)] {
+                let case = &format!("{case} naming a resource of {form}");
+                let stated = not_authorized(&caller, &action, resource, &reason).message;
+                assert!(
+                    stated.len() <= LARGEST_MESSAGE_BYTES,
+                    "case {case:?}: expected a refusal within the {LARGEST_MESSAGE_BYTES} byte \
+                     maximum the carrying member declares, got {} bytes",
+                    stated.len()
+                );
+                assert!(
+                    stated.starts_with("User: "),
+                    "case {case:?}: expected the refusal to name the principal first, got {:?}",
+                    stated.chars().take(120).collect::<String>()
+                );
+                // A principal the sentence could not state whole is stated by its leading
+                // bytes and the count of what there was, so a caller can still tell which
+                // credential was refused and how long its ARN is.
+                if stated.contains(caller.arn.as_str()) {
+                    continue;
+                }
+                let marker = format!("... [{} bytes]", caller.arn.len());
+                assert!(
+                    stated.contains(marker.as_str()) && stated.contains(&caller.arn[..32]),
+                    "case {case:?}: expected a held principal to state its first bytes and \
+                     {marker:?}, got {:?}",
+                    stated.chars().take(120).collect::<String>()
+                );
+            }
         }
     }
 

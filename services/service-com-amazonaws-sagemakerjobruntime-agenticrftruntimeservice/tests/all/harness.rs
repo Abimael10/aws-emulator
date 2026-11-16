@@ -168,6 +168,28 @@ pub fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     (engine, router)
 }
 
+/// A router carrying this service BESIDE the IAM and STS services over ONE shared engine:
+/// the assembly a suite about WHO may call an operation needs, because the policies, the
+/// users and the sessions such a suite seeds are the ones those services' own handlers
+/// write. This service itself is mounted by [`mounted_service`], so there is one mounting of
+/// it however a suite assembles the rest.
+#[must_use]
+pub fn mounted_with_identity() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
+    let (engine, mut router) = mounted_service();
+    router
+        .register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        )
+        .register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+    (engine, router)
+}
+
 /// Dispatch one request to `path` with `headers` and `body`, signed for this service with
 /// [`DEFAULT_ACCESS_KEY_ID`], and reduce the answer.
 pub async fn send(
