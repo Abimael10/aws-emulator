@@ -67,3 +67,23 @@ Both clusters came back with empty stub_path and empty owned_by, i.e. no open is
 1. Boot the emulator from this checkout and replay the simparity-wire-aws-v1 wire corpus.
 2. Cause 1: replay fixture route53-catalog-get-checker-ip-ranges step task#1 — GET /2013-04-01/checkeripranges. Compare every CheckerIpRanges member with the recorded response; members 19, 20, 22, 23, 24, 26, 27, 28, 30, 31 differ.
 3. Cause 2: replay fixture route53-catalog-list-geo-locations step task#1 — GET /2013-04-01/geolocations. Compare GeoLocationDetails entry-by-entry with the recorded response; entries from index 34 onward diverge in CountryCode/CountryName and the response's MaxItems does not match the recorded value.
+
+## Resolution
+
+Cause 1 is fixed: the health-checker addresses are the published ones rather than one computed from the
+retired regional block that holds each of them, and the replay key for
+`$.GetCheckerIpRangesResponse.CheckerIpRanges.member[*]` passes.
+
+Cause 2 is fixed in substance and carries a named residue. The geolocation catalog is now the service's
+own table — the country names it publishes, the codes it places traffic in (one the standard leaves to
+its users included, four territories it cannot place traffic in left out), and the subdivisions of every
+country it places traffic by subdivision in, each listed immediately after its country — and the
+required `MaxItems` reports the page size that applied, cut to the ceiling one page of this catalog
+carries, so the replay key for `$.ListGeoLocationsResponse.MaxItems` passes too.
+
+RESIDUE, still diverging: 3 of the catalog's 332 entries — the romanisation of two region names and one
+city name inside the subdivision block of the country the catalog gained — so the replay key for
+`$.ListGeoLocationsResponse.GeoLocationDetailsList.GeoLocationDetails[*]` still fails on those three
+entries alone (down from 58 diverging positions across the catalog). Their codes, their ordering and
+every other entry agree with the recording; the table spells all of them from one published standard
+rather than mixing sources. A later sweep that re-files this cluster is about those three names.

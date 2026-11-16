@@ -19,9 +19,10 @@
 //!    blocks themselves are not published as blocks — a caller that allow-listed
 //!    them would allow 64 addresses no checker sources from and miss the ones it
 //!    does.
-//! 2. `CountryName` is Route 53's own country naming, not an ASCII-folded ISO
-//!    long form: it keeps a name's non-ASCII letters, uses a country's short form
-//!    and brackets a parenthetical with square brackets. The same spelling
+//! 2. `CountryName` is Route 53's own country naming, not an ASCII-folded or
+//!    modernised ISO form: it keeps a name's non-ASCII letters, keeps the
+//!    spelling the service has published all along and brackets a parenthetical
+//!    with square brackets. The same spelling
 //!    reaches the wire from `ListGeoLocations` and from `GetGeoLocation`, byte for
 //!    byte, so a client that validates one against the other agrees with itself.
 //!
@@ -76,22 +77,25 @@ const RETIRED_REGIONAL_BLOCKS: &[&str] = &[
 /// folded ISO long form, and most of them are codes the recorded case never named
 /// (`CI`, `CV`, `CW`, `RE`, `ST`, `CD`, `CG`):
 ///
-/// * a name's non-ASCII letters are kept rather than folded (`AX`, `BL`, `CI`,
-///   `CW`, `RE`, `ST`);
-/// * a country's short form is used rather than an ISO long form (`BQ`, `CV`);
+/// * a name's non-ASCII letters are kept rather than folded (`AX`, `BL`, `CW`,
+///   `RE`, `ST`);
+/// * the spelling the service has published all along is kept rather than the
+///   one a country has since been renamed to, whether that is an older short
+///   form (`BQ`, `CV`, `CD`) or an older long form (`CG`, `CZ`);
 /// * a parenthetical is bracketed with square brackets (`CC`);
-/// * a name that distinguishes two countries sharing one name does it with the
-///   capital (`CD`, `CG`).
+/// * a name that distinguishes two countries sharing one is the service's own
+///   wording for it (`CD`, `CG`).
 const PUBLISHED_COUNTRY_NAMES: &[(&str, &str)] = &[
     ("AX", "Åland"),
     ("BL", "Saint Barthélemy"),
     ("BQ", "Bonaire"),
     ("CC", "Cocos [Keeling] Islands"),
-    ("CD", "Congo - Kinshasa"),
-    ("CG", "Congo - Brazzaville"),
-    ("CI", "Côte d'Ivoire"),
+    ("CD", "Congo"),
+    ("CG", "Republic of the Congo"),
+    ("CI", "Ivory Coast"),
     ("CV", "Cape Verde"),
     ("CW", "Curaçao"),
+    ("CZ", "Czech Republic"),
     ("RE", "Réunion"),
     ("ST", "São Tomé and Príncipe"),
 ];
@@ -100,7 +104,10 @@ const PUBLISHED_COUNTRY_NAMES: &[(&str, &str)] = &[
 ///
 /// A block is inside another when it is at least as specific and its network
 /// address agrees on every bit the outer prefix fixes.
-fn within(outer: &str, inner: &str) -> bool {
+///
+/// `pub(crate)` so the catalog-contents suite reads containment the same way
+/// rather than growing a second copy of this test.
+pub(crate) fn within(outer: &str, inner: &str) -> bool {
     let (Some((outer_network, outer_prefix)), Some((inner_network, inner_prefix))) =
         (parse_cidr(outer), parse_cidr(inner))
     else {

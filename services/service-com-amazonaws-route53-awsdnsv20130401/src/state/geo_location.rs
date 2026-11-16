@@ -28,11 +28,13 @@
 //!   no other location are answered from). The NAMES are the service's own, not
 //!   the standard's English spelling — see [`COUNTRIES`].
 //! * a SUBDIVISION carries its country's code and name PLUS
-//!   `SubdivisionCode`/`SubdivisionName`. `GeoLocationDetails$SubdivisionName`:
-//!   "Route 53 currently supports only states in the United States", and
-//!   `SubdivisionCode` points at the United States Postal Service's "Appendix B:
-//!   Two-Letter State and Possession Abbreviations" for the codes, which is where
-//!   [`SUBDIVISIONS`] takes them from.
+//!   `SubdivisionCode`/`SubdivisionName`. A geolocation record set's own
+//!   `SubdivisionCode` admits only a state of the United States, spelled with
+//!   the United States Postal Service's "Appendix B: Two-Letter State and
+//!   Possession Abbreviations", but the catalog is wider than that one country,
+//!   which is why `GeoLocationDetails$SubdivisionCode` sends a client to this
+//!   listing for the codes ("For a list of all supported subdivision codes, use
+//!   the ListGeoLocations API") — see [`SUBDIVISIONS`].
 //!
 //! Nothing here is reached over the network and nothing is derived from a
 //! request: the table is the published catalog, and what matters about it is that
@@ -65,18 +67,36 @@ pub const DEFAULT_COUNTRY_CODE: &str = "*";
 
 /// The countries Route 53 supports, as `(code, name)`.
 ///
-/// Source of the CODES: the ones assigned by ISO 3166-1 alpha-2, which is the
-/// standard `GeoLocation$CountryCode` names; the `*` row is the default location
-/// the same member documents.
+/// Source of the CODES: the two-letter codes of ISO 3166-1 alpha-2, which is the
+/// standard `GeoLocation$CountryCode` names, as the SERVICE's own geolocation
+/// table carries them — which is not the standard's assigned set verbatim:
+///
+/// * the `*` row is the default location `GeoLocation$CountryCode` documents;
+/// * a code the standard leaves to its users is carried when the service places
+///   traffic in it (`XK`, Kosovo, which has no assigned alpha-2 code);
+/// * a code the service publishes no location for is NOT carried: the catalog
+///   holds a location only where the service can place a query in it, so a code
+///   it leaves out is one no geolocation record set can ever match.
+///
+/// A code the table leaves out is a location `GetGeoLocation` refuses with
+/// `NoSuchGeoLocation` and `ChangeResourceRecordSets` refuses as unsupported,
+/// which is what "Route 53 doesn't support the specified geographic location"
+/// means — so this set is the one place either answer comes from.
 ///
 /// Source of the NAMES: the service's own country naming, which is NOT the ISO
-/// standard's own English spelling. It keeps a name's non-ASCII letters rather
-/// than folding them to ASCII (`Åland`, `Saint Barthélemy`, `Côte d'Ivoire`,
-/// `Curaçao`, `Réunion`, `São Tomé and Príncipe`), it uses a country's short
-/// form rather than an ISO long form (`Bonaire`, `Cape Verde`), and it brackets
-/// a parenthetical with square brackets (`Cocos [Keeling] Islands`). A client
-/// displays `CountryName` to a user and compares it against what Route 53
-/// returns, so a folded or re-worded name is a name AWS does not use.
+/// standard's own English spelling and NOT the current CLDR one either. It keeps
+/// a name's non-ASCII letters rather than folding them to ASCII (`Åland`, `Saint
+/// Barthélemy`, `Curaçao`, `Réunion`, `São Tomé and Príncipe`), it brackets a
+/// parenthetical with square brackets (`Cocos [Keeling] Islands`), and for the
+/// rest it keeps the spelling the service has published all along rather than
+/// the one a country has since been renamed to: an older short form
+/// (`Macedonia`, `Ivory Coast`, `Czech Republic`, `Bonaire`, `Cape Verde`) where
+/// the current standard carries a longer or newer one, and a long form
+/// (`Republic of Korea`, `Hashemite Kingdom of Jordan`, `Republic of Moldova`,
+/// `Federated States of Micronesia`, `Republic of the Congo`) where the current
+/// standard carries a short one. A client displays `CountryName` to a user and
+/// compares it against what Route 53 returns, so a folded, modernised or
+/// re-worded name is a name AWS does not use.
 ///
 /// The rows are spelled out in code order, but the ORDER the wire carries is
 /// computed by [`catalog`] rather than being a property of this table.
@@ -115,17 +135,16 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("BR", "Brazil"),
     ("BS", "Bahamas"),
     ("BT", "Bhutan"),
-    ("BV", "Bouvet Island"),
     ("BW", "Botswana"),
     ("BY", "Belarus"),
     ("BZ", "Belize"),
     ("CA", "Canada"),
     ("CC", "Cocos [Keeling] Islands"),
-    ("CD", "Congo - Kinshasa"),
+    ("CD", "Congo"),
     ("CF", "Central African Republic"),
-    ("CG", "Congo - Brazzaville"),
+    ("CG", "Republic of the Congo"),
     ("CH", "Switzerland"),
-    ("CI", "Côte d'Ivoire"),
+    ("CI", "Ivory Coast"),
     ("CK", "Cook Islands"),
     ("CL", "Chile"),
     ("CM", "Cameroon"),
@@ -135,9 +154,8 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("CU", "Cuba"),
     ("CV", "Cape Verde"),
     ("CW", "Curaçao"),
-    ("CX", "Christmas Island"),
     ("CY", "Cyprus"),
-    ("CZ", "Czechia"),
+    ("CZ", "Czech Republic"),
     ("DE", "Germany"),
     ("DJ", "Djibouti"),
     ("DK", "Denmark"),
@@ -147,14 +165,13 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("EC", "Ecuador"),
     ("EE", "Estonia"),
     ("EG", "Egypt"),
-    ("EH", "Western Sahara"),
     ("ER", "Eritrea"),
     ("ES", "Spain"),
     ("ET", "Ethiopia"),
     ("FI", "Finland"),
     ("FJ", "Fiji"),
     ("FK", "Falkland Islands"),
-    ("FM", "Micronesia"),
+    ("FM", "Federated States of Micronesia"),
     ("FO", "Faroe Islands"),
     ("FR", "France"),
     ("GA", "Gabon"),
@@ -177,7 +194,6 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("GW", "Guinea-Bissau"),
     ("GY", "Guyana"),
     ("HK", "Hong Kong"),
-    ("HM", "Heard Island and McDonald Islands"),
     ("HN", "Honduras"),
     ("HR", "Croatia"),
     ("HT", "Haiti"),
@@ -194,7 +210,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("IT", "Italy"),
     ("JE", "Jersey"),
     ("JM", "Jamaica"),
-    ("JO", "Jordan"),
+    ("JO", "Hashemite Kingdom of Jordan"),
     ("JP", "Japan"),
     ("KE", "Kenya"),
     ("KG", "Kyrgyzstan"),
@@ -203,7 +219,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("KM", "Comoros"),
     ("KN", "Saint Kitts and Nevis"),
     ("KP", "North Korea"),
-    ("KR", "South Korea"),
+    ("KR", "Republic of Korea"),
     ("KW", "Kuwait"),
     ("KY", "Cayman Islands"),
     ("KZ", "Kazakhstan"),
@@ -220,14 +236,14 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("LY", "Libya"),
     ("MA", "Morocco"),
     ("MC", "Monaco"),
-    ("MD", "Moldova"),
+    ("MD", "Republic of Moldova"),
     ("ME", "Montenegro"),
     ("MF", "Saint Martin"),
     ("MG", "Madagascar"),
     ("MH", "Marshall Islands"),
-    ("MK", "North Macedonia"),
+    ("MK", "Macedonia"),
     ("ML", "Mali"),
-    ("MM", "Myanmar"),
+    ("MM", "Myanmar [Burma]"),
     ("MN", "Mongolia"),
     ("MO", "Macao"),
     ("MP", "Northern Mariana Islands"),
@@ -262,7 +278,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("PK", "Pakistan"),
     ("PL", "Poland"),
     ("PM", "Saint Pierre and Miquelon"),
-    ("PN", "Pitcairn"),
+    ("PN", "Pitcairn Islands"),
     ("PR", "Puerto Rico"),
     ("PS", "Palestine"),
     ("PT", "Portugal"),
@@ -294,7 +310,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("SV", "El Salvador"),
     ("SX", "Sint Maarten"),
     ("SY", "Syria"),
-    ("SZ", "Eswatini"),
+    ("SZ", "Swaziland"),
     ("TC", "Turks and Caicos Islands"),
     ("TD", "Chad"),
     ("TF", "French Southern Territories"),
@@ -302,7 +318,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("TH", "Thailand"),
     ("TJ", "Tajikistan"),
     ("TK", "Tokelau"),
-    ("TL", "Timor-Leste"),
+    ("TL", "East Timor"),
     ("TM", "Turkmenistan"),
     ("TN", "Tunisia"),
     ("TO", "Tonga"),
@@ -313,7 +329,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("TZ", "Tanzania"),
     ("UA", "Ukraine"),
     ("UG", "Uganda"),
-    ("UM", "United States Minor Outlying Islands"),
+    ("UM", "U.S. Minor Outlying Islands"),
     ("US", "United States"),
     ("UY", "Uruguay"),
     ("UZ", "Uzbekistan"),
@@ -326,6 +342,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("VU", "Vanuatu"),
     ("WF", "Wallis and Futuna"),
     ("WS", "Samoa"),
+    ("XK", "Kosovo"),
     ("YE", "Yemen"),
     ("YT", "Mayotte"),
     ("ZA", "South Africa"),
@@ -336,15 +353,51 @@ pub const COUNTRIES: &[(&str, &str)] = &[
 /// The subdivisions Route 53 supports, as `(country code, subdivision code,
 /// subdivision name)`.
 ///
-/// Source: the two-letter abbreviations the United States Postal Service
-/// publishes in "Appendix B: Two-Letter State and Possession Abbreviations",
-/// which is where `GeoLocationDetails$SubdivisionCode`'s own documentation points
-/// for them. Only the United States has rows, because
-/// `GeoLocationDetails$SubdivisionName` documents that "Route 53 currently
-/// supports only states in the United States" — the table is keyed by country
-/// rather than hard-wired to one, so a country the service starts supporting
-/// subdivisions for is a row here and no change to either handler.
+/// A geolocation record set's own `SubdivisionCode` takes "the two-letter code
+/// for a state of the United States", from the abbreviations the United States
+/// Postal Service publishes in "Appendix B: Two-Letter State and Possession
+/// Abbreviations" — but the CATALOG is wider than that one country, which is why
+/// `GeoLocationDetails$SubdivisionCode` sends a client here for it ("For a list
+/// of all supported subdivision codes, use the ListGeoLocations API") instead of
+/// to Appendix B alone. The other country the service places traffic by
+/// subdivision in is the one `GeoLocation$CountryCode` singles out beside the
+/// standard ("Route 53 also supports the country code UA for Ukraine"), whose
+/// rows carry that country's own subdivision codes and names — the numeric codes
+/// ISO 3166-2 assigns its regions, which is why `GeoLocationSubdivisionCode`
+/// admits up to three characters rather than exactly two, beside that same
+/// standard's romanised names for them.
+///
+/// The table is keyed by country rather than hard-wired to one, so a country the
+/// service starts placing traffic by subdivision in is rows here and no change
+/// to either handler.
 pub const SUBDIVISIONS: &[(&str, &str, &str)] = &[
+    ("UA", "05", "Vinnytska oblast"),
+    ("UA", "07", "Volynska oblast"),
+    ("UA", "09", "Luhanska oblast"),
+    ("UA", "12", "Dnipropetrovska oblast"),
+    ("UA", "14", "Donetska oblast"),
+    ("UA", "18", "Zhytomyrska oblast"),
+    ("UA", "21", "Zakarpatska oblast"),
+    ("UA", "23", "Zaporizka oblast"),
+    ("UA", "26", "Ivano-Frankivska oblast"),
+    ("UA", "30", "Kyiv"),
+    ("UA", "32", "Kyivska oblast"),
+    ("UA", "35", "Kirovohradska oblast"),
+    ("UA", "40", "Sevastopol"),
+    ("UA", "43", "Avtonomna Respublika Krym"),
+    ("UA", "46", "Lvivska oblast"),
+    ("UA", "48", "Mykolaivska oblast"),
+    ("UA", "51", "Odeska oblast"),
+    ("UA", "53", "Poltavska oblast"),
+    ("UA", "56", "Rivnenska oblast"),
+    ("UA", "59", "Sumska oblast"),
+    ("UA", "61", "Ternopilska oblast"),
+    ("UA", "63", "Kharkivska oblast"),
+    ("UA", "65", "Khersonska oblast"),
+    ("UA", "68", "Khmelnytska oblast"),
+    ("UA", "71", "Cherkaska oblast"),
+    ("UA", "74", "Chernihivska oblast"),
+    ("UA", "77", "Chernivetska oblast"),
     ("US", "AK", "Alaska"),
     ("US", "AL", "Alabama"),
     ("US", "AR", "Arkansas"),

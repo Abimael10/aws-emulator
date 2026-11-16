@@ -87,10 +87,17 @@ const PUBLISHED_LOCATIONS: &[(&str, &str)] = &[
 /// resources: `ListHostedZones$MaxItems` ("If you specify a value greater than
 /// 100, Route 53 returns only the first 100").
 ///
-/// This operation's own `MaxItems` documents no such bound, so 100 is just one
-/// row of the `maxitems` tables below; the rows past it are what assert that a
-/// larger `maxitems` really is honoured here.
+/// This catalog's own page ceiling is higher than that, so 100 is just one row of
+/// the `maxitems` tables below; the rows past it are what assert that a larger
+/// `maxitems` really is honoured here, up to [`CATALOG_PAGE_CEILING`].
 const PAGE_BOUND: i32 = 100;
+
+/// The most locations one page of this catalog carries, which is also the bound a
+/// request naming no `maxitems` is served and reads back.
+///
+/// Written out here rather than read from the crate under test: a `maxitems` past
+/// it is served and echoed AT it, which is what the rows past it below assert.
+const CATALOG_PAGE_CEILING: i32 = 500;
 
 /// One `GeoLocationDetails` as the wire carried it.
 ///
@@ -286,13 +293,13 @@ async fn walk(router: &MultiServiceRouter, page_size: Option<i32>) -> Vec<Entry>
 }
 
 /// One `GetGeoLocation` call, with the query string `query`.
-async fn get(router: &MultiServiceRouter, query: &str) -> Reply {
+pub(crate) async fn get(router: &MultiServiceRouter, query: &str) -> Reply {
     call(router, "GET", &format!("/2013-04-01/geolocation?{query}"), "").await
 }
 
 /// The query string that asks about `(country code, subdivision code)`, with an
 /// empty subdivision meaning the country itself.
-fn location_query(country_code: &str, subdivision_code: &str) -> String {
+pub(crate) fn location_query(country_code: &str, subdivision_code: &str) -> String {
     if subdivision_code.is_empty() {
         format!("countrycode={country_code}")
     } else {
@@ -495,26 +502,37 @@ async fn a_page_is_bounded_by_maxitems_and_the_next_codes_resume_after_it() {
 #[tokio::test]
 async fn the_response_echoes_the_maxitems_the_request_asked_for() {
     // "The value that you specified for MaxItems in the request" — echoed as
-    // asked, and the page bounded by that same value and by nothing else: this
-    // operation's `MaxItems` documents no bound of Route 53's own, so the rows
-    // past `PAGE_BOUND` are answered in full rather than cut to 100.
+    // asked while the asked-for size is one this catalog is served in, and the
+    // page bounded by that same value: the rows past `PAGE_BOUND` are answered in
+    // full rather than cut to 100, and the row past `CATALOG_PAGE_CEILING` is the
+    // one the ceiling cuts, in the page AND in the echo.
     let router = router();
     let catalog = walk(&router, Some(50)).await.len();
-    for asked in [1, 5, PAGE_BOUND, PAGE_BOUND + 1, 4_096] {
+    for asked in [
+        1,
+        5,
+        PAGE_BOUND,
+        PAGE_BOUND + 1,
+        CATALOG_PAGE_CEILING,
+        CATALOG_PAGE_CEILING + 1,
+        4_096,
+    ] {
         let reply = list(&router, &format!("maxitems={asked}")).await;
+        let served = asked.min(CATALOG_PAGE_CEILING);
         assert_eq!(
             reply.first("MaxItems"),
-            Some(asked.to_string().as_str()),
-            "case maxitems={asked}: the response echoes the value asked for, got {:?}",
+            Some(served.to_string().as_str()),
+            "case maxitems={asked}: the response echoes the value asked for, cut to the \
+             {CATALOG_PAGE_CEILING} a page carries, got {:?}",
             reply.first("MaxItems")
         );
         let page = entries(&reply.body);
-        let expected = (asked as usize).min(catalog);
+        let expected = (served as usize).min(catalog);
         assert_eq!(
             page.len(),
             expected,
-            "case maxitems={asked}: a page carries what was asked for, bounded only by the \
-             {catalog} location(s) left, got {} location(s)",
+            "case maxitems={asked}: a page carries what was asked for, bounded by the page \
+             ceiling and by the {catalog} location(s) left, got {} location(s)",
             page.len()
         );
         let truncated = reply.first("IsTruncated");
@@ -529,11 +547,18 @@ async fn the_response_echoes_the_maxitems_the_request_asked_for() {
 
 #[tokio::test]
 async fn a_request_naming_no_maxitems_reads_the_whole_catalog_in_one_page() {
-    // A `maxitems` the request does not name bounds nothing, so the one page
-    // carries every location, nothing follows it, and the `MaxItems` read back is
-    // the bound that did apply — the number of locations the catalog holds.
+    // A `maxitems` the request does not name is served the page this catalog is
+    // served in, which is past the catalog itself: the one page carries every
+    // location, nothing follows it, and the `MaxItems` read back is that bound.
     let router = router();
     let whole = walk(&router, Some(50)).await;
+    assert!(
+        whole.len() < CATALOG_PAGE_CEILING as usize,
+        "case {:?}: the catalog has to fit inside one page for this rule to be readable, got {} \
+         location(s) against a ceiling of {CATALOG_PAGE_CEILING}",
+        "no maxitems",
+        whole.len()
+    );
 
     let reply = list(&router, "").await;
     let page = entries(&reply.body);
@@ -559,8 +584,8 @@ async fn a_request_naming_no_maxitems_reads_the_whole_catalog_in_one_page() {
     );
     assert_eq!(
         reply.first("MaxItems"),
-        Some(whole.len().to_string().as_str()),
-        "case {:?}: the bound that applied is the catalog's own size, got {:?}",
+        Some(CATALOG_PAGE_CEILING.to_string().as_str()),
+        "case {:?}: the bound that applied is the page this catalog is served in, got {:?}",
         "no maxitems",
         reply.first("MaxItems")
     );

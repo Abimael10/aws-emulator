@@ -617,8 +617,12 @@ pub const TRAFFIC_POLICY_FORMAT_VERSION: &str = "2015-10-01";
 ///   now source from — two per `/21` inside it, at the `/21`'s third and
 ///   seventh `/23`, so sixteen blocks across the `/18`;
 /// * one single-address `/32` left in each of the sixteen legacy regional
-///   blocks, at the first address of that block's upper half, which is what the
-///   regions that have not been migrated still probe from.
+///   blocks, which is what the regions that have not been migrated still probe
+///   from. Each of those addresses is published in its own right: where inside
+///   its block it sits is not a property of the block — the published addresses
+///   sit at different offsets in theirs, and one of them is not even on a `/26`
+///   or `/27` boundary — so each row below is the published address itself and
+///   never one computed from the block that holds it.
 ///
 /// The retired per-region `/26` blocks themselves are NOT published here any
 /// more: a caller programmes a firewall from this set, so publishing a block no
@@ -650,19 +654,19 @@ pub const CHECKER_IP_RANGES: &[&str] = &[
     "54.183.255.160/32",
     "54.228.16.32/32",
     "54.232.40.96/32",
-    "54.241.32.96/32",
-    "54.243.31.224/32",
+    "54.241.32.64/32",
+    "54.243.31.192/32",
     "54.244.52.224/32",
-    "54.245.168.32/32",
-    "54.248.220.32/32",
-    "54.250.253.224/32",
+    "54.245.168.0/32",
+    "54.248.220.0/32",
+    "54.250.253.192/32",
     "54.251.31.160/32",
-    "54.252.79.160/32",
-    "54.252.254.224/32",
-    "54.255.254.224/32",
+    "54.252.79.128/32",
+    "54.252.254.243/32",
+    "54.255.254.192/32",
     "107.23.255.32/32",
-    "176.34.159.224/32",
-    "177.71.207.160/32",
+    "176.34.159.192/32",
+    "177.71.207.128/32",
 ];
 
 /// The health-checker CIDR blocks in the order the API reports them, with any

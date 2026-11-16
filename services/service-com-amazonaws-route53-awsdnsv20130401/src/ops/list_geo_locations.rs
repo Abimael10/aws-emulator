@@ -139,6 +139,20 @@ impl From<ListGeoLocationsErrorModeled> for ListGeoLocationsError {
     }
 }
 
+/// The most locations Route 53 serves in one page of this catalog, which is also
+/// the page a request naming no `maxitems` of its own is served.
+///
+/// `MaxItems` in the response is "the value that you specified for MaxItems in
+/// the request", and a `maxitems` past this ceiling is served and read back AT
+/// the ceiling rather than as asked — the same shape as the ceilings the listings
+/// of caller-owned resources publish on their own `MaxItems` ("Amazon Route 53
+/// returns a maximum of 1000 items. If you set MaxItems to a value greater than
+/// 1000, Route 53 returns only the first 1000" on
+/// `ListHealthChecksRequest$MaxItems`), with this catalog's own number. It is
+/// larger than the catalog, so a caller that names no bound still reads every
+/// location in one page.
+const MAX_PAGE_SIZE: i32 = 500;
+
 /// A value a request carried, or `None` when it carried none: an absent query
 /// parameter and an empty one both name nothing.
 fn given(value: &Option<String>) -> Option<&str> {
@@ -265,20 +279,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let catalog = store.geo_locations();
 
         // `maxitems` is "the maximum number of geolocations to be included in the
-        // response body for this request" and this operation documents no bound of
-        // its own on it — unlike the listings of caller-owned resources, whose own
-        // `MaxItems` documents Route 53's 100 — so a request that asks for the whole
-        // catalog gets the whole catalog, and a request that names no `maxitems` is
-        // bounded by nothing but the catalog itself.
-        let catalog_size = i32::try_from(catalog.len()).unwrap_or(i32::MAX);
-        // A `maxitems` below one asks for no page at all, so it is refused rather than
-        // served.
-        let page_size = served_page_size(input.max_items, catalog_size, i32::MAX)
+        // response body for this request", bounded by the page this catalog is
+        // served in ([`MAX_PAGE_SIZE`]): a request that asks for more than that is
+        // served the ceiling, and a request that names no `maxitems` is served it
+        // too, which is past the whole catalog and so carries every location. A
+        // `maxitems` below one asks for no page at all, so it is refused through the
+        // page-size reader every listing here shares rather than served.
+        let page_size = served_page_size(input.max_items, MAX_PAGE_SIZE, MAX_PAGE_SIZE)
             .map_err(ListGeoLocationsErrorModeled::InvalidInput)?;
         // Route 53 echoes the `maxitems` the caller asked for ("The value that you
-        // specified for MaxItems in the request"); a request that specified none
-        // reads back the bound that did apply, which is the catalog's own size.
-        let reported_max_items = input.max_items.unwrap_or(catalog_size);
+        // specified for MaxItems in the request"), cut to the ceiling where the
+        // caller asked past it; a request that specified none reads back the bound
+        // that did apply, which is that same ceiling.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE).min(MAX_PAGE_SIZE);
         let start = match start {
             None => 0,
             Some(wanted) => {
@@ -304,8 +317,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_continent_code: next.and_then(|next| next.continent_code.clone()),
             next_country_code: next.and_then(|next| next.country_code.clone()),
             next_subdivision_code: next.and_then(|next| next.subdivision_code.clone()),
-            // The echoed `maxitems`, or the bound that applied when the request
-            // named none.
+            // The echoed `maxitems`, cut to the page ceiling, or that ceiling when
+            // the request named none.
             max_items: reported_max_items,
         })
     }
