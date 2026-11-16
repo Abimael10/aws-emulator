@@ -23,6 +23,9 @@ mod account_link_error_messages;
 #[path = "all/account_links.rs"]
 mod account_links;
 
+#[path = "all/available_management_cidr_ranges.rs"]
+mod available_management_cidr_ranges;
+
 #[path = "all/batch_per_item_error_codes.rs"]
 mod batch_per_item_error_codes;
 

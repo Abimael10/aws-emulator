@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAvailableManagementCidrRanges
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAvailableManagementCidrRanges`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAvailableManagementCidrRanges::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the management network CIDR blocks the account can still use for Bring
+//! Your Own License (BYOL), computed from the requested search range and from the
+//! BYOL configuration [`crate::state`] persists — the configuration `ModifyAccount`
+//! writes and `DescribeAccount` reports.
+//!
+//! This is the ONLY file to touch for this operation.
+//!
+//! AWS documents a BYOL ENTITLEMENT as the gate on this operation ("can be run only
+//! by Amazon Web Services accounts that are enabled for BYOL"). That entitlement is
+//! granted to an account out of band and nothing in this model sets or reports it —
+//! the `DedicatedTenancySupport` value `ModifyAccount` writes is the account's
+//! dedicated tenancy setting, and a recorded WorkSpaces response serves the ranges
+//! for an account no API call ever turned it on for — so the emulated account is
+//! treated as entitled and the ranges are served. `AccessDeniedException` stays
+//! modelled, with no state here that can answer it.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +88,8 @@
 //! * `AccessDeniedException` (HTTP 400) — The user is not authorized to access a resource.
 //! * `InvalidParameterValuesException` (HTTP 400) — One or more parameter values are not
 //!   valid.
+//! * `InternalServerException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   the store this operation reads could not be reached.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -96,11 +105,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `ListAvailableManagementCidrRangesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#ListAvailableManagementCidrRanges")]
+//
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models
+// the shape (every other state-reading operation in this crate lists it), and an
+// unreachable store is a server fault, never a bad request — so it must not be
+// reported as one of the two client errors this operation does list.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#ListAvailableManagementCidrRanges",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListAvailableManagementCidrRangesErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidParameterValuesException(InvalidParameterValuesException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -116,6 +134,81 @@ impl From<ListAvailableManagementCidrRangesErrorModeled> for ListAvailableManage
     fn from(modeled: ListAvailableManagementCidrRangesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The prefix length every management network CIDR block carries.
+///
+/// `ManagementCidrRanges` is a `DedicatedTenancyCidrRangeList`, whose member
+/// `DedicatedTenancyManagementCidrRange` has the pattern
+/// `^(^(…)\.(…)\.0\.0)(\/(16$))$` (see
+/// `smithy_query(query="shape",shape="DedicatedTenancyCidrRangeList")`): the only
+/// value this operation can report, and the only one `ModifyAccount` accepts, is an
+/// `a.b.0.0/16`.
+const MANAGEMENT_BLOCK_PREFIX: u32 = 16;
+
+/// The address bits below a management block, i.e. the bits an `a.b.0.0/16` leaves
+/// to hosts. Shifting an address right by this many bits gives the INDEX of the
+/// block holding it, which is what this operation enumerates and paginates over.
+const MANAGEMENT_BLOCK_HOST_BITS: u32 = 32 - MANAGEMENT_BLOCK_PREFIX;
+
+/// The page size used when the request names no `MaxResults`.
+///
+/// `MaxResults` targets `ManagementCidrRangeMaxResults`, which is `range 1..5`, so
+/// no request can be served a page larger than five whatever it asks for; a request
+/// that asks for no size is served that same modelled maximum.
+const DEFAULT_MANAGEMENT_CIDR_PAGE_SIZE: usize = 5;
+
+/// Refuse the request with this operation's own `InvalidParameterValuesException`
+/// ("One or more parameter values are not valid"), naming the member at fault.
+fn invalid_parameters(message: String) -> ListAvailableManagementCidrRangesError {
+    ListAvailableManagementCidrRangesErrorModeled::InvalidParameterValuesException(
+        InvalidParameterValuesException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Parse an IPv4 CIDR block into its address and prefix length.
+///
+/// `std`'s own `Ipv4Addr` parser does the address, so the only thing added here is
+/// the prefix length, valid up to the 32-bit IPv4 address width. Nothing beyond that
+/// is parsed by hand and no crate is pulled in for one number.
+fn parse_ipv4_cidr(value: &str) -> Option<(u32, u32)> {
+    let (address, prefix) = value.split_once('/')?;
+    let address: ::std::net::Ipv4Addr = address.parse().ok()?;
+    let prefix: u32 = prefix.parse().ok()?;
+    (prefix <= 32).then(|| (u32::from(address), prefix))
+}
+
+/// The inclusive span of management block indexes the CIDR block `address/prefix`
+/// covers.
+///
+/// The constraint is "the IP address range to search", so the blocks it selects are
+/// the `/16`s that OVERLAP it: a constraint shorter than a `/16` selects every block
+/// inside it, and one longer than a `/16` (down to the `/32` the member's pattern
+/// still admits) selects the single block that contains it.
+fn management_block_span(address: u32, prefix: u32) -> (u32, u32) {
+    let host_bits = 32 - prefix;
+    // A /0 covers the whole space; shifting a u32 by 32 is undefined, so the mask is
+    // built by checked shifts rather than by `u32::MAX << host_bits`.
+    let network = address
+        .checked_shr(host_bits)
+        .unwrap_or(0)
+        .checked_shl(host_bits)
+        .unwrap_or(0);
+    let last_address = network | u32::MAX.checked_shr(prefix).unwrap_or(0);
+    (
+        network >> MANAGEMENT_BLOCK_HOST_BITS,
+        last_address >> MANAGEMENT_BLOCK_HOST_BITS,
+    )
+}
+
+/// Render management block `index` as the `a.b.0.0/16` the model's
+/// `DedicatedTenancyManagementCidrRange` pattern admits.
+fn render_management_block(index: u32) -> String {
+    let address = ::std::net::Ipv4Addr::from(index << MANAGEMENT_BLOCK_HOST_BITS);
+    format!("{address}/{MANAGEMENT_BLOCK_PREFIX}")
 }
 
 /// The `ListAvailableManagementCidrRanges` operation.
@@ -154,18 +247,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAvailableManagementCidrRanges` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAvailableManagementCidrRangesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAvailableManagementCidrRanges"))
+        // The three input members and the stored BYOL configuration decide
+        // everything here; request metadata decides nothing.
+        let _ = ctx;
+
+        // "The IP address range to search ... in CIDR notation (that is, specify the
+        // range as an IPv4 CIDR block)". The member's own pattern already refuses
+        // anything that is not one at the boundary, so this only guards the case
+        // where it does not.
+        let constraint = input.management_cidr_range_constraint.as_str();
+        let (address, prefix) = parse_ipv4_cidr(constraint).ok_or_else(|| {
+            invalid_parameters(format!(
+                "The ManagementCidrRangeConstraint value {constraint} is not valid; \
+                 specify an IP address range as an IPv4 CIDR block."
+            ))
+        })?;
+
+        // The token names the LAST block the previous page reported, by its block
+        // index; this page resumes strictly after it.
+        let after_block = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                invalid_parameters("The NextToken value is not valid.".to_string())
+            })?),
+            None => None,
+        };
+        // `MaxResults` is `range 1..5`, so request validation refuses anything
+        // outside that; a value that still does not convert, or converts to zero, is
+        // refused here rather than silently answered with a default-sized page.
+        let max_results = match input.max_results {
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    invalid_parameters(format!(
+                        "The MaxResults value {max_results} is not valid; MaxResults must be \
+                         between 1 and {DEFAULT_MANAGEMENT_CIDR_PAGE_SIZE}."
+                    ))
+                })?,
+            None => DEFAULT_MANAGEMENT_CIDR_PAGE_SIZE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAvailableManagementCidrRangesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the WorkSpaces state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // Reporting only: the management CIDR range an account holds moves when a
+        // caller modifies the account, so there is nothing the clock owes this store
+        // and nothing this read may write.
+        let byol = state.lock().byol().clone();
+
+        // A block already taken for this account's management network interface is
+        // not one the account "can use ... when you enable BYOL": the stored
+        // `DedicatedTenancyManagementCidrRange` is in use, so it is withheld from the
+        // ranges on offer. Every other block the search range covers is available.
+        let taken = byol
+            .management_cidr_range()
+            .and_then(parse_ipv4_cidr)
+            .map(|(address, _)| address >> MANAGEMENT_BLOCK_HOST_BITS);
+
+        let (first_block, last_block) = management_block_span(address, prefix);
+        // Resuming after the last block of the previous page, and never before the
+        // first block the search range covers.
+        let resume_from = match after_block {
+            Some(block) => u64::from(first_block).max(block.saturating_add(1)),
+            None => u64::from(first_block),
+        };
+        // Lazy: a `/0` constraint spans every block in the IPv4 space, and only the
+        // page's worth plus one lookahead is ever visited. The range is empty when
+        // the token names a block at or past the end of the search range, and every
+        // index in it is a block index, so it fits a `u32` without truncation.
+        let mut available = (resume_from..=u64::from(last_block))
+            .map(|block| block as u32)
+            .filter(|block| taken != Some(*block));
+        let page: Vec<u32> = available.by_ref().take(max_results).collect();
+        // A token only when an available block is left beyond this page: "This value
+        // is null when there are no more results to return."
+        let more_to_come = available.next().is_some();
+        let next_token = page
+            .last()
+            .filter(|_| more_to_come)
+            .map(|block| crate::state::encode_page_token(u64::from(*block)));
+
+        Ok(ListAvailableManagementCidrRangesOutput {
+            management_cidr_ranges: Some(
+                page.iter()
+                    .copied()
+                    .map(render_management_block)
+                    .collect::<Vec<String>>(),
+            ),
+            next_token,
+        })
     }
 }
