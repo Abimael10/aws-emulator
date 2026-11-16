@@ -287,7 +287,8 @@ fn unservable_image<Eng: Send + Sync + 'static>(
     launch.images.iter().find_map(|image| {
         // A reference naming another registry is not this one's to serve: whether it can be
         // fetched was decided by the path above.
-        let reference = registry_pull::parse_reference(image)?;
+        let addressed = reference_into_this_registry(image, &launch.task_arn);
+        let reference = registry_pull::parse_reference(&addressed)?;
         match registry_pull::serve_pull(
             engine,
             &reference,
@@ -303,6 +304,47 @@ fn unservable_image<Eng: Send + Sync + 'static>(
             }
         }
     })
+}
+
+/// The reference `image` makes into AMAZON ECR, in the AWS-hosted spelling that registry's
+/// own reading of a pull reference takes ([`registry_pull::parse_reference`]).
+///
+/// One registry is addressed by two spellings here, and both name it: AWS's own registry
+/// host (`<account>.dkr.ecr.<region>.<suffix>`), and the ADDRESS the registry announces to a
+/// client — `Repository$repositoryUri` is "The URI for the repository. You can use this URI
+/// for container image push and pull operations", and on this machine that URI is built on
+/// an address of the emulator serving the registry, because AWS's own registry host resolves
+/// nowhere here ([`addresses_this_emulators_registry`]). A container definition written from
+/// what Amazon ECR handed the client therefore carries that address, so it is rewritten into
+/// the published spelling and resolved exactly like one that carries it already, rather than
+/// read a second time with a reading of this service's own.
+///
+/// One address serves every Region's registry, so such a reference names no Region of its
+/// own: the Region is the one the TASK runs in, which its own ARN carries. The host is
+/// composed with THAT Region's partition suffix, read through Amazon ECR's own reading of it
+/// (`registry_dns_suffix`), which is the inverse of the walk that registry resolves the
+/// rewritten reference by — so a task of any partition's Region resolves, not only one of the
+/// commercial partition.
+fn reference_into_this_registry<'image>(
+    image: &'image str,
+    task_arn: &str,
+) -> ::std::borrow::Cow<'image, str> {
+    use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state as ecr_store;
+
+    let Some((authority, path)) = image.split_once('/') else {
+        return ::std::borrow::Cow::Borrowed(image);
+    };
+    if !addresses_this_emulators_registry(authority) {
+        return ::std::borrow::Cow::Borrowed(image);
+    }
+    let Some(region) = ::service_common::arn::region_of(task_arn, ARN_NAMESPACE) else {
+        return ::std::borrow::Cow::Borrowed(image);
+    };
+    ::std::borrow::Cow::Owned(format!(
+        "{}{ECR_REGISTRY_INFIX}{region}.{}/{path}",
+        ecr_store::registry_id(),
+        ecr_store::registry_dns_suffix(region)
+    ))
 }
 
 /// Why the containers of `launch` cannot be launched where the task is placed — the
@@ -445,10 +487,13 @@ fn endpoints_reach_registry(
 
 /// Whether `image` names a repository in Amazon ECR, whose registry is an AWS service and
 /// so has VPC endpoints: an ECR image is pulled from `<account>.dkr.ecr.<region>.<suffix>`
-/// (Amazon ECR User Guide, the registry URI a pull uses).
+/// (Amazon ECR User Guide, the registry URI a pull uses), or from the ADDRESS that registry
+/// announces its own repositories at here ([`addresses_this_emulators_registry`]), which
+/// names the very same registry.
 fn is_ecr_image(image: &str) -> bool {
     let host = registry_host(image);
-    host.contains(ECR_REGISTRY_INFIX) && host.contains(".amazonaws.")
+    (host.contains(ECR_REGISTRY_INFIX) && host.contains(".amazonaws."))
+        || addresses_this_emulators_registry(host)
 }
 
 /// Whether any of `images` is one a registry serves only to an AUTHENTICATED principal, so
@@ -476,7 +521,7 @@ pub fn needs_execution_role_to_pull<'a>(mut images: impl Iterator<Item = &'a str
 /// Whether the registry ONE image reference resolves to serves it only to an authenticated
 /// principal — the per-reference half of [`needs_execution_role_to_pull`].
 fn serves_only_an_authenticated_principal(image: &str) -> bool {
-    is_ecr_image(image) || addresses_this_emulators_registry(registry_host(image))
+    is_ecr_image(image)
 }
 
 /// Whether `host` is an address of THIS EMULATOR rather than the name of a registry

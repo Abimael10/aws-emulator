@@ -1069,20 +1069,24 @@ fn repository_arn(name: &str) -> String {
     format!("arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}")
 }
 
-/// `<accountId>.dkr.ecr.<region>.amazonaws.com/<name>` — the URI
-/// `Fn::GetAtt <repository>.RepositoryUri` reports and a container image reference is built
-/// on ("The format is `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`"): the
-/// registry host of the account and Region that holds the repository, then the repository's
+/// `<registry endpoint>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports and
+/// a container image reference is built on. `Repository$repositoryUri` is "The URI for the
+/// repository. You can use this URI for container image `push` and `pull` operations", so it
+/// is an ADDRESS a container client dials rather than an AWS host that resolves nowhere on
+/// this machine: the endpoint this emulator serves the registry at, then the repository's
 /// name. The stack's value is the one the repository's owning service reported, so this is
 /// the URI Amazon ECR itself reports for a repository of this account's registry.
 fn repository_uri(name: &str) -> String {
     format!("{}/{name}", registry_host())
 }
 
-/// `<accountId>.dkr.ecr.<region>.amazonaws.com` — the host of the registry this account
-/// holds in the Region these stacks are created in.
+/// The endpoint this harness's emulator serves its registries at: the harness's router is
+/// served on no port of its own, so it is the base `smithy_server_runtime` reports for one.
 fn registry_host() -> String {
-    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com")
+    let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
+    base.split_once("://")
+        .map_or(base, |(_scheme, authority)| authority)
+        .to_string()
 }
 
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:1` — what `Ref` of an
@@ -1364,7 +1368,7 @@ fn cases() -> Vec<Case> {
                 // case letters"), a task definition's as its family.
                 form(
                     "RepositoryUri",
-                    "<the registry of this account and Region>/warehouse-registry-<id>",
+                    "<the endpoint this emulator serves the registry at>/warehouse-registry-<id>",
                     |value| {
                         value
                             .strip_prefix(&format!(

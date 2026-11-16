@@ -81,6 +81,10 @@ enum Requested {
         tags: Vec<String>,
         /// The Dockerfile the image is built from.
         dockerfile: Option<String>,
+        /// The `--build-arg` values the command carried, keyed by variable name: "set
+        /// build-time variables", which take effect where the Dockerfile declares an `ARG`
+        /// for them ([`container_image`]).
+        build_arguments: ::std::collections::BTreeMap<String, String>,
         /// The context the image is built from.
         context: String,
     },
@@ -109,6 +113,8 @@ fn requested(arguments: &[String]) -> Option<Requested> {
     let mut operands: Vec<&str> = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     let mut dockerfile: Option<String> = None;
+    let mut build_arguments: ::std::collections::BTreeMap<String, String> =
+        ::std::collections::BTreeMap::new();
     let mut password: Option<String> = None;
     let mut password_stdin = false;
     let mut username: Option<String> = None;
@@ -118,6 +124,10 @@ fn requested(arguments: &[String]) -> Option<Requested> {
             "-f" | "--file" => dockerfile = Some(words.next()?.to_string()),
             "-u" | "--username" => username = Some(words.next()?.to_string()),
             "-p" | "--password" => password = Some(words.next()?.to_string()),
+            "--build-arg" => {
+                let (name, value) = build_argument(words.next()?)?;
+                build_arguments.insert(name, value);
+            }
             "--password-stdin" => password_stdin = true,
             option if option.starts_with('-') => {
                 // An option written with its value attached (`--tag=x`), which is the same
@@ -128,6 +138,10 @@ fn requested(arguments: &[String]) -> Option<Requested> {
                     "-f" | "--file" => dockerfile = Some(value.to_string()),
                     "-u" | "--username" => username = Some(value.to_string()),
                     "-p" | "--password" => password = Some(value.to_string()),
+                    "--build-arg" => {
+                        let (name, value) = build_argument(value)?;
+                        build_arguments.insert(name, value);
+                    }
                     _ => return None,
                 }
             }
@@ -157,6 +171,7 @@ fn requested(arguments: &[String]) -> Option<Requested> {
             Some(Requested::Build {
                 tags,
                 dockerfile,
+                build_arguments,
                 context: context.to_string(),
             })
         }
@@ -181,6 +196,16 @@ fn requested(arguments: &[String]) -> Option<Requested> {
     }
 }
 
+/// The variable and the value one `--build-arg` word names: "`--build-arg <varname>=<value>`".
+///
+/// `None` for a word naming no value, which takes the variable's value from the environment
+/// the builder itself runs in — an environment this program is handed none of, so that form is
+/// not performed rather than resolved against something else.
+fn build_argument(written: &str) -> Option<(String, String)> {
+    let (name, value) = written.split_once('=')?;
+    (!name.is_empty()).then(|| (name.to_string(), value.to_string()))
+}
+
 /// Perform the invocation `arguments` asks for, or answer `None` for one this program
 /// performs nothing of.
 pub(super) fn performed(
@@ -199,8 +224,16 @@ pub(super) fn performed(
         Requested::Build {
             tags,
             dockerfile,
+            build_arguments,
             context,
-        } => built(tools, &tags, dockerfile.as_deref(), &context, files),
+        } => built(
+            tools,
+            &tags,
+            dockerfile.as_deref(),
+            &build_arguments,
+            &context,
+            files,
+        ),
         Requested::Tag { source, target } => tagged(tools, &source, &target),
         Requested::Push { reference } => pushed(tools, &reference),
     })
@@ -241,6 +274,7 @@ fn built(
     tools: &BuildTools,
     tags: &[String],
     dockerfile: Option<&str>,
+    build_arguments: &::std::collections::BTreeMap<String, String>,
     context: &str,
     files: &dyn ProgramFiles,
 ) -> ProgramOutcome {
@@ -251,7 +285,7 @@ fn built(
         },
         str::to_string,
     );
-    let image = match container_image::composed(files, context, &dockerfile) {
+    let image = match container_image::composed(files, context, &dockerfile, build_arguments) {
         Ok(image) => image,
         Err(detail) => return tools.refused(DOCKER_PROGRAM, &detail, DOCKER_FAILED),
     };
@@ -708,6 +742,7 @@ mod tests {
                 Some(Requested::Build {
                     tags: vec!["app:v1".to_string()],
                     dockerfile: None,
+                    build_arguments: ::std::collections::BTreeMap::new(),
                     context: ".".to_string(),
                 }),
             ),
@@ -725,8 +760,39 @@ mod tests {
                 Some(Requested::Build {
                     tags: vec!["app:v1".to_string(), "app:latest".to_string()],
                     dockerfile: Some("docker/Dockerfile".to_string()),
+                    build_arguments: ::std::collections::BTreeMap::new(),
                     context: "src".to_string(),
                 }),
+            ),
+            (
+                // "--build-arg <varname>=<value>": the values the Dockerfile's own `ARG`
+                // declarations take, in both spellings the option is written in.
+                "a build carrying build arguments",
+                vec![
+                    "build",
+                    "--build-arg",
+                    "BODY=a b c",
+                    "--build-arg=TAG=v2",
+                    "-t",
+                    "app:v2",
+                    ".",
+                ],
+                Some(Requested::Build {
+                    tags: vec!["app:v2".to_string()],
+                    dockerfile: None,
+                    build_arguments: [("BODY", "a b c"), ("TAG", "v2")]
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value.to_string()))
+                        .collect(),
+                    context: ".".to_string(),
+                }),
+            ),
+            (
+                // A `--build-arg` naming no value takes it from the environment the builder
+                // itself runs in, which this program is handed none of.
+                "a build argument with no value",
+                vec!["build", "--build-arg", "BODY", "-t", "app:v2", "."],
+                None,
             ),
             (
                 "a build naming no context",

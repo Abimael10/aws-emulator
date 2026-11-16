@@ -487,6 +487,186 @@ async fn a_builds_image_push_is_what_the_registry_then_holds() {
     }
 }
 
+/// RULE: a build's commands are run by the shell of the build environment, so a command that
+/// materialises its Dockerfile from a Base64-encoded environment variable
+/// (`base64 -d`) writes the document the build then builds from — and a `--build-arg`
+/// changes the IMAGE exactly where that Dockerfile uses the variable it names: a different
+/// value for a variable the document resolves into an instruction composes a different image
+/// (and therefore a different digest), while a value nothing in the document uses composes
+/// the very same one.
+///
+/// The rows differ along what the rule generalises over: whether the Dockerfile declares an
+/// `ARG` for the variable the build passes, which value it passes, and whether the same
+/// (document, value) pair is built twice — crossed with the tag each push addresses, so the
+/// digests are read back out of Amazon ECR per tag.
+#[tokio::test]
+async fn a_build_argument_changes_the_image_where_the_dockerfile_uses_it() {
+    let router = emulator();
+    let registry = registry_host();
+    let repository = "argument-images";
+    ecr_ok(
+        &router,
+        "the suite's repository",
+        "CreateRepository",
+        &json!({"repositoryName": repository}),
+    )
+    .await;
+    let role = role_allowing(&router, "codebuild-ecr-arguments", &PUSH_ACTIONS).await;
+
+    /// A Dockerfile that RESOLVES the build argument into an instruction of the image.
+    const USES_THE_ARGUMENT: &str = "FROM scratch\nARG BODY\nENV BODY=$BODY\nEXPOSE 80\n";
+    /// One that declares no `ARG` for it, so a value passed for it is not in force.
+    const DECLARES_NO_ARGUMENT: &str = "FROM scratch\nENV BODY=fixed\nEXPOSE 80\n";
+
+    // (case, the Dockerfile, the value passed for BODY, the tag the push addresses)
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "a Dockerfile that resolves the argument",
+            USES_THE_ARGUMENT,
+            "the first body",
+            "uses-first",
+        ),
+        (
+            "the same document and the same value again",
+            USES_THE_ARGUMENT,
+            "the first body",
+            "uses-first-again",
+        ),
+        (
+            "the same document with another value",
+            USES_THE_ARGUMENT,
+            "the second body",
+            "uses-second",
+        ),
+        (
+            "a document that declares no ARG for it",
+            DECLARES_NO_ARGUMENT,
+            "the third body",
+            "no-argument-third",
+        ),
+        (
+            "the same document with another value nothing uses",
+            DECLARES_NO_ARGUMENT,
+            "the fourth body",
+            "no-argument-fourth",
+        ),
+    ];
+
+    let mut digests: Vec<(&str, String)> = Vec::new();
+    for (index, (case, dockerfile, body, tag)) in rows.iter().enumerate() {
+        let reference = format!("{registry}/{repository}:{tag}");
+        // The command sequence the check's own buildspec uses: the Dockerfile travels as a
+        // Base64-encoded environment variable and is decoded into the working tree, then the
+        // build passes the body as a build argument.
+        let spec = format!(
+            "version: 0.2\nphases:\n  pre_build:\n    commands:\n      - 'echo \
+             \"$DOCKERFILE_B64\" | base64 -d > Dockerfile'\n      - 'aws ecr \
+             get-login-password --region $AWS_REGION | docker login --username AWS \
+             --password-stdin {registry}'\n  build:\n    commands:\n      - 'docker build \
+             --build-arg \"BODY=$BODY\" -t {reference} .'\n  post_build:\n    commands:\n     \
+             - 'docker push {reference}'\n"
+        );
+        let project = format!("ecr-argument-proj-{index}");
+        let (status, created) = call(
+            &router,
+            "CreateProject",
+            json!({
+                "name": project,
+                "serviceRole": role,
+                "source": {"type": "NO_SOURCE", "buildspec": spec},
+                "artifacts": {"type": "NO_ARTIFACTS"},
+                "environment": {
+                    "type": "LINUX_CONTAINER",
+                    "image": "aws/codebuild/amazonlinux2-x86_64-standard:5.0",
+                    "computeType": "BUILD_GENERAL1_SMALL",
+                    "privilegedMode": true,
+                    "environmentVariables": [
+                        {
+                            "name": "DOCKERFILE_B64",
+                            "value": aws_smithy_types::base64::encode(dockerfile),
+                        },
+                        {"name": "BODY", "value": body},
+                    ],
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateProject must answer 200, got {status} with {created}"
+        );
+
+        let build = settled_build(&router, case, &project).await;
+        assert_eq!(
+            build["buildStatus"],
+            json!("SUCCEEDED"),
+            "case {case:?}: every command must exit zero, got {build}"
+        );
+
+        let described = ecr_ok(
+            &router,
+            case,
+            "DescribeImages",
+            &json!({
+                "repositoryName": repository,
+                "imageIds": [{"imageTag": tag}],
+            }),
+        )
+        .await;
+        let digest = described["imageDetails"][0]["imageDigest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            digest.starts_with("sha256:") && digest.len() > "sha256:".len(),
+            "case {case:?}: the push must leave an image addressed by its content digest, \
+             got {described}"
+        );
+        digests.push((case, digest));
+    }
+
+    /// The digest the row whose case is `case` pushed.
+    fn digest_of<'held>(digests: &'held [(&str, String)], case: &str) -> &'held str {
+        digests
+            .iter()
+            .find(|(held, _)| *held == case)
+            .map(|(_, digest)| digest.as_str())
+            .unwrap_or_else(|| panic!("case {case:?}: expected a digest for it"))
+    }
+
+    // (case, the two rows compared, whether they are the same image)
+    let comparisons: Vec<(&str, &str, &str, bool)> = vec![
+        (
+            "the same document and value, built twice",
+            "a Dockerfile that resolves the argument",
+            "the same document and the same value again",
+            true,
+        ),
+        (
+            "a value the document resolves into an instruction",
+            "a Dockerfile that resolves the argument",
+            "the same document with another value",
+            false,
+        ),
+        (
+            "a value the document uses nowhere",
+            "a document that declares no ARG for it",
+            "the same document with another value nothing uses",
+            true,
+        ),
+    ];
+    for (case, left, right, same) in comparisons {
+        let one = digest_of(&digests, left);
+        let other = digest_of(&digests, right);
+        assert_eq!(
+            one == other,
+            same,
+            "case {case:?}: expected {} images, got {one} and {other}",
+            if same { "the same" } else { "two different" }
+        );
+    }
+}
+
 /// RULE: what a push uploaded is a REAL image: the registry addresses it by the content
 /// digest of its manifest, serves that manifest, and holds every blob the manifest names —
 /// and the same context pushed under two tags is one image, because an image is addressed by

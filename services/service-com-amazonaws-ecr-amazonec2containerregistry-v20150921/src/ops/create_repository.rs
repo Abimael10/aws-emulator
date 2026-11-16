@@ -329,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for it rather than two entries for one key.
         repo.merge_tags(tags);
 
-        let repository = repo.to_repository();
+        let repository = repo.to_repository(&crate::state::announced_registry_endpoint(ctx));
         store
             .repositories
             .insert(crate::state::repository_key(&region, &name), repo);

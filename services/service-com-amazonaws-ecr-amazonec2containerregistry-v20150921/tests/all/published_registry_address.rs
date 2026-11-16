@@ -3,25 +3,16 @@
 //! The registry address this service reports for a repository and for a `docker login`,
 //! driven end to end over the wire.
 //!
-//! Two rules are under test, because the model states two different kinds of value:
+//! ONE rule is under test, because the model states one kind of value twice: both
+//! `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
+//! container image `push` and `pull` operations") and `AuthorizationData$proxyEndpoint`
+//! ("The registry URL to use for this authorization token in a `docker login` command") are
+//! ADDRESSES a container client DIALS, so each names the endpoint THIS emulator serves the
+//! registry API at: the endpoint the CALLER reached this emulator on when a registry client
+//! can use it (it names no service), and the address this emulator is served at otherwise.
+//! The two agree, which is what lets a client log in where it pushes.
 //!
-//! - `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//!   container image `push` and `pull` operations") NAMES the registry that holds the
-//!   repository, in the registry URL form the model itself writes down
-//!   (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
-//!   `https://aws_account_id.dkr.ecr.region.amazonaws.com`"): the account id of the
-//!   registry, `dkr`, `ecr`, the Region that registry serves and the partition's DNS
-//!   suffix, followed by `/<repositoryName>`. It is therefore the SAME value whatever
-//!   endpoint the call arrived on — a client reads the owning account and Region out of it
-//!   to build an image reference, to decide which registry to authenticate to, and to
-//!   check that an image belongs to its own account and Region.
-//! - `AuthorizationData$proxyEndpoint` ("The registry URL to use for this authorization
-//!   token in a `docker login` command") is the one address a container client is handed to
-//!   DIAL, so it names the endpoint THIS emulator serves the registry API at: the endpoint
-//!   the CALLER reached this emulator on when a registry client can use it (it names no
-//!   service), and the address this emulator is served at otherwise.
-//!
-//! The class each rule generalises over is the endpoint the call arrived on crossed with
+//! The class the rule generalises over is the endpoint the call arrived on crossed with
 //! the repository name and the operation reporting it, so the rows span the endpoint forms
 //! a caller reaches this emulator by — the registry host ECR publishes (whose first label
 //! is an account id, so it names no service), the emulator's own socket, a loopback name
@@ -44,8 +35,7 @@ use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedServ
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    announced_registry_endpoint, at, endpoint_host, given_layer, ok, repository_uri, REGION,
-    REGISTRY_ID,
+    announced_registry_endpoint, at, endpoint_host, given_layer, ok, REGION, REGISTRY_ID,
 };
 
 /// One endpoint a caller reaches this emulator on: where the endpoint travels (the `Host`
@@ -119,11 +109,16 @@ const DOCKER_LAYER_MEDIA_TYPE: &str =
 /// ```
 const REPOSITORY_NAMES: [&str; 5] = ["app", "ab", "team/app", "org/team/app", "a.b_c--d"];
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: a router carrying only this service, over one shared engine, served at the
+/// address this harness's emulator answers on (`crate::wire::SERVED_URL_BASE`).
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    router.set_url_base(
+        ::smithy_server_runtime::EndpointUrl::parse(crate::wire::SERVED_URL_BASE)
+            .expect("the base URL must parse"),
+    );
     router.register_service(EmulatedService::new(engine));
     router
 }
@@ -193,10 +188,10 @@ async fn every_reported_repository_uri_names_the_registry_that_holds_the_reposit
         let router = emulator();
         for name in REPOSITORY_NAMES {
             let case = format!("{}, repository {name}", endpoint.case);
-            // The registry of this account in the Region the call is signed for, plus the
-            // repository's own name: the value is a NAME, so the endpoint the call arrived
-            // on does not enter it.
-            let expected = repository_uri(REGION, name);
+            // The endpoint this emulator serves the registry at for THIS caller, plus the
+            // repository's own name: the value is an ADDRESS, so the endpoint the call
+            // arrived on is what it is built on.
+            let expected = format!("{}/{name}", endpoint.login_endpoint);
 
             let created = call_at(
                 &router,
@@ -212,18 +207,18 @@ async fn every_reported_repository_uri_names_the_registry_that_holds_the_reposit
                  {created_uri:?}"
             );
 
-            // The account and the Region are recoverable from the value, which is what a
-            // client parses it for: the authority's first label is the registryId the same
-            // response reports, and the path is exactly the repository's name.
+            // The two parts a container client splits the value into: the address it dials,
+            // which is never an AWS host this emulator does not answer on, and the
+            // repository path it composes a tag, a digest or a registry v2 path on.
             let registry_id = text(&case, &created, "/repository/registryId");
             let (authority, path) = created_uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
             assert!(
-                authority.starts_with(&format!("{registry_id}.dkr.ecr.{REGION}.")),
-                "case {case:?}: expected the authority of {created_uri:?} to name the \
-                 registry account {registry_id:?} and the Region {REGION:?}, got \
-                 {authority:?}"
+                !authority.contains(".amazonaws.com")
+                    || Some(authority) == endpoint.host.as_deref(),
+                "case {case:?}: the authority {authority:?} of {created_uri:?} is an AWS \
+                 host this emulator does not answer on"
             );
             assert_eq!(
                 path, name,
@@ -231,12 +226,12 @@ async fn every_reported_repository_uri_names_the_registry_that_holds_the_reposit
                  name {name:?}, got {path:?}"
             );
 
-            // The Region a call is signed for names the ARN too, and neither is changed by
-            // which endpoint the call arrived on.
+            // The Region a call is signed for names the ARN, which is a LABEL and so is
+            // not changed by which endpoint the call arrived on.
             let arn = text(&case, &created, "/repository/repositoryArn");
             assert_eq!(
                 arn,
-                format!("arn:aws:ecr:{REGION}:{REGISTRY_ID}:repository/{name}"),
+                format!("arn:aws:ecr:{REGION}:{registry_id}:repository/{name}"),
                 "case {case:?}: expected the ARN to name the signed Region, got {arn:?}"
             );
 
@@ -295,16 +290,15 @@ async fn every_reported_repository_uri_names_the_registry_that_holds_the_reposit
 }
 
 #[tokio::test]
-async fn a_repository_uri_is_unchanged_by_the_endpoint_a_read_came_in_on() {
-    // The stored repository is one record, and its URI follows from that record: the
-    // registry account and the Region it belongs to. So every later reader is reported the
-    // same URI however it reached the emulator, while the address a `docker login` is
-    // pointed at follows the reader's own endpoint.
+async fn a_repository_uri_names_the_endpoint_the_read_was_answered_at() {
+    // The stored repository is one record, and its ARN — a LABEL — follows from that record
+    // alone. Its URI is an ADDRESS, so it follows the endpoint the reader reached this
+    // emulator on, exactly as the address a `docker login` is pointed at does: a client is
+    // never handed a push address it is not already talking to.
     let router = emulator();
     let endpoints = endpoints();
     let creating = &endpoints[0];
-    let name = "reported-per-record";
-    let expected = repository_uri(REGION, name);
+    let name = "reported-per-reader";
     let created = call_at(
         &router,
         creating,
@@ -312,26 +306,29 @@ async fn a_repository_uri_is_unchanged_by_the_endpoint_a_read_came_in_on() {
         &json!({"repositoryName": name}),
     )
     .await;
+    let registry_id = text(creating.case, &created, "/repository/registryId");
     let created_uri = text(creating.case, &created, "/repository/repositoryUri");
     assert_eq!(
-        created_uri, expected,
-        "case {:?}: expected the create to report {expected:?}, got {created_uri:?}",
+        created_uri,
+        format!("{}/{name}", creating.login_endpoint),
+        "case {:?}: expected the create to report the address it was answered at, got \
+         {created_uri:?}",
         creating.case
     );
 
     for endpoint in &endpoints {
+        let expected = format!("{}/{name}", endpoint.login_endpoint);
         let listed = call_at(&router, endpoint, "DescribeRepositories", &json!({})).await;
         let listed_uri = text(endpoint.case, &listed, "/repositories/0/repositoryUri");
         assert_eq!(
             listed_uri, expected,
-            "case {:?}: expected the read to report {expected:?} whatever endpoint it came \
-             in on, got {listed_uri:?}",
+            "case {:?}: expected the read to report {expected:?}, got {listed_uri:?}",
             endpoint.case
         );
         let arn = text(endpoint.case, &listed, "/repositories/0/repositoryArn");
         assert_eq!(
             arn,
-            format!("arn:aws:ecr:{REGION}:{REGISTRY_ID}:repository/{name}"),
+            format!("arn:aws:ecr:{REGION}:{registry_id}:repository/{name}"),
             "case {:?}: expected the stored ARN to be unchanged by the read's endpoint, \
              got {arn:?}",
             endpoint.case
@@ -343,6 +340,19 @@ async fn a_repository_uri_is_unchanged_by_the_endpoint_a_read_came_in_on() {
             format!("https://{}", endpoint.login_endpoint),
             "case {:?}: expected the login URL to name the endpoint this read was answered \
              at, got {proxy_endpoint:?}",
+            endpoint.case
+        );
+        // The one thing the pairing is FOR: a client logs in where it pushes, so the host
+        // half of the URI is the host half of the login URL.
+        let login_host = proxy_endpoint
+            .strip_prefix("https://")
+            .unwrap_or(&proxy_endpoint)
+            .to_string();
+        assert_eq!(
+            listed_uri.split_once('/').map(|(host, _)| host),
+            Some(login_host.as_str()),
+            "case {:?}: expected {listed_uri:?} to be pushed at the registry the login URL \
+             {proxy_endpoint:?} names",
             endpoint.case
         );
     }

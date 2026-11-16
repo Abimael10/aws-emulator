@@ -669,6 +669,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // The Availability Zone of each subnet this service's placements name, and the CIDR
+        // block the interface created in one takes its address out of, read out of the same
+        // store under the same rule ([`crate::state::subnet_placements`]): the SCHEDULER
+        // places this service's tasks, with no call there to read Amazon VPC for it, so what
+        // it needs is read here and kept on this store
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::record_subnet_placements`]).
+        let placements = crate::state::subnet_placements(
+            &*self.engine,
+            &crate::state::configured_subnets(input.network_configuration.as_ref()),
+        );
 
         // The capacity the account's Amazon EC2 instances owe their clusters: an instance
         // launched into a cluster was registered by the agent on it, whether or not anybody
@@ -679,6 +689,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.advance_clock(now);
+        // Where the subnets this service places into are, before anything places a task into
+        // one.
+        guard.record_subnet_placements(placements);
 
         // "Runs and maintains your desired number of tasks ... in the specified cluster":
         // a cluster this account does not hold as one to act in holds no service either.

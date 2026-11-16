@@ -22,11 +22,17 @@
 //!   characters or the delimited fields the list names, one output line per input line;
 //! * `head -n COUNT` — "the first COUNT lines of each file", ten lines when no count is given;
 //! * `sha256sum` / `sha512sum` — the digest of its input, written as the lowercase hexadecimal
-//!   digest, two spaces and the name of what was read (`-` for standard input).
+//!   digest, two spaces and the name of what was read (`-` for standard input);
+//! * `base64` / `base64 -d` — "Base64 encode or decode FILE, or standard input, to standard
+//!   output": the encoding wrapped after [`DEFAULT_BASE64_WRAP`] characters, or after the
+//!   `-w COLS` an invocation names (`0` disabling the wrapping), and the decoding of its
+//!   input, which "ignores" the line breaks an encoding wrote and, under `-i`, every other
+//!   character outside the Base64 alphabet. Input that is no Base64 encoding at all is the
+//!   utility's own [`BASE64_INVALID_INPUT`] failure.
 //!
 //! The option spellings and the output forms above are each utility's own, from the GNU
-//! coreutils manual (`wc`, `cut`, `head`, `sha2 utilities`) — which is what the images these
-//! sessions stand for carry — and POSIX for `wc`, `cut` and `head`.
+//! coreutils manual (`wc`, `cut`, `head`, `sha2 utilities`, `base64`) — which is what the images
+//! these sessions stand for carry — and POSIX for `wc`, `cut` and `head`.
 //!
 //! # What is NOT performed
 //!
@@ -41,6 +47,10 @@
 //!   run ([`Filter::read`] answering `None`), which is the fail-closed default the session's
 //!   own catalog keeps.
 //!
+//! A session's streams and files carry TEXT, so a `base64 -d` whose bytes are not text writes
+//! none of them and fails ([`BASE64_UNDECODABLE_BYTES`]) rather than writing something other
+//! than what the input decodes to.
+//!
 //! This module computes over the text it is handed: it opens nothing, reads no path of the
 //! host, and holds nothing between calls. WHERE the input comes from — a file of the session's
 //! tree or the stage before it in a pipeline — is the session's to resolve
@@ -50,7 +60,7 @@ use ::sha2::Digest;
 
 /// The utilities this module performs, as the names a command line invokes them by. A session
 /// hands a command whose name is one of these to [`Filter::read`].
-pub const TEXT_FILTER_COMMANDS: &[&str] = &["wc", "cut", "head", "sha256sum", "sha512sum"];
+pub const TEXT_FILTER_COMMANDS: &[&str] = &["wc", "cut", "head", "sha256sum", "sha512sum", "base64"];
 
 /// Which count a `wc` invocation asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +99,18 @@ enum Portion {
     },
 }
 
+/// What one `base64` invocation asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Base64Work {
+    /// `-d`/`--decode`: "decode data" rather than encode it.
+    decode: bool,
+    /// `-i`/`--ignore-garbage`: "when decoding, ignore non-alphabet characters".
+    ignore_garbage: bool,
+    /// `-w`/`--wrap=COLS`: "wrap encoded lines after COLS character", and `0` to "disable line
+    /// wrapping".
+    wrap: usize,
+}
+
 /// The work one invocation of a text filter performs over ONE input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Work {
@@ -100,6 +122,8 @@ enum Work {
     Head(usize),
     /// `sha256sum` / `sha512sum`.
     Digest(Digester),
+    /// `base64`, encoding or decoding.
+    Base64(Base64Work),
 }
 
 /// One invocation of a text filter: the work it performs, and the file it reads when it names
@@ -118,6 +142,19 @@ const DEFAULT_HEAD_LINES: usize = 10;
 
 /// The delimiter `cut -f` takes when the invocation names none: "the default is TAB".
 const DEFAULT_FIELD_DELIMITER: char = '\t';
+
+/// How many characters an ENCODING is wrapped after when the invocation names no width:
+/// "wrap encoded lines after COLS character (default 76)".
+pub const DEFAULT_BASE64_WRAP: usize = 76;
+
+/// What `base64` writes to standard error for input that is no Base64 encoding: "base64:
+/// invalid input".
+pub const BASE64_INVALID_INPUT: &str = "base64: invalid input";
+
+/// What a `base64 -d` writes to standard error when what its input decodes to is not text,
+/// which a session's streams and files carry (see the module docs).
+pub const BASE64_UNDECODABLE_BYTES: &str =
+    "base64: the input decodes to bytes that are not text";
 
 /// What the output names for an input read from standard input, as a checksum utility writes
 /// it.
@@ -165,6 +202,7 @@ impl Filter {
             "head" => Work::Head(head_lines(&options)?),
             "sha256sum" => Work::Digest(Digester::Sha256),
             "sha512sum" => Work::Digest(Digester::Sha512),
+            "base64" => Work::Base64(base64_work(&options)?),
             _ => return None,
         };
         Some(Self { work, file })
@@ -178,9 +216,11 @@ impl Filter {
 
     /// What this invocation writes to standard output for `input`, which was read from
     /// `label` — the file's own name, or [`STANDARD_INPUT_LABEL`] for standard input.
-    #[must_use]
-    pub fn perform(&self, label: &str, input: &str) -> String {
-        match &self.work {
+    ///
+    /// `Err` is what the utility writes to standard ERROR for an input it cannot compute over,
+    /// which is a failed invocation rather than one that wrote nothing.
+    pub fn perform(&self, label: &str, input: &str) -> Result<String, String> {
+        Ok(match &self.work {
             Work::Count(count) => {
                 let counted = counted(*count, input);
                 // The count alone for standard input; the count and the file's name for a file
@@ -195,7 +235,8 @@ impl Filter {
             Work::Digest(digester) => {
                 format!("{}  {label}\n", digest_of(*digester, input))
             }
-        }
+            Work::Base64(work) => base64_performed(*work, input)?,
+        })
     }
 }
 
@@ -207,6 +248,8 @@ fn value_taking_options(name: &str) -> &'static [&'static str] {
         "cut" => &["-c", "-f", "-d"],
         // `head`'s line count.
         "head" => &["-n"],
+        // `base64`'s wrapping width.
+        "base64" => &["-w", "--wrap"],
         // `wc`'s counts and the checksum utilities take none.
         _ => &[],
     }
@@ -298,6 +341,102 @@ fn head_lines(options: &[String]) -> Option<usize> {
         lines = Some(written.trim().parse::<usize>().ok()?);
     }
     Some(lines.unwrap_or(DEFAULT_HEAD_LINES))
+}
+
+/// What a `base64` invocation's options ask for, or `None` for an option form this module does
+/// not perform.
+///
+/// The width option carries its value glued to it ([`Filter::read`] folds the spelling that
+/// writes it as the next word into that one), written either way GNU writes it (`-w COLS`,
+/// `--wrap=COLS`).
+fn base64_work(options: &[String]) -> Option<Base64Work> {
+    let mut work = Base64Work {
+        decode: false,
+        ignore_garbage: false,
+        wrap: DEFAULT_BASE64_WRAP,
+    };
+    for option in options {
+        match option.as_str() {
+            "-d" | "--decode" => work.decode = true,
+            "-i" | "--ignore-garbage" => work.ignore_garbage = true,
+            _ => {
+                let written = option
+                    .strip_prefix("--wrap")
+                    .map(|rest| rest.strip_prefix('=').unwrap_or(rest))
+                    .or_else(|| option.strip_prefix("-w"))
+                    .filter(|written| !written.is_empty())?;
+                work.wrap = written.trim().parse::<usize>().ok()?;
+            }
+        }
+    }
+    Some(work)
+}
+
+/// What a `base64` invocation writes for `input`, and the standard-error line of one whose
+/// input it cannot compute over.
+fn base64_performed(work: Base64Work, input: &str) -> Result<String, String> {
+    if work.decode {
+        return base64_decoded(work, input);
+    }
+    Ok(base64_encoded(work, input))
+}
+
+/// The Base64 encoding of `input`, wrapped as the invocation asks.
+///
+/// "Wrap encoded lines after COLS character", so every line but the last is exactly that wide
+/// and each is ended by the newline the utility writes; a width of `0` disables the wrapping
+/// and the whole encoding is one line. An EMPTY input encodes to nothing, so nothing is
+/// written for it — not even a line ending.
+fn base64_encoded(work: Base64Work, input: &str) -> String {
+    use ::base64::Engine as _;
+
+    let encoded = ::base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
+    if encoded.is_empty() {
+        return String::new();
+    }
+    if work.wrap == 0 || encoded.len() <= work.wrap {
+        return format!("{encoded}\n");
+    }
+    // The encoding is Base64 alphabet, so it is ASCII and a byte boundary is a character
+    // boundary.
+    let mut written = String::with_capacity(encoded.len() + encoded.len() / work.wrap + 1);
+    for line in encoded.as_bytes().chunks(work.wrap) {
+        written.push_str(&String::from_utf8_lossy(line));
+        written.push('\n');
+    }
+    written
+}
+
+/// What `input` decodes to, or the standard-error line of a decode that could not be made.
+///
+/// The line breaks an encoding wrote are not data, so they are not decoded as any: GNU's own
+/// decoder ignores them, and `-i` ("ignore non-alphabet characters") extends that to every
+/// character outside the alphabet. What is left has to be a Base64 encoding — anything else is
+/// [`BASE64_INVALID_INPUT`] — and what it decodes to has to be text, which is what a session's
+/// streams and files carry ([`BASE64_UNDECODABLE_BYTES`]).
+fn base64_decoded(work: Base64Work, input: &str) -> Result<String, String> {
+    use ::base64::Engine as _;
+
+    let held: String = input
+        .chars()
+        .filter(|character| {
+            if work.ignore_garbage {
+                is_base64_alphabet(*character)
+            } else {
+                *character != '\n' && *character != '\r'
+            }
+        })
+        .collect();
+    let decoded = ::base64::engine::general_purpose::STANDARD
+        .decode(held.as_bytes())
+        .map_err(|_| BASE64_INVALID_INPUT.to_string())?;
+    String::from_utf8(decoded).map_err(|_| BASE64_UNDECODABLE_BYTES.to_string())
+}
+
+/// Whether `character` is one of the Base64 alphabet or its padding, which is what a decode
+/// reads and what `-i` keeps of its input (RFC 4648 table 1 and the `=` pad).
+fn is_base64_alphabet(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
 }
 
 /// The positions one `cut` list names, as the ranges it is written with.
@@ -628,12 +767,105 @@ mod tests {
                  36ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f  -\n"
                     .to_string(),
             ),
+            (
+                // The vectors RFC 4648 section 10 publishes for the Base64 alphabet, which
+                // are the encodings of these inputs.
+                "base64 of standard input",
+                "base64",
+                words(&[]),
+                STANDARD_INPUT_LABEL,
+                "foobar",
+                "Zm9vYmFy\n".to_string(),
+            ),
+            (
+                // "fo" pads to one `=`, which is what the alphabet's padding rule gives.
+                "base64 of an input that pads",
+                "base64",
+                words(&["payload.txt"]),
+                "payload.txt",
+                "fo",
+                "Zm8=\n".to_string(),
+            ),
+            (
+                // "wrap encoded lines after COLS character": 60 bytes of input encode to 80
+                // characters, so the default width writes 76 of them and then the rest.
+                "base64 wrapped at the default width",
+                "base64",
+                words(&[]),
+                STANDARD_INPUT_LABEL,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\nYWFh\n"
+                    .to_string(),
+            ),
+            (
+                // "-w, --wrap=COLS ... Use 0 to disable line wrapping."
+                "base64 with the wrapping disabled",
+                "base64",
+                words(&["-w", "0"]),
+                STANDARD_INPUT_LABEL,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\n"
+                    .to_string(),
+            ),
+            (
+                "base64 with a wrapping width written as one word",
+                "base64",
+                words(&["--wrap=4"]),
+                STANDARD_INPUT_LABEL,
+                "foobar",
+                "Zm9v\nYmFy\n".to_string(),
+            ),
+            (
+                "base64 of nothing at all",
+                "base64",
+                words(&[]),
+                STANDARD_INPUT_LABEL,
+                "",
+                String::new(),
+            ),
+            (
+                "base64 -d of an encoding",
+                "base64",
+                words(&["-d"]),
+                STANDARD_INPUT_LABEL,
+                "Zm9vYmFy",
+                "foobar".to_string(),
+            ),
+            (
+                // The line breaks an encoding wrote are not data, and neither is the newline
+                // the stage before a decode ended its output with.
+                "base64 --decode of a wrapped encoding",
+                "base64",
+                words(&["--decode"]),
+                STANDARD_INPUT_LABEL,
+                "Zm9v\nYmFy\n",
+                "foobar".to_string(),
+            ),
+            (
+                "base64 -d of a file",
+                "base64",
+                words(&["-d", "encoded.txt"]),
+                "encoded.txt",
+                "RlJPTSBzY3JhdGNo\n",
+                "FROM scratch".to_string(),
+            ),
+            (
+                // "-i, --ignore-garbage: when decoding, ignore non-alphabet characters".
+                "base64 -d -i of an encoding carrying garbage",
+                "base64",
+                words(&["-d", "-i"]),
+                STANDARD_INPUT_LABEL,
+                "Zm9v*Ym Fy",
+                "foobar".to_string(),
+            ),
         ];
         for (case, name, arguments, label, input, expected) in rows {
             let filter = Filter::read(name, &arguments)
                 .unwrap_or_else(|| panic!("case {case:?}: expected {name} {arguments:?} to be a \
                                            form this module performs"));
-            let written = filter.perform(label, input);
+            let written = filter.perform(label, input).unwrap_or_else(|refusal| {
+                panic!("case {case:?}: expected an output, got the refusal {refusal:?}")
+            });
             assert_eq!(
                 written, expected,
                 "case {case:?}: expected {expected:?}, got {written:?}"
@@ -660,6 +892,8 @@ mod tests {
             ("an option whose value was never written", "cut", words(&["-c"])),
             ("head with a count that is not one", "head", words(&["-n", "two"])),
             ("head with an option it has none of", "head", words(&["-c", "2"])),
+            ("base64 with an option it has none of", "base64", words(&["-x"])),
+            ("base64 with a width that is not one", "base64", words(&["-w", "wide"])),
             ("a utility this module has none of", "tail", words(&["-n1"])),
         ];
         for (case, name, arguments) in rows {
@@ -667,6 +901,90 @@ mod tests {
             assert!(
                 read.is_none(),
                 "case {case:?}: expected {name} {arguments:?} not to be performed, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: an input no Base64 encoding decodes from is the utility's own failure, and an
+    /// encoding ROUND-TRIPS: what an encode wrote decodes back to the very bytes it read,
+    /// whatever width it was wrapped at.
+    ///
+    /// The refusal rows differ along how the input breaks the alphabet; the round-trip rows
+    /// along the input's length (which decides the padding), the characters it carries and
+    /// the wrapping width, so a line break in the middle of an encoding is covered too.
+    #[test]
+    fn a_base64_decode_answers_the_bytes_an_encode_read_or_fails() {
+        // (case, the arguments, the input, the standard-error line it writes)
+        let refused: Vec<(&str, Vec<String>, &str, &str)> = vec![
+            (
+                "a character outside the alphabet",
+                words(&["-d"]),
+                "Zm9v*YmFy",
+                BASE64_INVALID_INPUT,
+            ),
+            (
+                "an encoding one character short of a quantum",
+                words(&["-d"]),
+                "Zm9vYmFyZ",
+                BASE64_INVALID_INPUT,
+            ),
+            (
+                // A session's streams and files carry text, so bytes that are none are not
+                // written as something else: `/w==` decodes to the byte 0xff, which is no
+                // UTF-8 sequence.
+                "an encoding of bytes that are not text",
+                words(&["-d"]),
+                "/w==",
+                BASE64_UNDECODABLE_BYTES,
+            ),
+        ];
+        for (case, arguments, input, expected) in refused {
+            let filter = Filter::read("base64", &arguments)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a performed form"));
+            let answered = filter.perform(STANDARD_INPUT_LABEL, input);
+            assert_eq!(
+                answered.as_ref().err().map(String::as_str),
+                Some(expected),
+                "case {case:?}: expected the refusal {expected:?}, got {answered:?}"
+            );
+        }
+
+        // (case, the input, the wrapping width the encode is asked for)
+        let round_tripped: Vec<(&str, &str, Vec<String>)> = vec![
+            ("one byte, which pads twice", "a", words(&[])),
+            ("two bytes, which pad once", "ab", words(&[])),
+            ("three bytes, which do not pad", "abc", words(&[])),
+            (
+                "a whole Dockerfile, wrapped at the default width",
+                "FROM scratch\nARG BODY\nENV BODY=$BODY\nEXPOSE 80\nCMD [\"serve\"]\n",
+                words(&[]),
+            ),
+            (
+                "the same text with the wrapping disabled",
+                "FROM scratch\nARG BODY\nENV BODY=$BODY\nEXPOSE 80\nCMD [\"serve\"]\n",
+                words(&["-w0"]),
+            ),
+            (
+                "text wrapped at a width that splits every quantum",
+                "the quick brown fox jumps over the lazy dog",
+                words(&["--wrap", "5"]),
+            ),
+            ("text outside ASCII", "héllo wörld — ⚙", words(&[])),
+        ];
+        for (case, input, arguments) in round_tripped {
+            let encoder = Filter::read("base64", &arguments)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a performed encode"));
+            let encoded = encoder
+                .perform(STANDARD_INPUT_LABEL, input)
+                .unwrap_or_else(|refusal| panic!("case {case:?}: expected an encoding, got {refusal:?}"));
+            let decoder = Filter::read("base64", &words(&["-d"]))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a performed decode"));
+            let decoded = decoder
+                .perform(STANDARD_INPUT_LABEL, &encoded)
+                .unwrap_or_else(|refusal| panic!("case {case:?}: expected a decoding, got {refusal:?}"));
+            assert_eq!(
+                decoded, input,
+                "case {case:?}: expected {input:?} back from {encoded:?}, got {decoded:?}"
             );
         }
     }

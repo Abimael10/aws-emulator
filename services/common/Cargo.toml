@@ -197,6 +197,10 @@ brush-parser = { version = "0.4", default-features = false }
 # ... and the path of that URI spells an Amazon S3 key, so its percent-escaping is resolved
 # by the maintained encoder the URL parser itself uses.
 percent-encoding = "2"
+# `posix_shell_text_filters`: the Base64 encoder and decoder the `base64` utility of a shell
+# session computes with, from the maintained codec this workspace already encodes with rather
+# than a second implementation of the alphabet here.
+base64 = "0.22"
 # `acm_certificate_termination`: the TLS server a service terminating a connection under a
 # Certificate Manager certificate answers a handshake with — one statement of the
 # certificate selection and the key loading for every presenting service. The TLS

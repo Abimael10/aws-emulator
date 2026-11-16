@@ -2160,16 +2160,18 @@ pub struct Repo {
 impl Repo {
     /// The `Repository` every operation that reports this repository returns.
     ///
-    /// `repositoryUri` is composed here rather than stored on the record, from the
-    /// registry account and the Region this repository belongs to ([`repository_uri`]): it
-    /// follows from the record, so the two cannot drift, and every operation that reports
-    /// this repository reports the one URI that names it.
-    pub fn to_repository(&self) -> Repository {
+    /// `repositoryUri` is composed here rather than stored on the record, from
+    /// `registry_endpoint` — the endpoint this emulator serves this registry at for the
+    /// caller being answered ([`announced_registry_endpoint`]) — and the repository's own
+    /// name ([`repository_uri`]): it follows from the record and the endpoint the answer is
+    /// given at, so every operation that reports this repository reports the one URI a
+    /// client pushes and pulls it at.
+    pub fn to_repository(&self, registry_endpoint: &str) -> Repository {
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(&self.registry_id, &self.region, &self.name)),
+            repository_uri: Some(repository_uri(registry_endpoint, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self

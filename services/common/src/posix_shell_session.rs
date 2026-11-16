@@ -1961,7 +1961,15 @@ impl ShellSession {
                 Err(status) => return status,
             },
         };
-        let written = filter.perform(&label, &input);
+        let written = match filter.perform(&label, &input) {
+            Ok(written) => written,
+            // An input the utility cannot compute over: what it writes about it goes to
+            // standard error, and nothing is written to standard output.
+            Err(refusal) => {
+                let _ = self.write_stderr(&format!("{refusal}\n"), redirections);
+                return self.config.statuses.failure;
+            }
+        };
         if self.write_stdout(&written, redirections) {
             self.config.statuses.success
         } else {

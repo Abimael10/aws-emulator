@@ -30,8 +30,17 @@
 //! nothing in this emulator reaches a registry off it, so the image a build composes carries
 //! its own context as its single layer and no base layer. The instruction is still required
 //! to be there, because a Dockerfile without one is not a Dockerfile a build can run.
+//!
+//! What the DOCUMENT declares about the image is read beside the context
+//! ([`super::dockerfile`]) and composed into the configuration blob: the environment, command,
+//! entry point, exposed ports, working directory and user its instructions set, and the
+//! `history` whose entries are the instructions as they ran — resolved against the
+//! `--build-arg` values the command carried. So an image's digest depends on a build argument
+//! exactly where the Dockerfile uses it, as it does on the files of the context.
 
+use super::dockerfile;
 use ::service_common::posix_shell_session::ProgramFiles;
+use ::std::collections::BTreeMap;
 use ::std::io::Write as _;
 
 /// The media type of the manifest this composes (Docker Image Manifest V2, Schema 2).
@@ -50,7 +59,7 @@ pub const DEFAULT_DOCKERFILE: &str = "Dockerfile";
 /// The instruction a Dockerfile has to open with: "a Dockerfile must begin with a `FROM`
 /// instruction" (Dockerfile reference), ignoring the parser directives and comments before
 /// it.
-const FROM_INSTRUCTION: &str = "FROM";
+const FROM_INSTRUCTION: &str = dockerfile::FROM_INSTRUCTION;
 
 /// How many bytes of the build's working tree ONE image carries.
 ///
@@ -124,7 +133,8 @@ pub fn content_digest(bytes: &[u8]) -> String {
 }
 
 /// Compose the image `docker build` builds from the context at `context` in `files`, built
-/// from the Dockerfile at `dockerfile`.
+/// from the Dockerfile at `dockerfile`, with the `--build-arg` values `build_arguments` the
+/// command carried.
 ///
 /// `Err` carries what the command reports instead: a Dockerfile the tree does not hold, a
 /// Dockerfile that is not one, a context with nothing in it, or a context past
@@ -133,6 +143,7 @@ pub fn composed(
     files: &dyn ProgramFiles,
     context: &str,
     dockerfile: &str,
+    build_arguments: &BTreeMap<String, String>,
 ) -> Result<LocalImage, String> {
     let Some(declaration) = files.read(dockerfile) else {
         return Err(format!(
@@ -150,7 +161,7 @@ pub fn composed(
     // path (`-f` may name one outside it).
     let dockerfile_entry = entry_name(context, dockerfile);
     if !carried.iter().any(|(path, _)| path == &dockerfile_entry) {
-        carried.push((dockerfile_entry, declaration));
+        carried.push((dockerfile_entry, declaration.clone()));
     }
     if carried.is_empty() {
         return Err(format!(
@@ -169,7 +180,8 @@ pub fn composed(
     }
     let archive = archived(&carried)?;
     let layer = compressed(&archive)?;
-    let config = configuration(&archive);
+    let declared = self::dockerfile::declared(&declaration, build_arguments);
+    let config = configuration(&archive, &declared);
     Ok(LocalImage { config, layer })
 }
 
@@ -278,20 +290,23 @@ const IMAGE_ARCHITECTURE: &str = ::std::env::consts::ARCH;
 /// See [`IMAGE_ARCHITECTURE`].
 const IMAGE_OS: &str = ::std::env::consts::OS;
 
-/// The image configuration document for a layer whose UNCOMPRESSED bytes are `archive`.
+/// The image configuration document for a layer whose UNCOMPRESSED bytes are `archive`, as
+/// the Dockerfile `declared`.
 ///
 /// `rootfs.diff_ids` names each layer by the digest of its uncompressed archive, which is
 /// what an image configuration states about its filesystem; the platform values are this
-/// environment's own.
-fn configuration(archive: &[u8]) -> Vec<u8> {
+/// environment's own, and `config` and `history` are what the document declares
+/// ([`super::dockerfile`]).
+fn configuration(archive: &[u8], declared: &self::dockerfile::Declaration) -> Vec<u8> {
     ::serde_json::json!({
         "architecture": IMAGE_ARCHITECTURE,
         "os": IMAGE_OS,
-        "config": {},
+        "config": declared.configuration(),
         "rootfs": {
             "type": "layers",
             "diff_ids": [content_digest(archive)],
         },
+        "history": declared.history(),
     })
     .to_string()
     .into_bytes()
@@ -388,11 +403,12 @@ mod tests {
         let mut seen: BTreeMap<String, &str> = BTreeMap::new();
         for (case, files) in rows {
             let tree = Tree::of(&files);
-            let image = composed(&tree, ".", DEFAULT_DOCKERFILE)
+            let image = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new())
                 .unwrap_or_else(|error| panic!("case {case:?}: expected an image, got {error}"));
             let digest = content_digest(image.manifest().as_bytes());
             // The same context, composed again, is the same image.
-            let again = composed(&tree, ".", DEFAULT_DOCKERFILE).expect("the same image");
+            let again =
+                composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new()).expect("the same image");
             assert_eq!(
                 image, again,
                 "case {case:?}: the same context must compose the same image, got {:?} then {:?}",
@@ -456,7 +472,7 @@ mod tests {
         ];
         for (case, files, composes) in rows {
             let tree = Tree::of(&files);
-            let answered = composed(&tree, ".", DEFAULT_DOCKERFILE);
+            let answered = composed(&tree, ".", DEFAULT_DOCKERFILE, &BTreeMap::new());
             assert_eq!(
                 answered.is_ok(),
                 composes,

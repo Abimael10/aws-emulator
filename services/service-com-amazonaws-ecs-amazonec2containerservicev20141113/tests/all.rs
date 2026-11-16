@@ -259,6 +259,8 @@ mod service_registry_dns_record_rules;
 mod service_revisions;
 #[path = "all/service_run_state.rs"]
 mod service_run_state;
+#[path = "all/service_task_interface_subnet_address.rs"]
+mod service_task_interface_subnet_address;
 #[path = "all/service_validation.rs"]
 mod service_validation;
 #[path = "all/services_by_namespace.rs"]

@@ -50,3 +50,40 @@ Actual (emulator): neither check reached any of these assertions. No build outco
 7. Register a task definition pinning repoUri@digest, create a Fargate service on it behind the target group, and poll for one RUNNING task, a 'healthy' target and an HTTP 200 through the ALB whose body equals the baked body.
 8. Start a second build with a new tag, register the next revision pinning its digest, UpdateService to it, and poll for the ALB to serve build #2's body and for the PRIMARY deployment to reach rolloutState 'COMPLETED' on that revision.
 9. For the rollback check, deploy a revision whose image fails the ALB health check and poll for that deployment's rolloutState 'FAILED' with the circuit-breaker rolloutStateReason, for the service to roll back to the last COMPLETED revision, and for the ALB to have kept serving the previous build's bytes.
+
+## Resolution
+
+Four root causes stood between the chain and its first assertable observation, and each is fixed:
+
+1. `Repository$repositoryUri` ("You can use this URI for container image `push` and `pull`
+   operations") is an ADDRESS a container client dials, so it is now built on the endpoint this
+   emulator serves the registry at — the same reading `AuthorizationData$proxyEndpoint` already
+   took — instead of on the `<account>.dkr.ecr.<region>.amazonaws.com` host that resolves nowhere
+   on the machine the emulator runs on. Amazon ECS brings a reference carrying that address into
+   the registry's own spelling before resolving a pull.
+2. A build environment now provides the `base64` text filter a buildspec invokes (encode,
+   `-d`/`--decode`, `-i`, `-w`/`--wrap=COLS`), added to the one catalog every shell session in the
+   tree shares.
+3. `docker build --build-arg NAME=VALUE` is read, and what the Dockerfile declares about the image
+   — `ENV`, `CMD`, `ENTRYPOINT`, `EXPOSE`, `WORKDIR`, `USER` and the resolved instruction `history`
+   — is composed into the image configuration, so a build argument changes the image exactly where
+   the document uses it and two builds that differ in one get two digests.
+4. `CreateService`, `UpdateService` and `CreateTaskSet` record where the subnets they place into
+   are, so an `awsvpc` task the SCHEDULER places takes its elastic network interface's address out
+   of that subnet's own CIDR block rather than out of the default-VPC fallback.
+
+What the chain now serves: `StartBuild` → every phase `SUCCEEDED` and `buildStatus SUCCEEDED`, the
+pushed image addressable in ECR by a `sha256:` digest of non-zero size, a task definition pinned to
+it, and one RUNNING task of the service whose ENI address lies in the check's VPC CIDR (the service
+converging on `rolloutState COMPLETED` with a healthy target is covered by
+`core/router/tests/all/cloudformation_alb_fargate_service_converges.rs`).
+
+What is NOT served, and remains open as its own work: the last leg of both checks — an HTTP `GET`
+through the ALB answering 200 with the bytes the built image serves, and therefore the body-tracking
+and circuit-breaker rollback assertions that follow it. That needs a capability this emulator does
+not have at all: a container that RUNS its image's HTTP server in process, and an Elastic Load
+Balancing v2 `forward` to an `ip` target group that reaches it — today
+`elasticloadbalancingv2/src/service/data_plane.rs::forward` answers `502` for a registration "with
+no server of this emulator's behind it", and `ecs/src/state/container_runtime.rs` states that "there
+is no container image to run". Nothing of that leg is faked here: no body, status, health or
+duration is reported for work nothing ran.

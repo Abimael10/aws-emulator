@@ -22,10 +22,13 @@
 //!
 //! However a declaration composes the container image out of the repository, the image the
 //! registered revision carries names that repository through the registry URI AWS publishes
-//! for it (`AWS::ECR::Repository`'s `RepositoryUri`: "The format is
-//! `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`"), with the tag the
-//! declaration asked for — which is also the reference form a pull of one of its images is
-//! addressed by.
+//! for it (`aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`), with the tag the
+//! declaration asked for: a resource's properties are resolved against the return values
+//! CloudFormation publishes for the resources of the template, which is what a declaration
+//! has to go on before the create that makes one has answered. The stack's OUTPUT is
+//! evaluated after the create, so what it carries is the address Amazon ECR itself reports
+//! for the repository — the endpoint this emulator serves that registry at, which is where a
+//! container client pushes and pulls.
 //!
 //! The rows differ along what the rule generalises over: how the declaration composes the
 //! image from the repository (an `Fn::Sub` over the repository's `RepositoryUri` attribute, an
@@ -273,14 +276,26 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// The registry URI AWS publishes for the repository `repository`, which is the reference a
-/// pull of one of its images is addressed by.
+/// The registry URI AWS publishes for the repository `repository`, which is what a
+/// declaration of the same template resolves the repository's `RepositoryUri` attribute to.
 ///
-/// Source: `AWS::ECR::Repository`'s `RepositoryUri` return value — "The format is
-/// `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`" — which is also the
-/// reference form the Amazon ECR User Guide gives for a pull.
+/// Source: the reference form the Amazon ECR User Guide gives for a pull,
+/// `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`.
 fn registry_uri(repository: &str) -> String {
     format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{repository}")
+}
+
+/// `<registry endpoint>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
+/// the ADDRESS a container client pushes and pulls it at (`Repository$repositoryUri`: "You
+/// can use this URI for container image `push` and `pull` operations"). This suite's router is
+/// served on no port of its own, so that endpoint is the base `smithy_server_runtime` reports
+/// for one.
+fn published_repository_uri(repository: &str) -> String {
+    let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
+    let authority = base
+        .split_once("://")
+        .map_or(base, |(_scheme, authority)| authority);
+    format!("{authority}/{repository}")
 }
 
 /// One deployment: the template, and what each owning service must then hold.
@@ -533,7 +548,7 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
         // composes a tag or a digest on what it was handed. The stack publishes one for the
         // repository it created too, and the two must agree.
         let published_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let expected_uri = registry_uri(&repository);
+        let expected_uri = published_repository_uri(&repository);
         for (reported_by, uri) in [
             ("Amazon ECR", published_uri.clone()),
             (
@@ -600,7 +615,8 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             row.case
         );
         // However the declaration composed it, the image the revision carries names this
-        // repository through the registry URI AWS publishes for it, with the declared tag.
+        // repository through the registry URI AWS publishes for it — the value a declaration
+        // of the same template resolves the repository's attribute to — with the declared tag.
         let expected_image = format!("{}:{}", registry_uri(&repository), row.tag);
         // Addressed by the FAMILY alone, which is "the latest ACTIVE revision in that
         // family" — the read that answered `ClientException` while nothing was registered.

@@ -30,11 +30,17 @@ pub fn endpoint_host(region: &str) -> String {
     format!("api.ecr.{region}.amazonaws.com")
 }
 
+/// The base URL this harness's emulator is SERVED at, which is what
+/// `smithy_server_runtime::OperationContext::endpoint` reports and therefore the address a
+/// registry client of these suites is handed to dial. A loopback socket, because that is the
+/// only kind of address a client on the machine an emulator runs on can reach.
+pub const SERVED_URL_BASE: &str = "https://127.0.0.1:9297";
+
 /// The registry URL this service announces to a call made through this harness: its calls
 /// are addressed to [`endpoint_host`], which names a service and is therefore an endpoint
 /// no registry client can use, so what is announced is the address this emulator is served
-/// at — `smithy_server_runtime::UNSERVED_URL_BASE` for a router that was given none.
-pub const ANNOUNCED_REGISTRY_URL: &str = ::smithy_server_runtime::UNSERVED_URL_BASE;
+/// at ([`SERVED_URL_BASE`]).
+pub const ANNOUNCED_REGISTRY_URL: &str = SERVED_URL_BASE;
 
 /// The `host[:port]` half of [`ANNOUNCED_REGISTRY_URL`], which is the endpoint a
 /// `docker login` made through this harness is pointed at.
@@ -46,22 +52,12 @@ pub fn announced_registry_endpoint() -> &'static str {
 /// so a wrong registry id in the implementation fails these tests.
 pub const REGISTRY_ID: &str = "000000000000";
 
-/// `<registryId>.dkr.ecr.<region>.amazonaws.com` — the host of this account's registry in
-/// `region`, in the registry URL form `AuthorizationData$proxyEndpoint` documents ("The
-/// Amazon ECR registry URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`").
-///
-/// Composed here rather than imported from the crate, so a wrong composition in the
-/// implementation fails these tests. `region` is of the commercial partition, which is the
-/// partition every Region these suites sign for belongs to.
-pub fn registry_host(region: &str) -> String {
-    format!("{REGISTRY_ID}.dkr.ecr.{region}.amazonaws.com")
-}
-
-/// The URI Amazon ECR reports for the repository `name` of this account's registry in
-/// `region` (`Repository$repositoryUri`): that registry's host ([`registry_host`]) followed
-/// by the repository's own name.
-pub fn repository_uri(region: &str, name: &str) -> String {
-    format!("{}/{name}", registry_host(region))
+/// The URI Amazon ECR reports for the repository `name` (`Repository$repositoryUri`: "The URI
+/// for the repository. You can use this URI for container image `push` and `pull`
+/// operations"): the endpoint this emulator serves the registry at for a call made through
+/// this harness ([`announced_registry_endpoint`]), followed by the repository's own name.
+pub fn repository_uri(name: &str) -> String {
+    format!("{}/{name}", announced_registry_endpoint())
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").
@@ -78,6 +74,12 @@ pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    // The emulator is SERVED somewhere ([`SERVED_URL_BASE`]), which is the address every
+    // registry address this service announces is built on.
+    router.set_url_base(
+        ::smithy_server_runtime::EndpointUrl::parse(SERVED_URL_BASE)
+            .unwrap_or_else(|| panic!("the base URL {SERVED_URL_BASE} must parse")),
+    );
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
 }

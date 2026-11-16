@@ -83,6 +83,8 @@ mod aws_cli;
 pub mod container_image;
 /// The Docker CLI, as a build's commands invoke it.
 mod docker_cli;
+/// What a Dockerfile declares about the image built from it.
+pub mod dockerfile;
 
 /// The whole wall clock ONE build's tool calls may spend, shared by every call the build's
 /// commands make.

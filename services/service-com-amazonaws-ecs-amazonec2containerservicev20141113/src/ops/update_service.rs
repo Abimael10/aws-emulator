@@ -571,6 +571,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // Where those subnets are, read out of the same store under the same rule
+        // ([`crate::state::subnet_placements`]), for the placements this service's SCHEDULER
+        // makes afterwards; an update that names no configuration moves the service into no
+        // new subnet, so it records none.
+        let placements = crate::state::subnet_placements(
+            &*self.engine,
+            &crate::state::configured_subnets(input.network_configuration.as_ref()),
+        );
 
         // The capacity the account's Amazon EC2 instances owe their clusters, in place
         // before the scheduler looks for it ([`crate::state::settle_ec2_capacity`]) and with
@@ -580,7 +588,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.advance_clock(now);
-
+        guard.record_subnet_placements(placements);
         if !guard.has_active_cluster(&cluster_name) {
             return Err(UpdateServiceErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {

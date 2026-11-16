@@ -360,9 +360,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // Where those subnets are, read out of the same store under the same rule
+        // ([`crate::state::subnet_placements`]), for the placements this task set's own
+        // scheduler makes afterwards.
+        let placements = crate::state::subnet_placements(
+            &*self.engine,
+            &crate::state::configured_subnets(input.network_configuration.as_ref()),
+        );
 
         let mut guard = state.lock();
         guard.advance_clock(now);
+        guard.record_subnet_placements(placements);
 
         let Some(cluster) = guard.active_cluster(&cluster_name) else {
             return Err(CreateTaskSetErrorModeled::ClusterNotFoundException(
