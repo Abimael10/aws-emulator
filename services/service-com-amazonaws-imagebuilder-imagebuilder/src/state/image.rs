@@ -187,11 +187,10 @@ impl ComAmazonawsImagebuilderImagebuilderState {
                 .map(DistributionConfigurationRecord::view),
             image_tests_configuration: Some(record.image_tests_configuration.clone()),
             date_created: Some(record.date_created.clone()),
-            // "The output resources that Image Builder produces for this image": this
-            // emulator runs no build instance and distributes nothing, so a build version
-            // reports no output AMI or container image rather than naming one that exists
-            // nowhere.
-            output_resources: None,
+            // "The output resources that Image Builder produces for this image": the AMIs
+            // the build registered with Amazon EC2, reported from the instant the build is
+            // due on ([`ImageBuildVersionRecord::output_resources`]).
+            output_resources: record.output_resources(at),
             tags: Some(reported_tags(record.tags.as_ref())),
             build_type: record.build_type.clone(),
             // "The origin of the base image that Image Builder used to build this image": a
@@ -213,5 +212,33 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             workflows: record.workflows.clone(),
             logging_configuration: record.logging_configuration.clone(),
         }
+    }
+
+    /// Re-run the build of the build version `arn` in place at the instant `at`, and answer
+    /// whether this store holds that build version in `request_region`.
+    ///
+    /// "The image re-runs asynchronously in place: the same build version returns to the test
+    /// or distribution phase where it failed and continues from there. No new image build
+    /// version is created" (`RetryImage`) — so the SAME record is the one that runs: the
+    /// status it ended in is no longer the status it reports, its build is outstanding again
+    /// until it is due ([`super::IMAGE_BUILD_SPAN`]), and what the ended run produced is no
+    /// longer what this build version produced.
+    pub fn rerun_image_build(
+        &mut self,
+        arn: &str,
+        request_region: &str,
+        at: SystemTime,
+    ) -> bool {
+        let Some(record) = self
+            .images
+            .get_mut(arn)
+            .filter(|record| record.region == request_region)
+        else {
+            return false;
+        };
+        record.terminal_status = None;
+        record.available_at = at.checked_add(super::IMAGE_BUILD_SPAN);
+        record.output_amis.clear();
+        true
     }
 }

@@ -230,8 +230,12 @@ pub async fn parent_image_resolved(
     ParentImageLookup::Unestablished
 }
 
-/// The EC2 client this service asks about the base image a request named, addressed to the
-/// Region the request was signed for, or `None` when there is no Region label to ask in.
+/// The EC2 client this service asks about an AMI with, addressed to the Region the request
+/// was signed for, or `None` when there is no Region label to ask in.
+///
+/// The ONE client of this crate for EC2's resources: the base image a create names is
+/// resolved through it ([`parent_image_resolved`]) and so is the AMI an image build produces
+/// ([`super::produce_output_ami`]), so both reach the same EC2 the same way.
 ///
 /// The Region a request is signed for is CALLER-SUPPLIED text, and here it ends up in an
 /// endpoint URL's authority rather than in a response, so it is read as a Region label
@@ -243,7 +247,7 @@ pub async fn parent_image_resolved(
 /// stalled stream — and each of those would need a sleep implementation this client is not
 /// given. The same goes for caching the identity: the credentials the callback hands over
 /// are used directly.
-fn ec2_client(
+pub fn ec2_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> Option<::aws_sdk_ec2::Client> {

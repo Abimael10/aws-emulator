@@ -8,6 +8,11 @@
 //! an image ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::image_answer`], which
 //! resolves a build version this account built or an image AWS publishes).
 //!
+//! The one member a read does NOT take from this store is the AMI an image AWS publishes is
+//! backed by: an AMI is Amazon EC2's resource and no build of this account registered that
+//! one, so it is resolved against EC2 here
+//! ([`crate::state::managed_image_output_resources`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .lock()
             .image_answer(&input.image_build_version_arn, &region, at);
 
-        let Some(image) = view else {
+        let Some(mut image) = view else {
             return Err(GetImageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::required_resource_not_found_message(
@@ -203,6 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // An image AWS PUBLISHES is backed by an AMI Amazon publishes, which is Amazon EC2's
+        // resource and no record of this store, so "the output resources that Image Builder
+        // produces for this image" are resolved against EC2 for it — outside the guard, which
+        // the read above has already dropped. A build version of this account reports the
+        // AMIs it registered, which its own view already carries.
+        if let Some((published, _)) =
+            crate::state::managed_image(&input.image_build_version_arn, &region)
+        {
+            image.output_resources = Some(
+                crate::state::managed_image_output_resources(ctx, &region, published).await,
+            );
+        }
 
         Ok(GetImageOutput {
             request_id: Some(crate::state::new_request_id()),

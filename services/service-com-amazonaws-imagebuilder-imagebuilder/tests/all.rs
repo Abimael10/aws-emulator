@@ -41,6 +41,8 @@ mod distribution_target_regions;
 mod error_response_envelope;
 #[path = "all/image_creation.rs"]
 mod image_creation;
+#[path = "all/image_output_resources.rs"]
+mod image_output_resources;
 #[path = "all/image_packages.rs"]
 mod image_packages;
 #[path = "all/image_pipeline_execution.rs"]

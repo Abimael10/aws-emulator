@@ -174,6 +174,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Two steps, in this order, because they belong to two different stores. The build
+        // version is filed in THIS service's store, under its guard alone ([`Self::queue`]);
+        // the AMI the build produces is Amazon EC2's resource, so it is registered with EC2
+        // afterwards, with no guard held ([`crate::state::produce_output_ami`]).
+        let queued = self.queue(input, ctx)?;
+        if let Some(build) = &queued.build {
+            crate::state::produce_output_ami(&*self.engine, ctx, build).await;
+        }
+        Ok(queued.output)
+    }
+}
+
+/// What queueing one run of a pipeline left for the rest of the handler.
+struct QueuedRun {
+    /// The answer this call is reported by.
+    output: StartImagePipelineExecutionOutput,
+    /// The build version this call queued, when it queued one: a retry of a request whose
+    /// build was already queued repeats that call's answer and queues nothing, so it
+    /// produces no second AMI either.
+    build: Option<crate::state::QueuedImageBuild>,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartImagePipelineExecution<Eng> {
+    /// Queue one build of the recipe the pipeline `input` names holds, and answer what the
+    /// caller is told.
+    ///
+    /// Everything this operation refuses, reads and files happens here, under this service's
+    /// store guard — which is why it is not `async`: a guard held across an await would make
+    /// the handler's future non-`Send`, and nothing this step does waits for anything outside
+    /// this store.
+    fn queue(
+        &self,
+        input: StartImagePipelineExecutionInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<QueuedRun, StartImagePipelineExecutionError> {
         // Every modelled constraint on this input — the pipeline ARN's pattern, the token
         // length, the tag-map bounds — has been refused by the centralized walk before
         // this body runs, so what is read here is only what the store can answer.
@@ -209,10 +244,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            return Ok(StartImagePipelineExecutionOutput {
-                request_id: Some(receipt.request_id.clone()),
-                client_token: Some(receipt.client_token.clone()),
-                image_build_version_arn: Some(receipt.arn.clone()),
+            return Ok(QueuedRun {
+                output: StartImagePipelineExecutionOutput {
+                    request_id: Some(receipt.request_id.clone()),
+                    client_token: Some(receipt.client_token.clone()),
+                    image_build_version_arn: Some(receipt.arn.clone()),
+                },
+                build: None,
             });
         }
 
@@ -308,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::START_IMAGE_PIPELINE_EXECUTION_OPERATION,
             crate::state::ImageBuildVersionRecord {
                 arn: arn.clone(),
-                region,
+                region: region.clone(),
                 name,
                 version,
                 build_version,
@@ -339,6 +377,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // time": the build was only just queued, so nothing has been inventoried
                 // on a build instance yet.
                 packages: ::std::collections::BTreeMap::new(),
+                // "A new image moves through build, test, and distribution statuses during
+                // creation, and ends in the AVAILABLE, FAILED, or CANCELLED state" (the
+                // modelled `ImageState`): nothing has ended this build, so the status it
+                // reports is the one its clock decides.
+                terminal_status: None,
+                // The AMI this build produces is registered with Amazon EC2 below, once the
+                // build version is filed: a build that was only just queued has produced
+                // nothing.
+                output_amis: Vec::new(),
             },
             &client_token,
             fingerprint,
@@ -355,10 +402,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        Ok(StartImagePipelineExecutionOutput {
-            request_id: Some(request_id),
-            client_token: Some(client_token),
-            image_build_version_arn: Some(arn),
+        Ok(QueuedRun {
+            output: StartImagePipelineExecutionOutput {
+                request_id: Some(request_id),
+                client_token: Some(client_token),
+                image_build_version_arn: Some(arn.clone()),
+            },
+            build: Some(crate::state::QueuedImageBuild {
+                arn,
+                region,
+                queued_at,
+            }),
         })
     }
 }

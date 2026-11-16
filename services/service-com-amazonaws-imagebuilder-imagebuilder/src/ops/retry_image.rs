@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetryImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RetryImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Re-runs the build of an image build version that FAILED or was CANCELLED, in place.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RetryImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a reference reaches is the store's own reading of an image
+//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image`]), and what a
+//! re-run does to that build version is the store's own
+//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::rerun_image_build`]): "the
+//! image re-runs asynchronously in place … No new image build version is created".
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +93,10 @@
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
 //!   at this time.
+//! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the refusal a build that is not FAILED or CANCELLED earns.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors`: the report a
+//!   reference naming no build version of this Region earns.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -105,20 +107,31 @@ use super::types::*;
 // `RetryImageError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuilder.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `RetryImageError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#RetryImage")]
+// The operation's MODELED errors, plus the two this SERVICE models for a request this one
+// refuses and its own `errors` list omits:
+//
+// * `com.amazonaws.imagebuilder#ResourceNotFoundException` (HTTP 404, "At least one of the
+//   resources referenced by your request does not exist", declared in
+//   `types/shared_types.rs`) — `imageBuildVersionArn` may name no build version at all, and a
+//   reference that resolves to nothing is reported MISSING rather than dressed up as an
+//   invalid request, which is a different claim a client branches on;
+// * `com.amazonaws.imagebuilder#InvalidParameterValueException` (HTTP 400, "The value that
+//   you provided for the specified parameter is invalid") — the class this service refuses a
+//   parameter VALUE with, which is what a build that may not be retried is.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#RetryImage",
+    extra_errors = ["InvalidParameterValueException", "ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum RetryImageErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -174,18 +187,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RetryImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RetryImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RetryImage"))
+        // Every modelled constraint on this input — the ARN pattern and the token length —
+        // has been refused by the centralized walk before this body runs, so what is checked
+        // here is only what the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RetryImageErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The instant is read ONCE, so the status the build reports and the instant its
+        // re-run is due are decided against one instant.
+        let at = ::std::time::SystemTime::now();
+        let fingerprint = crate::state::retry_image_request_fingerprint(&input);
+
+        // The idempotency check, the status the build reports and the re-run of that build
+        // happen under ONE lock, so two retries of one build version cannot both re-run it.
+        // The guard lives in this block alone: the AMI the re-run produces is registered
+        // with Amazon EC2 below, outside it.
+        {
+            let mut store = state.lock();
+
+            // "If you retry a request with the same client token, Image Builder returns the
+            // original response without running the operation again" — so a repeat of the
+            // request answers what the first call answered, and the build is not re-run a
+            // second time.
+            if let Some(receipt) = store.create_receipt(
+                crate::state::RETRY_IMAGE_OPERATION,
+                &region,
+                &input.client_token,
+            ) {
+                if receipt.fingerprint != fingerprint {
+                    return Err(RetryImageErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(answer(receipt.client_token.clone(), receipt.arn.clone()));
+            }
+
+            // The reference is read the way every reference to an image of this service is
+            // ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image`]):
+            // the modelled `ImageBuildVersionArn` names ONE build version, and one of another
+            // Region — or of Amazon's published catalog, which no build of this account runs
+            // — is reached by no reference of this endpoint, so it is reported MISSING.
+            let Some(status) = store
+                .resolve_image(&input.image_build_version_arn, &region, at)
+                .map(|record| record.status_at(at).to_string())
+            else {
+                return Err(missing(&input.image_build_version_arn));
+            };
+
+            // "The image must be in the FAILED or CANCELLED state": a build in any other
+            // status is not retried, and the one that is running keeps running — nothing
+            // about it is written.
+            if !crate::state::RETRYABLE_IMAGE_STATUSES.contains(&status.as_str()) {
+                return Err(RetryImageErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::image_not_retryable_message()),
+                    },
+                )
+                .into());
+            }
+
+            // "The image re-runs asynchronously in place … No new image build version is
+            // created", so the SAME build version is the one that runs again.
+            if !store.rerun_image_build(&input.image_build_version_arn, &region, at) {
+                return Err(missing(&input.image_build_version_arn));
+            }
+            store.file_create_receipt(
+                crate::state::RETRY_IMAGE_OPERATION,
+                &region,
+                &input.client_token,
+                fingerprint,
+                crate::state::new_request_id(),
+                input.image_build_version_arn.clone(),
+            );
+        }
+
+        // The re-run's output image is Amazon EC2's resource, so it is registered with EC2
+        // outside this store's lock and recorded on the build version afterwards
+        // ([`crate::state::produce_output_ami`]).
+        crate::state::produce_output_ami(
+            &*self.engine,
+            ctx,
+            &crate::state::QueuedImageBuild {
+                arn: input.image_build_version_arn.clone(),
+                region: region.clone(),
+                queued_at: at,
+            },
+        )
+        .await;
+
+        Ok(answer(input.client_token, input.image_build_version_arn))
+    }
+}
+
+/// The report a reference naming no build version of the calling Region earns.
+fn missing(reference: &str) -> RetryImageError {
+    RetryImageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(reference)),
+    })
+    .into()
+}
+
+/// The answer a re-run build version is reported by, which a repeat of its request repeats
+/// verbatim: the token that identified the request and the build version that is running
+/// again — "the ARN of the image to be retried", which is the one the request named, since no
+/// new build version is created.
+fn answer(client_token: String, arn: String) -> RetryImageOutput {
+    RetryImageOutput {
+        client_token: Some(client_token),
+        image_build_version_arn: Some(arn),
     }
 }

@@ -75,6 +75,17 @@ pub struct ManagedImage {
     /// member) — which a published image is the one kind of image this service can report,
     /// since the catalog says which operating system it carries.
     pub os_version: &'static str,
+    /// The name Amazon publishes the Amazon EC2 AMI this base image is backed by under, as a
+    /// `ec2:DescribeImages` name filter: a published AMI's name carries the build it is of, so
+    /// the name of one operating system's images is a PATTERN over those builds, and the
+    /// newest build matching it is the AMI the base image resolves to
+    /// ([`super::managed_image_output_resources`]).
+    ///
+    /// The forms are Amazon's own published AMI names (Amazon EC2 User Guide, "Find an AMI";
+    /// the Amazon Linux 2023, Windows and Ubuntu server name forms), and nothing here records
+    /// WHICH builds exist: that is EC2's catalog to answer, so a pattern no published image
+    /// matches resolves to no AMI.
+    pub base_image_name_pattern: &'static str,
 }
 
 /// The Amazon-managed images this emulator holds, from the names Image Builder publishes
@@ -86,34 +97,42 @@ pub const MANAGED_IMAGES: &[ManagedImage] = &[
     ManagedImage {
         name: "Amazon Linux 2 x86",
         os_version: "Amazon Linux 2",
+        base_image_name_pattern: "amzn2-ami-hvm-*-x86_64-gp2",
     },
     ManagedImage {
         name: "Amazon Linux 2 arm64",
         os_version: "Amazon Linux 2",
+        base_image_name_pattern: "amzn2-ami-hvm-*-arm64-gp2",
     },
     ManagedImage {
         name: "Amazon Linux 2023 x86",
         os_version: "Amazon Linux 2023",
+        base_image_name_pattern: "al2023-ami-2*-x86_64",
     },
     ManagedImage {
         name: "Amazon Linux 2023 arm64",
         os_version: "Amazon Linux 2023",
+        base_image_name_pattern: "al2023-ami-2*-arm64",
     },
     ManagedImage {
         name: "Windows Server 2019 English Full Base x86",
         os_version: "Microsoft Windows Server 2019",
+        base_image_name_pattern: "Windows_Server-2019-English-Full-Base-*",
     },
     ManagedImage {
         name: "Windows Server 2022 English Full Base x86",
         os_version: "Microsoft Windows Server 2022",
+        base_image_name_pattern: "Windows_Server-2022-English-Full-Base-*",
     },
     ManagedImage {
         name: "Ubuntu Server 20 LTS x86",
         os_version: "Ubuntu 20.04",
+        base_image_name_pattern: "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*",
     },
     ManagedImage {
         name: "Ubuntu Server 22 LTS x86",
         os_version: "Ubuntu 22.04",
+        base_image_name_pattern: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
     },
 ];
 
@@ -171,6 +190,11 @@ impl ManagedImage {
             distribution_configuration: None,
             image_tests_configuration: None,
             date_created: Some(MANAGED_IMAGE_DATE_CREATED.to_string()),
+            // "The output resources that Image Builder produces for this image": a published
+            // image is backed by an AMI AMAZON publishes, which is EC2's resource and no
+            // record of this store, so the read path resolves it against EC2
+            // ([`super::managed_image_output_resources`]) rather than the catalog reporting
+            // one from here.
             output_resources: None,
             tags: Some(reported_tags(None)),
             build_type: None,
@@ -189,13 +213,28 @@ impl ManagedImage {
 /// The published image the ARN `reference` reaches in `request_region`, as the modelled
 /// `Image` a read reports, or `None` when it reaches none.
 ///
+/// What the catalog knows about that entry ([`ManagedImage::view`]); the AMI it is BACKED by
+/// is EC2's to answer ([`super::managed_image_output_resources`]), so a read that reports it
+/// asks EC2 for it.
+#[must_use]
+pub fn managed_image_view(reference: &str, request_region: &str) -> Option<Image> {
+    managed_image(reference, request_region)
+        .map(|(image, partition)| image.view(partition, request_region))
+}
+
+/// The catalog entry the ARN `reference` reaches in `request_region`, with the partition the
+/// reference named, or `None` when it reaches none.
+///
 /// The reference is read exactly as one to an account's own image is — through this crate's
 /// one reading of a versioned reference ([`VersionedReference`]) — so the name it carries
 /// selects the entry, a trailing `x` wildcards a version node, and a build version ARN names
 /// the published build. A reference naming another Region reaches nothing, since a regional
 /// endpoint serves only its own Region.
 #[must_use]
-pub fn managed_image_view(reference: &str, request_region: &str) -> Option<Image> {
+pub fn managed_image<'reference>(
+    reference: &'reference str,
+    request_region: &str,
+) -> Option<(&'static ManagedImage, &'reference str)> {
     let owner = ::service_common::arn::parse_of(reference, ARN_SERVICE)?;
     // An account id in the owner field names an image an ACCOUNT built, which this catalog
     // holds none of; those are the records of the build store.
@@ -217,5 +256,5 @@ pub fn managed_image_view(reference: &str, request_region: &str) -> Option<Image
     MANAGED_IMAGES
         .iter()
         .find(|image| normalized_name(image.name) == reference.name)
-        .map(|image| image.view(owner.partition, request_region))
+        .map(|image| (image, owner.partition))
 }

@@ -40,10 +40,6 @@ const AMI_NAME_MEMBER: &str = "name";
 /// writes it.
 const BUILD_DATE_TAG: &str = "{{ imagebuilder:buildDate }}";
 
-/// That tag with the whitespace inside its braces removed, which is the form a name is
-/// compared in: the tag is a template expression, so that whitespace is not part of it.
-const COMPACT_BUILD_DATE_TAG: &str = "{{imagebuilder:buildDate}}";
-
 /// One entry of `distributions` this service cannot accept: where it sits, and which of its
 /// requirements it broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,11 +125,11 @@ fn broken_requirement(entry: &Distribution) -> Option<RefusedEntryRequirement<'_
 /// Whether `name` includes the build-date tag, so each build of the image produces a
 /// uniquely named AMI.
 ///
-/// Compared with the whitespace inside the braces removed, so a name writing the tag
-/// compactly names each build as surely as one writing it the way the documentation does.
+/// Read through this crate's ONE reading of that tag ([`super::carries_build_date_tag`]),
+/// which is also what expands it into the name of the AMI a build produces — so a name this
+/// create accepts is one the build path names each build by.
 fn names_each_build(name: &str) -> bool {
-    let compact: String = name.chars().filter(|value| !value.is_whitespace()).collect();
-    compact.contains(COMPACT_BUILD_DATE_TAG)
+    super::carries_build_date_tag(name)
 }
 
 #[cfg(test)]
