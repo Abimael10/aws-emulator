@@ -140,7 +140,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides before anything is read: a caller whose identity-based policies do not
+        // allow this action is told it is not authorized rather than told what this account
+        // holds. A listing addresses no single list — it reports the account's — so it is
+        // judged against every certificate revocation list of this account in the Region the
+        // request was signed for.
+        if let Some(denied) = crate::state::authorization::refused(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::any_crl(ctx),
+        ) {
+            return Err(ListCrlsErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 

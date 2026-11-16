@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line — no prose between the pairs, no blank line, and nothing after the
+// last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
+// sorts to, so two branches landing at once insert two lines in two places and have no prose
+// to duplicate, re-word or mistype, which is what had gone wrong here: both this header and
+// the tail of the list had grown hundreds of re-typed copies of these paragraphs.
+// What a suite covers, and why it drives the assembled router rather than one service crate,
+// belongs in that suite's OWN module header, where it is read beside the test it explains; a
+// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
+// file, which is where the prose earlier landings had left in the list already lives.
+// EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
 // Single integration-test target for the router: a declaration list, and nothing else.
 //
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
@@ -116,9 +128,26 @@
 // (`tests/<name>.rs`), which the layout check refuses: the `#[path]` above each `mod` is what
 // points it into `tests/all/`.
 // comment, like an inner attribute, is legal only before the first item, so one left past the
-// declarations compiles no suite of this target at all — which is what the re-typed copies of
-// this header that kept arriving in its tail had done. With none anywhere below this block, no
+// declarations compiles no suite of this target at all, and with none anywhere in the file no
 // merge of two landings can leave one there.
+// `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` would resolve to a SIBLING of
+// this file, which the layout check refuses: the `#[path]` above each `mod` is what points
+// the declaration into `tests/all/`. A suite file no `mod` here names is compiled nowhere and
+// its tests never run, a suite left at the top level of `tests/` fails the build, and a
+// second `mod` for one name is `E0428`. Some of the files below are shared harnesses or
+// probes rather than suites; every one of them is declared, for that reason.
+// `all/all_rs_carries_no_inner_doc_comment.rs`, `all/all_rs_declares_each_suite_once.rs`,
+// `all/all_rs_inner_doc_comments_precede_the_first_item.rs`,
+// `all/all_rs_is_a_canonical_declaration_list.rs`,
+// `all/declaration_roots_are_canonical_and_complete.rs`,
+// `all/declaration_roots_end_with_their_last_declaration.rs`,
+// `all/declaration_roots_keep_inner_attributes_ahead_of_the_first_item.rs` and
+// `all/every_suite_file_is_declared.rs` pin every rule above, for this file and for every
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+// The module headers of the suites this root compiles wrap without the indentation
+// `clippy::doc_lazy_continuation` asks of a doc list item, so the lint is allowed for the
+// whole target. An inner attribute, like an inner doc comment, is legal only before the first
+// item, so it stands here rather than in the list below.
 // note about THIS file belongs in `all/appended_notes.rs`. The suites
 // `all/all_rs_is_a_canonical_declaration_list.rs`, `all/every_suite_file_is_declared.rs` and
 // `all/declaration_roots_are_canonical_and_complete.rs` check all of the above, for this file

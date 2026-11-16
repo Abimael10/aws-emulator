@@ -26,6 +26,11 @@
 /// has asked this account for credentials.
 pub mod subjects;
 
+/// Whether IAM lets the caller of a request perform the action it asks for: the
+/// authorization decision every operation that models `AccessDeniedException` takes before
+/// it reads or writes anything.
+pub mod authorization;
+
 /// The principal a request speaks for, which a created profile records as its creator.
 mod caller_identity;
 
@@ -526,6 +531,22 @@ pub fn crl_arn(region: &str, crl_id: &str) -> String {
 /// satisfies: `arn:aws:rolesanywhere:<region>:<account>:profile/<profileId>`.
 pub fn profile_arn(region: &str, profile_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("profile/{profile_id}"))
+}
+
+/// The ARN of the trust anchor this id names, in the Region the request was signed for:
+/// the ARN its create minted, so a request that addresses a trust anchor names the SAME ARN
+/// whether or not one is stored under that id.
+///
+/// `TrustAnchorArn` is
+/// `@pattern("^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)$")`
+/// (`smithy_query(query="operation", operation="ImportCrl")`), which this satisfies:
+/// `arn:aws:rolesanywhere:<region>:<account>:trust-anchor/<trustAnchorId>`.
+pub fn trust_anchor_arn(region: &str, trust_anchor_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("trust-anchor/{trust_anchor_id}"),
+    )
 }
 
 /// The trust-anchor id a `TrustAnchorArn` names, or the empty string when the ARN carries

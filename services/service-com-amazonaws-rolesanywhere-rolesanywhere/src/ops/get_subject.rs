@@ -136,9 +136,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A subject is addressed by its own id and its refusal carries no Region-derived
-        // text, so nothing on this path reads the request's metadata.
-        let _ = ctx;
+        // IAM decides before the store is reached: a caller whose identity-based policies do
+        // not allow this action is told it is not authorized rather than told anything about
+        // the subject it addressed — including whether an audit record for that identity
+        // exists. The decision is taken against the ARN the id names, which is also the only
+        // part of this path that reads the request's Region.
+        if let Some(denied) = crate::state::authorization::refused(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::addressed_subject(ctx, &input.subject_id),
+        ) {
+            return Err(GetSubjectErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();

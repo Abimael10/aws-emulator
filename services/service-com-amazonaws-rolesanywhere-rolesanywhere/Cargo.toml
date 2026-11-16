@@ -36,6 +36,12 @@ ring = "0.17"
 # own session registry, through its own mint, and the role comes from IAM through its
 # reader there, so a vended credential speaks for its role everywhere.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The ONE evaluation of an IAM policy document against a request, which this service's
+# per-operation authorization step (`state::authorization`) decides through.
+service-common = { path = "../common" }
+# The identity-based policies in force on the calling principal are read through the IAM
+# service's own accessors there (`state::authorization`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -49,8 +55,6 @@ rcgen = "0.13"
 # Generates the RSA key pair `rcgen`'s backend cannot, and signs with it, so the suite
 # covers the RSA scheme beside the elliptic-curve one.
 aws-lc-rs = "1"
-# Seeds the role a vended session is a session of, as `iam:CreateRole` records it.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

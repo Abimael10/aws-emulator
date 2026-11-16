@@ -146,6 +146,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before anything is stored: a caller whose identity-based policies do
+        // not allow this action is told it is not authorized, and no trust anchor is
+        // created. A create addresses a trust anchor whose id does not exist yet, so it is
+        // judged against every trust anchor of this account in the Region the request was
+        // signed for.
+        if let Some(denied) = crate::state::authorization::refused(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::any_trust_anchor(ctx),
+        ) {
+            return Err(CreateTrustAnchorErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -201,11 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.notification_settings.unwrap_or_default(),
         );
         let record = crate::state::TrustAnchorRecord {
-            trust_anchor_arn: ::engine::emulator_arn(
-                crate::state::ARN_NAMESPACE,
-                &region,
-                &format!("trust-anchor/{trust_anchor_id}"),
-            ),
+            trust_anchor_arn: crate::state::trust_anchor_arn(&region, &trust_anchor_id),
             trust_anchor_id: trust_anchor_id.clone(),
             name: input.name,
             source: input.source,

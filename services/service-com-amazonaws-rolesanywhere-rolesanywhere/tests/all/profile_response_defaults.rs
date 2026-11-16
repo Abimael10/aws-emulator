@@ -333,6 +333,13 @@ impl Client {
     /// Record that the account holds `access_key_id` for the IAM user `user_name` — the
     /// user record `iam:CreateUser` writes and the access-key record
     /// `iam:CreateAccessKey` writes — and answer that user's ARN.
+    ///
+    /// The user is given an inline policy allowing this service's actions, as
+    /// `iam:PutUserPolicy` writes one: on AWS an IAM user whose policies grant nothing may
+    /// perform no action of any service, so a fixture user that is to MAKE calls has to
+    /// carry the grant for them. What the grant is read for is
+    /// `tests/all/identity_authorization.rs`; here it only puts the caller in a position to
+    /// exercise the rules this suite is about.
     fn hold_long_term_key_for(&self, user_name: &str, access_key_id: &str) -> String {
         let arn = format!("arn:aws:iam::{ACCOUNT}:user/{user_name}");
         let state =
@@ -350,6 +357,22 @@ impl Client {
                 permissions_boundary: None,
                 tags: None,
             },
+        );
+        account.user_inline_policies.insert(
+            iam::name_key(user_name),
+            std::collections::BTreeMap::from([(
+                iam::name_key("rolesanywhere-caller"),
+                iam::InlinePolicy {
+                    policy_name: "rolesanywhere-caller".to_string(),
+                    policy_document: json!({
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {"Effect": "Allow", "Action": "rolesanywhere:*", "Resource": "*"}
+                        ]
+                    })
+                    .to_string(),
+                },
+            )]),
         );
         account.access_keys.insert(
             access_key_id.to_string(),

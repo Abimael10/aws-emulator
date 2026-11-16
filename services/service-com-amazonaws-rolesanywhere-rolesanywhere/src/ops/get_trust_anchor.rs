@@ -135,7 +135,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides before the store is reached: a caller whose identity-based policies do
+        // not allow this action is told it is not authorized rather than told anything about
+        // the trust anchor it addressed. The decision is taken against the ARN the id names,
+        // not against a stored record, so it does not depend on whether that trust anchor
+        // exists.
+        if let Some(denied) = crate::state::authorization::refused(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::addressed_trust_anchor(ctx, &input.trust_anchor_id),
+        ) {
+            return Err(GetTrustAnchorErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();

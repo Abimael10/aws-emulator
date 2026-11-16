@@ -151,6 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides before anything is stored: a caller whose identity-based policies do
+        // not allow this action is told it is not authorized, and no profile is created. A
+        // create addresses a profile whose id does not exist yet, so it is judged against
+        // every profile of this account in the Region the request was signed for.
+        if let Some(denied) = crate::state::authorization::refused(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::any_profile(ctx),
+        ) {
+            return Err(CreateProfileErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
