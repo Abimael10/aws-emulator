@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcLink
+//! IMPLEMENTED: stores one `VpcLink` record — the name, description, targets and tags the
+//! request carries — and reports it in the `PENDING` status its asynchronous provisioning
+//! starts in. Each target is resolved against the load balancers Elastic Load Balancing
+//! holds, so a link pointing at a network load balancer that does not exist settles
+//! `FAILED` instead of reporting itself ready. Writes.
 //!
 //! ## Shape of an operation
 //!
@@ -200,14 +205,37 @@ fn names_a_network_load_balancer(target_arn: &str) -> bool {
 /// A create is "an asynchronous operation": whether the targets can carry traffic is
 /// decided while the link is provisioning rather than when the request is read, so this
 /// is the outcome the link SETTLES in ([`VpcLinkEntry::failure`]) and not a refusal of
-/// the call. The first target that names no network load balancer is the one reported,
-/// which is the one the caller has to change.
-fn provisioning_failure(input: &CreateVpcLinkInput) -> Option<String> {
-    input
+/// the call.
+///
+/// Two questions are put to each target, in this order, because they are about different
+/// things and earn different descriptions:
+///
+/// 1. does the ARN name a network load balancer AT ALL ([`names_a_network_load_balancer`])
+///    — a question about the value, answered here;
+/// 2. does the network load balancer it names EXIST — a question about the RESOURCE, which
+///    only the service that owns load balancers can answer, so it is asked there
+///    ([`crate::state::load_balancer_state`]).
+///
+/// The first target that fails either is the one reported, which is the one the caller has
+/// to change.
+async fn provisioning_failure(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    input: &CreateVpcLinkInput,
+) -> Option<String> {
+    if let Some(target) = input
         .target_arns
         .iter()
         .find(|target| !names_a_network_load_balancer(target))
-        .map(|target| crate::state::vpc_link_target_is_not_a_load_balancer(target))
+    {
+        return Some(crate::state::vpc_link_target_is_not_a_load_balancer(target));
+    }
+    crate::state::load_balancer_state::unresolvable_target(
+        ctx,
+        region,
+        input.target_arns.iter().map(String::as_str),
+    )
+    .await
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -294,8 +322,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Whether the link can be provisioned at all, decided from the targets before
-        // the record is built (the entry below takes ownership of them).
-        let failure = provisioning_failure(&input);
+        // the record is built (the entry below takes ownership of them). The question
+        // reaches the service that owns load balancers, so it is asked before the store
+        // lock is taken: no lock of this service is held across the hop.
+        let failure = provisioning_failure(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input,
+        )
+        .await;
 
         let mut store = state.lock();
         // Bound the growth a caller drives, at API Gateway's published quota.

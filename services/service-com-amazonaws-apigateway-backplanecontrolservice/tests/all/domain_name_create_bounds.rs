@@ -26,6 +26,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     MAX_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
 };
 
+use crate::domain_name_collection::create_request;
 use crate::rest_api_lifecycle::{assert_failure, string_member, Answer, Gateway};
 
 /// `CreateDomainName` with `body`.
@@ -127,7 +128,7 @@ async fn the_tags_a_create_carries_follow_the_documented_tag_rule() {
             .collect();
         let answer = create_domain(
             &gateway,
-            json!({ "domainName": domain_name, "tags": Value::Object(tags.clone()) }),
+            create_request(&domain_name, json!({ "tags": Value::Object(tags.clone()) })),
         )
         .await;
 

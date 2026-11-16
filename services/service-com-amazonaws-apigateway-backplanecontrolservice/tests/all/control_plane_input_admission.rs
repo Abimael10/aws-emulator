@@ -32,7 +32,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
 };
 
 use crate::base_path_mapping::{create_mapping, deployed_api, get_mapping, mapping_of};
-use crate::domain_name_collection::created_domain;
+use crate::domain_name_collection::{create_request, created_domain};
 use crate::rest_api_lifecycle::{assert_failure, string_member, Answer, Gateway};
 use crate::usage_plan_lifecycle::get_usage_plan;
 
@@ -197,11 +197,13 @@ async fn a_certificate_member_takes_only_a_certificate_manager_certificate_arn()
             let domain_name = format!("ok-{index}-{}.example.com", member.to_ascii_lowercase());
             let created = create_domain(
                 &gateway,
-                json!({
-                    "domainName": domain_name,
-                    "endpointConfiguration": endpoint,
-                    member: value,
-                }),
+                create_request(
+                    &domain_name,
+                    json!({
+                        "endpointConfiguration": endpoint,
+                        member: value,
+                    }),
+                ),
             )
             .await;
             assert_eq!(
@@ -234,11 +236,13 @@ async fn a_certificate_member_takes_only_a_certificate_manager_certificate_arn()
             let domain_name = format!("bad-{index}-{}.example.com", member.to_ascii_lowercase());
             let refused = create_domain(
                 &gateway,
-                json!({
-                    "domainName": domain_name,
-                    "endpointConfiguration": endpoint,
-                    member: value,
-                }),
+                create_request(
+                    &domain_name,
+                    json!({
+                        "endpointConfiguration": endpoint,
+                        member: value,
+                    }),
+                ),
             )
             .await;
             assert_bad_request(&refused, INVALID_ARN, &case);

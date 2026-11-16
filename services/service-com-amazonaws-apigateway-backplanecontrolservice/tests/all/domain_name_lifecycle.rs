@@ -17,6 +17,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::MAX_DOMAIN_NAMES;
 
+use crate::domain_name_collection::create_request;
 use crate::rest_api_lifecycle::{assert_failure, string_member, Answer, Gateway};
 
 /// `CreateDomainName` with `body`.
@@ -44,7 +45,7 @@ async fn an_account_holds_at_most_its_quota_of_custom_domain_names() {
     // Fill the account to the published quota. Every create is accepted: the bound is on
     // the number of records, so the LAST one that fits is still stored.
     for index in 0..MAX_DOMAIN_NAMES {
-        let answer = create_domain(&gateway, json!({ "domainName": nth_name(index) })).await;
+        let answer = create_domain(&gateway, create_request(&nth_name(index), json!({}))).await;
         assert_eq!(
             answer.status,
             201,
@@ -60,21 +61,21 @@ async fn an_account_holds_at_most_its_quota_of_custom_domain_names() {
     for (case, body) in [
         (
             "one past the quota",
-            json!({ "domainName": nth_name(MAX_DOMAIN_NAMES) }),
+            create_request(&nth_name(MAX_DOMAIN_NAMES), json!({})),
         ),
         (
             "one past the quota, as a private record",
-            json!({
-                "domainName": nth_name(MAX_DOMAIN_NAMES + 1),
-                "endpointConfiguration": { "types": ["PRIVATE"] },
-            }),
+            create_request(
+                &nth_name(MAX_DOMAIN_NAMES + 1),
+                json!({ "endpointConfiguration": { "types": ["PRIVATE"] } }),
+            ),
         ),
         (
             "one past the quota, tagged",
-            json!({
-                "domainName": nth_name(MAX_DOMAIN_NAMES + 2),
-                "tags": { "team": "platform" },
-            }),
+            create_request(
+                &nth_name(MAX_DOMAIN_NAMES + 2),
+                json!({ "tags": { "team": "platform" } }),
+            ),
         ),
     ] {
         let answer = create_domain(&gateway, body).await;

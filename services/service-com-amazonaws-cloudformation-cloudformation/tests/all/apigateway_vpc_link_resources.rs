@@ -20,11 +20,14 @@
 //! balancer (an application load balancer, a target group, a resource of another service
 //! entirely, a value that is no ARN at all).
 //!
-//! The target ARNs are written by the rows rather than taken from a load balancer this stack
-//! created: an `AWS::ElasticLoadBalancingV2::LoadBalancer` is DECLARED-ONLY in this emulator
-//! — no Elastic Load Balancing call is made for one yet, which is its own issue — so what a
-//! row states is an ARN of the form that service writes for a network load balancer, which is
-//! what API Gateway reads a `targetArns` entry as.
+//! The load balancers the rows target are created through Elastic Load Balancing's OWN API
+//! over the same router, not written out as ARNs: a VPC link's target has to be a load
+//! balancer that EXISTS — API Gateway resolves every `targetArns` entry against that service
+//! while the link is being provisioned, so a link over an ARN nobody created settles `FAILED`
+//! — and an `AWS::ElasticLoadBalancingV2::LoadBalancer` is DECLARED-ONLY in this emulator (no
+//! Elastic Load Balancing call is made for one yet, which is its own issue), so a template
+//! cannot bring one up. The failure half still WRITES its targets, because what those rows
+//! state is a value that misses being a network load balancer whatever the account holds.
 //!
 //! Everything goes over the wire each service speaks through the one router `stack_lifecycle.rs`
 //! builds — the CloudFormation calls over its awsQuery wire, the VPC-link reads over API
@@ -37,8 +40,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, resource_event_reason, resource_event_statuses,
-    router, wait_for_the_transition, xml_blocks, xml_text, ACCOUNT_ID, REGION,
+    call, create_stack, describe_stack, ec2, elbv2, member, resource_event_reason,
+    resource_event_statuses, router, wait_for_the_transition, xml_blocks, xml_text, ACCOUNT_ID,
+    REGION,
 };
 
 /// How many characters a minted VPC link id carries, and which they may be: API Gateway
@@ -63,12 +67,55 @@ const CREATE_FAILED: &str = "CREATE_FAILED";
 const REMOVAL_POLLS: usize = 20;
 const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The ARN Elastic Load Balancing writes for the NETWORK load balancer `name`:
-/// `loadbalancer/net/<name>/<id>`, the resource path that service's own ARNs carry, under the
-/// `elasticloadbalancing` namespace. This is what `VpcLink$targetArns` names — "the ARN of the
-/// network load balancer of the VPC targeted by the VPC link".
-fn network_load_balancer_arn(name: &str) -> String {
-    elb_arn(&format!("loadbalancer/net/{name}/0123456789abcdef"))
+/// One SUBNET of this account, created through Amazon EC2's own API: a load balancer is
+/// placed in subnets Elastic Load Balancing resolves against that service, so the ones the
+/// load balancers below are attached to are real.
+async fn subnet(router: &MultiServiceRouter) -> String {
+    let (status, body) = ec2(router, "CreateVpc", &[("CidrBlock", "10.91.0.0/16")]).await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateVpc must answer 200, got {status} {body}"
+    );
+    let vpc_id = xml_text(&body, "vpcId").unwrap_or_else(|| panic!("setup: no vpcId in {body}"));
+    let (status, body) = ec2(
+        router,
+        "CreateSubnet",
+        &[("VpcId", &vpc_id), ("CidrBlock", "10.91.1.0/24")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateSubnet must answer 200, got {status} {body}"
+    );
+    xml_text(&body, "subnetId").unwrap_or_else(|| panic!("setup: no subnetId in {body}"))
+}
+
+/// A NETWORK load balancer of this account, created through Elastic Load Balancing's own
+/// `CreateLoadBalancer` over the same router, answering the ARN that service assigned it —
+/// which is what `VpcLink$targetArns` names, "the ARN of the network load balancer of the VPC
+/// targeted by the VPC link", and what API Gateway resolves a link's targets against.
+async fn network_load_balancer(
+    router: &MultiServiceRouter,
+    subnet_id: &str,
+    name: &str,
+) -> String {
+    let (status, body) = elbv2(
+        router,
+        "CreateLoadBalancer",
+        &[
+            ("Name".to_string(), name.to_string()),
+            ("Type".to_string(), "network".to_string()),
+            ("Scheme".to_string(), "internal".to_string()),
+            ("Subnets.member.1".to_string(), subnet_id.to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateLoadBalancer({name}) must answer 200, got {status} {body}"
+    );
+    xml_text(&body, "LoadBalancerArn")
+        .unwrap_or_else(|| panic!("setup: no LoadBalancerArn in {body}"))
 }
 
 /// The ARN of an APPLICATION load balancer of the same account: the same ARN form with the
@@ -237,15 +284,16 @@ struct LinkCase {
     links: Vec<DeclaredLink>,
 }
 
-fn link_cases() -> Vec<LinkCase> {
-    let one_target = vec![network_load_balancer_arn("vpclinkcfn-one")];
+async fn link_cases(router: &MultiServiceRouter) -> Vec<LinkCase> {
+    let subnet_id = subnet(router).await;
+    let one_target = vec![network_load_balancer(router, &subnet_id, "vpclinkcfn-one").await];
     let two_targets = vec![
-        network_load_balancer_arn("vpclinkcfn-two-a"),
-        network_load_balancer_arn("vpclinkcfn-two-b"),
+        network_load_balancer(router, &subnet_id, "vpclinkcfn-two-a").await,
+        network_load_balancer(router, &subnet_id, "vpclinkcfn-two-b").await,
     ];
-    let described = vec![network_load_balancer_arn("vpclinkcfn-described")];
-    let first = vec![network_load_balancer_arn("vpclinkcfn-pair-a")];
-    let second = vec![network_load_balancer_arn("vpclinkcfn-pair-b")];
+    let described = vec![network_load_balancer(router, &subnet_id, "vpclinkcfn-described").await];
+    let first = vec![network_load_balancer(router, &subnet_id, "vpclinkcfn-pair-a").await];
+    let second = vec![network_load_balancer(router, &subnet_id, "vpclinkcfn-pair-b").await];
     vec![
         LinkCase {
             case: "a link over one network load balancer, with nothing else declared",
@@ -425,7 +473,7 @@ async fn output_value(
 #[tokio::test]
 async fn a_cloudformation_vpc_link_is_created_under_the_id_the_stack_publishes() {
     let router = router();
-    for case in link_cases() {
+    for case in link_cases(&router).await {
         let name = case.case;
         let described = deploy(&router, name, case.stack, &case.template).await;
         assert_eq!(
@@ -641,7 +689,10 @@ async fn deleting_the_stack_removes_the_vpc_link_from_api_gateway() {
     let case = "a deleted vpc link stack";
     let router = router();
     let stack = "vpclinkcfn-deleted";
-    let targets = vec![network_load_balancer_arn("vpclinkcfn-deleted")];
+    let targets = vec![{
+        let subnet_id = subnet(&router).await;
+        network_load_balancer(&router, &subnet_id, "vpclinkcfn-deleted").await
+    }];
     let template = json!({
         "Resources": {
             "Private": vpc_link_resource("vpclinkcfn-deleted-link", &targets, None, None)

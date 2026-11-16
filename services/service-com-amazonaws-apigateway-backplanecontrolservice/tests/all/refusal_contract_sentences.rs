@@ -36,6 +36,7 @@
 use serde_json::{json, Value};
 
 use crate::authorizer_lifecycle::{create_authorizer, created_authorizer, lambda_uri};
+use crate::domain_name_collection::create_request;
 use crate::models::create_model;
 use crate::patch_updates::{op, patch, replace};
 use crate::rest_api_lifecycle::{
@@ -385,8 +386,7 @@ async fn a_second_create_of_one_domain_name_is_the_operations_bad_request() {
     ];
 
     for (case, domain_name, first, second) in rows {
-        let mut request = first;
-        request["domainName"] = json!(domain_name);
+        let request = create_request(domain_name, first);
         let created = gateway.call("POST", "/domainnames", Some(request)).await;
         assert_eq!(
             created.status, 201,
@@ -394,8 +394,7 @@ async fn a_second_create_of_one_domain_name_is_the_operations_bad_request() {
             created.status, created.body
         );
 
-        let mut repeat = second;
-        repeat["domainName"] = json!(domain_name);
+        let repeat = create_request(domain_name, second);
         let refused = gateway
             .call("POST", "/domainnames", Some(repeat.clone()))
             .await;

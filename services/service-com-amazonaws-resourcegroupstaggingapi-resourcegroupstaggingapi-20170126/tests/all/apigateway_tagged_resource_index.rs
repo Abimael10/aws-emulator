@@ -351,7 +351,17 @@ async fn create_rows(router: &MultiServiceRouter) -> (Vec<Row>, String) {
         router,
         "POST",
         "/domainnames",
-        Some(serde_json::json!({ "domainName": domain_name, "tags": tags("domainname") })),
+        // A custom domain name is created with the certificate its (default, edge-optimized)
+        // endpoint presents: a create that names none is refused, and which certificate that
+        // is has nothing to do with the tag index under test.
+        Some(serde_json::json!({
+            "domainName": domain_name,
+            "certificateArn": format!(
+                "arn:aws:acm:{REGION}:{}:certificate/11111111-2222-3333-4444-555555555555",
+                engine::emulator_account_id()
+            ),
+            "tags": tags("domainname"),
+        })),
     )
     .await;
     assert_eq!(

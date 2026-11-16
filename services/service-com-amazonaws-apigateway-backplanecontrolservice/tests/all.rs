@@ -846,3 +846,8 @@ mod client_certificate_collection_pages;
 // broken by a list ELEMENT stated at the list member.
 #[path = "all/control_plane_input_rules.rs"]
 mod control_plane_input_rules;
+// Appended for the reason the note above gives: what `CreateDomainName` requires of the
+// CERTIFICATE the endpoint type a request resolves to would present, and that the
+// completeness refusal stays distinct from the unreadable-ARN one.
+#[path = "all/domain_name_certificate_completeness.rs"]
+mod domain_name_certificate_completeness;

@@ -62,16 +62,58 @@ async fn create_domain(gateway: &Gateway, body: Value) -> Answer {
 ///
 /// Shared with the `domain_name_access_association_reject` suite, which needs a STORED
 /// domain name to show that a rejection resolves the domain name before the association.
+///
+/// The certificate the record's endpoint type would PRESENT is filled in when `body` names
+/// none ([`with_the_endpoint_certificate`]): a create that names none is refused, and which
+/// certificate a record presents is the `domain_name_certificate_state` suite's subject
+/// rather than these suites'.
 pub(crate) async fn created_domain(gateway: &Gateway, domain_name: &str, body: Value) -> Value {
-    let mut request = body;
-    request["domainName"] = json!(domain_name);
-    let answer = create_domain(gateway, request).await;
+    let answer = create_domain(gateway, create_request(domain_name, body)).await;
     assert_eq!(
         answer.status, 201,
         "case CreateDomainName({domain_name:?}): expected 201, got {} with {:?}",
         answer.status, answer.body
     );
     answer.body
+}
+
+/// One certificate of this account, in the form
+/// [`::service_common::arn::ACM_CERTIFICATE`] states — what a create's certificate members
+/// have to name. Nothing in this target holds certificates (Certificate Manager is mounted
+/// only where a suite brings certificates in through its own API), so the member names a
+/// certificate of the account and no more.
+pub(crate) const ACCOUNT_CERTIFICATE_ARN: &str =
+    "arn:aws:acm:us-west-2:000000000000:certificate/11111111-2222-3333-4444-555555555555";
+
+/// The create body for `domain_name`: `body` with the name set and the certificate its
+/// endpoint type presents filled in when it names none ([`with_the_endpoint_certificate`]).
+pub(crate) fn create_request(domain_name: &str, body: Value) -> Value {
+    let mut request = body;
+    request["domainName"] = json!(domain_name);
+    with_the_endpoint_certificate(&mut request);
+    request
+}
+
+/// Name the certificate the endpoint type `request` resolved to would PRESENT, when the
+/// request names none: `regionalCertificateArn` for a `REGIONAL` record and `certificateArn`
+/// for an edge-optimized or private one. A request that already names its endpoint's
+/// certificate is left exactly as the case wrote it.
+pub(crate) fn with_the_endpoint_certificate(request: &mut Value) {
+    let regional = request["endpointConfiguration"]["types"]
+        .as_array()
+        .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("REGIONAL")));
+    let member = if regional {
+        "regionalCertificateArn"
+    } else {
+        "certificateArn"
+    };
+    let uploaded = !regional
+        && request["certificateBody"].is_string()
+        && request["certificatePrivateKey"].is_string();
+    if request[member].is_string() || uploaded {
+        return;
+    }
+    request[member] = json!(ACCOUNT_CERTIFICATE_ARN);
 }
 
 /// `GetDomainName` for `domain_name`, with `query` appended when it is not empty.
@@ -400,15 +442,16 @@ async fn a_created_domain_name_is_persisted_and_read_back_for_every_endpoint_typ
 }
 
 #[tokio::test]
-async fn a_created_domain_name_without_a_certificate_reports_no_upload_date() {
+async fn a_created_domain_name_reports_an_upload_date_only_for_an_uploaded_certificate() {
     let gateway = Gateway::new();
 
     // Rows differ in whether the request carried a certificate for the edge-optimized or
     // private endpoint, which is what `certificateUploadDate` is "the timestamp when the
     // certificate ... was uploaded" of. A regional certificate ARN is not one, and
-    // neither is an edge certificate on a regional record.
+    // neither is an edge certificate on a regional record. Every row names the certificate
+    // its endpoint type presents, because a create that names none is refused (the
+    // `domain_name_certificate_completeness` suite owns that rule).
     let rows: Vec<(&str, Value, bool)> = vec![
-        ("no certificate at all", json!({}), false),
         (
             "a regional certificate only",
             json!({
@@ -442,9 +485,10 @@ async fn a_created_domain_name_without_a_certificate_reports_no_upload_date() {
             true,
         ),
         (
-            "a regional record with an edge certificate ARN",
+            "a regional record carrying an edge certificate ARN as well",
             json!({
                 "endpointConfiguration": { "types": ["REGIONAL"] },
+                "regionalCertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/reg",
                 "certificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/abc",
             }),
             false,
@@ -720,7 +764,7 @@ async fn a_domain_name_is_read_as_a_domain_name() {
     ];
 
     for (case, domain_name, accepted) in &rows {
-        let answer = create_domain(&gateway, json!({ "domainName": domain_name })).await;
+        let answer = create_domain(&gateway, create_request(domain_name, json!({}))).await;
         if *accepted {
             assert_eq!(
                 answer.status, 201,
@@ -772,9 +816,12 @@ async fn a_name_identifies_one_public_record_and_a_private_one_by_its_id_as_well
     // states for this operation, not a second record.
     for case in ["the same name again", "the same name, regional"] {
         let body = if case.ends_with("regional") {
-            json!({ "domainName": domain_name, "endpointConfiguration": { "types": ["REGIONAL"] } })
+            create_request(
+                domain_name,
+                json!({ "endpointConfiguration": { "types": ["REGIONAL"] } }),
+            )
         } else {
-            json!({ "domainName": domain_name })
+            create_request(domain_name, json!({}))
         };
         let answer = create_domain(&gateway, body).await;
         assert_failure(&answer, 400, BAD_REQUEST, case);
@@ -808,13 +855,13 @@ async fn a_name_identifies_one_public_record_and_a_private_one_by_its_id_as_well
         json!({ "endpointConfiguration": { "types": ["PRIVATE"] } }),
     )
     .await;
-    let after_private = create_domain(&gateway, json!({ "domainName": mixed })).await;
+    let after_private = create_domain(&gateway, create_request(mixed, json!({}))).await;
     assert_eq!(
         after_private.status, 201,
         "case a non-private create after a private record of the same name: expected 201, got {} with {:?}",
         after_private.status, after_private.body
     );
-    let twice = create_domain(&gateway, json!({ "domainName": mixed })).await;
+    let twice = create_domain(&gateway, create_request(mixed, json!({}))).await;
     assert_failure(
         &twice,
         400,

@@ -1037,20 +1037,44 @@ async fn an_endpoint_type_patch_the_service_cannot_serve_is_refused() {
 async fn a_patched_certificate_is_stamped_with_the_instant_it_was_supplied() {
     let gateway = Gateway::new();
     // `certificateUploadDate` is the instant the certificate an edge-optimized or private
-    // endpoint uses was supplied, so a record created without one carries none until a
-    // patch supplies it, and a remove of that certificate clears it again.
+    // endpoint uses was supplied, so a record whose certificate a patch REMOVES carries none
+    // until a patch supplies one again, and the patch that supplies it stamps that instant.
+    //
+    // The record is created with the certificate its edge-optimized endpoint presents,
+    // because a create that names none is refused (the
+    // `domain_name_certificate_completeness` suite owns that rule), so the removal is what
+    // leaves it with no certificate to date.
     let name = "certificate.example.com";
     let created = created_domain(
         &gateway,
         name,
-        json!({ "endpointConfiguration": { "types": ["EDGE"] } }),
+        json!({
+            "endpointConfiguration": { "types": ["EDGE"] },
+            "certificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/created",
+        }),
     )
     .await;
-    assert_eq!(
-        created["certificateUploadDate"],
-        Value::Null,
-        "case a record created with no certificate: expected no upload date, got {:?}",
+    assert!(
+        created["certificateUploadDate"].is_number(),
+        "case a record created with its endpoint's certificate: expected the instant it was \
+         supplied, got {:?}",
         created["certificateUploadDate"]
+    );
+    let emptied = patch_ok(
+        &gateway,
+        "the created certificate removed",
+        &domain_uri(name),
+        vec![op("remove", "/certificateArn", None)],
+    )
+    .await;
+    assert_members(
+        &emptied,
+        &[
+            ("certificateArn", Value::Null),
+            ("certificateUploadDate", Value::Null),
+        ],
+        "the created certificate removed",
+        "UpdateDomainName",
     );
 
     let supplied = patch_ok(

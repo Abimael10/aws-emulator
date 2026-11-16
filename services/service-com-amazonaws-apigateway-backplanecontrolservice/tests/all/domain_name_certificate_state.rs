@@ -360,16 +360,28 @@ async fn a_created_domain_name_may_only_use_a_certificate_the_manager_has_issued
 
     let mut admitted_names: Vec<String> = Vec::new();
     let mut refused_names: Vec<String> = Vec::new();
+    // The certificate the endpoint of the `ownershipVerificationCertificateArn` rows
+    // PRESENTS. A create must name the certificate its endpoint type serves traffic with —
+    // a completeness rule of its own, which the `domain_name_certificate_completeness` suite
+    // owns — and an ownership certificate is not one, so those rows name an ISSUED
+    // certificate for the endpoint and vary only the ownership certificate, which is what
+    // this suite weighs.
+    let serving = certificates
+        .iter()
+        .find(|certificate| certificate.status.as_deref() == Some(ISSUED))
+        .expect("the suite imports one issued certificate")
+        .arn
+        .clone();
     for (index, (member, endpoint_type)) in configurations.iter().enumerate() {
         for (row, certificate) in certificates.iter().enumerate() {
             let case =
                 format!("{member} on a {endpoint_type} domain name with {}", certificate.case);
             let domain_name = format!("d{index}-{row}.example.com");
-            let answer = create_domain(
-                &gateway,
-                create_body(&domain_name, endpoint_type, member, &certificate.arn),
-            )
-            .await;
+            let mut body = create_body(&domain_name, endpoint_type, member, &certificate.arn);
+            if *member == "ownershipVerificationCertificateArn" {
+                body["regionalCertificateArn"] = json!(serving);
+            }
+            let answer = create_domain(&gateway, body).await;
             if certificate.admitted() {
                 assert_eq!(
                     answer.status, 201,

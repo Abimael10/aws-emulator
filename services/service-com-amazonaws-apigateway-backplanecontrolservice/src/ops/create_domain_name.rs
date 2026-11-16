@@ -3,8 +3,9 @@
 //! @op CreateDomainName
 //! IMPLEMENTED: stores one custom `DomainName` record — the name, the certificate and
 //! endpoint configuration the request carries, and the endpoint names API Gateway
-//! assigns it — and reports that stored record. The certificates the request names are
-//! resolved against the state Certificate Manager holds them in first, so a domain name
+//! assigns it — and reports that stored record. A create that names no certificate for the
+//! endpoint type it resolved to is refused, and the certificates the request does name are
+//! resolved against the state Certificate Manager holds them in, so a domain name
 //! that could never present its certificate is refused instead of stored. Writes.
 //!
 //! ## Shape of an operation
@@ -190,8 +191,8 @@ use super::types::*;
 use crate::state::{
     bound_chars, bound_domain_name, bound_entries, bound_tag, domain_name_key,
     edge_distribution_domain_name, regional_endpoint_domain_name, DomainNameEntry,
-    DEFAULT_SECURITY_POLICY, EDGE_DISTRIBUTION_HOSTED_ZONE_ID, MAX_POLICY_CHARS, MAX_STRING_CHARS,
-    MAX_TAGS, PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
+    DEFAULT_ENDPOINT_TYPE, DEFAULT_SECURITY_POLICY, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
+    MAX_POLICY_CHARS, MAX_STRING_CHARS, MAX_TAGS, PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
 };
 
 /// Refuse a request whose caller-sized members would grow the store past a bound.
@@ -282,6 +283,45 @@ fn bound_input(input: &CreateDomainNameInput) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether `member` was set to a value at all: a member set to an empty (or blank) string
+/// names nothing, so it is not a value the record could be served with.
+fn supplied(member: &Option<String>) -> bool {
+    member
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Whether `input` names the certificate the endpoint type it resolved to would PRESENT.
+///
+/// WHICH member names that certificate is a fact about the ENDPOINT, from the members' own
+/// documentation:
+///
+/// * a `REGIONAL` endpoint presents what `regionalCertificateArn` names — "the reference to
+///   an Amazon Web Services-managed certificate that will be used by regional endpoint for
+///   this domain name";
+/// * an edge-optimized (`EDGE`) or a `PRIVATE` endpoint presents what `certificateArn` names
+///   — "the reference to an Amazon Web Services-managed certificate that will be used by
+///   edge-optimized endpoint or private endpoint for this domain name" — or the certificate
+///   MATERIAL the request uploads instead of referencing one: `certificateBody` ("the body of
+///   the server certificate that will be used by edge-optimized endpoint or private endpoint
+///   for this domain name") with `certificatePrivateKey` ("your edge-optimized endpoint's
+///   domain name certificate's private key"), the leaf and the key an endpoint needs to
+///   complete a handshake. `certificateChain` is the intermediates between them and the root,
+///   which an endpoint presenting a leaf signed by a trusted authority does not need.
+///
+/// `ownershipVerificationCertificateArn` is not among them whichever endpoint serves the
+/// record: it is "the ARN of the public certificate issued by ACM to validate ownership of
+/// your custom domain", which proves ownership of the name rather than serving its traffic,
+/// and `certificateName`/`regionalCertificateName` are "the user-friendly name of the
+/// certificate", which names no certificate at all.
+fn names_the_endpoint_certificate(input: &CreateDomainNameInput, endpoint_type: &str) -> bool {
+    if endpoint_type == REGIONAL_ENDPOINT_TYPE {
+        return supplied(&input.regional_certificate_arn);
+    }
+    let uploaded = supplied(&input.certificate_body) && supplied(&input.certificate_private_key);
+    supplied(&input.certificate_arn) || uploaded
 }
 
 impl From<&DomainNameEntry> for CreateDomainNameOutput {
@@ -401,7 +441,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let bad_request = |message: String| -> Self::Error {
@@ -424,7 +464,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // domain name (DomainName)" — so a stored domain name always names its endpoint
         // types and its IP address type.
         let endpoint_configuration =
-            crate::state::defaulted_endpoint_configuration(input.endpoint_configuration);
+            crate::state::defaulted_endpoint_configuration(input.endpoint_configuration.take());
         let types = endpoint_configuration
             .types
             .clone()
@@ -444,6 +484,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let private = types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE);
         let regional = types.iter().any(|kind| kind == REGIONAL_ENDPOINT_TYPE);
+
+        // A custom domain name TERMINATES TLS for the requests it serves, so the certificate
+        // the endpoint presents is part of what makes the record servable at all: a create
+        // that names none for the endpoint type it resolved to is INCOMPLETE and is refused
+        // as the bad request it is, before anything is minted, opened or stored — rather than
+        // stored as a domain name that could never complete a handshake and reported
+        // `PENDING` as if it were on its way to serving traffic. Which member names that
+        // certificate is the endpoint's own question; see [`names_the_endpoint_certificate`].
+        let endpoint_type = types
+            .first()
+            .map_or(DEFAULT_ENDPOINT_TYPE, String::as_str);
+        if !names_the_endpoint_certificate(&input, endpoint_type) {
+            return Err(bad_request(crate::state::certificate_not_provided(
+                endpoint_type,
+            )));
+        }
 
         // The endpoint members a domain name carries are the ones its endpoint type has:
         // an edge-optimized domain name is served by the CloudFront distribution API

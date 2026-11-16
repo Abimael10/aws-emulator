@@ -4015,6 +4015,23 @@ pub const DOMAIN_NAME_NOT_FOUND: &str = "Domain not found";
 /// neither the name the request sent nor the record it collided with.
 pub const DOMAIN_NAME_ALREADY_EXISTS: &str = "The domain name you provided already exists.";
 
+/// The `BadRequestException` message for a custom-domain create that names NO certificate
+/// the endpoint type it resolved to could present.
+///
+/// A custom domain name terminates TLS for the requests it serves, so the certificate the
+/// endpoint presents is part of what makes the record servable at all — which is why API
+/// Gateway answers a create that leaves it out synchronously rather than storing a domain
+/// name that can never complete a handshake.
+///
+/// The sentence is FIXED but for the ENDPOINT TYPE, which is the type the request resolved to
+/// (its `endpointConfiguration.types`, or [`DEFAULT_ENDPOINT_TYPE`] where it set none) — so a
+/// caller is told which endpoint's certificate is missing and can tell this refusal from the
+/// one a value that is no certificate ARN at all earns ([`INVALID_ARN`]): that is a FORM
+/// check on a value the request did carry, this is a COMPLETENESS check on one it did not.
+pub fn certificate_not_provided(endpoint_type: &str) -> String {
+    format!("A certificate was not provided for the endpoint type {endpoint_type}.")
+}
+
 /// The `NotFoundException` message for a `basePath` the addressed custom domain name
 /// carries no mapping for, in the shape of the sibling identifier messages above. Shared
 /// by every operation that resolves a base path mapping, so all of them say the same thing
@@ -4746,6 +4763,11 @@ pub mod vpc_endpoints;
 /// The STATE Certificate Manager holds a certificate in, as that service reports it — what
 /// the certificate a custom domain name would present is resolved against; see that module.
 pub mod acm_certificate_state;
+
+/// Whether the network load balancer a VPC link's target names EXISTS, as Elastic Load
+/// Balancing reports it — what the targets a link would be provisioned over are resolved
+/// against; see that module.
+pub mod load_balancer_state;
 
 /// The usage a usage plan's QUOTA is metered against — the requests each of its API keys
 /// sent on each day, and the daily log of used and remaining quota a read reports from

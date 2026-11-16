@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::domain_name_collection::create_request;
 use crate::rest_api_lifecycle::{page_items, string_member, Gateway};
 
 /// The hosted zone every CloudFront distribution is aliased through, which
@@ -125,10 +126,10 @@ async fn create_in(
         region,
         "POST",
         "/domainnames",
-        Some(json!({
-            "domainName": domain_name,
-            "endpointConfiguration": { "types": [endpoint_type] },
-        })),
+        Some(create_request(
+            domain_name,
+            json!({ "endpointConfiguration": { "types": [endpoint_type] } }),
+        )),
     )
     .await;
     assert_eq!(
