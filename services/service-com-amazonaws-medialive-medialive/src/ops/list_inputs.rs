@@ -179,7 +179,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut remaining = state
             .inputs
-            .range::<str, _>((first, ::std::ops::Bound::Unbounded));
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            // An input whose deletion has come due is no longer one of the
+            // account's inputs this operation produces a list of, so the listing
+            // leaves it out. Its record stays in the store so `DescribeInput`
+            // goes on reporting the terminal `DELETED` state — which is what an
+            // SDK waiter polling for that state reads — exactly as a deleted
+            // input security group drops out of `ListInputSecurityGroups` while
+            // its own describe keeps reporting it
+            // (`crate::ops::list_input_security_groups`, where the same cut
+            // point is recorded). A listing reports the account's current
+            // inputs, not every input it ever held.
+            //
+            // Recorded evidence, from replaying the
+            // `medialive.batch-delete-rejects-mixed-resource-lists-and-deletes-inputs`
+            // check: after it deletes the two inputs it asserts
+            // `not listed & {a["Id"], b["Id"]}`, which failed ("batch-deleted
+            // inputs still listed") while this filter was absent and passes with
+            // it, and the same inputs read back as `DELETED` through the
+            // describe.
+            //
+            // The cut is the TERMINAL state alone: an input whose delete has
+            // been accepted but not yet settled is still one the account holds,
+            // in the transient `DELETING` state its enum models, so it is still
+            // reported.
+            .filter(|(_, input)| !input.is_deleted());
 
         // Every member of a listed input is derived from the store at the moment
         // of the read, through the SAME projection `DescribeInput` reads, so the

@@ -251,7 +251,15 @@ async fn every_channel_response_reports_the_configuration_collections_as_collect
                 "destinations": [
                     {
                         "id": "d0",
-                        "settings": [{ "url": "rtmp://example.com/live/a" }],
+                        // One per-encoder setting per pipeline of the class this
+                        // channel has (`OutputDestination$Settings`: "one
+                        // destination for each redundant encoder"), which is
+                        // what a create requires — the body names no class, so
+                        // the service's two-pipeline default applies.
+                        "settings": [
+                            { "url": "rtmp://example.com/live/a" },
+                            { "url": "rtmp://example.com/live/b" },
+                        ],
                         "logicalInterfaceNames": ["eth0"],
                     },
                     {
@@ -275,7 +283,7 @@ async fn every_channel_response_reports_the_configuration_collections_as_collect
                 ("inputAttachments[0].logicalInterfaceNames", 2),
                 ("inputAttachments[1].logicalInterfaceNames", 0),
                 ("destinations[0].mediaPackageSettings", 0),
-                ("destinations[0].settings", 1),
+                ("destinations[0].settings", 2),
                 ("destinations[0].srtSettings", 0),
                 ("destinations[0].logicalInterfaceNames", 1),
                 ("destinations[1].mediaPackageSettings", 0),

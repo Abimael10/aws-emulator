@@ -527,22 +527,23 @@ async fn every_resource_a_delete_cannot_touch_is_reported_as_its_own_failure() {
 
 /// Rule: the resources named in one `BatchDelete` are attempted independently,
 /// so the call answers 200 and reports every accepted delete in `Successful` and
-/// every refused one in `Failed`, however the request mixes them.
+/// every refused one in `Failed`, however the request mixes existing and unknown
+/// ids.
 ///
 /// The rows differ along how many resources are named, how many of them exist,
-/// which kinds they span and in what order — the recorded one-of-each case is
-/// one row, and the row naming nothing follows from the model, whose
-/// `BatchDeleteRequest` has no required member.
+/// which kind they are and in what order — the recorded one-of-each case is one
+/// row. Each row names its ids in the member of the ONE kind it is about, because
+/// a call requires exactly one non-empty id list
+/// (`crate::cross_field_refusals` is the suite about that rule).
 #[tokio::test]
 async fn one_call_reports_the_accepted_and_the_refused_side_by_side() {
-    // (case, channels to create, inputs to create, unknown ids per member)
-    let table: [(&str, usize, usize, usize); 6] = [
-        ("nothing named", 0, 0, 0),
+    // (case, channels to create, inputs to create, unknown ids)
+    let table: [(&str, usize, usize, usize); 5] = [
         ("one real channel and one unknown id", 1, 0, 1),
         ("two real channels and one unknown id", 2, 0, 1),
         ("one real channel and two unknown ids", 1, 0, 2),
         ("real channels only", 3, 0, 0),
-        ("channels and inputs, both halves", 2, 2, 1),
+        ("inputs only, with an unknown id", 0, 2, 1),
     ];
 
     for (case, channels, inputs, unknown) in table {
@@ -564,30 +565,29 @@ async fn one_call_reports_the_accepted_and_the_refused_side_by_side() {
         }
 
         // The unknown ids are interleaved after the real ones, so the result
-        // entries cannot be an artefact of the request's order.
+        // entries cannot be an artefact of the request's order. They travel in
+        // the member of the one kind the row names, since one call names exactly
+        // one non-empty id list.
         let unknown_ids: Vec<String> = (0..unknown)
             .map(|index| format!("000000{index}"))
             .collect();
-        let mut requested_channels = channel_ids.clone();
-        requested_channels.extend(unknown_ids.clone());
-        let mut requested_inputs = input_ids.clone();
-        if inputs > 0 {
-            requested_inputs.extend(unknown_ids.clone());
-        }
+        let (member, existing) = if channels > 0 {
+            ("channelIds", channel_ids.clone())
+        } else {
+            ("inputIds", input_ids.clone())
+        };
+        let mut requested = existing.clone();
+        requested.extend(unknown_ids.clone());
 
-        let body = json!({
-            "channelIds": requested_channels,
-            "inputIds": requested_inputs,
-        });
+        let mut body = json!({});
+        body[member] = json!(requested);
         let (successful, failed) = batch_delete(&router, case, body).await;
 
         let accepted: Vec<&str> = successful
             .iter()
             .map(|entry| entry["id"].as_str().unwrap_or_default())
             .collect();
-        let mut expected_accepted: Vec<&str> =
-            channel_ids.iter().map(String::as_str).collect();
-        expected_accepted.extend(input_ids.iter().map(String::as_str));
+        let expected_accepted: Vec<&str> = existing.iter().map(String::as_str).collect();
         assert_eq!(
             accepted, expected_accepted,
             "case {case:?}: expected every existing resource accepted once, got {successful:?}"
@@ -604,11 +604,10 @@ async fn one_call_reports_the_accepted_and_the_refused_side_by_side() {
             .iter()
             .map(|entry| entry["id"].as_str().unwrap_or_default())
             .collect();
-        let expected_refusals = unknown * (1 + usize::from(inputs > 0));
         assert_eq!(
             refused.len(),
-            expected_refusals,
-            "case {case:?}: expected {expected_refusals} refusal(s), got {failed:?}"
+            unknown,
+            "case {case:?}: expected {unknown} refusal(s), got {failed:?}"
         );
         for entry in &failed {
             assert_eq!(
@@ -650,20 +649,18 @@ async fn one_call_reports_the_accepted_and_the_refused_side_by_side() {
 /// operation's modelled `BadRequestException` rather than walked.
 ///
 /// The rows span the bound itself and one id past it, each named in one member
-/// and spread over all four, because the cap is on their sum.
+/// and — for the row the cap refuses — spread over all four, because the cap is
+/// on their sum and is counted before the request's shape is judged (a call
+/// names exactly one non-empty id list, the subject of
+/// `crate::cross_field_refusals`).
 #[tokio::test]
 async fn a_batch_above_the_bound_is_refused_whole() {
     let cap = MAX_BATCH_DELETE_IDS;
     let quarter = cap / 4;
     // (case, ids per member in model order, whether the batch is refused)
-    let table: [(&str, [usize; 4], bool); 4] = [
+    let table: [(&str, [usize; 4], bool); 3] = [
         ("at the bound, one member", [cap, 0, 0, 0], false),
         ("one past the bound, one member", [cap + 1, 0, 0, 0], true),
-        (
-            "at the bound, spread over every member",
-            [quarter, quarter, quarter, cap - 3 * quarter],
-            false,
-        ),
         (
             "one past the bound, spread over every member",
             [quarter, quarter, quarter, cap + 1 - 3 * quarter],

@@ -143,6 +143,9 @@ mod cluster_network_resolution;
 #[path = "all/cluster_update.rs"]
 mod cluster_update;
 
+#[path = "all/cross_field_refusals.rs"]
+mod cross_field_refusals;
+
 #[path = "all/current_user_cut_point.rs"]
 mod current_user_cut_point;
 

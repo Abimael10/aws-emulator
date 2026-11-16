@@ -56,6 +56,14 @@ struct Batch {
     /// Its id members in model order, each with the resource type the not-found
     /// entry for an id of that member names.
     members: &'static [(&'static str, &'static str)],
+    /// Whether ONE call of it may name resources of SEVERAL kinds at once.
+    ///
+    /// `BatchDelete` requires exactly one non-empty id list, so a call of it
+    /// that fills two members is refused whole rather than walked
+    /// (`crate::cross_field_refusals` is the suite about that rule); the rows
+    /// that spread ids over every member therefore belong to the operations that
+    /// do accept a mixed call.
+    mixes_kinds: bool,
     /// The most ids one call may name across every member above.
     cap: usize,
     /// The channel standing it accepts.
@@ -83,6 +91,7 @@ fn batch_operations() -> Vec<Batch> {
                 ("multiplexIds", "Multiplex"),
             ],
             cap: MAX_BATCH_DELETE_IDS,
+            mixes_kinds: false,
             accepts: Standing::Idle,
             reaches: "DELETING",
         },
@@ -91,6 +100,7 @@ fn batch_operations() -> Vec<Batch> {
             uri: "/prod/batch/start",
             members: &[("channelIds", "Channel"), ("multiplexIds", "Multiplex")],
             cap: MAX_BATCH_START_IDS,
+            mixes_kinds: true,
             accepts: Standing::Idle,
             reaches: "STARTING",
         },
@@ -99,6 +109,7 @@ fn batch_operations() -> Vec<Batch> {
             uri: "/prod/batch/stop",
             members: &[("channelIds", "Channel"), ("multiplexIds", "Multiplex")],
             cap: MAX_BATCH_STOP_IDS,
+            mixes_kinds: true,
             accepts: Standing::Running,
             reaches: "STOPPING",
         },
@@ -182,8 +193,9 @@ async fn channel_in(router: &MultiServiceRouter, case: &str, row: &Batch) -> (St
 ///
 /// The rows span the OPERATION (all three Batch operations) and, within each,
 /// every id member of its request — so each resource kind the family walks is
-/// classified by the one shared rule — plus the row that names an unknown id in
-/// EVERY member at once, because the entries of one call are independent.
+/// classified by the one shared rule — plus, for an operation whose call may
+/// name several kinds at once, the row that names an unknown id in EVERY member
+/// at once, because the entries of one call are independent.
 #[tokio::test]
 async fn every_batch_operation_reports_an_unknown_id_the_one_shared_way() {
     for row in batch_operations() {
@@ -211,7 +223,11 @@ async fn every_batch_operation_reports_an_unknown_id_the_one_shared_way() {
             );
         }
 
-        // Every member at once: one entry per named id, each the same way.
+        // Every member at once: one entry per named id, each the same way —
+        // for the operations whose call may name several kinds.
+        if !row.mixes_kinds {
+            continue;
+        }
         let case = format!("{} every member", row.op);
         let mut body = json!({});
         let mut expected: Vec<Value> = Vec::new();
@@ -294,7 +310,10 @@ async fn every_batch_operation_reports_an_accepted_resource_the_one_shared_way()
 ///
 /// The rows span the OPERATION and, within each, where the ids sit and how many
 /// there are: at the bound and one past it, each in a single member and spread
-/// over all of them, because the cap is on their sum.
+/// over all of them, because the cap is on their sum. The cap is counted before
+/// the request's SHAPE is judged, so an operation that accepts only one id list
+/// keeps the spread row the cap refuses and drops the one it would otherwise
+/// have answered.
 #[tokio::test]
 async fn every_batch_operation_bounds_its_ids_the_one_shared_way() {
     for row in batch_operations() {
@@ -312,6 +331,10 @@ async fn every_batch_operation_bounds_its_ids_the_one_shared_way() {
                 spread(cap + 1, 1, members),
                 true,
             ),
+            // The ids spread over every member: the cap is on their sum, and it
+            // is counted before the request's shape is judged, so the row one
+            // past the bound belongs to every operation while the row AT the
+            // bound belongs to the ones whose call may name several kinds.
             (
                 "at the bound, spread over every member".to_string(),
                 spread(cap, members, members),
@@ -322,7 +345,12 @@ async fn every_batch_operation_bounds_its_ids_the_one_shared_way() {
                 spread(cap + 1, members, members),
                 true,
             ),
-        ];
+        ]
+        .into_iter()
+        .filter(|(shape, _, is_refused)| {
+            row.mixes_kinds || *is_refused || !shape.contains("every member")
+        })
+        .collect();
 
         for (shape, counts, is_refused) in plan {
             // A router of its own per row, so each batch is judged against a

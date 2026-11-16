@@ -20,7 +20,7 @@
 //! unminted id are ONE row each, and the other rows are what the rule
 //! generalises over — which member is missing, how many problems one request
 //! carries, where in the attachment list the bad entry sits, what makes the
-//! reference unresolvable (never minted, minted and deleted, named at all) and
+//! reference unresolvable (never minted, named at all) and
 //! whether the request asked to be performed or only checked.
 
 use serde_json::{json, Value};
@@ -332,22 +332,20 @@ async fn a_create_accepts_a_configuration_it_can_run() {
 }
 
 /// Rule: a reference resolves against the inputs this account HOLDS, so an id
-/// whose input has been deleted is as unresolvable as one nothing ever minted —
-/// and a `DryRun` request, which asks for the create to be CHECKED rather than
-/// performed, earns exactly the same refusal.
+/// nothing ever minted is unresolvable — and a `DryRun` request, which asks for
+/// the create to be CHECKED rather than performed, earns exactly the same
+/// refusal.
+///
+/// An id this account DOES hold a record for and whose delete has been accepted
+/// is a different fact — that input exists and is identified, it is simply in a
+/// state no channel can ingest through — so it is refused as a problem with the
+/// request itself rather than as an unresolvable reference;
+/// `crate::cross_field_refusals` is the suite about that rule.
 #[tokio::test]
 async fn a_reference_resolves_against_the_inputs_the_account_holds() {
     let router = medialive();
-    let deleted = attachable_input(&router, "doomed").await;
-    let (status, body) = call(&router, "DELETE", &format!("/prod/inputs/{deleted}"), None).await;
-    assert_eq!(status, 200, "DeleteInput: got {status}: {body}");
-    // The delete is settled by the clock, so the record is in its terminal
-    // state rather than the transient one the delete left it in.
-    wait_for_the_clock();
 
     let table: Vec<(&str, bool, &str)> = vec![
-        ("a deleted input, performed", false, &deleted),
-        ("a deleted input, checked only", true, &deleted),
         ("an id nothing minted, performed", false, UNMINTED_INPUT_ID),
         ("an id nothing minted, checked only", true, UNMINTED_INPUT_ID),
     ];

@@ -303,13 +303,21 @@ async fn a_deleted_input_is_not_resurrected_by_its_idempotency_token() {
             dead_state,
             "case {case:?}: expected the deleted input to stay {dead_state:?}"
         );
-        let mut expected_held = vec![primary_id.clone(), first_id.clone(), retried_id.clone()];
+        // The listing reports the account's CURRENT inputs, so the deleted one is
+        // among them while its delete is still in flight and drops out once the
+        // deletion has come due — the cut `crate::input_listing` states — while
+        // its record stays readable through its own describe either way (the
+        // state assertion above).
+        let mut expected_held = vec![primary_id.clone(), retried_id.clone()];
+        if !wait {
+            expected_held.push(first_id.clone());
+        }
         expected_held.sort();
         assert_eq!(
             held_ids(&router, case).await,
             expected_held,
-            "case {case:?}: expected the account to hold the primary, the deleted input and the \
-             retry's own, got {:?}",
+            "case {case:?}: expected the account to list the primary, the retry's own input and \
+             the deleted one exactly while its delete is in flight, got {:?}",
             held_ids(&router, case).await
         );
 

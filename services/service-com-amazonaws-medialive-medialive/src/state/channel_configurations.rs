@@ -216,6 +216,44 @@ impl ComAmazonawsMedialiveMedialiveState {
         problems
     }
 
+    /// The input one of `configuration`'s attachments names that is no longer
+    /// one a channel can ingest through, as the id the request named and the
+    /// `InputState` that input reports — `None` when every attachment names an
+    /// input a channel may still be fed by.
+    ///
+    /// An id this account holds a record for and whose delete this service has
+    /// ACCEPTED is a different fact from an id this account never held: the
+    /// input EXISTS and is identified, it is just being (or has been) torn down,
+    /// so the attachment names a real input in a state no channel can ingest
+    /// through. It is reported as a problem with the REQUEST — the operation's
+    /// modelled `BadRequestException`, naming the input and the state it is in
+    /// ([`super::attached_input_state_message`]) — rather than as one more
+    /// `ValidationErrors` entry about an unresolvable reference, so a caller
+    /// branching on the status is told to fix the request rather than handed a
+    /// semantic validation report, and the message says WHICH input is unusable
+    /// and WHY.
+    ///
+    /// Only the attachments the write ADDS are resolved, for the same reason
+    /// [`Self::channel_configuration_problems`] resolves only those: an
+    /// attachment the stored channel already holds is part of the configuration
+    /// that channel already claims, so an edit of another member is not refused
+    /// for it.
+    pub fn unusable_attached_input(
+        &self,
+        configuration: &ChannelConfiguration<'_>,
+    ) -> Option<(String, String)> {
+        configuration.input_attachments.iter().find_map(|attachment| {
+            let id = attachment.input_id.as_deref().filter(|id| !id.is_empty())?;
+            if configuration.holds_input(id) {
+                return None;
+            }
+            let input = self.inputs.get(id)?;
+            input
+                .is_delete_accepted()
+                .then(|| (id.to_string(), self.input_state(input).to_string()))
+        })
+    }
+
     /// Every problem the `AnywhereSettings` of a channel configuration carries,
     /// appended to `problems`.
     ///

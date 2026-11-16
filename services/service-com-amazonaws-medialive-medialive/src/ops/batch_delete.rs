@@ -14,6 +14,12 @@
 //! then settles into the terminal `DELETED` they keep, and `DELETED` at once for
 //! an input security group, whose enum models no transient step.
 //!
+//! One call deletes resources of ONE kind: the four id lists are four
+//! alternatives, so a request that fills two of them (or none) is refused whole
+//! with the operation's modelled `BadRequestException`
+//! ([`crate::state::batch_results::exactly_one_id_list`]) and nothing is
+//! deleted.
+//!
 //! The batch itself is bounded: the ids one call may name are capped by
 //! [`crate::state::MAX_BATCH_DELETE_IDS`], refused with the operation's modelled
 //! `BadRequestException` before the state guard is taken, because the model puts
@@ -95,7 +101,8 @@ use super::types::*;
 // of one rule. What is below is this operation's own part: which resource kinds
 // it walks and the state rule each kind's single-resource delete follows.
 use crate::state::batch_results::{
-    accepted, failure_code, not_found, refused, within_id_cap, Outcome, Results, State,
+    accepted, exactly_one_id_list, failure_code, not_found, refused, within_id_cap, Outcome,
+    Results, State,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -191,6 +198,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.multiplex_ids,
             ],
         )
+        .map_err(|message| {
+            BatchDeleteErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        // One call deletes resources of ONE kind: the four id lists are four
+        // alternatives, so a request that fills two of them (or none) is not a
+        // request this operation serves. A cross-member rule the model states
+        // nothing about — it declares no constraint between the four lists — so
+        // it is checked HERE, before the state guard is taken and before any
+        // resource is touched: a mixed call deletes nothing rather than
+        // performing both halves, and the caller is told to split it.
+        exactly_one_id_list(&[
+            &input.channel_ids,
+            &input.input_ids,
+            &input.input_security_group_ids,
+            &input.multiplex_ids,
+        ])
         .map_err(|message| {
             BatchDeleteErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message),

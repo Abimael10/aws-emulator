@@ -239,6 +239,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let channel_class = input
             .channel_class
             .unwrap_or_else(|| crate::state::channel_class::STANDARD.to_string());
+        // Each destination's per-encoder `Settings` is a PER-PIPELINE list —
+        // "one destination for each redundant encoder" — so it carries exactly
+        // one entry per pipeline of the class this channel would have. A
+        // cross-field rule (`ChannelClass` against `Destinations[].Settings`)
+        // that no single-member constraint expresses, answered as this
+        // operation's own modelled client error before anything is stored, and
+        // the same rule `UpdateChannel` writes the same list under.
+        if let Some(message) = crate::state::channel_destination_settings_error(
+            &channel_class,
+            input.destinations.as_deref().unwrap_or_default(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
@@ -310,14 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        // The whole channel configuration is validated BEFORE anything is
-        // stored, so a request that does not describe a channel this service
-        // could run creates nothing: one `ValidationErrors` entry per problem,
-        // each naming the element it was found at, in the operation's modelled
-        // 422. The same rule `UpdateChannel` validates a rewritten
-        // configuration against, so the two cannot disagree about what a
-        // channel configuration is.
-        let problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
+        // The channel configuration this request WOULD store, assembled once:
+        // the two rules below are two refusal classes over the same
+        // configuration, so they are judged on one description of it rather than
+        // on two. A create holds no stored channel yet, so every reference it
+        // names is one it ADDS and each is resolved.
+        let configuration = crate::state::ChannelConfiguration {
             encoder_settings: input.encoder_settings.as_ref(),
             input_attachments: input.input_attachments.as_deref().unwrap_or_default(),
             channel_security_groups: input
@@ -325,10 +337,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .unwrap_or_default(),
             anywhere_settings: input.anywhere_settings.as_ref(),
-            // A create holds no stored channel yet, so every reference it names
-            // is one it ADDS and each is resolved.
             held: None,
-        });
+        };
+
+        // An attachment may name an input this account holds whose delete this
+        // service has already accepted: the input is identified and real, it is
+        // simply in a state no channel can ingest through, so the request itself
+        // is what cannot be served — this operation's modelled
+        // `BadRequestException`, naming the input and its state — rather than
+        // one more unresolvable-reference entry in the 422 below. Answered
+        // first, so a caller is told which input is unusable instead of being
+        // told that input does not exist.
+        if let Some((input_id, input_state)) = state.unusable_attached_input(&configuration) {
+            return Err(bad_request(&crate::state::attached_input_state_message(
+                &input_id,
+                &input_state,
+            )));
+        }
+
+        // The whole channel configuration is validated BEFORE anything is
+        // stored, so a request that does not describe a channel this service
+        // could run creates nothing: one `ValidationErrors` entry per problem,
+        // each naming the element it was found at, in the operation's modelled
+        // 422. The same rule `UpdateChannel` validates a rewritten
+        // configuration against, so the two cannot disagree about what a
+        // channel configuration is.
+        let problems = state.channel_configuration_problems(&configuration);
         if !problems.is_empty() {
             return Err(unprocessable(problems));
         }

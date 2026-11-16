@@ -263,6 +263,19 @@ pub mod channel_configurations;
 
 pub use channel_configurations::ChannelConfiguration;
 
+/// The PER-PIPELINE LIST slice: the one rule every write of a list the model
+/// documents as carrying one entry per encoding pipeline — a channel
+/// destination's per-encoder `Settings`, a pushed-to input's ingest
+/// `Destinations` — validates that list against before anything is stored, plus
+/// the messages those refusals carry.
+pub mod pipeline_lists;
+
+pub use pipeline_lists::{
+    channel_destination_settings_error, destination_settings_message,
+    push_destination_count_error, PIPELINES_PER_STANDARD_CLASS,
+    PUSH_DESTINATION_COUNT_MESSAGE,
+};
+
 /// The channel DEFAULTS slice: the values the service applies to a channel's
 /// configuration as it stores it — the log level a request that chose none is
 /// stored with, and the collection members a request supplied nothing for, which
@@ -2951,6 +2964,10 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// * the two cross-member rules the `Vpc` member's own doc states — it
     ///   "requires setting the roleArn property on Input creation" and is "not
     ///   compatible with the inputSecurityGroups property".
+    /// * a pushed-to input's `Destinations` is a PER-PIPELINE list — one ingest
+    ///   endpoint per pipeline — so it carries no more entries than the
+    ///   pipelines it can feed ([`pipeline_lists`], the one rule every
+    ///   per-pipeline list of this service is written under).
     ///
     /// A VPC input and an on-premises input are the two cases the whitelist does
     /// NOT admit anything for: the former's ingest addresses "will be created in
@@ -3026,6 +3043,13 @@ impl ComAmazonawsMedialiveMedialiveState {
         // nothing of the request.
         if input.needs_input_whitelist() && input.security_groups.len() != 1 {
             return Some(ONE_SECURITY_GROUP_PER_INPUT_MESSAGE.to_string());
+        }
+        // A pushed-to input is pushed to one ingest endpoint per pipeline, so
+        // its `Destinations` is a per-pipeline list and carries no more entries
+        // than the pipelines it can feed ([`pipeline_lists`], the one rule every
+        // per-pipeline list is written under).
+        if let Some(message) = push_destination_count_error(input) {
+            return Some(message);
         }
         if pulls_from_sources(input.input_type.as_deref()) && input.sources.is_empty() {
             return Some(required_for_input_type_message("sources", input_type));
@@ -3750,6 +3774,19 @@ pub fn already_deleted_message(subject: &str) -> String {
 /// every other message this service writes.
 pub fn deleted_input_subject(input_id: &str) -> String {
     format!("inputId={input_id}")
+}
+
+/// The message a channel write refused because an attachment names an input in
+/// a state no channel can ingest through carries: the input the REQUEST named
+/// and the `InputState` that input reports, in the service's own wording for
+/// this rejection class.
+///
+/// ONE helper, so `CreateChannel` and `UpdateChannel` — which attach inputs
+/// under the same rule
+/// ([`ComAmazonawsMedialiveMedialiveState::unusable_attached_input`]) — cannot
+/// word the refusal two ways.
+pub fn attached_input_state_message(input_id: &str, state: &str) -> String {
+    format!("Input {input_id} is {state}")
 }
 
 /// The message a delete refused on an input a channel still attaches carries:

@@ -346,7 +346,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .input_attachments
             .as_deref()
             .unwrap_or(&stored.input_attachments);
-        let mut problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
+        // The destinations this update WOULD leave on the channel, against the
+        // class the channel HAS (`UpdateChannelClass` is what writes the class):
+        // each destination's per-encoder `Settings` is a per-pipeline list, so
+        // it carries exactly one entry per pipeline — the same rule
+        // `CreateChannel` writes the same list under, refused the same way
+        // before anything is written.
+        if let Some(message) = crate::state::channel_destination_settings_error(
+            &stored.channel_class,
+            input.destinations.as_deref().unwrap_or(&stored.destinations),
+        ) {
+            return Err(bad_request(&message));
+        }
+        let configuration = crate::state::ChannelConfiguration {
             encoder_settings,
             input_attachments,
             channel_security_groups: input
@@ -365,7 +377,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // still names it) must not turn an edit of another member into a
             // refusal for a member the request never supplied.
             held: Some(stored),
-        });
+        };
+        // An attachment this update ADDS may name an input whose delete this
+        // service has already accepted: a real, identified input in a state no
+        // channel can ingest through, so the request itself is what cannot be
+        // served — the same modelled client error, with the same wording,
+        // `CreateChannel` answers such an attachment with.
+        if let Some((input_id, input_state)) = state.unusable_attached_input(&configuration) {
+            return Err(bad_request(&crate::state::attached_input_state_message(
+                &input_id,
+                &input_state,
+            )));
+        }
+        let mut problems = state.channel_configuration_problems(&configuration);
         // The channel's schedule resolves its channel-scoped references —
         // an input attachment by name, an output by name, the features a kind of
         // action needs — against exactly the members this update replaces, so

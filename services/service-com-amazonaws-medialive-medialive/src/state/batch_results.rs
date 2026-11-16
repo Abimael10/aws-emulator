@@ -143,6 +143,45 @@ pub fn accepted(
     }))
 }
 
+/// The message a Batch call naming a number of non-empty id lists other than one
+/// is refused with.
+///
+/// FIXED text, with no variable part: the refusal states the request shape the
+/// operation accepts — one id list, naming resources of ONE kind — and neither
+/// the lists the request filled nor the ids in them change what has to be true.
+/// The kinds it names are the four an id list of this family can name
+/// (`smithy_query(query="operation", operation="BatchDelete")`: ChannelIds,
+/// InputIds, InputSecurityGroupIds, MultiplexIds).
+pub const ONE_ID_LIST_PER_CALL_MESSAGE: &str = "Exactly one non-empty list of channel, \
+     multiplex, input, or input security group IDs is required";
+
+/// Check that the request filled EXACTLY ONE of its id lists, answering the
+/// message that refusal carries.
+///
+/// `BatchDelete` acts on resources of one kind per call: its four lists are four
+/// alternatives rather than four parts of one request, so a call that fills two
+/// of them asks for two batches at once and a call that fills none asks for
+/// nothing. Neither is a request the operation serves, and the refusal is taken
+/// BEFORE any resource is touched, so a mixed call deletes nothing instead of
+/// performing both halves and leaving the caller without the resources the
+/// one-kind call would have kept. It lives here, beside [`within_id_cap`],
+/// because both are rules about the SHAPE of a batch request rather than about
+/// any one resource; which lists a given operation passes is that operation's
+/// own ([`crate::ops::batch_delete`]).
+///
+/// An EMPTY list is not a filled one: a member carrying no id names no resource,
+/// so it is the same request as one that leaves the member out.
+pub fn exactly_one_id_list(id_lists: &[&Option<Vec<String>>]) -> Result<(), String> {
+    let filled = id_lists
+        .iter()
+        .filter(|ids| ids.as_ref().is_some_and(|ids| !ids.is_empty()))
+        .count();
+    if filled == 1 {
+        return Ok(());
+    }
+    Err(ONE_ID_LIST_PER_CALL_MESSAGE.to_string())
+}
+
 /// Check the ids ONE batch call names against the cap that operation sets,
 /// answering the message that refusal carries: the operation, the number of ids
 /// named and the cap.

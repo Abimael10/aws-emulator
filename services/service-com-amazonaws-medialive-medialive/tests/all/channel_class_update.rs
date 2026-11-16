@@ -71,12 +71,20 @@ async fn idle_channel(router: &MultiServiceRouter, case: &str, body: Value) -> S
 /// The channel each row starts from: a named channel carrying one destination, a
 /// role, a tag and an input attachment, so a class update can be seen to leave
 /// every member but the class alone.
+///
+/// The destination carries one per-encoder setting per pipeline of the class the
+/// channel is CREATED with (`OutputDestination$Settings`: "one destination for
+/// each redundant encoder"), which is what a create requires.
 fn baseline_body(class: Option<&str>) -> Value {
+    let settings = match class {
+        Some("SINGLE_PIPELINE") => json!([{ "url": "rtmp://a" }]),
+        _ => json!([{ "url": "rtmp://a" }, { "url": "rtmp://b" }]),
+    };
     let mut body = json!({
         "name": "class-baseline",
         "roleArn": "arn:aws:iam::111122223333:role/Baseline",
         "logLevel": "INFO",
-        "destinations": [{ "id": "baseline-destination", "settings": [{ "url": "rtmp://a" }] }],
+        "destinations": [{ "id": "baseline-destination", "settings": settings }],
         "inputAttachments": [{ "inputAttachmentName": "baseline", "inputId": "1000000" }],
         "tags": { "team": "video" },
     });

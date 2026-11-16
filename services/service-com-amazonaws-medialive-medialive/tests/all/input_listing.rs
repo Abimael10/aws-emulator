@@ -17,7 +17,6 @@ use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{MAX_INPUTS, MAX_LIST_PAGE_SIZE};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::wait_for_the_clock;
 use crate::support::resolved_input_body;
 use crate::wire::{call, error_code, medialive};
 
@@ -112,6 +111,26 @@ async fn delete_input(router: &MultiServiceRouter, case: &str, id: &str) -> Valu
         "case {case:?}: expected DeleteInput({id}) to answer 200, got {status}: {deleted}"
     );
     deleted
+}
+
+/// The input `id`, read until its `State` is `state`, or a panic once a generous
+/// deadline has passed: a transition the clock owes is materialised by the next
+/// read, so a row that needs the settled state waits for THAT condition rather
+/// than for a span of time.
+async fn input_in_state(router: &MultiServiceRouter, case: &str, id: &str, state: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let described = describe_input(router, case, id).await;
+        if described["state"] == json!(state) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected input {id} to reach {state}, it reported {:?}",
+            described["state"]
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// One row of a pull-source list, as `InputSourceRequest` shapes it.
@@ -477,16 +496,17 @@ async fn a_listed_input_is_the_input_describe_reports() {
     }
 }
 
-/// Rule: a deleted resource keeps its record in the terminal state its own state
-/// enum models, so every reader — the listing included — goes on reporting it
-/// there, which is what an SDK waiter polling for that state reads.
+/// Rule: the listing reports the account's CURRENT inputs, so an input whose
+/// deletion has come due drops out of it while its record stays individually
+/// addressable through `DescribeInput` in the terminal state its own state enum
+/// models — which is what an SDK waiter polling for that state reads.
 ///
-/// The rows differ along WHICH of the stored inputs are deleted — the first, one
-/// in the middle, the last, several, all of them, none — because the delete's
-/// position in mint order is what a paged listing could get wrong, and each row
-/// is walked unpaged, one input at a time and two at a time.
+/// The rows differ along WHICH of the five stored inputs are deleted — the
+/// first, one in the middle, the last, several, all of them, none — because the
+/// delete's position in mint order is what a paged listing could get wrong, and
+/// each row is walked unpaged, one input at a time and two at a time.
 #[tokio::test]
-async fn a_deleted_input_stays_listed_in_its_terminal_state() {
+async fn a_deleted_input_drops_out_of_the_listing_and_stays_readable() {
     // (case, the indices of the five stored inputs the row deletes)
     let table: [(&str, &[usize]); 6] = [
         ("nothing deleted", &[]),
@@ -506,47 +526,65 @@ async fn a_deleted_input_stays_listed_in_its_terminal_state() {
         for index in deleted_indices {
             delete_input(&router, case, &created[*index]).await;
         }
-        // The delete opens a `DELETING` window and the clock owes the terminal
-        // `DELETED`, so the assertion below is made once that is due.
-        if !deleted_indices.is_empty() {
-            wait_for_the_clock();
+        // The delete opens a `DELETING` window, in which the input is still one
+        // the account holds; only once the clock has made the terminal state due
+        // does it drop out of the listing. The row waits for THAT condition,
+        // read through the input's own describe.
+        for index in deleted_indices {
+            input_in_state(&router, case, &created[*index], "DELETED").await;
         }
 
+        let survivors: Vec<String> = created
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !deleted_indices.contains(index))
+            .map(|(_, id)| id.clone())
+            .collect();
         for page_size in [None, Some(1), Some(2)] {
             let (reported, pages) = every_page(&router, case, page_size).await;
             assert_eq!(
-                reported, created,
+                reported, survivors,
                 "case {case:?}: with page size {page_size:?}, expected the listing to report \
-                 every input the account holds, in mint order; pages were {pages:?}"
+                 every input the account still holds, in mint order; pages were {pages:?}"
             );
         }
 
-        // Each listed input carries the state its own describe reports for it:
-        // the terminal `DELETED` for a deleted one, `DETACHED` for the rest.
+        // Each input the listing dropped is still readable on its own, in the
+        // terminal state the delete settled into, and each one it reports
+        // carries the state its own describe reports for it.
         let (status, body) = list(&router, "").await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status}: {body}"
         );
-        for (index, input) in listed(case, &body).iter().enumerate() {
+        for (index, id) in created.iter().enumerate() {
+            let described = describe_input(&router, case, id).await;
             let expected = if deleted_indices.contains(&index) {
                 "DELETED"
             } else {
                 "DETACHED"
             };
             assert_eq!(
-                input["state"],
+                described["state"],
                 json!(expected),
-                "case {case:?}: expected input {index} to be listed as {expected}, got {:?}",
-                input["state"]
+                "case {case:?}: expected input {index} to be readable as {expected}, got {:?}",
+                described["state"]
             );
-            let described = describe_input(&router, case, &created[index]).await;
-            assert_eq!(
-                input["state"], described["state"],
-                "case {case:?}: expected the listed state to equal the described one, got {:?} \
-                 vs {:?}",
-                input["state"], described["state"]
-            );
+            let listed_entry = listed(case, &body)
+                .into_iter()
+                .find(|input| input["id"] == json!(id));
+            match listed_entry {
+                Some(entry) => assert_eq!(
+                    entry["state"], described["state"],
+                    "case {case:?}: expected the listed state to equal the described one, got \
+                     {:?} vs {:?}",
+                    entry["state"], described["state"]
+                ),
+                None => assert!(
+                    deleted_indices.contains(&index),
+                    "case {case:?}: expected input {index} to be listed, it was not"
+                ),
+            }
         }
     }
 }

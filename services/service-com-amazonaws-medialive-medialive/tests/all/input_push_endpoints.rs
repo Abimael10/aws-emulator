@@ -228,6 +228,10 @@ async fn a_push_input_reports_the_ingest_endpoint_of_its_protocol() {
 /// Rule: every allocated ingest address is distinct and fixed for the lifetime
 /// of the input — an update that rewrites the destinations keeps the address of
 /// each slot that already had one and allocates one for each slot it adds.
+///
+/// A pushed-to input declares one ingest destination per pipeline, so the list
+/// it grows into here is the whole of it (`crate::cross_field_refusals` is the
+/// suite about that bound).
 #[tokio::test]
 async fn an_ingest_address_is_distinct_and_fixed_for_the_lifetime_of_the_input() {
     let router = medialive();
@@ -236,7 +240,7 @@ async fn an_ingest_address_is_distinct_and_fixed_for_the_lifetime_of_the_input()
         json!({
             "name": "fixed",
             "type": "RTMP_PUSH",
-            "destinations": [{ "streamName": "a" }, { "streamName": "b" }],
+            "destinations": [{ "streamName": "a" }],
         }),
     )
     .await;
@@ -252,13 +256,8 @@ async fn an_ingest_address_is_distinct_and_fixed_for_the_lifetime_of_the_input()
     let created = addresses(&first);
     assert_eq!(
         created.len(),
-        2,
-        "case \"two destinations\": expected an address per destination, got {created:?}"
-    );
-    assert_eq!(
-        created.iter().collect::<BTreeSet<_>>().len(),
-        2,
-        "case \"two destinations\": expected distinct addresses, got {created:?}"
+        1,
+        "case \"one destination\": expected an address per destination, got {created:?}"
     );
 
     // Reading the input does not move its endpoints.
@@ -270,11 +269,11 @@ async fn an_ingest_address_is_distinct_and_fixed_for_the_lifetime_of_the_input()
         );
     }
 
-    // Renaming the streams keeps every address and rebuilds each URL on it.
+    // Renaming the stream keeps the address and rebuilds the URL on it.
     let renamed = update_input(
         &router,
         &id,
-        json!({ "destinations": [{ "streamName": "c" }, { "streamName": "d" }] }),
+        json!({ "destinations": [{ "streamName": "c" }] }),
     )
     .await;
     assert_eq!(
@@ -289,22 +288,22 @@ async fn an_ingest_address_is_distinct_and_fixed_for_the_lifetime_of_the_input()
         destinations(&renamed)[0]
     );
 
-    // A third destination gets an address of its own; the first two keep theirs.
+    // A second destination gets an address of its own; the first keeps its own.
     let grown = update_input(
         &router,
         &id,
-        json!({ "destinations": [{ "streamName": "c" }, { "streamName": "d" }, { "streamName": "e" }] }),
+        json!({ "destinations": [{ "streamName": "c" }, { "streamName": "d" }] }),
     )
     .await;
     let grown_addresses = addresses(&grown);
     assert_eq!(
-        grown_addresses[..2],
+        grown_addresses[..1],
         created[..],
         "case \"a destination added\": expected the existing addresses to stay fixed, got {grown_addresses:?}"
     );
     assert_eq!(
         grown_addresses.iter().collect::<BTreeSet<_>>().len(),
-        3,
+        2,
         "case \"a destination added\": expected distinct addresses, got {grown_addresses:?}"
     );
 
