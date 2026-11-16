@@ -11,7 +11,8 @@
 //! authenticated against the seed the create provisioned the device with, a pair that is not
 //! two codes in a row proves nothing and is refused `InvalidAuthenticationCode` (HTTP 403)
 //! with the device left unassigned, and a device another user already holds cannot be enabled
-//! for a second one.
+//! for a second one. Each refusal carries IAM's own sentence for its class, which is part of
+//! the contract a client matches on.
 //!
 //! What a successful enable records is read back through the account's own listing of its
 //! devices (`ListVirtualMFADevices`), which is where a device's user and enable date are
@@ -34,6 +35,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::user_lifecycle::{call, element, elements, error_code, router};
+
+/// One REFUSED row: what the request addresses, and the class and the sentence IAM answers it
+/// with.
+struct Refusal {
+    case: &'static str,
+    /// The user the request names.
+    user: &'static str,
+    /// Whether the serial the request carries names a device the account holds.
+    held_serial: bool,
+    /// The expected HTTP status.
+    status: u16,
+    /// The expected error code.
+    code: &'static str,
+    /// The expected message, in full.
+    message: String,
+}
 
 /// The IAM user every row enables a device for.
 const USER: &str = "mfa-operator";
@@ -251,7 +268,9 @@ async fn only_two_consecutive_pass_codes_of_the_device_enable_it() {
 
 /// RULE: what the request ADDRESSES has to exist and be free — a serial the account holds no
 /// device under and a user it does not hold are both the entity that does not exist, and a
-/// device its holder already has is a resource that already exists.
+/// device already enabled for a user is a resource that already exists, refused with IAM's
+/// `MFA Device for user ` … ` already exists.` sentence naming the user that enrolment belongs
+/// to.
 #[tokio::test]
 async fn an_absent_entity_and_an_enabled_device_are_refused_in_their_own_classes() {
     let router = router();
@@ -262,35 +281,39 @@ async fn an_absent_entity_and_an_enabled_device_are_refused_in_their_own_classes
     let (first, second) = (pass_code(&seed, step), pass_code(&seed, step + 1));
     let absent_serial = format!("{serial_number}-absent");
 
-    let rows: [(&str, &str, &str, u16, &str); 4] = [
-        (
-            "a serial the account holds no device under",
-            USER,
-            absent_serial.as_str(),
-            404,
-            "NoSuchEntity",
-        ),
-        (
-            "a user the account does not hold",
-            "nobody",
-            serial_number.as_str(),
-            404,
-            "NoSuchEntity",
-        ),
-        (
-            "the device its own holder already has",
-            USER,
-            serial_number.as_str(),
-            409,
-            "EntityAlreadyExists",
-        ),
-        (
-            "the device another user already holds",
-            "second-operator",
-            serial_number.as_str(),
-            409,
-            "EntityAlreadyExists",
-        ),
+    let rows: [Refusal; 4] = [
+        Refusal {
+            case: "a serial the account holds no device under",
+            user: USER,
+            held_serial: false,
+            status: 404,
+            code: "NoSuchEntity",
+            message: format!("MFA Device with serial number {absent_serial} does not exist."),
+        },
+        Refusal {
+            case: "a user the account does not hold",
+            user: "nobody",
+            held_serial: true,
+            status: 404,
+            code: "NoSuchEntity",
+            message: "The user with name nobody cannot be found.".to_string(),
+        },
+        Refusal {
+            case: "the device its own holder already has",
+            user: USER,
+            held_serial: true,
+            status: 409,
+            code: "EntityAlreadyExists",
+            message: format!("MFA Device for user {USER} already exists."),
+        },
+        Refusal {
+            case: "the device another user already holds",
+            user: "second-operator",
+            held_serial: true,
+            status: 409,
+            code: "EntityAlreadyExists",
+            message: format!("MFA Device for user {USER} already exists."),
+        },
     ];
 
     // The first enable has to succeed: the two conflict rows are about a device that is
@@ -311,12 +334,18 @@ async fn an_absent_entity_and_an_enabled_device_are_refused_in_their_own_classes
         "the device must be enabled for the first user, got {status} {body}"
     );
 
-    for (case, user, serial, expected_status, expected_code) in rows {
+    for row in &rows {
+        let case = row.case;
+        let serial = if row.held_serial {
+            serial_number.as_str()
+        } else {
+            absent_serial.as_str()
+        };
         let (status, body) = call(
             &router,
             "EnableMFADevice",
             &[
-                ("UserName", user),
+                ("UserName", row.user),
                 ("SerialNumber", serial),
                 ("AuthenticationCode1", &first),
                 ("AuthenticationCode2", &second),
@@ -324,13 +353,21 @@ async fn an_absent_entity_and_an_enabled_device_are_refused_in_their_own_classes
         )
         .await;
         assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected HTTP {expected_status}, got {status} {body}"
+            status, row.status,
+            "case {case:?}: expected HTTP {}, got {status} {body}",
+            row.status
         );
         let code = error_code(&body);
         assert_eq!(
-            code, expected_code,
-            "case {case:?}: expected {expected_code}, got {code:?}: {body}"
+            code, row.code,
+            "case {case:?}: expected {}, got {code:?}: {body}",
+            row.code
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, row.message,
+            "case {case:?}: expected message {:?}, got {message:?}: {body}",
+            row.message
         );
     }
 }

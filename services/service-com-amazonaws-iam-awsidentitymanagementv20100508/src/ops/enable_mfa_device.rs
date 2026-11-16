@@ -241,18 +241,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A device is ONE user's: "enables the specified MFA device and associates it with
         // the specified IAM user", so a device another user already holds cannot be enabled
         // for a second one, and re-enabling the device its holder already has is the same
-        // conflict — a resource that already exists.
+        // conflict — a resource that already exists, reported in IAM's own wording for that
+        // class ([`crate::state::mfa_device_already_enabled_message`]), which names the user
+        // the enrolment the account already holds belongs to.
         if let Some(holder) = &device.user_key {
+            let holder_name = store
+                .users
+                .get(holder)
+                .map_or_else(|| holder.clone(), |user| user.user_name.clone());
             return Err(
                 EnableMFADeviceErrorModeled::EntityAlreadyExistsException(
                     EntityAlreadyExistsException {
-                        message: Some(format!(
-                            "Device {} is already enabled for user {}.",
-                            input.serial_number,
-                            store
-                                .users
-                                .get(holder)
-                                .map_or_else(|| holder.clone(), |user| user.user_name.clone())
+                        message: Some(crate::state::mfa_device_already_enabled_message(
+                            &holder_name,
                         )),
                     },
                 )

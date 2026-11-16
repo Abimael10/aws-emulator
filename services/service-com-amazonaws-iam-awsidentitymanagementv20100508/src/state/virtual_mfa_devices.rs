@@ -10,7 +10,8 @@
 //! [`virtual_mfa_device_answers_in_sequence`], [`virtual_mfa_device_resync_step`]), the
 //! sentences every operation on a device refuses one with
 //! ([`INVALID_AUTHENTICATION_CODE`], [`mfa_device_not_found_message`],
-//! [`mfa_device_not_found_for_user_message`]) and the report every reader of a device makes
+//! [`mfa_device_not_found_for_user_message`], [`mfa_device_already_enabled_message`]) and the
+//! report every reader of a device makes
 //! ([`ComAmazonawsIamAwsidentitymanagementv20100508State::virtual_mfa_device_report`]).
 
 #[allow(unused_imports)]
@@ -338,6 +339,19 @@ pub fn mfa_device_not_found_message(serial_number: &str) -> String {
 /// entity that does not exist is the pair, not the device.
 pub fn mfa_device_not_found_for_user_message(serial_number: &str, user_name: &str) -> String {
     format!("MFA Device {serial_number} cannot be found for user {user_name}.")
+}
+
+/// How IAM refuses an enrolment of a device that is ALREADY enabled: the `MFA Device for user `
+/// … ` already exists.` sentence of IAM's entity-already-exists family, carrying the name of
+/// the user the device is enabled for.
+///
+/// The entity whose creation the request attempted is an enrolment — a device held BY a user —
+/// which is what the sentence names, the same shape as the login profile's
+/// (`Login Profile for user ` … ` already exists.`): the user is the one the account already
+/// holds the enrolment for, so the sentence states a fact about the account's state rather
+/// than echoing a name back.
+pub fn mfa_device_already_enabled_message(user_name: &str) -> String {
+    format!("MFA Device for user {user_name} already exists.")
 }
 
 /// The time step `at` falls in: the TOTP counter, `floor(unix seconds / time step)`.
