@@ -389,6 +389,12 @@ const EVENT_SOURCE_PASSTHROUGH: &[&str] = &[
     "TumblingWindowInSeconds",
 ];
 
+/// The `RuleState` values an `AWS::Events::Rule` the transform synthesizes is put in force
+/// with: "the state of the rule" EventBridge takes at `PutRule$State`, where "ENABLED"
+/// means the rule matches published events and "DISABLED" means it matches none.
+const RULE_ENABLED: &str = "ENABLED";
+const RULE_DISABLED: &str = "DISABLED";
+
 /// Expand the template document in place, where it declares [`TRANSFORM`].
 ///
 /// Answers whether the expansion CHANGED anything — a document declaring any other
@@ -1426,6 +1432,21 @@ fn event_rule(
         &Value::Object(event_properties.clone()),
         &["Description", "Name", "State", "EventBusName"],
     );
+    // "Enabled: indicates whether the rule is enabled" — the enablement an event source
+    // declares as a BOOLEAN is the generated rule's own `State`, which EventBridge spells
+    // as one of its named values ([`RULE_ENABLED`] / [`RULE_DISABLED`]), so a declaration
+    // that asks for a paused trigger expands into a rule that is paused. A declaration that
+    // states `State` itself states that member directly, and it is carried through above, so
+    // nothing re-derives it; a value that is no boolean states no enablement at all, and the
+    // rule then takes the state EventBridge defaults an omitted `State` to.
+    if !rule.contains_key("State") {
+        if let Some(enabled) = declared_flag(event_properties.get("Enabled")) {
+            rule.insert(
+                "State".to_string(),
+                json!(if enabled { RULE_ENABLED } else { RULE_DISABLED }),
+            );
+        }
+    }
     rule.insert(
         "Targets".to_string(),
         json!([{
@@ -2277,6 +2298,19 @@ fn copy_through(into: &mut Map<String, Value>, properties: &Value, names: &[&str
         if let Some(value) = properties.get(*name) {
             into.insert((*name).to_string(), value.clone());
         }
+    }
+}
+
+/// A declared boolean in either spelling a template gives one: JSON's boolean, or the text a
+/// template spells one as, read case-insensitively. `None` where the property is absent or
+/// is no boolean at all — an intrinsic, say — which states nothing the expansion can map, so
+/// the member it would have decided is left for the target type's own default.
+fn declared_flag(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) if text.eq_ignore_ascii_case("true") => Some(true),
+        Value::String(text) if text.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
     }
 }
 
