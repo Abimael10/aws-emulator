@@ -864,6 +864,7 @@ pub fn identity_provider_test_message(server: &Server) -> &'static str {
 /// built from anything the caller sent.
 pub const ACCESS_ACTION_CREATE: &str = "create";
 pub const ACCESS_ACTION_DESCRIBE: &str = "describe";
+pub const ACCESS_ACTION_UPDATE: &str = "update";
 pub const ACCESS_ACTION_DELETE: &str = "delete";
 
 /// The refusal for an access-grant request addressed at a server that has no
@@ -878,7 +879,8 @@ pub const ACCESS_ACTION_DELETE: &str = "delete";
 ///
 /// The text is fixed for the operation and the server's configuration: `action` is the
 /// operation's own verb (one of [`ACCESS_ACTION_CREATE`], [`ACCESS_ACTION_DESCRIBE`],
-/// [`ACCESS_ACTION_DELETE`]) and `identity_provider_type` is a value of the
+/// [`ACCESS_ACTION_UPDATE`], [`ACCESS_ACTION_DELETE`]) and `identity_provider_type` is
+/// a value of the
 /// `IdentityProviderType` enum's closed set, read off the STORED server. Nothing the
 /// caller sent — no `ServerId`, no `ExternalId` — reaches it, so two requests refused
 /// for the same condition on equally configured servers read identically.
@@ -2486,8 +2488,8 @@ pub fn home_directory_violation(
 /// ordered range for `ListAccesses`.
 ///
 /// `DeleteAccess` reads only the grant's identity; the members below are the ones
-/// `DescribedAccess` reports, which `CreateAccess` / `UpdateAccess` (their own stub
-/// issues) resolve when they write a grant.
+/// `DescribedAccess` reports, which `CreateAccess` resolves when it writes a grant and
+/// `UpdateAccess` replaces one at a time.
 #[derive(Debug, Clone, Default)]
 pub struct Access {
     pub server_id: String,

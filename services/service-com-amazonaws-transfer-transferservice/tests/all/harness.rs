@@ -71,6 +71,25 @@ pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/transfer-s3";
 /// an IAM principal seeds it against this key.
 pub(crate) const ACCESS_KEY_ID: &str = "AKIDTEST";
 
+/// A directory identifier satisfying `DirectoryId`'s modelled `len 12..12`, pattern
+/// `^d-[0-9a-f]{10}$` — what an `AWS_DIRECTORY_SERVICE` server authenticates against,
+/// and so what every suite about ACCESS GRANTS configures its server with.
+pub(crate) const DIRECTORY_ID: &str = "d-0123456789";
+
+/// A function ARN satisfying `Function`'s modelled `len 1..170`, pattern
+/// `^arn:[a-z-]+:lambda:.*$`: the one `IdentityProviderDetails` member an `AWS_LAMBDA`
+/// server is configured through.
+pub(crate) const LAMBDA_IDP: &str = "arn:aws:lambda:us-east-1:000000000000:function:idp";
+
+/// The shortest `ExternalId` the modelled `len 1..256`, pattern `^S-1-[\d-]+$` admits:
+/// the low end of the group-SID space, beside the full-length SIDs a suite's own rows
+/// name.
+pub(crate) const SHORT_SID: &str = "S-1-0";
+
+/// A `ServerId` satisfying the modelled `len 19..19`, pattern `^s-([0-9a-f]{17})$` that
+/// no `CreateServer` ever minted, so every operation addressed at it resolves nothing.
+pub(crate) const UNMINTED_SERVER_ID: &str = "s-0000000000000dead";
+
 /// This service's own store in the shared engine, as a suite seeds and reads it.
 pub(crate) type TransferState =
     service_com_amazonaws_transfer_transferservice::ComAmazonawsTransferTransferserviceState;
@@ -501,6 +520,40 @@ impl Emulator {
             "CreateUser {user_name}: expected 200, got {} with body {}",
             answer.status, answer.body
         );
+    }
+
+    /// Create a server whose identity provider is the DIRECTORY one an access grant
+    /// needs — the only `IdentityProviderType` an `ExternalId` can name a group in — and
+    /// return its `ServerId`.
+    pub(crate) async fn directory_server(&self) -> String {
+        self.create_server(json!({
+            "IdentityProviderType": "AWS_DIRECTORY_SERVICE",
+            "IdentityProviderDetails": {"DirectoryId": DIRECTORY_ID},
+        }))
+        .await
+    }
+
+    /// `DescribeAccess` for one grant, asserted to have been served and to answer the
+    /// `ServerId` it was addressed at, with the `DescribedAccess` it reported.
+    pub(crate) async fn described_access(&self, server_id: &str, external_id: &str) -> Value {
+        let answer = self
+            .call(
+                "DescribeAccess",
+                json!({"ServerId": server_id, "ExternalId": external_id}),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "DescribeAccess {external_id}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.get("ServerId").as_str(),
+            Some(server_id),
+            "DescribeAccess {external_id}: expected ServerId {server_id:?}, got {}",
+            answer.body
+        );
+        answer.get("Access").clone()
     }
 
     /// Create an AS2 profile from `request` and return its `ProfileId`.

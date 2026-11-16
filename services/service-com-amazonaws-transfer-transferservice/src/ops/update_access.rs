@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,9 +138,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-transfer-transferservic
 // here — hence the `UpdateAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.transfer#UpdateAccess")]
+// `AccessDeniedException` is widened in with `extra_errors`, exactly as `CreateAccess`
+// and `UpdateUser` widen it: the SERVICE models the shape (`CreateServer`,
+// `UpdateServer` and `DeleteServer` all list it) and the real service answers this
+// operation with it — for a caller an identity policy denies, and for a role ARN in
+// another account — while this operation's modelled error list omits it. The shape,
+// its status (403) and its body stay the model's own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.transfer#UpdateAccess",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdateAccessErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceError(InternalServiceError),
     InvalidRequestException(InvalidRequestException),
     ResourceExistsException(ResourceExistsException),
@@ -209,18 +210,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        // WHO is asking is decided before WHAT is asked, by the same gate every other
+        // access and user write consults: a caller whose identity policy explicitly
+        // denies this action is refused with the modelled `AccessDeniedException`
+        // (HTTP 403) and nothing is written. `DescribedAccess` models no ARN, so this
+        // request addresses no nameable resource and only a statement covering every
+        // resource can apply to it — the reading `explicit_deny` documents for `None`,
+        // and the one `CreateAccess` gives it.
+        if let Some(message) =
+            st::authorization::explicit_deny(&*self.engine, ctx.parts(), Self::NAME, None)
+        {
+            return Err(UpdateAccessErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The ACCOUNT of a role this request asks the service to pass is checked BEFORE
+        // any resource the request names is resolved, exactly as on the create and on
+        // the two user writes: passing a role across accounts is a privilege-escalation
+        // guard, so it is refused for its own reason whether or not the grant exists.
+        if input
+            .role
+            .as_deref()
+            .is_some_and(st::authorization::cross_account_role)
+        {
+            return Err(UpdateAccessErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(st::authorization::CROSS_ACCOUNT_PASS_ROLE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A session policy that is not a JSON document is refused before it can be
+        // stored, by the same rule and helper the create applies: the member is a policy
+        // DOCUMENT, so one the service cannot parse would otherwise silently become this
+        // access's effective permissions.
+        if let Some(message) = st::policy_document_violation("Policy", input.policy.as_deref()) {
+            return Err(UpdateAccessErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAccessErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // The server is resolved first — its configuration is what decides whether an
+        // access grant can exist at all — and an id the store does not hold is not
+        // found, exactly as for every other operation of this service.
+        let Some(server) = guard.servers.get(&input.server_id) else {
+            return Err(st::not_found(
+                UpdateAccessErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        };
+        let identity_provider_type = server.identity_provider_type.clone();
+
+        // The server-type gate precedes the `ExternalId` lookup, exactly as in
+        // `CreateAccess`, `DescribeAccess` and `DeleteAccess`: on a server with no
+        // directory the request names a group that cannot exist, which is a malformed
+        // request rather than a missing grant — so the two cases stay distinguishable.
+        if identity_provider_type != st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE {
+            return Err(UpdateAccessErrorModeled::InvalidRequestException(
+                st::accesses_require_directory_provider(
+                    st::ACCESS_ACTION_UPDATE,
+                    &identity_provider_type,
+                ),
+            )
+            .into());
+        }
+
+        let key = (input.server_id.clone(), input.external_id.clone());
+        let stored = guard.accesses.get_mut(&key).ok_or_else(|| {
+            st::not_found(UpdateAccessErrorModeled::ResourceNotFoundException(
+                st::unknown_access(&input.external_id),
+            ))
+        })?;
+
+        // "Allows you to update parameters for the access specified in the ServerID and
+        // ExternalID parameters": a member the request names replaces the stored one,
+        // and a member it omits leaves that property as the grant already had it. The
+        // grant's identity (`ServerId` and `ExternalId`) is not an update parameter, so
+        // it is untouched here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccess"))
+        // The configuration the update would LEAVE has to satisfy the same documented
+        // cross-member requirement a create does, so it is checked against the effective
+        // values — the request's where it names one, the stored grant's otherwise —
+        // before anything is written, exactly as `UpdateUser` checks the same two
+        // members.
+        let effective_type = input
+            .home_directory_type
+            .clone()
+            .or_else(|| stored.home_directory_type.clone());
+        let effective_mappings = input
+            .home_directory_mappings
+            .clone()
+            .unwrap_or_else(|| stored.home_directory_mappings.clone());
+        if let Some(message) = st::home_directory_violation(
+            effective_type.as_deref(),
+            Some(effective_mappings.as_slice()),
+        ) {
+            return Err(UpdateAccessErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        if let Some(home_directory) = input.home_directory {
+            stored.home_directory = Some(home_directory);
+        }
+        if let Some(mappings) = input.home_directory_mappings {
+            stored.home_directory_mappings = mappings;
+        }
+        if let Some(policy) = input.policy {
+            stored.policy = Some(policy);
+        }
+        if let Some(posix_profile) = input.posix_profile {
+            stored.posix_profile = Some(posix_profile);
+        }
+        if let Some(role) = input.role {
+            stored.role = Some(role);
+        }
+        // The type the request named replaces the stored one, like every other property
+        // above; a request that names none leaves the stored type alone. `CreateAccess`
+        // is where the absent-type default is resolved, because that is the write with
+        // no stored value to keep.
+        if let Some(home_directory_type) = input.home_directory_type {
+            stored.home_directory_type = Some(home_directory_type);
+        }
+
+        Ok(UpdateAccessOutput {
+            server_id: input.server_id,
+            external_id: input.external_id,
+        })
     }
 }

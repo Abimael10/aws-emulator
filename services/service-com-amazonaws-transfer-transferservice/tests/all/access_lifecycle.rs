@@ -26,59 +26,15 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{assert_members, member_of, Emulator, ROLE};
-
-/// Satisfies `DirectoryId`'s modelled `len 12..12`, pattern `^d-[0-9a-f]{10}$`.
-const DIRECTORY_ID: &str = "d-0123456789";
-
-/// Satisfies `Function`'s modelled `len 1..170`, pattern `^arn:[a-z-]+:lambda:.*$`.
-const LAMBDA_IDP: &str = "arn:aws:lambda:us-east-1:000000000000:function:idp";
+use crate::harness::{
+    assert_members, member_of, Emulator, DIRECTORY_ID, LAMBDA_IDP, ROLE, SHORT_SID,
+    UNMINTED_SERVER_ID,
+};
 
 /// A group SID satisfying `ExternalId`'s modelled `len 1..256`, pattern
 /// `^S-1-[\d-]+$` — the form `Get-ADGroup` reports, per the member's documentation.
 const GROUP_SID: &str = "S-1-1-12-1234567890-123456789-1234567890-1234";
 
-/// A second, differently shaped `ExternalId` the same pattern admits: the shortest
-/// legal form.
-const SHORT_SID: &str = "S-1-0";
-
-/// A `ServerId` satisfying the modelled `^s-([0-9a-f]{17})$` that no `CreateServer`
-/// ever minted.
-const UNMINTED_SERVER_ID: &str = "s-0000000000000dead";
-
-/// Create a server whose identity provider is the directory one an access needs, and
-/// return its `ServerId`.
-async fn directory_server(emulator: &Emulator) -> String {
-    emulator
-        .create_server(json!({
-            "IdentityProviderType": "AWS_DIRECTORY_SERVICE",
-            "IdentityProviderDetails": {"DirectoryId": DIRECTORY_ID},
-        }))
-        .await
-}
-
-/// `DescribeAccess` for one access, asserted to have been served, with the
-/// `DescribedAccess` it reported.
-async fn described_access(emulator: &Emulator, server_id: &str, external_id: &str) -> Value {
-    let answer = emulator
-        .call(
-            "DescribeAccess",
-            json!({"ServerId": server_id, "ExternalId": external_id}),
-        )
-        .await;
-    assert_eq!(
-        answer.status, 200,
-        "DescribeAccess {external_id}: expected 200, got {} with body {}",
-        answer.status, answer.body
-    );
-    assert_eq!(
-        answer.get("ServerId").as_str(),
-        Some(server_id),
-        "DescribeAccess {external_id}: expected ServerId {server_id:?}, got {}",
-        answer.body
-    );
-    answer.get("Access").clone()
-}
 
 /// RULE 1: `CreateAccess` is served only on a directory-backed server, and refused on
 /// every other identity provider type with HTTP 400 `InvalidRequestException` naming
@@ -226,7 +182,7 @@ async fn create_access_is_served_only_on_a_directory_backed_server() {
 #[tokio::test]
 async fn a_created_access_reads_back_through_describe_access() {
     let emulator = Emulator::new();
-    let server_id = directory_server(&emulator).await;
+    let server_id = emulator.directory_server().await;
 
     let posix = json!({"Uid": 1000, "Gid": 1000, "SecondaryGids": [2000, 2001]});
     let mappings = json!([
@@ -312,14 +268,14 @@ async fn a_created_access_reads_back_through_describe_access() {
             answer.status, answer.body
         );
 
-        let access = described_access(&emulator, &server_id, external_id).await;
+        let access = emulator.described_access(&server_id, external_id).await;
         assert_members(case, &access, expected);
     }
 
     // Every access of the table is still readable after the later creates, each under
     // its own `ExternalId`: the records do not overwrite one another.
     for (case, external_id, _, expected) in &cases {
-        let access = described_access(&emulator, &server_id, external_id).await;
+        let access = emulator.described_access(&server_id, external_id).await;
         assert_members(&format!("{case} after the whole table"), &access, expected);
     }
 }
@@ -333,7 +289,7 @@ async fn a_created_access_reads_back_through_describe_access() {
 #[tokio::test]
 async fn create_access_enforces_the_home_directory_pairing() {
     let emulator = Emulator::new();
-    let server_id = directory_server(&emulator).await;
+    let server_id = emulator.directory_server().await;
 
     // Each row carries what the shared rule's refusal must NAME: the member always,
     // plus the condition in the direction whose rule states one.
@@ -416,8 +372,8 @@ async fn create_access_enforces_the_home_directory_pairing() {
 #[tokio::test]
 async fn an_access_is_addressed_by_its_server_and_external_id() {
     let emulator = Emulator::new();
-    let first = directory_server(&emulator).await;
-    let second = directory_server(&emulator).await;
+    let first = emulator.directory_server().await;
+    let second = emulator.directory_server().await;
 
     // A server the store does not hold: refused with the service's not-found answer
     // (HTTP 400 `ResourceNotFoundException`, `ResourceType` `Server`), for both the
@@ -504,7 +460,7 @@ async fn an_access_is_addressed_by_its_server_and_external_id() {
         );
     }
     for (server_id, home) in [(&first, "/bucket/first"), (&second, "/bucket/second")] {
-        let access = described_access(&emulator, server_id, GROUP_SID).await;
+        let access = emulator.described_access(server_id, GROUP_SID).await;
         assert_members(
             &format!("the access of {server_id}"),
             &access,
@@ -542,7 +498,7 @@ async fn an_access_is_addressed_by_its_server_and_external_id() {
         "case \"the same pair twice\": expected the ExternalId in Resource, got {}",
         answer.body
     );
-    let access = described_access(&emulator, &first, GROUP_SID).await;
+    let access = emulator.described_access(&first, GROUP_SID).await;
     assert_members(
         "the stored record after a refused duplicate",
         &access,
@@ -571,7 +527,7 @@ async fn an_access_is_addressed_by_its_server_and_external_id() {
         "case \"DescribeAccess after DeleteServer\": expected ResourceNotFoundException, got {}",
         answer.body
     );
-    let access = described_access(&emulator, &second, GROUP_SID).await;
+    let access = emulator.described_access(&second, GROUP_SID).await;
     assert_members(
         "the surviving server's access",
         &access,
@@ -588,7 +544,7 @@ async fn a_servers_access_set_is_bounded() {
     use service_com_amazonaws_transfer_transferservice::state::MAX_ACCESSES_PER_SERVER;
 
     let emulator = Emulator::new();
-    let server_id = directory_server(&emulator).await;
+    let server_id = emulator.directory_server().await;
 
     for n in 0..MAX_ACCESSES_PER_SERVER {
         let answer = emulator
@@ -632,7 +588,7 @@ async fn a_servers_access_set_is_bounded() {
     );
 
     // The bound refused the new record and kept every stored one.
-    let access = described_access(&emulator, &server_id, "S-1-5-21-0").await;
+    let access = emulator.described_access(&server_id, "S-1-5-21-0").await;
     assert_members(
         "the first access after the bound was hit",
         &access,
