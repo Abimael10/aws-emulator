@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMaintenanceWindows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMaintenanceWindows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMaintenanceWindows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the maintenance windows this account holds at the endpoint the request reached:
+//! "retrieves the maintenance windows in an Amazon Web Services account". Every window a
+//! `CreateMaintenanceWindow` persisted in this service's store
+//! ([`crate::state::maintenance_windows::MaintenanceWindowRecord`]) is projected as the
+//! modelled `MaintenanceWindowIdentity`, so a listing reports the windows that were
+//! created rather than anything invented here, and a window a delete removed is reported
+//! no more.
+//!
+//! "Optional filters used to narrow down the scope of the returned maintenance windows.
+//! Supported filter keys are Name and Enabled": the filters a request states INTERSECT
+//! while each filter's values union, and a key outside that documented set names no
+//! property of a window at all, so the request is refused naming it rather than served a
+//! listing narrowed by nothing.
+//!
+//! A page holds at most `MaxResults` windows and the `NextToken` this read hands out is
+//! the id of the window the next page starts at, so a walk over the pages reports each
+//! window once. This is a REPORTING operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +153,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMaintenanceWindows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMaintenanceWindowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMaintenanceWindows"))
+        use crate::state::maintenance_windows::{
+            is_maintenance_window_id, is_window_filter_key, window_page_size, WINDOW_FILTER_KEYS,
+        };
+        use crate::state::{invalid_filter_key_message, INVALID_NEXT_TOKEN};
+
+        // The filter list's length (0..5) and `MaxResults`'s range (10..100) are MODELLED
+        // constraints the centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMaintenanceWindowsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the maintenance window store is unavailable".to_string()),
+            })
+        })?;
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            // A key outside the documented set names no property of a window, so the filter
+            // cannot be served at all: the key is validated — and the request refused,
+            // naming it — before anything is asked about the windows. The refusal is worded
+            // through the crate's one wording of this class
+            // ([`crate::state::invalid_filter_key_message`]), so every filter-key refusal
+            // this service states reads the same way. This operation models no filter error,
+            // so it is a 400 `ValidationException`.
+            let key = filter.key.as_deref().unwrap_or_default();
+            if !is_window_filter_key(key) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    invalid_filter_key_message(key, WINDOW_FILTER_KEYS),
+                ));
+            }
+        }
+
+        let page_size = window_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the window the next page starts
+        // at, so a token that is not shaped like a window id was not one of ours — and
+        // neither is one that is, but names no window of this result: a token this read did
+        // not hand out is refused rather than served an empty page, the rule the sibling
+        // maintenance window listing of this crate takes too
+        // (`crate::ops::describe_maintenance_window_targets`). This operation models no
+        // token error, so it is a 400 `ValidationException`.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_maintenance_window_id(token) => Some(token.to_string()),
+            Some(_) => return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN)),
+        };
+
+        // A window lives in the Region its endpoint names, which is the signed credential
+        // scope's — so the windows "in an Amazon Web Services account" this read reports are
+        // that Region's.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let matching: Vec<&crate::state::maintenance_windows::MaintenanceWindowRecord> = store
+            .maintenance_windows_in(&region)
+            .into_iter()
+            .filter(|window| {
+                filters.iter().all(|filter| {
+                    window.matches_filter(
+                        filter.key.as_deref().unwrap_or_default(),
+                        filter.values.as_deref().unwrap_or_default(),
+                    )
+                })
+            })
+            .collect();
+
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => match matching.iter().position(|window| window.window_id == token) {
+                Some(at) => at,
+                // Shaped like a window id, but no window of this result: not a page of it
+                // to resume.
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))
+                }
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page = matching.get(start..).unwrap_or_default();
+        let window_identities = page
+            .iter()
+            .take(page_size)
+            .map(|window| window.to_maintenance_window_identity(now))
+            .collect();
+        // A window is still waiting past this page: hand the caller the id it resumes at, so
+        // the next request continues where this one stopped.
+        let next_token = page.get(page_size).map(|window| window.window_id.clone());
+
+        Ok(DescribeMaintenanceWindowsOutput {
+            window_identities: Some(window_identities),
+            next_token,
+        })
     }
 }

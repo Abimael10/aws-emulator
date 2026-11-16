@@ -38,6 +38,8 @@ use std::time::{Duration, SystemTime};
 
 use ::chrono::{Offset, TimeZone};
 
+use crate::ops::types::MaintenanceWindowIdentity;
+
 use super::ComAmazonawsSsmAmazonssmState;
 
 /// What every maintenance window id starts with, from the modelled `MaintenanceWindowId`
@@ -157,6 +159,63 @@ const DEFAULT_ZONE: ::chrono_tz::Tz = ::chrono_tz::Tz::UTC;
 /// wait after the date and time specified by a cron expression before running the
 /// maintenance window" (`CreateMaintenanceWindow$ScheduleOffset`).
 const ONE_DAY: Duration = Duration::from_secs(86_400);
+
+/// The filter keys a describe of the account's maintenance windows may narrow by:
+/// "Supported filter keys are Name and Enabled"
+/// (`DescribeMaintenanceWindowsRequest$Filters`). What a refusal of another key lists, and
+/// the one place that set is written.
+pub const WINDOW_FILTER_KEYS: &[&str] = &["Name", "Enabled"];
+
+/// Whether `key` is one of the filter keys a window describe takes
+/// ([`WINDOW_FILTER_KEYS`]).
+#[must_use]
+pub fn is_window_filter_key(key: &str) -> bool {
+    WINDOW_FILTER_KEYS.contains(&key)
+}
+
+/// The smallest page a describe of the account's windows serves, from the modelled
+/// `MaintenanceWindowMaxResults` (`range 10..100`) — the SAME member a describe of a
+/// window's targets is bounded by, so both read the range from the one place.
+pub const MIN_WINDOW_PAGE_SIZE: i32 = super::maintenance_window_targets::MIN_TARGET_PAGE_SIZE;
+
+/// The largest page that read serves, from the same modelled member, which is also the
+/// page a request naming no `MaxResults` is served.
+pub const MAX_WINDOW_PAGE_SIZE: i32 = super::maintenance_window_targets::MAX_TARGET_PAGE_SIZE;
+
+/// The page size a window describe serves (see `super::page_size`).
+pub fn window_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(max_results, MIN_WINDOW_PAGE_SIZE, MAX_WINDOW_PAGE_SIZE)
+}
+
+/// Whether `id` is a maintenance window id — the modelled `MaintenanceWindowId` pattern
+/// (`^mw-[0-9a-f]{17}$`), which is [`WINDOW_ID_PREFIX`] followed by exactly
+/// [`WINDOW_ID_HEX_DIGITS`] lowercase hex digits.
+///
+/// This crate's one reading of that shape: what tells a window id apart from text that
+/// could never name a window, whether it arrives as an identifier or as a page token.
+#[must_use]
+pub fn is_maintenance_window_id(id: &str) -> bool {
+    id.strip_prefix(WINDOW_ID_PREFIX).is_some_and(|digits| {
+        digits.len() == WINDOW_ID_HEX_DIGITS
+            && digits
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// How a filter's value states a boolean, or `None` for a value stating neither.
+///
+/// "For example, Name=MyMaintenanceWindow and Enabled=True"
+/// (`DescribeMaintenanceWindowsRequest$Filters`): a filter's values arrive as text, so the
+/// value is read as the boolean it spells however it is cased. A value spelling neither
+/// boolean is the value of no window's `Enabled`, so it selects none.
+fn boolean_filter_value(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
 
 /// How this service states a `Schedule` that is not a schedule at all.
 ///
@@ -594,6 +653,14 @@ pub struct MaintenanceWindowRecord {
     /// When the create ran, which is also where a `rate(...)` schedule's series is
     /// anchored.
     pub created_date: SystemTime,
+    /// Which create of this store minted the window: the value the store's mint counter
+    /// stood at ([`super::ComAmazonawsSsmAmazonssmState::next_maintenance_window_id`]).
+    ///
+    /// A listing of the account's windows reports them in the order they were created, and
+    /// the clock alone does not order two creates that land inside one of its ticks, so the
+    /// counter — which rises once per create and never repeats — is what makes that order
+    /// total and genuinely creation-ordered.
+    pub created_sequence: u64,
     /// When the window was last written. Equal to [`created_date`](Self::created_date)
     /// until something updates the window.
     pub modified_date: SystemTime,
@@ -676,6 +743,47 @@ impl MaintenanceWindowRecord {
             .filter(|stated| !stated.is_empty())
     }
 
+    /// The modelled `MaintenanceWindowIdentity` for this record: "information about the
+    /// maintenance window" as a listing reports it, every member projected from what the
+    /// write persisted, with `NextExecutionTime` read from the stored schedule and the
+    /// clock the same way a single read of the window reads it
+    /// ([`Self::next_execution_time`]).
+    #[must_use]
+    pub fn to_maintenance_window_identity(&self, now: SystemTime) -> MaintenanceWindowIdentity {
+        MaintenanceWindowIdentity {
+            window_id: Some(self.window_id.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            enabled: self.enabled,
+            duration: Some(self.duration),
+            cutoff: self.cutoff,
+            schedule: Some(self.schedule.clone()),
+            schedule_timezone: self.schedule_timezone.clone(),
+            schedule_offset: self.schedule_offset,
+            // Modelled as plain strings, so each is reported exactly as the write stated it.
+            end_date: self.end_date.clone(),
+            start_date: self.start_date.clone(),
+            next_execution_time: self.next_execution_time(now),
+        }
+    }
+
+    /// Whether the filter `key`=`values` selects this window.
+    ///
+    /// Each key narrows by one property of the window, and a filter's values UNION: a
+    /// window is selected when one of that filter's values is its value for the key. A key
+    /// outside [`WINDOW_FILTER_KEYS`] selects nothing — its caller refuses such a key
+    /// before anything is asked about the windows.
+    #[must_use]
+    pub fn matches_filter(&self, key: &str, values: &[String]) -> bool {
+        match key {
+            "Name" => values.contains(&self.name),
+            "Enabled" => values
+                .iter()
+                .any(|value| boolean_filter_value(value) == Some(self.enabled)),
+            _ => false,
+        }
+    }
+
     /// The members a create SUPPLIED, rendered as one canonical string.
     ///
     /// This is what "the parameters don't match the original call to the API with the same
@@ -731,6 +839,25 @@ impl ComAmazonawsSsmAmazonssmState {
     ) -> Option<&MaintenanceWindowRecord> {
         self.maintenance_windows
             .get(&(region.to_string(), window_id.to_string()))
+    }
+
+    /// Every maintenance window `region` holds, in the order they were created — the order
+    /// a listing of the account's windows reports them in, by the mint counter each create
+    /// recorded ([`MaintenanceWindowRecord::created_sequence`]), with the minted id breaking
+    /// a tie so the order is total and a page can resume at an id.
+    pub fn maintenance_windows_in(&self, region: &str) -> Vec<&MaintenanceWindowRecord> {
+        let mut held: Vec<&MaintenanceWindowRecord> = self
+            .maintenance_windows
+            .iter()
+            .filter(|((region_of, _), _)| region_of == region)
+            .map(|(_, window)| window)
+            .collect();
+        held.sort_by(|left, right| {
+            left.created_sequence
+                .cmp(&right.created_sequence)
+                .then_with(|| left.window_id.cmp(&right.window_id))
+        });
+        held
     }
 
     /// The same window, to write it.
@@ -918,6 +1045,7 @@ mod tests {
             tags: BTreeMap::new(),
             // 2030-01-01T00:00:00Z, a Tuesday.
             created_date: epoch(1_893_456_000),
+            created_sequence: 1,
             modified_date: epoch(1_893_456_000),
         }
     }
@@ -1099,6 +1227,174 @@ mod tests {
                  {:?} and {:?}",
                 first.creation_fingerprint(),
                 second.creation_fingerprint()
+            );
+        }
+    }
+
+    /// A listing of one Region's windows is ordered by the create that minted each, even
+    /// when the clock cannot tell two creates apart, and holds that Region's windows alone.
+    ///
+    /// The rows differ along the Region a window was created through and along whether the
+    /// instants the creates recorded order them.
+    #[test]
+    fn the_region_listing_is_ordered_by_the_create_that_minted_each() {
+        let mut store = ComAmazonawsSsmAmazonssmState::default();
+        // (case, the Region, the instant the create recorded)
+        let rows: [(&str, &str, u64); 4] = [
+            ("the first window here", "us-east-1", 1_893_456_000),
+            // One tick of a clock that cannot tell these two apart.
+            ("a window created in the same tick", "us-east-1", 1_893_456_000),
+            ("a window created later", "us-east-1", 1_893_456_030),
+            ("a window of another Region", "eu-central-1", 1_893_456_010),
+        ];
+        let mut minted: Vec<(&str, String, &str)> = Vec::new();
+        for (case, region, at) in rows {
+            let at = epoch(at);
+            let mut record = window("cron(0 8 * * ? *)");
+            record.region = region.to_string();
+            record.created_date = at;
+            record.modified_date = at;
+            record.window_id = store.next_maintenance_window_id(at);
+            record.created_sequence = store.maintenance_window_sequence;
+            minted.push((case, record.window_id.clone(), region));
+            store.insert_maintenance_window(record);
+        }
+
+        for region in ["us-east-1", "eu-central-1"] {
+            let expected: Vec<String> = minted
+                .iter()
+                .filter(|(_, _, held)| *held == region)
+                .map(|(_, window_id, _)| window_id.clone())
+                .collect();
+            let reported: Vec<String> = store
+                .maintenance_windows_in(region)
+                .into_iter()
+                .map(|held| held.window_id.clone())
+                .collect();
+            assert_eq!(
+                reported, expected,
+                "case {region:?}: expected the Region's windows in the order they were \
+                 created, got {reported:?}"
+            );
+        }
+    }
+
+    /// A filter selects a window exactly when one of its values is the window's value for
+    /// the key it names. The rows differ along the key, the values under it and the window
+    /// the filter is asked about — including a DISABLED window, the state only an update
+    /// puts a window in.
+    #[test]
+    fn a_filter_selects_the_windows_whose_value_it_names() {
+        // (case, the key, its values, whether an enabled window and a disabled one are
+        // selected)
+        let rows: [(&str, &str, &[&str], bool, bool); 9] = [
+            ("the window's own name", "Name", &["a-window"], true, true),
+            ("another window's name", "Name", &["other-window"], false, false),
+            (
+                "either name, whose values union",
+                "Name",
+                &["other-window", "a-window"],
+                true,
+                true,
+            ),
+            ("no value at all", "Name", &[], false, false),
+            // "For example […] Enabled=True": the value is read as the boolean it spells
+            // however it is cased.
+            ("enabled, as the documented example cases it", "Enabled", &["True"], true, false),
+            ("enabled, lowercased", "Enabled", &["true"], true, false),
+            ("not enabled, uppercased", "Enabled", &["FALSE"], false, true),
+            ("either state, whose values union", "Enabled", &["true", "false"], true, true),
+            ("a value spelling neither boolean", "Enabled", &["maybe"], false, false),
+        ];
+
+        for (case, key, values, selects_enabled, selects_disabled) in rows {
+            let values: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+            let enabled = window("cron(0 8 * * ? *)");
+            let mut disabled = window("cron(0 8 * * ? *)");
+            disabled.enabled = false;
+            for (state, held, expected) in [
+                ("enabled", &enabled, selects_enabled),
+                ("disabled", &disabled, selects_disabled),
+            ] {
+                let selected = held.matches_filter(key, &values);
+                assert_eq!(
+                    selected, expected,
+                    "case {case:?} against the {state} window: expected selected={expected}, \
+                     got {selected}"
+                );
+            }
+            // A key outside the documented set names no property of a window, so it selects
+            // none; its caller refuses such a key before asking.
+            assert!(
+                !enabled.matches_filter("NotAKey", &values),
+                "case {case:?}: expected an undocumented key to select nothing"
+            );
+        }
+    }
+
+    /// A page token is a window id exactly when it carries the modelled
+    /// `MaintenanceWindowId` form (`^mw-[0-9a-f]{17}$`): the rows differ along the prefix,
+    /// the number of digits and the alphabet they are drawn from.
+    #[test]
+    fn a_window_id_carries_the_modelled_form() {
+        let minted = mint_window_id(7, epoch(1_893_456_000));
+        // (case, the text, whether it is a window id)
+        let rows: [(&str, &str, bool); 8] = [
+            ("an id this service minted", minted.as_str(), true),
+            ("the shortest and longest hex digit", "mw-00000000000000000", true),
+            ("every digit at its maximum", "mw-fffffffffffffffff", true),
+            ("one digit short", "mw-0000000000000000", false),
+            ("one digit long", "mw-000000000000000000", false),
+            ("no prefix at all", "00000000000000000", false),
+            ("hex in upper case, which the pattern excludes", "mw-FFFFFFFFFFFFFFFFF", false),
+            ("a digit outside the hex alphabet", "mw-0000000000000000g", false),
+        ];
+
+        for (case, text, expected) in rows {
+            let read = is_maintenance_window_id(text);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected is_maintenance_window_id({text:?})={expected}, got {read}"
+            );
+        }
+    }
+
+    /// Every filter key this read takes is one the service documents, and the page it serves
+    /// stays inside the modelled `MaintenanceWindowMaxResults` range (10..100) — including
+    /// at each bound and one past it.
+    #[test]
+    fn the_filter_keys_and_the_page_bounds_are_the_modelled_ones() {
+        // The documented set: "Supported filter keys are Name and Enabled".
+        assert_eq!(
+            WINDOW_FILTER_KEYS,
+            &["Name", "Enabled"],
+            "expected the documented filter keys, got {WINDOW_FILTER_KEYS:?}"
+        );
+        for key in WINDOW_FILTER_KEYS {
+            assert!(
+                is_window_filter_key(key),
+                "case {key:?}: expected a documented key to be taken"
+            );
+        }
+        assert!(
+            !is_window_filter_key("name"),
+            "expected the filter keys to be read case-sensitively"
+        );
+
+        // (case, the MaxResults asked for, the page served)
+        let rows: [(&str, Option<i32>, Option<usize>); 6] = [
+            ("no bound at all", None, Some(MAX_WINDOW_PAGE_SIZE as usize)),
+            ("the smallest page", Some(MIN_WINDOW_PAGE_SIZE), Some(MIN_WINDOW_PAGE_SIZE as usize)),
+            ("the largest page", Some(MAX_WINDOW_PAGE_SIZE), Some(MAX_WINDOW_PAGE_SIZE as usize)),
+            ("one page in from the top", Some(MAX_WINDOW_PAGE_SIZE - 1), Some((MAX_WINDOW_PAGE_SIZE - 1) as usize)),
+            ("one below the smallest", Some(MIN_WINDOW_PAGE_SIZE - 1), None),
+            ("one above the largest", Some(MAX_WINDOW_PAGE_SIZE + 1), None),
+        ];
+        for (case, asked, expected) in rows {
+            let served = window_page_size(asked).ok();
+            assert_eq!(
+                served, expected,
+                "case {case:?}: expected window_page_size({asked:?})={expected:?}, got {served:?}"
             );
         }
     }

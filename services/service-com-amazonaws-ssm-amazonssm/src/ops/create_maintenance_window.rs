@@ -253,6 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token,
             tags: crate::state::to_btree_map(input.tags),
             created_date: now,
+            // Replaced by the store's mint counter below, once this create is known to be a
+            // create: it is what orders a listing by the order its windows were created.
+            created_sequence: 0,
             // Nothing has updated the window yet, so it was last written when it was
             // created.
             modified_date: now,
@@ -298,6 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The id is the SERVICE's to choose: no input member carries one.
         record.window_id = store.next_maintenance_window_id(now);
+        // The counter that id was minted from, so a listing reports this window after every
+        // window created before it and before every one created after it.
+        record.created_sequence = store.maintenance_window_sequence;
         let window_id = record.window_id.clone();
         store.insert_maintenance_window(record);
 

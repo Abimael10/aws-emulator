@@ -77,6 +77,8 @@ mod instance_properties;
 mod just_in_time_node_access;
 #[path = "all/maintenance_windows.rs"]
 mod maintenance_windows;
+#[path = "all/maintenance_window_listing.rs"]
+mod maintenance_window_listing;
 #[path = "all/maintenance_window_targets.rs"]
 mod maintenance_window_targets;
 #[path = "all/managed_node_filter_validation.rs"]
