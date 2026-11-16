@@ -801,6 +801,12 @@ fn modeled_operation_key<'r>(svc: &'r dyn Service, req: &'r RtRequest) -> Option
 /// runs the operation and finishes WHATEVER it answered with the same envelope
 /// ([`stamp_envelope`]), which is idempotent for a response already finished.
 ///
+/// Being that one place, it is also where each RUNNING instance's own `AWS/EC2` series are
+/// published — the reading of each metric whose period is due
+/// ([`crate::state::publish_instance_metrics`]), off the answer rather than in front of it —
+/// and where the clock that keeps sampling the instances without a call is started
+/// ([`crate::state::drive_instance_metric_clock`]).
+///
 /// Stateless but for the shared engine the authorization gate reads: the operation to run
 /// is resolved from the service the framework hands `run`, so one value serves every
 /// operation and nothing is built per request.
@@ -836,6 +842,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
             // CloudTrail reads it ([`management_events`]). It changes nothing about what
             // this call answers.
             management_events::record_served_call(&*self.engine, svc, req, ctx, &response).await;
+            // The TELEMETRY leg, for the same reason and in the same place: the request has
+            // been answered, so what it left the account's instances in is sampled into the
+            // `AWS/EC2` series each running instance publishes about itself, with no store
+            // lock held, and the clock that keeps sampling them is (re)started.
+            crate::state::publish_instance_metrics(&*self.engine);
+            crate::state::drive_instance_metric_clock(&self.engine);
             response
         })
     }

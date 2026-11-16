@@ -108,16 +108,17 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 # reaches a client's rules on is that service's own. No network client feature is enabled: the
 # transport is the emulator's own.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# `state::instance_telemetry`: the AWS/EC2 series a running instance publishes about itself, and
+# `state::nat_gateway_metrics`: the `AWS/NATGateway` traffic metrics a NAT gateway publishes. A
+# metric has ONE home — the metric store that OWNS it, the one CloudWatch's own `ListMetrics`,
+# `GetMetricStatistics` and alarm evaluation read — so both append their datapoints through that
+# service's own state accessor rather than keeping a second copy of the series beside it.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # `state::flow_log_s3_delivery`: the Amazon S3 client a flow log's destination bucket policy is
 # amended through, over the in-process callback into this same emulator — the permissions the log
 # delivery service needs to write a flow log's records are Amazon S3's own resource. No network
 # client feature is enabled: the transport is the emulator's own.
 aws-sdk-s3 = { version = "1", default-features = false }
-# `state::nat_gateway_metrics`: a NAT gateway publishes its traffic metrics in the
-# `AWS/NATGateway` namespace, and a metric has ONE home — the CloudWatch emulator's own metric
-# store, which `ListMetrics` and `GetMetricStatistics` read. The data points are appended
-# through that service's own state accessor rather than through a second copy of them.
-service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

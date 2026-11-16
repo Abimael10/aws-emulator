@@ -20,6 +20,13 @@
 // tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/aws_managed_prefix_list_name_scopes.rs"]
 mod aws_managed_prefix_list_name_scopes;
+// The `AWS/EC2` series a RUNNING instance publishes about itself: every metric of the published
+// catalog, dimensioned on that instance and in its own unit, once per period of the cadence its
+// monitoring state selects, stopping and resuming with the instance. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail of
+// this file are where every new ec2 suite inserts its lines.
+#[path = "all/instance_metric_publication.rs"]
+mod instance_metric_publication;
 // The DOCUMENTS a management-event record of a served call carries: the parameters it was
 // dispatched with and what it answered, in the form EC2's own API documents take, beside the
 // resources it acted on. Declared beside `aws_managed_prefix_list_name_scopes` for the reason

@@ -2579,6 +2579,16 @@ pub use guest_user_data::*;
 pub mod instance_status_checks;
 pub use instance_status_checks::*;
 
+/// The `AWS/EC2` series a RUNNING instance publishes about ITSELF — the instance metric
+/// families, the cadence its monitoring state selects them at, and the CloudWatch metric store
+/// they are appended to. A SUBMODULE for the same reason [`image_usage_reports`] is one. Only
+/// the two seams the service front door drives are re-exported: the metric catalog this module
+/// names its units and namespace with is one of several in this store ([`nat_gateway_metrics`]
+/// holds another), so each is reached through its own module rather than glob-exported into one
+/// namespace where two publishers' `BYTES_UNIT` would be the same name.
+pub mod instance_telemetry;
+pub use instance_telemetry::{drive_instance_metric_clock, publish_instance_metrics};
+
 /// The credit option for CPU usage ONE instance runs under — resolved from the launch's own
 /// `CreditSpecification` and the account's default for the instance family, and reported by
 /// `DescribeInstanceCreditSpecifications`. A SUBMODULE for the same reason

@@ -3604,6 +3604,27 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// REFUSED disable carried is not here, so a replay of one is refused the same way the
     /// first call was.
     pub capacity_manager_disable_client_tokens: BTreeSet<String>,
+    /// Which period of each `AWS/EC2` series this store has already published for each
+    /// instance: the instance id, then the metric name, then the START of the period the last
+    /// datapoint of that series carried, as epoch seconds — see [`instance_telemetry`], the
+    /// submodule that owns this slice.
+    ///
+    /// What it is FOR is one datapoint per period: a period is published into exactly once,
+    /// however often the sampler looks, so a reader's `Average`, `Minimum` and `Maximum` over a
+    /// period agree about what that period measured. The metric name is a `&'static str` out of
+    /// [`instance_telemetry::INSTANCE_METRICS`], so no request text reaches this map, and the
+    /// entries of instances this store no longer holds are dropped as the samples are taken —
+    /// which bounds the map by the instances of the account times that one catalog.
+    pub(super) instance_metric_periods: BTreeMap<String, BTreeMap<&'static str, i64>>,
+    /// How long the running instance-metric clock's claim on this store stands, or `None` when
+    /// no clock holds one — see [`instance_telemetry::drive_instance_metric_clock`].
+    ///
+    /// A LEASE rather than a flag, renewed on every wake-up, so a clock whose task ended without
+    /// releasing it cannot stop this store from ever having a clock again.
+    pub(super) instance_metric_clock_until: Option<SystemTime>,
+    /// The task of the running instance-metric clock, so the next claim can abort a clock that
+    /// outlived its lease instead of leaving two clocks over one store.
+    pub(super) instance_metric_clock: Option<::tokio::task::JoinHandle<()>>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -4032,6 +4053,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             declarative_policies_reports: BTreeMap::new(),
             // No disable has been served for a fresh account, so no token names one.
             capacity_manager_disable_client_tokens: BTreeSet::new(),
+            // A fresh account holds no instance, so nothing has published an `AWS/EC2` series
+            // yet and no clock samples one.
+            instance_metric_periods: BTreeMap::new(),
+            instance_metric_clock_until: None,
+            instance_metric_clock: None,
         };
         // The ambient default network of [`DEFAULT_REGION`], so a request signed for the
         // emulator's own Region finds it without this store ever writing on a read. Every

@@ -46,6 +46,13 @@ pub const SUMMARY_STATUS_OK: &str = "ok";
 /// `SummaryStatus`'s `initializing` — the checks have not finished yet.
 pub const SUMMARY_STATUS_INITIALIZING: &str = "initializing";
 
+/// `SummaryStatus`'s `impaired` — the check FAILED, which is what an instance or a host with a
+/// problem reports. Nothing in this store impairs an instance or its host, so no check here
+/// reaches it; it is named beside the other members of the catalog so the one place that reads a
+/// check's verdict ([`super::instance_telemetry`]) spells every verdict that catalog has rather
+/// than only the ones this store produces.
+pub const SUMMARY_STATUS_IMPAIRED: &str = "impaired";
+
 /// `SummaryStatus`'s `not-applicable` — there is nothing to check, which is what an instance
 /// that is not running reports.
 pub const SUMMARY_STATUS_NOT_APPLICABLE: &str = "not-applicable";
