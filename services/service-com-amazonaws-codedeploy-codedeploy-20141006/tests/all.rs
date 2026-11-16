@@ -57,6 +57,8 @@ mod deployment_target_record_readability;
 mod deployment_targets;
 #[path = "all/deployment_trigger_notifications.rs"]
 mod deployment_trigger_notifications;
+#[path = "all/ecs_service_resolution.rs"]
+mod ecs_service_resolution;
 #[path = "all/fixed_error_sentences.rs"]
 mod fixed_error_sentences;
 #[path = "all/get_deployment_instance.rs"]

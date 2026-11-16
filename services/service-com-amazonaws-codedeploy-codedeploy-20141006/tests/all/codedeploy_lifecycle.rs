@@ -83,6 +83,21 @@ impl Emulator {
         Self::mounted(false, false, false, true)
     }
 
+    /// One emulator with Amazon ECS mounted beside CodeDeploy on the SAME engine.
+    ///
+    /// The cluster and the service a deployment group's `ecsServices` name belong
+    /// to Amazon ECS, so a suite about that resolution creates them through that
+    /// service's own front door rather than reaching into its store.
+    pub(crate) fn with_ecs() -> Self {
+        let mut emulator = Self::mounted(false, false, false, false);
+        emulator.router.register_service(
+            service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
     /// One emulator with AWS Lambda *and* Amazon S3 mounted beside CodeDeploy on
     /// the SAME engine, for a suite about a revision that keeps its AppSpec in an
     /// S3 object: the object belongs to S3 and the alias the deployment moves to
@@ -231,6 +246,51 @@ impl Emulator {
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     }
 
+    /// Call one AMAZON ECS `operation` through the same front door, answering its
+    /// HTTP status and parsed body.
+    ///
+    /// Amazon ECS's model declares `awsJson1_1`
+    /// (`smithy_query(query="service_info")`) and its own target prefix, so the
+    /// envelope and the prefix are that service's, not CodeDeploy's; the SigV4
+    /// credential scope routes the request to the `ecs` signing name, and the suite
+    /// verifies no signature. Only meaningful on an [`Emulator::with_ecs`].
+    pub(crate) async fn ecs_call(&self, operation: &str, body: Value) -> (u16, Value) {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "ecs.us-east-1.amazonaws.com")
+            .header(
+                "x-amz-target",
+                format!("AmazonEC2ContainerServiceV20141113.{operation}"),
+            )
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/ecs/\
+                 aws4_request, SignedHeaders=host, Signature=0000",
+            )
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// The same, requiring success and answering the response body.
+    pub(crate) async fn ecs_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, parsed) = self.ecs_call(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "ecs {operation} must succeed, got {status} with {parsed:?}"
+        );
+        parsed
+    }
+
     /// One `awsQuery` request against the IAM emulator through the same front
     /// door, answering its HTTP status and XML body.
     ///
@@ -245,7 +305,8 @@ impl Emulator {
             body.push_str(&form_encode(name));
             body.push('=');
             body.push_str(&form_encode(value));
-        }        let request = ::http::Request::builder()
+        }
+        let request = ::http::Request::builder()
             .method("POST")
             .uri("/")
             .header("host", "iam.amazonaws.com")

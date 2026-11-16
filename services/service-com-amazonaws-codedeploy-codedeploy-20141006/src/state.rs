@@ -71,6 +71,10 @@ pub mod service_role;
 /// place a deployment is failed for the permissions its role withholds.
 pub mod service_role_permissions;
 
+/// The Amazon ECS services a deployment group targets, resolved against the
+/// service that OWNS them: the one place an `ecsServices` pair is loaded.
+pub mod ecs_services;
+
 /// The SHA256 digest of a revision that carries its content inline: the one place
 /// that digest is computed, where such a revision is recorded.
 pub mod revision_digest;

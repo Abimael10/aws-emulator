@@ -407,6 +407,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A group's `ecsServices` name resources of ANOTHER service, so each pair
+        // is LOADED from the service that owns it before anything is stored: a
+        // group that named a cluster or a service the account does not have would
+        // otherwise look correctly wired and target nothing. The load is made here,
+        // with this service's store unlocked — it reaches Amazon ECS's own handler,
+        // which takes that service's lock — and the verdict is APPLIED below, once
+        // the application the request names has been resolved, for the reason the
+        // role verdict is ([`crate::state::ecs_services`]).
+        let ecs_refusal = match input.ecs_services.as_deref() {
+            Some(ecs_services) => {
+                crate::state::ecs_services::unloadable_ecs_service_message(
+                    ctx,
+                    &region,
+                    ecs_services,
+                )
+                .await
+            }
+            None => None,
+        };
+
         let application_name = input.application_name;
         let deployment_group_name = input.deployment_group_name;
         let requested_config = input.deployment_config_name;
@@ -457,6 +477,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(message),
                     },
                 ));
+            }
+            // And the Amazon ECS services the group would target, resolved above
+            // against the service that owns them: a pair that could not be loaded
+            // is refused here, so nothing is stored for it.
+            if let Some(message) = ecs_refusal {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::InvalidECSServiceException(
+                        InvalidECSServiceException {
+                            message: Some(message),
+                        },
+                    ),
+                );
             }
             if application
                 .deployment_groups

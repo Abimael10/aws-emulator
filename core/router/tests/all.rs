@@ -11,6 +11,10 @@
 // sorts to, so two branches landing at once insert two lines in two places and have no prose
 // to duplicate, re-word or mistype, which is what had gone wrong here: both this header and
 // the tail of the list had grown hundreds of re-typed copies of these paragraphs.
+//
+// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
+// place its name sorts to. That list holds those pairs and nothing else: no prose between
+// them, no blank line, and nothing at all after the last one.
 // Single integration-test target for the router: this header, the one inner attribute below
 // it, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
 // `tests/all/`, sorted by name, and no other line.
@@ -62,12 +66,24 @@
 // header and the tail of the list had each grown hundreds of re-typed copies of these
 // paragraphs, and no suite of this target ran.
 //
-// What a suite covers, and why it drives the assembled router rather than one service crate,
-// belongs in that suite's OWN module header, where it is read beside the test it explains. A
-// note about THIS file belongs in `all/appended_header_notes.rs`, `all/appended_notes.rs`,
-// `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which keep what earlier landings
-// had appended here and are declared below like any other file.
+// A suite's own module header is where what it covers belongs, beside the test it explains,
+// and a remark about THIS root belongs in one of the comment-only files declared below
+// (`all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs`,
+// `all/appended_prose.rs`), which hold what earlier landings had appended here.
 //
+// Every comment of this root is an ordinary one, this block included, since a module doc is
+// legal only ahead of the first item and a copy of one below the list would compile no suite
+// at all. A file under `tests/all/` that no declaration names is compiled nowhere, a name
+// declared twice compiles neither copy, and a file left directly under `tests/` fails the
+// build; some of the files declared below are shared harnesses or probes, and each is
+// declared for that reason. A bare `mod` in a test-target crate root would resolve beside
+// this file, which is why every declaration carries the `#[path]` above it.
+//
+// The `all/all_rs_*` and `all/declaration_roots_*` suites, with
+// `all/every_suite_file_is_declared.rs`, read all of that back — here and in every service
+// crate's own root — so no rule above needs restating anywhere else. The attribute below
+// allows one lint for the suites this root compiles, and being an inner attribute it stands
+// ahead of the first declaration.
 // EVERY comment in this file is an ordinary `//` one, this header included. A doc comment of
 // the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
 // copy left among or below the declarations compiles no suite of this target at all. A suite

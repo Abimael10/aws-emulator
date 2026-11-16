@@ -445,6 +445,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => None,
         };
+        // The Amazon ECS services the group would target after this update are
+        // resolved against the service that OWNS them, exactly as a created
+        // group's are: a group may not be moved onto a pair that cannot be loaded
+        // either. The load is made with this service's store unlocked and the
+        // verdict applied below, once the group being updated has been resolved
+        // ([`crate::state::ecs_services`]).
+        let ecs_refusal = match input.ecs_services.as_deref() {
+            Some(ecs_services) => {
+                crate::state::ecs_services::unloadable_ecs_service_message(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    ecs_services,
+                )
+                .await
+            }
+            None => None,
+        };
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             // Resolving a NAMED configuration is a read of the configuration
@@ -500,6 +517,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(message),
                     },
                 ));
+            }
+            // And the Amazon ECS services the update names, resolved above against
+            // the service that owns them: a pair that could not be loaded is
+            // refused here, so the stored group keeps the targets it had.
+            if let Some(message) = ecs_refusal {
+                return Err(
+                    UpdateDeploymentGroupErrorModeled::InvalidECSServiceException(
+                        InvalidECSServiceException {
+                            message: Some(message),
+                        },
+                    ),
+                );
             }
             // A `newDeploymentGroupName` equal to the current one asks for no
             // rename at all, so it is not a collision with itself.

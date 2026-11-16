@@ -64,6 +64,11 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # transport, sleep and credential machinery out, since the callback supplies all
 # three.
 aws-sdk-sns = { version = "1", default-features = false }
+# A deployment group's `ecsServices` name Amazon ECS clusters and services, which
+# are that service's resources: each pair is LOADED over Amazon ECS's own modelled
+# `DescribeServices` through the in-process callback before the group is stored
+# (`state::ecs_services`); `default-features = false` for the reason above.
+aws-sdk-ecs = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -86,6 +91,11 @@ percent-encoding = "2.3"
 # both are mounted beside CodeDeploy on one engine by the shared test harness.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# A deployment group's `ecsServices` are resolved against Amazon ECS, so the suite
+# about that resolution mounts that service beside CodeDeploy on one engine and
+# creates the cluster, the task definition and the service through its own front
+# door.
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
 
 [lints]
 workspace = true
