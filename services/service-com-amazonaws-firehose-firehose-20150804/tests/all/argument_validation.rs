@@ -19,9 +19,10 @@
 //!    and that dependency is a property of the request alone;
 //! 3. the same argument-dependency rule over a create's SOURCE: the declared
 //!    `DeliveryStreamType` fixes which source configuration the create takes, so the one
-//!    that type names is required and any other is refused — as an argument fault whose
-//!    sentence is built from the request (the member and the declared type), never from a
-//!    value the service made up.
+//!    that type names is required — as an argument fault whose sentence is built from the
+//!    request (the configuration and the declared type), never from a value the service
+//!    made up — while a source configuration of ANOTHER type configures nothing of the
+//!    stream being made and is ignored rather than refused.
 //!
 //! The IAM resolution of a role Firehose must be able to ASSUME is a cross-service rule
 //! (it needs IAM mounted beside this service) and lives in
@@ -613,9 +614,12 @@ async fn the_source_configuration_a_create_takes_is_fixed_by_its_declared_type()
     }
 
     // The foreign source: every (declared type, supplied member) pair where the member is
-    // not the one that type names is refused, whichever way round.
+    // not the one that type names, whichever way round. The member configures nothing of
+    // the declared type's stream, so it decides nothing about the answer: the create is
+    // served when the declared type needs no further configuration (`DirectPut`), and
+    // refused for the configuration that type IS fed by — never for the foreign one.
     let mut index = 0usize;
-    for (stream_type, _) in SOURCE_OF_TYPE {
+    for (stream_type, own_member) in SOURCE_OF_TYPE {
         for (_, member) in SOURCE_OF_TYPE {
             if SOURCE_OF_TYPE
                 .iter()
@@ -635,19 +639,52 @@ async fn the_source_configuration_a_create_takes_is_fixed_by_its_declared_type()
                 "S3DestinationConfiguration": s3_configuration(),
             });
             request[*member] = configuration;
-            let (status, refused) = emulator.call("CreateDeliveryStream", request).await;
-            assert_eq!(status, 400, "case {case:?}: got {status} {refused:?}");
-            assert_eq!(
-                error_code(&refused),
-                "InvalidArgumentException",
-                "case {case:?}: got {refused:?}"
-            );
-            let message = error_message(&refused);
-            assert!(
-                message.contains(member) && message.contains(stream_type),
-                "case {case:?}: the refusal must name the foreign member and the declared \
-                 type, got {message:?}"
-            );
+            let (status, answered) = emulator.call("CreateDeliveryStream", request).await;
+            let (read, described) = emulator
+                .call(
+                    "DescribeDeliveryStream",
+                    json!({ "DeliveryStreamName": name }),
+                )
+                .await;
+            if *stream_type == "DirectPut" {
+                assert_eq!(status, 200, "case {case:?}: got {status} {answered:?}");
+                assert_eq!(
+                    (read, &described["DeliveryStreamDescription"]["DeliveryStreamType"]),
+                    (200, &json!("DirectPut")),
+                    "case {case:?}: the created stream carries its declared type, got \
+                     {read} {described:?}"
+                );
+                assert!(
+                    described["DeliveryStreamDescription"]["Source"].is_null(),
+                    "case {case:?}: an ignored source configuration leaves no Source, got \
+                     {described:?}"
+                );
+            } else {
+                // The declared type's OWN configuration is what is missing here, and a
+                // foreign one is no substitute for it.
+                assert_eq!(status, 400, "case {case:?}: got {status} {answered:?}");
+                assert_eq!(
+                    error_code(&answered),
+                    "InvalidArgumentException",
+                    "case {case:?}: got {answered:?}"
+                );
+                let configuration = if *own_member == "KinesisStreamSourceConfiguration" {
+                    "KinesisSourceStreamConfig"
+                } else {
+                    own_member
+                };
+                let expected = format!("{configuration} is mandatory for {stream_type} stream type.");
+                let message = error_message(&answered);
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected {expected:?}, got {message:?}"
+                );
+                assert_eq!(
+                    (read, error_code(&described).as_str()),
+                    (400, "ResourceNotFoundException"),
+                    "case {case:?}: a refused create must store nothing, got {described:?}"
+                );
+            }
         }
     }
 

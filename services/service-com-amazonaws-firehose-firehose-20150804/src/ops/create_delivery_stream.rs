@@ -303,7 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DELIVERY_STREAM_TYPE_VALUES.join(", ")
             )));
         }
-        let source = source_description(&input, &stream_type)?;
+        // The source configuration the declared type is fed by, which is the only one this
+        // create reads: a source configuration of another type is no part of this stream.
+        let configured = configured_source(&stream_type);
+        let source = source_description(&input, &stream_type, configured)?;
         let region = crate::state::request_region(ctx);
         let encryption = encryption_configuration(
             input
@@ -317,7 +320,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not hold, or one that does not trust the Firehose service principal, is an
         // argument fault, so the stream is never created and a client cannot be handed a
         // stream that reports healthy and can never deliver.
-        if let Some(message) = crate::state::unassumable_role(ctx, &region, &role_arns(&input)).await
+        if let Some(message) =
+            crate::state::unassumable_role(ctx, &region, &role_arns(&input, configured)).await
         {
             return Err(invalid_argument(message));
         }
@@ -464,6 +468,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The default `DeliveryStreamType`.
 const DIRECT_PUT: &str = crate::state::DIRECT_PUT_STREAM_TYPE;
 
+/// The `DeliveryStreamType` values naming a service that feeds the stream, spelled as the
+/// model's enum does (`DELIVERY_STREAM_TYPE_VALUES`, the authority for the set). The
+/// Kinesis one is the spelling the state module already carries, so this file introduces
+/// no second one.
+const KINESIS_STREAM_AS_SOURCE: &str = crate::state::kinesis_source::KINESIS_STREAM_AS_SOURCE;
+const MSK_AS_SOURCE: &str = "MSKAsSource";
+const DATABASE_AS_SOURCE: &str = "DatabaseAsSource";
+
 /// Firehose's own name for the source configuration a `KinesisStreamAsSource` stream is fed
 /// by, as its refusal for an absent one states it — which is not the request member's name
 /// (`KinesisStreamSourceConfiguration`). The other stream types' refusals name the
@@ -489,23 +501,37 @@ fn invalid_argument(message: String) -> CreateDeliveryStreamError {
 /// so the gate is over all of them rather than over the destination's own role alone.
 /// Each is the modelled `RoleARN` shape, so the boundary validator has already refused
 /// anything that is not shaped like an IAM role ARN by the time this runs.
-fn role_arns(input: &CreateDeliveryStreamInput) -> Vec<&str> {
+fn role_arns(input: &CreateDeliveryStreamInput, configured: ConfiguredSource) -> Vec<&str> {
     let mut found: Vec<&str> = Vec::new();
 
     // The source roles: Firehose reads a Kinesis stream, an MSK cluster or a database
-    // through a role the source configuration names.
-    if let Some(config) = input.kinesis_stream_source_configuration.as_ref() {
-        found.push(config.role_arn.as_str());
-    }
-    if let Some(config) = input.msk_source_configuration.as_ref() {
-        found.push(config.authentication_configuration.role_arn.as_str());
-    }
-    if let Some(config) = input.database_source_configuration.as_ref() {
-        found.extend(crate::state::secrets_manager_role(Some(
-            &config
-                .database_source_authentication_configuration
-                .secrets_manager_configuration,
-        )));
+    // through a role the source configuration names — the configuration the declared type
+    // is fed by, and that one alone. A source configuration belonging to another stream
+    // type is no part of the stream this create makes, so the role it names is not one
+    // Firehose would ever assume for it and nothing is resolved from it.
+    match configured {
+        ConfiguredSource::KinesisStream => {
+            if let Some(config) = input.kinesis_stream_source_configuration.as_ref() {
+                found.push(config.role_arn.as_str());
+            }
+        }
+        ConfiguredSource::Msk => {
+            if let Some(config) = input.msk_source_configuration.as_ref() {
+                found.push(config.authentication_configuration.role_arn.as_str());
+            }
+        }
+        ConfiguredSource::Database => {
+            if let Some(config) = input.database_source_configuration.as_ref() {
+                found.extend(crate::state::secrets_manager_role(Some(
+                    &config
+                        .database_source_authentication_configuration
+                        .secrets_manager_configuration,
+                )));
+            }
+        }
+        // A `DirectPutSourceConfiguration` carries a throughput hint and no role: there is
+        // nothing for Firehose to assume over a stream its own callers put to.
+        ConfiguredSource::DirectPut => {}
     }
 
     // The destination roles, one arm per destination the model declares.
@@ -845,50 +871,50 @@ fn sole_destination(
         .ok_or_else(|| invalid_argument(crate::service::sole_destination_required_message()))
 }
 
-/// The `SourceDescription` for the declared stream type, refusing a source configuration
-/// that does not belong to that type and a type whose source configuration is absent.
+/// Which source configuration a Firehose stream of this `DeliveryStreamType` is fed by.
+///
+/// The type says where the stream's records come from, and each type is configured by ONE
+/// of the create's source-configuration members. Every other source-configuration member a
+/// create carries describes a source of a type this stream is not, so it configures nothing
+/// of the stream being made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfiguredSource {
+    KinesisStream,
+    Msk,
+    Database,
+    DirectPut,
+}
+
+/// The source configuration the declared type is fed by.
+///
+/// An unrecognised type cannot reach this (the handler judges the value against
+/// `DELIVERY_STREAM_TYPE_VALUES` first), and an absent one has already defaulted to
+/// `DirectPut`.
+fn configured_source(stream_type: &str) -> ConfiguredSource {
+    match stream_type {
+        KINESIS_STREAM_AS_SOURCE => ConfiguredSource::KinesisStream,
+        MSK_AS_SOURCE => ConfiguredSource::Msk,
+        DATABASE_AS_SOURCE => ConfiguredSource::Database,
+        _ => ConfiguredSource::DirectPut,
+    }
+}
+
+/// The `SourceDescription` of a stream of the declared type, read from the ONE source
+/// configuration that type is fed by.
+///
+/// The model declares `DeliveryStreamType` and the four source configurations as
+/// independent optional members and states no exclusion between them, so a source
+/// configuration belonging to another type is not an argument fault: it configures no part
+/// of this stream and the create ignores it, keeping only the configuration the declared
+/// type names. A type whose own source configuration is absent has nothing to be fed by,
+/// which IS an argument fault.
 fn source_description(
     input: &CreateDeliveryStreamInput,
     stream_type: &str,
+    configured: ConfiguredSource,
 ) -> Result<Option<SourceDescription>, CreateDeliveryStreamError> {
-    let supplied: Vec<&'static str> = [
-        input
-            .kinesis_stream_source_configuration
-            .as_ref()
-            .map(|_| "KinesisStreamSourceConfiguration"),
-        input
-            .msk_source_configuration
-            .as_ref()
-            .map(|_| "MSKSourceConfiguration"),
-        input
-            .database_source_configuration
-            .as_ref()
-            .map(|_| "DatabaseSourceConfiguration"),
-        input
-            .direct_put_source_configuration
-            .as_ref()
-            .map(|_| "DirectPutSourceConfiguration"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    // The source configuration a create supplies must be the one its declared type names.
-    let expected = match stream_type {
-        "KinesisStreamAsSource" => "KinesisStreamSourceConfiguration",
-        "MSKAsSource" => "MSKSourceConfiguration",
-        "DatabaseAsSource" => "DatabaseSourceConfiguration",
-        _ => "DirectPutSourceConfiguration",
-    };
-    if let Some(foreign) = supplied.iter().find(|name| **name != expected) {
-        return Err(invalid_argument(format!(
-            "{foreign} cannot be specified for a Firehose stream of type {stream_type}; \
-             that type is configured with {expected}"
-        )));
-    }
-
-    match stream_type {
-        "KinesisStreamAsSource" => {
+    match configured {
+        ConfiguredSource::KinesisStream => {
             let Some(config) = input.kinesis_stream_source_configuration.as_ref() else {
                 return Err(invalid_argument(
                     crate::service::mandatory_source_configuration_message(
@@ -908,7 +934,7 @@ fn source_description(
                 ..SourceDescription::default()
             }))
         }
-        "MSKAsSource" => {
+        ConfiguredSource::Msk => {
             let Some(config) = input.msk_source_configuration.as_ref() else {
                 return Err(invalid_argument(
                     crate::service::mandatory_source_configuration_message(
@@ -930,7 +956,7 @@ fn source_description(
                 ..SourceDescription::default()
             }))
         }
-        "DatabaseAsSource" => {
+        ConfiguredSource::Database => {
             let Some(config) = input.database_source_configuration.as_ref() else {
                 return Err(invalid_argument(
                     crate::service::mandatory_source_configuration_message(
@@ -963,7 +989,7 @@ fn source_description(
             }))
         }
         // DirectPut carries a source description only when the create configured one.
-        _ => Ok(input
+        ConfiguredSource::DirectPut => Ok(input
             .direct_put_source_configuration
             .as_ref()
             .map(|config| SourceDescription {

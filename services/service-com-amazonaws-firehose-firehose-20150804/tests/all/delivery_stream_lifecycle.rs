@@ -1036,19 +1036,6 @@ async fn create_refuses_input_combinations_the_model_cannot_express() {
             "InvalidArgumentException",
         ),
         (
-            "a Kinesis source on a DirectPut stream",
-            json!({
-                "DeliveryStreamName": "mismatched-source",
-                "DeliveryStreamType": "DirectPut",
-                "S3DestinationConfiguration": s3_configuration(),
-                "KinesisStreamSourceConfiguration": {
-                    "KinesisStreamARN": format!("arn:aws:kinesis:{REGION}:000000000000:stream/src"),
-                    "RoleARN": ROLE_ARN,
-                },
-            }),
-            "InvalidArgumentException",
-        ),
-        (
             "KinesisStreamAsSource without its source configuration",
             json!({
                 "DeliveryStreamName": "missing-source",
