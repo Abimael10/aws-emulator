@@ -213,7 +213,14 @@ pub struct PriceListRecord {
     pub region_code: Option<String>,
     /// The ISO-4217 currency the files are denominated in.
     pub currency_code: String,
-    /// The instant from which this price list is in effect.
+    /// The instant this version of the price list was PUBLISHED at. It is what names
+    /// the file set — the version segment of the ARN, of the file path and of the file
+    /// itself — and is an attribute of the publication, not of the prices it carries.
+    pub published_at: SystemTime,
+    /// The instant from which the prices in this version are in effect, which is what
+    /// `ListPriceLists$EffectiveDate` selects a version by. Independent of
+    /// [`Self::published_at`]: a version is published once, and takes effect on its
+    /// own date.
     pub effective_date: SystemTime,
     /// The formats the files are published in.
     pub file_formats: Vec<String>,
@@ -236,10 +243,23 @@ impl PriceListRecord {
             .unwrap_or_default()
     }
 
-    /// The `yyyymmddHHMMSS` version stamp AWS names a price-list file set by, derived
-    /// from the effective date so the two always agree.
+    /// Seconds since the Unix epoch at which this version was published.
+    pub fn published_epoch_secs(&self) -> i64 {
+        epoch_secs(self.published_at)
+    }
+
+    /// The instant this version was published, as an RFC 3339 timestamp.
+    pub fn publication_date_text(&self) -> String {
+        ::aws_smithy_types::DateTime::from_secs(self.published_epoch_secs())
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_default()
+    }
+
+    /// The `yyyymmddHHMMSS` version stamp a price-list file set is named by: the digits
+    /// of the instant it was PUBLISHED at, so the stamp carries that instant's time of
+    /// day and never the date the prices it carries take effect on.
     pub fn version(&self) -> String {
-        version_stamp(&self.effective_date_text())
+        version_stamp(&self.publication_date_text())
     }
 
     /// The stored file path for `file_format`, matched the way the API accepts the
@@ -353,7 +373,11 @@ impl ComAmazonawsPricingAwspricelistserviceState {
             in_effect
                 .entry(record.region_code.clone())
                 .and_modify(|held| {
-                    if held.effective_epoch_secs() < record.effective_epoch_secs() {
+                    // The newest version in effect: the latest effective date, and among
+                    // versions that take effect together the one published last.
+                    let held_key = (held.effective_epoch_secs(), held.published_epoch_secs());
+                    let candidate = (record.effective_epoch_secs(), record.published_epoch_secs());
+                    if held_key < candidate {
                         *held = record;
                     }
                 })
@@ -623,7 +647,7 @@ fn price_list_file_json(record: &PriceListRecord, products: &[&Product]) -> Stri
         "disclaimer": FILE_DISCLAIMER,
         "offerCode": record.service_code,
         "version": record.version(),
-        "publicationDate": record.effective_date_text(),
+        "publicationDate": record.publication_date_text(),
         "currencyCode": record.currency_code,
         "regionCode": record.region_code,
         "products": product_blocks,
@@ -653,7 +677,7 @@ fn price_list_file_csv(record: &PriceListRecord, products: &[&Product]) -> Strin
     for (name, value) in [
         ("FormatVersion", FILE_FORMAT_VERSION.to_string()),
         ("Disclaimer", FILE_DISCLAIMER.to_string()),
-        ("Publication Date", record.effective_date_text()),
+        ("Publication Date", record.publication_date_text()),
         ("Version", record.version()),
         ("OfferCode", record.service_code.clone()),
     ] {
@@ -1150,8 +1174,11 @@ fn product_from_draft(service_code: &str, draft: ProductDraft) -> Product {
 
 /// The `aws_v1` product-offer document for one product: the `product` block with its
 /// attributes, and every term type that prices it.
+///
+/// The document's `version` is the stamp of the instant it was PUBLISHED at, not of the
+/// date its prices take effect on — the two are stated separately, as `publicationDate`
+/// and each term's `effectiveDate`.
 fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
-    let effective = CATALOG_PUBLICATION_DATE;
     let mut terms = serde_json::Map::new();
     terms.insert(
         "OnDemand".to_string(),
@@ -1174,8 +1201,8 @@ fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
         },
         "serviceCode": service_code,
         "terms": terms,
-        "version": version_stamp(effective),
-        "publicationDate": effective,
+        "version": version_stamp(CATALOG_PUBLICATION_DATE),
+        "publicationDate": CATALOG_PUBLICATION_DATE,
     })
     .to_string()
 }
@@ -1197,7 +1224,7 @@ fn on_demand_term(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
         serde_json::json!({
             "sku": sku,
             "offerTermCode": ON_DEMAND_TERM_CODE,
-            "effectiveDate": CATALOG_PUBLICATION_DATE,
+            "effectiveDate": CATALOG_EFFECTIVE_DATE,
             "termAttributes": {},
             "priceDimensions": dimensions,
         }),
@@ -1241,7 +1268,7 @@ fn reserved_terms(draft: &ProductDraft) -> serde_json::Map<String, serde_json::V
             serde_json::json!({
                 "sku": sku,
                 "offerTermCode": term.offer_term_code,
-                "effectiveDate": CATALOG_PUBLICATION_DATE,
+                "effectiveDate": CATALOG_EFFECTIVE_DATE,
                 "termAttributes": {
                     "LeaseContractLength": format!("{}yr", term.lease_years),
                     "OfferingClass": term.offering_class,
@@ -1366,12 +1393,12 @@ fn seeded_price_lists(
             .map(String::as_str)
             .collect();
         for region_code in regions {
-            for effective_date in PRICE_LIST_EFFECTIVE_DATES.iter().copied() {
+            for version in PRICE_LIST_VERSIONS {
                 let record = price_list_record(
                     &catalog.service_code,
                     region_code,
                     currency_for(region_code),
-                    effective_date,
+                    version,
                 );
                 price_lists.insert(record.arn.clone(), record);
             }
@@ -1382,16 +1409,21 @@ fn seeded_price_lists(
 
 /// Build a price-list record: its ARN, the formats it is published in, and the path
 /// each of those formats is served at. Every one is derived from the service, Region,
-/// currency and effective date, so the ARN `ListPriceLists` reports resolves in
-/// `GetPriceListFileUrl` and the URL is the same on every call.
+/// currency and the version's publication instant, so the ARN `ListPriceLists` reports
+/// resolves in `GetPriceListFileUrl` and the URL is the same on every call.
+///
+/// The version segment of both the ARN and the file path is the stamp of the instant
+/// the file set was PUBLISHED at, never of the date its prices take effect on: the
+/// version identifies the published file set, while the effective date only says from
+/// when its prices apply.
 fn price_list_record(
     service_code: &str,
     region_code: &str,
     currency_code: &str,
-    effective_date: &str,
+    seed: &PriceListVersionSeed,
 ) -> PriceListRecord {
     let partition = partition_for(currency_code);
-    let version = version_stamp(effective_date);
+    let version = version_stamp(seed.published_at);
     let arn = format!(
         // Not `engine::emulator_arn`: a Price List ARN carries neither a Region nor an
         // account id (the modelled pattern is `^arn:…:pricing:::price-list/…$`), which
@@ -1418,7 +1450,8 @@ fn price_list_record(
         service_code: service_code.to_string(),
         region_code: Some(region_code.to_string()),
         currency_code: currency_code.to_string(),
-        effective_date: instant_of(effective_date),
+        published_at: instant_of(seed.published_at),
+        effective_date: instant_of(seed.effective_date),
         file_formats,
         file_paths,
     }
@@ -1446,8 +1479,8 @@ fn partition_for(currency_code: &str) -> &'static str {
     }
 }
 
-/// The `yyyymmddHHMMSS` version stamp AWS names a price-list file set by, derived
-/// from its RFC 3339 effective date so the two always agree.
+/// The `yyyymmddHHMMSS` version stamp a published price-list file set is named by: the
+/// digits of the RFC 3339 instant it was published at.
 fn version_stamp(rfc3339: &str) -> String {
     rfc3339.chars().filter(char::is_ascii_digit).collect()
 }
@@ -1471,15 +1504,46 @@ fn epoch_secs(instant: SystemTime) -> i64 {
     }
 }
 
-/// The publication date of the seeded catalog's offer documents.
-const CATALOG_PUBLICATION_DATE: &str = "2024-01-01T00:00:00Z";
+/// The instant the seeded catalog's offer documents were published at: the stamp their
+/// `version` names and the `publicationDate` they report — a publication instant with a
+/// time of day, not the date their prices take effect on.
+const CATALOG_PUBLICATION_DATE: &str = "2024-01-09T16:52:41Z";
 
-/// The effective dates the catalog publishes a price-list file set for.
+/// The date the prices in the seeded catalog's offer documents take effect from, which
+/// each term reports as its `effectiveDate`.
+const CATALOG_EFFECTIVE_DATE: &str = "2024-01-01T00:00:00Z";
+
+/// One published version of a price-list file set.
 ///
-/// AWS keeps every published version of a price list addressable, so a Region's
-/// price list exists in more than one version and `ListPriceLists(EffectiveDate=…)`
-/// selects the versions in effect at that instant.
-const PRICE_LIST_EFFECTIVE_DATES: &[&str] = &["2023-01-01T00:00:00Z", "2024-06-01T00:00:00Z"];
+/// The two instants are independent attributes of a version: `published_at` is when the
+/// file set was published, which is the version it is addressed by, and
+/// `effective_date` is when the prices it carries apply from, which is what
+/// `ListPriceLists$EffectiveDate` selects on. A version is published before the prices
+/// it carries take effect, so one reported as in effect at an instant was already
+/// published by then.
+struct PriceListVersionSeed {
+    /// The RFC 3339 instant this version was published at, with a time of day.
+    published_at: &'static str,
+    /// The RFC 3339 instant from which this version's prices are in effect.
+    effective_date: &'static str,
+}
+
+/// The price-list versions the catalog publishes for every service and Region, oldest
+/// first.
+///
+/// AWS keeps every published version of a price list addressable, so a Region's price
+/// list exists in more than one version and `ListPriceLists(EffectiveDate=…)` selects
+/// the version in effect at that instant.
+const PRICE_LIST_VERSIONS: &[PriceListVersionSeed] = &[
+    PriceListVersionSeed {
+        published_at: "2022-12-20T18:34:52Z",
+        effective_date: "2023-01-01T00:00:00Z",
+    },
+    PriceListVersionSeed {
+        published_at: "2024-05-23T21:07:16Z",
+        effective_date: "2024-06-01T00:00:00Z",
+    },
+];
 
 /// The `locationType` every Region-scoped product in this catalog carries.
 const AWS_REGION_LOCATION_TYPE: &str = "AWS Region";

@@ -487,3 +487,396 @@ fn json_dimensions(file: &Value) -> usize {
     }
     dimensions
 }
+
+/// The `yyyymmddHHMMSS` stamp form of an RFC 3339 instant: its digits.
+fn digits(rfc3339: &str) -> String {
+    rfc3339.chars().filter(char::is_ascii_digit).collect()
+}
+
+/// One RFC 3339 instant as the epoch seconds the awsJson1_1 wire carries a timestamp as.
+fn instant(rfc3339: &str) -> i64 {
+    ::aws_smithy_types::DateTime::from_str(
+        rfc3339,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .expect("a well-formed RFC 3339 instant")
+    .secs()
+}
+
+/// The value of one `name,value` header line of a price-list file's CSV form, which
+/// carries the file header in leading short records before the dimension columns.
+fn csv_header_value(body: &str, name: &str) -> Option<String> {
+    let mut reader = ::csv::ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(false)
+        .from_reader(body.as_bytes());
+    reader
+        .records()
+        .filter_map(Result::ok)
+        .take_while(|record| record.get(0) != Some("SKU"))
+        .find(|record| record.get(0) == Some(name) && record.len() == 2)
+        .and_then(|record| record.get(1).map(str::to_string))
+}
+
+/// One stored price-list version, copied out of the catalog so the assertions below run
+/// with no lock held.
+struct StoredVersion {
+    arn: String,
+    service_code: String,
+    region_code: String,
+    version: String,
+    publication_date: String,
+    effective_date: String,
+    published_secs: i64,
+    effective_secs: i64,
+}
+
+/// Every price-list version the catalog publishes.
+fn stored_versions(engine: &std::sync::Arc<engine::InMemoryEngine>) -> Vec<StoredVersion> {
+    let state = engine.state::<PricingState>();
+    let guard = state.lock();
+    guard
+        .price_lists
+        .values()
+        .map(|record| StoredVersion {
+            arn: record.arn.clone(),
+            service_code: record.service_code.clone(),
+            region_code: record.region_code.clone().unwrap_or_default(),
+            version: record.version(),
+            publication_date: record.publication_date_text(),
+            effective_date: record.effective_date_text(),
+            published_secs: record.published_epoch_secs(),
+            effective_secs: record.effective_epoch_secs(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_price_list_version_names_the_instant_it_was_published_not_its_effective_date() {
+    let (router, engine) = router_with_engine();
+    let published = stored_versions(&engine);
+
+    // Rows differ in the service, the Region the price list covers, the currency its
+    // files are denominated in and the instant the client asks about — both partitions,
+    // a service priced with one usage type per Region, and dates inside each published
+    // version's window, including one exactly ON a version's effective instant.
+    let cases: &[(&str, &str, &str, &str)] = &[
+        ("AmazonEC2", "us-east-1", "USD", "2024-07-15T09:41:03Z"),
+        ("AmazonEC2", "eu-west-1", "USD", "2023-06-15T00:00:00Z"),
+        ("AmazonEC2", "cn-north-1", "CNY", "2024-06-02T12:00:00Z"),
+        ("AmazonS3", "eu-west-1", "USD", "2025-03-04T07:08:09Z"),
+        ("AWSLambda", "us-east-1", "USD", "2023-01-01T00:00:00Z"),
+        ("AmazonSNS", "ap-northeast-1", "USD", "2024-12-31T23:59:59Z"),
+    ];
+
+    for (service_code, region_code, currency_code, asked) in cases.iter().copied() {
+        let case = format!("{service_code}/{region_code}/{currency_code}@{asked}");
+        let listed = ok(
+            &router,
+            "ListPriceLists",
+            &json!({
+                "ServiceCode": service_code,
+                "CurrencyCode": currency_code,
+                "RegionCode": region_code,
+                "EffectiveDate": instant(asked),
+            }),
+        )
+        .await;
+        let entries = list_member(&listed, "PriceLists");
+        assert_eq!(
+            entries.len(),
+            1,
+            "case {case}: the Region's price list must be reported once, got {listed}"
+        );
+        let arn = entries[0]
+            .get("PriceListArn")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let version = arn_version(&arn);
+
+        let stored = published
+            .iter()
+            .find(|stored| stored.arn == arn)
+            .unwrap_or_else(|| panic!("case {case}: the listed ARN must be stored, got {arn}"));
+
+        // The version a price list is addressed by is the stamp of the instant it was
+        // PUBLISHED at: a publication instant carries a time of day, so the stamp's last
+        // six digits are not the all-zero ones a date-derived stamp always has.
+        assert_eq!(
+            version,
+            digits(&stored.publication_date),
+            "case {case}: the ARN must name the publication instant {}, got {version}",
+            stored.publication_date
+        );
+        assert_eq!(
+            version.len(),
+            14,
+            "case {case}: a version is a yyyymmddHHMMSS stamp, got {version}"
+        );
+        assert!(
+            version.chars().all(char::is_numeric),
+            "case {case}: a version is all digits, got {version}"
+        );
+        assert_ne!(
+            &version[8..],
+            "000000",
+            "case {case}: the version must carry the publication instant's time of day, \
+             got {version}"
+        );
+
+        // And it is NOT the date the prices take effect on, nor the date the client
+        // asked about: the effective date only selects which published version answers.
+        assert_ne!(
+            version,
+            digits(&stored.effective_date),
+            "case {case}: the version must not be the effective date {}",
+            stored.effective_date
+        );
+        assert_ne!(
+            version,
+            digits(asked),
+            "case {case}: the version must not be the requested instant"
+        );
+        assert_ne!(
+            stored.published_secs, stored.effective_secs,
+            "case {case}: a version's publication instant and its effective date are \
+             separate attributes, both {}",
+            stored.publication_date
+        );
+
+        // Every address of the file set carries that same version: the path
+        // GetPriceListFileUrl hands back is the published offer-file layout
+        // `/offers/v1.0/{partition}/{offerCode}/{version}/{regionCode}/index.{format}`.
+        let partition = if currency_code == "CNY" { "cn" } else { "aws" };
+        for file_format in list_member(&entries[0], "FileFormats")
+            .iter()
+            .filter_map(Value::as_str)
+        {
+            let resolved = ok(
+                &router,
+                "GetPriceListFileUrl",
+                &json!({ "PriceListArn": arn, "FileFormat": file_format }),
+            )
+            .await;
+            let url = resolved
+                .get("Url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (_, path) = split_https_url(&url).unwrap_or_else(|| {
+                panic!("case {case}/{file_format}: not an https URL: {url:?}")
+            });
+            assert_eq!(
+                path,
+                format!(
+                    "/offers/v1.0/{partition}/{service_code}/{version}/{region_code}/\
+                     index.{file_format}"
+                ),
+                "case {case}/{file_format}: the URL must address the version its ARN \
+                 names, got {path}"
+            );
+
+            // The file itself states the same version, and reports the publication
+            // instant as its publication date rather than the effective date.
+            let state = engine.state::<PricingState>();
+            let (_, body) = render_price_list_file(&state, &path).unwrap_or_else(|| {
+                panic!("case {case}/{file_format}: nothing is served at {path:?}")
+            });
+            let (file_version, file_published) = match file_format {
+                "json" => {
+                    let file: Value = serde_json::from_str(&body).unwrap_or_else(|error| {
+                        panic!("case {case}/{file_format}: must be JSON: {error}")
+                    });
+                    (
+                        file.get("version")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        file.get("publicationDate")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                }
+                "csv" => (
+                    csv_header_value(&body, "Version").unwrap_or_default(),
+                    csv_header_value(&body, "Publication Date").unwrap_or_default(),
+                ),
+                other => panic!("case {case}: {other} is listed but no file is served for it"),
+            };
+            assert_eq!(
+                file_version, version,
+                "case {case}/{file_format}: the file must state the version its ARN names"
+            );
+            assert_eq!(
+                file_published, stored.publication_date,
+                "case {case}/{file_format}: the file must report the instant it was \
+                 published at"
+            );
+            assert_eq!(
+                digits(&file_published),
+                file_version,
+                "case {case}/{file_format}: the file's version is its publication \
+                 instant's stamp"
+            );
+            assert_ne!(
+                file_published, stored.effective_date,
+                "case {case}/{file_format}: the publication date must not be the \
+                 effective date"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_published_version_has_its_own_publication_instant() {
+    let (router, engine) = router_with_engine();
+    let published = stored_versions(&engine);
+    assert!(
+        !published.is_empty(),
+        "the catalog must publish price-list versions"
+    );
+
+    // Over the WHOLE seeded catalog, not one price list: every version is named by its
+    // own publication instant, which is an attribute of the publication and is never
+    // the date its prices take effect on.
+    for stored in &published {
+        let case = &stored.arn;
+        assert_eq!(
+            arn_version(&stored.arn),
+            stored.version,
+            "case {case}: the ARN must name the stored version"
+        );
+        assert_eq!(
+            stored.version,
+            digits(&stored.publication_date),
+            "case {case}: the version is the publication instant's stamp, got {}",
+            stored.version
+        );
+        assert_ne!(
+            stored.version,
+            digits(&stored.effective_date),
+            "case {case}: the version must not be the effective date's stamp"
+        );
+        assert_ne!(
+            &stored.version[8..],
+            "000000",
+            "case {case}: a publication instant carries a time of day, got {}",
+            stored.version
+        );
+        assert!(
+            stored.published_secs <= stored.effective_secs,
+            "case {case}: a version is published before its prices take effect, got \
+             published {} effective {}",
+            stored.publication_date,
+            stored.effective_date
+        );
+    }
+
+    // Each price list is published in more than one version, and the versions order the
+    // same way their effective dates do — so a newer version is also the later
+    // publication, and no two share a publication instant.
+    let mut by_price_list: BTreeMap<(String, String), Vec<&StoredVersion>> = BTreeMap::new();
+    for stored in &published {
+        by_price_list
+            .entry((stored.service_code.clone(), stored.region_code.clone()))
+            .or_default()
+            .push(stored);
+    }
+    for ((service_code, region_code), mut versions) in by_price_list {
+        let case = format!("{service_code}/{region_code}");
+        versions.sort_by_key(|stored| stored.effective_secs);
+        assert!(
+            versions.len() > 1,
+            "case {case}: a price list must exist in more than one version, got {}",
+            versions.len()
+        );
+        for pair in versions.windows(2) {
+            assert!(
+                pair[0].published_secs < pair[1].published_secs,
+                "case {case}: the newer version must be the later publication, got {} \
+                 then {}",
+                pair[0].publication_date,
+                pair[1].publication_date
+            );
+            assert!(
+                pair[0].version < pair[1].version,
+                "case {case}: version stamps must order as the publications do, got {} \
+                 then {}",
+                pair[0].version,
+                pair[1].version
+            );
+        }
+    }
+
+    // And what the API selects for an instant is one of those published versions, never
+    // a stamp built from the instant asked about. Rows differ in the price list and in
+    // where the instant falls: before a version takes effect, exactly on it, inside its
+    // window and long after the newest one.
+    let lists: &[(&str, &str, &str)] = &[
+        ("AmazonEC2", "us-east-1", "USD"),
+        ("AmazonEC2", "cn-north-1", "CNY"),
+        ("AmazonS3", "ap-northeast-1", "USD"),
+    ];
+    let asked_instants = [
+        "2023-02-14T03:21:44Z",
+        "2024-05-31T23:59:59Z",
+        "2024-06-01T00:00:00Z",
+        "2026-11-09T20:56:22Z",
+    ];
+    for (service_code, region_code, currency_code) in lists.iter().copied() {
+        let versions: BTreeSet<&str> = published
+            .iter()
+            .filter(|stored| {
+                stored.service_code == service_code && stored.region_code == region_code
+            })
+            .map(|stored| stored.version.as_str())
+            .collect();
+        assert!(
+            !versions.is_empty(),
+            "case {service_code}/{region_code}: the catalog must publish this price list"
+        );
+        for asked in asked_instants {
+            let case = format!("{service_code}/{region_code}@{asked}");
+            let listed = ok(
+                &router,
+                "ListPriceLists",
+                &json!({
+                    "ServiceCode": service_code,
+                    "CurrencyCode": currency_code,
+                    "RegionCode": region_code,
+                    "EffectiveDate": instant(asked),
+                }),
+            )
+            .await;
+            let entries = list_member(&listed, "PriceLists");
+            assert_eq!(
+                entries.len(),
+                1,
+                "case {case}: the Region's price list must be reported once, got {listed}"
+            );
+            let version = arn_version(
+                entries[0]
+                    .get("PriceListArn")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            assert!(
+                versions.contains(version.as_str()),
+                "case {case}: the reported version must be one the catalog published, \
+                 got {version} of {versions:?}"
+            );
+            assert_ne!(
+                version,
+                digits(asked),
+                "case {case}: the version must not be derived from the requested instant"
+            );
+            assert!(
+                version <= version_stamp_at(instant(asked)),
+                "case {case}: a version in effect at an instant was already published by \
+                 then, got {version}"
+            );
+        }
+    }
+}
