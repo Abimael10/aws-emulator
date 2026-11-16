@@ -407,6 +407,8 @@ mod cloudformation_lambda_function_log_destination;
 mod cloudformation_lambda_ssm_sourced_update;
 #[path = "all/cloudformation_lambda_versions_and_aliases.rs"]
 mod cloudformation_lambda_versions_and_aliases;
+#[path = "all/cloudformation_least_privileged_provider_lifecycle.rs"]
+mod cloudformation_least_privileged_provider_lifecycle;
 #[path = "all/cloudformation_management_events.rs"]
 mod cloudformation_management_events;
 #[path = "all/cloudformation_metric_stream_estate_is_drainable.rs"]

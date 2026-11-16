@@ -36,6 +36,11 @@
 //!   request, the signature and the refusal are the ones above. A service this runtime
 //!   supplies no resource classes for is REFUSED rather than served an interface that does
 //!   nothing.
+//! * The HTTP CLIENT the SDK is built on is supplied too ([`urllib3`]), because a managed
+//!   runtime carries it on the import path beside the SDK that brings it: a handler that
+//!   sends a request with `urllib3.PoolManager()` — which is how AWS's own documented
+//!   custom-resource response code answers CloudFormation — reaches this emulator over the
+//!   same seam the standard library's own client rides.
 //! * A paginated operation has the paginator the SDK's own client answers with:
 //!   `client.get_paginator(...)` pages it through by driving the members its model states
 //!   ([`paginator`]), and an operation the model does not mark as paginated has none, which
@@ -75,6 +80,9 @@ mod dynamodb;
 /// The paginator a client answers with for a paginated operation.
 mod paginator;
 
+/// The HTTP client the SDK is built on, which a managed runtime ships beside it.
+mod urllib3;
+
 /// The modules this runtime puts on a Python handler's import path, as the SDK it ships.
 ///
 /// Resolved AFTER the deployment package's own entries, so a package that ships its own
@@ -98,6 +106,7 @@ pub fn runtime_modules() -> Vec<PackageModule> {
     .into_iter()
     .chain(paginator::modules())
     .chain(dynamodb::modules())
+    .chain(urllib3::modules())
     .map(|(path, source)| PackageModule {
         path: path.to_string(),
         source: source.to_string(),

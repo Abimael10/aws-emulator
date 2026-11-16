@@ -385,6 +385,8 @@ mod handler_s3_wildcard_grant;
 mod handler_sdk_client_config;
 #[path = "all/handler_sdk_error_classes.rs"]
 mod handler_sdk_error_classes;
+#[path = "all/handler_sdk_http_client.rs"]
+mod handler_sdk_http_client;
 #[path = "all/handler_sdk_idempotency_token.rs"]
 mod handler_sdk_idempotency_token;
 #[path = "all/handler_sdk_paginator.rs"]
