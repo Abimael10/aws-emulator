@@ -29,7 +29,9 @@ struct Row {
     route: Value,
     /// The `RequestParameterKey` the DELETE addresses.
     delete: &'static str,
-    /// The `requestParameters` a later `GetRoute` must report.
+    /// The `requestParameters` a later `GetRoute` must report, or `Value::Null` when the
+    /// delete left the route holding none — a route with no request parameters reports no
+    /// `requestParameters` member at all (`tests/all/route_empty_collections.rs`).
     remaining: fn() -> Value,
 }
 
@@ -51,8 +53,11 @@ fn rows() -> Vec<Row> {
                     "route.request.header.Authorization": { "required": true }
                 }
             }),
+            // The map loses its last entry, so the route holds no request parameters at
+            // all and reports no `requestParameters` member — `Value::Null` here, which
+            // is what `Value::get` of an absent member answers through `remaining`.
             delete: "route.request.header.Authorization",
-            remaining: || json!({}),
+            remaining: || Value::Null,
         },
         Row {
             case: "the first of two keys in key order",
@@ -192,8 +197,11 @@ async fn deleting_a_request_parameter_removes_exactly_that_entry() {
         );
         let expected = (row.remaining)();
         assert_eq!(
-            fetched.get("requestParameters"),
-            Some(&expected),
+            fetched
+                .get("requestParameters")
+                .cloned()
+                .unwrap_or(Value::Null),
+            expected,
             "case {:?}: expected the remaining parameters {expected}, got {fetched}",
             row.case
         );

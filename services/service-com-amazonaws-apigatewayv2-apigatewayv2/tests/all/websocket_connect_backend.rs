@@ -388,7 +388,10 @@ async fn request_parameters_are_declared_only_on_the_connection_requests_route()
             );
             assert_eq!(
                 fetched.get("requestParameters"),
-                Some(parameters),
+                parameters
+                    .as_object()
+                    .filter(|declared| !declared.is_empty())
+                    .map(|_| parameters),
                 "case {case:?}: expected GetRoute to report the declaration, got {fetched}"
             );
             continue;

@@ -166,12 +166,33 @@ async fn update_route(
 /// The record `created` becomes once `patch` is applied: every member the patch names
 /// takes the patch's value, and every other member keeps the stored one. That is the
 /// patch rule itself, written once, so each row only has to supply the patch.
+///
+/// A patch that names an EMPTY collection leaves the route holding no entries under that
+/// member, and a route holding none reports no such member at all
+/// (`tests/all/route_empty_collections.rs`), so such a member is dropped from the
+/// expectation rather than expected as `{}` or `[]`.
 fn patched_record(created: &Value, patch: &Value) -> Value {
     let mut expected = created.clone();
     for (member, value) in patch.as_object().expect("the patch is a JSON object") {
+        if is_empty_collection(value) {
+            expected
+                .as_object_mut()
+                .expect("a route is reported as a JSON object")
+                .remove(member);
+            continue;
+        }
         expected[member] = value.clone();
     }
     expected
+}
+
+/// Whether `value` is a collection holding no entries.
+fn is_empty_collection(value: &Value) -> bool {
+    match value {
+        Value::Object(entries) => entries.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
 }
 
 /// The route every patch row starts from: a WebSocket route carrying every member the

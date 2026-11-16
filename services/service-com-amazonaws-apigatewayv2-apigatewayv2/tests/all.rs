@@ -263,6 +263,8 @@ mod refusal_resource_identity;
 mod reset_authorizers_cache;
 #[path = "all/route_deletion.rs"]
 mod route_deletion;
+#[path = "all/route_empty_collections.rs"]
+mod route_empty_collections;
 #[path = "all/route_key_grammar.rs"]
 mod route_key_grammar;
 #[path = "all/route_request_parameter.rs"]

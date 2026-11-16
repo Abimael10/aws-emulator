@@ -422,9 +422,16 @@ async fn a_route_of_either_protocol_carries_the_request_parameters_it_declares()
             .as_object_mut()
             .expect("every row declares a map")
             .remove(removed);
+        // A route left holding no request parameters reports no `requestParameters`
+        // member at all, so the expectation for an emptied map is an ABSENT member
+        // (`tests/all/route_empty_collections.rs`).
+        let expected = remaining
+            .as_object()
+            .filter(|entries| !entries.is_empty())
+            .map(|_| &remaining);
         assert_eq!(
             after.get("requestParameters"),
-            Some(&remaining),
+            expected,
             "case {case:?}: expected the deleted entry gone and the rest kept, got {after}"
         );
     }

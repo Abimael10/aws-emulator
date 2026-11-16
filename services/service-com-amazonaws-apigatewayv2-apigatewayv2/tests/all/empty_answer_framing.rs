@@ -7,11 +7,11 @@
 //! give — carries no body at all and STATES the length it has, `content-length: 0`, rather
 //! than leaving the framing header off; an answer that DOES carry content keeps its body
 //! and is not reframed.** The modelled statuses come from the model itself
-//! (`smithy_query(query="digest")`: `DeleteApi`, `DeleteRoute`, `DeleteStage`,
-//! `DeleteAccessLogSettings`, `DeleteCorsConfiguration`, `DeleteProductPage`,
-//! `DeleteProductRestEndpointPage`, `DeletePortalProductSharingPolicy` are all
-//! `code: 204` over `Unit`), and what a client reads the message end from is the stated
-//! length.
+//! (`smithy_query(query="digest")`: `DeleteApi`, `DeleteRoute`,
+//! `DeleteRouteRequestParameter`, `DeleteStage`, `DeleteAccessLogSettings`,
+//! `DeleteCorsConfiguration`, `DeleteProductPage`, `DeleteProductRestEndpointPage`,
+//! `DeletePortalProductSharingPolicy` are all `code: 204` over `Unit`), and what a client
+//! reads the message end from is the stated length.
 //!
 //! The rows span what the rule generalises over: the resource family (an api, a child of an
 //! api, a settings member of a stage, a portal product's pages, a policy member of a
@@ -113,7 +113,12 @@ async fn every_answer_that_carries_no_content_states_content_length_zero() {
         &emulator,
         "POST",
         &format!("/v2/apis/{api}/routes"),
-        Some(json!({ "routeKey": "GET /items" })),
+        // The route carries a request parameter, so the entry's own sub-resource is one of
+        // the rows below: a DELETE of a member of a child of an api.
+        Some(json!({
+            "routeKey": "GET /items",
+            "requestParameters": { "route.request.header.x-trace": { "required": true } }
+        })),
     )
     .await;
     assert_eq!(
@@ -201,6 +206,12 @@ async fn every_answer_that_carries_no_content_states_content_length_zero() {
         (
             "DeleteAccessLogSettings, a member of a stage",
             format!("/v2/apis/{api}/stages/{stage}/accesslogsettings"),
+        ),
+        (
+            "DeleteRouteRequestParameter, an entry of a map a route carries",
+            format!(
+                "/v2/apis/{api}/routes/{route}/requestparameters/route.request.header.x-trace"
+            ),
         ),
         (
             "DeleteRoute, a child of an api",

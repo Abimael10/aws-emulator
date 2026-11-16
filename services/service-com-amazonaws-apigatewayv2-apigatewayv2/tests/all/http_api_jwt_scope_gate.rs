@@ -376,11 +376,18 @@ async fn deploy(
             .get("authorizationScopes")
             .cloned()
             .unwrap_or(Value::Null);
+        // A route stored with no scopes holds no entries under the member, and reports no
+        // `authorizationScopes` member at all
+        // (`tests/all/route_empty_collections.rs`).
+        let expected = if scopes.is_empty() {
+            Value::Null
+        } else {
+            json!(scopes)
+        };
         assert_eq!(
-            reported,
-            json!(scopes),
+            reported, expected,
             "case {route_key:?}: GetRoute must report the authorizationScopes the create \
-             stored, expected {scopes:?}, got {reported} in {fetched}"
+             stored, expected {expected}, got {reported} in {fetched}"
         );
     }
 

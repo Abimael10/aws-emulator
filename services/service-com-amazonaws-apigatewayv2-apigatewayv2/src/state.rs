@@ -1647,27 +1647,36 @@ impl Route {
     }
 
     /// Project the record onto the modelled `Route` shape.
+    ///
+    /// The route's collection members — `RequestModels`, `RequestParameters` and
+    /// `AuthorizationScopes` — are neither `@required` nor given a `@default` by the
+    /// model, so a route holding NO entries under one of them reports NOTHING for it
+    /// rather than an empty collection: an absent member and an empty one are different
+    /// facts to a client that branches on a member being present. This is the single
+    /// projection every reader of a route goes through, so the create, the readers, the
+    /// listing and the patch all report one route the same way.
     pub fn to_wire(&self) -> wire::Route {
         wire::Route {
             api_gateway_managed: Some(self.api_gateway_managed),
             api_key_required: Some(self.api_key_required),
-            authorization_scopes: Some(self.authorization_scopes.clone()),
+            authorization_scopes: (!self.authorization_scopes.is_empty())
+                .then(|| self.authorization_scopes.clone()),
             authorization_type: Some(self.authorization_type.clone()),
             authorizer_id: self.authorizer_id.clone(),
             model_selection_expression: self.model_selection_expression.clone(),
             operation_name: self.operation_name.clone(),
-            request_models: Some(
+            request_models: (!self.request_models.is_empty()).then(|| {
                 self.request_models
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
-            request_parameters: Some(
+                    .collect()
+            }),
+            request_parameters: (!self.request_parameters.is_empty()).then(|| {
                 self.request_parameters
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+                    .collect()
+            }),
             route_id: Some(self.route_id.clone()),
             route_key: self.route_key.clone(),
             route_response_selection_expression: self.route_response_selection_expression.clone(),
