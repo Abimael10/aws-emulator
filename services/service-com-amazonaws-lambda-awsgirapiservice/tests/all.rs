@@ -585,6 +585,8 @@ mod service_set_tag_keys;
 mod signing_name_routing;
 #[path = "all/sns_queue_event_source_pipeline.rs"]
 mod sns_queue_event_source_pipeline;
+#[path = "all/sqs_event_source_delete_stops_polling.rs"]
+mod sqs_event_source_delete_stops_polling;
 #[path = "all/sqs_event_source_handler_run.rs"]
 mod sqs_event_source_handler_run;
 #[path = "all/sqs_event_source_hold.rs"]

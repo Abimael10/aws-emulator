@@ -46,3 +46,25 @@ Cause 2 — expected: after DeleteEventSourceMapping, messages sent to the sourc
 2. Give the execution role no grant for the action under test (or revoke it after a successful control call) and invoke the function. Every call still succeeds with ok=True instead of being refused.
 3. For cause 2, create an SQS event source mapping, confirm it consumes, delete it with DeleteEventSourceMapping, then send more messages. The check is killed at 60 s with no verdict.
 4. Replay the eight check ids in trace_ids.
+
+## Resolution
+
+Cause 1 is served: the SQS and EventBridge handlers authorize every call against the
+identity-based documents in force on the signing principal, and a running function's SDK
+calls are signed with a session of its execution role, so all seven of its replay keys pass.
+
+Cause 2 is resolved as far as the emulator's served behaviour goes, with one caveat recorded
+here rather than left implicit. What was wrong: the removal `DeleteEventSourceMapping` owes
+became due 500 ms after the call — shorter than one client round trip — so the `Deleting`
+state the delete answers with could never be read back; it is now due after the "several
+seconds" that operation documents. The rest of the cause is pinned by
+`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/sqs_event_source_delete_stops_polling.rs`,
+which drives the whole pair end to end (an IAM role, two SQS queues and a running python
+relay handler) and asserts both halves: the mapping consumes while it is held, and from the
+delete onwards every message stays on the source queue and the function is not invoked.
+
+CAVEAT: the replay of `events__lambda__sqs.cli-delete-event-source-mapping-stops-polling`
+still ends in `Check timed out after 60.0s`. No call of that sequence is refused or answered
+wrongly — the scenario completes in seconds when driven directly, both on one engine and
+through the assembled router — so the remaining timeout is the check's own budget against its
+CLI-driven sequence and not a divergence that could be traced to a served response.

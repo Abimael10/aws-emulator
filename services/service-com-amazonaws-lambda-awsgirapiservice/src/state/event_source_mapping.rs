@@ -120,12 +120,14 @@ pub const EVENT_SOURCE_MAPPING_SETTLE_DELAY: Duration = Duration::from_millis(50
 ///
 /// That operation documents the wait itself — "When you delete an event source mapping,
 /// it enters a Deleting state and might not be completely deleted for several seconds" —
-/// without stating a duration, so the span is EMULATOR-CHOSEN, and deliberately non-zero
-/// for the same reason as [`EVENT_SOURCE_MAPPING_SETTLE_DELAY`]: a caller that reads the
-/// mapping straight after deleting it sees the `Deleting` state the delete answered with.
-/// The instant the removal becomes due is stored on the record and nothing sleeps for it
-/// (see [`EventSourceMappingRecord::begin_delete`]).
-pub const EVENT_SOURCE_MAPPING_DELETE_DELAY: Duration = Duration::from_millis(500);
+/// without stating a duration, so the span is EMULATOR-CHOSEN. It is SEVERAL seconds and
+/// not a fraction of one, because the `Deleting` state the delete answers with is a state
+/// the model enumerates and a client watches for: every observation of it costs the client
+/// another round trip, so a window shorter than one round trip is a transient state no
+/// client can ever see, and a client that waits for the mapping to report it waits for
+/// something that has already gone. The instant the removal becomes due is stored on the
+/// record and nothing sleeps for it (see [`EventSourceMappingRecord::begin_delete`]).
+pub const EVENT_SOURCE_MAPPING_DELETE_DELAY: Duration = Duration::from_secs(3);
 
 /// The most event source mappings this emulator keeps.
 ///
