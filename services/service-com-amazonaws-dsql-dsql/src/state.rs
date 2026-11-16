@@ -50,14 +50,16 @@
 //! against this account's IAM on the same terms
 //! ([`unresolved_policy_principal`], over the principals
 //! [`policy_principals`] reads out of it), because a document one entry point would
-//! refuse as granting to nobody cannot be reachable through the other. A cluster
-//! or stream identifier's whole FORM is the `@pattern` its shape declares, which
-//! the boundary constraint walk decides before any handler runs, so no operation
-//! adds a narrower form of its own and every value inside that pattern is resolved
-//! against the store. The one precondition beyond the pattern — the minted value
-//! RANGE three cluster-addressed operations state as their own
-//! ([`validate_minted_cluster_identifier`]) — lives here so those three cannot
-//! word it differently.
+//! refuse as granting to nobody cannot be reachable through the other. An
+//! identifier's outer FORM is the `@pattern` its shape declares, which the
+//! boundary constraint walk decides before any handler runs; the preconditions
+//! BEYOND that pattern live here, so no two operations that state one can word it
+//! differently — the minted value RANGE three cluster-addressed operations state
+//! as their own ([`validate_minted_cluster_identifier`]), and the base32 encoding
+//! a stream id is written in, which every operation addressed at a stream requires
+//! of its `streamIdentifier` label ([`validate_stream_identifier`]). A value that
+//! satisfies the precondition an operation states is resolved against the store
+//! like any other.
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
@@ -67,7 +69,7 @@
 //! of a value that names no resource of this service ([`invalid_resource_arn`]) live
 //! here too, for the same reason.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2330,6 +2332,55 @@ fn invalid_cluster_identifier(member: &str, value: &str) -> ValidationException 
     }
 }
 
+/// The member a stream identifier arrives in on the operations addressed at a
+/// stream (`smithy_query(query="operation", operation="GetStream,DeleteStream")`:
+/// `streamIdentifier`, an `@httpLabel` targeting `StreamId`).
+pub const STREAM_IDENTIFIER_MEMBER: &str = "streamIdentifier";
+
+/// Check a STREAM identifier against the encoding a stream id is written in: the
+/// value has to be [`RESOURCE_ID_LEN`] symbols of [`CROCKFORD_SYMBOLS`] — a
+/// base32-encoded identifier ([`decode_resource_identifier`] reads exactly those)
+/// — or the call is refused before the cluster or the stream is looked up.
+///
+/// `StreamId`'s `@pattern` is wider than the encoding: `^[a-z0-9]{26}$` admits the
+/// four letters base32 leaves out (`i` and `l` read as `1`, `o` as `0`, and `u` is
+/// left out of the encoding altogether), so a value inside the pattern can be no
+/// base32-encoded identifier at all. Such a value names no stream that could
+/// exist — `StreamArn`'s own path runs over the same encoded id, so it could not
+/// appear in one — and both operations that take this label answer it as a
+/// malformed request instead of as an absent resource, before any lookup runs
+/// (recorded in `dsql-cdc-stream-error-handling` steps task#5 and task#6). A value
+/// the encoding DOES spell is an identifier, resolved against the store like any
+/// other and reported as [`stream_not_found`] when the cluster does not hold it.
+///
+/// `member` is the input member the value arrived in
+/// ([`STREAM_IDENTIFIER_MEMBER`] on both of them), so the refusal names what the
+/// caller has to fix.
+pub fn validate_stream_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
+    if decode_resource_identifier(value).is_some() {
+        return Ok(());
+    }
+    Err(unreadable_identifier(member))
+}
+
+/// The modelled `ValidationException` an identifier that is no base32-encoded
+/// identifier at all is refused with, in Aurora DSQL's sentence for a member whose
+/// value it cannot READ as the thing that member carries
+/// ([`unreadable_member_message`]): it names the member and the format the value
+/// had to be in, and echoes nothing the caller sent — a value outside the encoding
+/// is not an identifier to quote back. `fieldList` names the member that failed, so
+/// the refusal carries the same members as every other identifier refusal here.
+fn unreadable_identifier(member: &str) -> ValidationException {
+    ValidationException {
+        message: unreadable_member_message(member, &format!("the format '{IDENTIFIER_FORMAT}'")),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("Member must be {IDENTIFIER_FORMAT}"),
+        }]),
+    }
+}
+
 /// The prefix that marks a tag key as belonging to AWS rather than to the caller.
 ///
 /// A tag under this prefix is written and maintained by AWS itself, so a caller can
@@ -2490,22 +2541,26 @@ fn unreadable_member_message(member: &str, form: &str) -> String {
 ///
 /// A value that is no policy document names nobody rather than failing here: what
 /// makes a document unusable is stated by [`validate_cluster_policy`], once.
+///
+/// The repeats are dropped through a membership SET rather than by rescanning what
+/// has been named already, so one request's document costs one pass over its
+/// entries however many of them it carries: the document's own ceiling is
+/// `PolicyDocument`'s `@length(1..20480)` (`smithy_query(query="shape",
+/// shape="PolicyDocument")`), decided by the boundary constraint walk, and a
+/// document right at it still names enough principals for a rescan per entry to
+/// be work this service does not need to do.
 pub fn policy_principals(document: &str) -> Vec<String> {
     let Some(parsed) = parse_policy(document) else {
         return Vec::new();
     };
     let statements = statements(&parsed);
-    let mut named: Vec<String> = Vec::new();
-    for principal in statements
+    let mut named = HashSet::new();
+    statements
         .iter()
         .filter_map(|statement| statement.get("Principal"))
         .flat_map(principal_entries)
-    {
-        if !named.contains(&principal) {
-            named.push(principal);
-        }
-    }
-    named
+        .filter(|principal| named.insert(principal.clone()))
+        .collect()
 }
 
 /// The refusal a policy document earns when one of the identities it GRANTS TO is

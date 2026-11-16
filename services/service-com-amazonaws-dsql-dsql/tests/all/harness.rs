@@ -481,9 +481,10 @@ pub async fn names_a_resource_of_its_own_type(
 /// route, so one the account does not hold is reported as an absent resource
 /// rather than refused as input, which is what
 /// `tests/all/resource_identifier_absence.rs` pins; a 26-character
-/// lowercase-alphanumeric value the encoding does not spell is an identifier all
-/// the same, which `tests/all/identifier_pattern_is_the_whole_form.rs` pins, and
-/// one above the minted range is answered per operation, which
+/// lowercase-alphanumeric value the encoding does not spell is answered per
+/// operation, which `tests/all/identifier_pattern_is_the_whole_form.rs` and
+/// `tests/all/identifier_outside_the_encoding.rs` pin, and one above the minted
+/// range is answered per operation too, which
 /// `tests/all/identifier_value_range.rs` pins.
 pub fn absent_identifier() -> String {
     "0zzzzzzzzzzzzzzzzzzzzzzzzz".to_string()

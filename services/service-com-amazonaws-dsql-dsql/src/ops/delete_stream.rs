@@ -15,6 +15,11 @@
 //! stream; that token carried by a DIFFERENT delete is a `ConflictException`
 //! (409).
 //!
+//! A `streamIdentifier` the base32 encoding a stream id is written in does not
+//! spell is no stream id at all, so it is refused with the modelled
+//! `ValidationException` (400) before the ledger and before any lookup, and this
+//! mutating call never reaches the store.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -86,6 +91,8 @@
 //!
 //! * `ConflictException` (HTTP 409) — The submitted action has conflicts.
 //! * `ResourceNotFoundException` (HTTP 404) — The resource could not be found.
+//! * `ValidationException` (HTTP 400) — The input failed to satisfy the constraints specified
+//!   by an Amazon Web Services service.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -168,12 +175,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Each identifier's whole FORM is the `^[a-z0-9]{26}$` `ClusterId` and
-        // `StreamId` declare, which the boundary constraint walk decides before
-        // this handler runs, so every value that reaches here is a well-formed
-        // identifier: the ledger and the lookups below decide whether it names a
-        // stream this service holds, and an identifier it does not hold is the
-        // absent resource rather than a malformed request.
+        // The stream label's outer FORM is `StreamId`'s `^[a-z0-9]{26}$`, already
+        // decided by the boundary constraint walk, but that pattern is wider than
+        // the base32 encoding a stream id is written in: a value the encoding does
+        // not spell is no stream id at all, so it is refused as a malformed
+        // request before anything else — ahead of the token ledger, which decides
+        // what to do with a request whose input is acceptable in the first place,
+        // and ahead of the lookups, so this mutating call never reaches the store.
+        // The cluster label states no precondition beyond its pattern — every
+        // value of it is resolved against the store below and an absent one is
+        // reported as the missing cluster, which is the answer recorded for this
+        // and every other cluster-addressed operation bar the three that state the
+        // minted range ([`crate::state::validate_minted_cluster_identifier`]).
+        if let Err(invalid) = crate::state::validate_stream_identifier(
+            crate::state::STREAM_IDENTIFIER_MEMBER,
+            &input.stream_identifier,
+        ) {
+            return Err(DeleteStreamErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteStreamErrorModeled::InternalServerException(
                 InternalServerException {

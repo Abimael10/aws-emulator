@@ -45,6 +45,8 @@ mod fixed_refusal_sentences;
 mod harness;
 #[path = "all/identifier_format_refusal.rs"]
 mod identifier_format_refusal;
+#[path = "all/identifier_outside_the_encoding.rs"]
+mod identifier_outside_the_encoding;
 #[path = "all/identifier_pattern_is_the_whole_form.rs"]
 mod identifier_pattern_is_the_whole_form;
 #[path = "all/identifier_value_range.rs"]
@@ -109,6 +111,8 @@ mod shared_recorded_status;
 mod state_roundtrip;
 #[path = "all/stream_deletion.rs"]
 mod stream_deletion;
+#[path = "all/stream_identifier_form.rs"]
+mod stream_identifier_form;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
 #[path = "all/stream_listing.rs"]

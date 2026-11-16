@@ -17,11 +17,13 @@
 //! table: a value outside `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`
 //! (`smithy_query(query="shape", shape="ClusterId,StreamId")`) is refused at the
 //! boundary (`tests/all/malformed_resource_identifier.rs`), one inside that
-//! pattern that the service's own encoding alphabet does not spell is an
-//! identifier all the same (`tests/all/identifier_pattern_is_the_whole_form.rs`),
-//! and one written in the alphabet but ABOVE the minted range is answered per
-//! operation — refused by the three that state that range as a precondition, an
-//! absent resource on the rest (`tests/all/identifier_value_range.rs`).
+//! pattern that the service's own base32 encoding does not spell is answered per
+//! operation — refused by the two addressed at a stream, since a value outside
+//! that encoding is no stream id, an absent cluster on the rest
+//! (`tests/all/identifier_pattern_is_the_whole_form.rs`) — and one written in
+//! the encoding but ABOVE the minted range is answered per operation too —
+//! refused by the three that state that range as a precondition, an absent
+//! resource on the rest (`tests/all/identifier_value_range.rs`).
 //!
 //! The identifier table spans what the form generalises over — which symbols the
 //! value uses and where, across the range this service's own minting scheme draws
@@ -97,20 +99,21 @@ impl Class {
     }
 }
 
-/// What a route answers for an identifier written in the identifier alphabet
-/// whose symbols spell a value ABOVE the range this service mints from.
+/// What a route answers for a value inside the modelled pattern that sits outside
+/// one of the two narrower forms this service's own identifiers have.
 ///
-/// The model does not say: `ClusterId` and `StreamId` carry one `@pattern` each,
-/// and every one of these operations models both `ValidationException` and
+/// The model does not say which: `ClusterId` and `StreamId` carry one `@pattern`
+/// each, and every one of these operations models both `ValidationException` and
 /// `ResourceNotFoundException` (`smithy_query(query="digest")`). It is the wire
-/// behaviour of each operation that says, and the two answers are pinned per route
-/// in `tests/all/identifier_value_range.rs`.
+/// behaviour of each operation that says, so it is carried per route and per value
+/// class — [`Route::outside_the_encoding`] and [`Route::above_the_minted_range`] —
+/// and pinned by the suite that owns each class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AboveTheMintedRange {
-    /// The operation states the minted range as a precondition of its own: such a
-    /// value is refused as input, 400 `ValidationException`, before any lookup.
+pub enum Verdict {
+    /// The operation states that form as a precondition of its own: such a value
+    /// is refused as input, 400 `ValidationException`, before any lookup.
     Refused,
-    /// The operation states no range precondition: such a value is an identifier
+    /// The operation states no such precondition: such a value is an identifier
     /// it resolves against the store, so an account that does not hold it answers
     /// 404 `ResourceNotFoundException`.
     Absent,
@@ -118,12 +121,20 @@ pub enum AboveTheMintedRange {
 
 /// One route that carries a resource identifier: how to issue it with the
 /// identifier under test, which member that identifier arrives in, which
-/// resource it addresses, and what it answers for a value above the minted range.
+/// resource it addresses, and what it answers for each class of value inside the
+/// modelled pattern that this service's own identifiers never take.
 pub struct Route {
     pub operation: &'static str,
     pub member: &'static str,
     pub class: Class,
-    pub above_the_minted_range: AboveTheMintedRange,
+    /// What the route answers for a 26-character `[a-z0-9]` value the base32
+    /// encoding this service writes an identifier in does not spell
+    /// (`tests/all/identifier_pattern_is_the_whole_form.rs`).
+    pub outside_the_encoding: Verdict,
+    /// What the route answers for a value written in that encoding whose symbols
+    /// spell a value above the range a minted identifier is drawn from
+    /// (`tests/all/identifier_value_range.rs`).
+    pub above_the_minted_range: Verdict,
     /// The request, given the identifier under test and a live cluster, so a row
     /// that puts the identifier under test in one label can fill the other with a
     /// cluster that is really held.
@@ -176,21 +187,24 @@ pub fn routes() -> Vec<Route> {
             operation: "GetCluster",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Refused,
+            outside_the_encoding: Verdict::Refused,
+            above_the_minted_range: Verdict::Refused,
             request: |id, _| ("GET", format!("/cluster/{id}"), None),
         },
         Route {
             operation: "DeleteCluster",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Refused,
+            outside_the_encoding: Verdict::Refused,
+            above_the_minted_range: Verdict::Refused,
             request: |id, _| ("DELETE", format!("/cluster/{id}"), None),
         },
         Route {
             operation: "UpdateCluster",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| {
                 (
                     "POST",
@@ -203,14 +217,16 @@ pub fn routes() -> Vec<Route> {
             operation: "GetClusterPolicy",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Refused,
+            outside_the_encoding: Verdict::Refused,
+            above_the_minted_range: Verdict::Refused,
             request: |id, _| ("GET", format!("/cluster/{id}/policy"), None),
         },
         Route {
             operation: "PutClusterPolicy",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| {
                 (
                     "POST",
@@ -223,7 +239,8 @@ pub fn routes() -> Vec<Route> {
             operation: "DeleteClusterPolicy",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| {
                 (
                     "DELETE",
@@ -236,7 +253,8 @@ pub fn routes() -> Vec<Route> {
             operation: "GetVpcEndpointServiceName",
             member: "identifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| {
                 (
                     "GET",
@@ -249,35 +267,40 @@ pub fn routes() -> Vec<Route> {
             operation: "CreateStream",
             member: "clusterIdentifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| ("POST", format!("/stream/{id}"), Some(stream_request())),
         },
         Route {
             operation: "ListStreams",
             member: "clusterIdentifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| ("GET", format!("/stream/{id}"), None),
         },
         Route {
             operation: "GetStream on the cluster label",
             member: "clusterIdentifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| ("GET", format!("/stream/{id}/{}", absent_identifier()), None),
         },
         Route {
             operation: "GetStream on the stream label",
             member: "streamIdentifier",
             class: Class::Stream,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Refused,
+            above_the_minted_range: Verdict::Absent,
             request: |id, live| ("GET", format!("/stream/{live}/{id}"), None),
         },
         Route {
             operation: "DeleteStream on the cluster label",
             member: "clusterIdentifier",
             class: Class::Cluster,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Absent,
+            above_the_minted_range: Verdict::Absent,
             request: |id, _| {
                 (
                     "DELETE",
@@ -290,7 +313,8 @@ pub fn routes() -> Vec<Route> {
             operation: "DeleteStream on the stream label",
             member: "streamIdentifier",
             class: Class::Stream,
-            above_the_minted_range: AboveTheMintedRange::Absent,
+            outside_the_encoding: Verdict::Refused,
+            above_the_minted_range: Verdict::Absent,
             request: |id, live| ("DELETE", format!("/stream/{live}/{id}"), None),
         },
     ]
@@ -315,13 +339,9 @@ pub fn value_in_the_alphabet() -> String {
     format!("0{tail}")
 }
 
-/// The sentence a cluster identifier outside the form an operation states is
-/// refused with: it names the member and quotes the value it rejected.
-///
-/// There is no stream wording to spell beside it: the only operations that state a
-/// form beyond `^[a-z0-9]{26}$` are three addressed at a CLUSTER by `identifier`,
-/// and every operation that carries a stream identifier resolves each value of
-/// the pattern against the store.
+/// The sentence a cluster identifier outside the form one of the three
+/// cluster-addressed operations states is refused with: it names the member and
+/// quotes the value it rejected.
 pub fn expected_refusal_sentence(member: &str, value: &str) -> String {
     format!(
         "Invalid input '{member}: {value}'. The cluster identifier format is invalid. \
@@ -329,10 +349,35 @@ pub fn expected_refusal_sentence(member: &str, value: &str) -> String {
     )
 }
 
+/// The sentence a STREAM identifier that is no base32-encoded identifier at all is
+/// refused with: Aurora DSQL's wording for a member whose value it cannot read as
+/// the thing that member carries — it names the member and the format the value had
+/// to be in, and echoes nothing the caller sent.
+pub fn expected_unreadable_sentence(member: &str) -> String {
+    format!(
+        "Aurora DSQL can't process the request because the {member} that you specified \
+         isn't valid. Provide the {member} in the format 'a valid base32-encoded \
+         26-character string' and try again."
+    )
+}
+
+/// The sentence `route` refuses a value of `case`'s class with, which is the
+/// wording of the precondition that route states: the cluster-addressed operations
+/// state the value range a cluster identifier is minted from
+/// ([`expected_refusal_sentence`]), while the stream label states the encoding a
+/// stream id is written in ([`expected_unreadable_sentence`]).
+fn expected_sentence_of(route: &Route, value: &str) -> String {
+    match route.class {
+        Class::Cluster => expected_refusal_sentence(route.member, value),
+        Class::Stream => expected_unreadable_sentence(route.member),
+    }
+}
+
 /// Assert that `route` refuses `case` as INPUT: HTTP 400 with the service's own
 /// modelled `ValidationException` — its `@required` `reason` filled, its
-/// `fieldList` naming the member the value arrived in, the sentence
-/// [`expected_refusal_sentence`] words, and no resource named at all.
+/// `fieldList` naming the member the value arrived in, the sentence the
+/// precondition that route states is worded in ([`expected_sentence_of`]), and no
+/// resource named at all.
 ///
 /// The one place that body is spelled, so every suite that asserts a refused
 /// identifier over this route table asserts the same thing.
@@ -341,12 +386,6 @@ pub async fn refused_as_input(dsql: &Dsql, route: &Route, live: &str, case: &IdC
     let answer = dsql.call(method, &path, body).await;
     let name = format!("{} on {}", case.name, route.operation);
 
-    assert_eq!(
-        route.class,
-        Class::Cluster,
-        "case {name}: only a cluster-addressed operation states a form beyond the \
-         modelled pattern"
-    );
     assert_eq!(
         answer.status, 400,
         "case {name}: a value outside the form this route states must answer 400, got {} {:?}",
@@ -372,7 +411,7 @@ pub async fn refused_as_input(dsql: &Dsql, route: &Route, live: &str, case: &IdC
         "case {name}: the refusal must name {:?} in fieldList, got {field_list:?}",
         route.member
     );
-    let expected = expected_refusal_sentence(route.member, &case.value);
+    let expected = expected_sentence_of(route, &case.value);
     assert_eq!(
         answer.message(),
         expected,

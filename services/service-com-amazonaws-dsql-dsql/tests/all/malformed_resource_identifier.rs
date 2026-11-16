@@ -12,8 +12,12 @@
 //! the service's own modelled `ValidationException`, whose `@required` `reason` is
 //! filled and whose `fieldList` names the member the value arrived in — before any
 //! state is read, and never as a report that some resource is absent. A value
-//! INSIDE the pattern is an identifier whatever letters it uses, which
-//! `tests/all/identifier_pattern_is_the_whole_form.rs` pins.
+//! INSIDE the pattern is answered per operation: an identifier on every route that
+//! states no narrower form, which
+//! `tests/all/identifier_pattern_is_the_whole_form.rs` pins, and a refusal on the
+//! routes that state the base32 encoding or the minted range, which
+//! `tests/all/identifier_outside_the_encoding.rs` and
+//! `tests/all/identifier_value_range.rs` pin.
 //!
 //! The value table spans the ways a URI label can fall outside the pattern: the
 //! wrong case, the wrong length (under, over, and far under) and a character the

@@ -7,7 +7,10 @@
 //! stored, and — for a stream in the status an unusable delivery target produced
 //! — the `statusReason` carrying the `StreamFailureErrorCode` behind it and the
 //! instant that status was reached. Neither an unknown cluster nor an unknown
-//! stream is reported as an empty answer: both are `ResourceNotFoundException`.
+//! stream is reported as an empty answer: both are `ResourceNotFoundException`. A
+//! `streamIdentifier` the base32 encoding a stream id is written in does not spell
+//! is no stream id at all, so it is refused with the modelled
+//! `ValidationException` (400) before any lookup runs.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +83,8 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The resource could not be found.
+//! * `ValidationException` (HTTP 400) — The input failed to satisfy the constraints specified
+//!   by an Amazon Web Services service.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -157,12 +162,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Each identifier's whole FORM is the `^[a-z0-9]{26}$` `ClusterId` and
-        // `StreamId` declare, which the boundary constraint walk decides before
-        // this handler runs, so every value that reaches here is a well-formed
-        // identifier and the only question left is whether the store holds it:
-        // the lookups below answer an identifier it does not hold as the absent
-        // resource rather than as a malformed request.
+        // The stream label's outer FORM is `StreamId`'s `^[a-z0-9]{26}$`, already
+        // decided by the boundary constraint walk, but that pattern is wider than
+        // the base32 encoding a stream id is written in: a value the encoding does
+        // not spell is no stream id at all, so it is refused as a malformed
+        // request BEFORE the cluster or the stream is looked up, and a caller can
+        // tell "you sent me garbage" from "it isn't there". The cluster label
+        // states no precondition beyond its pattern — every value of it is
+        // resolved against the store below and an absent one is reported as the
+        // missing cluster, which is the answer recorded for this and every other
+        // cluster-addressed operation bar the three that state the minted range
+        // ([`crate::state::validate_minted_cluster_identifier`]).
+        if let Err(invalid) = crate::state::validate_stream_identifier(
+            crate::state::STREAM_IDENTIFIER_MEMBER,
+            &input.stream_identifier,
+        ) {
+            return Err(GetStreamErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetStreamErrorModeled::InternalServerException(
                 InternalServerException {

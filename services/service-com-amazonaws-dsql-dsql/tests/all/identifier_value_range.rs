@@ -35,8 +35,8 @@
 
 use crate::harness::Dsql;
 use crate::resource_identifier_absence::{
-    refused_as_input, reported_absent, routes, the_store_is_untouched, AboveTheMintedRange, IdCase,
-    Route, IDENTIFIER_LEN, IDENTIFIER_SYMBOLS, LEADING_SYMBOL_MAX,
+    refused_as_input, reported_absent, routes, the_store_is_untouched, IdCase, Route, Verdict,
+    IDENTIFIER_LEN, IDENTIFIER_SYMBOLS, LEADING_SYMBOL_MAX,
 };
 
 /// Identifiers written in the alphabet whose symbols spell a value above the
@@ -130,8 +130,8 @@ async fn an_identifier_above_the_minted_range_is_answered_per_operation() {
     for case in values_above_the_minted_range() {
         for route in &routes {
             match route.above_the_minted_range {
-                AboveTheMintedRange::Refused => refused_as_input(&dsql, route, &live, &case).await,
-                AboveTheMintedRange::Absent => reported_absent(&dsql, route, &live, &case).await,
+                Verdict::Refused => refused_as_input(&dsql, route, &live, &case).await,
+                Verdict::Absent => reported_absent(&dsql, route, &live, &case).await,
             }
         }
     }
@@ -152,11 +152,11 @@ async fn the_same_identifier_gets_both_answers_on_different_operations() {
     let routes = routes();
     let gated: Vec<&Route> = routes
         .iter()
-        .filter(|route| route.above_the_minted_range == AboveTheMintedRange::Refused)
+        .filter(|route| route.above_the_minted_range == Verdict::Refused)
         .collect();
     let resolving: Vec<&Route> = routes
         .iter()
-        .filter(|route| route.above_the_minted_range == AboveTheMintedRange::Absent)
+        .filter(|route| route.above_the_minted_range == Verdict::Absent)
         .collect();
     assert!(
         !gated.is_empty() && !resolving.is_empty(),
