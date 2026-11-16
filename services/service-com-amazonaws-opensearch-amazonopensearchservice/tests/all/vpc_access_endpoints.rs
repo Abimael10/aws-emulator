@@ -130,11 +130,31 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// The `ClusterConfig` a create naming `subnets` carries: a VPC-access domain is reached
+/// through ONE subnet per Availability Zone it is placed in, so a row naming several
+/// subnets is a zone-aware cluster of that many zones, with one data node in each.
+fn cluster_config(subnets: usize) -> Value {
+    let mut cluster = json!({
+        "InstanceType": "t3.small.search",
+        "InstanceCount": subnets.max(1),
+    });
+    if subnets > 1 {
+        cluster["ZoneAwarenessEnabled"] = json!(true);
+        cluster["ZoneAwarenessConfig"] = json!({ "AvailabilityZoneCount": subnets });
+    }
+    cluster
+}
+
 /// A `CreateDomain` body for one row.
 fn create_body(name: &str, row: &Row) -> Value {
+    let subnets = row
+        .vpc_options
+        .as_ref()
+        .and_then(|options| options["SubnetIds"].as_array().map(Vec::len))
+        .unwrap_or(1);
     let mut body = json!({
         "DomainName": name,
-        "ClusterConfig": { "InstanceType": "t3.small.search", "InstanceCount": 1 },
+        "ClusterConfig": cluster_config(subnets),
         "EBSOptions": { "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 10 },
     });
     if let Some(vpc_options) = &row.vpc_options {

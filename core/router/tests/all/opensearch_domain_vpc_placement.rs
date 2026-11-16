@@ -241,12 +241,27 @@ fn expected_placement(networks: &[Network], picks: &[Pick]) -> Option<(String, V
     vpc.map(|vpc| (vpc, zones))
 }
 
+/// The `ClusterConfig` a call naming `subnets` carries: a VPC-access domain is reached
+/// through ONE subnet per Availability Zone it is placed in, so a row naming several
+/// subnets is a zone-aware cluster of that many zones, with one data node in each.
+fn cluster_config(subnets: usize) -> Value {
+    let mut cluster = json!({
+        "InstanceType": "t3.small.search",
+        "InstanceCount": subnets.max(1),
+    });
+    if subnets > 1 {
+        cluster["ZoneAwarenessEnabled"] = json!(true);
+        cluster["ZoneAwarenessConfig"] = json!({ "AvailabilityZoneCount": subnets });
+    }
+    cluster
+}
+
 /// A `CreateDomain` body naming `subnets`, or a public domain where the row names none.
 fn create_body(name: &str, subnets: &[String]) -> Value {
     let mut body = json!({
         "DomainName": name,
         "EngineVersion": ENGINE_VERSION,
-        "ClusterConfig": { "InstanceType": "t3.small.search", "InstanceCount": 1 },
+        "ClusterConfig": cluster_config(subnets.len()),
         "EBSOptions": { "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 10 },
     });
     if !subnets.is_empty() {
@@ -296,6 +311,9 @@ async fn update_config(
                 "SubnetIds": subnets,
                 "SecurityGroupIds": SECURITY_GROUPS,
             },
+            // The placement a change names carries the topology it is placed in with it:
+            // one subnet per Availability Zone.
+            "ClusterConfig": cluster_config(subnets.len()),
             "DryRun": dry_run,
         })),
     )

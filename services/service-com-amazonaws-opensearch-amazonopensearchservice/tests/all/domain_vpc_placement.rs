@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{Emulator, SETTLE_WAIT};
+use super::domain_lifecycle::{settled_domain, Emulator};
 
 /// The engine release every domain below runs.
 const ENGINE_VERSION: &str = "OpenSearch_2.11";
@@ -87,12 +87,32 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// The `ClusterConfig` a create naming `subnets` carries: a VPC-access domain is reached
+/// through ONE subnet per Availability Zone it is placed in, so a row naming several
+/// subnets is a zone-aware cluster of that many zones, with one data node in each.
+fn cluster_config(subnets: usize) -> Value {
+    let mut cluster = json!({
+        "InstanceType": "t3.small.search",
+        "InstanceCount": subnets.max(1),
+    });
+    if subnets > 1 {
+        cluster["ZoneAwarenessEnabled"] = json!(true);
+        cluster["ZoneAwarenessConfig"] = json!({ "AvailabilityZoneCount": subnets });
+    }
+    cluster
+}
+
 /// A `CreateDomain` body for one row.
 fn create_body(row: &Row) -> Value {
+    let subnets = row
+        .vpc_options
+        .as_ref()
+        .and_then(|options| options["SubnetIds"].as_array().map(Vec::len))
+        .unwrap_or(1);
     let mut body = json!({
         "DomainName": row.name,
         "EngineVersion": ENGINE_VERSION,
-        "ClusterConfig": { "InstanceType": "t3.small.search", "InstanceCount": 1 },
+        "ClusterConfig": cluster_config(subnets),
         "EBSOptions": { "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 10 },
     });
     if let Some(vpc_options) = &row.vpc_options {
@@ -188,9 +208,9 @@ async fn a_change_of_placement_whose_subnets_resolve_nowhere_is_served_whole() {
         created.status, created.body
     );
 
-    // The create's own provisioning span falls due first, so the domain is idle and a
-    // configuration change is served on it.
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The domain is idle before the change, which is the CONDITION a client waits for —
+    // polled rather than slept for, so the case cannot depend on how fast the host runs.
+    settled_domain(&emulator, public.name).await;
 
     // A dry run first: it "returns the results of a dry run analysis without actually
     // applying the change", so the domain is still public afterwards.
@@ -201,7 +221,11 @@ async fn a_change_of_placement_whose_subnets_resolve_nowhere_is_served_whole() {
     let dry = emulator
         .update_config(
             public.name,
-            json!({ "VPCOptions": moved.clone(), "DryRun": true }),
+            json!({
+                "VPCOptions": moved.clone(),
+                "ClusterConfig": cluster_config(2),
+                "DryRun": true,
+            }),
         )
         .await;
     assert_eq!(
@@ -222,7 +246,10 @@ async fn a_change_of_placement_whose_subnets_resolve_nowhere_is_served_whole() {
         vpc_options: Some(moved.clone()),
     };
     let applied = emulator
-        .update_config(public.name, json!({ "VPCOptions": moved }))
+        .update_config(
+            public.name,
+            json!({ "VPCOptions": moved, "ClusterConfig": cluster_config(2) }),
+        )
         .await;
     assert_eq!(
         applied.status, 200,

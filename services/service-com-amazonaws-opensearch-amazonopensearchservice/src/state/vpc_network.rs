@@ -238,6 +238,66 @@ pub fn subnets_not_in_one_vpc() -> ValidationException {
     }
 }
 
+/// How the service names the number of subnets a placement takes, for the sentence the
+/// refusal below states: the counts a domain is placed in are [`SINGLE_ZONE`] and the
+/// values of [`ZONE_COUNT_RANGE`], and the service states such a count in words rather
+/// than in digits (the same way it words how many nodes a zone deployment takes).
+const SUBNET_COUNT_WORDS: [(i32, &str); 3] = [(1, "one"), (2, "two"), (3, "three")];
+
+/// How many subnets a VPC-access domain whose cluster is `cluster` is placed with: ONE per
+/// Availability Zone the cluster is placed in — [`SINGLE_ZONE`] where it asks for no zone
+/// awareness, and the zone count it asks for where it does
+/// ([`super::requested_zone_count`]).
+///
+/// `None` where the cluster asks for zone awareness with a count the service does not place
+/// a domain in: that count names no number of zones at all, which
+/// [`super::zone_count_refusal`] states itself, so there is no number of subnets to require.
+fn placement_subnet_count(cluster: Option<&ClusterConfig>) -> Option<i32> {
+    match cluster {
+        Some(cluster) if cluster.zone_awareness_enabled == Some(true) => {
+            super::requested_zone_count(cluster)
+        }
+        // A cluster that asks for no zone awareness — and the absence of a cluster
+        // configuration, which asks for the service's own defaults, zone awareness off
+        // among them — occupies a single zone.
+        _ => Some(SINGLE_ZONE),
+    }
+}
+
+/// Whether the subnets a VPC-access domain is placed in are as many as the Availability
+/// Zones its cluster is placed in, and the refusal stating that number otherwise.
+///
+/// `VPCOptions$SubnetIds` is documented "if your domain uses multiple Availability Zones,
+/// you need to provide two subnet IDs, one per zone. Otherwise, provide only one", and
+/// `ClusterConfig$ZoneAwarenessEnabled` is the switch that decides how many zones the
+/// domain uses: so a VPC-access domain names exactly ONE subnet per zone it is placed in
+/// ([`placement_subnet_count`]), and a list of any other length describes a placement the
+/// service does not provision — it is refused rather than stored, so no domain is left
+/// behind naming subnets its own topology contradicts.
+///
+/// `None` where the call names no subnet list at all (a domain reached on a public endpoint
+/// has no placement to judge) and where the cluster's zone count is not one the service
+/// places a domain in — [`super::zone_count_refusal`] states that count itself.
+pub fn subnet_count_refusal(
+    cluster: Option<&ClusterConfig>,
+    subnet_ids: Option<&[String]>,
+) -> Option<ValidationException> {
+    let named = subnet_ids?.len();
+    let required = placement_subnet_count(cluster)?;
+    // Compared as a wide signed count, so a list of any length is judged without a cast
+    // that could wrap it into the required number.
+    if i64::try_from(named).is_ok_and(|named| named == i64::from(required)) {
+        return None;
+    }
+    let (_, word) = SUBNET_COUNT_WORDS
+        .into_iter()
+        .find(|(count, _)| *count == required)?;
+    let plural = if required == SINGLE_ZONE { "" } else { "s" };
+    Some(ValidationException {
+        message: Some(format!("You must specify exactly {word} subnet{plural}.")),
+    })
+}
+
 /// The EC2 filter that selects security groups BY ID (`group-id`, listed by
 /// `DescribeSecurityGroups`'s own `Filters` documentation).
 ///

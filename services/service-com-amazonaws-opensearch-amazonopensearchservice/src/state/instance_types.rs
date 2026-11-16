@@ -1580,7 +1580,12 @@ const ZONE_COUNT_WORDS: [(i32, &str, &str); 2] =
 /// `None` where the cluster asks for no zone awareness, and where the count it names is
 /// outside [`super::ZONE_COUNT_RANGE`] — such a count names no supported number of zones,
 /// which [`zone_count_refusal`] refuses before the spread below is judged.
-fn requested_zone_count(cluster: &ClusterConfig) -> Option<i32> {
+///
+/// It is the ONE reading of how many zones a requested cluster is placed in: the spread of
+/// its data nodes is judged against it below, and so is the number of subnets a VPC-access
+/// placement names ([`super::vpc_network::subnet_count_refusal`]), so no two rules can
+/// disagree about how many zones one configuration asks for.
+pub fn requested_zone_count(cluster: &ClusterConfig) -> Option<i32> {
     if cluster.zone_awareness_enabled != Some(true) {
         return None;
     }

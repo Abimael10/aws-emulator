@@ -82,7 +82,7 @@ fn rows() -> Vec<Row> {
             case: "a dualstack domain reached inside a VPC",
             domain: "pub-when-vpcdual",
             vpc_options: Some(json!({
-                "SubnetIds": ["subnet-00000000000000001", "subnet-00000000000000002"],
+                "SubnetIds": ["subnet-00000000000000001"],
             })),
             ip_address_type: Some("dualstack"),
             members: &["Endpoints.vpc", "Endpoints.vpcv2"],

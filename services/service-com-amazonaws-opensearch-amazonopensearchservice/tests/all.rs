@@ -355,6 +355,8 @@ mod vpc_endpoints;
 mod vpc_endpoints_for_domain;
 #[path = "all/vpc_endpoints_for_domain_status.rs"]
 mod vpc_endpoints_for_domain_status;
+#[path = "all/vpc_placement_subnet_count.rs"]
+mod vpc_placement_subnet_count;
 #[path = "all/vpc_security_groups_grounded_in_ec2.rs"]
 mod vpc_security_groups_grounded_in_ec2;
 #[path = "all/warm_storage_instance_family.rs"]

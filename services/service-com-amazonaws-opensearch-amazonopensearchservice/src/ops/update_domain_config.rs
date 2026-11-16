@@ -784,6 +784,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::data_node_count_refusal(Some(&merged.cluster_config)),
             crate::state::zone_count_refusal(Some(&merged.cluster_config)),
             crate::state::zone_awareness_refusal(Some(&merged.cluster_config)),
+            // ... and a VPC-access domain names one subnet per Availability Zone it is
+            // placed in, so a change that would leave it with a subnet list the merged
+            // cluster's zone count does not match is refused for the same reason the create
+            // path refuses it — judged on the MERGED record, so a change that only switches
+            // zone awareness on is checked against the subnets the domain keeps, and one
+            // that only replaces the subnets against the topology it keeps.
+            crate::state::vpc_network::subnet_count_refusal(
+                Some(&merged.cluster_config),
+                merged
+                    .vpc_options
+                    .as_ref()
+                    .and_then(|options| options.subnet_ids.as_deref()),
+            ),
             crate::state::dedicated_master_count_refusal(Some(&merged.cluster_config)),
             // ... and against the warm-storage capability of the hot-tier instance type
             // the merged cluster runs on, so a change that would leave the domain with a

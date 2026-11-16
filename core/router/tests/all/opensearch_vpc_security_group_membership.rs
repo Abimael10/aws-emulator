@@ -293,6 +293,21 @@ const UPDATE_ROWS: &[UpdateRow] = &[
     },
 ];
 
+/// The `ClusterConfig` a call naming `subnets` carries: a VPC-access domain is reached
+/// through ONE subnet per Availability Zone it is placed in, so a row naming several
+/// subnets is a zone-aware cluster of that many zones, with one data node in each.
+fn cluster_config(subnets: usize) -> Value {
+    let mut cluster = json!({
+        "InstanceType": "t3.small.search",
+        "InstanceCount": subnets.max(1),
+    });
+    if subnets > 1 {
+        cluster["ZoneAwarenessEnabled"] = json!(true);
+        cluster["ZoneAwarenessConfig"] = json!({ "AvailabilityZoneCount": subnets });
+    }
+    cluster
+}
+
 /// A `CreateDomain` body naming `subnets` and `groups`.
 fn create_body(name: &str, subnets: &[String], groups: &[String]) -> Value {
     let mut vpc_options = json!({ "SubnetIds": subnets });
@@ -302,7 +317,7 @@ fn create_body(name: &str, subnets: &[String], groups: &[String]) -> Value {
     json!({
         "DomainName": name,
         "EngineVersion": ENGINE_VERSION,
-        "ClusterConfig": { "InstanceType": "t3.small.search", "InstanceCount": 1 },
+        "ClusterConfig": cluster_config(subnets.len()),
         "EBSOptions": { "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 10 },
         "VPCOptions": vpc_options,
     })
@@ -339,14 +354,19 @@ async fn update_config(
     dry_run: bool,
 ) -> Reply {
     let mut vpc_options = json!({ "SecurityGroupIds": groups });
+    let mut body = json!({ "DryRun": dry_run });
     if !subnets.is_empty() {
         vpc_options["SubnetIds"] = json!(subnets);
+        // The placement a change names carries the topology it is placed in with it: one
+        // subnet per Availability Zone.
+        body["ClusterConfig"] = cluster_config(subnets.len());
     }
+    body["VPCOptions"] = vpc_options;
     opensearch(
         router,
         "POST",
         &format!("{PREFIX}/opensearch/domain/{name}/config"),
-        Some(json!({ "VPCOptions": vpc_options, "DryRun": dry_run })),
+        Some(body),
     )
     .await
 }

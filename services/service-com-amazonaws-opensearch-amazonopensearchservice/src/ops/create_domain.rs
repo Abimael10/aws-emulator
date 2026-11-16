@@ -450,6 +450,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::data_node_count_refusal(input.cluster_config.as_ref()),
             crate::state::zone_count_refusal(input.cluster_config.as_ref()),
             crate::state::zone_awareness_refusal(input.cluster_config.as_ref()),
+            // ... and a VPC-access domain is reached through one subnet per Availability
+            // Zone it is placed in, so a request whose `VPCOptions$SubnetIds` is not as
+            // long as the cluster's zone count describes a placement the service does not
+            // provision ([`crate::state::vpc_network::subnet_count_refusal`]) — refused
+            // here, before any domain record is written, and by the same rule the update
+            // path applies.
+            crate::state::vpc_network::subnet_count_refusal(
+                input.cluster_config.as_ref(),
+                input
+                    .vpc_options
+                    .as_ref()
+                    .and_then(|options| options.subnet_ids.as_deref()),
+            ),
             crate::state::dedicated_master_count_refusal(input.cluster_config.as_ref()),
             // A policy document that is not JSON denotes no access policy at all, so it is
             // refused rather than stored as one nothing could later read or enforce

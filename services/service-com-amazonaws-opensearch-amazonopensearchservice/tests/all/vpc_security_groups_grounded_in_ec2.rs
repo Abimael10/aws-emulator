@@ -26,9 +26,11 @@ use super::domain_lifecycle::{poll_until, settled_domain, Emulator};
 use super::vpc_endpoint_updates::update_endpoint;
 use super::vpc_endpoints::{create_endpoint, describe_endpoints, member, minted, vpc_domain};
 
-/// The subnets every placement below names: nothing resolves them either, so what differs
-/// between the rows is only the security groups.
-const SUBNETS: [&str; 2] = ["subnet-0ccc0000000000001", "subnet-0ccc0000000000002"];
+/// The subnet every placement below names: nothing resolves it either, so what differs
+/// between the rows is only the security groups. ONE subnet, because the clusters below ask
+/// for no zone awareness and a VPC-access domain names one subnet per Availability Zone it
+/// is placed in.
+const SUBNETS: [&str; 1] = ["subnet-0ccc0000000000001"];
 
 /// One list of security groups a call names.
 struct Row {
