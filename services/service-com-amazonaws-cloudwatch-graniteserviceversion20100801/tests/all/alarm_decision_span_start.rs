@@ -370,20 +370,28 @@ const CONTRAST_PERIOD: i32 = 300;
 
 /// How far into the aligned period the twins' datapoints are published at the earliest.
 ///
-/// A rolling range's boundaries are counted back from an end read at the minute and one evaluation
-/// cadence behind the clock, so once the clock is this far into the aligned period that end has
-/// passed the period's own boundary and the span it opens lies strictly INSIDE the period before
-/// it — which is what makes the two windows' spans differ at all. Right at the boundary the two
-/// grids can still agree.
-const CONTRAST_PHASE_FROM_SECS: f64 = 15.0;
+/// A rolling range's boundaries are counted back from an end read at the MINUTE and one
+/// evaluation cadence behind the clock, so once the clock is a minute into the aligned period
+/// that end has passed the period's own boundary and the span it opens lies strictly INSIDE the
+/// period before it — which is what makes the two windows' spans differ at all. It is also what
+/// the datapoint inside the open aligned period needs: stamped in the newest minute that has
+/// CLOSED, it is inside that period only once the clock is a minute into it. Right at the
+/// boundary the two grids can still agree.
+const CONTRAST_PHASE_FROM_SECS: f64 = 60.0;
 
 /// How much of the aligned period must be left when they are published and read.
 ///
 /// The twins' datapoints are placed relative to the period the clock is in, so the reading has to
-/// fall in that same period; and the rolling range's end, which is read at the minute and includes
-/// the minute the clock is in, has to stay inside it too, so the rolling span opens strictly
-/// before the aligned boundary the clock has last passed.
-const CONTRAST_ROOM_SECS: f64 = 55.0;
+/// fall in that same period; and the rolling range's end, which is read at the minute, has to stay
+/// short of the period's own end, so the span it opens — a look-back behind that end — lies
+/// strictly before the aligned boundary the clock has last passed rather than on it.
+///
+/// Wider than that end alone needs, so the case does not depend on how fast the host gets from
+/// the publish to the read: whatever room is left over is slack a loaded machine may spend on the
+/// two writes, the evaluation and the two reads between them. The cost is the wait ahead of the
+/// case, which is bounded by the span outside the admissible phase — under three minutes, and
+/// nothing is asserted about it.
+const CONTRAST_ROOM_SECS: f64 = 100.0;
 
 /// Wait until the clock is at least `from` seconds into the `period`-second window it is in and at
 /// least `room` seconds short of that window's end.
@@ -432,14 +440,18 @@ async fn an_aligned_range_opens_on_a_clock_boundary_and_a_rolling_one_inside_the
         ok(&router, "PutMetricAlarm", &twin_of(name, &window)).await;
     }
 
-    // The same two breaching datapoints for each twin: one in the aligned period the clock is IN,
-    // stamped at this instant, and one in the aligned period before it, which has closed. The
-    // aligned window grades only the closed one; the rolling range has already reached the open
-    // one.
+    // The same two breaching datapoints for each twin, both stamped in a minute that has CLOSED,
+    // because the rolling range's end is read at the minute: a stamp in the minute still being
+    // published into is in no range yet, whatever second of it the suite happens to run in. One
+    // of them sits in the last closed minute of the aligned period BEFORE this one, and one in
+    // the newest closed minute, which is inside the aligned period the clock is IN. The aligned
+    // window grades only the closed period; the rolling range has already reached the open one.
     let open_start = window_start(now_secs(), period);
     let closed_start = open_start - period;
+    let in_the_closed_period = open_start - REGULAR_RESOLUTION_SECS / 2.0;
+    let in_the_open_period = graded_window_stamp(REGULAR_RESOLUTION_SECS);
     for name in [aligned, rolling] {
-        publish_breaching(&router, name, &[closed_start + period / 2.0, now_secs()]).await;
+        publish_breaching(&router, name, &[in_the_closed_period, in_the_open_period]).await;
     }
     wait_for_evaluation();
 
