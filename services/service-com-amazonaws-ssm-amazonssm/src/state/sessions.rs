@@ -46,6 +46,15 @@ pub const ENDED_SESSION_STATUSES: &[&str] = &["Terminated", "Terminating", "Fail
 /// default for Session Manager sessions" (`Session$AccessType`).
 pub const ACCESS_TYPE_STANDARD: &str = "Standard";
 
+/// The `ConnectionStatus` of a managed node Session Manager can reach: it "is running and
+/// ready to receive Session Manager connections" (`GetConnectionStatus`), which is the
+/// state an agent that is reporting itself puts its node in (from the modelled enum,
+/// `crate::ops::types::CONNECTION_STATUS_VALUES`).
+pub const CONNECTION_STATUS_CONNECTED: &str = "connected";
+
+/// The `ConnectionStatus` of a target this endpoint cannot reach (same enum).
+pub const CONNECTION_STATUS_NOTCONNECTED: &str = "notconnected";
+
 /// How far back a report of ENDED sessions reaches: "Retrieves a list of all active
 /// sessions (both connected and disconnected) or terminated sessions from the past 30
 /// days" (`DescribeSessions`), so a session that ended before that window is no longer
@@ -333,6 +342,23 @@ pub fn stream_url(authority: &str, session_id: &str) -> String {
 }
 
 impl super::ComAmazonawsSsmAmazonssmState {
+    /// The `ConnectionStatus` this endpoint reports for `target`: "whether it is running and
+    /// ready to receive Session Manager connections" (`GetConnectionStatus`).
+    ///
+    /// A target is connected exactly when this Region holds it as a managed node whose agent
+    /// is responding ([`super::ComAmazonawsSsmAmazonssmState::node_agent_is_responding`]),
+    /// which is the same fact that decides whether a session can be opened to it — so a
+    /// report and a start cannot disagree about one target. Nothing about the SESSIONS of
+    /// the target is read: a connected node is ready to RECEIVE a connection whether or not
+    /// one has been opened to it.
+    pub fn connection_status(&self, region: &str, target: &str) -> &'static str {
+        if self.node_agent_is_responding(region, target) {
+            CONNECTION_STATUS_CONNECTED
+        } else {
+            CONNECTION_STATUS_NOTCONNECTED
+        }
+    }
+
     /// Whether this store has room for another session ([`MAX_SESSIONS_TOTAL`]).
     pub fn can_hold_another_session(&self) -> bool {
         self.sessions.len() < MAX_SESSIONS_TOTAL
@@ -409,6 +435,21 @@ mod tests {
             states, modelled,
             "expected the two reported states to be the modelled SessionState values, got \
              {states:?} against {modelled:?}"
+        );
+    }
+
+    /// The two statuses a connection report answers with are the modelled
+    /// `ConnectionStatus` values, and nothing else is.
+    #[test]
+    fn the_reported_connection_statuses_come_from_the_model() {
+        let mut reported = vec![CONNECTION_STATUS_CONNECTED, CONNECTION_STATUS_NOTCONNECTED];
+        reported.sort_unstable();
+        let mut modelled = crate::ops::types::CONNECTION_STATUS_VALUES.to_vec();
+        modelled.sort_unstable();
+        assert_eq!(
+            reported, modelled,
+            "expected the two reported connection statuses to be the modelled \
+             ConnectionStatus values, got {reported:?} against {modelled:?}"
         );
     }
 }

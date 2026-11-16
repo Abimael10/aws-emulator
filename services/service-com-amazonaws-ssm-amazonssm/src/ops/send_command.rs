@@ -456,15 +456,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A node takes a command through its agent's poll, so a node whose agent is not
         // reporting is one of the states `InvalidInstanceId` is documented for ("SSM Agent
         // isn't running… The managed node isn't in a valid state").
-        let usable = |id: &str| {
-            store
-                .managed_node(&region, id)
-                .filter(|node| {
-                    node.properties.ping_status.as_deref() == Some(crate::state::PING_STATUS_ONLINE)
-                })
-                .is_some()
-        };
-        if !named.iter().all(|id| usable(id)) {
+        if !named
+            .iter()
+            .all(|id| store.node_agent_is_responding(&region, id))
+        {
             return Err(SendCommandErrorModeled::InvalidInstanceId(InvalidInstanceId {
                 message: Some(crate::state::commands::NODES_NOT_IN_A_VALID_STATE.to_string()),
             })

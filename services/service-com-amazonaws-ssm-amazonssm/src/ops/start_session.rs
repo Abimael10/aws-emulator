@@ -239,11 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PingStatus` reports. A target no such node answers for is what
         // `TargetNotConnected` exists for, including "a managed node that is located in a
         // different account or Region", since a node is held per Region.
-        let connected = store
-            .managed_node(&region, &input.target)
-            .and_then(|node| node.properties.ping_status.clone())
-            .is_some_and(|status| status == crate::state::PING_STATUS_ONLINE);
-        if !connected {
+        if !store.node_agent_is_responding(&region, &input.target) {
             return Err(StartSessionErrorModeled::TargetNotConnected(
                 TargetNotConnected {
                     message: Some(format!("{} is not connected.", input.target)),

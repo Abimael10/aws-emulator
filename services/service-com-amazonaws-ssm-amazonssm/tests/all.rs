@@ -87,6 +87,8 @@ mod managed_node_filter_validation;
 mod managed_node_iam_role;
 #[path = "all/managed_node_information.rs"]
 mod managed_node_information;
+#[path = "all/node_connection_status.rs"]
+mod node_connection_status;
 #[path = "all/node_inventory.rs"]
 mod node_inventory;
 #[path = "all/ops_data_summary.rs"]

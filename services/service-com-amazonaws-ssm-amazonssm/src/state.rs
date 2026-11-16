@@ -4019,6 +4019,22 @@ impl ComAmazonawsSsmAmazonssmState {
             .get_mut(&(region.to_string(), id.to_string()))
     }
 
+    /// Whether `region` holds a node under `id` whose AGENT IS RESPONDING: the node pinged
+    /// Systems Manager to report itself, which is what [`PING_STATUS_ONLINE`] records.
+    ///
+    /// The one reading of whether a node is reachable through this service, so every
+    /// operation that needs it agrees: a session is opened only to such a node
+    /// (`StartSession`, else `TargetNotConnected`), a command is delivered only to one
+    /// (`SendCommand`, else `InvalidInstanceId`) and `GetConnectionStatus` reports exactly
+    /// these nodes `connected`. A node this Region holds none of — and a node held per
+    /// Region is held by one — is not reachable, and neither is one whose agent has stopped
+    /// reporting.
+    pub fn node_agent_is_responding(&self, region: &str, id: &str) -> bool {
+        self.managed_node(region, id)
+            .and_then(|node| node.properties.ping_status.as_deref())
+            .is_some_and(|status| status == PING_STATUS_ONLINE)
+    }
+
     /// Every managed node `region` holds, in ascending node-id order, as
     /// `(node id, record)`. The order is what makes a describe's resume cursor total: it
     /// is a node id, not an offset into a list that may have changed.

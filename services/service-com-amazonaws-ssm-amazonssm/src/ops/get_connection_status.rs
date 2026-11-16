@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnectionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnectionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report whether Session Manager can reach a managed node: "retrieves the Session Manager
+//! connection status for a managed node to determine whether it is running and ready to
+//! receive Session Manager connections". This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnectionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A node is reachable exactly when THIS endpoint holds it as a managed node whose agent is
+//! responding — the ping the agent makes to report itself, which
+//! [`crate::state::ComAmazonawsSsmAmazonssmState::node_agent_is_responding`] is the one
+//! reading of — so the status reported here is the same fact that decides whether
+//! `StartSession` opens a session to the target or refuses it as `TargetNotConnected`
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::connection_status`]). A target no node of
+//! this Region answers for — one nothing registered, one whose instance is gone, or a node
+//! of another Region, since a node is held per Region — is `notconnected`; no session of the
+//! target is read, because a node that is connected is ready "to receive Session Manager
+//! connections" whether or not one has been opened.
+//!
+//! This is a REPORT: the one write it makes before reading is materialising the node
+//! registrations the clock already owed
+//! ([`crate::state::node_registration::settle_registrations`]), which was due at the same
+//! instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +148,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnectionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnectionStatus"))
+        // `Target`'s presence and its 1..400 length are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetConnectionStatusErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Session Manager is regional: a node is reached through the endpoint it registered
+        // at, which is the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        // The registration an instance of this Region had already made by now was owed at
+        // the same instant whether or not anybody called, so it is materialised before the
+        // store is asked about the target — with no guard of it held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+
+        let status = state.lock().connection_status(&region, &input.target);
+        Ok(GetConnectionStatusOutput {
+            // "The ID of the managed node to check connection status"
+            // (`GetConnectionStatusResponse$Target`): the target the request asked about.
+            target: Some(input.target),
+            status: Some(status.to_string()),
+        })
     }
 }
