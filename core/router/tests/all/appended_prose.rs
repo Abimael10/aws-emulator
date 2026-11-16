@@ -33,7 +33,9 @@
 //! A SIXTH run had grown back below that root's last declaration while this repair was under
 //! review, again carrying a second declaration of a suite the sorted list already declared.
 //! That stranded pair was dropped with the prose around it, the sorted one left where it is,
-//! for the same reason as the five runs before it.
+//! for the same reason as the five runs before it. The same run reached a branch already in
+//! review, which had moved the pairs stranded in it into the places their names sort to and
+//! dropped the prose; the two cleanups agree, so the list carries each of those pairs once.
 //!
 //! A SEVENTH run had grown back in both places at once: the header itself held a dozen
 //! re-typed copies of its paragraphs, and below the last declaration stood another run of them

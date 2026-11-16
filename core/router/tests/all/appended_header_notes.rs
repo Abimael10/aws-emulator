@@ -19,5 +19,9 @@
 //! lines truncated mid-sentence; it was reduced to the one copy of each paragraph that stands
 //! there now, for the same reason as the runs before it.
 //!
+//! A THIRD such run came of merging two branches that had each reduced the header: the merge
+//! kept both reductions, so the block said each paragraph twice over. It was reduced to one
+//! copy of each paragraph again, which is the rule `all_rs_carries_one_header_block.rs` reads.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

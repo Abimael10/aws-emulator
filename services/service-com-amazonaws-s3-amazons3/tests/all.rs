@@ -149,6 +149,8 @@ mod bucket_website;
 mod bucket_website_delete;
 #[path = "all/bucket_website_refusals.rs"]
 mod bucket_website_refusals;
+#[path = "all/bucket_website_routing_rule_ceiling.rs"]
+mod bucket_website_routing_rule_ceiling;
 #[path = "all/checksum_mode_header_case.rs"]
 mod checksum_mode_header_case;
 #[path = "all/cli_download_legs.rs"]
