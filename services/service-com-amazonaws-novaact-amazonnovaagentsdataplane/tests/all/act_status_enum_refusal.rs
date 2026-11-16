@@ -166,7 +166,7 @@ async fn a_status_outside_the_value_set_is_refused_with_the_set_the_front_door_l
         .clone();
     assert_eq!(listed.len(), 1, "one act is stored, got {body}");
     assert_eq!(
-        listed[0]["status"], "RUNNING",
-        "the act must still be RUNNING, got {body}"
+        listed[0]["status"], crate::act_status_update::INITIAL_ACT_STATUS,
+        "the act must still hold the status it was created in, got {body}"
     );
 }

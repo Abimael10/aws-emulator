@@ -493,8 +493,10 @@ async fn the_workflow_chain_round_trips_through_stored_state() {
             "case {label:?}: actId must be a lowercase UUID, got {act_id:?}"
         );
         assert_eq!(
-            body["status"], "RUNNING",
-            "case {label:?}: a created act's initial status is RUNNING, got {body}"
+            body["status"], crate::act_status_update::INITIAL_ACT_STATUS,
+            "case {label:?}: a created act's initial status is \
+             {}, got {body}",
+            crate::act_status_update::INITIAL_ACT_STATUS
         );
     }
 }

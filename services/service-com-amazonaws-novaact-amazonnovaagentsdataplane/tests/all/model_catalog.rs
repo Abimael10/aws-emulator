@@ -8,9 +8,10 @@
 //! its own `minimumCompatibilityVersion` — while everything that depends on the REQUEST
 //! is computed from it: the echoed `clientCompatibilityVersion`, the `supportedModelIds`
 //! that version reaches (a model at or above its own minimum whose lifecycle is not
-//! `DEPRECATED`), each alias's `resolvedModelId` (filled exactly when that caller reaches
-//! the model the alias points at) and the compatibility `message` (only where the caller
-//! reaches no model at all).
+//! `DEPRECATED`), the `modelAliases` that version resolves (an alias is offered exactly
+//! when the caller can use the model it points at, and then carries it as
+//! `resolvedModelId`) and the compatibility `message` (only where the caller reaches no
+//! model at all).
 //!
 //! So the table below varies what that rule generalises over — the compatibility version,
 //! across every published minimum, each bound of `Integer` and one version below the
@@ -205,13 +206,10 @@ async fn the_compatibility_view_of_the_catalog_is_computed_from_the_requested_ve
             ),
         }
 
-        // Every alias points at a model the catalog holds and has not retired, and
-        // resolves exactly when THIS caller reaches it.
+        // The aliases this caller is OFFERED are exactly the ones it resolves: an alias
+        // whose target model the caller cannot use is not listed at all, and every listed
+        // one points at a published, unretired model and resolves to it.
         let aliases = list_of(&body, "modelAliases");
-        assert!(
-            !aliases.is_empty(),
-            "case {version}: expected ListModels to publish at least one alias, got {body}"
-        );
         for alias in aliases {
             let alias_name = text(alias, "aliasName");
             let latest = text(alias, "latestModelId");
@@ -229,13 +227,28 @@ async fn the_compatibility_view_of_the_catalog_is_computed_from_the_requested_ve
                 pointed.1, DEPRECATED,
                 "case {version}: alias {alias_name:?} must not point at a retired model, got {pointed:?}"
             );
-            let expected_resolved = supported.contains(&latest).then(|| latest.clone());
+            assert!(
+                supported.contains(&latest),
+                "case {version}: alias {alias_name:?} must not be offered to a caller that \
+                 cannot use {latest:?}, which it reaches {supported:?}"
+            );
             let resolved = alias["resolvedModelId"].as_str().map(str::to_string);
             assert_eq!(
-                resolved, expected_resolved,
-                "case {version}: alias {alias_name:?} expected resolvedModelId {expected_resolved:?}, got {resolved:?}"
+                resolved,
+                Some(latest.clone()),
+                "case {version}: alias {alias_name:?} expected resolvedModelId {latest:?}, \
+                 got {resolved:?}"
             );
         }
+        // A caller that reaches a model is offered an alias for it; one that reaches none is
+        // offered no alias either.
+        assert_eq!(
+            aliases.is_empty(),
+            supported.is_empty(),
+            "case {version}: a caller reaching {supported:?} expected \
+             {} aliases, got {aliases:?}",
+            if supported.is_empty() { "no" } else { "some" }
+        );
 
         // A reporting operation answers the same thing twice: nothing about the call
         // changes what the next caller sees.
@@ -278,6 +291,129 @@ async fn a_newer_client_reaches_every_model_an_older_one_reaches() {
         !previous.is_empty(),
         "case \"top of the range\": expected the highest version walked to reach a model, got {previous:?}"
     );
+}
+
+/// RULE: an alias is a reference the caller resolves and then runs, so a response offers
+/// only the aliases the REQUESTED compatibility version resolves — the alias list and the
+/// supported model ids of one response are two views of the one compatibility decision and
+/// cannot disagree.
+///
+/// The rows walk the whole published range of minimums and a version on each side of it,
+/// and each row's expectation is derived from the catalog the response itself reports, so a
+/// later revision of the catalog changes no expectation here.
+#[tokio::test]
+async fn only_the_aliases_the_requested_version_resolves_are_offered() {
+    let emulator = Emulator::new("ap-northeast-1");
+
+    let (status, published) = list_models(&emulator, i64::from(i32::MAX)).await;
+    assert_eq!(
+        status, 200,
+        "case \"published\": expected HTTP 200, got {status} {published}"
+    );
+    // Every alias is offered to a caller at the highest version there is, so this is the
+    // whole published alias set: the rows below are subsets of it.
+    let every_alias: Vec<(String, String)> = aliases_by_name(&published);
+    assert!(
+        every_alias.len() > 1,
+        "case \"published\": expected more than one published alias, so filtering is \
+         exercised, got {every_alias:?}"
+    );
+    let catalog = reported_catalog(&published);
+    let minimums: BTreeSet<i64> = catalog
+        .iter()
+        .filter(|(_, status, _)| status != DEPRECATED)
+        .map(|(_, _, minimum)| *minimum)
+        .collect();
+    let lowest = *minimums
+        .iter()
+        .next()
+        .expect("a catalog with a usable model");
+    let highest = *minimums
+        .iter()
+        .next_back()
+        .expect("a catalog with a usable model");
+    assert!(
+        highest > lowest,
+        "case \"published\": expected models with different minimum compatibility versions, \
+         got {catalog:?}"
+    );
+
+    let mut versions: BTreeSet<i64> = minimums.clone();
+    versions.insert(lowest - 1);
+    versions.insert(highest + 1);
+
+    let mut previous: BTreeSet<String> = BTreeSet::new();
+    for version in &versions {
+        let version = *version;
+        let (status, body) = list_models(&emulator, version).await;
+        assert_eq!(
+            status, 200,
+            "case {version}: expected HTTP 200, got {status} {body}"
+        );
+        // The models this version can use, computed from the catalogue the response reports —
+        // its own `minimumCompatibilityVersion` and lifecycle — rather than from the
+        // supportedModelIds of the same response, so one wrong predicate cannot satisfy both
+        // sides of this row.
+        let usable: BTreeSet<String> = catalog
+            .iter()
+            .filter(|(_, status, minimum)| status != DEPRECATED && *minimum <= version)
+            .map(|(model_id, _, _)| model_id.clone())
+            .collect();
+        // The other view of that same decision has to agree with it.
+        let supported: BTreeSet<String> = supported_ids(&body).into_iter().collect();
+        assert_eq!(
+            supported, usable,
+            "case {version}: expected supportedModelIds {usable:?}, got {supported:?}"
+        );
+
+        // Exactly the published aliases whose target this version can use, in the order the
+        // service publishes them.
+        let expected: Vec<(String, String)> = every_alias
+            .iter()
+            .filter(|(_, latest)| usable.contains(latest))
+            .cloned()
+            .collect();
+        let offered = aliases_by_name(&body);
+        assert_eq!(
+            offered, expected,
+            "case {version}: expected the aliases {expected:?} this version resolves, got \
+             {offered:?}"
+        );
+
+        // The offered set only grows with the version, because the only version-dependent
+        // condition on the model an alias points at is a lower bound.
+        let names: BTreeSet<String> = offered.iter().map(|(name, _)| name.clone()).collect();
+        assert!(
+            previous.is_subset(&names),
+            "case {version}: expected every alias version {} was offered to still be \
+             offered, got {names:?}",
+            version - 1
+        );
+        previous = names;
+    }
+
+    // A caller below every published minimum resolves nothing, so it is offered no alias
+    // rather than one it cannot run.
+    let (status, body) = list_models(&emulator, lowest - 1).await;
+    assert_eq!(
+        status, 200,
+        "case \"below every minimum\": expected HTTP 200, got {status} {body}"
+    );
+    let offered = aliases_by_name(&body);
+    assert!(
+        offered.is_empty(),
+        "case \"below every minimum\": a caller that reaches no model must be offered no \
+         alias, got {offered:?}"
+    );
+}
+
+/// The aliases a response offers, as `(aliasName, latestModelId)` in the order it carries
+/// them.
+fn aliases_by_name(body: &Value) -> Vec<(String, String)> {
+    list_of(body, "modelAliases")
+        .iter()
+        .map(|alias| (text(alias, "aliasName"), text(alias, "latestModelId")))
+        .collect()
 }
 
 /// RULE: the ids the catalog publishes are this service's own model ids — a model a

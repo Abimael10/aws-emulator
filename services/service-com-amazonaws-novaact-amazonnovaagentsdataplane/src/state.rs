@@ -363,6 +363,22 @@ impl ActStatus {
             .find(|status| status.as_wire() == value)
     }
 
+    /// The status an act takes when it is CREATED.
+    ///
+    /// An act is driven by the CLIENT: the only operation that takes an act's next step is
+    /// called by the caller and carries the results of the tool calls IT executed, and a
+    /// tool call is "a request for the client to execute a specific tool". So an act that
+    /// has only just been stored has had no step taken on it yet and the next move belongs
+    /// to the caller — which is exactly what `PENDING_CLIENT_ACTION` tells it. `RUNNING`
+    /// describes an act the service is itself executing, which an act becomes once a step
+    /// has been handed to it, not before.
+    ///
+    /// The ONE place a new act's status is decided, so every creator of an act stores the
+    /// same status and every read of one reports what was stored.
+    pub fn initial() -> Self {
+        Self::PendingClientAction
+    }
+
     /// Whether the act has FINISHED: it ran to the end, it failed, or it ran out of time.
     /// Only an act in one of those statuses has an `endedAt`.
     pub fn is_terminal(self) -> bool {

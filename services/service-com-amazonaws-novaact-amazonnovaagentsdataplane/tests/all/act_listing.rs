@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_novaact_amazonnovaagentsdataplane::ops::types::TraceLocation;
 use service_com_amazonaws_novaact_amazonnovaagentsdataplane::state::ActStatus;
 
+use crate::act_status_update::INITIAL_ACT_STATUS;
 use crate::workflow_lifecycle::{text, Emulator};
 
 /// The definition every case lists through.
@@ -399,8 +400,9 @@ async fn each_summary_is_read_off_the_stored_act() {
             "case {label}: the summary reports the session holding the act, got {summary}"
         );
         assert_eq!(
-            summary["status"], "RUNNING",
-            "case {label}: an act this service has just accepted is RUNNING, got {summary}"
+            summary["status"], INITIAL_ACT_STATUS,
+            "case {label}: an act this service has just accepted holds the status it was \
+             created in, got {summary}"
         );
         let started_at = text(summary, "startedAt");
         assert!(
@@ -523,8 +525,8 @@ async fn a_finished_act_reports_its_stored_end_and_trace() {
             .find(|summary| text(summary, "actId") == created.act_id)
             .unwrap_or_else(|| panic!("case {}: must be listed, got {body}", created.act_id));
         assert_eq!(
-            summary["status"], "RUNNING",
-            "case {}: an untouched act is still RUNNING, got {summary}",
+            summary["status"], INITIAL_ACT_STATUS,
+            "case {}: an untouched act still holds the status it was created in, got {summary}",
             created.act_id
         );
         assert!(

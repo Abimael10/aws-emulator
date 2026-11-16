@@ -84,6 +84,16 @@ pub fn usable_at(model: &ModelSummary, client_compatibility_version: i32) -> boo
         && model.minimum_compatibility_version <= client_compatibility_version
 }
 
+/// The published model ids a client at `client_compatibility_version` can use, in the
+/// order the catalog publishes them ([`usable_at`] decides each one).
+pub fn usable_model_ids(client_compatibility_version: i32) -> Vec<String> {
+    catalog()
+        .into_iter()
+        .filter(|model| usable_at(model, client_compatibility_version))
+        .map(|model| model.model_id)
+        .collect()
+}
+
 /// The lowest client compatibility version that reaches any model at all, i.e. the
 /// version a client below every model's minimum has to reach to use this service.
 ///
@@ -106,8 +116,9 @@ pub fn lowest_usable_compatibility_version() -> Option<i32> {
 /// retired model, and a new revision moves the alias by being published, which is what
 /// makes the reference stable.
 ///
-/// `resolvedModelId` is NOT filled in here: resolution is per caller
-/// ([`usable_at`]), so the operation answering a request fills it.
+/// This is the whole published set, so it is not what a caller is answered:
+/// `resolvedModelId` is empty here, and which of these aliases a given caller is OFFERED
+/// is a function of that caller's own compatibility version ([`aliases_offered_at`]).
 pub fn aliases() -> Vec<ModelAlias> {
     let catalog = catalog();
     // A `BTreeMap` for both reasons: later (newer) revisions of a generation overwrite
@@ -149,4 +160,30 @@ fn generation_of(model_id: &str) -> &str {
     model_id
         .split_once(REVISION_SEPARATOR)
         .map_or(model_id, |(generation, _)| generation)
+}
+
+/// The aliases a client at `client_compatibility_version` is OFFERED: the published
+/// aliases ([`aliases`]) whose target model that version can use ([`usable_at`]), each
+/// carrying that model as its `resolvedModelId`.
+///
+/// An alias is a reference a caller is meant to resolve and then run, so one whose target
+/// this caller cannot run is not offered to it at all: the aliases a response lists and
+/// the model ids its compatibility information reports as supported are two views of the
+/// one compatibility decision, and cannot disagree inside one response.
+///
+/// Resolution does NOT fall back to an earlier revision of the alias's generation. An alias
+/// names that generation's newest usable revision ([`aliases`]), so resolving it to an older
+/// one would answer a model the alias does not point at; a caller that can only run the
+/// earlier revision asks for it by its own model id, which the catalog still publishes and
+/// `supportedModelIds` still offers.
+pub fn aliases_offered_at(client_compatibility_version: i32) -> Vec<ModelAlias> {
+    let usable = usable_model_ids(client_compatibility_version);
+    aliases()
+        .into_iter()
+        .filter(|alias| usable.contains(&alias.latest_model_id))
+        .map(|alias| ModelAlias {
+            resolved_model_id: Some(alias.latest_model_id.clone()),
+            ..alias
+        })
+        .collect()
 }

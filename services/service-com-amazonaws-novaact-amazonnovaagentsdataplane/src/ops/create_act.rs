@@ -6,6 +6,11 @@
 //! status. The id is a freshly generated lowercase UUID, as the model's `UuidString` is
 //! constrained to, and the task and tool specs are kept so later reads see them.
 //!
+//! The status it is created in is [`crate::state::ActStatus::initial`]: an act is driven by
+//! the client, so one that has only just been stored has had no step taken on it and the
+//! next move is the caller's. The answer is read back off the stored record, so what a
+//! later read of the act reports and what this create answered cannot differ.
+//!
 //! All three parents are resolved first: an unknown definition name, run id or session id
 //! answers `ResourceNotFoundException` (404), and a run that is not running conflicts
 //! (409). A `clientToken` already seen replays the act it created.
@@ -271,16 +276,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let insertion_seq = state.next_insertion_seq();
         let act_id = state.mint_uuid();
+        // The model documents this member as the act's INITIAL status but names no value
+        // for it, so the status an act is created in is decided once, beside the status
+        // type itself, and STORED: what this create answers is read back off the stored
+        // record below, and every later read of the act reports the same thing.
         let act = crate::state::Act {
             act_id: act_id.clone(),
             task: input.task.clone(),
             tool_specs: input.tool_specs.clone().unwrap_or_default(),
-            // The model documents this member as the act's INITIAL status, and an act
-            // AWS has just accepted is running.
-            status: crate::state::ActStatus::Running,
+            status: crate::state::ActStatus::initial(),
             error: None,
             created_at: now,
-            // A running act has not ended and has no trace recorded for it yet.
+            // An act that has just been created has not finished, whichever status it
+            // starts in, and has no trace recorded for it yet.
             ended_at: None,
             trace_location: None,
             insertion_seq,

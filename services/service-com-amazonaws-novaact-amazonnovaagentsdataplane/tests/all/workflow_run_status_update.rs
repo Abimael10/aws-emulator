@@ -83,7 +83,10 @@ fn run_path(definition_name: &str, run_id: &str) -> String {
 }
 
 /// One `UpdateWorkflowRun` call asking for `status`.
-async fn move_to(
+///
+/// `pub(crate)` with the reader below so the sibling suite that drives a run through its
+/// terminal transition uses this harness rather than a second copy of it.
+pub(crate) async fn move_to(
     emulator: &Emulator,
     definition_name: &str,
     run_id: &str,
@@ -100,7 +103,7 @@ async fn move_to(
 
 /// The stored run read back through `GetWorkflowRun` — the implemented reader of a run — so
 /// nothing below can pass on what the update itself answered.
-async fn read_run(emulator: &Emulator, definition_name: &str, run_id: &str) -> Value {
+pub(crate) async fn read_run(emulator: &Emulator, definition_name: &str, run_id: &str) -> Value {
     let (status, body) = emulator
         .call("GET", &run_path(definition_name, run_id), None)
         .await;

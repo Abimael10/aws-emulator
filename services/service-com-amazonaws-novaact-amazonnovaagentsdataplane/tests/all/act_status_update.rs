@@ -45,6 +45,12 @@ pub(crate) const FINISHED_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "TIMED_O
 /// not an outcome submitted for an act that has already finished.
 pub(crate) const REPORTED_OUTCOMES: [&str; 2] = ["SUCCEEDED", "FAILED"];
 
+/// The status `CreateAct` stores a new act in: an act is driven by its client, so one that
+/// has only just been created has had no step taken on it and the next move is the
+/// caller's. Spelled out here rather than taken from the crate so a change to the handler's
+/// derivation cannot move both sides of the comparison at once.
+pub(crate) const INITIAL_ACT_STATUS: &str = "PENDING_CLIENT_ACTION";
+
 /// Whether `status` is one the act has finished in.
 fn finishes(status: &str) -> bool {
     FINISHED_STATUSES.contains(&status)
@@ -84,13 +90,16 @@ pub(crate) async fn chain(emulator: &Emulator, definition: &str) -> Chain {
     }
 }
 
-/// One new act under `chain`, created `RUNNING` as `CreateAct` reports it.
+/// One new act under `chain`, in the status `CreateAct` stores a new act in.
 pub(crate) async fn new_act(emulator: &Emulator, chain: &Chain, task: &str) -> String {
     let (status, body) = emulator
         .create_act(&chain.definition, &chain.run_id, &chain.session_id, task)
         .await;
     assert_eq!(status, 201, "the act must be created, got {status} {body}");
-    assert_eq!(body["status"], "RUNNING", "a new act is RUNNING, got {body}");
+    assert_eq!(
+        body["status"], INITIAL_ACT_STATUS,
+        "a new act is {INITIAL_ACT_STATUS}, got {body}"
+    );
     text(&body, "actId")
 }
 
@@ -502,11 +511,11 @@ async fn an_update_naming_a_resource_the_store_does_not_hold_is_a_404() {
         );
     }
 
-    // The act the rows above named is still RUNNING: nothing was written down a chain that
-    // did not resolve.
+    // The act the rows above named still holds the status it was created in: nothing was
+    // written down a chain that did not resolve.
     let stored = summary(&emulator, &chain, &act_id).await;
     assert_eq!(
-        stored["status"], "RUNNING",
+        stored["status"], INITIAL_ACT_STATUS,
         "the present act must be untouched, got {stored}"
     );
 }

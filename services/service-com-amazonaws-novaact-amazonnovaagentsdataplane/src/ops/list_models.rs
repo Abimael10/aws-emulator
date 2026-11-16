@@ -15,10 +15,13 @@
 //! `minimumCompatibilityVersion` whose lifecycle still admits use), so two callers at two
 //! versions are answered two compatibility views of the one catalog.
 //!
-//! ALIASES. Each published alias reports the model it currently points at
-//! (`latestModelId`) whoever asks, and a `resolvedModelId` only where THIS caller's
-//! version reaches that model: an alias resolves to the model the caller would actually
-//! run, and to nothing when the caller cannot run it.
+//! ALIASES. An alias is a stable reference a caller RESOLVES and then runs, so the aliases
+//! a response lists are exactly the ones THIS caller's version resolves: an alias whose
+//! target model the caller cannot use is not offered to it at all, and every alias that is
+//! offered reports both the model it points at (`latestModelId`) and the model this caller
+//! would actually run (`resolvedModelId`). So the alias list and
+//! `compatibilityInformation.supportedModelIds` are two views of one compatibility
+//! decision and cannot contradict each other inside one response.
 //!
 //! MESSAGE. `compatibilityInformation.message` carries additional information about
 //! compatibility requirements where there is any to give: a caller below every published
@@ -178,24 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A list of model IDs that are supported for the client compatibility version":
         // the published models this caller's version reaches, in the order the catalog
         // publishes them.
-        let supported_model_ids: Vec<String> = model_summaries
-            .iter()
-            .filter(|model| crate::state::model_catalog::usable_at(model, client_version))
-            .map(|model| model.model_id.clone())
-            .collect();
+        let supported_model_ids =
+            crate::state::model_catalog::usable_model_ids(client_version);
 
-        // "The resolved model ID after alias resolution" — resolution is the caller's,
-        // so an alias whose model this version cannot reach resolves to nothing while
-        // still reporting the model it points at.
-        let model_aliases = crate::state::model_catalog::aliases()
-            .into_iter()
-            .map(|alias| ModelAlias {
-                resolved_model_id: supported_model_ids
-                    .contains(&alias.latest_model_id)
-                    .then(|| alias.latest_model_id.clone()),
-                ..alias
-            })
-            .collect();
+        // The aliases this caller is offered: only those whose target model its version
+        // reaches, each resolved to that model. An alias is a reference the caller resolves
+        // and then runs, so offering one it cannot run would contradict the supported ids
+        // in the same response.
+        let model_aliases = crate::state::model_catalog::aliases_offered_at(client_version);
 
         // The compatibility note, only where there is something to say: a caller below
         // every published model's minimum cannot use the service at this version, so it

@@ -21,6 +21,8 @@ mod act_status_transition_refusal;
 mod act_status_update;
 #[path = "all/create_preconditions.rs"]
 mod create_preconditions;
+#[path = "all/derived_response_state.rs"]
+mod derived_response_state;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
 #[path = "all/identity_authorization.rs"]
