@@ -23,7 +23,8 @@
 //! wildcard action patterns, a grant of one action asked about another, several resources
 //! in one question, several policies in effect at once, the `policyNamesToAdd` /
 //! `policyNamesToSkip` overrides, the modelled 1..10 bound on `authInfos` and one past it,
-//! a policy variable with and without the context it needs, and each principal form.
+//! a policy variable with and without the context it needs, a question that names no
+//! `actionType` at all, and each principal form.
 
 use std::sync::Arc;
 
@@ -1446,4 +1447,198 @@ async fn a_request_past_the_evaluation_ceilings_is_refused() {
             );
         }
     }
+}
+
+/// `AuthInfo$actionType` is OPTIONAL while `resources` is required
+/// (`smithy_query(query="shape",shape="AuthInfo")`), so a question may name no action at
+/// all — and then it asks about no policy action, which no statement of a policy in effect
+/// can name. Such a question is therefore the implicit deny, naming every policy in effect
+/// as one that bore on nothing and nothing as having allowed it, however broadly those
+/// policies grant; the same resources asked about a named action are still decided against
+/// those same grants, and the result echoes the question it answers without inventing an
+/// `actionType` the request did not carry.
+#[tokio::test]
+async fn a_question_naming_no_action_type_is_decided_against_no_action() {
+    let emulator = Emulator::new();
+    let certificate = given_certificate(&emulator).await;
+
+    // Two policies in effect at once, the first granting EVERY IoT action on every
+    // resource, so what denies a question naming no action is the absent action alone.
+    given_attached_policy(
+        &emulator,
+        "grant-everything",
+        &statement("Allow", json!("iot:*"), json!("*")),
+        &certificate,
+    )
+    .await;
+    given_attached_policy(
+        &emulator,
+        "grant-one-topic",
+        &statement(
+            "Allow",
+            json!("iot:Publish"),
+            json!(topic_arn("yard/lights")),
+        ),
+        &certificate,
+    )
+    .await;
+
+    // The rule generalises over what a question names: each resource namespace an
+    // `ActionType` is authorized in, one resource and several, and no resource at all. The
+    // third column is the action that, when NAMED, decides those same resources.
+    let cases: Vec<(&str, Vec<String>, &str, &str)> = vec![
+        (
+            "one topic/ ARN",
+            vec![topic_arn("yard/lights")],
+            "PUBLISH",
+            "ALLOWED",
+        ),
+        (
+            "one topicfilter/ ARN",
+            vec![topic_filter_arn("yard/#")],
+            "SUBSCRIBE",
+            "ALLOWED",
+        ),
+        (
+            "one client/ ARN",
+            vec![client_arn("yard-lamp")],
+            "CONNECT",
+            "ALLOWED",
+        ),
+        (
+            "two topic/ ARNs",
+            vec![topic_arn("yard/lights"), topic_arn("yard/water")],
+            "RECEIVE",
+            "ALLOWED",
+        ),
+        ("no resource at all", Vec::new(), "PUBLISH", "IMPLICIT_DENY"),
+    ];
+
+    let in_effect = vec!["grant-everything".to_string(), "grant-one-topic".to_string()];
+
+    for (label, resources, action_type, named_decision) in &cases {
+        let unnamed = emulator
+            .test_authorization(
+                &json!({
+                    "principal": certificate,
+                    "authInfos": [{ "resources": resources }],
+                }),
+                None,
+            )
+            .await;
+        assert_eq!(
+            unnamed.status, 200,
+            "case {label}: TestAuthorization must answer 200, got {} {:?}",
+            unnamed.status, unnamed.body
+        );
+        let decided = unnamed.decision();
+        assert_eq!(
+            decided.decision, "IMPLICIT_DENY",
+            "case {label}: a question naming no actionType expected IMPLICIT_DENY, got \
+             {:?} ({:?})",
+            decided.decision, unnamed.body
+        );
+        assert!(
+            decided.allowed.is_empty(),
+            "case {label}: nothing allowed a question no statement bore on, got {:?}",
+            decided.allowed
+        );
+        assert!(
+            decided.explicit_deny.is_empty(),
+            "case {label}: no statement denied it explicitly, got {:?}",
+            decided.explicit_deny
+        );
+        assert_eq!(
+            decided.implicit_deny, in_effect,
+            "case {label}: expected implicitDeny to name the policies in effect {:?}, got \
+             {:?}",
+            in_effect, decided.implicit_deny
+        );
+        assert_eq!(
+            decided.auth_info,
+            json!({ "resources": resources }),
+            "case {label}: the echoed question must carry no actionType, got {:?}",
+            decided.auth_info
+        );
+
+        // Asked about a NAMED action, the very same resources are decided against those
+        // grants: what the question above lacked is the action, not a grant.
+        let named = emulator.ask(&certificate, action_type, resources).await;
+        assert_eq!(
+            named.status, 200,
+            "case {label} with actionType {action_type}: TestAuthorization must answer \
+             200, got {} {:?}",
+            named.status, named.body
+        );
+        let decided_named = named.decision();
+        assert_eq!(
+            decided_named.decision, *named_decision,
+            "case {label} with actionType {action_type}: expected {named_decision}, got \
+             {:?} ({:?})",
+            decided_named.decision, named.body
+        );
+        if *named_decision == "ALLOWED" {
+            assert!(
+                decided_named.allowed.contains(&"grant-everything".to_string()),
+                "case {label} with actionType {action_type}: the grant of every action \
+                 must be named as allowing it, got {:?}",
+                decided_named.allowed
+            );
+        }
+    }
+
+    // One request may mix the two kinds of question, and each answer still belongs to the
+    // question at its own index.
+    let mixed = emulator
+        .test_authorization(
+            &json!({
+                "principal": certificate,
+                "authInfos": [
+                    { "actionType": "PUBLISH", "resources": [topic_arn("yard/lights")] },
+                    { "resources": [topic_arn("yard/lights")] },
+                    { "actionType": "CONNECT", "resources": [client_arn("yard-lamp")] },
+                ],
+            }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        mixed.status, 200,
+        "case a request mixing named and unnamed actions: TestAuthorization must answer \
+         200, got {} {:?}",
+        mixed.status, mixed.body
+    );
+    let decisions: Vec<String> = mixed
+        .decisions()
+        .into_iter()
+        .map(|decided| decided.decision)
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            "ALLOWED".to_string(),
+            "IMPLICIT_DENY".to_string(),
+            "ALLOWED".to_string(),
+        ],
+        "case a request mixing named and unnamed actions: each answer must decide the \
+         question at its own index, got {:?}",
+        mixed.body
+    );
+
+    // Deciding is a READ: the relation the decisions were computed from is the relation
+    // they leave behind.
+    let attached = emulator.list_attached_policies(&certificate).await;
+    assert_eq!(
+        attached.status, 200,
+        "ListAttachedPolicies must answer 200 after the decisions, got {} {:?}",
+        attached.status, attached.body
+    );
+    let mut still_attached = policy_member(&attached.body, &[], "policyName");
+    still_attached.sort();
+    assert_eq!(
+        still_attached, in_effect,
+        "the attachment relation must be unchanged by a decision, expected {in_effect:?}, \
+         got {:?}",
+        attached.body
+    );
 }
