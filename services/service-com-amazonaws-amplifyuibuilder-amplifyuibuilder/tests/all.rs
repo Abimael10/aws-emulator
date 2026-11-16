@@ -104,6 +104,9 @@ mod resource_tagging;
 #[path = "all/response_front_door.rs"]
 mod response_front_door;
 
+#[path = "all/shared_page_bound.rs"]
+mod shared_page_bound;
+
 #[path = "all/shared_page_walk.rs"]
 mod shared_page_walk;
 

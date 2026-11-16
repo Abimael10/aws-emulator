@@ -162,19 +162,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `maxResults` targets `ListCodegenJobsLimit`, modelled `@range(min: 1,
-        // max: 100)` with `@default(100)`, so the request walk has already filled
-        // the default in and refused anything outside the range before this
-        // handler ran. The `clamp` states that invariant rather than correcting a
-        // caller — a value reaching here outside the range is a validator bug,
-        // which the debug assertion surfaces.
-        let requested = input.max_results;
-        debug_assert!(
-            (1..=crate::state::CODEGEN_JOB_PAGE_LIMIT).contains(&requested),
-            "maxResults {requested} should have been refused at the boundary"
+        // The page bound this list serves under, from the service's one
+        // page-bound derivation (`crate::state::page_bound`): `maxResults`
+        // targets `ListCodegenJobsLimit`, modelled `@range(min: 1, max: 100)`
+        // with `@default(100)`, so the request walk has already filled that
+        // default in and the member arrives here present.
+        let page_size = crate::state::page_bound(
+            Some(input.max_results),
+            crate::state::CODEGEN_JOB_PAGE_LIMIT,
         );
-        let page_size = usize::try_from(requested.clamp(1, crate::state::CODEGEN_JOB_PAGE_LIMIT))
-            .expect("a page size clamped into 1..=100 fits in usize");
 
         let key = (input.app_id.clone(), input.environment_name.clone());
         let mut store = state.lock();

@@ -67,6 +67,11 @@
 //! them, and the collection a token belongs to is read off the record kind the
 //! walk runs over rather than restated by each handler.
 //!
+//! The BOUND that walk serves under comes from [`page_bound`], the one place the
+//! page size of a list is derived: a list hands it the `maxResults` the request
+//! named and its own ceiling, so the page size a request naming none is served
+//! cannot drift between two of the lists either.
+//!
 //! ## The third-party token surface
 //!
 //! `RefreshToken` answers with an ACCESS TOKEN for a third-party provider, so the
@@ -1809,6 +1814,32 @@ impl UnknownPageToken {
             self.0
         )
     }
+}
+
+/// The page bound one of this service's paginated lists serves under: the
+/// `maxResults` the request named, or `limit` when it named none.
+///
+/// The one page-bound derivation of this service, shared by every list that
+/// models a `maxResults` and handed straight to [`page_of`]: a request that
+/// names no page size is served the largest page that operation's limit allows,
+/// so the default page size cannot drift between two of the lists the way it
+/// would if each handler filled it in. `limit` is the operation's own ceiling —
+/// [`LIST_ENTITY_PAGE_LIMIT`] for the entity lists, [`CODEGEN_JOB_PAGE_LIMIT`]
+/// for the codegen-job list — which is the maximum of the `@range` the member's
+/// target shape is modelled with.
+///
+/// The boundary validator refused anything outside that range before a handler
+/// ran, so the `clamp` states that invariant rather than correcting a caller: a
+/// value arriving here outside `1..=limit` is a validator bug, which the debug
+/// assertion surfaces.
+pub fn page_bound(max_results: Option<i32>, limit: i32) -> usize {
+    let requested = max_results.unwrap_or(limit);
+    debug_assert!(
+        (1..=limit).contains(&requested),
+        "maxResults {requested} should have been refused at the boundary"
+    );
+    usize::try_from(requested.clamp(1, limit))
+        .expect("a page size clamped into 1..=limit fits in usize")
 }
 
 /// One page of `records`, resumed at `next_token` and at most `page_size` long,
