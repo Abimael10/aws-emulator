@@ -756,6 +756,23 @@ impl ResourceTransition {
             ..Self::finished(resource, status, Some(reason))
         }
     }
+
+    /// The same transition, reporting the properties the deployment ASKED the owning service
+    /// for rather than the ones the resource carries now.
+    ///
+    /// `StackEvent$ResourceProperties` is "BLOB of the properties used to create the
+    /// resource": what each event reports is the declaration THIS transition applied. For a
+    /// resource the stack already has, the record carries the configuration really in force
+    /// until the owning service has taken the new one ([`carry_forward`]) — so a transition of
+    /// a change in flight, and the failed transition of a change that service refused, would
+    /// otherwise report the document the deployment was replacing instead of the one it
+    /// submitted, and a client reading the event stream of a failed update could not see what
+    /// was asked for. The revert of such a change reports the configuration IT applies, which
+    /// is the one in force, so nothing there goes through here.
+    fn applying(mut self, properties: &::serde_json::Value) -> Self {
+        self.resource_properties = super::template::properties_blob(properties);
+        self
+    }
 }
 
 /// The statuses one resource's transitions are reported under in the walk that CREATES it,
@@ -2033,10 +2050,13 @@ pub async fn reconcile(
                 // path there has nothing asked of its service, and the change is reported
                 // as NOT applied rather than as a success that dropped the caller's
                 // change.
-                outcome.transitions.push(ResourceTransition::starting(
-                    &resource,
-                    super::resource_status::UPDATE_IN_PROGRESS,
-                ));
+                outcome.transitions.push(
+                    ResourceTransition::starting(
+                        &resource,
+                        super::resource_status::UPDATE_IN_PROGRESS,
+                    )
+                    .applying(&declared_properties),
+                );
                 // A CUSTOM RESOURCE's changed declaration is applied by its PROVIDER, not by
                 // an owning service: the `Update` request carries the resource's current
                 // `PhysicalResourceId` and the `OldResourceProperties` it was last declared
@@ -2055,11 +2075,14 @@ pub async fn reconcile(
                             resource.logical_id.clone(),
                             super::failed_action::UPDATE,
                         ));
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            super::resource_status::UPDATE_FAILED,
-                            Some(reason.to_string()),
-                        ));
+                        outcome.transitions.push(
+                            ResourceTransition::finished(
+                                &resource,
+                                super::resource_status::UPDATE_FAILED,
+                                Some(reason.to_string()),
+                            )
+                            .applying(&declared_properties),
+                        );
                         outcome.resources.push(resource);
                         continue;
                     }
@@ -2109,15 +2132,18 @@ pub async fn reconcile(
                                 resource.logical_id.clone(),
                                 super::failed_action::UPDATE,
                             ));
-                            outcome.transitions.push(ResourceTransition::finished(
-                                &resource,
-                                super::resource_status::UPDATE_FAILED,
-                                Some(handler_failure_reason(
-                                    None,
-                                    &refusal,
-                                    &resource.physical_resource_id,
-                                )),
-                            ));
+                            outcome.transitions.push(
+                                ResourceTransition::finished(
+                                    &resource,
+                                    super::resource_status::UPDATE_FAILED,
+                                    Some(handler_failure_reason(
+                                        None,
+                                        &refusal,
+                                        &resource.physical_resource_id,
+                                    )),
+                                )
+                                .applying(&declared_properties),
+                            );
                             outcome.resources.push(resource);
                             continue;
                         }
@@ -2141,11 +2167,14 @@ pub async fn reconcile(
                 .await
                 {
                     failed.push((resource.logical_id.clone(), super::failed_action::UPDATE));
-                    outcome.transitions.push(ResourceTransition::finished(
-                        &resource,
-                        super::resource_status::UPDATE_FAILED,
-                        Some(reason),
-                    ));
+                    outcome.transitions.push(
+                        ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_FAILED,
+                            Some(reason),
+                        )
+                        .applying(&declared_properties),
+                    );
                     Box::pin(roll_back_failed_resource(
                         ctx,
                         region,
@@ -2286,11 +2315,14 @@ pub async fn reconcile(
                                     resource.logical_id.clone(),
                                     super::failed_action::UPDATE,
                                 ));
-                                outcome.transitions.push(ResourceTransition::finished(
-                                    &resource,
-                                    super::resource_status::UPDATE_FAILED,
-                                    Some(reason),
-                                ));
+                                outcome.transitions.push(
+                                    ResourceTransition::finished(
+                                        &resource,
+                                        super::resource_status::UPDATE_FAILED,
+                                        Some(reason),
+                                    )
+                                    .applying(&declared_properties),
+                                );
                                 Box::pin(roll_back_failed_resource(
                                     ctx,
                                     region,
@@ -2332,11 +2364,14 @@ pub async fn reconcile(
                             resource.logical_id.clone(),
                             super::failed_action::UPDATE,
                         ));
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            super::resource_status::UPDATE_FAILED,
-                            Some(unsupported),
-                        ));
+                        outcome.transitions.push(
+                            ResourceTransition::finished(
+                                &resource,
+                                super::resource_status::UPDATE_FAILED,
+                                Some(unsupported),
+                            )
+                            .applying(&declared_properties),
+                        );
                         Box::pin(roll_back_failed_resource(
                             ctx,
                             region,
@@ -2357,15 +2392,18 @@ pub async fn reconcile(
                             resource.logical_id.clone(),
                             super::failed_action::UPDATE,
                         ));
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            super::resource_status::UPDATE_FAILED,
-                            Some(handler_failure_reason(
-                                owner_for(&resource.resource_type),
-                                &refusal,
-                                &resource.physical_resource_id,
-                            )),
-                        ));
+                        outcome.transitions.push(
+                            ResourceTransition::finished(
+                                &resource,
+                                super::resource_status::UPDATE_FAILED,
+                                Some(handler_failure_reason(
+                                    owner_for(&resource.resource_type),
+                                    &refusal,
+                                    &resource.physical_resource_id,
+                                )),
+                            )
+                            .applying(&declared_properties),
+                        );
                         Box::pin(roll_back_failed_resource(
                             ctx,
                             region,

@@ -348,10 +348,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ...and the outputs an `Fn::GetStackOutput` in it reads off the stacks of that
             // Region, read in the same breath and for the same reason.
             let stack_outputs = store.stack_output_values(&request_region);
-            // ...and which of the stack's own exports another live stack IMPORTS: an export
-            // in use is PINNED, so an execution that would withdraw one is cancelled rather
-            // than carried out ([`crate::state::exports`]).
-            let importers = store.importers_by_export(&request_region);
             // ...and which physical names the live stacks of the Region manage, read in the
             // same breath: a resource this execution CREATES under a name another stack owns
             // fails in CloudFormation's own words ([`crate::state::physical_name`]).
@@ -743,20 +739,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 stack.fail_pending_transition(failed, reason);
             }
-            // An exported output value another live stack still IMPORTS cannot be withdrawn,
-            // whichever call deploys the template that would withdraw it: executing a change
-            // set against the publishing stack is cancelled exactly as `UpdateStack` is,
-            // naming the export and the stack that still imports it
-            // ([`crate::state::exports`]).
-            let withdraws_an_export_in_use = stack
-                .in_use_export_withdrawn(&importers)
-                .map(|(export_name, importing_stack_name)| {
-                    crate::state::exports::canceled_reason(
-                        crate::state::exports::CanceledOperation::Update,
-                        &export_name,
-                        &importing_stack_name,
-                    )
-                });
             // "The intrinsic function Fn::ImportValue returns the value of an output
             // exported by another stack": an export name no live stack of this account and
             // Region publishes has no value to import, so CloudFormation refuses the
@@ -765,9 +747,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             //
             // ...and so is a rollback its triggers already force, read before this block was
             // entered: the execution takes its failed status and is rolled back having
-            // deployed nothing, exactly as every refusal CloudFormation itself reaches is.
-            let refused_deployment = withdraws_an_export_in_use
-                .or_else(|| stack.unresolved_cross_stack_failure())
+            // deployed nothing, exactly as every refusal CloudFormation itself reaches is. An
+            // export another live stack IMPORTS is NOT one of them: the exports a deployment
+            // publishes are installed when it completes, so that rule is decided where it
+            // would publish them, after the resources have been changed (below).
+            let refused_deployment = stack
+                .unresolved_cross_stack_failure()
                 .or(firing_triggers);
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
@@ -913,6 +898,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // within a Region", so a name another stack holds is one this execution cannot
             // publish ([`crate::state::StoredStack::conflicting_export`]).
             let publishers = store.exporting_stacks(&request_region);
+            // ...and which of this stack's exports another live stack IMPORTS, read in the
+            // same breath and for the same reason: an export in use is PINNED, so an
+            // execution that would withdraw one is cancelled at that same stage
+            // ([`crate::state::exports`]).
+            let importers = store.importers_by_export(&request_region);
             match store.resolve_mut(&request_region, &stack_id) {
                 None => None,
                 Some(stack) => {
@@ -952,7 +942,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // stack of the Region already publishes fails it here.
                     let failure = materialised
                         .failure
-                        .or_else(|| stack.conflicting_export(&publishers));
+                        .or_else(|| stack.conflicting_export(&publishers))
+                        // ...and so does an export another live stack still IMPORTS,
+                        // whichever call deploys the template that would withdraw it:
+                        // executing a change set against the publishing stack is cancelled
+                        // exactly as `UpdateStack` is, naming the export and the stack that
+                        // still imports it, and rolled back below.
+                        .or_else(|| {
+                            stack.in_use_export_withdrawn(&importers).map(
+                                |(export_name, importing_stack_name)| {
+                                    crate::state::exports::canceled_reason(
+                                        crate::state::exports::CanceledOperation::Update,
+                                        &export_name,
+                                        &importing_stack_name,
+                                    )
+                                },
+                            )
+                        });
                     match failure {
                         None => {
                             // The execution got through its calls to the owning services and

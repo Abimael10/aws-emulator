@@ -12,6 +12,12 @@
 //! through, which is why what this module computes is a `StackStatusReason` and not a
 //! refusal of a request.
 //!
+//! WHEN a deployment is cancelled follows from when its exports would be published: they are
+//! installed as the operation COMPLETES, so the rule is decided at that stage — the
+//! deployment's own work is carried out, and the cancellation is what fails it and rolls it
+//! back, putting the resources it had already changed back as they were. That is also the
+//! stage the other rule about an export name is decided at, below.
+//!
 //! Both halves of the relation are derived from the stacks themselves ([`crate::state`]):
 //! an export is what a live stack's output declares an `Export` name for, and an import is
 //! what a live stack's deployed template resolved against one ([`StoredStack::imports`]).
@@ -195,7 +201,10 @@ impl StoredStack {
     /// THIS stack imports: the pin protects the cross-stack reference another stack holds.
     ///
     /// `importers` is [`ComAmazonawsCloudformationCloudformationState::importers_by_export`]
-    /// for this stack's Region, read before the stack was resolved for writing.
+    /// for this stack's Region, read before the stack was resolved for writing — and read
+    /// where the deployment would PUBLISH its exports, which is after its resources have been
+    /// changed: an importer that appeared while the deployment was running holds the export
+    /// just as one that was already there does.
     pub fn in_use_export_withdrawn(
         &self,
         importers: &BTreeMap<String, Vec<ImportingStack>>,

@@ -1163,11 +1163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ...and the outputs an `Fn::GetStackOutput` in it reads off the stacks of that
             // Region, read in the same breath and for the same reason.
             let stack_outputs = store.stack_output_values(&request_region);
-            // ...and which of this stack's exports another live stack IMPORTS, read in the
-            // same breath and for the same reason: an export in use is PINNED, so an update
-            // that would stop publishing it, or publish another value under it, is the one
-            // CloudFormation cancels ([`crate::state::exports`]).
-            let importers = store.importers_by_export(&request_region);
             // ...and which physical names the live stacks of the Region manage, read in the
             // same breath: a resource this update CREATES under a name another stack owns
             // fails in CloudFormation's own words ([`crate::state::physical_name`]).
@@ -1301,28 +1296,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(reason) = cannot_deploy {
                 stack.fail_pending_transition(status::UPDATE_FAILED, reason);
             }
-            // An exported output value another live stack still IMPORTS cannot be withdrawn:
-            // the importing stack resolved its `Fn::ImportValue` against the value this
-            // stack publishes, so an update that stops publishing that export — or publishes
-            // a different value under it — would break the reference. The model declares no
-            // error for it, so the CALL is accepted and the UPDATE is what is cancelled:
-            // CloudFormation refuses the deployment before anything is asked of the services
-            // that own the resources, naming the export and the stack that still imports it,
-            // and the update is rolled back below ([`crate::state::exports`]).
-            let withdraws_an_export_in_use = stack
-                .in_use_export_withdrawn(&importers)
-                .map(|(export_name, importing_stack_name)| {
-                    crate::state::exports::canceled_reason(
-                        crate::state::exports::CanceledOperation::Update,
-                        &export_name,
-                        &importing_stack_name,
-                    )
-                });
             // "The intrinsic function Fn::ImportValue returns the value of an output
             // exported by another stack": an export name no live stack of this account and
             // Region publishes has no value to import, so CloudFormation refuses the
             // deployment before anything is asked of the services that own the resources —
             // the update then fails naming the export and is rolled back below.
+            //
+            // An exported output value another live stack still IMPORTS is a rule of the
+            // other stage: the exports an update publishes are installed when it COMPLETES,
+            // so that one is decided where the update would publish them, after its resources
+            // have been changed (below, beside the export-name uniqueness rule).
             let unresolved_cross_stack = stack.unresolved_cross_stack_failure();
             // "Set to true to disable pre-deployment validations in [...] stack
             // operations", default false: with them ON, a declaration whose properties its
@@ -1363,9 +1346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already refused is not reported as failing this stage too: the first refusal
             // is its one diagnostic.
             let name_conflict = name_conflict.filter(|_| {
-                withdraws_an_export_in_use.is_none()
-                    && unresolved_cross_stack.is_none()
-                    && property_failure.is_none()
+                unresolved_cross_stack.is_none() && property_failure.is_none()
             });
             if let Some(conflicting) = &name_conflict {
                 stack.record_validation_failure(
@@ -1397,11 +1378,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ...and whether that stage is what refused THIS deployment, known here rather
             // than re-derived from the reason text below: a refusal reached before it stands
             // instead.
-            let refused_by_validation = withdraws_an_export_in_use.is_none()
-                && unresolved_cross_stack.is_none()
-                && failed_validation.is_some();
-            let refused_deployment = withdraws_an_export_in_use
-                .or(unresolved_cross_stack)
+            let refused_by_validation =
+                unresolved_cross_stack.is_none() && failed_validation.is_some();
+            let refused_deployment = unresolved_cross_stack
                 .or(failed_validation)
                 // ...and the rollback an alarm already in `ALARM` forces, read before this
                 // block was entered: it rolls the operation back having changed nothing.
@@ -1505,6 +1484,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // within a Region", so a name another stack holds is one this update cannot
             // publish ([`crate::state::StoredStack::conflicting_export`]).
             let publishers = store.exporting_stacks(&request_region);
+            // ...and which of this stack's exports another live stack IMPORTS, read in the
+            // same breath and for the same reason: an export in use is PINNED, so an update
+            // that would stop publishing it, or publish another value under it, is one
+            // CloudFormation cancels at this same stage ([`crate::state::exports`]).
+            let importers = store.importers_by_export(&request_region);
             let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
                 return Ok(output);
             };
@@ -1530,7 +1514,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // publishes fails it here rather than at the request, which was perfectly valid.
             let failure = materialised
                 .failure
-                .or_else(|| stack.conflicting_export(&publishers));
+                .or_else(|| stack.conflicting_export(&publishers))
+                // ...and so does an export another live stack still IMPORTS: the importing
+                // stack resolved its `Fn::ImportValue` against the value this stack
+                // publishes, so an update that would stop publishing that export — or
+                // publish a different value under it — would break the reference. The model
+                // declares no error for it, so the CALL is accepted and the UPDATE is what is
+                // CANCELLED: it is carried out, then failed naming the export and the stack
+                // that still imports it, and rolled back below — which is what puts the
+                // resources it had already changed back as they were.
+                .or_else(|| {
+                    stack.in_use_export_withdrawn(&importers).map(
+                        |(export_name, importing_stack_name)| {
+                            crate::state::exports::canceled_reason(
+                                crate::state::exports::CanceledOperation::Update,
+                                &export_name,
+                                &importing_stack_name,
+                            )
+                        },
+                    )
+                });
             if let Some(failure) = failure {
                 // The deployment could not be carried out: the update does not reach
                 // UPDATE_COMPLETE, and the stack reports what failed

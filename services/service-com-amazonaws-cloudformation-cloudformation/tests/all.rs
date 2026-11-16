@@ -783,3 +783,7 @@ mod private_macro_change_sets;
 mod rest_api_redeployment;
 #[path = "all/replacement_update_retention.rs"]
 mod replacement_update_retention;
+#[path = "all/canceled_export_update_events.rs"]
+mod canceled_export_update_events;
+#[path = "all/failed_update_event_properties.rs"]
+mod failed_update_event_properties;
