@@ -953,17 +953,18 @@ async fn a_session_for_a_resource_the_control_plane_lacks_is_not_found() {
     }
 }
 
-/// A poll serves the configuration ITS OWN profile has in force: once the deployment a
-/// session was started over has been undone, that profile has nothing in force in the
-/// environment — a deployment of another profile there is not what this session polls —
-/// so there is nothing to serve and the refusal is the modelled
-/// `ResourceNotFoundException` naming the `Configuration`.
+/// A session is over the configuration ITS OWN profile has in service: once the only
+/// deployment of that profile has been undone, the profile has nothing in service in the
+/// environment — a deployment of ANOTHER profile there is not what this session would poll —
+/// so there is nothing for a session to be over and the mint is refused with the modelled
+/// `ResourceNotFoundException` naming the `Deployment`.
 ///
-/// Having BEEN deployed (which is what lets the session be started at all) and having a
-/// configuration in force (which is what a poll serves) are two different questions, and
-/// this is the case that separates them.
+/// Holding a deployment RECORD and having a configuration in service are two different
+/// questions, and this is the case that separates them: the undone profile holds a record of
+/// its own and a sibling profile's deployment stands in the same environment, and neither
+/// lends it a session.
 #[tokio::test]
-async fn a_poll_with_nothing_in_force_for_its_profile_is_not_found() {
+async fn a_profile_whose_only_deployment_was_undone_gets_no_session() {
     let emulator = Emulator::new();
     let hierarchy = emulator
         .create_hierarchy("MyApp", "Prod", "MyProfile")
@@ -981,8 +982,8 @@ async fn a_poll_with_nothing_in_force_for_its_profile_is_not_found() {
         )
         .await;
     // OtherProfile is deployed and then that deployment is undone, so the profile has a
-    // deployment but no configuration in force, while MyProfile's deployment — another
-    // profile's, in the same environment — stays in force throughout.
+    // deployment record but nothing in service, while MyProfile's deployment — another
+    // profile's, in the same environment — stays in service throughout.
     let undone = emulator
         .deploy_numbered(
             &hierarchy,
@@ -995,18 +996,19 @@ async fn a_poll_with_nothing_in_force_for_its_profile_is_not_found() {
     emulator.stop_deployment(&hierarchy, undone).await;
 
     let cases: &[(&str, &str)] = &[
-        ("a profile with nothing in force, named by name", "OtherProfile"),
+        ("a profile with nothing in service, named by name", "OtherProfile"),
         ("the same profile named by id", &other_profile),
     ];
     for (name, profile) in cases {
-        let token = emulator
-            .session_token(
-                &hierarchy.application_name,
-                &hierarchy.environment_name,
-                profile,
-            )
+        let application = &hierarchy.application_name;
+        let environment = &hierarchy.environment_name;
+        let reply = emulator
+            .start_configuration_session(&format!(
+                r#"{{"ApplicationIdentifier":"{application}",
+                      "EnvironmentIdentifier":"{environment}",
+                      "ConfigurationProfileIdentifier":"{profile}"}}"#
+            ))
             .await;
-        let reply = emulator.get_latest_configuration(&token).await;
         assert_eq!(
             reply.status, 404,
             "case {name}: expected 404, got {} body {}",
@@ -1021,17 +1023,40 @@ async fn a_poll_with_nothing_in_force_for_its_profile_is_not_found() {
         );
         assert_eq!(
             reply.json()["ResourceType"].as_str(),
-            Some("Configuration"),
-            "case {name}: expected the Configuration resource type, got {}",
+            Some("Deployment"),
+            "case {name}: expected the Deployment resource type, got {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.json()["Message"].as_str(),
+            Some("Deployment not found"),
+            "case {name}: expected the whole fixed message, got {}",
             reply.text()
         );
         assert!(
-            reply.json()["ReferencedBy"].is_null(),
-            "case {name}: a poll names no resource parameter of its own, so ReferencedBy \
-             must be absent, got {}",
+            reply.json()["InitialConfigurationToken"].is_null(),
+            "case {name}: a refused session mints no token, got {}",
             reply.text()
         );
     }
+
+    // The sibling profile, whose deployment DID put a configuration in service, still gets
+    // a session over it: the refusal above is about the profile, not about the environment.
+    let token = emulator
+        .session_token(
+            &hierarchy.application_name,
+            &hierarchy.environment_name,
+            &hierarchy.profile_name,
+        )
+        .await;
+    let served = emulator.get_latest_configuration(&token).await;
+    assert_eq!(
+        served.status,
+        200,
+        "the sibling profile's session must still serve its configuration, got {} body {}",
+        served.status,
+        served.text()
+    );
 }
 
 /// How a token is made unusable before the poll that uses it.

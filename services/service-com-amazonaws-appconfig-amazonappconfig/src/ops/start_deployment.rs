@@ -338,6 +338,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let started_at = std::time::SystemTime::now();
+        // A deployment whose environment's monitored CloudWatch alarms have already made a
+        // rollback due is rolled back before this call decides whether the environment is
+        // still working on one: that breach fell due at an instant that has passed, so a
+        // deployment the alarm already ended does not block the one being asked for.
+        crate::state::alarm_monitors::settle(&*self.engine, started_at);
         let region = crate::state::request_region(ctx.parts());
         let dynamic_parameters = input
             .dynamic_extension_parameters

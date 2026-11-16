@@ -119,7 +119,7 @@ const ROWS: &[Row] = &[
         level: Level::Environment,
         growth_factor: 100.0,
         stopped: false,
-        expected_state: "Complete",
+        expected_state: "COMPLETE",
         expected_types: &["OnDeploymentStart", "OnDeploymentComplete"],
     },
     Row {
@@ -127,7 +127,7 @@ const ROWS: &[Row] = &[
         level: Level::ConfigurationProfile,
         growth_factor: 50.0,
         stopped: false,
-        expected_state: "Complete",
+        expected_state: "COMPLETE",
         expected_types: &["OnDeploymentStart", "OnDeploymentComplete"],
     },
     Row {
@@ -135,7 +135,7 @@ const ROWS: &[Row] = &[
         level: Level::Application,
         growth_factor: 10.0,
         stopped: true,
-        expected_state: "RolledBack",
+        expected_state: "ROLLED_BACK",
         expected_types: &["OnDeploymentStart", "OnDeploymentRolledBack"],
     },
 ];

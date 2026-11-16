@@ -300,6 +300,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
+        // A deployment whose environment's monitored CloudWatch alarms have already made a
+        // rollback due is rolled back before this stop is judged against its state: that
+        // breach fell due at an instant that has passed, so the stop is answered about the
+        // state the clock had already put the deployment in.
+        crate::state::alarm_monitors::settle(&*self.engine, now);
         let mut store = state.lock();
         let allow_revert = input.allow_revert.unwrap_or(false);
 

@@ -180,7 +180,7 @@ fn read_deployment_state(case: &str, body: &Value) -> String {
 /// The terminal `DeploymentState` a stop of a deployment in progress leaves behind: the
 /// stop settles the rollback it performs, so there is no transitional state for a reader
 /// to catch. Spelled as the value `Deployment$State` goes on the wire as.
-const ROLLED_BACK: &str = "RolledBack";
+const ROLLED_BACK: &str = "ROLLED_BACK";
 
 /// The MEMBER NAME of [`ROLLED_BACK`], which is the form a refusal's sentence spells a
 /// state in.
@@ -279,7 +279,7 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
         let at_start = member(&start_body, "State");
         let at_start = at_start.as_str().unwrap_or_default();
         assert!(
-            matches!(at_start, "Deploying" | "Baking"),
+            matches!(at_start, "DEPLOYING" | "BAKING"),
             "case {case:?}: this row's strategy must leave the deployment in progress, got \
              {at_start:?}"
         );
@@ -431,12 +431,12 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
         &application,
         &environment,
         1,
-        &["Complete"],
+        &["COMPLETE"],
     )
     .await;
     assert_eq!(
         member(&start_body, "State").as_str(),
-        Some("Complete"),
+        Some("COMPLETE"),
         "a deployment nobody stopped completes on its own, got {}",
         member(&start_body, "State")
     );
@@ -468,7 +468,7 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
         let read_back = get_deployment(&router, &application, &environment, 1).await.json();
         assert_eq!(
             member(&read_back, "State").as_str(),
-            Some("Complete"),
+            Some("COMPLETE"),
             "case {case:?}: a refused stop leaves the deployment where it was, got {}",
             member(&read_back, "State")
         );
@@ -499,7 +499,7 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
     let revert_body = reverted.json();
     assert_eq!(
         member(&revert_body, "State").as_str(),
-        Some("Reverted"),
+        Some("REVERTED"),
         "case {case:?}: a reverted deployment reports the reverted state, got {}",
         member(&revert_body, "State")
     );
@@ -530,7 +530,7 @@ async fn a_completed_deployment_is_reverted_only_when_the_request_allows_it() {
     let read_back = get_deployment(&router, &application, &environment, 1).await.json();
     assert_eq!(
         member(&read_back, "State").as_str(),
-        Some("Reverted"),
+        Some("REVERTED"),
         "case {case:?}: GetDeployment must report the state the revert wrote, got {}",
         member(&read_back, "State")
     );

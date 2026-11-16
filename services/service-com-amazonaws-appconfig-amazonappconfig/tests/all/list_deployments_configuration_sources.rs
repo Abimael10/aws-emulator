@@ -302,7 +302,7 @@ async fn deploy_every_source(
             application,
             environment,
             deployment_number,
-            &["Complete"],
+            &["COMPLETE"],
         )
         .await;
         deployed.push(Deployed {

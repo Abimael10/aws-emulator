@@ -66,12 +66,12 @@ const SAMPLE_AFTER: usize = 8;
 /// a float on the wire, so readings are compared with slack rather than for bit equality.
 const PERCENTAGE_SLACK: f64 = 0.01;
 
-/// The `DeploymentState` a rollout nobody stopped ends in, in the CamelCase form the
-/// enum's members go on the wire as.
-const COMPLETE: &str = "Complete";
+/// The `DeploymentState` a rollout nobody stopped ends in. The enum's members carry no
+/// `@enumValue` trait, so each goes on the wire as its own name.
+const COMPLETE: &str = "COMPLETE";
 
 /// The `DeploymentState` values a deployment stops at, after which it advances no further.
-const TERMINAL_STATES: &[&str] = &["Complete", "RolledBack", "Reverted"];
+const TERMINAL_STATES: &[&str] = &["COMPLETE", "ROLLED_BACK", "REVERTED"];
 
 /// One rollout to watch: the strategy pacing it and the cumulative percentage of targets
 /// each of its growth steps reaches.

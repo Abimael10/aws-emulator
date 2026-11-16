@@ -323,7 +323,7 @@ const PLAN: [Planned; 5] = [
         version: "1",
         description: None,
         revert: false,
-        expected_state: "Complete",
+        expected_state: "COMPLETE",
     },
     Planned {
         case: "a deployment named by version label",
@@ -331,7 +331,7 @@ const PLAN: [Planned; 5] = [
         version: "v2-beta",
         description: Some("the labelled revision"),
         revert: false,
-        expected_state: "Complete",
+        expected_state: "COMPLETE",
     },
     Planned {
         case: "a deployment of an unlabelled version",
@@ -343,7 +343,7 @@ const PLAN: [Planned; 5] = [
         version: "3",
         description: Some(""),
         revert: false,
-        expected_state: "Complete",
+        expected_state: "COMPLETE",
     },
     Planned {
         case: "a completed deployment the caller reverted",
@@ -351,7 +351,7 @@ const PLAN: [Planned; 5] = [
         version: "1",
         description: None,
         revert: true,
-        expected_state: "Reverted",
+        expected_state: "REVERTED",
     },
     Planned {
         case: "a deployment still rolling out",
@@ -359,7 +359,7 @@ const PLAN: [Planned; 5] = [
         version: "v2-beta",
         description: Some("the long rollout"),
         revert: false,
-        expected_state: "Deploying",
+        expected_state: "DEPLOYING",
     },
 ];
 
@@ -427,7 +427,7 @@ async fn deploy_the_plan(
                 application,
                 environment,
                 number,
-                &["Complete"],
+                &["COMPLETE"],
             )
             .await;
             let stopped = send(
@@ -452,7 +452,7 @@ async fn deploy_the_plan(
         }
         // An environment holds one deployment at a time, so a row whose deployment is
         // meant to be over waits for it before the next row starts.
-        if row.expected_state != "Deploying" {
+        if row.expected_state != "DEPLOYING" {
             crate::appconfig_workflow::deployment_in_state(
                 router,
                 row.case,
@@ -505,7 +505,7 @@ async fn deploy_completed(
             application,
             environment,
             number,
-            &["Complete"],
+            &["COMPLETE"],
         )
         .await;
         numbers.push(number);
@@ -638,7 +638,7 @@ async fn a_summary_reports_the_stored_deployment_as_the_reader_does() {
         // RULE 2: the instants are ISO-8601 strings, and a deployment cannot complete
         // before it started. A deployment still in flight carries no completion instant.
         let started_at = iso_instant(case, "StartedAt", &member(summary, "StartedAt"));
-        if row.expected_state == "Deploying" {
+        if row.expected_state == "DEPLOYING" {
             assert!(
                 member(summary, "CompletedAt").is_null(),
                 "case {case:?}: a deployment still in flight has no CompletedAt, got {}",
@@ -1224,7 +1224,7 @@ async fn the_listing_reports_what_the_deployments_before_it_left() {
         );
         assert_eq!(
             member(&page[0], "State").as_str(),
-            Some("Reverted"),
+            Some("REVERTED"),
             "case {case:?}: the listing must report the state the stop left, got {}",
             member(&page[0], "State")
         );

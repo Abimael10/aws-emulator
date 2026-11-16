@@ -546,9 +546,9 @@ async fn a_created_strategy_takes_both_mutations() {
 // =============================================================================
 
 /// The values `Deployment$State` goes on the wire as while AppConfig is still working on
-/// a deployment — the CamelCase spellings of the `DEPLOYING` and `BAKING` members, which
-/// is what a blocking deployment reports.
-const IN_FLIGHT_DEPLOYMENT_STATES: &[&str] = &["Deploying", "Baking"];
+/// a deployment — the `DEPLOYING` and `BAKING` members, which carry no `@enumValue` trait
+/// and so go on the wire as their own names.
+const IN_FLIGHT_DEPLOYMENT_STATES: &[&str] = &["DEPLOYING", "BAKING"];
 
 /// The `EnvironmentState` MEMBER NAME this conflict spells into its sentence for an
 /// environment that holds a deployment in flight.

@@ -171,12 +171,12 @@ fn logged(case: &str, document: &str, body: &Value) -> Vec<String> {
 /// completion instant, and a log that carries the bake's own event and not the completion
 /// that window has not reached yet.
 ///
-/// The state is asserted in the CamelCase form `Deployment$State` goes on the wire as,
-/// which is the form AppConfig publishes for each member of that enum.
+/// The state is asserted in the form `Deployment$State` goes on the wire as, which for
+/// every member of that enum is the member's own name.
 fn assert_inside_the_window(case: &str, label: &str, document: &Value) {
     assert_eq!(
         member(document, "State").as_str(),
-        Some("Baking"),
+        Some("BAKING"),
         "case {case:?} ({label}): the declared bake time holds the deployment in the \
          non-terminal BAKING, got {document}"
     );
@@ -263,7 +263,7 @@ async fn reads_inside_the_declared_bake_window_report_baking_without_consuming_i
         // The bake begins on its own, once the rollout has reached every target.
         let first =
             deployment_in_state(&router, case, &application, &environment, i64::from(number), &[
-                "Baking",
+                "BAKING",
             ])
             .await;
         assert_inside_the_window(case, "the read that found the window", &first);
@@ -304,7 +304,7 @@ async fn reads_inside_the_declared_bake_window_report_baking_without_consuming_i
         bring_the_window_forward(&shared, case, &application, &environment, number, declared);
         let completed =
             deployment_in_state(&router, case, &application, &environment, i64::from(number), &[
-                "Complete",
+                "COMPLETE",
             ])
             .await;
         assert_eq!(
@@ -363,7 +363,7 @@ async fn a_stop_inside_the_declared_bake_window_rolls_the_deployment_back() {
         .await;
         let baking =
             deployment_in_state(&router, case, &application, &environment, i64::from(number), &[
-                "Baking",
+                "BAKING",
             ])
             .await;
         assert_inside_the_window(case, "the read before the stop", &baking);
@@ -380,7 +380,7 @@ async fn a_stop_inside_the_declared_bake_window_rolls_the_deployment_back() {
         let settled = stopped.json();
         assert_eq!(
             member(&settled, "State").as_str(),
-            Some("RolledBack"),
+            Some("ROLLED_BACK"),
             "case {case:?}: the stop settles the rollback it performed, got {settled}"
         );
         assert_eq!(
@@ -416,7 +416,7 @@ async fn a_stop_inside_the_declared_bake_window_rolls_the_deployment_back() {
         let read_back = read(&router, case, &application, &environment, number).await;
         assert_eq!(
             member(&read_back, "State").as_str(),
-            Some("RolledBack"),
+            Some("ROLLED_BACK"),
             "case {case:?}: nothing is left for a reader to finish, got {read_back}"
         );
         assert_eq!(
@@ -476,7 +476,7 @@ async fn a_strategy_with_no_declared_bake_has_no_window_to_hold_anything_in() {
 
     let completed =
         deployment_in_state(&router, case, &application, &environment, i64::from(number), &[
-            "Complete",
+            "COMPLETE",
         ])
         .await;
     assert_eq!(

@@ -69,7 +69,7 @@ const WITHDRAWN_STAYS_PUT_FOR: Duration =
 
 /// The `DeploymentState` values a deployment stops at, after which no reader sees it move
 /// — as `Deployment$State` goes on the wire.
-const TERMINAL_STATES: &[&str] = &["Complete", "RolledBack", "Reverted"];
+const TERMINAL_STATES: &[&str] = &["COMPLETE", "ROLLED_BACK", "REVERTED"];
 
 /// How far two percentages may differ and still be the same point of the grid: the members
 /// are floats on the wire, so they are compared with slack rather than for bit equality.
@@ -236,7 +236,7 @@ async fn a_rollout_advances_over_the_wire_through_its_growth_types_grid() {
         let body = started.json();
         assert_eq!(
             deployment_state(case, &body),
-            "Deploying",
+            "DEPLOYING",
             "case {case:?}: a strategy that declares a rollout window leaves the deployment \
              rolling out, got {body}"
         );
@@ -305,7 +305,7 @@ async fn a_rollout_advances_over_the_wire_through_its_growth_types_grid() {
 
         assert_eq!(
             deployment_state(case, &body),
-            "Complete",
+            "COMPLETE",
             "case {case:?}: a rollout nobody stopped completes, got {body}"
         );
         assert_eq!(
@@ -531,7 +531,7 @@ async fn a_stop_part_way_through_a_rollout_withdraws_it_terminally() {
         let stop_body = stopped.json();
         assert_eq!(
             deployment_state(case, &stop_body),
-            "RolledBack",
+            "ROLLED_BACK",
             "case {case:?}: a deployment stopped at {reached}% of its targets is rolled back, got \
              {stop_body}"
         );
@@ -625,7 +625,7 @@ async fn a_stop_part_way_through_a_rollout_withdraws_it_terminally() {
             let later_body = later.json();
             assert_eq!(
                 deployment_state(case, &later_body),
-                "RolledBack",
+                "ROLLED_BACK",
                 "case {case:?}: a withdrawn rollout stays withdrawn as the clock runs on, got \
                  {later_body}"
             );
@@ -793,12 +793,12 @@ async fn a_rollout_part_way_through_serves_both_versions_at_once() {
         &application,
         &environment,
         i64::from(deployment_number(case, &first)),
-        &["Complete"],
+        &["COMPLETE"],
     )
     .await;
     assert_eq!(
         deployment_state(case, &first),
-        "Complete",
+        "COMPLETE",
         "case {case:?}: a strategy with no window and no bake completes a span after it \
          started, got {first}"
     );
@@ -853,7 +853,7 @@ async fn a_rollout_part_way_through_serves_both_versions_at_once() {
         if terminal {
             assert_eq!(
                 deployment_state(case, &body),
-                "Complete",
+                "COMPLETE",
                 "case {case:?}: a rollout nobody stopped completes, got {body}"
             );
             break;

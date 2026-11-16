@@ -290,7 +290,7 @@ fn expected_at_start(row: &Row) -> (&'static str, f64, bool, Vec<&'static str>) 
         // No rollout window and no bake time: AppConfig has nothing to pace and nothing to
         // monitor, so the deployment is over when the start answers.
         return (
-            "Complete",
+            "COMPLETE",
             100.0,
             true,
             vec!["DEPLOYMENT_COMPLETED", "DEPLOYMENT_STARTED"],
@@ -299,7 +299,7 @@ fn expected_at_start(row: &Row) -> (&'static str, f64, bool, Vec<&'static str>) 
     // Any paced stage puts every later stage after this call: no interval of the rollout
     // has elapsed at the start instant, so no growth step is due and nobody has the
     // configuration yet.
-    ("Deploying", 0.0, false, vec!["DEPLOYMENT_STARTED"])
+    ("DEPLOYING", 0.0, false, vec!["DEPLOYMENT_STARTED"])
 }
 
 /// The members of a Deployment document that NOTHING the clock does changes, so the read

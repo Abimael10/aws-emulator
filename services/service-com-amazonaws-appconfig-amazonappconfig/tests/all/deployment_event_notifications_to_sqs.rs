@@ -192,7 +192,7 @@ async fn deploy_and_wait_complete(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if state == "Complete" {
+        if state == "COMPLETE" {
             return number;
         }
         assert!(

@@ -417,7 +417,7 @@ async fn clients_are_split_across_a_partial_rollout_and_a_stop_withdraws_it() {
         &application,
         &environment,
         seeding,
-        &["Complete"],
+        &["COMPLETE"],
     )
     .await;
     let share = measure_share(&router, &application, &environment, &profile).await;

@@ -215,6 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal("AppConfig state is not reachable on this engine"));
         };
         let now = std::time::SystemTime::now();
+        // A deployment whose environment's monitored CloudWatch alarms have already made a
+        // rollback due is rolled back before the configuration in force is read: that breach
+        // fell due at an instant that has passed, so this materialises only what the clock
+        // had already made true — and a rolled-back deployment serves no target, which is
+        // what puts the previous version back in force here.
+        crate::state::alarm_monitors::settle(&*self.engine, now);
         let mut store = state.lock();
 
         // `ClientId` identifies the client asking, which is what AppConfig paces a

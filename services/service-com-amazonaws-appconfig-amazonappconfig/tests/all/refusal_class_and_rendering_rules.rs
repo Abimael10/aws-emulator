@@ -846,11 +846,11 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
     // name a refusal spells into its sentence): a plain stop of a completed deployment is
     // refused, so the row that reaches the rolled-back state stops one still in flight.
     let terminal_states: [(&str, bool, &str, &str); 2] = [
-        ("a reverted deployment", true, "Reverted", "REVERTED"),
+        ("a reverted deployment", true, "REVERTED", "REVERTED"),
         (
             "a rolled-back deployment",
             false,
-            "RolledBack",
+            "ROLLED_BACK",
             "ROLLED_BACK",
         ),
     ];
@@ -911,7 +911,7 @@ async fn a_terminal_stop_states_the_verb_the_request_asked_for() {
                 &application,
                 &environment,
                 number,
-                &["Complete"],
+                &["COMPLETE"],
             )
             .await;
         }

@@ -38,6 +38,9 @@ use crate::ops::types::{
     VendedMetricsSettings,
 };
 
+/// The CloudWatch alarms an environment's `Monitors` name, and the rollback they owe a
+/// deployment in flight into that environment.
+pub mod alarm_monitors;
 pub mod extension_actions;
 /// The extension and extension-association records an account holds, with the store
 /// methods every operation reaches them through.
@@ -53,33 +56,34 @@ pub mod validators;
 pub use rollout::RolloutBucket;
 
 /// `DeploymentState` values this service moves a deployment through — the WIRE values,
-/// which for this enum are NOT the model's member names.
+/// which for this enum ARE the model's member names.
 ///
-/// `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` lists the member names (`DEPLOYING`,
-/// `BAKING`, `COMPLETE`, …), but AppConfig serves `Deployment$State` in the CamelCase
-/// form — `Deploying | Baking | Complete | RollingBack | RolledBack | Reverted` — which
-/// is the form every recorded response carries, exactly as for `Environment$State`
-/// ([`ENVIRONMENT_READY_FOR_DEPLOYMENT`]): the shipped model JSON in `smithy-model/`
-/// carries no `@enumValue` trait on either enum's members, so the generated value lists
-/// fell back to the member names. A client waiting for a deployment to finish compares
-/// `State` against the served value, so these constants are the single place the service
-/// spells it.
+/// `DeploymentState`'s members (`BAKING`, `VALIDATING`, `DEPLOYING`, `COMPLETE`,
+/// `ROLLING_BACK`, `ROLLED_BACK`, `REVERTED`,
+/// `smithy_query(query="shape",shape="DeploymentState")`) carry no `@enumValue` trait, so
+/// each member's value IS its name, and that is the form AppConfig serves
+/// `Deployment$State` in: a deployment that finished reports `COMPLETE`. The sibling
+/// `Environment$State` is the one enum of this service that does NOT work that way — it is
+/// served in the CamelCase form its own API Reference publishes
+/// ([`ENVIRONMENT_READY_FOR_DEPLOYMENT`]) — so the two are spelled separately here rather
+/// than through one rule. A client waiting for a deployment to finish compares `State`
+/// against the served value, so these constants are the single place the service spells it.
 ///
-/// A refusal that spells a state INTO A SENTENCE names the enum's MEMBER instead
-/// ([`state_member_name`]), which is the form the recorded refusals carry.
-pub const DEPLOYMENT_DEPLOYING: &str = "Deploying";
+/// A refusal that spells a state INTO A SENTENCE names the enum's MEMBER too
+/// ([`state_member_name`]), which for this enum is the value it already holds.
+pub const DEPLOYMENT_DEPLOYING: &str = "DEPLOYING";
 /// See [`DEPLOYMENT_DEPLOYING`].
-pub const DEPLOYMENT_BAKING: &str = "Baking";
+pub const DEPLOYMENT_BAKING: &str = "BAKING";
 /// See [`DEPLOYMENT_DEPLOYING`].
-pub const DEPLOYMENT_COMPLETE: &str = "Complete";
+pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
 /// See [`DEPLOYMENT_DEPLOYING`]. Where a caller's stop puts a deployment that is still
 /// rolling out or baking: the rollback has started and has not finished yet.
-pub const DEPLOYMENT_ROLLING_BACK: &str = "RollingBack";
+pub const DEPLOYMENT_ROLLING_BACK: &str = "ROLLING_BACK";
 /// See [`DEPLOYMENT_ROLLING_BACK`]. Where that rollback leaves it once it finishes.
-pub const DEPLOYMENT_ROLLED_BACK: &str = "RolledBack";
+pub const DEPLOYMENT_ROLLED_BACK: &str = "ROLLED_BACK";
 /// See [`DEPLOYMENT_ROLLING_BACK`]. Where reverting a deployment that already completed
 /// leaves it.
-pub const DEPLOYMENT_REVERTED: &str = "Reverted";
+pub const DEPLOYMENT_REVERTED: &str = "REVERTED";
 
 /// `EnvironmentState` values this service moves an environment through — the WIRE
 /// values, which for this enum are NOT the model's member names.
@@ -93,10 +97,11 @@ pub const DEPLOYMENT_REVERTED: &str = "Reverted";
 /// generated value list fell back to the member names; the recorded wire form is
 /// authoritative and these constants are the single place the service spells it.
 ///
-/// `DeploymentState` ([`DEPLOYMENT_DEPLOYING`]) is served the same way. Every other enum
-/// this module names a value of (`GrowthType`, `DeploymentEventType`, `TriggeredBy`) is
-/// served as its member name, exactly as the AppConfig API Reference lists those members'
-/// valid values, so their constants are unchanged.
+/// `DeploymentState` ([`DEPLOYMENT_DEPLOYING`]) is NOT served the same way: it goes on the
+/// wire as its member name. Every other enum this module names a value of (`GrowthType`,
+/// `DeploymentEventType`, `TriggeredBy`) is served as its member name too, exactly as the
+/// AppConfig API Reference lists those members' valid values, so their constants are
+/// unchanged.
 pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "ReadyForDeployment";
 /// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`].
 pub const ENVIRONMENT_DEPLOYING: &str = "Deploying";
@@ -213,6 +218,14 @@ pub const TRIGGERED_BY_APPCONFIG: &str = "APPCONFIG";
 /// rollback an extension's action directed to the extension that directed it — which is
 /// the one attribution a client can use to tell its own abort apart from its guard's.
 pub const TRIGGERED_BY_EXTENSION: &str = "EXTENSION";
+/// The entity a rollback a monitored CloudWatch alarm initiated is attributed to
+/// ([`alarm_monitors`]): "events can be triggered by a user, AppConfig, an Amazon
+/// CloudWatch alarm, or an internal error"
+/// (`smithy_query(query="shape",shape="DeploymentEvent")`).
+pub const TRIGGERED_BY_CLOUDWATCH_ALARM: &str = "CLOUDWATCH_ALARM";
+/// See [`TRIGGERED_BY_CLOUDWATCH_ALARM`]: the entity a rollback AppConfig started because
+/// the monitoring the deployment needs could not be performed at all is attributed to.
+pub const TRIGGERED_BY_INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
 /// The documented application quota: `ServiceQuotaExceededException`'s own
 /// documentation lists "Applications: 100 max".
@@ -2002,6 +2015,34 @@ impl Environment {
             .max_by_key(|deployment| deployment.deployment_number)
     }
 
+    /// The most recent deployment of `configuration_profile_id` into this environment whose
+    /// rollout STANDS: one that put the profile's configuration into service here and was
+    /// not undone ([`Deployment::rollout_stands`]), and `None` when no deployment of that
+    /// profile ever did.
+    ///
+    /// What makes a configuration DEPLOYED into an environment, which is a different
+    /// question from which deployment is in force for a given target
+    /// ([`Self::in_force_deployment`]) and from which deployments the environment holds
+    /// ([`Self::latest_deployment_of`]): a deployment AppConfig rolled back or a caller
+    /// reverted never left a configuration in service here, so an environment holding
+    /// nothing but those has no deployed configuration — which is what the `appconfigdata`
+    /// data plane refuses a configuration session over.
+    ///
+    /// Reads the records as they stand, so a caller that wants the clock's effect on them
+    /// calls [`Self::materialize`] first.
+    pub fn deployed_configuration_of(
+        &self,
+        configuration_profile_id: &str,
+    ) -> Option<&Deployment> {
+        self.deployments
+            .values()
+            .filter(|deployment| {
+                deployment.configuration_profile_id == configuration_profile_id
+                    && deployment.rollout_stands()
+            })
+            .max_by_key(|deployment| deployment.deployment_number)
+    }
+
     /// The deployment whose configuration is in force for `configuration_profile_id` AT
     /// the target `target`: the most recent deployment of that profile into this
     /// environment whose configuration AppConfig serves that target
@@ -2624,6 +2665,15 @@ pub struct Deployment {
     /// as the instant it was owed from, so the transition is the clock's and no reader
     /// has to sleep for it.
     pub rollback_completion_due: Option<SystemTime>,
+    /// What a rollback AppConfig started on its OWN initiative is reported as having been
+    /// caused by: the `Description` the events of THAT rollback carry, and `None` for a
+    /// rollback nothing but a caller's stop asked for.
+    ///
+    /// Written where such a rollback is started ([`alarm_monitors::settle`]) and read again
+    /// when the clock finishes it, so the event that says the rollback COMPLETED names the
+    /// same cause the event that said it STARTED did: a rollback is one act of the service,
+    /// and a client reading its log at either end has to be able to tell what caused it.
+    pub rollback_description: Option<String>,
     /// How many of this deployment's logged events of each `DeploymentEventType` have
     /// already had the action point they owe invoked, so each stage of the deployment
     /// invokes its actions exactly once however often the deployment is read
@@ -2713,6 +2763,8 @@ impl Deployment {
             completed_at: None,
             // Nothing has stopped it: the only thing that sets this is a caller's stop.
             rollback_completion_due: None,
+            // Nothing has caused a rollback of it either.
+            rollback_description: None,
             // No stage of it has been reached yet, and its first tick falls due one
             // interval in: see [`extension_actions::drive_deployment`].
             notified_event_counts: BTreeMap::new(),
@@ -2778,7 +2830,11 @@ impl Deployment {
     /// Whether this deployment's rollout stands: it has begun, and nothing has undone
     /// it. Which TARGETS it has reached is a separate question
     /// ([`Self::serves_the_configuration_to`]).
-    fn rollout_stands(&self) -> bool {
+    ///
+    /// `pub` because it is also what decides whether a configuration has been DEPLOYED
+    /// into an environment at all ([`Environment::deployed_configuration_of`]), which the
+    /// `appconfigdata` data plane answers a session's mint from.
+    pub fn rollout_stands(&self) -> bool {
         self.is_in_flight() || self.state == DEPLOYMENT_COMPLETE
     }
 
@@ -2978,6 +3034,18 @@ impl Deployment {
         self.rollout_end() + self.bake_duration()
     }
 
+    /// The instant this deployment stops being eligible for AppConfig's own automatic
+    /// rollback: its completion.
+    ///
+    /// `FinalBakeTimeInMinutes` is "the amount of time that AppConfig monitors for Amazon
+    /// CloudWatch alarms before considering the deployment to be complete and no longer
+    /// eligible for automatic rollback", so the window AppConfig watches the environment's
+    /// monitors over runs from the deployment's start to exactly here
+    /// ([`alarm_monitors::settle`]).
+    pub fn monitored_until(&self) -> SystemTime {
+        self.completion_due()
+    }
+
     /// The cumulative percentage of targets each growth interval of this rollout reaches,
     /// in order, ending at 100%.
     ///
@@ -3060,12 +3128,19 @@ impl Deployment {
             };
             if now >= due {
                 self.state = DEPLOYMENT_ROLLED_BACK.to_string();
+                // The cause the rollback was started with is what its completion reports
+                // too: see [`Self::rollback_description`]. A rollback AppConfig's own
+                // schedule finished with no cause of its own reports the act itself.
+                let description = self
+                    .rollback_description
+                    .clone()
+                    .unwrap_or_else(|| DESCRIPTION_ROLLBACK_COMPLETED.to_string());
                 // `CompletedAt` stays absent: the rollback finishing is not the
                 // deployment completing. See the field's own note.
                 self.event_log.push(deployment_event(
                     EVENT_ROLLBACK_COMPLETED,
                     TRIGGERED_BY_APPCONFIG,
-                    DESCRIPTION_ROLLBACK_COMPLETED.to_string(),
+                    description,
                     due,
                 ));
             }
@@ -3723,13 +3798,14 @@ pub fn environment_not_ready_for_deployment(environment_id: &str, environment_st
 
 /// The enum MEMBER NAME for a state value this service stores on a record.
 ///
-/// The stored value is the CamelCase form the member goes on the wire as (see
-/// [`ENVIRONMENT_READY_FOR_DEPLOYMENT`] and [`DEPLOYMENT_DEPLOYING`]); a refusal that
-/// spells a state into a sentence spells the enum's member name instead, which is the
-/// form the model declares and the recorded refusals carry. One rule for both state
-/// enums: a member name is the served value broken at every boundary where a lower-case
-/// character is followed by an upper-case one, upper-cased. A value that carries no such
-/// boundary — a member name already, or a member this service never puts a record in — is
+/// `Environment$State` is stored in the CamelCase form that member goes on the wire as
+/// (see [`ENVIRONMENT_READY_FOR_DEPLOYMENT`]); a refusal that spells a state into a
+/// sentence spells the enum's member name instead, which is the form the model declares
+/// and the recorded refusals carry. One rule for both state enums: a member name is the
+/// served value broken at every boundary where a lower-case character is followed by an
+/// upper-case one, upper-cased. A value that carries no such boundary — a member name
+/// already, which is every `DeploymentState` value this service stores
+/// ([`DEPLOYMENT_DEPLOYING`]), or a member this service never puts a record in — is
 /// reported as given, so nothing is silently renamed.
 fn state_member_name(state: &str) -> String {
     let mut name = String::with_capacity(state.len() + 2);
@@ -3883,9 +3959,10 @@ impl StopVerb {
 /// request is stored here.
 ///
 /// The state is spelled as the `DeploymentState` MEMBER the record sits in
-/// ([`state_member_name`]) rather than as the CamelCase value the document serves it as:
+/// ([`state_member_name`]), which for this enum is the value the document serves too:
 /// the recorded refusals name the member, the same way the environment's conflict
-/// ([`environment_not_ready_for_deployment`]) does.
+/// ([`environment_not_ready_for_deployment`]) does, and that one DOES differ from the
+/// value `Environment$State` is served as.
 pub fn deployment_cannot_be_stopped(
     application_id: &str,
     environment_id: &str,

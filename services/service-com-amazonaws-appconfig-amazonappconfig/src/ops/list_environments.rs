@@ -164,6 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
+        // A deployment whose environment's monitored CloudWatch alarms have already made a
+        // rollback due is rolled back before these environments' states are read off their
+        // deployments: that breach fell due at an instant that has passed, so this
+        // materialises only what the clock had already made true.
+        crate::state::alarm_monitors::settle(&*self.engine, now);
         let mut store = state.lock();
 
         // An environment only exists under an application, so an unresolvable application

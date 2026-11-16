@@ -203,6 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
+        // A deployment whose environment's monitored CloudWatch alarms have already made a
+        // rollback due is rolled back before anything is read off it: that breach fell due
+        // at an instant that has passed, so this materialises only what the clock had
+        // already made true.
+        crate::state::alarm_monitors::settle(&*self.engine, now);
         // The ids the request's identifiers resolved to, which everything below this block
         // reads the store and drives the clock by.
         let application_id;

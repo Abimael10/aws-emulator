@@ -4,12 +4,12 @@
 //!
 //! The rule under test, which is about the data plane's precondition and not about one
 //! payload, one identifier spelling or one profile: `StartConfigurationSession` is a
-//! session over a DEPLOYED configuration, so a triple whose configuration profile has
-//! never been deployed into the named environment is refused with the modelled
+//! session over a DEPLOYED configuration, so a triple whose configuration profile has no
+//! configuration in service in the named environment is refused with the modelled
 //! `ResourceNotFoundException` (404) reporting the `Deployment` as the missing resource,
-//! and no token is minted. What makes a session possible is that the profile HAS been
-//! deployed into that environment — whatever state that deployment is in — and the
-//! refusal lifts the moment a deployment exists.
+//! and no token is minted. What makes a session possible is that some deployment of the
+//! profile into that environment put a configuration in service and nothing undid it —
+//! whatever stage that deployment is at — and the refusal lifts the moment one does.
 //!
 //! Every case drives real requests through the router harness the polling suite sets up
 //! ([`super::configuration_session_poll::Emulator`]), which mounts AppConfigData and the
@@ -313,8 +313,9 @@ async fn a_session_over_a_triple_with_no_deployment_is_refused_until_one_exists(
     }
 }
 
-/// The state a deployment of the profile is in when the session is started, and the
-/// `DeploymentState` AppConfig reports for it.
+/// The state a deployment of the profile is in when the session is started, the
+/// `DeploymentState` AppConfig reports for it, and whether that leaves a configuration in
+/// service for a session to be over.
 struct DeploymentStateCase {
     name: &'static str,
     /// Whether the deployment's rollout window and bake time are moved into the past,
@@ -325,10 +326,13 @@ struct DeploymentStateCase {
     stopped: bool,
     /// The `DeploymentState` values this leaves the deployment in, any of which the
     /// control plane may legitimately report by the time it is read (a stop starts a
-    /// rollback the clock then finishes), in the CamelCase form the enum's members go on
-    /// the wire as. `DeploymentState` is listed for GetDeployment in the control plane's
-    /// own `OPERATIONS.md`.
+    /// rollback the clock then finishes). The enum's members carry no `@enumValue` trait,
+    /// so each goes on the wire as its own name; `DeploymentState` is listed for
+    /// GetDeployment in the control plane's own `OPERATIONS.md`.
     states: &'static [&'static str],
+    /// Whether a session is minted: it is exactly when the rollout of some deployment of
+    /// the profile STANDS in that environment, which a rollback undoes.
+    session_minted: bool,
 }
 
 const DEPLOYMENT_STATE_CASES: &[DeploymentStateCase] = &[
@@ -336,29 +340,34 @@ const DEPLOYMENT_STATE_CASES: &[DeploymentStateCase] = &[
         name: "still monitoring its final bake time",
         settled: false,
         stopped: false,
-        states: &["Baking", "Deploying"],
+        states: &["BAKING", "DEPLOYING"],
+        session_minted: true,
     },
     DeploymentStateCase {
         name: "finished",
         settled: true,
         stopped: false,
-        states: &["Complete"],
+        states: &["COMPLETE"],
+        session_minted: true,
     },
     DeploymentStateCase {
         name: "undone by a caller's stop",
         settled: false,
         stopped: true,
-        states: &["RollingBack", "RolledBack", "Reverted"],
+        states: &["ROLLING_BACK", "ROLLED_BACK", "REVERTED"],
+        // A rollback returns the environment to the configuration that preceded this
+        // deployment, and there was none: nothing of this profile is in service here, so
+        // there is no deployed configuration for a session to be over.
+        session_minted: false,
     },
 ];
 
-/// What opens a session is that the configuration profile HAS been deployed into the
-/// environment, whatever state that deployment is in: a deployment still rolling out, one
-/// that finished, and one a caller undid are all deployments the environment holds, so
-/// each is given a session — the currency of the configuration is a question for the poll,
-/// not for the session.
+/// What opens a session is that the configuration profile has a configuration IN SERVICE in
+/// the environment: a deployment still rolling out and one that finished both put one there,
+/// whatever stage they are at, while one a caller undid left none — and the currency of the
+/// configuration a session IS opened over is a question for the poll, not for the session.
 #[tokio::test]
-async fn a_session_is_minted_for_any_deployment_the_environment_holds() {
+async fn a_session_is_minted_for_a_deployment_that_put_a_configuration_in_service() {
     for case in DEPLOYMENT_STATE_CASES {
         let name = case.name;
         let emulator = Emulator::new();
@@ -401,17 +410,66 @@ async fn a_session_is_minted_for_any_deployment_the_environment_holds() {
             case.states
         );
 
-        let token = emulator
-            .session_token(
-                &hierarchy.application_name,
-                &hierarchy.environment_name,
-                &hierarchy.profile_name,
+        if case.session_minted {
+            let token = emulator
+                .session_token(
+                    &hierarchy.application_name,
+                    &hierarchy.environment_name,
+                    &hierarchy.profile_name,
+                )
+                .await;
+            assert!(
+                is_modelled_token(&token),
+                "case {name}: a deployment in state {reported} put a configuration in service, \
+                 so it must open a session, got {token:?}"
+            );
+            continue;
+        }
+
+        let application = &hierarchy.application_name;
+        let environment = &hierarchy.environment_name;
+        let profile = &hierarchy.profile_name;
+        let refused = emulator
+            .post_json(
+                "/configurationsessions",
+                &format!(
+                    r#"{{"ApplicationIdentifier":"{application}",
+                          "EnvironmentIdentifier":"{environment}",
+                          "ConfigurationProfileIdentifier":"{profile}"}}"#
+                ),
             )
             .await;
+        assert_eq!(
+            refused.status,
+            404,
+            "case {name}: a deployment in state {reported} left no configuration in service, so \
+             the session must be refused 404, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ResourceNotFoundException",
+            "case {name}: expected ResourceNotFoundException, got {}",
+            refused.text()
+        );
+        let body = refused.json();
+        assert_eq!(
+            body["ResourceType"].as_str(),
+            Some(RESOURCE_TYPE_DEPLOYMENT),
+            "case {name}: expected the Deployment resource type, got {}",
+            refused.text()
+        );
+        assert_eq!(
+            body["Message"].as_str(),
+            Some(DEPLOYMENT_NOT_FOUND),
+            "case {name}: expected the whole fixed message, got {}",
+            refused.text()
+        );
         assert!(
-            is_modelled_token(&token),
-            "case {name}: a deployment in state {reported} must still open a session, \
-             got {token:?}"
+            body["InitialConfigurationToken"].is_null(),
+            "case {name}: a refused session must mint no token, got {}",
+            refused.text()
         );
     }
 }

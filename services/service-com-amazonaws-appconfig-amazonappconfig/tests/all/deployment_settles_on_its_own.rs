@@ -48,7 +48,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The `DeploymentState` values a deployment stops at: completed, a rollback that
 /// finished, and a revert of one that had completed — as `Deployment$State` goes on the
 /// wire. The states this suite waits for.
-const TERMINAL_STATES: &[&str] = &["Complete", "RolledBack", "Reverted"];
+const TERMINAL_STATES: &[&str] = &["COMPLETE", "ROLLED_BACK", "REVERTED"];
 
 /// One row: the case, the strategy's declared rollout minutes and final bake minutes, the
 /// state and share of targets `StartDeployment` must answer, and the deployment-event
@@ -175,7 +175,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
             bake_in_minutes: 0,
             // Nothing to pace and nothing to monitor, so the deployment is over when the
             // start answers.
-            state_at_start: "Complete",
+            state_at_start: "COMPLETE",
             percentage_at_start: 100.0,
             logged_events: &["DEPLOYMENT_STARTED", "DEPLOYMENT_COMPLETED"],
         },
@@ -183,7 +183,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
             case: "a rollout window and no bake time",
             duration_in_minutes: 1,
             bake_in_minutes: 0,
-            state_at_start: "Deploying",
+            state_at_start: "DEPLOYING",
             percentage_at_start: 0.0,
             logged_events: &[
                 "DEPLOYMENT_STARTED",
@@ -197,7 +197,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
             bake_in_minutes: 1,
             // A bake time is a stage AppConfig monitors AFTER the rollout, so the rollout
             // itself happens after the call too: the start answers 0% of targets reached.
-            state_at_start: "Deploying",
+            state_at_start: "DEPLOYING",
             percentage_at_start: 0.0,
             logged_events: &[
                 "DEPLOYMENT_STARTED",
@@ -210,7 +210,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
             case: "a rollout window and a bake time",
             duration_in_minutes: 30,
             bake_in_minutes: 10,
-            state_at_start: "Deploying",
+            state_at_start: "DEPLOYING",
             percentage_at_start: 0.0,
             logged_events: &[
                 "DEPLOYMENT_STARTED",
@@ -223,7 +223,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
             case: "both at the published upper bound of 1440 minutes",
             duration_in_minutes: 1440,
             bake_in_minutes: 1440,
-            state_at_start: "Deploying",
+            state_at_start: "DEPLOYING",
             percentage_at_start: 0.0,
             logged_events: &[
                 "DEPLOYMENT_STARTED",
@@ -324,7 +324,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
                 &application,
                 &environment,
                 i64::from(number),
-                &["Baking"],
+                &["BAKING"],
             )
             .await;
             bring_the_bake_forward(&shared, &application, &environment, row.bake_in_minutes);
@@ -333,7 +333,7 @@ async fn a_deployment_reaches_a_terminal_state_whatever_pacing_its_strategy_decl
         let document = settled(&router, row.case, &application, &environment, number).await;
         assert_eq!(
             document.get("State").and_then(Value::as_str),
-            Some("Complete"),
+            Some("COMPLETE"),
             "case {:?}: a deployment nobody stopped completes, got {document}",
             row.case
         );

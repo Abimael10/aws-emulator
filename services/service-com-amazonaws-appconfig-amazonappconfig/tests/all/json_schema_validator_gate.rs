@@ -713,7 +713,7 @@ async fn a_validator_attached_after_a_version_is_stored_gates_the_next_deploymen
             &application,
             &environment,
             1,
-            &["Complete"],
+            &["COMPLETE"],
         )
         .await;
         // The positive control: the data plane serves exactly the deployed bytes.

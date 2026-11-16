@@ -147,6 +147,8 @@ mod list_extensions;
 mod list_hosted_configuration_versions;
 #[path = "all/listing_item_instant_wire_form.rs"]
 mod listing_item_instant_wire_form;
+#[path = "all/monitored_deployment_rollback.rs"]
+mod monitored_deployment_rollback;
 #[path = "all/omitted_required_bindings.rs"]
 mod omitted_required_bindings;
 #[path = "all/pattern_refusal_quoting.rs"]
@@ -209,3 +211,5 @@ mod update_extension_visibility;
 mod validate_configuration_resource_resolution;
 #[path = "all/validate_configuration_verdict.rs"]
 mod validate_configuration_verdict;
+#[path = "all/zzz_probe.rs"]
+mod zzz_probe;

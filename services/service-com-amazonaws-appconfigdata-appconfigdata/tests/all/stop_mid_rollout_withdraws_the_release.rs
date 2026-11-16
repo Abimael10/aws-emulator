@@ -41,9 +41,10 @@ use super::rollout_percentage_splits_sessions::{
 /// The `DeploymentState` wire token a withdrawn release reports, as the recorded stop
 /// answers it — `DeploymentState` has no `STOPPED` member: a stop of a deployment still in
 /// progress is a rollback.
-const ROLLED_BACK: &str = "RolledBack";
+const ROLLED_BACK: &str = "ROLLED_BACK";
 /// The `DeploymentState` MEMBER NAME of [`ROLLED_BACK`], which is the form a refusal's
-/// sentence spells a state in rather than the value the document serves.
+/// sentence spells a state in — for this enum the very value the document serves, because
+/// its members carry no `@enumValue` trait.
 const ROLLED_BACK_MEMBER: &str = "ROLLED_BACK";
 /// The `EnvironmentState` wire token the environment of a withdrawn release reports, as the
 /// recording carries it.

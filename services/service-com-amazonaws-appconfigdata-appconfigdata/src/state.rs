@@ -646,11 +646,15 @@ pub struct SessionBinding {
 ///
 /// A session is over a DEPLOYED configuration — the operation's own doc is "starts a
 /// configuration session used to retrieve a deployed configuration" — so a triple whose
-/// configuration profile has never been deployed into that environment has no
-/// configuration for a session to be over, and the deployment is the resource that is
-/// missing. Whether the configuration that deployment put in force is still the one
-/// served is a separate question, answered per poll by [`served_configuration`]: what
-/// makes a session possible is that the profile HAS been deployed here.
+/// configuration profile has no configuration IN SERVICE in that environment
+/// ([`AppConfigState::deployed_configuration_of`], which is every deployment of it that was
+/// rolled back or reverted having left none) has no configuration for a session to be over,
+/// and the deployment is the resource that is missing. Whether the configuration that
+/// deployment put in force is the one THIS session is served is a separate question,
+/// answered per poll by [`served_configuration`]: what makes a session possible is that the
+/// profile HAS a deployed configuration here.
+///
+/// [`AppConfigState::deployed_configuration_of`]: ::service_com_amazonaws_appconfig_amazonappconfig::state::Environment::deployed_configuration_of
 ///
 /// `target` is where the session being started stands in a gradual rollout
 /// ([`Session::rollout_bucket`]), which is what the configuration it is bound to is
@@ -670,6 +674,12 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
     target: RolloutBucket,
     now: SystemTime,
 ) -> Option<Result<SessionBinding, UnresolvedResource>> {
+    // A deployment whose environment's monitored CloudWatch alarms have already made a
+    // rollback due is rolled back before this resolution reads the environment: a
+    // deployment the alarm, or an unreadable monitor role, already ended never put a
+    // configuration into service here, and that is what decides whether there is anything
+    // for a session to be over. Called with no AppConfig guard held.
+    ::service_com_amazonaws_appconfig_amazonappconfig::state::alarm_monitors::settle(engine, now);
     let state = app_config_state(engine)?;
     let store = state.lock();
     let (resolved, learned_names) = match resolve_in(
@@ -688,7 +698,7 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
         .and_then(|application| application.environments.get(&resolved.environment_id))
         .is_some_and(|environment| {
             environment
-                .latest_deployment_of(&resolved.configuration_profile_id)
+                .deployed_configuration_of(&resolved.configuration_profile_id)
                 .is_some()
         });
     if !deployed {
@@ -752,6 +762,13 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
     target: RolloutBucket,
     now: SystemTime,
 ) -> Option<Result<ServedConfiguration, UnresolvedResource>> {
+    // A deployment whose environment's monitored CloudWatch alarms have already made a
+    // rollback due is rolled back before this poll reads what is in force: that breach fell
+    // due at an instant that has passed, and it is the control plane's own reading of it
+    // (`…appconfig…::state::alarm_monitors::settle`), so a poll sees the same rollback every
+    // reader of the deployment does — and the version that preceded it back in force.
+    // Called with no AppConfig guard held, which is why it is here and not in `served_in`.
+    ::service_com_amazonaws_appconfig_amazonappconfig::state::alarm_monitors::settle(engine, now);
     let state = app_config_state(engine)?;
     let store = state.lock();
     let (resolved, _learned) = match resolve_in(

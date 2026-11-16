@@ -56,6 +56,14 @@ boon = "0.6"
 # Where one target of a gradual rollout stands is derived from the key that identifies
 # that target, by hashing it (`state::rollout`).
 sha2 = { workspace = true }
+# The CloudWatch store an environment's `Monitors` are judged against: a monitored
+# deployment is rolled back while the alarm its environment names is in ALARM, and that
+# alarm's state belongs to CloudWatch's own records (`state::alarm_monitors`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The IAM store a monitor's `AlarmRoleArn` is resolved against: whether the role's trust
+# policy lets AppConfig assume it, and so whether the alarm can be monitored at all
+# (`state::alarm_monitors`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -63,6 +71,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # `tokio::time` drives the tests' wait past an action point's due instant.
 tokio = { workspace = true, features = ["time"] }
+# Percent-encoding for the `awsQuery` form body an IAM request travels in: the monitor
+# role a deployment is watched under is created through IAM's own `CreateRole`.
+percent-encoding = "2.3"
 # An extension action's target lives in another service, and an invocation is asserted
 # where a client sees it: on the queue the action's `Uri` names, and against the Lambda
 # function it names.

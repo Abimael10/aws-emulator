@@ -472,7 +472,7 @@ async fn a_leaf_is_deletable_while_a_deployment_is_in_flight() {
     );
     assert_ne!(
         deployment.string("State").as_deref(),
-        Some("Complete"),
+        Some("COMPLETE"),
         "case {case:?}: the deployment must still be in flight, got {}",
         deployment.json()
     );

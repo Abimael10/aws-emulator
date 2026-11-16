@@ -158,6 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
+        // A deployment whose environment's monitored CloudWatch alarms have already made a
+        // rollback due is rolled back before this update reports the environment's state:
+        // that breach fell due at an instant that has passed, so the state answered here is
+        // the one the clock had already put the environment in.
+        crate::state::alarm_monitors::settle(&*self.engine, now);
         let mut store = state.lock();
 
         // An environment only exists under an application, so the parent is resolved

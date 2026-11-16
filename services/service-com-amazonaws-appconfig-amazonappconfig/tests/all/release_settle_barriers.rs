@@ -37,9 +37,9 @@ use crate::deployment_wire_fidelity::{create_strategy, host_version, Row};
 use crate::environment_state_wire_form::is_a_published_environment_state;
 
 /// The published value a settled deployment reports, which is what a client's settle
-/// barrier compares against. Source: the AppConfig API Reference's valid-value list for
-/// `Deployment$State` and the form every recorded AppConfig response carries.
-const SETTLED_DEPLOYMENT: &str = "Complete";
+/// barrier compares against. Source: the model's `DeploymentState` enum, whose members
+/// carry no `@enumValue` trait, so each goes on the wire as its own name.
+const SETTLED_DEPLOYMENT: &str = "COMPLETE";
 
 /// The published value an environment with no deployment in flight reports. Source: the
 /// AppConfig API Reference's valid-value list for `Environment$State`

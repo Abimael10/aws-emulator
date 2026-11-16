@@ -43,10 +43,10 @@ const INSTANT_STRATEGY: &str = r#"{"Name":"EveryTargetAtOnce",
                                    "ReplicateTo":"NONE"}"#;
 
 /// The `DeploymentState` value AppConfig reports for a deployment whose rollout and bake
-/// time are both over, in the CamelCase form the enum's members go on the wire as
-/// (`DeploymentState` in
+/// time are both over. The enum's members carry no `@enumValue` trait, so each goes on the
+/// wire as its own name (`DeploymentState` in
 /// `services/service-com-amazonaws-appconfig-amazonappconfig/OPERATIONS.md`, GetDeployment).
-const DEPLOYMENT_COMPLETE: &str = "Complete";
+const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
 
 /// How much of an interval is left when a poll is made "just before" its interval is up.
 ///

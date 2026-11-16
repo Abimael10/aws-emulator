@@ -214,7 +214,7 @@ async fn a_busy_environment_refuses_every_body_with_its_own_state() {
     );
     assert_eq!(
         started.string("State").as_deref(),
-        Some("Deploying"),
+        Some("DEPLOYING"),
         "the first deployment must still be rolling out, got {}",
         started.json()
     );
@@ -419,7 +419,7 @@ const PHASES: &[Phase] = &[
         // The longest rollout the model allows, grown one percent at a time, so the
         // deployment is still rolling out for the whole case.
         row: SLOW_ROLLOUT,
-        deployment_state: "Deploying",
+        deployment_state: "DEPLOYING",
         environment_state: "Deploying",
     },
     Phase {
@@ -427,14 +427,14 @@ const PHASES: &[Phase] = &[
         // growth interval and the bake then holds the deployment, which is the phase whose
         // own state differs from the environment's.
         row: ("monitoring its final bake time", 0, 100.0, "LINEAR", 1440),
-        deployment_state: "Baking",
+        deployment_state: "BAKING",
         environment_state: "Deploying",
     },
     Phase {
         // A rollout in ten-percent steps with a bake window still to come: a strategy that
         // paces both stages rather than only one of them.
         row: ("rolling out with a bake window to come", 15, 10.0, "LINEAR", 10),
-        deployment_state: "Deploying",
+        deployment_state: "DEPLOYING",
         environment_state: "Deploying",
     },
 ];
