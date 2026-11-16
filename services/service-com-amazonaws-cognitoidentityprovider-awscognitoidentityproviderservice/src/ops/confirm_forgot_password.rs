@@ -228,6 +228,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+        // A source address reaches this pool's threat protection only from an app
+        // client configured to propagate it: "if you don't include
+        // [EnablePropagateAdditionalUserContextData], you can't send the source IP
+        // address to Amazon Cognito threat protection features" (this service's
+        // model), so a request that sends one to any other app client of the pool
+        // sends a value that app client may not use
+        // ([`crate::state::propagated_address_forbidden`]), and no password is
+        // replaced.
+        if state.lock().propagated_address_forbidden(
+            &input.client_id,
+            input
+                .user_context_data
+                .as_ref()
+                .and_then(|context| context.ip_address.as_deref()),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::PROPAGATED_ADDRESS_FORBIDDEN_MESSAGE.to_string(),
+            ));
+        }
         // A code's validity is read against the clock, so an expired one is refused
         // whether or not anything has swept it.
         let now = ::std::time::SystemTime::now();
@@ -437,6 +456,17 @@ fn user_not_found() -> ConfirmForgotPasswordError {
 fn not_authorized(message: &str) -> ConfirmForgotPasswordError {
     ConfirmForgotPasswordErrorModeled::NotAuthorizedException(NotAuthorizedException {
         message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> ConfirmForgotPasswordError {
+    ConfirmForgotPasswordErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
     })
     .into()
 }

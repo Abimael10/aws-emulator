@@ -248,6 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .user_context_data
                     .as_ref()
                     .and_then(|context| context.ip_address.clone()),
+                // A code resend is no authentication request, so the pool's
+                // always-block address ranges decide nothing about it and its
+                // threat protection found nothing against it.
+                risk_decision: crate::state::auth_events::RiskDecision::NoRisk,
                 // This one call is the whole attempt: it answers no challenge and
                 // leaves none outstanding.
                 answered_session: None,
@@ -274,6 +278,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmatio
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+        // A source address reaches this pool's threat protection only from an app
+        // client configured to propagate it: "if you don't include
+        // [EnablePropagateAdditionalUserContextData], you can't send the source IP
+        // address to Amazon Cognito threat protection features" (this service's
+        // model), so a request that sends one to any other app client of the pool
+        // sends a value that app client may not use
+        // ([`crate::state::propagated_address_forbidden`]), and no code is issued.
+        if state.lock().propagated_address_forbidden(
+            &input.client_id,
+            input
+                .user_context_data
+                .as_ref()
+                .and_then(|context| context.ip_address.as_deref()),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::PROPAGATED_ADDRESS_FORBIDDEN_MESSAGE.to_string(),
+            ));
+        }
         // The code is issued under this service's lock, and that lock is RELEASED before
         // the pool's custom email sender is invoked: nothing else of this service can be
         // served while a function is being waited for.

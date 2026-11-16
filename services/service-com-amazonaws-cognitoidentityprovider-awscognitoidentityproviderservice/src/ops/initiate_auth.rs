@@ -322,7 +322,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|context| context.ip_address.clone());
         let auth_flow = input.auth_flow.clone();
-        let answered = self.initiate(input, ctx).await;
+        // The pool's threat protection decides this request BEFORE it is served, so
+        // no credential of it is evaluated and nothing it would move is moved: an
+        // always-block address range "overrides the risk decision and always blocks
+        // authentication requests" (`RiskExceptionConfigurationType` in this
+        // service's model). It is also what the event this attempt logs records as
+        // the pool's decision.
+        let blocked = self.blocked(&input);
+        let answered = if blocked {
+            Err(not_authorized(
+                crate::state::AUTHENTICATION_BLOCKED_MESSAGE,
+            ))
+        } else {
+            self.initiate(input, ctx).await
+        };
         let attempt = crate::state::auth_metrics::attempt_of(&answered, |output| {
             output.authentication_result.is_some()
         });
@@ -356,6 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attempt,
                     challenge: password_challenge(&auth_flow),
                     ip_address,
+                    risk_decision: crate::state::auth_events::RiskDecision::of_blocked(blocked),
                     // This call STARTS the attempt it logs, and the response to the
                     // challenge it answered with (if any) continues that attempt.
                     answered_session: None,
@@ -397,6 +411,29 @@ fn password_challenge(auth_flow: &str) -> Option<&'static str> {
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> InitiateAuth<Eng> {
+    /// Whether this pool's threat protection PREVENTS the request `input` asks
+    /// for: an always-block address range that applies to its app client covers
+    /// the address the request presents
+    /// ([`crate::state::UserPool::blocks_authentication`]). A reporting read of
+    /// the stored configuration, which moves nothing.
+    fn blocked(&self, input: &InitiateAuthInput) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let guard = state.lock();
+        guard.pool_of_client(&input.client_id).is_some_and(|pool| {
+            pool.blocks_authentication(
+                &input.client_id,
+                crate::state::PresentedAddress::Propagated(
+                    input
+                        .user_context_data
+                        .as_ref()
+                        .and_then(|context| context.ip_address.as_deref()),
+                ),
+            )
+        })
+    }
+
     /// Serve the sign-in `input` asks for: the whole operation but for the observation its
     /// outcome publishes, which its caller makes once this has answered.
     async fn initiate(
@@ -407,6 +444,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> InitiateAuth<Eng>
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+
+        // A source address reaches this pool's threat protection only from an app
+        // client configured to propagate it: "if you don't include
+        // [EnablePropagateAdditionalUserContextData], you can't send the source IP
+        // address to Amazon Cognito threat protection features" (this service's
+        // model), so a request that sends one to any other app client of the pool
+        // sends a value that app client may not use and is refused rather than
+        // served ([`crate::state::UserPool::forbids_propagated_address`]).
+        if state.lock().propagated_address_forbidden(
+            &input.client_id,
+            input
+                .user_context_data
+                .as_ref()
+                .and_then(|context| context.ip_address.as_deref()),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::PROPAGATED_ADDRESS_FORBIDDEN_MESSAGE.to_string(),
+            ));
+        }
 
         let now = ::std::time::SystemTime::now();
         let auth_parameters = input.auth_parameters.unwrap_or_default();

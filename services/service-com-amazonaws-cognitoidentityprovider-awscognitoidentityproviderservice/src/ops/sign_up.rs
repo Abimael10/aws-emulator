@@ -302,6 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the password the user registers with.
                 challenge: None,
                 ip_address,
+                // A registration is no authentication request, so the pool's
+                // always-block address ranges decide nothing about it and its
+                // threat protection found nothing against it.
+                risk_decision: crate::state::auth_events::RiskDecision::NoRisk,
                 // This one call is the whole attempt: it answers no challenge and
                 // leaves none outstanding.
                 answered_session: None,
@@ -325,6 +329,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+        // A source address reaches this pool's threat protection only from an app
+        // client configured to propagate it: "if you don't include
+        // [EnablePropagateAdditionalUserContextData], you can't send the source IP
+        // address to Amazon Cognito threat protection features" (this service's
+        // model), so a request that sends one to any other app client of the pool
+        // sends a value that app client may not use
+        // ([`crate::state::propagated_address_forbidden`]), and nothing is stored.
+        if state.lock().propagated_address_forbidden(
+            &input.client_id,
+            input
+                .user_context_data
+                .as_ref()
+                .and_then(|context| context.ip_address.as_deref()),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::PROPAGATED_ADDRESS_FORBIDDEN_MESSAGE.to_string(),
+            ));
+        }
         let caller =
             crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id));
         // The registration is decided under this service's lock, and that lock is RELEASED

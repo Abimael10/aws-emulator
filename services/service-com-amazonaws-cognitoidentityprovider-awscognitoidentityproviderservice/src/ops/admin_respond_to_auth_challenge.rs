@@ -333,7 +333,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|context| context.ip_address.clone())
             .filter(|ip_address| !ip_address.is_empty());
-        let answered = self.respond(input, ctx).await;
+        // The pool's threat protection decides this request BEFORE it is served,
+        // so the response it carries is not evaluated and the challenge it answers
+        // stays outstanding: an always-block address range "overrides the risk
+        // decision and always blocks authentication requests"
+        // (`RiskExceptionConfigurationType` in this service's model). It is also
+        // what the event of the attempt this call continues records as the pool's
+        // decision.
+        let blocked = self.blocked(&input);
+        let answered = if blocked {
+            Err(not_authorized(
+                crate::state::AUTHENTICATION_BLOCKED_MESSAGE,
+            ))
+        } else {
+            self.respond(input, ctx).await
+        };
         let attempt = crate::state::auth_metrics::attempt_of(&answered, |output| {
             output.authentication_result.is_some()
         });
@@ -359,6 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attempt,
                     challenge,
                     ip_address,
+                    risk_decision: crate::state::auth_events::RiskDecision::of_blocked(blocked),
                     // This call CONTINUES the sign-in waiting on the session it
                     // answered, so it finishes that sign-in's own event rather than
                     // logging a second one, and leaves it waiting on the next
@@ -377,6 +392,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAuthChallenge<Eng> {
+    /// Whether this pool's threat protection PREVENTS the request `input` carries:
+    /// an always-block address range that applies to its app client covers the
+    /// address the request states for the device it signs in
+    /// ([`crate::state::UserPool::blocks_authentication`]). A reporting read of
+    /// the stored configuration, which moves nothing.
+    fn blocked(&self, input: &AdminRespondToAuthChallengeInput) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let guard = state.lock();
+        guard.pool(&input.user_pool_id).is_some_and(|pool| {
+            pool.blocks_authentication(
+                &input.client_id,
+                crate::state::PresentedAddress::Stated(
+                    input
+                        .context_data
+                        .as_ref()
+                        .map(|context| context.ip_address.as_str()),
+                ),
+            )
+        })
+    }
+
     /// Answer the outstanding challenge `input` responds to: the whole operation but for the
     /// observation its outcome publishes, which its caller makes once this has answered.
     async fn respond(

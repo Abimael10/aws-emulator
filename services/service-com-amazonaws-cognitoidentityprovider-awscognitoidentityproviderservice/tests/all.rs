@@ -49,6 +49,8 @@ mod admin_user_pool_lifecycle;
 mod alias_attribute_ownership;
 #[path = "all/app_client_and_pool_configuration.rs"]
 mod app_client_and_pool_configuration;
+#[path = "all/app_client_oauth_preconditions.rs"]
+mod app_client_oauth_preconditions;
 #[path = "all/app_client_refusal_wording.rs"]
 mod app_client_refusal_wording;
 #[path = "all/app_client_validity_defaults.rs"]
@@ -65,6 +67,8 @@ mod authentication_refusal_classes;
 mod authentication_refusal_wire;
 #[path = "all/authentication_success_shape.rs"]
 mod authentication_success_shape;
+#[path = "all/blocked_ip_authentication_gate.rs"]
+mod blocked_ip_authentication_gate;
 #[path = "all/case_insensitive_user_resolution.rs"]
 mod case_insensitive_user_resolution;
 #[path = "all/change_password.rs"]

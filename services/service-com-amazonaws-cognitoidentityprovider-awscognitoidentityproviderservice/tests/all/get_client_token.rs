@@ -292,10 +292,15 @@ async fn fixture(router: &MultiServiceRouter, case: &GrantCase) -> Fixture {
         json!([CLIENT_TOKEN_AUTH_FLOW]),
     );
     body.insert("AllowedOAuthFlows".to_string(), json!(["client_credentials"]));
-    body.insert(
-        "AllowedOAuthFlowsUserPoolClient".to_string(),
-        json!(true),
-    );
+    // "AllowedOAuthFlows and AllowedOAuthScopes are required if user pool client is
+    // allowed to use OAuth flows", so the authorization server is turned on only on
+    // a row that configures a scope for it to authorize.
+    if !case.configured_scopes.is_empty() {
+        body.insert(
+            "AllowedOAuthFlowsUserPoolClient".to_string(),
+            json!(true),
+        );
+    }
     body.insert(
         "AllowedOAuthScopes".to_string(),
         json!(case.configured_scopes),

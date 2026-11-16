@@ -96,6 +96,14 @@ totp-lite = "2.0"
 # delimited-text reader this workspace already parses CSV with, so a quoted field or an
 # embedded separator is read the way every other reader of that format reads it.
 csv = "1.3"
+# `url`: reads the scheme and the host of a redirect URL an app client registers
+# (`src/state/client_preconditions.rs`), the way every other reader of a URL in this
+# tree does, rather than scanning the authority by hand.
+url = "2"
+# `ipnet`: reads the CIDR notation a pool's threat-protection address exceptions are
+# "displayed and set in" and decides whether a request's address lies in one of those
+# blocks (`src/state/risk_exceptions.rs`).
+ipnet = "2"
 # The validity window rcgen stamps on that certificate is the one the model documents
 # for an issued signing certificate, so the two instants are converted from the pool's
 # `SystemTime`s into the date-time type rcgen takes.

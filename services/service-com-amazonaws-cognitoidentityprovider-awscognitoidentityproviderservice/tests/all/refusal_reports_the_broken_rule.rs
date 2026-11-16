@@ -323,7 +323,6 @@ async fn a_presented_client_secret_is_verified_rather_than_shape_checked() {
             "ClientSecret": CLIENT_SECRET,
             "ExplicitAuthFlows": ["ALLOW_CLIENT_TOKEN_AUTH"],
             "AllowedOAuthFlows": ["client_credentials"],
-            "AllowedOAuthFlowsUserPoolClient": true,
         }),
     )
     .await;

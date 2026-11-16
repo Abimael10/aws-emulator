@@ -364,6 +364,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_oauth_flow(message.to_string()));
         }
 
+        // The OAuth authorization server an app client turns on issues a token
+        // only for a grant it allows and only with a scope it may authorize, so a
+        // request that turns it on without both configures a server that can
+        // issue nothing ([`crate::state::oauth_configuration_incomplete`]). The
+        // rule lives in `state.rs` so this path and the update path enforce the
+        // same one, and it is asked before any resource is looked up, the way the
+        // framework's own constraint checks run before this handler at all.
+        if crate::state::oauth_configuration_incomplete(
+            input.allowed_o_auth_flows_user_pool_client,
+            input.allowed_o_auth_flows.as_deref(),
+            input.allowed_o_auth_scopes.as_deref(),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::OAUTH_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+
+        // Every URL this app client would redirect a browser to is one Amazon
+        // Cognito registers: HTTPS, or cleartext to the loopback interface alone
+        // ([`crate::state::http_redirect_uri`]). Asked through the same `state.rs`
+        // rule the update path asks, over every redirect member the request
+        // carries, before anything is stored.
+        if let Some(url) = crate::state::http_redirect_uri(
+            input
+                .callback_ur_ls
+                .iter()
+                .flatten()
+                .chain(input.logout_ur_ls.iter().flatten())
+                .chain(input.default_redirect_uri.iter())
+                .map(String::as_str),
+        ) {
+            return Err(invalid_parameter(crate::state::http_redirect_uri_message(
+                url,
+            )));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let pool = guard

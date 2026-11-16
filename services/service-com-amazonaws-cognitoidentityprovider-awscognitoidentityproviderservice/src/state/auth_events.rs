@@ -41,6 +41,13 @@
 //! is recorded: a level is what adaptive authentication "assessed for the
 //! authentication event" (`EventRiskType.RiskLevel`), and an evaluation that found no
 //! risk assessed none.
+//!
+//! One request IS decided against a signal the pool itself holds: an always-block
+//! address range of its threat-protection exceptions. "If `Block`, your user pool
+//! prevented the attempt" (`EventRiskType.RiskDecision`), so an attempt the pool
+//! prevented records that decision ([`RiskDecision`]) rather than the no-risk one,
+//! and still no level: that decision "overrides the risk decision"
+//! (`RiskExceptionConfigurationType`) instead of resting on an assessment.
 
 use ::std::time::SystemTime;
 
@@ -156,6 +163,43 @@ pub fn challenge_response(attempt: Attempt) -> &'static str {
     }
 }
 
+/// `RiskDecisionType`'s value for an attempt the pool PREVENTED: "if `Block`, your
+/// user pool prevented the attempt" (`EventRiskType.RiskDecision` in this service's
+/// model), one of the three modelled decisions
+/// (`smithy_query(query="shape",shape="RiskDecisionType"`): NoRisk | AccountTakeover
+/// | Block).
+pub const RISK_DECISION_BLOCK: &str = "Block";
+
+/// What the pool's threat protection DECIDED about the request an event records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskDecision {
+    /// The pool found nothing against the request ([`NO_RISK`]).
+    NoRisk,
+    /// The pool prevented the attempt ([`RISK_DECISION_BLOCK`]).
+    Block,
+}
+
+impl RiskDecision {
+    /// The decision a request the pool did or did not prevent records.
+    #[must_use]
+    pub fn of_blocked(blocked: bool) -> Self {
+        if blocked {
+            Self::Block
+        } else {
+            Self::NoRisk
+        }
+    }
+
+    /// The `RiskDecisionType` value this decision is reported as.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRisk => NO_RISK,
+            Self::Block => RISK_DECISION_BLOCK,
+        }
+    }
+}
+
 /// The feedback a submitter left on one logged event.
 #[derive(Debug, Clone)]
 pub struct Feedback {
@@ -190,6 +234,9 @@ pub struct AuthEvent {
     pub ip_address: Option<String>,
     /// The feedback submitted on this event, once some was.
     pub feedback: Option<Feedback>,
+    /// What the pool's threat protection decided about the request
+    /// ([`RiskDecision`]).
+    pub risk_decision: RiskDecision,
     /// The challenge session the attempt this event records is WAITING ON, for an
     /// attempt a challenge is outstanding for, and `None` once it is over.
     ///
@@ -219,6 +266,7 @@ impl ::std::fmt::Debug for AuthEvent {
             .field("response", &self.response)
             .field("challenge_responses", &self.challenge_responses)
             .field("ip_address", &self.ip_address)
+            .field("risk_decision", &self.risk_decision)
             .field("feedback", &self.feedback)
             .finish_non_exhaustive()
     }
@@ -234,8 +282,10 @@ impl AuthEvent {
             creation_date: Some(to_date_time(self.creation_date)),
             event_response: Some(self.response.clone()),
             event_risk: Some(EventRiskType {
-                risk_decision: Some(NO_RISK.to_string()),
-                // An evaluation that found no risk assessed no level.
+                risk_decision: Some(self.risk_decision.as_str().to_string()),
+                // Neither decision rests on an assessed level: this emulator has
+                // no risk signal to assess, and a prevented attempt was decided
+                // by the pool's own always-block exception instead.
                 risk_level: None,
                 compromised_credentials_detected: Some(false),
             }),
@@ -332,6 +382,9 @@ pub struct Logged<'a> {
     pub challenge: Option<&'static str>,
     /// The source address the request reported for the user's device.
     pub ip_address: Option<String>,
+    /// What the pool's threat protection decided about the request
+    /// ([`RiskDecision`]).
+    pub risk_decision: RiskDecision,
     /// The challenge session this call ANSWERED, for a call that continues an
     /// attempt an earlier call started: it finishes that attempt's own event
     /// instead of logging a new one.
@@ -402,6 +455,11 @@ fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) {
         }) {
             event.response = event_response(logged.attempt).to_string();
             event.outstanding_session = logged.outstanding_session.clone();
+            // An attempt the pool PREVENTED carries that decision from the call
+            // that was prevented, whichever call of the attempt that was.
+            if logged.risk_decision == RiskDecision::Block {
+                event.risk_decision = RiskDecision::Block;
+            }
             if let Some(challenge) = logged.challenge {
                 event
                     .challenge_responses
@@ -421,6 +479,7 @@ fn log(user: &mut User, logged: &Logged<'_>, at: SystemTime) {
             .unwrap_or_default(),
         ip_address: logged.ip_address.clone(),
         feedback: None,
+        risk_decision: logged.risk_decision,
         outstanding_session: logged.outstanding_session.clone(),
         feedback_token: new_feedback_token(),
     };

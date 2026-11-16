@@ -25,6 +25,12 @@ mod pool_resources;
 /// The cross-member preconditions a user-pool write has to satisfy before the
 /// pool is stored.
 mod pool_preconditions;
+/// The cross-member preconditions an app-client write has to satisfy before the
+/// client is stored.
+mod client_preconditions;
+/// The always-block address ranges a pool's threat protection evaluates an
+/// authentication request against.
+mod risk_exceptions;
 /// The stored user of a pool, and the import jobs that create users in bulk.
 mod users;
 /// A pool's third-party identity providers and its managed login branding.
@@ -67,7 +73,9 @@ mod new_password_challenge;
 /// answers it, and what satisfying it leaves behind.
 mod mfa_challenge;
 pub use attributes::*;
+pub use client_preconditions::*;
 pub use new_password_challenge::*;
+pub use risk_exceptions::*;
 pub use csv_header::*;
 pub use presented_tokens::*;
 pub use identity_providers::*;

@@ -285,7 +285,6 @@ async fn an_oauth_flow_combination_no_app_client_can_hold_is_refused_by_create_a
         &json!({
             "UserPoolId": user_pool_id,
             "ClientName": "standing",
-            "AllowedOAuthFlowsUserPoolClient": true,
             "AllowedOAuthFlows": ["code"],
         }),
     )
@@ -302,10 +301,7 @@ async fn an_oauth_flow_combination_no_app_client_can_hold_is_refused_by_create_a
             &router,
             &user_pool_id,
             "oauth-flow-client",
-            &json!({
-                "AllowedOAuthFlowsUserPoolClient": true,
-                "AllowedOAuthFlows": flows,
-            }),
+            &json!({ "AllowedOAuthFlows": flows }),
         )
         .await;
         let after = clients(&router, &user_pool_id).await.len();
@@ -360,7 +356,6 @@ async fn an_oauth_flow_combination_no_app_client_can_hold_is_refused_by_create_a
             &json!({
                 "UserPoolId": user_pool_id,
                 "ClientId": standing_id,
-                "AllowedOAuthFlowsUserPoolClient": true,
                 "AllowedOAuthFlows": flows,
             }),
         )
@@ -498,7 +493,6 @@ async fn a_scope_the_pool_has_no_definition_of_is_refused_by_create_and_update()
         &json!({
             "UserPoolId": user_pool_id,
             "ClientName": "standing",
-            "AllowedOAuthFlowsUserPoolClient": true,
             "AllowedOAuthScopes": ["openid"],
         }),
     )
@@ -518,10 +512,7 @@ async fn a_scope_the_pool_has_no_definition_of_is_refused_by_create_and_update()
             &router,
             &user_pool_id,
             "scope-client",
-            &json!({
-                "AllowedOAuthFlowsUserPoolClient": true,
-                "AllowedOAuthScopes": scopes,
-            }),
+            &json!({ "AllowedOAuthScopes": scopes }),
         )
         .await;
         let after = clients(&router, &user_pool_id).await.len();
@@ -572,7 +563,6 @@ async fn a_scope_the_pool_has_no_definition_of_is_refused_by_create_and_update()
             &json!({
                 "UserPoolId": user_pool_id,
                 "ClientId": standing_id,
-                "AllowedOAuthFlowsUserPoolClient": true,
                 "AllowedOAuthScopes": scopes,
             }),
         )

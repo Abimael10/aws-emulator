@@ -12168,6 +12168,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "ipnet",
  "rcgen",
  "ring",
  "serde_json",
@@ -12187,6 +12188,7 @@ dependencies = [
  "tokio",
  "totp-lite",
  "tracing",
+ "url",
  "x509-cert",
  "zip",
 ]

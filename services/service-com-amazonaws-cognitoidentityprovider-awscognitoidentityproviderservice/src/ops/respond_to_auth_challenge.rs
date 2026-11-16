@@ -334,7 +334,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .user_context_data
             .as_ref()
             .and_then(|context| context.ip_address.clone());
-        let answered = self.respond(input, ctx).await;
+        // The pool's threat protection decides this request BEFORE it is served,
+        // so the response it carries is not evaluated and the challenge it answers
+        // stays outstanding: an always-block address range "overrides the risk
+        // decision and always blocks authentication requests"
+        // (`RiskExceptionConfigurationType` in this service's model). It is also
+        // what the event of the attempt this call continues records as the pool's
+        // decision.
+        let blocked = self.blocked(&input);
+        let answered = if blocked {
+            Err(not_authorized(
+                crate::state::AUTHENTICATION_BLOCKED_MESSAGE,
+            ))
+        } else {
+            self.respond(input, ctx).await
+        };
         let attempt = crate::state::auth_metrics::attempt_of(&answered, |output| {
             output.authentication_result.is_some()
         });
@@ -361,6 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attempt,
                     challenge,
                     ip_address,
+                    risk_decision: crate::state::auth_events::RiskDecision::of_blocked(blocked),
                     // This call CONTINUES the sign-in waiting on the session it
                     // answered, so it finishes that sign-in's own event rather than
                     // logging a second one, and leaves it waiting on the next
@@ -379,6 +394,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChallenge<Eng> {
+    /// Whether this pool's threat protection PREVENTS the request `input` carries:
+    /// an always-block address range that applies to its app client covers the
+    /// address the request presents
+    /// ([`crate::state::UserPool::blocks_authentication`]). A reporting read of
+    /// the stored configuration, which moves nothing.
+    fn blocked(&self, input: &RespondToAuthChallengeInput) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let guard = state.lock();
+        guard.pool_of_client(&input.client_id).is_some_and(|pool| {
+            pool.blocks_authentication(
+                &input.client_id,
+                crate::state::PresentedAddress::Propagated(
+                    input
+                        .user_context_data
+                        .as_ref()
+                        .and_then(|context| context.ip_address.as_deref()),
+                ),
+            )
+        })
+    }
+
     /// Answer the outstanding challenge `input` responds to: the whole operation but for the
     /// observation its outcome publishes, which its caller makes once this has answered.
     async fn respond(
@@ -396,6 +434,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
         // A session's window is read against the clock, so an expired challenge is
         // refused whether or not anything has swept it.
         let now = ::std::time::SystemTime::now();
+        // A source address reaches this pool's threat protection only from an app
+        // client configured to propagate it: "if you don't include
+        // [EnablePropagateAdditionalUserContextData], you can't send the source IP
+        // address to Amazon Cognito threat protection features" (this service's
+        // model), so a request that sends one to any other app client of the pool
+        // sends a value that app client may not use
+        // ([`crate::state::UserPool::forbids_propagated_address`]).
+        if state.lock().propagated_address_forbidden(
+            &input.client_id,
+            input
+                .user_context_data
+                .as_ref()
+                .and_then(|context| context.ip_address.as_deref()),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::PROPAGATED_ADDRESS_FORBIDDEN_MESSAGE.to_string(),
+            ));
+        }
         // `Session` is "the session identifier that maintains the state of
         // authentication requests and challenge responses": without it there is no
         // outstanding challenge to answer.

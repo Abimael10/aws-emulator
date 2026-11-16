@@ -205,6 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // This operation models no context data, so the request reports no
                     // address for the user's device.
                     ip_address: None,
+                    // A password change is no authentication request, so the
+                    // pool's always-block address ranges decide nothing about it
+                    // and its threat protection found nothing against it.
+                    risk_decision: crate::state::auth_events::RiskDecision::NoRisk,
                     // This one call is the whole attempt: it answers no challenge
                     // and leaves none outstanding.
                     answered_session: None,
