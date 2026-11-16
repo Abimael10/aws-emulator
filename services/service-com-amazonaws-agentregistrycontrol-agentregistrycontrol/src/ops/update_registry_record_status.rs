@@ -223,22 +223,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A status this SERVICE sets for its own asynchronous work is not a curator's to
-        // choose, in either direction: a record cannot be moved INTO one, and one whose
-        // asynchronous change is still in flight is not in the workflow yet.
-        if ASYNCHRONOUS_STATUSES.contains(&input.status.as_str()) {
-            return Err(UpdateRegistryRecordStatusErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "status {} reports an asynchronous change this service makes itself \
-                         and is not a curation status a record can be moved to",
-                        input.status
-                    )),
+        // A status the SERVICE itself reaches is not a target a caller may name:
+        // `PENDING_APPROVAL` is entered by a submission, which is where the registry's
+        // approval configuration is applied, and the asynchronous statuses report this
+        // service's own create and update work. The value is a member of the enum, so the
+        // framework admitted it; it is this operation that does not accept it as a target.
+        if !crate::state::is_record_curation_target(&input.status) {
+            let refusal = crate::state::invalid_target_status_message(&input.status);
+            return Err(UpdateRegistryRecordStatusErrorModeled::ValidationException(
+                ValidationException {
+                    message: refusal.clone(),
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "status".to_string(),
+                        message: refusal,
+                    }]),
                 },
             )
             .into());
         }
-        if ASYNCHRONOUS_STATUSES.contains(&record.status.as_str()) {
+
+        // Deprecation retires a record, so the status it is stored in is terminal and no
+        // later change applies to it — including another status change.
+        if crate::state::is_terminal_record_status(&record.status) {
+            return Err(UpdateRegistryRecordStatusErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::terminal_record_status_message(&record.status),
+                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // A record whose own asynchronous change is still in flight is not in the workflow
+        // yet, so the lifecycle has no step to take from where it stands.
+        if crate::state::is_asynchronous_record_status(&record.status) {
             return Err(UpdateRegistryRecordStatusErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
@@ -246,6 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          that change has finished",
                         record.status
                     )),
+                },
+            )
+            .into());
+        }
+
+        // The curation workflow is a workflow: a step is taken from the status the record
+        // is stored in, so the lifecycle's own transition table — not the caller — decides
+        // which status follows which, and a pair it does not hold is refused with the
+        // statuses that status does allow.
+        if !crate::state::record_status_transition_allowed(&record.status, &input.status) {
+            return Err(UpdateRegistryRecordStatusErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::invalid_status_transition_message(
+                        &record.status,
+                        &input.status,
+                    ),
+                    reason: crate::state::RESOURCE_CONFLICT.to_string(),
+                    field_list: None,
                 },
             )
             .into());
@@ -289,13 +327,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `RegistryRecordStatus` values that report an ASYNCHRONOUS change this service makes
-/// itself, rather than a step of the registry's curation workflow: a record is `CREATING`
-/// while `CreateRegistryRecord` is in flight and `UPDATING` while `UpdateRegistryRecord`
-/// is, and the two `*_FAILED` values report that one of those did not finish. The curation
-/// values are every other member of the enum
-/// (`crate::ops::types::REGISTRY_RECORD_STATUS_VALUES`), which the framework has already
-/// checked `status` against before this handler runs — so this names the four it withholds
-/// rather than a second copy of the five it admits.
-const ASYNCHRONOUS_STATUSES: &[&str] = &["CREATING", "UPDATING", "CREATE_FAILED", "UPDATE_FAILED"];

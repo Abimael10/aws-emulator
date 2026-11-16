@@ -4,16 +4,25 @@
 //! router so every assertion goes through routing, deserialization, the handler and
 //! serialization.
 //!
-//! The rule under test: `UpdateRegistryRecordStatus` moves a record to the status a
-//! curator names and records the reason given with it — "Updates the status of a registry
-//! record as part of the registry's curation workflow, for example to approve or reject a
-//! record that is pending approval, or to deprecate an approved record so that it is no
-//! longer discoverable". The answer echoes the resulting status and that reason, and both
-//! are persisted, so every later read reports them. The statuses a curator may name are
-//! the curation ones: a status that reports an ASYNCHRONOUS change this service makes
-//! itself (`CREATING`, `UPDATING`, and the two `*_FAILED` values) is not one a record can
-//! be moved to, and a record in one of them is not in the workflow yet — both are the
-//! modelled `ConflictException`. A registry or a record this service does not hold is the
+//! The rule under test: `UpdateRegistryRecordStatus` is a step of the registry's curation
+//! workflow — "Updates the status of a registry record as part of the registry's curation
+//! workflow, for example to approve or reject a record that is pending approval, or to
+//! deprecate an approved record so that it is no longer discoverable" — so the record's
+//! stored status, not the caller, decides which status may follow it:
+//!
+//! * a caller may name only a status the curation workflow is its own: a status the SERVICE
+//!   reaches by itself (`PENDING_APPROVAL`, entered by a submission, and the asynchronous
+//!   `CREATING`, `UPDATING`, `CREATE_FAILED`, `UPDATE_FAILED`) is refused as a target;
+//! * a record in the terminal `DEPRECATED` status is retired, so no later change applies;
+//! * any other pair is taken only when the record lifecycle's transition table holds it,
+//!   and refused with the statuses the stored status does allow otherwise;
+//! * every refusal is the modelled `ValidationException` (HTTP 400) and writes nothing,
+//!   while an allowed step answers 202, echoes the resulting status and the reason it was
+//!   given, and persists both for every later read.
+//!
+//! A record whose own asynchronous change is still in flight, and a registry that has not
+//! reached `READY`, are the modelled `ConflictException` (409): neither resource is in a
+//! state the workflow runs in. A registry or a record this service does not hold is the
 //! modelled `ResourceNotFoundException`, worded as every other operation of this service
 //! words that class.
 //!
@@ -51,6 +60,45 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `crate::ops::types::REGISTRY_RECORD_STATUS_VALUES` (APPROVED, CREATE_FAILED, CREATING,
 /// DEPRECATED, DRAFT, PENDING_APPROVAL, REJECTED, UPDATE_FAILED, UPDATING).
 const ASYNCHRONOUS_STATUSES: [&str; 4] = ["CREATING", "UPDATING", "CREATE_FAILED", "UPDATE_FAILED"];
+
+/// The statuses the record lifecycle allows a record in each status to move to, as the
+/// service states them in the refusal of a transition it does not hold — written out here
+/// rather than read from the crate, so the wording and the order are pinned by the test.
+/// Source: the transition table the service states for a status, whose `DRAFT` row AWS
+/// states as `PENDING_APPROVAL, DEPRECATED, DRAFT, UPDATING, UPDATE_PENDING_AUTH`.
+const VALID_TRANSITIONS: [(&str, &str); 5] = [
+    (
+        "DRAFT",
+        "PENDING_APPROVAL, DEPRECATED, DRAFT, UPDATING, UPDATE_PENDING_AUTH",
+    ),
+    (
+        "PENDING_APPROVAL",
+        "APPROVED, REJECTED, DEPRECATED, PENDING_APPROVAL, UPDATING, UPDATE_PENDING_AUTH",
+    ),
+    (
+        "APPROVED",
+        "REJECTED, DEPRECATED, APPROVED, UPDATING, UPDATE_PENDING_AUTH",
+    ),
+    (
+        "REJECTED",
+        "DRAFT, DEPRECATED, REJECTED, UPDATING, UPDATE_PENDING_AUTH",
+    ),
+    ("CREATING", "DRAFT, CREATE_FAILED"),
+];
+
+/// The sentence this service refuses a transition its lifecycle does not hold with, built
+/// from [`VALID_TRANSITIONS`] so the test states the expected text itself.
+fn expected_transition_refusal(current: &str, target: &str) -> String {
+    let valid = VALID_TRANSITIONS
+        .iter()
+        .find(|(status, _)| *status == current)
+        .map(|(_, valid)| *valid)
+        .unwrap_or_default();
+    format!(
+        "Invalid status transition from {current} to {target}. \
+         Valid transitions from {current}: {valid}"
+    )
+}
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Reply {
@@ -199,15 +247,23 @@ async fn record_reaching(
     }
 }
 
+/// The reason the staging path leaves on a record it had to move through the workflow to
+/// reach `start_status`, so a test can assert that a refused call changed nothing.
+const STAGED_REASON: &str = "staged by the suite";
+
 /// A `READY` registry holding one record in `start_status`, created through this service's
-/// own operations and taken to that status through them — `auto_approve` chooses what a
-/// submission lands in. Returns (registryId, registryArn, recordId, recordArn).
+/// own operations and taken to that status through them: a submission enters the workflow
+/// (auto-approved when the start status is past review), and the curation steps the
+/// lifecycle allows carry it the rest of the way. Returns
+/// (registryId, registryArn, recordId, recordArn).
 async fn record_in_status(
     router: &MultiServiceRouter,
     case: &str,
-    auto_approve: bool,
     start_status: &str,
 ) -> (String, String, String, String) {
+    // A submission is auto-approved where the start status is one past review, so the
+    // record gets there without a curation step that the status table would refuse.
+    let auto_approve = matches!(start_status, "APPROVED" | "DEPRECATED");
     let registry_name: String = case
         .chars()
         .map(|character| {
@@ -278,61 +334,108 @@ async fn record_in_status(
             "case {case:?}: SubmitRegistryRecordForApproval must answer 202, got {} {:?}",
             submitted.status, submitted.body
         );
-        record_reaching(router, case, &registry_id, &record_id, start_status).await;
+        let submitted_status = if auto_approve {
+            "APPROVED"
+        } else {
+            "PENDING_APPROVAL"
+        };
+        record_reaching(router, case, &registry_id, &record_id, submitted_status).await;
+
+        // The remaining statuses are curation steps the lifecycle allows from where the
+        // submission left the record: PENDING_APPROVAL -> REJECTED, APPROVED -> DEPRECATED.
+        if start_status != submitted_status {
+            let moved = update_status(
+                router,
+                &registry_id,
+                &record_id,
+                json!({ "status": start_status, "statusReason": STAGED_REASON }),
+            )
+            .await;
+            assert_eq!(
+                (moved.status, moved.str_field("status")),
+                (202, start_status),
+                "case {case:?}: staging the record in {start_status} must succeed, got {} {:?}",
+                moved.status,
+                moved.body
+            );
+        }
     }
     (registry_id, registry_arn, record_id, record_arn)
 }
 
 #[tokio::test]
-async fn a_curation_status_is_written_with_its_reason_and_read_back() {
+async fn a_curation_step_the_lifecycle_allows_is_written_with_its_reason_and_read_back() {
     let (router, _engine) = router();
 
-    // (case, the status the record starts in, whether its registry auto-approves, the
-    // status a curator moves it to, the reason given). The rows span the curation
-    // transitions the operation's own doc names — approve or reject a record that is
-    // pending approval, deprecate an approved one — plus a move back out of the workflow,
-    // and they differ in the reason text so no fixed string can satisfy them.
-    let rows: [(&str, &str, bool, &str, &str); 5] = [
+    // (case, the status the record starts in, the status a curator moves it to, the reason
+    // given). The rows span every transition the lifecycle's table allows a caller to ask
+    // for — the workflow steps the operation's own doc names (approve or reject a record
+    // pending approval, deprecate an approved one), approval withdrawn from an approved
+    // record, retirement from any live status, a rejected record returning to draft, and a
+    // repeat of the status a record already has (every row that does not end in the terminal
+    // status repeats its step through the ARN form below) — and they differ in the reason
+    // text so no fixed string can satisfy them.
+    let rows: [(&str, &str, &str, &str); 10] = [
         (
             "approve a record pending approval",
             "PENDING_APPROVAL",
-            false,
             "APPROVED",
             "reviewed by the catalogue team",
         ),
         (
             "reject a record pending approval",
             "PENDING_APPROVAL",
-            false,
             "REJECTED",
             "descriptor does not describe a reachable endpoint",
         ),
         (
+            "retire a record pending approval",
+            "PENDING_APPROVAL",
+            "DEPRECATED",
+            "withdrawn before review",
+        ),
+        (
             "deprecate an approved record",
             "APPROVED",
-            true,
             "DEPRECATED",
             "superseded by v2",
         ),
         (
-            "return an approved record to draft",
+            "re-approve an approved record",
             "APPROVED",
-            true,
-            "DRAFT",
-            "withdrawn at the owner's request",
+            "APPROVED",
+            "re-reviewed after the owner's note",
         ),
         (
-            "move a draft record into the workflow",
+            "turn down a record that was approved",
+            "APPROVED",
+            "REJECTED",
+            "approval withdrawn after a second look",
+        ),
+        (
+            "retire a draft record",
             "DRAFT",
-            false,
-            "PENDING_APPROVAL",
-            "",
+            "DEPRECATED",
+            "never completed",
+        ),
+        ("keep a draft record in draft", "DRAFT", "DRAFT", ""),
+        (
+            "return a rejected record to draft",
+            "REJECTED",
+            "DRAFT",
+            "owner is revising the descriptor",
+        ),
+        (
+            "retire a rejected record",
+            "REJECTED",
+            "DEPRECATED",
+            "abandoned after rejection",
         ),
     ];
 
-    for (case, start_status, auto_approve, target, reason) in rows {
+    for (case, start_status, target, reason) in rows {
         let (registry_id, registry_arn, record_id, record_arn) =
-            record_in_status(&router, case, auto_approve, start_status).await;
+            record_in_status(&router, case, start_status).await;
 
         let updated = update_status(
             &router,
@@ -381,33 +484,55 @@ async fn a_curation_status_is_written_with_its_reason_and_read_back() {
         );
 
         // Either identifier form names the same record, so the ARN form reaches it too.
-        let again = update_status(
-            &router,
-            &registry_arn,
-            &record_arn,
-            json!({ "status": start_status, "statusReason": "restored by the suite" }),
-        )
-        .await;
-        assert_eq!(
-            (again.status, again.str_field("status")),
-            (202, start_status),
-            "case {case:?}: the ARN form of each label names the same resources, got {} {:?}",
-            again.status,
-            again.body
-        );
+        // Repeating a status a record already holds is a step the table allows, except out
+        // of the terminal one, which the terminal rule covers on its own.
+        if target != "DEPRECATED" {
+            let again = update_status(
+                &router,
+                &registry_arn,
+                &record_arn,
+                json!({ "status": target, "statusReason": "restated by the suite" }),
+            )
+            .await;
+            assert_eq!(
+                (
+                    again.status,
+                    again.str_field("status"),
+                    again.str_field("statusReason")
+                ),
+                (202, target, "restated by the suite"),
+                "case {case:?}: the ARN form of each label names the same resources, got {} \
+                 {:?}",
+                again.status,
+                again.body
+            );
+        }
     }
 }
 
 #[tokio::test]
-async fn an_asynchronous_status_is_not_one_a_curator_can_name() {
-    let (router, engine) = router();
-    let case = "asynchronous target status";
-    let (registry_id, _registry_arn, record_id, _record_arn) =
-        record_in_status(&router, case, true, "APPROVED").await;
+async fn a_status_the_service_reaches_by_itself_is_not_one_a_caller_can_name() {
+    let (router, _engine) = router();
 
-    // A target status that reports this service's own asynchronous work is refused, and
-    // the record keeps the status it had.
+    // (the status the record starts in, the target a caller names). The targets span every
+    // `RegistryRecordStatus` outside the curation ones: `PENDING_APPROVAL`, which only a
+    // submission enters, and the four that report this service's own asynchronous work. The
+    // rows start from two different statuses, and `PENDING_APPROVAL` is a status the DRAFT
+    // row's own transition list holds — so it is refused as a TARGET a caller may not name,
+    // not as a transition the table lacks.
+    let mut rows: Vec<(&str, &str)> = vec![("DRAFT", "PENDING_APPROVAL")];
     for target in ASYNCHRONOUS_STATUSES {
+        rows.push(("DRAFT", target));
+    }
+    rows.push(("APPROVED", "PENDING_APPROVAL"));
+    rows.push(("APPROVED", "CREATING"));
+
+    for (start_status, target) in rows {
+        let case = format!("name {target} on a {start_status} record");
+        let (registry_id, _registry_arn, record_id, _record_arn) =
+            record_in_status(&router, &case, start_status).await;
+        let before = get_record(&router, &registry_id, &record_id).await;
+
         let refused = update_status(
             &router,
             &registry_id,
@@ -416,31 +541,157 @@ async fn an_asynchronous_status_is_not_one_a_curator_can_name() {
         )
         .await;
         assert_eq!(
-            (refused.status, refused.error_code.as_deref()),
-            (409, Some("ConflictException")),
-            "case {case:?} ({target}): expected the modelled 409 ConflictException, got {} \
-             {:?}",
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (
+                400,
+                Some("ValidationException"),
+                format!("Invalid target status: {target}")
+            ),
+            "case {case:?}: expected the modelled 400 ValidationException naming the target \
+             it will not accept, got {} {:?}",
             refused.status,
             refused.body
         );
-        assert!(
-            refused.message().contains(target),
-            "case {case:?} ({target}): the refusal names the status it would not accept, \
-             got {:?}",
-            refused.message()
-        );
-        let read_back = get_record(&router, &registry_id, &record_id).await;
+
+        // A refused call writes nothing: status and reason are what they were.
+        let after = get_record(&router, &registry_id, &record_id).await;
         assert_eq!(
-            read_back.str_field("status"),
-            "APPROVED",
-            "case {case:?} ({target}): a refused transition writes nothing, got {:?}",
-            read_back.body
+            (after.str_field("status"), after.str_field("statusReason")),
+            (before.str_field("status"), before.str_field("statusReason")),
+            "case {case:?}: a refused transition writes nothing, got {:?}",
+            after.body
         );
     }
+}
 
-    // And a record whose own asynchronous change has not finished is not in the workflow
-    // yet. Only this service's own work puts a record in one of those statuses, so each
-    // row is staged in its store directly.
+#[tokio::test]
+async fn a_transition_the_lifecycle_does_not_allow_is_refused_with_the_ones_it_allows() {
+    let (router, _engine) = router();
+
+    // (the status the record starts in, the target a curator asks for). The rows span the
+    // pairs of curation statuses the lifecycle's table does NOT hold: a record skipping
+    // review in either direction, a record pending approval or an approved one dragged back
+    // to draft, and a rejected one approved without a new submission.
+    let rows: [(&str, &str); 5] = [
+        ("DRAFT", "APPROVED"),
+        ("DRAFT", "REJECTED"),
+        ("PENDING_APPROVAL", "DRAFT"),
+        ("APPROVED", "DRAFT"),
+        ("REJECTED", "APPROVED"),
+    ];
+
+    for (start_status, target) in rows {
+        let case = format!("{start_status} to {target}");
+        let (registry_id, _registry_arn, record_id, _record_arn) =
+            record_in_status(&router, &case, start_status).await;
+        let before = get_record(&router, &registry_id, &record_id).await;
+
+        let refused = update_status(
+            &router,
+            &registry_id,
+            &record_id,
+            json!({ "status": target, "statusReason": "asked for by the suite" }),
+        )
+        .await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (
+                400,
+                Some("ValidationException"),
+                expected_transition_refusal(start_status, target)
+            ),
+            "case {case:?}: expected the modelled 400 ValidationException naming the \
+             transitions {start_status} does allow, got {} {:?}",
+            refused.status,
+            refused.body
+        );
+
+        let after = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (after.str_field("status"), after.str_field("statusReason")),
+            (before.str_field("status"), before.str_field("statusReason")),
+            "case {case:?}: a refused transition writes nothing, got {:?}",
+            after.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deprecated_record_is_retired_so_nothing_moves_it_again() {
+    let (router, _engine) = router();
+    let case = "a deprecated record";
+    let (registry_id, registry_arn, record_id, record_arn) =
+        record_in_status(&router, case, "DEPRECATED").await;
+
+    // Every curation target a caller may name, asked for on a retired record — including
+    // the status it already holds — and each identifier form of the two labels.
+    let rows: [(&str, bool); 5] = [
+        ("DRAFT", false),
+        ("APPROVED", false),
+        ("REJECTED", false),
+        ("DEPRECATED", false),
+        ("APPROVED", true),
+    ];
+
+    for (target, by_arn) in rows {
+        let row = format!("{case}: {target}{}", if by_arn { " by ARN" } else { "" });
+        let (registry, record) = if by_arn {
+            (registry_arn.as_str(), record_arn.as_str())
+        } else {
+            (registry_id.as_str(), record_id.as_str())
+        };
+        let refused = update_status(
+            &router,
+            registry,
+            record,
+            json!({ "status": target, "statusReason": "asked for by the suite" }),
+        )
+        .await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (
+                400,
+                Some("ValidationException"),
+                "Cannot update registry record in DEPRECATED status (terminal state)".to_string()
+            ),
+            "case {row:?}: expected the modelled 400 ValidationException stating the record \
+             is terminal, got {} {:?}",
+            refused.status,
+            refused.body
+        );
+
+        let after = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (after.str_field("status"), after.str_field("statusReason")),
+            ("DEPRECATED", STAGED_REASON),
+            "case {row:?}: the retired record keeps its status and its reason, got {:?}",
+            after.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_record_whose_asynchronous_change_is_in_flight_is_not_in_the_workflow() {
+    let (router, engine) = router();
+    let case = "an asynchronous status";
+    let (registry_id, _registry_arn, record_id, _record_arn) =
+        record_in_status(&router, case, "APPROVED").await;
+
+    // A record whose own asynchronous change has not finished is not in the workflow yet.
+    // Only this service's own work puts a record in one of those statuses, so each row is
+    // staged in its store directly.
     for current in ASYNCHRONOUS_STATUSES {
         {
             let state = engine
@@ -482,7 +733,7 @@ async fn a_registry_that_is_not_ready_has_no_curation_workflow() {
     let (router, engine) = router();
     let case = "a registry that is not READY";
     let (registry_id, _registry_arn, record_id, _record_arn) =
-        record_in_status(&router, case, true, "APPROVED").await;
+        record_in_status(&router, case, "APPROVED").await;
 
     // A registry is usable once it reaches READY. The statuses it can be in instead are
     // its own asynchronous ones (`RegistryStatus`: CREATE_FAILED, CREATING, DELETE_FAILED,
@@ -530,7 +781,7 @@ async fn a_resource_this_service_does_not_hold_is_not_found() {
     let (router, _engine) = router();
     let case = "an absent resource";
     let (registry_id, _registry_arn, record_id, _record_arn) =
-        record_in_status(&router, case, true, "APPROVED").await;
+        record_in_status(&router, case, "APPROVED").await;
 
     // A registry id and a record id of the modelled shapes
     // (`RegistryId` ^[a-zA-Z0-9]{12,16}$, `RegistryRecordId` ^[a-zA-Z0-9]{12}$) that this

@@ -122,6 +122,12 @@ pub fn duplicate_registry_name_message(name: &str) -> String {
 /// `crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`.
 pub const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
 
+/// The `ValidationExceptionReason` a request refused over the RESOURCE's stored state
+/// carries, rather than over the shape of one of its fields — the record lifecycle's
+/// transition table and its terminal status. From the same catalogue as
+/// [`FIELD_VALIDATION_FAILED`].
+pub const RESOURCE_CONFLICT: &str = "ResourceConflict";
+
 /// How many `@idempotencyToken` replays are remembered at once. Entries are dropped
 /// when the resource they name is removed; this cap bounds what is left, oldest first,
 /// so a long-lived process cannot accumulate tokens for ever.
@@ -152,6 +158,144 @@ pub const RECORD_DRAFT: &str = "DRAFT";
 pub const RECORD_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
 /// `RegistryRecordStatus` of a record the approval workflow has approved.
 pub const RECORD_APPROVED: &str = "APPROVED";
+/// `RegistryRecordStatus` of a record a curator turned down.
+pub const RECORD_REJECTED: &str = "REJECTED";
+/// `RegistryRecordStatus` of a retired record, which is no longer discoverable. It is the
+/// record lifecycle's TERMINAL status: nothing moves a record out of it again.
+pub const RECORD_DEPRECATED: &str = "DEPRECATED";
+/// `RegistryRecordStatus` while `UpdateRegistryRecord` is in flight.
+pub const RECORD_UPDATING: &str = "UPDATING";
+/// `RegistryRecordStatus` of a record whose creation did not finish.
+pub const RECORD_CREATE_FAILED: &str = "CREATE_FAILED";
+/// `RegistryRecordStatus` of a record whose edit did not finish.
+pub const RECORD_UPDATE_FAILED: &str = "UPDATE_FAILED";
+
+/// The `RegistryRecordStatus` values that report an ASYNCHRONOUS change this service makes
+/// itself rather than a step of the registry's curation workflow: a record is `CREATING`
+/// while `CreateRegistryRecord` is in flight and `UPDATING` while `UpdateRegistryRecord`
+/// is, and the two `*_FAILED` values report that one of those did not finish.
+pub const RECORD_ASYNCHRONOUS_STATUSES: &[&str] = &[
+    RECORD_CREATING,
+    RECORD_UPDATING,
+    RECORD_CREATE_FAILED,
+    RECORD_UPDATE_FAILED,
+];
+
+/// Whether a record in `status` has a change of this service's own still in flight, so it
+/// is not in the curation workflow yet.
+pub fn is_asynchronous_record_status(status: &str) -> bool {
+    RECORD_ASYNCHRONOUS_STATUSES.contains(&status)
+}
+
+/// A step of the record lifecycle that no `RegistryRecordStatus` member names: an edit of
+/// a record waiting for authorisation before it is applied. It is never a value on the
+/// wire; it appears only in the list of statuses a status allows a record to move to,
+/// which the service states as it is ([`record_status_transitions`]).
+const RECORD_UPDATE_PENDING_AUTH: &str = "UPDATE_PENDING_AUTH";
+
+/// The statuses a caller may name as the TARGET of a status change: the curation steps of
+/// the registry's workflow. Every other `RegistryRecordStatus` is reached only by the
+/// service itself — `PENDING_APPROVAL` by a submission, and `CREATING`, `UPDATING` and the
+/// two `*_FAILED` values by this service's own asynchronous create and update — so a
+/// request naming one is refused rather than performed. The whole catalogue is
+/// `crate::ops::types::REGISTRY_RECORD_STATUS_VALUES`.
+pub const RECORD_CURATION_TARGETS: &[&str] = &[
+    RECORD_DRAFT,
+    RECORD_APPROVED,
+    RECORD_REJECTED,
+    RECORD_DEPRECATED,
+];
+
+/// Whether `status` is one a caller may ask a record to be moved to.
+pub fn is_record_curation_target(status: &str) -> bool {
+    RECORD_CURATION_TARGETS.contains(&status)
+}
+
+/// Whether a record in `status` is retired, so no later change applies to it.
+pub fn is_terminal_record_status(status: &str) -> bool {
+    status == RECORD_DEPRECATED
+}
+
+/// The statuses the record lifecycle allows a record in `status` to move to, by ANY means:
+/// a curator's step, a submission, or this service's own asynchronous work. Its order is
+/// the order the service states them in — the workflow's next steps, then retirement, then
+/// the status itself (a repeat of a step applies again), then the two steps an edit of the
+/// record goes through.
+///
+/// The `DRAFT` row is the list AWS itself states for that status, down to its order and to
+/// `UPDATE_PENDING_AUTH`, which no enum member names. The other rows are that same shape
+/// read off the workflow the operation documents, so a later observation of one of them
+/// corrects that row alone.
+///
+/// A record whose own asynchronous change is still in flight is held before this table is
+/// consulted, so the statuses that report one carry no row of their own.
+pub fn record_status_transitions(status: &str) -> &'static [&'static str] {
+    match status {
+        RECORD_CREATING => &[RECORD_DRAFT, RECORD_CREATE_FAILED],
+        RECORD_DRAFT => &[
+            RECORD_PENDING_APPROVAL,
+            RECORD_DEPRECATED,
+            RECORD_DRAFT,
+            RECORD_UPDATING,
+            RECORD_UPDATE_PENDING_AUTH,
+        ],
+        RECORD_PENDING_APPROVAL => &[
+            RECORD_APPROVED,
+            RECORD_REJECTED,
+            RECORD_DEPRECATED,
+            RECORD_PENDING_APPROVAL,
+            RECORD_UPDATING,
+            RECORD_UPDATE_PENDING_AUTH,
+        ],
+        RECORD_APPROVED => &[
+            RECORD_REJECTED,
+            RECORD_DEPRECATED,
+            RECORD_APPROVED,
+            RECORD_UPDATING,
+            RECORD_UPDATE_PENDING_AUTH,
+        ],
+        RECORD_REJECTED => &[
+            RECORD_DRAFT,
+            RECORD_DEPRECATED,
+            RECORD_REJECTED,
+            RECORD_UPDATING,
+            RECORD_UPDATE_PENDING_AUTH,
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether the record lifecycle lets a record in `current` move to `target`.
+///
+/// The table also carries the statuses this service's own work reaches, which no request may
+/// name, so a caller's target is admitted by [`is_record_curation_target`] first.
+pub fn record_status_transition_allowed(current: &str, target: &str) -> bool {
+    record_status_transitions(current).contains(&target)
+}
+
+/// How this service refuses a target status a caller may not name: the fixed lead-in and
+/// the value the request asked for.
+pub fn invalid_target_status_message(status: &str) -> String {
+    format!("Invalid target status: {status}")
+}
+
+/// How this service refuses a status change the record lifecycle does not allow: the
+/// status the record is stored in, the status the request asked for, and the statuses that
+/// stored status does allow, listed in the order [`record_status_transitions`] states them.
+pub fn invalid_status_transition_message(current: &str, target: &str) -> String {
+    format!(
+        "Invalid status transition from {current} to {target}. Valid transitions from \
+         {current}: {}",
+        record_status_transitions(current).join(", ")
+    )
+}
+
+/// How this service refuses any later change to a record in a terminal status: the
+/// record is retired, so a submission, an edit and a status change all state this. The one
+/// variable part is the status the record is stored in.
+pub fn terminal_record_status_message(status: &str) -> String {
+    format!("Cannot update registry record in {status} status (terminal state)")
+}
 
 /// The one `AutoApprovalRule` the model declares — the catalogue it comes from is
 /// `crate::ops::types::AUTO_APPROVAL_RULE_VALUES`. It selects every submitted record,
