@@ -734,7 +734,8 @@ async fn describe_flow_logs_filters_the_store_rather_than_looking_one_up() {
     }
 
     // A filter name this operation does not document is refused rather than read as "no
-    // results".
+    // results", and the refusal names the ENTRY at fault by its position in the request —
+    // the rule `super::flow_log_refusal_wording` asserts over a table of positions.
     let (status, body) =
         describe_flow_logs(&router, &filters(&[("resource-type", &["VPC"])])).await;
     assert_eq!(
@@ -743,8 +744,14 @@ async fn describe_flow_logs_filters_the_store_rather_than_looking_one_up() {
     );
     assert_eq!(
         error_code(&body),
-        "InvalidFilter",
-        "an undocumented filter: expected InvalidFilter, got {body}"
+        "InvalidParameterValue",
+        "an undocumented filter: expected InvalidParameterValue, got {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        "1 validation error detected: Value 'resource-type' at 'filter.1.member.name' has \
+         an invalid format",
+        "an undocumented filter: expected the parameter-validation clause, got {body}"
     );
 }
 
@@ -1285,7 +1292,7 @@ async fn a_create_is_held_to_the_members_its_resource_and_destination_require() 
                 param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
                 param("LogDestination", "arn:aws:s3:::flow-logs-bucket"),
             ],
-            "InvalidParameterValue",
+            "InvalidParameter",
         ),
         refusal(
             "no destination for an S3 destination type",
@@ -1307,7 +1314,7 @@ async fn a_create_is_held_to_the_members_its_resource_and_destination_require() 
                 param("LogDestination", "arn:aws:s3:::flow-logs-bucket"),
                 param("LogGroupName", "not-for-s3"),
             ],
-            "InvalidParameterCombination",
+            "InvalidParameter",
         ),
         refusal(
             "an aggregation interval that is neither 60 nor 600",
@@ -1319,7 +1326,7 @@ async fn a_create_is_held_to_the_members_its_resource_and_destination_require() 
                 param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
                 param("MaxAggregationInterval", "300"),
             ],
-            "InvalidParameterValue",
+            "InvalidParameter",
         ),
         refusal(
             "a TrafficType for a transit gateway resource type",
@@ -1341,7 +1348,7 @@ async fn a_create_is_held_to_the_members_its_resource_and_destination_require() 
                 param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
                 param("MaxAggregationInterval", "600"),
             ],
-            "InvalidParameterValue",
+            "InvalidParameter",
         ),
     ];
 

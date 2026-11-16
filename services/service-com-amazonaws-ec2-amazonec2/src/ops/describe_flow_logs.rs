@@ -207,10 +207,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // results". Each value is compiled into its pattern ONCE here, rather than
         // recompiled for every candidate flow log.
         let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
-        for filter in filters {
+        for (position, filter) in filters.iter().enumerate() {
             let name = filter.name.as_deref().unwrap_or_default();
-            let canonical = canonical_filter_name(name)
-                .ok_or_else(|| crate::state::invalid_filter(&REPORTED_FLOW_LOG_FILTERS))?;
+            // The name of a filter this operation does not document is a value outside the
+            // form that parameter takes, which this operation's `Filters` member is held to
+            // by the request-parameter layer: the refusal names the ENTRY at fault by the
+            // position the request sent it at, counting from 1, so a caller with several
+            // filters is told which one to fix.
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                crate::state::invalid_parameter_format(
+                    &crate::state::parameter_entry_path(
+                        FILTER_PARAMETER_WIRE_NAME,
+                        position.saturating_add(1),
+                        FILTER_NAME_WIRE_NAME,
+                    ),
+                    &crate::state::echoed_resource_id(name),
+                )
+            })?;
             let values: &[String] = filter.values.as_deref().unwrap_or_default();
             if values.len() > MAX_FILTER_VALUES {
                 return Err(crate::state::invalid_parameter_value(format!(
@@ -366,20 +379,15 @@ const FLOW_LOG_FILTERS: [&str; 7] = [
     "tag-key",
 ];
 
-/// The names a refusal reports as supported: [`FLOW_LOG_FILTERS`] plus the `tag:<key>`
-/// family, which this operation accepts by prefix and so cannot be a member of the array
-/// the matcher resolves against. A caller fixing a misspelled filter from the message has
-/// to be told about it too.
-const REPORTED_FLOW_LOG_FILTERS: [&str; 8] = [
-    "deliver-log-status",
-    "log-destination-type",
-    "flow-log-id",
-    "log-group-name",
-    "resource-id",
-    "traffic-type",
-    "tag:<key>",
-    "tag-key",
-];
+/// The wire name of this operation's filter list — the name the request sends each entry
+/// under (`Filter.1.Name=…`), which is the model member's own name
+/// (`DescribeFlowLogsRequest$Filter`) — as the parameter layer paths a refused entry by
+/// ([`crate::state::parameter_entry_path`]).
+const FILTER_PARAMETER_WIRE_NAME: &str = "Filter";
+
+/// The wire name of the member of one entry that carries the filter's name (`Filter$Name`),
+/// the last segment of that path.
+const FILTER_NAME_WIRE_NAME: &str = "Name";
 
 /// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
 /// the filter value" (`DescribeFlowLogsRequest$Filter`).

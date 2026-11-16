@@ -5,7 +5,9 @@
 //! Deletes the flow logs the request names. The WHOLE `FlowLogIds` batch is resolved
 //! against [`crate::state`] before anything is removed, so a call that names one flow log
 //! this account does not hold deletes nothing and is refused outright — the flow logs it
-//! named that DO exist survive untouched.
+//! named that DO exist survive untouched. An id outside the FORM EC2 issues flow log ids in
+//! is refused before any of that, as the unreadable parameter it is rather than as a flow
+//! log that is merely absent.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 max = state::MAX_RESOURCE_IDS,
             )));
         }
+        // The FORM of each id, read before anything is looked up: a value outside the form
+        // EC2 issues flow log ids in names no flow log that could ever exist, so it is
+        // refused as the unreadable parameter it is rather than reported as a lookup miss —
+        // a caller that mistyped an id would otherwise believe the id was well formed and
+        // the flow log merely gone. The clause names the whole id parameter the way the
+        // request-parameter layer renders a list, because the parameter is what is at fault.
+        if !input
+            .flow_log_ids
+            .iter()
+            .all(|flow_log_id| state::prefixed_id_is_well_formed(state::FLOW_LOG_ID_PREFIX, flow_log_id))
+        {
+            return Err(state::invalid_parameter_format(
+                &state::parameter_path(FLOW_LOG_ID_PARAMETER_WIRE_NAME),
+                &state::rendered_parameter_list(&input.flow_log_ids),
+            ));
+        }
         // One flow log gets one answer however many times the batch names it.
         let flow_log_ids = state::deduplicate_ids(&input.flow_log_ids);
 
@@ -197,3 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The wire name of this operation's id list — the name the request sends each id under
+/// (`FlowLogId.1=…`), which is the model member's own wire name (`DeleteFlowLogsRequest`'s
+/// `FlowLogIds`, `xmlName` `FlowLogId`) — as the parameter layer paths the parameter by
+/// ([`crate::state::parameter_path`]).
+const FLOW_LOG_ID_PARAMETER_WIRE_NAME: &str = "FlowLogId";

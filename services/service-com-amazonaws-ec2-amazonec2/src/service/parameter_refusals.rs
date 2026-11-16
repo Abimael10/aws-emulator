@@ -303,6 +303,26 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
                 ),
             })
         }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_flow_log_parameter_catalog(allowed) =>
+        {
+            // A value outside one of the flow-log surface's own catalogs is refused by the
+            // PARAMETER layer that surface validates its members through — the layer whose
+            // clause a refused `Filter` name and a refused `FlowLogId` carry
+            // ([`crate::state::parameter_format_violation_message`]) — rather than reported as
+            // a model-constraint violation: EC2's `InvalidParameterValue` with that clause,
+            // naming the parameter by the path the walk reports and the value the request
+            // sent. The value is already elided to the framework's `MAX_ECHOED_VALUE`, so
+            // echoing it cannot amplify a request into an arbitrarily long response, and the
+            // catalog itself is not stated back.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::parameter_format_violation_message(
+                    &violation.path,
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
         ViolationKind::MinValue(minimum)
             if violation.path == crate::state::MAX_RESULTS_MEMBER_PATH =>
         {

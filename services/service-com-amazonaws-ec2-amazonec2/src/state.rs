@@ -2744,6 +2744,18 @@ pub mod enclave_certificate_iam_roles;
 /// lines here. Everything it declares is re-exported below, so a handler reaches it as
 /// `crate::state::grant_flow_log_delivery` like any helper of this module.
 pub mod flow_log_s3_delivery;
+/// WHICH service's ARN each flow-log destination type names, the reading of a destination
+/// against the type a request asked for, and the refusal for one that is not of that type —
+/// in a file of its own rather than as more lines here. Everything it declares is
+/// re-exported below, so a handler reaches it as
+/// `crate::state::flow_log_destination_names_its_type` like any helper of this module.
+pub mod flow_log_destinations;
+/// EC2's request-PARAMETER validation refusal — the envelope, the path a parameter is named
+/// by, how a list parameter's value prints, and the refusal for a value outside a
+/// parameter's form — in a file of its own rather than as more lines here. Everything it
+/// declares is re-exported below, so a handler reaches it as
+/// `crate::state::invalid_parameter_format` like any helper of this module.
+pub mod parameter_validation;
 /// The attributes of the ACCOUNT itself — the catalog `DescribeAccountAttributes` reports,
 /// each attribute's value derived from what already owns it, and the refusal for a name that
 /// is no account attribute — in a file of its own rather than as more lines here. Everything
@@ -2961,6 +2973,10 @@ pub use account_attributes::*;
 pub use enclave_certificate_iam_roles::*;
 
 pub use flow_log_s3_delivery::*;
+
+pub use flow_log_destinations::*;
+
+pub use parameter_validation::*;
 
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another IPAM internet registry association fits inside the store's ceiling
@@ -3921,15 +3937,20 @@ pub fn unknown_flow_log_format_fields(log_format: &str) -> Vec<&str> {
 /// records it promises.
 ///
 /// The message names every unrecognised token, each quoted and spelled as the request
-/// spelled it, in the order the format named them; `unknown` is never empty, because a
-/// format whose every token is a field is not refused at all.
+/// spelled it, in SORTED order rather than the order the format named them — the order a
+/// recorded refusal of this class pins, and the one that makes the sentence a function of
+/// the SET of unrecognised tokens: two formats naming the same fields in different orders
+/// are refused the same way. `unknown` is never empty, because a format whose every token is
+/// a field is not refused at all.
 pub fn unknown_flow_log_fields<E>(unknown: &[&str]) -> Scaffolded<E> {
+    let mut sorted: Vec<&str> = unknown.to_vec();
+    sorted.sort_unstable();
     Scaffolded::service_error(
         INVALID_PARAMETER,
         400,
         format!(
             "Unknown fields provided: {fields}",
-            fields = unknown
+            fields = sorted
                 .iter()
                 .map(|field| format!("'{field}'"))
                 .collect::<Vec<String>>()
@@ -4186,6 +4207,29 @@ pub fn flow_log_delivery_role_required<E>(log_destination_type: &str) -> Scaffol
         ),
     )
 }
+
+/// Refuse a `CreateFlowLogs` whose `MaxAggregationInterval` is not an interval a flow log
+/// may be created with: HTTP 400 [`INVALID_PARAMETER`], with the sentence a recorded refusal
+/// of this class pins — [`INVALID_FLOW_LOG_AGGREGATION_INTERVAL_MESSAGE`], which has no
+/// variable part.
+///
+/// "The possible values are 60 seconds (1 minute) or 600 seconds (10 minutes). This
+/// parameter must be 60 seconds for transit gateway resource types"
+/// (`CreateFlowLogsRequest$MaxAggregationInterval`): BOTH clauses are the one question of
+/// whether the interval the request asked for is one this flow log may have, so an interval
+/// outside the pair and an interval the resource type does not admit are the same refusal.
+pub fn invalid_flow_log_aggregation_interval<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        INVALID_FLOW_LOG_AGGREGATION_INTERVAL_MESSAGE,
+    )
+}
+
+/// EC2's sentence for an aggregation interval a flow log may not be created with: fixed
+/// text, naming neither the value the request sent nor the values it could have sent.
+pub const INVALID_FLOW_LOG_AGGREGATION_INTERVAL_MESSAGE: &str =
+    "Invalid Flow Log Max Aggregation Interval.";
 
 /// The name of the log group a `log-group:` CloudWatch Logs ARN names, or `None` when the
 /// ARN names something else — for the caller that gave the destination as an ARN rather

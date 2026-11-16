@@ -11,14 +11,14 @@
 //! Transit Gateway Guide" and "Specify the fields using the `${field-id}` format, separated
 //! by spaces" (`CreateFlowLogsRequest$LogFormat`) — so a create whose `LogFormat` carries a
 //! `${…}` token that names no such field is refused HTTP 400 `InvalidParameter`, naming
-//! every unrecognised token, and stores NOTHING; a create whose every token names a
-//! published field is served and reports the format back verbatim.
+//! every unrecognised token in SORTED order, and stores NOTHING; a create whose every token
+//! names a published field is served and reports the format back verbatim.
 //!
 //! The rows differ in which published fields the format names and how many (one, several,
 //! fields from each published table, a tag of the monitored resource), and — on the refusal
-//! side — in how many tokens are unrecognised, where in the format they sit, whether a
-//! token repeats, and how the unrecognised token differs from a real field (a misspelling,
-//! a different case, a name of no field at all).
+//! side — in how many tokens are unrecognised, where in the format they sit, in which order
+//! they are named, whether a token repeats, and how the unrecognised token differs from a
+//! real field (a misspelling, a different case, a name of no field at all).
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -181,10 +181,11 @@ async fn a_log_format_of_published_fields_is_served_and_read_back_verbatim() {
 }
 
 /// A `LogFormat` carrying a `${…}` token that names no published field is REFUSED — HTTP
-/// 400 `InvalidParameter`, with every unrecognised token named and quoted in the order the
-/// format named them — and the monitored resource is left with exactly the flow logs it
-/// already carried. The rows differ in how many tokens are unrecognised, where they sit,
-/// whether one repeats, and how an unrecognised token differs from a real field.
+/// 400 `InvalidParameter`, with every unrecognised token named and quoted in SORTED order,
+/// whatever order the format named them in — and the monitored resource is left with exactly
+/// the flow logs it already carried. The rows differ in how many tokens are unrecognised,
+/// where they sit, in which order they are named, whether one repeats, and how an
+/// unrecognised token differs from a real field.
 #[tokio::test]
 async fn a_log_format_naming_a_field_that_does_not_exist_is_refused_and_stores_nothing() {
     let (router, engine) = super::ec2_query::emulator();
@@ -245,6 +246,23 @@ async fn a_log_format_naming_a_field_that_does_not_exist_is_refused_and_stores_n
             "one unrecognised token, named twice",
             "${alpha} ${srcaddr} ${alpha}",
             vec!["alpha"],
+        ),
+        // The same SET of unrecognised tokens, named in the reverse order: the message is a
+        // function of the set, so these two rows expect the same sentence.
+        (
+            "two unrecognised tokens in sorted order",
+            "${alpha} ${bravo}",
+            vec!["alpha", "bravo"],
+        ),
+        (
+            "the same two in reverse order",
+            "${bravo} ${alpha}",
+            vec!["alpha", "bravo"],
+        ),
+        (
+            "three unrecognised tokens, none in order",
+            "${charlie} ${srcaddr} ${alpha} ${bravo}",
+            vec!["alpha", "bravo", "charlie"],
         ),
     ];
 

@@ -75,3 +75,28 @@ Replayed wire corpus simparity-wire-aws-v1. Representative: ec2-vfd-cloudwatch-l
 1. CreateFlowLogs with LogDestinationType=cloud-watch-logs and an s3 ARN as LogDestination (fixture ec2-vfd-cloudwatch-logs-destination-and-delivery-role, task#6): compare code and message.
 2. CreateSubnet with AvailabilityZone=usw2-az1 (ec2-vvd-traj-subnet-create-mistakes-then-recovery, task#5): note the emulator lists three AZs where the recording lists four.
 3. Replay the remaining fixture#step tokens in trace_ids and diff code and message.
+
+## Resolution
+
+Causes 1, 2, 3 and 4 are fixed: `CreateFlowLogs` reads every destination-bearing member
+against the `LogDestinationType` in force and refuses `InvalidParameter`
+(`Invalid <type> destination: <value>`, `<Member> is not supported when LogDestinationType is
+<type>`); unknown `LogFormat` fields are named in sorted order; `DescribeFlowLogs` refuses an
+unrecognised filter name and `DeleteFlowLogs` an unreadable `FlowLogId` through the
+request-parameter clause, naming the entry's 1-based position and the whole id parameter.
+Cause 6 needed no change: the private-DNS refusal already names both VPC attributes and the
+VPC id.
+
+Cause 5 is fixed only in its refusal RULE, and its remaining half is DECLINED here: the
+sentence `CreateSubnet` answers is already AWS's — the value, the member, and the Region's
+full zone set for that member in lower case — and
+`services/service-com-amazonaws-ec2-amazonec2/tests/all/subnet_zone_refusal_wording.rs` now
+pins it over three Regions and both members. What still differs is the Region's published
+zone SET: us-west-2 reports three zones where AWS publishes four. That is the Availability
+Zone catalog, which is the subject of
+`issues/things-that-do-not-work/20261111T180943Z-ec2-read-paths-serve-emulator-derived-catalog-data.md`
+(cause 7), `20261109T233303Z-…` and `20261108T143229Z-…`, whose recordings also pin the
+per-account zone-name -> zone-id mapping a count-only change here would contradict; the count
+also feeds the shared id mint (one default subnet per zone), so raising it shifts every later
+resource id (21 tests in this crate fail on it). It is tracked by those issues, not fixed by
+this change.

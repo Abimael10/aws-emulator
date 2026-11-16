@@ -242,13 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`AssignIpv6AddressOnCreation` is sent as `assignIpv6AddressOnCreation`).
 ///
 /// The refusals of this operation name an attribute the way the CALLER wrote it, so a client
-/// can match the text against the parameters it sent.
+/// can match the text against the parameters it sent. The spelling rule itself is the crate's
+/// one ([`crate::state::parameter_path`], which the request-parameter layer's own clauses name
+/// a member by), so the two cannot come to spell one member two ways.
 fn wire_member_name(member: &str) -> String {
-    let mut characters = member.chars();
-    match characters.next() {
-        Some(first) => first.to_lowercase().chain(characters).collect(),
-        None => String::new(),
-    }
+    crate::state::parameter_path(member)
 }
 
 /// Every member of `ModifySubnetAttributeRequest` that names an attribute to set, as the

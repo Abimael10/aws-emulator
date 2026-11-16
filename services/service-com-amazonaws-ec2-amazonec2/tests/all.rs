@@ -2581,3 +2581,17 @@ mod published_amd_and_graviton_catalog_rows;
 // Declared at the tail of this file, which is where every new ec2 suite lands.
 #[path = "all/dry_run_probe_decides_on_iam.rs"]
 mod dry_run_probe_decides_on_iam;
+// HOW the flow-log surface refuses: a `LogDestination` read against the destination type the
+// request asked for, an unrecognised `DescribeFlowLogs` filter name named by its position in
+// the request, and a `FlowLogId` outside the id form refused before any lookup — each under
+// the error class and in the sentence that class carries. Declared at the tail of this file,
+// which is where every new ec2 suite lands.
+#[path = "all/flow_log_refusal_wording.rs"]
+mod flow_log_refusal_wording;
+// WHAT a subnet-creating refusal tells a caller about the Availability Zones it may use: the
+// value, the member it was sent under and the Region's FULL zone set for that member, read
+// back from `DescribeAvailabilityZones` so the advertised set is the set the Region has and
+// every zone it offers is one a subnet can be created in. Declared at the tail of this file,
+// which is where every new ec2 suite lands.
+#[path = "all/subnet_zone_refusal_wording.rs"]
+mod subnet_zone_refusal_wording;

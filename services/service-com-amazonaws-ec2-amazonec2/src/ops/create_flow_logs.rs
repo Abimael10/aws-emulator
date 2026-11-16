@@ -264,13 +264,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name of a new or existing CloudWatch Logs log group where Amazon EC2
         // publishes your flow logs. This parameter is valid only if the destination type is
-        // cloud-watch-logs" (`$LogGroupName`).
+        // cloud-watch-logs" (`$LogGroupName`) — a member the destination type in force does
+        // not take at all, which is refused rather than ignored
+        // ([`state::flow_log_member_unsupported_for_destination`]).
         if !publishes_to_log_group && input.log_group_name.is_some() {
-            return Err(state::invalid_parameter_combination(format!(
-                "LogGroupName is valid only for the destination type \
-                 {cloud_watch_logs}, not for {log_destination_type}",
-                cloud_watch_logs = state::LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS,
-            )));
+            return Err(state::flow_log_member_unsupported_for_destination(
+                LOG_GROUP_NAME_MEMBER,
+                &log_destination_type,
+            ));
+        }
+
+        // "The destination options" (`$DestinationOptions`) describe the OBJECTS an Amazon S3
+        // delivery writes — a file format, Hive-compatible prefixes, per-hour partitioning
+        // (`DestinationOptionsRequest`) — so they are the one destination type's members, and
+        // every other type is refused them the same way `LogGroupName` is refused above.
+        if log_destination_type != state::LOG_DESTINATION_TYPE_S3
+            && input.destination_options.is_some()
+        {
+            return Err(state::flow_log_member_unsupported_for_destination(
+                DESTINATION_OPTIONS_MEMBER,
+                &log_destination_type,
+            ));
+        }
+
+        // "The meaning of this parameter depends on the destination type" — a log group ARN
+        // for cloud-watch-logs, a bucket ARN for s3, a delivery stream ARN for
+        // kinesis-data-firehose (`$LogDestination`). A destination naming any other service
+        // is no destination of the type this request asked for, so it is refused here —
+        // before the store is reached — rather than stored as a flow log whose records
+        // nothing could receive ([`state::flow_log_destination_names_its_type`]).
+        if let Some(destination) = input.log_destination.as_deref() {
+            if !state::flow_log_destination_names_its_type(&log_destination_type, destination) {
+                return Err(state::invalid_flow_log_destination(
+                    &log_destination_type,
+                    destination,
+                ));
+            }
         }
 
         // Where the records go. For CloudWatch Logs the destination is ONE log group named
@@ -291,14 +320,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(str::to_string);
             let name = match (named, in_arn, input.log_destination.as_deref()) {
                 (Some(name), _, _) | (None, Some(name), _) => name,
-                // A destination WAS given, but it is not the ARN of a log group, so there
-                // is no group for it to name: that is a value this operation cannot accept
-                // rather than a parameter the request left out.
+                // A destination WAS given, and it is an ARN of CloudWatch Logs, but it names
+                // no log group for the records to go to — the one destination this type
+                // takes. That is the same fault as an ARN of another service: a value this
+                // destination type cannot accept, and so the same refusal.
                 (None, None, Some(destination)) => {
-                    return Err(state::invalid_parameter_value(format!(
-                        "LogDestination '{destination}' is not the ARN of a CloudWatch Logs \
-                         log group"
-                    )))
+                    return Err(state::invalid_flow_log_destination(
+                        &log_destination_type,
+                        destination,
+                    ))
                 }
                 (None, None, None) => {
                     return Err(state::missing_parameter(
@@ -335,26 +365,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 state::DEFAULT_MAX_AGGREGATION_INTERVAL
             });
-        if !state::FLOW_LOG_AGGREGATION_INTERVALS.contains(&max_aggregation_interval) {
-            return Err(state::invalid_parameter_value(format!(
-                "MaxAggregationInterval must be one of [{allowed}], not \
-                 {max_aggregation_interval}",
-                allowed = state::FLOW_LOG_AGGREGATION_INTERVALS
-                    .iter()
-                    .map(i32::to_string)
-                    .collect::<Vec<String>>()
-                    .join(", "),
-            )));
-        }
-        if monitors_transit_gateway
-            && max_aggregation_interval != state::TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL
-        {
-            return Err(state::invalid_parameter_value(format!(
-                "MaxAggregationInterval must be {required} for the resource type \
-                 {resource_type}",
-                required = state::TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL,
-                resource_type = input.resource_type,
-            )));
+        // Both clauses ask the ONE question of whether the interval the request asked for is
+        // one this flow log may have, so they are one refusal: a value outside the documented
+        // pair, and a value the resource type does not admit.
+        let interval_is_allowed = state::FLOW_LOG_AGGREGATION_INTERVALS
+            .contains(&max_aggregation_interval)
+            && (!monitors_transit_gateway
+                || max_aggregation_interval == state::TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL);
+        if !interval_is_allowed {
+            return Err(state::invalid_flow_log_aggregation_interval());
         }
 
         // "If you specify this parameter, you must include at least one field. … Specify
@@ -633,3 +652,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The member a request names a CloudWatch Logs log group with (`$LogGroupName`), as a
+/// refusal that names the member spells it — the request's own spelling.
+const LOG_GROUP_NAME_MEMBER: &str = "LogGroupName";
+
+/// The member a request names the destination options with (`$DestinationOptions`), spelled
+/// the same way.
+const DESTINATION_OPTIONS_MEMBER: &str = "DestinationOptions";
