@@ -66,7 +66,11 @@ async fn get_certificate(gateway: &Gateway, client_certificate_id: &str) -> Answ
 }
 
 /// `GetClientCertificates`, with `query` appended to the collection URI (`""` for none).
-async fn list_certificates(gateway: &Gateway, query: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling suite that reads the PAGE this collection is cut to
+/// (`client_certificate_collection_pages`) lists it through this one helper rather than a
+/// second copy of the request.
+pub(crate) async fn list_certificates(gateway: &Gateway, query: &str) -> Answer {
     gateway
         .call("GET", &format!("/clientcertificates{query}"), None)
         .await
@@ -99,7 +103,9 @@ async fn patch_certificate(
 
 /// A client certificate generated with `request`, asserting the modelled 201 and answering
 /// the whole body.
-async fn generated(gateway: &Gateway, case: &str, request: Value) -> Value {
+///
+/// `pub(crate)` for the reason [`list_certificates`] records.
+pub(crate) async fn generated(gateway: &Gateway, case: &str, request: Value) -> Value {
     let answer = generate(gateway, request).await;
     assert_eq!(
         answer.status, 201,

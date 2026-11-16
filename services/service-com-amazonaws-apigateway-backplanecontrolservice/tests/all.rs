@@ -828,3 +828,9 @@ mod stage_logging_role_current_setting;
 // keeps its own reader's sentence and is covered in `all/documentation_parts.rs`.
 #[path = "all/definition_payload_refusals.rs"]
 mod definition_payload_refusals;
+// Appended for the reason the note above gives: the PAGE `GetClientCertificates` answers
+// with on an account that holds more client certificates than one default-sized page
+// reports — the default cut, the walk by it, and that listing the collection changes none
+// of the records it reports.
+#[path = "all/client_certificate_collection_pages.rs"]
+mod client_certificate_collection_pages;
