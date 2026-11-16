@@ -24,11 +24,10 @@
 //! resource carries — are two rows of it.
 //!
 //! The second rule here is about the ENVELOPE rather than the sentence: every failure of
-//! this service names its error shape in `x-amzn-errortype` in the QUALIFIED form its wire
-//! carries — the shape name, the separator, then the locator of the namespace that declares
-//! the shape — where the framework's restJson1 renderers write the bare name. It holds for
-//! a modelled refusal an operation answered and for one the framework raised before any
-//! handler ran, and a success names no shape at all.
+//! this service names its error shape in `x-amzn-errortype` by that shape's NAME, the name
+//! the model declares it under, with nothing appended beside it. It holds for a modelled
+//! refusal an operation answered and for one the framework raised before any handler ran,
+//! and a success names no shape at all.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -61,11 +60,9 @@ const SNAPSHOT_TYPE: &str = "Snapshot";
 /// The header a restJson1 client resolves an error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
-/// What this service's wire appends to an error shape's name in that header: the
-/// separator, the service stack's locator root, and the namespace that declares the
-/// shape — this service's own (`smithy_query(query="service_info")`: service shape
-/// `com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda`).
-const ERROR_TYPE_LOCATOR: &str = ":http://internal.amazon.com/coral/com.amazonaws.docdbelastic/";
+/// The error shape every refusal below is refused with, as the model names it
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
+const NOT_FOUND_SHAPE: &str = "ResourceNotFoundException";
 
 /// The ARN resource segments of those two classes.
 const CLUSTER_SEGMENT: &str = "cluster";
@@ -463,7 +460,7 @@ async fn an_operation_asked_for_one_named_class_keeps_its_own_sentence() {
 }
 
 #[tokio::test]
-async fn every_failure_names_its_error_shape_in_the_qualified_form() {
+async fn every_failure_names_its_error_shape_by_its_name() {
     // The envelope rule, over everything that can answer a failure: the modelled refusal
     // each tag operation answers for an ARN it holds nothing under, a refusal the
     // framework raises before any handler runs, and a typed reader's own refusal. A
@@ -502,21 +499,16 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             status, 404,
             "case {case:?}: expected HTTP 404, got {status} with {body}"
         );
-        let expected = format!("ResourceNotFoundException{ERROR_TYPE_LOCATOR}");
+        let expected = NOT_FOUND_SHAPE.to_string();
         assert_eq!(
             error_type.as_deref(),
             Some(expected.as_str()),
             "case {case:?}: expected {expected:?} in {ERROR_TYPE_HEADER}, got {error_type:?}"
         );
-        // The shape an SDK resolves is the text before the separator, and it is the shape
-        // the body names in `__type`.
-        let resolved = error_type
-            .as_deref()
-            .and_then(|value| value.split(':').next())
-            .unwrap_or_default()
-            .to_string();
+        // The shape the header names is the shape the body names in `__type`, and the
+        // header carries nothing beside that name.
         assert_eq!(
-            resolved,
+            error_type.clone().unwrap_or_default(),
             error_code(&body),
             "case {case:?}: the header and the body must name one shape, got {error_type:?} \
              and {body}"
@@ -538,10 +530,16 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
         "case \"an omitted required member\": expected HTTP 400, got {status} with {body}"
     );
     let named = error_type.unwrap_or_default();
+    assert_eq!(
+        named,
+        error_code(&body),
+        "case \"an omitted required member\": the header must name the shape the body names, \
+         got {named:?} and {body}"
+    );
     assert!(
-        named.ends_with(ERROR_TYPE_LOCATOR),
-        "case \"an omitted required member\": expected a shape qualified with \
-         {ERROR_TYPE_LOCATOR:?}, got {named:?}"
+        !named.is_empty() && named.chars().all(|c| c.is_ascii_alphanumeric()),
+        "case \"an omitted required member\": expected the shape name alone in \
+         {ERROR_TYPE_HEADER}, got {named:?}"
     );
 
     // A typed reader's refusal: the envelope rule is the whole service's, not the tagging
@@ -557,7 +555,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
         status, 404,
         "case \"GetCluster on an absent cluster\": expected HTTP 404, got {status} with {body}"
     );
-    let expected = format!("ResourceNotFoundException{ERROR_TYPE_LOCATOR}");
+    let expected = NOT_FOUND_SHAPE.to_string();
     assert_eq!(
         error_type.as_deref(),
         Some(expected.as_str()),

@@ -45,10 +45,9 @@
 //! Two response headers of this service's wire are not what the framework's restJson1
 //! renderers write, and neither belongs to a modelled shape, so no handler can set them:
 //!
-//! * `x-amzn-errortype`, which every failure names its error shape in, in the QUALIFIED
-//!   form this wire carries — the shape name, the separator, then the locator of the
-//!   namespace that declares it — where the renderers write the bare name
-//!   ([`error_type_locator`]);
+//! * `x-amzn-errortype`, which every failure names its error shape in by that shape's
+//!   NAME alone — nothing is appended to it, neither the namespace that declares the
+//!   shape nor a locator for it inside a serving stack ([`error_type_locator`]);
 //! * `content-type`, which every response carrying a JSON payload — a success and a
 //!   failure alike — announces as the JSON media type the REQUEST named for its own
 //!   payload, defaulting to this service's native AWS JSON 1.1 media type when the
@@ -63,7 +62,7 @@
 pub mod error_type_locator;
 pub mod json_media_type;
 
-use error_type_locator::{ErrorTypeLocatorDefinition, QualifyingErrorType};
+use error_type_locator::{ErrorTypeHeaderDefinition, NamingErrorShape};
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
@@ -77,11 +76,11 @@ use std::sync::Arc;
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The generated entry, with its framework-level error renderers wrapped so a response
     /// no operation produced names its error shape the way this service names it.
-    entry: ErrorTypeLocatorDefinition<crate::ServiceDefinition<Eng>>,
+    entry: ErrorTypeHeaderDefinition<crate::ServiceDefinition<Eng>>,
     /// Serves each modelled operation exactly as the generated table does, naming the
     /// error shape of whatever it answers. Held on the service because
     /// [`Service::override_operation`] hands back a borrow of `self`.
-    qualifying_error_type: QualifyingErrorType,
+    naming_error_shape: NamingErrorShape,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -90,8 +89,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: ErrorTypeLocatorDefinition::new(crate::ServiceDefinition::new(engine)),
-            qualifying_error_type: QualifyingErrorType,
+            entry: ErrorTypeHeaderDefinition::new(crate::ServiceDefinition::new(engine)),
+            naming_error_shape: NamingErrorShape,
         }
     }
 }
@@ -101,7 +100,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry: what is
-        // handed back is that entry under this service's [`ErrorTypeLocatorDefinition`],
+        // handed back is that entry under this service's [`ErrorTypeHeaderDefinition`],
         // which reads identity, protocol and the routing table straight off it and names
         // the error shape on the three framework-level error renderers.
         &self.entry
@@ -128,7 +127,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // NOT a re-route: the operation served is the one the generated routing table
         // names for this request, wrapped so that every response names its error shape the
-        // way this service's wire names it (see [`QualifyingErrorType`]) — the one place
+        // way this service's wire names it (see [`NamingErrorShape`]) — the one place
         // every operation's response passes. The routing DECISION stays the model's: the
         // key is resolved by its own protocol, and a request the generated table does not
         // answer declines here, leaving the router's routing-error path (which the
@@ -136,7 +135,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if !self.entry.routes(req) {
             return None;
         }
-        Some(&self.qualifying_error_type)
+        Some(&self.naming_error_shape)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

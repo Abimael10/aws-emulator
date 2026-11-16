@@ -1,40 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! How this service NAMES, in the `x-amzn-errortype` response header, the error shape a
-//! refused call is refused with.
+//! refused call is refused with — and why that name carries no locator beside it.
 //!
-//! A restJson1 client resolves the error shape from that header, and the framework's
-//! renderers write the shape's bare name into it. What this service's wire carries is the
-//! QUALIFIED form: the shape name, the separator, and then the service stack's own locator
-//! for that shape — the namespace that declares it, under the stack's locator root:
+//! A restJson1 client resolves the error shape from that header, and what this service's
+//! wire carries is the shape's NAME, as the model declares it, and nothing else:
 //!
 //! ```text
 //! HTTP/1.1 404 Not Found
-//! x-amzn-errortype: ResourceNotFoundException:http://internal.amazon.com/coral/com.amazonaws.docdbelastic/
+//! x-amzn-errortype: ResourceNotFoundException
 //!
 //! {"__type":"ResourceNotFoundException","message":"Resource was not found", …}
 //! ```
 //!
-//! The locator is not part of the shape's NAME — every SDK resolves the shape from the
-//! text before the separator (and after a `#`, for a namespaced name), so nothing a client
-//! resolves changes — but it is what this service's wire carries, and a client that
-//! validates the whole header value sees it. The body keeps naming the bare shape in
-//! `__type`, exactly as the renderer wrote it.
+//! Nothing is appended to that name: not the namespace that declares the shape, and not a
+//! locator for it inside whatever stack serves the request. A locator is an internal
+//! detail of where a shape is declared — it is not part of the name a client resolves, no
+//! trait of this model states it, and a response a client reads does not carry it, so a
+//! value carrying one is a value no client can compare to the error it names. The name the
+//! framework's restJson1 renderers write is therefore exactly the value this service
+//! answers with, and the body keeps naming that same shape in `__type`.
 //!
-//! The namespace is read off this service's own identity rather than written out here, so
-//! the value follows the model: the shape id the generated identity states
-//! (`com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda`) carries the namespace that
-//! declares this service's shapes.
+//! The value is model-derived end to end: it is the error shape's own name, so an error
+//! shape renamed in the model renames it here with no edit, and no part of it comes from
+//! the request or from state.
 //!
 //! The header belongs to the RESPONSE, not to any modelled shape — no error shape of this
-//! model declares it, so no handler can set it — so this module completes it at the two
-//! layers every response of this service passes through:
+//! model declares it, so no handler can set it — so this module holds the header to that
+//! one form at the two layers every response of this service passes through:
 //!
-//! * [`QualifyingErrorType`], the wrapper [`crate::service::EmulatedService`] hands the
+//! * [`NamingErrorShape`], the wrapper [`crate::service::EmulatedService`] hands the
 //!   router from `Service::override_operation`, covers everything an operation answers: a
 //!   success (untouched), a modelled error, and a constraint refusal raised while that
 //!   operation was being served;
-//! * [`ErrorTypeLocatorDefinition`], the definition wrapper `Service::definition` hands
+//! * [`ErrorTypeHeaderDefinition`], the definition wrapper `Service::definition` hands
 //!   back, covers a response NO operation produced: a routing failure, a transport failure
 //!   detected up front, and a pre-dispatch refusal.
 //!
@@ -56,53 +55,45 @@ use smithy_server_runtime::{
 /// The header a restJson1 client resolves the error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
-/// What separates the shape name from the locator that follows it.
-const SEPARATOR: char = ':';
+/// What separates the namespace that declares a shape from the shape's own name, in a
+/// value that arrives written as an absolute shape id.
+const NAMESPACE_SEPARATOR: char = '#';
 
-/// The root every shape locator of the service stack hangs under; the namespace that
-/// declares the shape follows it.
-const LOCATOR_ROOT: &str = "http://internal.amazon.com/coral/";
+/// What separates a shape's name from anything appended after it — a locator for the shape
+/// inside a serving stack, which this wire does not carry.
+const APPENDED_SEPARATOR: char = ':';
 
 /// The lowest HTTP status that is a failure, and so the lowest one that names an error
 /// shape at all.
 const FIRST_FAILURE_STATUS: u16 = 400;
 
-/// The locator this service qualifies a shape name with, for the service whose Smithy
-/// shape id is `service_shape_id`: the separator, the locator root, then the namespace that
-/// id carries.
+/// The error SHAPE a header value names: the shape's own name, with neither the namespace
+/// that may precede it nor anything that may follow it.
 ///
-/// Derived, not written out: a model moved to another namespace qualifies its shapes under
-/// that namespace with no edit here.
-fn locator(service_shape_id: &str) -> String {
-    let namespace = service_shape_id.split('#').next().unwrap_or_default().trim();
-    format!("{SEPARATOR}{LOCATOR_ROOT}{namespace}/")
-}
-
-/// The bare error SHAPE a header value names.
-///
-/// A value may arrive namespaced (`com.amazonaws.docdbelastic#ResourceNotFoundException`)
-/// or with a locator already appended; neither is part of the shape's name.
+/// A renderer writes the bare name, which is already the answer; a value that arrived
+/// namespaced (`com.amazonaws.docdbelastic#ResourceNotFoundException`) or with something
+/// appended after a separator names the same shape, and neither part is the shape's name.
 fn shape_named(raw: &str) -> &str {
     let raw = raw.trim();
-    let after_namespace = raw.rsplit('#').next().unwrap_or(raw);
+    let after_namespace = raw.rsplit(NAMESPACE_SEPARATOR).next().unwrap_or(raw);
     after_namespace
-        .split(SEPARATOR)
+        .split(APPENDED_SEPARATOR)
         .next()
         .unwrap_or(after_namespace)
         .trim()
 }
 
 /// `resp` as this service answers it: a failure names its error shape in
-/// [`ERROR_TYPE_HEADER`] with this service's locator appended.
+/// [`ERROR_TYPE_HEADER`] by that shape's name alone.
 ///
 /// A success is returned untouched, as is a failure whose renderer named no shape (there is
-/// nothing to qualify, and this invents no header the renderer did not write). IDEMPOTENT:
-/// the shape is read back out of whatever the header carries, so a value that already
-/// carries the locator is rewritten to itself and the two layers above cannot report two
-/// locators for one call. A header value the HTTP layer will not carry is left as it was
-/// rather than turned into a transport failure, which on an error path would replace a
-/// modelled 4xx with a 500 an SDK retries.
-pub fn with_error_type_locator(mut resp: RtResponse, locator: &str) -> RtResponse {
+/// nothing to name, and this invents no header the renderer did not write) and one already
+/// naming the bare shape — which is what every renderer of this service writes, so the
+/// common path rewrites nothing. IDEMPOTENT: the shape is read back out of whatever the
+/// header carries, so the two layers above cannot disagree about one call. A header value
+/// the HTTP layer will not carry is left as it was rather than turned into a transport
+/// failure, which on an error path would replace a modelled 4xx with a 500 an SDK retries.
+pub fn with_error_type_shape_name(mut resp: RtResponse) -> RtResponse {
     if resp.status().as_u16() < FIRST_FAILURE_STATUS {
         return resp;
     }
@@ -110,26 +101,22 @@ pub fn with_error_type_locator(mut resp: RtResponse, locator: &str) -> RtRespons
         return resp;
     };
     let shape = shape_named(named);
-    if shape.is_empty() {
+    if shape.is_empty() || shape == named {
         return resp;
     }
-    let qualified = format!("{shape}{locator}");
-    let _ = resp.headers_mut().try_insert(ERROR_TYPE_HEADER, qualified);
+    let shape = shape.to_string();
+    let _ = resp.headers_mut().try_insert(ERROR_TYPE_HEADER, shape);
     resp
 }
 
 /// `resp` as this service ANSWERS `req`: the two completions of a response this service
 /// owns, applied together at every layer a response passes through.
 ///
-/// Each is its own concern and lives in its own module — the error shape's locator here,
-/// the media type a JSON payload is announced with in
-/// [`super::json_media_type`] — and this is the one place they are composed, so no layer
-/// can apply one and forget the other.
-fn answered(resp: RtResponse, req: &RtRequest, locator: &str) -> RtResponse {
-    with_json_media_type(
-        with_error_type_locator(resp, locator),
-        &announced_media_type(req),
-    )
+/// Each is its own concern and lives in its own module — the error shape's name here, the
+/// media type a JSON payload is announced with in [`super::json_media_type`] — and this is
+/// the one place they are composed, so no layer can apply one and forget the other.
+fn answered(resp: RtResponse, req: &RtRequest) -> RtResponse {
+    with_json_media_type(with_error_type_shape_name(resp), &announced_media_type(req))
 }
 
 /// The modelled operation the service's own routing table names for this request, or `None`
@@ -149,9 +136,9 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 /// keeps owning the whole deserialize -> validate -> handle -> serialize sequence and every
 /// status, shape and message it answers with. One wrapper serves every operation of this
 /// service, and it is the one place each of their responses passes through.
-pub struct QualifyingErrorType;
+pub struct NamingErrorShape;
 
-impl ErasedOperation for QualifyingErrorType {
+impl ErasedOperation for NamingErrorShape {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -159,14 +146,8 @@ impl ErasedOperation for QualifyingErrorType {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // Read out of the definition BEFORE the await: `&dyn ErasedServiceDefinition`
-            // is not `Sync`, so holding one across the await would make this future
-            // non-`Send`.
-            let locator = locator(svc.definition().identity().shape_id());
             match modeled_operation(svc, req) {
-                Some(operation) => {
-                    answered(operation.run(svc, req, ctx).await, req, &locator)
-                }
+                Some(operation) => answered(operation.run(svc, req, ctx).await, req),
                 // Unreachable through a `Service::override_operation` that claims a request
                 // only when the routing table holds its key; answered as the framework
                 // answers an unroutable request rather than guessed at (and the definition
@@ -190,16 +171,16 @@ impl ErasedOperation for QualifyingErrorType {
 ///
 /// Identity, the routing table and the protocol come from the wrapped definition untouched:
 /// nothing model-derived is restated here.
-pub struct ErrorTypeLocatorDefinition<D>(D);
+pub struct ErrorTypeHeaderDefinition<D>(D);
 
-impl<D: ErasedServiceDefinition> ErrorTypeLocatorDefinition<D> {
+impl<D: ErasedServiceDefinition> ErrorTypeHeaderDefinition<D> {
     /// Wrap `inner`, completing the headers of every framework-level response it renders.
     pub fn new(inner: D) -> Self {
         Self(inner)
     }
 
     /// Whether the generated routing table can serve this request — the condition under
-    /// which this service claims it for [`QualifyingErrorType`], so a request naming no
+    /// which this service claims it for [`NamingErrorShape`], so a request naming no
     /// modelled operation stays the framework's routing failure.
     pub fn routes(&self, req: &RtRequest) -> bool {
         self.0
@@ -209,14 +190,9 @@ impl<D: ErasedServiceDefinition> ErrorTypeLocatorDefinition<D> {
             .and_then(|key| self.0.routing_table().get(key))
             .is_some()
     }
-
-    /// The locator this definition's identity names: the one value both layers qualify with.
-    fn locator(&self) -> String {
-        locator(self.0.identity().shape_id())
-    }
 }
 
-impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDefinition<D> {
+impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeHeaderDefinition<D> {
     fn identity(&self) -> &ServiceIdentity {
         self.0.identity()
     }
@@ -230,7 +206,7 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
     }
 
     fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
-        answered(self.0.routing_error_response(req), req, &self.locator())
+        answered(self.0.routing_error_response(req), req)
     }
 
     fn framework_error_response(
@@ -238,11 +214,7 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
         error: aws_smithy_schema_server::ProtocolError,
         req: &RtRequest,
     ) -> RtResponse {
-        answered(
-            self.0.framework_error_response(error, req),
-            req,
-            &self.locator(),
-        )
+        answered(self.0.framework_error_response(error, req), req)
     }
 
     fn refusal_response(
@@ -251,11 +223,7 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
         chosen: Option<Refused>,
         req: &RtRequest,
     ) -> RtResponse {
-        answered(
-            self.0.refusal_response(error, chosen, req),
-            req,
-            &self.locator(),
-        )
+        answered(self.0.refusal_response(error, chosen, req), req)
     }
 
     fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
@@ -266,16 +234,18 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
 #[cfg(test)]
 mod tests {
     //! The header over the forms a response can name its error shape in. The wire
-    //! behaviour — that every refusal of every operation carries the qualified form — is
-    //! asserted through the router in `tests/all/tagging_not_found_sentence.rs`.
+    //! behaviour — that every refusal of every operation names the bare shape — is
+    //! asserted through the router in `tests/all/error_type_header_form.rs`.
 
     use super::*;
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
 
-    /// This service's Smithy shape id, as the generated identity states it
-    /// (`smithy_query(query="service_info")`).
-    const SHAPE_ID: &str = "com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda";
+    /// The namespace that declares this service's shapes, as the generated identity states
+    /// the service shape id (`smithy_query(query="service_info")`:
+    /// `com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda`). Used only to build
+    /// the decorated forms a value can arrive in.
+    const NAMESPACE: &str = "com.amazonaws.docdbelastic";
 
     /// One response, built from a status and the error type its renderer named.
     fn response(status: u16, error_type: Option<&str>) -> RtResponse {
@@ -289,33 +259,10 @@ mod tests {
         resp
     }
 
-    /// The locator is built from the namespace of the shape id, whatever that namespace is.
+    /// Every shape a renderer can name is answered by its own name, so the value follows
+    /// the model's error shapes rather than one recorded refusal.
     #[test]
-    fn the_locator_names_the_namespace_that_declares_the_shapes() {
-        for (case, shape_id, expected) in [
-            (
-                "this service",
-                SHAPE_ID,
-                ":http://internal.amazon.com/coral/com.amazonaws.docdbelastic/",
-            ),
-            (
-                "another namespace",
-                "com.amazon.coral.service#UnknownOperationException",
-                ":http://internal.amazon.com/coral/com.amazon.coral.service/",
-            ),
-        ] {
-            let actual = locator(shape_id);
-            assert_eq!(
-                actual, expected,
-                "case {case:?}: expected the locator {expected:?}, got {actual:?}"
-            );
-        }
-    }
-
-    /// Every shape a renderer can name gets its own name qualified, so the value is not
-    /// keyed to one recorded refusal.
-    #[test]
-    fn the_header_qualifies_whatever_shape_the_renderer_named() {
+    fn the_header_names_whatever_shape_the_renderer_named() {
         for shape in [
             "ResourceNotFoundException",
             "ValidationException",
@@ -323,45 +270,47 @@ mod tests {
             "ThrottlingException",
             "InternalServerException",
         ] {
-            let answered = with_error_type_locator(response(400, Some(shape)), &locator(SHAPE_ID));
-            let expected = format!("{shape}{}", locator(SHAPE_ID));
+            let answered = with_error_type_shape_name(response(400, Some(shape)));
             assert_eq!(
                 answered.headers().get(ERROR_TYPE_HEADER),
-                Some(expected.as_str()),
-                "case {shape:?}: expected {expected:?}, got {:?}",
+                Some(shape),
+                "case {shape:?}: expected {shape:?}, got {:?}",
                 answered.headers().get(ERROR_TYPE_HEADER)
             );
         }
     }
 
-    /// The shape is read out of every form a renderer can state it in, and a value that
-    /// already carries the locator is not doubled.
+    /// The shape is read out of every form a renderer can state it in, and whatever was
+    /// written beside the name — a namespace, a locator, both — is not answered with.
     #[test]
-    fn the_shape_is_read_out_of_every_form_and_qualified_once() {
+    fn nothing_beside_the_shape_name_is_answered_with() {
         for (case, named) in [
             ("bare", "ResourceNotFoundException".to_string()),
+            ("namespaced", format!("{NAMESPACE}#ResourceNotFoundException")),
             (
-                "namespaced",
-                "com.amazonaws.docdbelastic#ResourceNotFoundException".to_string(),
+                "a locator appended",
+                format!("ResourceNotFoundException:http://internal.example.test/{NAMESPACE}/"),
             ),
             (
-                "already qualified",
-                format!("ResourceNotFoundException{}", locator(SHAPE_ID)),
+                "namespaced with a locator appended",
+                format!(
+                    "{NAMESPACE}#ResourceNotFoundException:http://internal.example.test/\
+                     {NAMESPACE}/"
+                ),
             ),
+            ("padded", "  ResourceNotFoundException  ".to_string()),
         ] {
-            let answered =
-                with_error_type_locator(response(404, Some(&named)), &locator(SHAPE_ID));
-            let expected = format!("ResourceNotFoundException{}", locator(SHAPE_ID));
+            let answered = with_error_type_shape_name(response(404, Some(&named)));
             assert_eq!(
                 answered.headers().get(ERROR_TYPE_HEADER),
-                Some(expected.as_str()),
-                "case {case:?}: expected {expected:?}, got {:?}",
+                Some("ResourceNotFoundException"),
+                "case {case:?}: expected the bare shape name, got {:?}",
                 answered.headers().get(ERROR_TYPE_HEADER)
             );
         }
     }
 
-    /// Nothing to qualify: a success, and a failure whose renderer named no shape (or an
+    /// Nothing to name: a success, and a failure whose renderer named no shape (or an
     /// empty one), are left exactly as they were.
     #[test]
     fn a_response_that_names_no_shape_is_left_as_it_was() {
@@ -370,8 +319,7 @@ mod tests {
             ("no header", 404, None),
             ("an empty header", 404, Some("")),
         ] {
-            let answered =
-                with_error_type_locator(response(status, named), &locator(SHAPE_ID));
+            let answered = with_error_type_shape_name(response(status, named));
             assert_eq!(
                 answered.headers().get(ERROR_TYPE_HEADER),
                 named,

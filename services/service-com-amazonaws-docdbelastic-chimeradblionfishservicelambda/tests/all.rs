@@ -31,6 +31,8 @@ mod create_cluster_service_rules;
 mod duplicate_name_conflict_wording;
 #[path = "all/error_resource_identity.rs"]
 mod error_resource_identity;
+#[path = "all/error_type_header_form.rs"]
+mod error_type_header_form;
 #[path = "all/maintenance_and_restore.rs"]
 mod maintenance_and_restore;
 #[path = "all/not_found_wording.rs"]
