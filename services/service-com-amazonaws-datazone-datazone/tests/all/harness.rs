@@ -134,6 +134,21 @@ impl Emulator {
         (Self { router }, engine)
     }
 
+    /// One emulator with DataZone alone, plus the engine it is mounted on.
+    ///
+    /// A suite reaches for the engine only when its FIXTURE needs a resource no
+    /// implemented operation creates yet (`crate::subscription_request_decisions` needs a
+    /// subscription target, whose create is still a scaffold). Every ASSERTION there is
+    /// still made on the HTTP answer alone.
+    pub(crate) fn with_engine() -> (Self, Arc<engine::InMemoryEngine>) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(
+            service_com_amazonaws_datazone_datazone::EmulatedService::new(Arc::clone(&engine)),
+        );
+        (Self { router }, engine)
+    }
+
     /// One emulator whose own endpoint is `base`: the base URL
     /// `OperationContext::endpoint` reports, which is what the data port publishes when the
     /// emulator is served on one and what every URL a handler hands out therefore names.

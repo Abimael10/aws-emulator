@@ -2,7 +2,8 @@
 
 //! @op CreateSubscriptionRequest
 //! A subscription request is a principal's ask for access to a catalog listing: this
-//! operation records it in the domain's store, PENDING a decision, and
+//! operation records it in the domain's store — awaiting a decision when the subscribed
+//! listings resolve to a subscription target, already resolved when they do not — and
 //! `GetSubscriptionRequestDetails` reads it back.
 //!
 //! ## Shape of an operation
@@ -184,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, stored_forms, IdempotencyKey, ResourceKind,
-            SubscribedListingRef, SubscriptionRequest, DOMAIN_STATUS_AVAILABLE, ENTITY_TYPE_ASSET,
-            MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN, SUBSCRIPTION_REQUEST_STATUS_PENDING,
+            caller_principal, check_asset_references, created_subscription_request_status, now_ms,
+            stored_forms, AssetReferenceRefusal, IdempotencyKey, ResourceKind, SubscribedListingRef,
+            SubscriptionRequest, DOMAIN_STATUS_AVAILABLE, ENTITY_TYPE_ASSET,
+            MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN,
         };
 
         // The metadata forms the request carries, read by the rule
@@ -281,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut listings = Vec::with_capacity(input.subscribed_listings.len());
         // The published ASSETS those listings record — what an `assetScopes` or
         // `assetPermissions` entry may name.
-        let mut subscribed_assets: Vec<&str> = Vec::new();
+        let mut subscribed_assets: Vec<String> = Vec::new();
         for listing_input in &input.subscribed_listings {
             let listing = domain
                 .listings
@@ -304,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
             if listing.entity_type == ENTITY_TYPE_ASSET {
-                subscribed_assets.push(listing.entity_id.as_str());
+                subscribed_assets.push(listing.entity_id.clone());
             }
             listings.push(SubscribedListingRef {
                 listing_id: listing.id.clone(),
@@ -313,48 +315,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An `assetScopes` / `assetPermissions` entry narrows the access asked for on ONE
-        // asset, so it has to name an asset the subscribed listings publish — otherwise
-        // the request asks for something about an asset it is not about — and a scope's
-        // `filterIds` have to name filters of that asset, so a stored scope's filters
-        // always resolve when it is reported back.
-        for (index, scope) in input.asset_scopes.iter().flatten().enumerate() {
-            if !subscribed_assets.contains(&scope.asset_id.as_str()) {
-                return Err(CreateSubscriptionRequestErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "assetScopes[{index}].assetId must name an asset one of the subscribedListings publishes"
-                        ),
-                    },
-                )
-                .into());
-            }
-            let asset = domain.assets.get(&scope.asset_id);
-            if scope
-                .filter_ids
-                .iter()
-                .any(|id| asset.is_none_or(|asset| !asset.filters.contains_key(id)))
-            {
-                return Err(
+        // asset, checked by the rule `crate::state::check_asset_references` states — the
+        // same rule a DECISION on a request applies to the entries it carries.
+        let asset_scopes = input.asset_scopes.unwrap_or_default();
+        let asset_permissions = input.asset_permissions.unwrap_or_default();
+        if let Err(refusal) = check_asset_references(
+            domain,
+            &subscribed_assets,
+            &asset_scopes,
+            &asset_permissions,
+        ) {
+            return Err(match refusal {
+                AssetReferenceRefusal::NotSubscribed(message) => {
+                    CreateSubscriptionRequestErrorModeled::ValidationException(
+                        ValidationException { message },
+                    )
+                    .into()
+                }
+                AssetReferenceRefusal::FilterNotFound => {
                     CreateSubscriptionRequestErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
                             message: ResourceKind::AssetFilter.not_found_message(),
                         },
                     )
-                    .into(),
-                );
-            }
-        }
-        for (index, permission) in input.asset_permissions.iter().flatten().enumerate() {
-            if !subscribed_assets.contains(&permission.asset_id.as_str()) {
-                return Err(CreateSubscriptionRequestErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "assetPermissions[{index}].assetId must name an asset one of the subscribedListings publishes"
-                        ),
-                    },
-                )
-                .into());
-            }
+                    .into()
+                }
+            });
         }
 
         // The store is bounded, so a create loop cannot grow the emulator's heap without
@@ -372,33 +358,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Whether the created request awaits a decision at all, by the rule
+        // `crate::state::created_subscription_request_status` states: it does when the
+        // subscribed listings resolve to a subscription target the access would be
+        // granted through, and otherwise there is nothing to decide and the service
+        // resolves the ask at once.
+        let status = created_subscription_request_status(domain, &listings);
+
         let id = store.mint_id(now);
         let request = SubscriptionRequest {
             id: id.clone(),
             domain_id: input.domain_identifier.clone(),
-            // A created request is an ask awaiting a decision, which is the PENDING
-            // member of `SubscriptionRequestStatus`; `AcceptSubscriptionRequest` and
-            // `RejectSubscriptionRequest` are what move it to a terminal member.
-            status: SUBSCRIPTION_REQUEST_STATUS_PENDING.to_string(),
+            status: status.to_string(),
             request_reason: input.request_reason,
             principals,
             listings,
             metadata_forms,
-            asset_scopes: input.asset_scopes.unwrap_or_default(),
-            asset_permissions: input.asset_permissions.unwrap_or_default(),
+            asset_scopes,
+            asset_permissions,
             created_by: caller_principal(ctx),
             created_at_ms: now,
             // Nothing has updated the request yet, so `updatedAt` — a REQUIRED output
             // member — is the instant it was made, and `updatedBy` is absent.
             updated_by: None,
             updated_at_ms: now,
-            // Nobody has decided the request yet.
+            // No REVIEWER has decided the request: a request that awaits a decision has
+            // had none taken on it yet, and one the service resolved at create was
+            // resolved by nobody, so neither member is reported either way.
             reviewer_id: None,
             decision_comment: None,
             // `existingSubscriptionId` names the subscription the asked-for access
-            // already exists under. A subscription is created by accepting a request,
-            // and `AcceptSubscriptionRequest` is still a scaffold, so this store holds
-            // none for any principal and there is none to report.
+            // already exists under. A listing with no subscription target behind it
+            // materialises no subscription at all — there is nothing to grant access
+            // through — so there is none to report.
             existing_subscription_id: None,
         };
 

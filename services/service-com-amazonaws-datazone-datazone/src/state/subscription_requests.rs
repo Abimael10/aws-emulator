@@ -26,12 +26,160 @@ use crate::ops::types::{
 /// The `SubscriptionRequestStatus` members (model enum
 /// `com.amazonaws.datazone#SubscriptionRequestStatus`: PENDING | ACCEPTED | REJECTED).
 ///
-/// A created request is PENDING — it is an ask awaiting a decision — and a decision
-/// moves it to one of the two terminal members. None of the three is in-progress, so a
-/// stored request owes the clock no transition.
+/// A created request is PENDING when there is a decision to await and ACCEPTED when
+/// there is not ([`created_subscription_request_status`]); a decision moves a PENDING one
+/// to one of the two terminal members. None of the three is in-progress, so a stored
+/// request owes the clock no transition.
 pub const SUBSCRIPTION_REQUEST_STATUS_PENDING: &str = "PENDING";
 pub const SUBSCRIPTION_REQUEST_STATUS_ACCEPTED: &str = "ACCEPTED";
 pub const SUBSCRIPTION_REQUEST_STATUS_REJECTED: &str = "REJECTED";
+
+/// The `SubscriptionRequestStatus` a request created against `listings` carries.
+///
+/// A subscription is fulfilled through a subscription target of the domain, so a request
+/// whose subscribed listings resolve to a target is an ask AWAITING a decision —
+/// [`SUBSCRIPTION_REQUEST_STATUS_PENDING`], which `AcceptSubscriptionRequest` /
+/// `RejectSubscriptionRequest` then move to a terminal member. A request whose listings
+/// resolve to NO target has no decision to await: there is nothing to grant through, so
+/// the service resolves it at once and it is already
+/// [`SUBSCRIPTION_REQUEST_STATUS_ACCEPTED`] when the create answers (recorded behaviour
+/// — the model says only that `status` is required and one of the three members).
+///
+/// Read off the store, so the same listing resolves the same way for every operation
+/// that reports the request, and a listing a target is created for later is PENDING from
+/// then on without this rule changing.
+pub fn created_subscription_request_status(
+    domain: &Domain,
+    listings: &[SubscribedListingRef],
+) -> &'static str {
+    let awaits_a_decision = listings.iter().any(|reference| {
+        domain
+            .listings
+            .get(&reference.listing_id)
+            .and_then(|listing| listing.revisions.get(&reference.revision))
+            .and_then(|revision| super::fulfilling_subscription_target(domain, revision))
+            .is_some()
+    });
+    if awaits_a_decision {
+        SUBSCRIPTION_REQUEST_STATUS_PENDING
+    } else {
+        SUBSCRIPTION_REQUEST_STATUS_ACCEPTED
+    }
+}
+
+/// The `ValidationException` message `AcceptSubscriptionRequest` refuses a request that
+/// is no longer PENDING with: a decision has already been taken on it, so there is none
+/// left to take. Entirely fixed text — recorded from the service — so it echoes nothing
+/// of the request or of the store back.
+pub const SUBSCRIPTION_ALREADY_DECIDED_MESSAGE: &str =
+    "The approved subscription is already revoked or unsubscribed.";
+
+/// The `ValidationException` message `RejectSubscriptionRequest` refuses a request that
+/// is not PENDING with.
+///
+/// Fixed text followed by ONE variable part: the status the request currently carries,
+/// read from the store (so an already-accepted request and an already-rejected one each
+/// name their own).
+pub fn cannot_reject_message(status: &str) -> String {
+    format!("Cannot reject a subscription request with status {status}")
+}
+
+impl SubscriptionRequest {
+    /// Whether this request is still awaiting a decision, i.e. whether a decision
+    /// operation may take one on it. The one rule both decision handlers ask, so neither
+    /// can refuse on a different notion of "already decided".
+    pub fn awaits_a_decision(&self) -> bool {
+        self.status == SUBSCRIPTION_REQUEST_STATUS_PENDING
+    }
+
+    /// Record a decision on this request: the terminal `status`, the reviewer that took
+    /// it, the comment it carried, and the instant it was taken.
+    ///
+    /// The one writer both decision handlers use, so an accept and a reject cannot leave
+    /// a differently-shaped record behind. A decision that carries no comment leaves the
+    /// stored one absent, which is what the reader reports.
+    pub fn record_decision(
+        &mut self,
+        status: &str,
+        reviewer: String,
+        decision_comment: Option<String>,
+        now: i64,
+    ) {
+        self.status = status.to_string();
+        self.reviewer_id = Some(reviewer.clone());
+        self.decision_comment = decision_comment;
+        self.updated_by = Some(reviewer);
+        self.updated_at_ms = now;
+    }
+}
+
+/// The published ASSETS the stored listings of `request` record — what an `assetScopes`
+/// or `assetPermissions` entry about this request may name.
+///
+/// Only an ASSET listing publishes an asset; a data product listing publishes the
+/// product, whose own assets come from its record.
+pub fn subscribed_asset_ids(domain: &Domain, request: &SubscriptionRequest) -> Vec<String> {
+    request
+        .listings
+        .iter()
+        .filter_map(|reference| domain.listings.get(&reference.listing_id))
+        .filter(|listing| listing.entity_type == super::ENTITY_TYPE_ASSET)
+        .map(|listing| listing.entity_id.clone())
+        .collect()
+}
+
+/// Why an `assetScopes` or `assetPermissions` entry cannot be recorded.
+#[derive(Debug, Clone)]
+pub enum AssetReferenceRefusal {
+    /// The entry names an asset none of the subscribed listings publishes, so the
+    /// request would ask for something about an asset it is not about. Carries the
+    /// `ValidationException` message, which names the member only.
+    NotSubscribed(String),
+    /// A scope names a filter that is not one of its asset's own, so it is as absent as
+    /// one nothing created: a `ResourceNotFoundException` for
+    /// [`super::ResourceKind::AssetFilter`].
+    FilterNotFound,
+}
+
+/// Check the `assetScopes` and `assetPermissions` a create or a decision carries against
+/// the assets `subscribed_assets` the subscribed listings publish.
+///
+/// Each entry narrows what is asked for on ONE asset, so it has to name an asset those
+/// listings publish, and a scope's `filterIds` have to name filters OF that asset — so a
+/// stored scope's filters always resolve when it is reported back. The one rule every
+/// operation that takes these members applies, so a create and a decision cannot admit
+/// different entries.
+pub fn check_asset_references(
+    domain: &Domain,
+    subscribed_assets: &[String],
+    asset_scopes: &[AcceptedAssetScope],
+    asset_permissions: &[AssetPermission],
+) -> Result<(), AssetReferenceRefusal> {
+    let publishes = |asset_id: &str| subscribed_assets.iter().any(|id| id == asset_id);
+    for (index, scope) in asset_scopes.iter().enumerate() {
+        if !publishes(&scope.asset_id) {
+            return Err(AssetReferenceRefusal::NotSubscribed(format!(
+                "assetScopes[{index}].assetId must name an asset one of the subscribedListings publishes"
+            )));
+        }
+        let asset = domain.assets.get(&scope.asset_id);
+        if scope
+            .filter_ids
+            .iter()
+            .any(|id| asset.is_none_or(|asset| !asset.filters.contains_key(id)))
+        {
+            return Err(AssetReferenceRefusal::FilterNotFound);
+        }
+    }
+    for (index, permission) in asset_permissions.iter().enumerate() {
+        if !publishes(&permission.asset_id) {
+            return Err(AssetReferenceRefusal::NotSubscribed(format!(
+                "assetPermissions[{index}].assetId must name an asset one of the subscribedListings publishes"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The most subscription requests this emulator stores in one domain.
 ///

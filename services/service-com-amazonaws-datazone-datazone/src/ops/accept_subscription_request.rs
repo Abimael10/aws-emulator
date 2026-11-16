@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptSubscriptionRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptSubscriptionRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptSubscriptionRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A decision on a subscription request: this operation moves a request that is still
+//! awaiting one to `ACCEPTED`, recording the reviewer, the comment and the asset scopes
+//! and permissions the decision narrows the access to, and refuses a request a decision
+//! has already been taken on.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +181,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptSubscriptionRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptSubscriptionRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptSubscriptionRequest"))
+        use crate::state::{
+            caller_principal, check_asset_references, now_ms, subscribed_asset_ids,
+            AssetReferenceRefusal, ResourceKind, SUBSCRIPTION_ALREADY_DECIDED_MESSAGE,
+            SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AcceptSubscriptionRequestErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DataZone store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // decision is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(AcceptSubscriptionRequestErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // The prerequisites, read under the same lock the write takes: a domain already
+        // on its way out holds no request to decide, a request this domain does not hold
+        // is as absent as one nothing created, and a request that is no longer awaiting a
+        // decision has none left to take — the state-machine guard this operation and
+        // `RejectSubscriptionRequest` each apply to their own side.
+        {
+            let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+                AcceptSubscriptionRequestErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+            let request = domain
+                .subscription_requests
+                .get(&input.identifier)
+                .ok_or_else(|| {
+                    AcceptSubscriptionRequestErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: ResourceKind::SubscriptionRequest.not_found_message(),
+                        },
+                    )
+                })?;
+            if !request.awaits_a_decision() {
+                return Err(AcceptSubscriptionRequestErrorModeled::ValidationException(
+                    ValidationException {
+                        message: SUBSCRIPTION_ALREADY_DECIDED_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+            // The assets the stored request is about: what an `assetScopes` or
+            // `assetPermissions` entry this decision carries may name, by the rule
+            // `crate::state::check_asset_references` states — the same rule the create
+            // applies to the entries IT carries.
+            let subscribed_assets = subscribed_asset_ids(domain, request);
+            if let Err(refusal) = check_asset_references(
+                domain,
+                &subscribed_assets,
+                input.asset_scopes.as_deref().unwrap_or_default(),
+                input.asset_permissions.as_deref().unwrap_or_default(),
+            ) {
+                return Err(match refusal {
+                    AssetReferenceRefusal::NotSubscribed(message) => {
+                        AcceptSubscriptionRequestErrorModeled::ValidationException(
+                            ValidationException { message },
+                        )
+                        .into()
+                    }
+                    AssetReferenceRefusal::FilterNotFound => {
+                        AcceptSubscriptionRequestErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: ResourceKind::AssetFilter.not_found_message(),
+                            },
+                        )
+                        .into()
+                    }
+                });
+            }
+        }
+
+        // Derived from the caller's own credential scope, never from the request body:
+        // the reviewer of a decision is whoever took it.
+        let reviewer = caller_principal(ctx);
+        // The request was found under this same lock just above, so it is still there; an
+        // impossible disappearance is reported as a server fault rather than answered as
+        // though the decision had been recorded.
+        let lost = || -> Self::Error {
+            AcceptSubscriptionRequestErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the subscription request disappeared while it was being decided"
+                        .to_string(),
+                },
+            )
+            .into()
+        };
+        let request = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .and_then(|domain| domain.subscription_requests.get_mut(&input.identifier))
+            .ok_or_else(lost)?;
+        // A decision may narrow what the access is granted on: a member the request
+        // carries replaces what the ask recorded, a member it omits leaves that
+        // untouched.
+        if let Some(asset_scopes) = input.asset_scopes {
+            request.asset_scopes = asset_scopes;
+        }
+        if let Some(asset_permissions) = input.asset_permissions {
+            request.asset_permissions = asset_permissions;
+        }
+        request.record_decision(
+            SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
+            reviewer,
+            input.decision_comment,
+            now,
+        );
+
+        // Built from the record that was actually stored, so a 200 can never report a
+        // decision this call did not persist.
+        let domain = store
+            .domains
+            .get(&input.domain_identifier)
+            .ok_or_else(lost)?;
+        let request = domain
+            .subscription_requests
+            .get(&input.identifier)
+            .ok_or_else(lost)?;
+        let rendered = crate::state::subscription_request_view(domain, request).ok_or_else(|| {
+            AcceptSubscriptionRequestErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DataZone store lost a listing a subscription request records"
+                        .to_string(),
+                },
+            )
+        })?;
+        Ok(AcceptSubscriptionRequestOutput {
+            id: rendered.id,
+            created_by: rendered.created_by,
+            updated_by: rendered.updated_by,
+            domain_id: rendered.domain_id,
+            status: rendered.status,
+            created_at: rendered.created_at,
+            updated_at: rendered.updated_at,
+            request_reason: rendered.request_reason,
+            subscribed_principals: rendered.subscribed_principals,
+            subscribed_listings: rendered.subscribed_listings,
+            reviewer_id: rendered.reviewer_id,
+            decision_comment: rendered.decision_comment,
+            existing_subscription_id: rendered.existing_subscription_id,
+            metadata_forms: rendered.metadata_forms,
+        })
     }
 }

@@ -87,6 +87,8 @@ mod project_memberships;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscription_request_decisions.rs"]
+mod subscription_request_decisions;
 #[path = "all/subscription_requests.rs"]
 mod subscription_requests;
 #[path = "all/update_account_pool.rs"]

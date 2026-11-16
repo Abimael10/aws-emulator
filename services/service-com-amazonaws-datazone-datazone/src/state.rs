@@ -23,6 +23,13 @@ use std::collections::{BTreeMap, VecDeque};
 mod subscription_requests;
 pub use subscription_requests::*;
 
+/// Subscription targets: the stored record, and the lookup that says whether a published
+/// listing has one behind it. A concern of its own, so it lives in its own module beside
+/// this one; everything it declares is re-exported here, so a handler reaches it as
+/// `crate::state::…` like the rest of the store.
+mod subscription_targets;
+pub use subscription_targets::*;
+
 /// A domain's data portal: where this emulator publishes it, and the page served there. A
 /// concern of its own, so it lives in its own module beside this one; everything it declares
 /// is re-exported here, so a handler reaches it as `crate::state::…` like the rest of the
@@ -319,6 +326,12 @@ pub struct Domain {
     /// listing of them iterates in one stable order and a pagination token can resume
     /// from a key. Bounded by [`MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN`].
     pub subscription_requests: BTreeMap<String, SubscriptionRequest>,
+    /// The subscription targets of this domain, keyed by their `SubscriptionTargetId` —
+    /// the identifier `GetSubscriptionTarget` addresses one by — so they go with the
+    /// domain when it is deleted. Read by
+    /// [`created_subscription_request_status`] to decide whether a subscription to a
+    /// published listing has a fulfilment path behind it.
+    pub subscription_targets: BTreeMap<String, SubscriptionTarget>,
 }
 
 impl Domain {
