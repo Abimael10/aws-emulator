@@ -37,6 +37,8 @@ mod image_read_authorization;
 mod image_refusal_paths;
 #[path = "all/image_request_validation.rs"]
 mod image_request_validation;
+#[path = "all/image_version_deletion.rs"]
+mod image_version_deletion;
 #[path = "all/image_version_listing.rs"]
 mod image_version_listing;
 #[path = "all/image_version_pedigree.rs"]

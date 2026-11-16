@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMicrovmImageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMicrovmImageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMicrovmImageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes ONE version of the [`crate::state::MicrovmImage`] the `imageIdentifier` names:
+//! the call records that version `DELETING` and the removal the clock then owes takes the
+//! record, so a later read of it and the version listing both miss. The delete is
+//! idempotent — a repeat while the removal is in flight reports the same `DELETING`, and
+//! one addressed at a version an earlier delete already took reports the settled
+//! `DELETED` — while a version the image never held is refused with the modelled 404. An
+//! image always holds at least one version, so the delete of the last one it still holds
+//! is refused with the modelled 400
+//! ([`crate::state::LAST_IMAGE_VERSION_REFUSAL`]) — removing the image itself is what
+//! `DeleteMicrovmImage` is for.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMicrovmImageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMicrovmImageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMicrovmImageVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let region = crate::state::request_region(ctx);
+        let updated_at = crate::state::now_datetime();
+
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+        store.materialize_due(now);
+
+        // AUTHORIZATION BEFORE EXISTENCE, the verdict every customer-facing call
+        // addressed at a `MicrovmImageIdentifier` takes first
+        // (`crate::state::resolve_image_access`): an identifier this account holds no
+        // record of in the region the request was signed for — AWS's own catalogue,
+        // another account's, or one minted through another region's endpoint — is DENIED
+        // whether or not it names anything, so a refusal never tells a caller with no
+        // permission on an identifier whether it exists. A value that is no identifier of
+        // this API at all is a bad REQUEST instead, decided on the input.
+        let name = match store.resolve_image_access(&region, &input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => name,
+            crate::state::ImageAccess::Absent => {
+                return Err(not_found(
+                    crate::state::version_address_image_not_found_message(
+                        &input.image_identifier,
+                        &input.image_version,
+                    ),
+                ));
+            }
+            crate::state::ImageAccess::Denied => {
+                return Err(
+                    DeleteMicrovmImageVersionErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(crate::state::image_access_denied_message(
+                                Self::NAME,
+                                &input.image_identifier,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::ImageAccess::Malformed => {
+                return Err(
+                    DeleteMicrovmImageVersionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::invalid_arn_format_message(
+                                &input.image_identifier,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let Some(image) = store.image_named_mut(&region, &name) else {
+            return Err(not_found(
+                crate::state::version_address_image_not_found_message(
+                    &input.image_identifier,
+                    &input.image_version,
+                ),
+            ));
+        };
+        // Past the image's verdict the lookup is an own-account one. A version this image
+        // no longer HOLDS is one of two different answers. "This operation is idempotent;
+        // deleting a version that has already been deleted succeeds without error": a
+        // version an earlier delete took is reported in the settled deletion state
+        // `MicrovmImageVersionState` names for it, so a client that retries its own delete
+        // is told the deletion stands rather than that the version is missing. A version
+        // the image NEVER held is the modelled 404, which is what keeps a delete of a
+        // mistyped version from being reported as a deletion.
+        if !image.versions.contains_key(&input.image_version) {
+            return match image.deleted_version_state(&input.image_version) {
+                Some(settled) => Ok(deleted(&input, settled)),
+                None => Err(not_found(crate::state::image_version_not_found_message(
+                    &image.image_arn,
+                    &input.image_version,
+                ))),
+            };
+        }
+
+        // A MicroVM image is addressed THROUGH its versions — a launch pins one, a build
+        // belongs to one — so the service keeps every image holding at least one: the
+        // delete of the last version an image still holds would leave a record nothing
+        // could be launched or built from, and is refused as a bad request naming the
+        // call that does what the caller asked for.
+        if image.is_only_live_version(&input.image_version) {
+            return Err(
+                DeleteMicrovmImageVersionErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::LAST_IMAGE_VERSION_REFUSAL.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // The delete is DURABLE and ASYNCHRONOUS, as the whole image's is: the call
+        // records the version `DELETING` and the removal the clock then owes takes the
+        // record ([`crate::state::MicrovmImage::begin_version_deletion`]), so
+        // `GetMicrovmImageVersion` and the version listing miss once it is due and
+        // nothing can be launched from it from the moment the delete is recorded. A
+        // repeat while that removal is in flight leaves it exactly as it is and reports
+        // the same state.
+        let Some(state_after_deletion) =
+            image.begin_version_deletion(&input.image_version, now, updated_at)
+        else {
+            // Unreachable while the lookup above and this write run under the one lock;
+            // the honest answer for a version the image does not hold is that 404.
+            return Err(not_found(crate::state::image_version_not_found_message(
+                &image.image_arn,
+                &input.image_version,
+            )));
+        };
+
+        Ok(deleted(&input, state_after_deletion))
     }
+}
+
+/// What the operation answers for the version the request addressed, in the state the
+/// record carries after the call.
+///
+/// "The identifier of the MicroVM image" and "the version that was deleted": the ones the
+/// request addressed, in the form it addressed them, as the image-wide delete answers
+/// with.
+fn deleted(
+    input: &DeleteMicrovmImageVersionInput,
+    state: String,
+) -> DeleteMicrovmImageVersionOutput {
+    DeleteMicrovmImageVersionOutput {
+        image_identifier: input.image_identifier.clone(),
+        image_version: input.image_version.clone(),
+        state,
+    }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn unavailable() -> DeleteMicrovmImageVersionError {
+    DeleteMicrovmImageVersionErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the MicroVM image store is unavailable".to_string()),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// 404: the request named an image this account's own record no longer holds, or a
+/// version the resolved image does not hold.
+///
+/// `ResourceNotFoundException` models `message` as its only required member;
+/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
+/// the message is the whole envelope.
+fn not_found(message: String) -> DeleteMicrovmImageVersionError {
+    DeleteMicrovmImageVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
 }

@@ -408,6 +408,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // UPDATING -> UPDATED move, once the clock makes it due. Until then the
             // version the image was serving stays its active one.
             build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+            // Nothing has asked for this version to go, so no removal of it is owed.
+            delete_due_at: None,
             // "or UPDATE_FAILED on failure": the branch that move takes is the verdict
             // the object store gave for this version's code artifact, and a build that
             // produced nothing leaves the version the image was serving active.

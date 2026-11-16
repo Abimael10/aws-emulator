@@ -422,6 +422,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The build is asynchronous: the version completes, and with it the
             // image's CREATING -> CREATED move, once the clock makes it due.
             build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+            // Nothing has asked for this version to go, so no removal of it is owed.
+            delete_due_at: None,
             // "or CREATE_FAILED on failure": the branch that move takes is the verdict
             // the object store gave for this version's code artifact.
             build_failure_reason: artifact.failure_reason(),
@@ -453,6 +455,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 latest_failed_image_version: None,
                 tags,
                 versions,
+                // A record just created has had no version taken from it.
+                deleted_versions: ::std::collections::BTreeSet::new(),
                 delete_due_at: None,
             },
         );

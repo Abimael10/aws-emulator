@@ -104,6 +104,14 @@ pub const MICROVM_SUSPEND_SPAN: Duration = Duration::from_millis(500);
 /// through it quickly.
 pub const IMAGE_DELETE_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after `DeleteMicrovmImageVersion` the removal of ONE version becomes due.
+///
+/// Deleting a version is the same asynchronous deletion of this service as deleting the
+/// whole image, one record deep — the call reports the version `DELETING` and a client
+/// polls `GetMicrovmImageVersion` until it answers 404 — so it is owed on the same span
+/// rather than on a second figure that could drift from it.
+pub const IMAGE_VERSION_DELETE_SPAN: Duration = IMAGE_DELETE_SPAN;
+
 /// The AWS-managed network connector a MicroVM image gets when the request names no
 /// `egressNetworkConnectors`: outbound internet access.
 ///
@@ -344,6 +352,20 @@ pub fn image_not_found_message(identifier: &str) -> String {
 pub fn version_address_image_not_found_message(identifier: &str, image_version: &str) -> String {
     format!("MicroVMImage not found for MicroVMImage: {identifier}, Version: {image_version}")
 }
+
+/// The `message` of the 400 `DeleteMicrovmImageVersion` answers when the version it
+/// addresses is the last one its image still holds.
+///
+/// A MicroVM image is a sequence of version records and is addressed through them
+/// (`RunMicrovm` launches a version, a build belongs to one), so the service keeps an
+/// image holding at least one: taking the last version off an image would leave a record
+/// nothing could be launched or built from, and removing the image itself is what
+/// `DeleteMicrovmImage` is for. The sentence is AWS's own for this refusal — whole fixed
+/// text, no variable parts at all, which is why it names neither the image nor the
+/// version (recorded AWS behaviour) — and it states both halves of the rule: the
+/// condition, and the call that does what the caller asked for.
+pub const LAST_IMAGE_VERSION_REFUSAL: &str =
+    "This is the last version. Please delete the entire image";
 
 /// The `message` of the 404 the DELETE path answers for an `imageIdentifier` that
 /// resolves to no record, built from the identifier the request carried.
@@ -1105,6 +1127,25 @@ pub const VERSION_STATE_SUCCESSFUL: &str = "SUCCESSFUL";
 /// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`): the state a
 /// version settles in when the build of it did not produce an image.
 pub const VERSION_STATE_FAILED: &str = "FAILED";
+/// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`): the state a
+/// version carries while `DeleteMicrovmImageVersion`'s asynchronous removal of it is in
+/// flight.
+pub const VERSION_STATE_DELETING: &str = "DELETING";
+/// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`): the state a
+/// version's deletion has SETTLED in, which is what the delete of a version an earlier
+/// delete already took reports ("this operation is idempotent; deleting a version that has
+/// already been deleted succeeds without error").
+pub const VERSION_STATE_DELETED: &str = "DELETED";
+
+/// Whether a version in `state` is one a delete is already taking.
+///
+/// The removal is asynchronous, so the record is still there while it runs, but nothing
+/// can be launched or built from such a version, it is not one of the versions its image
+/// still holds ([`MicrovmImage::live_versions`]), and a further delete of it is the
+/// documented idempotent success rather than a second deletion.
+pub fn is_version_deletion_state(state: &str) -> bool {
+    state == VERSION_STATE_DELETING
+}
 
 /// A `MicrovmImageVersionStatus` value (`MICROVM_IMAGE_VERSION_STATUS_VALUES`).
 pub const VERSION_STATUS_ACTIVE: &str = "ACTIVE";
@@ -1343,6 +1384,10 @@ pub struct MicrovmImageVersion {
     pub tags: BTreeMap<String, String>,
     /// When the asynchronous build completes; `None` once it has.
     pub build_due_at: Option<Instant>,
+    /// When this version's asynchronous removal takes the record
+    /// ([`IMAGE_VERSION_DELETE_SPAN`]); `None` while no delete of it is in flight, which
+    /// is every version a caller can still launch, build or update.
+    pub delete_due_at: Option<Instant>,
     /// Why the build of this version cannot produce an image, as the object store
     /// ANSWERED when the build was scheduled ([`code_artifact::CodeArtifactVerdict`]);
     /// `None` for a build whose code artifact the store served. The verdict is settled
@@ -1443,6 +1488,17 @@ pub struct MicrovmImage {
     pub latest_failed_image_version: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub versions: BTreeMap<String, MicrovmImageVersion>,
+    /// The versions of this image a delete has already TAKEN, newest-last in
+    /// [`version_order`].
+    ///
+    /// The version record itself is gone once its removal is due, so its own read and the
+    /// version listing miss; what stays is the label, because the delete is documented
+    /// idempotent — "deleting a version that has already been deleted succeeds without
+    /// error" — and that answer is only possible for a version this image is known to have
+    /// held. It is what separates that settled success from the modelled 404 for a version
+    /// the image never held at all. Bounded by [`MAX_MICROVM_IMAGE_VERSIONS`], the oldest
+    /// label dropped first, so a caller cycling builds and deletes cannot grow the store.
+    pub deleted_versions: ::std::collections::BTreeSet<String>,
     /// When this image's asynchronous deletion removes it; `None` while no delete is
     /// in flight.
     pub delete_due_at: Option<Instant>,
@@ -1508,6 +1564,125 @@ impl MicrovmImage {
         if !is_image_lifecycle_in_flight(&self.state) {
             self.state = IMAGE_STATE_UPDATED.to_string();
         }
+    }
+
+    /// The versions of this image a delete has NOT already taken: the records a later
+    /// read still resolves, a launch can still pin and the next build still counts from.
+    ///
+    /// A version whose deletion is in flight is already spoken for
+    /// ([`is_version_deletion_state`]), so it is not one of them even while the record is
+    /// still there — which is what makes the window in which the delete is idempotent a
+    /// window rather than a second deletable version.
+    pub fn live_versions(&self) -> impl Iterator<Item = &MicrovmImageVersion> {
+        self.versions
+            .values()
+            .filter(|version| !is_version_deletion_state(&version.state))
+    }
+
+    /// Whether `image_version` is the ONE version of this image no delete has taken yet
+    /// ([`Self::live_versions`]) — the condition
+    /// [`LAST_IMAGE_VERSION_REFUSAL`] is answered for, and false for a version whose own
+    /// removal is already in flight, whose repeat delete is the documented idempotent
+    /// success rather than a refusal.
+    pub fn is_only_live_version(&self, image_version: &str) -> bool {
+        let mut live = self.live_versions();
+        live.next()
+            .is_some_and(|version| version.image_version == image_version)
+            && live.next().is_none()
+    }
+
+    /// The state a delete of `image_version` reports when this image no longer HOLDS that
+    /// version: [`VERSION_STATE_DELETED`] for one an earlier delete took, and `None` for
+    /// one the image never held.
+    ///
+    /// "This operation is idempotent; deleting a version that has already been deleted
+    /// succeeds without error": the settled deletion is a state
+    /// `MicrovmImageVersionState` names, so the repeat reports it rather than minting a
+    /// second deletion or refusing. A version this image never held is a different answer
+    /// — the modelled 404 — which is what keeps a delete of a mistyped version from being
+    /// reported as a deletion.
+    pub fn deleted_version_state(&self, image_version: &str) -> Option<String> {
+        self.deleted_versions
+            .contains(image_version)
+            .then(|| VERSION_STATE_DELETED.to_string())
+    }
+
+    /// Record that `image_version` of this image has been taken by a delete, keeping at
+    /// most [`MAX_MICROVM_IMAGE_VERSIONS`] labels: the oldest goes first
+    /// ([`version_order`]), so the bound holds however many builds and deletes a caller
+    /// cycles through, and the delete of a label the bound dropped answers the modelled
+    /// 404 like any other version this image does not hold.
+    fn record_deleted_version(&mut self, image_version: &str) {
+        self.deleted_versions.insert(image_version.to_string());
+        while self.deleted_versions.len() > MAX_MICROVM_IMAGE_VERSIONS {
+            let Some(oldest) = self
+                .deleted_versions
+                .iter()
+                .min_by_key(|version| version_order(version))
+                .cloned()
+            else {
+                break;
+            };
+            self.deleted_versions.remove(&oldest);
+        }
+    }
+
+    /// Start the asynchronous deletion of this image's version `image_version` at `now`,
+    /// stamping `at`, and report the state the version then carries — `None` when the
+    /// image holds no such version.
+    ///
+    /// The delete is DURABLE and ASYNCHRONOUS, exactly as the whole image's is: the call
+    /// records the version [`VERSION_STATE_DELETING`] and the removal the clock then owes
+    /// takes the record ([`regions::RegionalStore::materialize_due`]), so the version's own
+    /// read and the version listing both miss once it is due. A repeat while that removal
+    /// is still in flight leaves it exactly as it is and reports the same state, which is
+    /// the window the operation's documented idempotence covers.
+    ///
+    /// A version on its way out can launch nothing, so it is INACTIVE from the moment the
+    /// delete is recorded and the image stops serving it: the pointers that named it
+    /// ("the latest active version of the MicroVM image", the latest failed one) are
+    /// cleared rather than left naming a version nothing can be run from. The build of a
+    /// version being deleted produces nothing anyone can read, so it is abandoned — and
+    /// the lifecycle of the IMAGE that build was the work of therefore ends here, on the
+    /// FAILED value of that lifecycle: the create or update it was the build of produced
+    /// no version anybody can read, which is the same settlement a build that produced
+    /// nothing reaches ([`regions::RegionalStore::materialize_due`]), and it leaves a
+    /// record a later update can start from rather than one stuck in a progressive state
+    /// this service is no longer writing.
+    pub fn begin_version_deletion(
+        &mut self,
+        image_version: &str,
+        now: Instant,
+        at: DateTime,
+    ) -> Option<String> {
+        let version = self.versions.get_mut(image_version)?;
+        if is_version_deletion_state(&version.state) {
+            return Some(version.state.clone());
+        }
+        version.state = VERSION_STATE_DELETING.to_string();
+        version.status = VERSION_STATUS_INACTIVE.to_string();
+        version.updated_at = Some(at);
+        version.delete_due_at = Some(now + IMAGE_VERSION_DELETE_SPAN);
+        let abandoned_build = version.build_due_at.take().is_some();
+        let state_after_deletion = version.state.clone();
+
+        if self.latest_active_image_version.as_deref() == Some(image_version) {
+            self.latest_active_image_version = None;
+        }
+        if self.latest_failed_image_version.as_deref() == Some(image_version) {
+            self.latest_failed_image_version = None;
+        }
+        self.updated_at = Some(at);
+
+        if abandoned_build && self.live_versions().all(|v| v.build_due_at.is_none()) {
+            if self.state == IMAGE_STATE_CREATING {
+                self.state = IMAGE_STATE_CREATE_FAILED.to_string();
+            } else if self.state == IMAGE_STATE_UPDATING {
+                self.state = IMAGE_STATE_UPDATE_FAILED.to_string();
+            }
+        }
+
+        Some(state_after_deletion)
     }
 }
 
@@ -1887,6 +2062,27 @@ impl regions::RegionalStore {
                         }
                     }
                 }
+            }
+        }
+
+        // `DeleteMicrovmImageVersion` is asynchronous: a version whose deletion the clock
+        // has made due is REMOVED, with every build record it held, and the image it
+        // belonged to carries the instant it last changed — so the version's own read and
+        // the version listing both miss once it is due. The LABEL stays on the image
+        // ([`MicrovmImage::record_deleted_version`]), because the delete is documented
+        // idempotent and that settled answer is owed for a version this image held.
+        let removed_at = now_datetime();
+        for image in self.images.values_mut() {
+            let due: Vec<String> = image
+                .versions
+                .iter()
+                .filter(|(_, version)| version.delete_due_at.is_some_and(|at| at <= now))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for version in due {
+                image.versions.remove(&version);
+                image.record_deleted_version(&version);
+                image.updated_at = Some(removed_at);
             }
         }
 
