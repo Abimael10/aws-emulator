@@ -174,10 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "The ID of the VPC" (`DescribeStaleSecurityGroupsRequest$VpcId`, required): a VPC
-        // the account does not have is an error, not an empty report — the same refusal
-        // every operation of this crate that resolves a `VpcId` answers.
+        // the account does not have is an error, not an empty report. The code is the one
+        // every operation of this crate answers an unknown VPC id with; the SENTENCE is this
+        // operation's own — its recorded refusal names the id and says it is not found FOR
+        // THE USER, where the operations that resolve a `VpcId` as the parent of what they
+        // act on say "The vpc ID '<id>' does not exist". Which of the two an operation
+        // answers is a fact of that operation, so it comes from the one shared template for
+        // this wording ([`crate::state::vpc_not_found_for_user`]).
         if !store.vpcs.contains_key(&input.vpc_id) {
-            return Err(crate::state::invalid_vpc_id_not_found(&input.vpc_id));
+            return Err(crate::state::vpc_not_found_for_user(&input.vpc_id));
         }
 
         // "Describes a stale security group (a security group that contains stale rules)"

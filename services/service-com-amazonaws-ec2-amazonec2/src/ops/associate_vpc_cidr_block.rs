@@ -260,10 +260,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for has nothing to associate a range with. The code is the one every operation of
         // this service answers an unknown VPC id with; the SENTENCE is this operation's own
         // — its recorded refusal names the id and says it is not found FOR THE USER, where
-        // the VPC's own operations say "The vpc ID '<id>' does not exist". Which of the two
-        // an operation answers is a fact of that operation.
+        // the operations that resolve a `VpcId` as the parent of what they act on say "The
+        // vpc ID '<id>' does not exist". Which of the two an operation answers is a fact of
+        // that operation, so it comes from the one shared template for this wording.
         if !store.vpcs.contains_key(&input.vpc_id) {
-            return Err(vpc_not_found_for_user(&input.vpc_id));
+            return Err(state::vpc_not_found_for_user(&input.vpc_id));
         }
         // An IPAM pool the range would be taken from is resolved the same way: a pool id
         // this account holds no pool for has no range to give out.
@@ -310,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let vpc = store
             .vpcs
             .get_mut(&input.vpc_id)
-            .ok_or_else(|| vpc_not_found_for_user(&input.vpc_id))?;
+            .ok_or_else(|| state::vpc_not_found_for_user(&input.vpc_id))?;
         if let Some(cidr_block) = ipv4_block.as_deref() {
             let held = vpc.cidr_block_association_set.iter().flatten();
             if held.clone().count() >= MAX_CIDR_BLOCKS_PER_VPC {
@@ -435,18 +436,3 @@ fn canonical_ipv4(cidr_block: &str) -> String {
     crate::state::canonical_vpc_ipv4_cidr(cidr_block).unwrap_or_else(|_| cidr_block.to_string())
 }
 
-/// `InvalidVpcID.NotFound` (HTTP 400) in the wording THIS operation answers a VPC id it
-/// cannot resolve with: `<id> is not found for user.`
-///
-/// A second wording of that code beside [`crate::state::invalid_vpc_id_not_found`]'s "The vpc
-/// ID '<id>' does not exist", and a named function here rather than a literal at the call
-/// site, because which of the two an operation answers is a fact of that operation: the
-/// recorded refusal of this one names the id and says it is not found for the user. The id
-/// comes from the REQUEST.
-fn vpc_not_found_for_user(vpc_id: &str) -> AssociateVpcCidrBlockError {
-    crate::scaffolded::Scaffolded::service_error(
-        crate::state::INVALID_VPC_ID_NOT_FOUND,
-        400,
-        format!("{vpc_id} is not found for user."),
-    )
-}

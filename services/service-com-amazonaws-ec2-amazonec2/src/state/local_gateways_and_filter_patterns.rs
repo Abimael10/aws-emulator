@@ -956,6 +956,27 @@ pub fn invalid_vpc_id_not_found<E>(vpc_id: &str) -> crate::scaffolded::Scaffolde
     )
 }
 
+/// Refuse a request that named a VPC id no VPC of the account has in the OTHER sentence EC2
+/// words `InvalidVpcID.NotFound` with: the id the request named, followed by `is not found for
+/// user.`
+///
+/// EC2 answers this code with one of two sentences, and which one a caller gets is a fact of
+/// the OPERATION rather than of the VPC: some operations say this, where the ones that resolve
+/// a `VpcId` as the parent of the resource they act on say [`invalid_vpc_id_not_found`]'s "The
+/// vpc ID '<id>' does not exist". Both carry the same code and the same status, and the only
+/// variable part of either is the id the REQUEST named — bounded by [`echoed_resource_id`],
+/// the one bound every refusal of this crate that quotes a caller-chosen id holds it to.
+///
+/// A named function in `crate::state` rather than a literal at a call site, so the operations
+/// that answer this wording cannot word it two ways between them.
+pub fn vpc_not_found_for_user<E>(vpc_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VPC_ID_NOT_FOUND,
+        400,
+        format!("{} is not found for user.", echoed_resource_id(vpc_id)),
+    )
+}
+
 /// Refuse a request that named a subnet id no subnet of the account has, the way EC2
 /// does: HTTP 400 `InvalidSubnetID.NotFound`.
 pub fn invalid_subnet_id_not_found<E>(subnet_id: &str) -> crate::scaffolded::Scaffolded<E> {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WORDING of eight families of EC2 refusal, driven over the wire the service actually
+//! The WORDING of nine families of EC2 refusal, driven over the wire the service actually
 //! speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST carrying
 //! `Action=<operation>`, answered with XML (README.md / OPERATIONS.md "Wire protocol").
 //!
@@ -586,4 +586,122 @@ async fn creating_an_exclusion_with_neither_target_names_both_members() {
             .await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Family 9: the two sentences that word an unknown VPC id
+// ---------------------------------------------------------------------------
+
+/// A `VpcId` the account holds no VPC for is refused `InvalidVpcID.NotFound` by every
+/// operation that resolves one, each with ITS OWN of the two sentences EC2 words that code
+/// with: the operations whose refusal names the id alone say `<id> is not found for user.`,
+/// where the operations that resolve the member as the parent of the resource they act on say
+/// `The vpc ID '<id>' does not exist`. Which sentence a caller gets is a fact of the
+/// OPERATION, and the id the REQUEST named is the only variable part of either.
+///
+/// The rows span both planes, several operations of each, and the ways an id is not the
+/// account's: the long and the short id form, a well-formed id of another resource type, and
+/// the id of a VPC the account created and then deleted.
+#[tokio::test]
+async fn each_plane_words_an_unknown_vpc_its_own_way() {
+    let router = emulator();
+
+    // A VPC that exists, so a refusal below is a verdict about the id the request carried
+    // rather than about an empty account; and one created and then deleted, so "a VPC the
+    // account had" is a row of its own.
+    let held = ok(
+        "a held vpc",
+        &router,
+        "CreateVpc",
+        &[param("CidrBlock", "10.0.0.0/16")],
+    )
+    .await;
+    let held_vpc =
+        element(&held, "vpcId").unwrap_or_else(|| panic!("CreateVpc answered no vpcId: {held}"));
+    let created = ok(
+        "a vpc to delete",
+        &router,
+        "CreateVpc",
+        &[param("CidrBlock", "10.1.0.0/16")],
+    )
+    .await;
+    let deleted_vpc = element(&created, "vpcId")
+        .unwrap_or_else(|| panic!("CreateVpc answered no vpcId: {created}"));
+    ok(
+        "the delete",
+        &router,
+        "DeleteVpc",
+        &[param("VpcId", &deleted_vpc)],
+    )
+    .await;
+
+    // (case, the id the request names)
+    let unknown: [(&str, String); 4] = [
+        (
+            "a long-form id nothing minted",
+            "vpc-0123456789abcdef0".to_string(),
+        ),
+        ("a short-form id nothing minted", "vpc-ffffffff".to_string()),
+        (
+            "a subnet id in the VpcId member",
+            "subnet-0123456789abcdef0".to_string(),
+        ),
+        ("the id of a vpc deleted a call ago", deleted_vpc.clone()),
+    ];
+
+    // The operations that name the id alone, each with the members it needs beside `VpcId`.
+    let names_the_id_alone: [(&str, &[(&str, &str)]); 2] = [
+        ("DescribeStaleSecurityGroups", &[]),
+        ("AssociateVpcCidrBlock", &[("CidrBlock", "10.9.0.0/16")]),
+    ];
+    // The operations that resolve the member as a parent, which word it the other way.
+    let says_the_id_does_not_exist: [(&str, &[(&str, &str)]); 4] = [
+        ("CreateRouteTable", &[]),
+        ("CreateNetworkAcl", &[]),
+        ("DeleteVpc", &[]),
+        ("CreateSubnet", &[("CidrBlock", "10.9.1.0/24")]),
+    ];
+
+    for (case, vpc_id) in unknown {
+        for (action, extra) in names_the_id_alone {
+            let mut params = vec![param("VpcId", &vpc_id)];
+            params.extend(extra.iter().map(|(name, value)| param(name, value)));
+            assert_refusal(
+                &format!("{action} for {case}"),
+                &router,
+                action,
+                &params,
+                "InvalidVpcID.NotFound",
+                &format!("{vpc_id} is not found for user."),
+            )
+            .await;
+        }
+        for (action, extra) in says_the_id_does_not_exist {
+            let mut params = vec![param("VpcId", &vpc_id)];
+            params.extend(extra.iter().map(|(name, value)| param(name, value)));
+            assert_refusal(
+                &format!("{action} for {case}"),
+                &router,
+                action,
+                &params,
+                "InvalidVpcID.NotFound",
+                &format!("The vpc ID '{vpc_id}' does not exist"),
+            )
+            .await;
+        }
+    }
+
+    // None of the refusals above changed what a later caller sees: the VPC that was never
+    // deleted is still the account's, and still reports no stale security group.
+    let reported = ok(
+        "the held vpc",
+        &router,
+        "DescribeStaleSecurityGroups",
+        &[param("VpcId", &held_vpc)],
+    )
+    .await;
+    assert!(
+        !reported.contains("<groupId>"),
+        "a refused request must leave {held_vpc} readable with no stale group, got {reported}"
+    );
 }

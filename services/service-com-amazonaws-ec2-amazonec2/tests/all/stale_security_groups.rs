@@ -604,7 +604,8 @@ async fn the_report_covers_only_the_groups_of_the_named_vpc() {
 }
 
 /// A VPC the account does not have is refused with `InvalidVpcID.NotFound`, whatever form
-/// the id a caller sent takes.
+/// the id a caller sent takes, in the sentence THIS operation words that code with: the id
+/// the request named followed by the fixed text, and nothing else.
 #[tokio::test]
 async fn a_vpc_the_account_does_not_have_is_refused() {
     let (router, engine) = ec2_query::emulator();
@@ -641,6 +642,12 @@ async fn a_vpc_the_account_does_not_have_is_refused() {
             ec2_query::error_code(&body),
             "InvalidVpcID.NotFound",
             "case {case:?}: expected InvalidVpcID.NotFound for {vpc_id}, got {body}"
+        );
+        let message = ec2_query::error_message(&body);
+        let expected = format!("{vpc_id} is not found for user.");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
         );
     }
 }
