@@ -9,7 +9,10 @@
 //! The cluster is resolved against this service's store first — by
 //! `ClusterIdentifier`, or by the `CustomDomainName` one of this account's
 //! clusters serves — so a request naming no cluster of this account answers
-//! `ClusterNotFoundFault` and issues nothing. The reported `DbUser` carries the
+//! `ClusterNotFoundFault`, and a `CustomDomainName` no cluster of this account
+//! serves is refused as the parameter value it is
+//! ([`crate::state::INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS`]); either way nothing
+//! is issued. The reported `DbUser` carries the
 //! prefix the operation documents for the request's `AutoCreate`
 //! ([`crate::state::credential_db_user`]), the password is minted by the
 //! emulator's credential store and by nothing in this file, and the expiry is
@@ -349,7 +352,9 @@ const MISSING_CLUSTER_NAME: &str = "Either ClusterIdentifier or CustomDomainName
 /// for the cluster credentials" — a property of the cluster that serves it
 /// (`Cluster$CustomDomainName`). So a request carrying both is served only when
 /// the two name the same cluster, and a request carrying neither names nothing at
-/// all.
+/// all. A `CustomDomainName` no cluster of this account serves is refused as the
+/// parameter value it is ([`crate::state::INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS`])
+/// rather than as a cluster this account does not hold.
 fn resolve_cluster(
     store: &crate::state::ComAmazonawsRedshiftRedshiftserviceversion20121201State,
     input: &GetClusterCredentialsInput,
@@ -372,13 +377,16 @@ fn resolve_cluster(
         ),
         (named, Some(domain)) => {
             // A custom domain name resolves to the ONE cluster that serves it, so
-            // a name no cluster of this account serves names no association, and
-            // therefore no cluster.
+            // a name no cluster of this account serves scopes the credentials to
+            // nothing at all: the request's own parameter is what cannot be
+            // honoured, and no cluster was named to be reported missing.
             let holder = store
                 .cluster_with_custom_domain(domain)
                 .and_then(|stored| stored.cluster.cluster_identifier.clone())
                 .ok_or_else(|| {
-                    cluster_not_found(st::custom_domain_association_not_found_message(domain))
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        st::INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS,
+                    )
                 })?;
             // Both members named, and they name different clusters: the cluster
             // the request names serves no such domain.

@@ -25,6 +25,14 @@ use smithy_server_runtime::MultiServiceRouter;
 /// the region from here rather than repeating the literal.
 pub(crate) const REGION: &str = "us-west-2";
 
+/// The access key id this harness presents when a case does not name a caller of
+/// its own: a key neither IAM nor AWS STS holds a record of, which is the position
+/// the long-term credential this emulator publishes at start is in.
+///
+/// `pub(crate)` so a sibling suite that asserts what a handler reports about that
+/// caller names the same key.
+pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// How long a poll loop of this harness is given before it calls the condition it
 /// waits on unobservable — generous next to the span a clock-owed transition is
 /// due after, so a loaded runner cannot fail a suite, and far short of a client's
@@ -506,6 +514,23 @@ impl Emulator {
         emulator
     }
 
+    /// An emulator with the IAM AND the AWS STS services mounted beside Redshift
+    /// on the SAME engine, exactly as the assembled emulator mounts them.
+    ///
+    /// WHO a request speaks for is STS's answer — the session its access key id
+    /// names, or the IAM user that holds the key — so a suite about the identity a
+    /// handler reports makes its callers with those two services' own operations
+    /// rather than asserting against a name it chose itself.
+    pub(crate) fn with_identity_services() -> Self {
+        let mut emulator = Self::with_iam();
+        emulator.router.register_service(
+            service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
     /// POST one IAM awsQuery action with these form parameters and answer it.
     ///
     /// The body is built exactly as [`Emulator::call_in_region`] builds one; what
@@ -514,7 +539,26 @@ impl Emulator {
     /// nowhere: a call made without [`Emulator::with_iam`] is the "IAM said
     /// nothing" deployment and answers as such.
     pub(crate) async fn call_iam(&self, action: &str, params: &[(&str, &str)]) -> Answer {
-        let mut body = format!("Action={action}&Version=2010-05-08");
+        self.call_query_as(DEFAULT_ACCESS_KEY_ID, "iam", "2010-05-08", action, params)
+            .await
+    }
+
+    /// POST one awsQuery action to ANOTHER service of this emulator (IAM, AWS
+    /// STS), signed with `access_key_id`.
+    ///
+    /// The same request builder as [`Emulator::call_iam`], with the service it is
+    /// addressed and signed for, the API version it publishes and the caller it
+    /// presents left to the case: a suite that mints its callers through IAM and
+    /// STS drives those calls through here rather than writing a second builder.
+    pub(crate) async fn call_query_as(
+        &self,
+        access_key_id: &str,
+        signing_name: &str,
+        version: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
+        let mut body = format!("Action={action}&Version={version}");
         for (name, value) in params {
             body.push('&');
             body.push_str(name);
@@ -523,12 +567,12 @@ impl Emulator {
         }
         let request = http::Request::builder()
             .method("POST")
-            .uri("https://iam.amazonaws.com/")
+            .uri(format!("https://{signing_name}.amazonaws.com/"))
             .header("content-type", "application/x-www-form-urlencoded")
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/iam/aws4_request, SignedHeaders=host, Signature=0"
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/{signing_name}/aws4_request, SignedHeaders=host, Signature=0"
                 ),
             )
             .body(bytes::Bytes::from(body))
@@ -724,6 +768,22 @@ impl Emulator {
         self.call_in_region(REGION, action, params).await
     }
 
+    /// POST one awsQuery action with these form parameters, signed for [`REGION`]
+    /// by the caller `access_key_id` names.
+    ///
+    /// The caller reaches a handler only through the request's SigV4 credential
+    /// scope, so a suite asserting what a handler reports about WHO called drives
+    /// the call through here rather than building its own request.
+    pub(crate) async fn call_as(
+        &self,
+        access_key_id: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
+        self.call_signed_as(access_key_id, REGION, action, params)
+            .await
+    }
+
     /// POST one awsQuery action with these form parameters, signed for `region`.
     ///
     /// The Region reaches a handler only through the request's SigV4 credential
@@ -731,6 +791,19 @@ impl Emulator {
     /// here rather than building its own request.
     pub(crate) async fn call_in_region(
         &self,
+        region: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
+        self.call_signed_as(DEFAULT_ACCESS_KEY_ID, region, action, params)
+            .await
+    }
+
+    /// The one Redshift request builder both of the above go through: `region` and
+    /// the caller are the only things they differ on.
+    async fn call_signed_as(
+        &self,
+        access_key_id: &str,
         region: &str,
         action: &str,
         params: &[(&str, &str)],
@@ -749,7 +822,7 @@ impl Emulator {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/redshift/aws4_request, SignedHeaders=host, Signature=0"
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/redshift/aws4_request, SignedHeaders=host, Signature=0"
                 ),
             )
             .body(bytes::Bytes::from(body))

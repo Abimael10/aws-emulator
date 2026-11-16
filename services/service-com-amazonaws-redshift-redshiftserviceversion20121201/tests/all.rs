@@ -29,6 +29,8 @@ mod cluster_compute_changes;
 mod cluster_configuration_changes;
 #[path = "all/cluster_credentials.rs"]
 mod cluster_credentials;
+#[path = "all/cluster_credentials_identity.rs"]
+mod cluster_credentials_identity;
 #[path = "all/cluster_credentials_with_iam.rs"]
 mod cluster_credentials_with_iam;
 #[path = "all/cluster_db_revision_reporting.rs"]

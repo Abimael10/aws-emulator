@@ -528,11 +528,18 @@ async fn the_cluster_is_resolved_by_either_name() {
             Some("Cluster no-such-cluster not found.".to_string()),
         ),
         (
+            // The credentials are SCOPED to the cluster that serves the name, so
+            // a name no cluster of this account serves scopes them to nothing:
+            // the request's own parameter is what cannot be honoured, and no
+            // cluster was named to be reported missing.
             "a custom domain name no cluster serves",
             vec![("CustomDomainName".to_string(), "absent.example.com".to_string())],
-            404,
-            "ClusterNotFound",
-            Some("There aren't any associations linked to the custom domain name absent.example.com.".to_string()),
+            400,
+            "InvalidParameterValue",
+            Some(
+                "To use get credentials, you must provide an active custom domain name."
+                    .to_string(),
+            ),
         ),
         (
             "both members naming different clusters",

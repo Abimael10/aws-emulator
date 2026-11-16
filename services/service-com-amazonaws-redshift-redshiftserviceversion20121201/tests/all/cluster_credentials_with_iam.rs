@@ -8,11 +8,14 @@
 //!
 //! * the credentials are issued for the database OF a cluster, so the cluster the
 //!   request names is resolved first and a name this account holds no cluster
-//!   under answers `ClusterNotFoundFault` and issues nothing;
+//!   under answers `ClusterNotFoundFault` and issues nothing, while a
+//!   `CustomDomainName` no cluster of this account serves scopes them to nothing
+//!   and is refused as the parameter value it is;
 //! * the database user is the CALLER's — "the database user is mapped 1:1 to the
 //!   source IAM identity" — so it carries the documented `IAM:` prefix, is the
 //!   same for two calls signed with the same credential, and is decided by nothing
-//!   in the request;
+//!   in the request (which identity it names is
+//!   [`crate::cluster_credentials_identity`]'s own rule);
 //! * the password expires at this call's instant plus the lifetime the request
 //!   asked for, inside the documented 900..3600 window, and a lifetime outside it
 //!   is refused;
@@ -27,9 +30,13 @@ use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{Answer, Emulator};
 
-/// The access key id the shared harness signs every request with, which IS the
-/// caller's identity as far as this emulator can see it.
-const PRESENTED_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+/// The identity the shared harness's requests speak for: it signs them with a key
+/// neither IAM nor AWS STS holds a record of, so the caller is the IAM user this
+/// emulator publishes at start, and this is the ARN `sts:GetCallerIdentity`
+/// answers for it. WHICH identity a credential resolves to is
+/// [`crate::cluster_credentials_identity`]'s own rule, asserted there against
+/// callers minted through IAM and AWS STS.
+const PRESENTED_CALLER_ARN: &str = "arn:aws:iam::000000000000:user/emulator";
 
 /// The parameters one row of a table sends.
 type Params = Vec<(&'static str, &'static str)>;
@@ -94,7 +101,7 @@ async fn a_live_cluster_yields_credentials_for_the_calling_identity() {
     );
     assert_eq!(
         first.text("DbUser").as_deref(),
-        Some(state::iam_identity_db_user(PRESENTED_ACCESS_KEY_ID).as_str()),
+        Some(state::iam_identity_db_user(PRESENTED_CALLER_ARN).as_str()),
         "case credentials for a live cluster: expected the caller's own database user, got {:?}",
         first.text("DbUser")
     );
@@ -266,15 +273,15 @@ async fn the_cluster_the_credentials_are_for_has_to_be_named() {
         (
             "a custom domain no cluster of this account serves",
             vec![("CustomDomainName", "nowhere.example.com")],
-            Some((404, "ClusterNotFound")),
+            Some((400, "InvalidParameterValue")),
         ),
         (
-            "an identifier and a domain that name different clusters",
+            "an identifier and a domain no cluster of this account serves",
             vec![
                 ("ClusterIdentifier", identifier),
                 ("CustomDomainName", "nowhere.example.com"),
             ],
-            Some((404, "ClusterNotFound")),
+            Some((400, "InvalidParameterValue")),
         ),
         (
             "neither member",

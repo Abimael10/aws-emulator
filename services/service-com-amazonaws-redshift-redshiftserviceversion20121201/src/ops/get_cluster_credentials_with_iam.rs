@@ -9,16 +9,22 @@
 //! The cluster is resolved against this service's store first — by
 //! `ClusterIdentifier`, or by the `CustomDomainName` one of this account's
 //! clusters serves, the same rule `GetClusterCredentials` resolves one by — so a
-//! request naming no cluster of this account answers `ClusterNotFoundFault` and
-//! issues nothing. The password is minted by the emulator's credential store and
+//! request naming no cluster of this account answers `ClusterNotFoundFault`, and a
+//! `CustomDomainName` no cluster of this account serves is refused as the
+//! parameter value it is
+//! ([`crate::state::INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS`]); either way nothing
+//! is issued. The password is minted by the emulator's credential store and
 //! by nothing in this file, and the expiry is this call's instant plus the
 //! lifetime the request asked for, inside the documented window
 //! ([`crate::state::credential_duration`]).
 //!
 //! Unlike `GetClusterCredentials` this operation takes no `DbUser`: "the database
 //! user is mapped 1:1 to the source IAM identity", so the user name is the
-//! CALLER's rather than the request's, and nothing is auto-created in the
-//! cluster's database (the operation models no `AutoCreate`).
+//! CALLER's rather than the request's — the name of the IAM identity the
+//! credential the request was signed with speaks for
+//! ([`crate::state::caller_identity_arn`], [`crate::state::iam_identity_db_user`])
+//! — and nothing is auto-created in the cluster's database (the operation models
+//! no `AutoCreate`).
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(store_unavailable(st::STORE_UNAVAILABLE.to_string()));
         };
 
+        // "The database user is mapped 1:1 to the source IAM identity": WHO the
+        // request speaks for is resolved the way `sts:GetCallerIdentity` resolves
+        // it, before this service's own store is locked — so no two services'
+        // stores are ever held at once.
+        let caller_identity_arn = st::caller_identity_arn(&*self.engine, ctx);
+
         // The instant the credentials are issued at, which is what their expiry
         // is measured from.
         let issued_at = ::std::time::SystemTime::now();
@@ -211,13 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
         }
 
-        // "The database user is mapped 1:1 to the source IAM identity": the
-        // identity is the one the request was SIGNED with, so the user name is
-        // derived from the caller's own credential and from nothing in the
-        // request. Nothing is created in the cluster's database — this operation
-        // models no `AutoCreate` — so the call writes nothing.
+        // The user name is that identity's OWN name under the prefix its kind
+        // carries, so it is a name a client can grant to in the database and it
+        // appears in the ARN STS answers for the same credential — never the
+        // access key id the request presented, which identifies a credential
+        // rather than an identity. Nothing is created in the cluster's database —
+        // this operation models no `AutoCreate` — so the call writes nothing.
         let presented_access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-        let db_user = st::iam_identity_db_user(&presented_access_key_id);
+        let db_user = st::iam_identity_db_user(&caller_identity_arn);
 
         // The password is minted by the emulator's credential store, the one
         // component that generates secrets, and is never derived from the request:
@@ -241,6 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ::tracing::info!(
             operation = Self::NAME,
             presented_access_key_id = %presented_access_key_id,
+            caller_identity_arn = %caller_identity_arn,
             cluster_identifier = %store
                 .clusters
                 .get(position)
@@ -281,7 +295,9 @@ const MISSING_CLUSTER_NAME: &str = "Either ClusterIdentifier or CustomDomainName
 /// credentials", a property of the cluster that serves it
 /// (`Cluster$CustomDomainName`) — so a request carrying both is served only when
 /// the two name the same cluster, and a request carrying neither names nothing at
-/// all.
+/// all. A `CustomDomainName` no cluster of this account serves is refused as the
+/// parameter value it is ([`crate::state::INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS`])
+/// rather than as a cluster this account does not hold.
 fn resolve_cluster(
     store: &crate::state::ComAmazonawsRedshiftRedshiftserviceversion20121201State,
     input: &GetClusterCredentialsWithIAMInput,
@@ -304,13 +320,16 @@ fn resolve_cluster(
         ),
         (named, Some(domain)) => {
             // A custom domain name resolves to the ONE cluster that serves it, so
-            // a name no cluster of this account serves names no association, and
-            // therefore no cluster.
+            // a name no cluster of this account serves scopes the credentials to
+            // nothing at all: the request's own parameter is what cannot be
+            // honoured, and no cluster was named to be reported missing.
             let holder = store
                 .cluster_with_custom_domain(domain)
                 .and_then(|stored| stored.cluster.cluster_identifier.clone())
                 .ok_or_else(|| {
-                    cluster_not_found(st::custom_domain_association_not_found_message(domain))
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        st::INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS,
+                    )
                 })?;
             if let Some(named) = named.filter(|named| *named != holder) {
                 return Err(cluster_not_found(

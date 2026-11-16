@@ -86,6 +86,11 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # the account's instances can answer; its store is read (never written) through
 # that crate's `state` seam (`state::identity_center`).
 service-com-amazonaws-ssoadmin-swbexternalservice = { workspace = true }
+# WHO a request speaks for is the AWS STS service's answer: the credentials a
+# `GetClusterCredentialsWithIAM` maps 1:1 to an IAM identity are resolved through
+# that crate's own accessors (`state::caller_identity`), so this service and
+# `sts:GetCallerIdentity` report one principal for one credential.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

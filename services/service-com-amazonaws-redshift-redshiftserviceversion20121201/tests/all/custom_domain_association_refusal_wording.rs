@@ -19,6 +19,13 @@
 //! sentence about that member's value, so no certificate ARN is interpolated
 //! into a sentence about a domain name.
 //!
+//! The GET-CREDENTIALS operations are a different rule, asserted here beside it:
+//! they do not operate ON an association, they SCOPE the credentials they issue to
+//! the cluster that serves the name — so a name no cluster of this account serves
+//! scopes them to nothing and the request's own parameter is what is refused, with
+//! HTTP 400 `InvalidParameterValue` and the family's fixed sentence, rather than a
+//! cluster being reported missing.
+//!
 //! The table spans what the rule generalises over: the operation that makes the
 //! lookup, and the shape of the name (two labels, a deeper name, hyphenated
 //! labels, and a label at the longest the member's own pattern admits — 63
@@ -62,6 +69,12 @@ fn absent_certificate_sentence(custom_domain_certificate_arn: &str) -> String {
          {custom_domain_certificate_arn}."
     )
 }
+
+/// The sentence a GET-CREDENTIALS operation answers when the custom domain name
+/// it is scoped to is no active association of this account. The whole sentence
+/// is fixed text and names nothing of the request, so it is spelled out here.
+const INACTIVE_DOMAIN_SENTENCE: &str =
+    "To use get credentials, you must provide an active custom domain name.";
 
 /// POST one action with owned parameters.
 async fn call(emulator: &Emulator, action: &str, params: &[(String, String)]) -> Answer {
@@ -164,9 +177,6 @@ async fn an_absent_custom_domain_association_is_refused_in_one_sentence() {
         ]
     }
 
-    // `GetClusterCredentials` resolves a cluster THROUGH the association, so the
-    // same condition reaches it as the fault its own model declares
-    // (`ClusterNotFound`) — the sentence is the condition's, not the fault's.
     let operations: Vec<(&str, Request, &str)> = vec![
         (
             "DescribeCustomDomainAssociations",
@@ -182,11 +192,6 @@ async fn an_absent_custom_domain_association_is_refused_in_one_sentence() {
             "DeleteCustomDomainAssociation",
             delete as Request,
             "CustomDomainAssociationNotFoundFault",
-        ),
-        (
-            "GetClusterCredentials",
-            credentials as Request,
-            "ClusterNotFound",
         ),
     ];
 
@@ -211,6 +216,88 @@ async fn an_absent_custom_domain_association_is_refused_in_one_sentence() {
                 refused.body
             );
         }
+
+        // The get-credentials family scopes the credentials it issues to the
+        // cluster that serves the name, so a name no cluster of this account
+        // serves is refused as the parameter value it is — the same refusal for
+        // both operations of the family, whether or not the request also names a
+        // cluster.
+        for (action, mut params) in [
+            ("GetClusterCredentials", credentials(&name)),
+            (
+                "GetClusterCredentialsWithIAM",
+                vec![pair("CustomDomainName", &name)],
+            ),
+        ] {
+            let case = format!("{action} on {name_case}");
+            let refused = call(&emulator, action, &params).await;
+            assert_eq!(
+                (
+                    refused.status,
+                    refused.error_code().as_deref(),
+                    refused.text("Message").as_deref()
+                ),
+                (
+                    400,
+                    Some("InvalidParameterValue"),
+                    Some(INACTIVE_DOMAIN_SENTENCE)
+                ),
+                "case {case}: expected 400 InvalidParameterValue with \
+                 {INACTIVE_DOMAIN_SENTENCE:?}, got {} / {:?} with body {}",
+                refused.status,
+                refused.error_code(),
+                refused.body
+            );
+
+            // The same refusal when the request ALSO names a cluster this
+            // account holds: the domain it scoped the credentials to is still no
+            // association of the account.
+            params.push(pair("ClusterIdentifier", CLUSTER));
+            let scoped = call(&emulator, action, &params).await;
+            assert_eq!(
+                (
+                    scoped.status,
+                    scoped.error_code().as_deref(),
+                    scoped.text("Message").as_deref()
+                ),
+                (
+                    400,
+                    Some("InvalidParameterValue"),
+                    Some(INACTIVE_DOMAIN_SENTENCE)
+                ),
+                "case {case} beside a cluster of this account: expected 400 \
+                 InvalidParameterValue with {INACTIVE_DOMAIN_SENTENCE:?}, got {} / {:?} with \
+                 body {}",
+                scoped.status,
+                scoped.error_code(),
+                scoped.body
+            );
+        }
+    }
+
+    // The association this account DOES hold scopes the credentials to the
+    // cluster that serves it, so the refusals above are about an absent name
+    // rather than about every name — and a request naming a cluster that serves
+    // no such association is told about THAT cluster, which is a different
+    // condition from the one above.
+    for (case, action, params) in [
+        (
+            "GetClusterCredentials on the served name",
+            "GetClusterCredentials",
+            credentials(SERVED_DOMAIN),
+        ),
+        (
+            "GetClusterCredentialsWithIAM on the served name",
+            "GetClusterCredentialsWithIAM",
+            vec![pair("CustomDomainName", SERVED_DOMAIN)],
+        ),
+    ] {
+        let served = call(&emulator, action, &params).await;
+        assert_eq!(
+            served.status, 200,
+            "case {case}: expected the credentials to be issued, got {} with body {}",
+            served.status, served.body
+        );
     }
 
     // A request that names its association through the CERTIFICATE is refused

@@ -110,6 +110,9 @@ mod tags;
 mod derived;
 /// The syntax every name this service admits has to satisfy.
 mod naming;
+/// The IAM identity a request speaks for, resolved the way
+/// `sts:GetCallerIdentity` resolves it.
+mod caller_identity;
 /// The subnets a cluster subnet group is made of, resolved against the service
 /// that owns them.
 mod ec2_subnets;
@@ -146,6 +149,7 @@ pub mod cluster_metrics;
 
 pub use cluster_metrics::*;
 
+pub use caller_identity::*;
 pub use clock::*;
 pub use cluster_data::*;
 pub use clusters::*;
@@ -3516,6 +3520,22 @@ pub fn custom_domain_association_not_found_message(custom_domain_name: &str) -> 
         "There aren't any associations linked to the custom domain name {custom_domain_name}."
     )
 }
+
+/// What a GET-CREDENTIALS request scoped to a custom domain name NO cluster of
+/// this account serves is refused with.
+///
+/// The credentials are issued for the database of the cluster that SERVES the
+/// domain name the request scopes them to, so a name no cluster of the account is
+/// associated with scopes them to nothing: the request's own parameter is what is
+/// wrong, which is why the family answers `InvalidParameterValue` (HTTP 400) here
+/// rather than reporting a cluster missing — the request named no cluster to be
+/// missing.
+///
+/// The whole sentence is fixed text, as Amazon Redshift words this refusal for
+/// the get-credentials operations: it carries no part of the request, so a caller
+/// matching on it sees the same sentence whatever domain name it sent.
+pub const INACTIVE_CUSTOM_DOMAIN_FOR_CREDENTIALS: &str =
+    "To use get credentials, you must provide an active custom domain name.";
 
 /// The same refusal for a request that names the association it wants through
 /// the CERTIFICATE instead of the domain name

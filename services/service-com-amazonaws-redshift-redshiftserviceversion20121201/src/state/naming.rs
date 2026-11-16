@@ -436,24 +436,65 @@ pub fn credential_db_user(db_user: &str, auto_create: bool) -> String {
     format!("{prefix}{db_user}")
 }
 
+/// The prefix the database user of an IAM ROLE identity carries, beside the
+/// `IAM:` prefix [`credential_db_user`] states for every other IAM identity.
+///
+/// Source: `smithy_query(query="doc", operation="GetClusterCredentials")` states
+/// the `IAM:`/`IAMA:` prefixes an identity logs on under, and the Amazon Redshift
+/// identity-to-database-user mapping gives a ROLE its own prefix — so the prefix
+/// says which KIND of IAM identity the database user stands for, and the name
+/// after it is that identity's own name.
+pub const IAM_ROLE_DB_USER_PREFIX: &str = "IAMR:";
+
+/// The resource type an assumed-role identity's ARN carries
+/// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`), which is what makes
+/// it a ROLE identity rather than a user.
+const ASSUMED_ROLE_RESOURCE_TYPE: &str = "assumed-role";
+
 /// The `DbUser` a `GetClusterCredentialsWithIAM` response reports for the IAM
-/// identity the request was signed with.
+/// identity the request was signed with, given that identity's ARN.
 ///
 /// Source: `smithy_query(query="doc", shape="ClusterExtendedCredentials",
 /// member="DbUser")` — "A database user name that you provide when you connect to
 /// a database. The database user is mapped 1:1 to the SOURCE IAM IDENTITY" —
 /// paired with the prefix `GetClusterCredentials` documents for a user an IAM
-/// identity logs on as ([`credential_db_user`]). So the name is the caller's
-/// identity under that prefix, and nothing in the request decides it: unlike
-/// `GetClusterCredentials`, this operation takes no `DbUser` at all.
+/// identity logs on as ([`credential_db_user`]). So the name is the IDENTITY's own
+/// name, and nothing in the request decides it: unlike `GetClusterCredentials`,
+/// this operation takes no `DbUser` at all.
 ///
-/// The identity the emulator has of a caller is the access key id its request
-/// presented, which is what the credential the request was signed with IS — so
-/// that is the identity the mapping is made from. It is not drawn per call: two
-/// calls signed with the same credential map to the same database user, which is
-/// what makes the mapping 1:1.
-pub fn iam_identity_db_user(presented_access_key_id: &str) -> String {
-    credential_db_user(presented_access_key_id, false)
+/// The identity's own name is the name field of its ARN — the user name of
+/// `user/<path…><name>` or of `federated-user/<name>`, the ROLE name of
+/// `assumed-role/<role>/<session>` — so the reported name always appears in the
+/// ARN `sts:GetCallerIdentity` answers for the same credential. A role identity
+/// carries [`IAM_ROLE_DB_USER_PREFIX`]; every other IAM identity carries the
+/// plain `IAM:` prefix (never the `IAMA:` one, which `GetClusterCredentials`
+/// documents for an auto-created user and this operation models no member for).
+///
+/// It is a function of the identity alone, so two calls signed with two
+/// credentials of ONE identity map to one database user, which is what makes the
+/// mapping 1:1 — and a value that is not a well-formed ARN is read as the name it
+/// stands for rather than replaced.
+pub fn iam_identity_db_user(caller_identity_arn: &str) -> String {
+    let resource =
+        ::service_common::arn::resource(caller_identity_arn).unwrap_or(caller_identity_arn);
+    let (resource_type, rest) = resource.split_once('/').unwrap_or(("", resource));
+    if resource_type == ASSUMED_ROLE_RESOURCE_TYPE {
+        // `assumed-role/<role>/<session>`: the identity is the ROLE, so the
+        // session name the caller chose per session names no database user.
+        let role_name = rest.split('/').find(|segment| !segment.is_empty());
+        return format!(
+            "{IAM_ROLE_DB_USER_PREFIX}{}",
+            role_name.unwrap_or(rest)
+        );
+    }
+    // Every other identity's name is the LAST segment of its resource field: an
+    // IAM user's path (`user/team/airflow/analyst`) belongs to where the identity
+    // sits, not to its name.
+    let name = rest
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(rest);
+    credential_db_user(name, false)
 }
 
 // The clusters a token request may scope its token to are documented on the
