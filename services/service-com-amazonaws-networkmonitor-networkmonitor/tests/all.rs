@@ -43,6 +43,8 @@ mod monitor_modified_at_follows_probe_writes;
 mod monitor_report_projection;
 #[path = "all/monitor_state_follows_probe_activation.rs"]
 mod monitor_state_follows_probe_activation;
+#[path = "all/probe_metric_publication.rs"]
+mod probe_metric_publication;
 #[path = "all/probe_report_projection.rs"]
 mod probe_report_projection;
 #[path = "all/probe_rules_precede_count_ceilings.rs"]

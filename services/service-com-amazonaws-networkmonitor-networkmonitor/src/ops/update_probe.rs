@@ -376,6 +376,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // once it has nothing in service, and owed `PENDING` -> `ACTIVE` again
         // the moment it has.
         monitor.follow_probe_write(changed, now);
+        // The toggle decides whether this probe measures at all, so the publisher's
+        // clock is driven with the probes the monitor now holds — with this store's
+        // guard released, because it locks the store itself. A probe switched off
+        // publishes nothing more, and one switched back on opens a series again
+        // ([`crate::state::drive_probe_metrics`]).
+        drop(store);
+        crate::state::drive_probe_metrics(&self.engine);
         Ok(output)
     }
 }

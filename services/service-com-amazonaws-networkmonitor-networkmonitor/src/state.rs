@@ -1621,7 +1621,21 @@ pub struct ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// Monotonic counter behind [`Self::next_probe_id`]; never reused within a
     /// run.
     probe_seq: u64,
+    /// How far each live probe's CloudWatch series has been published, and the one
+    /// in-process clock that advances them ([`probe_metrics`]). A schedule, not a
+    /// copy of the datapoints: those live in the metric store that owns them.
+    probe_metrics: probe_metrics::ProbeMetricPublisher,
 }
+
+/// What a probe PUBLISHES while it is live: the `AWS/NetworkMonitor` series its
+/// measurements are reported as, appended to the metric store that owns them.
+///
+/// Its own file because it is a concern of its own — the cadence a monitor's
+/// `aggregationPeriod` names, and the one clock that keeps it — and its items are
+/// re-exported here, so a handler names
+/// `crate::state::drive_probe_metrics` like any helper of this module.
+mod probe_metrics;
+pub use probe_metrics::*;
 
 impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// The monitors of `region`, in `monitorName` order; `None` when that region

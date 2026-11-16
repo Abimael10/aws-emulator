@@ -250,6 +250,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decided here rather than left to whichever caller settles the monitor
         // next.
         monitor.follow_probe_write(!already_tearing_down, now);
+        // A probe on its way out sends no more packets, so the publisher is driven
+        // with the probes the monitor still holds — with this store's guard
+        // released, because it locks the store itself: its series stops here rather
+        // than gaining windows nothing measured
+        // ([`crate::state::drive_probe_metrics`]).
+        drop(store);
+        crate::state::drive_probe_metrics(&self.engine);
         Ok(DeleteProbeOutput {})
     }
 }

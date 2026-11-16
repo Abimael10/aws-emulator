@@ -401,6 +401,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!("probe {probe_id} was not stored")),
                 })
             })?;
-        Ok(output_for(stored))
+        let output = output_for(stored);
+        // The probe this request added is one the monitor will aggregate and send to
+        // CloudWatch, so the publisher's clock is started — with this store's guard
+        // released, because it locks the store itself
+        // ([`crate::state::drive_probe_metrics`]).
+        drop(store);
+        crate::state::drive_probe_metrics(&self.engine);
+        Ok(output)
     }
 }

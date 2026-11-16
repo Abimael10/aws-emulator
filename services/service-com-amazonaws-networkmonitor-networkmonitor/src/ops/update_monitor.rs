@@ -242,6 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Answered from the STORED record, so what the caller is told is what a
         // later `GetMonitor` reads back.
-        Ok(output_for(monitor))
+        let output = output_for(monitor);
+        // `aggregationPeriod` is how far apart the windows this monitor's probes
+        // publish are stamped, so the publisher's clock is driven with the period
+        // the record now holds — with this store's guard released, because it locks
+        // the store itself ([`crate::state::drive_probe_metrics`]).
+        drop(store);
+        crate::state::drive_probe_metrics(&self.engine);
+        Ok(output)
     }
 }

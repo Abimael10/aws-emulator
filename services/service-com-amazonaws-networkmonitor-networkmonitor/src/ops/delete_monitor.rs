@@ -214,6 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The idempotency records that named it replay nothing now, so drop
         // them rather than leaving a token pointing at a monitor that is gone.
         store.forget_client_tokens_of_monitor(&region, &input.monitor_name);
+        // The monitor and its probes are gone, so nothing of theirs is measured any
+        // more: the publisher is driven with the records that remain — with this
+        // store's guard released, because it locks the store itself
+        // ([`crate::state::drive_probe_metrics`]).
+        drop(store);
+        crate::state::drive_probe_metrics(&self.engine);
         Ok(DeleteMonitorOutput {})
     }
 }
