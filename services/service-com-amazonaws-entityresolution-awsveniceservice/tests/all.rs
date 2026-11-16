@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/generated_id_form.rs"]
+mod generated_id_form;
 #[path = "all/id_mapping_workflow_delete.rs"]
 mod id_mapping_workflow_delete;
 #[path = "all/id_mapping_workflow_lifecycle.rs"]

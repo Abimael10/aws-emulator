@@ -328,7 +328,11 @@ fn refused_documents() -> Vec<(&'static str, String)> {
 /// Does `value` satisfy the modelled `PolicyToken`: `length 36..36`, pattern
 /// `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`
 /// (`smithy_query(query="operation",operation="PutPolicy")`)?
-fn is_modelled_policy_token(value: &str) -> bool {
+///
+/// `pub(crate)` so the sibling suite that asserts the FORM of every identifier this
+/// service mints reads the modelled token form from here rather than keeping a second
+/// copy of it.
+pub(crate) fn is_modelled_policy_token(value: &str) -> bool {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let groups: Vec<&str> = value.split('-').collect();
     value.len() == 36

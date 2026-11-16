@@ -48,13 +48,13 @@ const REGION: &str = "us-east-1";
 const ACCOUNT_ID: &str = "000000000000";
 
 /// The bucket every case's input objects are staged in.
-const INPUT_BUCKET: &str = "er-input";
+pub(crate) const INPUT_BUCKET: &str = "er-input";
 
 /// The bucket every workflow writes its output table to.
-const OUTPUT_BUCKET: &str = "er-output";
+pub(crate) const OUTPUT_BUCKET: &str = "er-output";
 
 /// The key prefix `outputSourceConfig[0].outputS3Path` names.
-const OUTPUT_PREFIX: &str = "output";
+pub(crate) const OUTPUT_PREFIX: &str = "output";
 
 /// The Glue database every input table is created in.
 const DATABASE: &str = "crm";
@@ -80,25 +80,25 @@ fn authorization(service: &str) -> String {
 /// The Glue table ARN an `InputSource$inputSourceARN` carries for `table`
 /// (`^arn:…:glue:<region>:<account>:table/<database>/<table>$`,
 /// `smithy_query(query="shape",shape="InputSource")`).
-fn glue_table_arn(table: &str) -> String {
+pub(crate) fn glue_table_arn(table: &str) -> String {
     format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/{DATABASE}/{table}")
 }
 
 /// The IAM role a workflow is created with.
-fn role_arn() -> String {
+pub(crate) fn role_arn() -> String {
     format!("arn:aws:iam::{ACCOUNT_ID}:role/entity-resolution")
 }
 
 /// One Entity Resolution response, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// A top-level string member, or `""` when the body carries none.
-    fn text(&self, member: &str) -> String {
+    pub(crate) fn text(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -109,12 +109,12 @@ impl Reply {
 
 /// Entity Resolution, Glue and Amazon S3 on ONE shared engine, the way the router
 /// mounts every service.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -133,7 +133,7 @@ impl Emulator {
     }
 
     /// One Entity Resolution call, as a client makes it.
-    async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
@@ -197,7 +197,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>` — `CreateBucket`.
-    async fn given_bucket(&self, bucket: &str) {
+    pub(crate) async fn given_bucket(&self, bucket: &str) {
         let (status, body) = self.s3("PUT", &format!("/{bucket}"), &[]).await;
         assert_eq!(
             status,
@@ -208,7 +208,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>/<key>` — `PutObject`, storing `body` as the object's own bytes.
-    async fn given_object(&self, bucket: &str, key: &str, body: &str) {
+    pub(crate) async fn given_object(&self, bucket: &str, key: &str, body: &str) {
         let (status, answered) = self
             .s3("PUT", &format!("/{bucket}/{key}"), body.as_bytes())
             .await;
@@ -222,14 +222,14 @@ impl Emulator {
 
     /// `GET /<bucket>/<key>` — `GetObject` — as the text it holds, or `None` when the
     /// store does not hold it.
-    async fn object_text(&self, bucket: &str, key: &str) -> Option<String> {
+    pub(crate) async fn object_text(&self, bucket: &str, key: &str) -> Option<String> {
         let (status, body) = self.s3("GET", &format!("/{bucket}/{key}"), &[]).await;
         (status == 200).then(|| String::from_utf8_lossy(&body).to_string())
     }
 
     /// The keys Amazon S3 holds under `prefix`, read out of the `<Key>` elements
     /// `ListObjectsV2` answered with.
-    async fn keys_under(&self, bucket: &str, prefix: &str) -> Vec<String> {
+    pub(crate) async fn keys_under(&self, bucket: &str, prefix: &str) -> Vec<String> {
         let (status, body) = self
             .s3("GET", &format!("/{bucket}?list-type=2&prefix={prefix}"), &[])
             .await;
@@ -246,7 +246,7 @@ impl Emulator {
     }
 
     /// `AWSGlue.CreateDatabase` for the one database every input table lives in.
-    async fn given_database(&self) {
+    pub(crate) async fn given_database(&self) {
         let (status, body) = self
             .glue("CreateDatabase", &json!({"DatabaseInput": {"Name": DATABASE}}))
             .await;
@@ -259,7 +259,7 @@ impl Emulator {
     /// `AWSGlue.CreateTable` for one input table: where its objects live, which columns
     /// it declares (none, for a table whose header names them) and whether its SerDe
     /// declares a header to skip.
-    async fn given_table(
+    pub(crate) async fn given_table(
         &self,
         name: &str,
         location: &str,
@@ -301,7 +301,7 @@ impl Emulator {
     }
 
     /// `POST /schemas` — `CreateSchemaMapping`.
-    async fn given_schema_mapping(&self, name: &str, fields: &Value) {
+    pub(crate) async fn given_schema_mapping(&self, name: &str, fields: &Value) {
         let reply = self
             .call(
                 "POST",
@@ -316,13 +316,13 @@ impl Emulator {
     }
 
     /// `POST /matchingworkflows` — `CreateMatchingWorkflow`.
-    async fn create_workflow(&self, request: &Value) -> Reply {
+    pub(crate) async fn create_workflow(&self, request: &Value) -> Reply {
         self.call("POST", "/matchingworkflows", Some(request)).await
     }
 
     /// `POST /matchingworkflows/{workflowName}/jobs` — `StartMatchingJob`. The operation
     /// models no body members at all, so the request carries no payload.
-    async fn start_job(&self, workflow_name: &str) -> Reply {
+    pub(crate) async fn start_job(&self, workflow_name: &str) -> Reply {
         self.call(
             "POST",
             &format!("/matchingworkflows/{workflow_name}/jobs"),
@@ -332,7 +332,7 @@ impl Emulator {
     }
 
     /// `GET /matchingworkflows/{workflowName}/jobs/{jobId}` — `GetMatchingJob`.
-    async fn get_job(&self, workflow_name: &str, job_id: &str) -> Reply {
+    pub(crate) async fn get_job(&self, workflow_name: &str, job_id: &str) -> Reply {
         self.call(
             "GET",
             &format!("/matchingworkflows/{workflow_name}/jobs/{job_id}"),
@@ -343,7 +343,7 @@ impl Emulator {
 
     /// `POST /matchingworkflows/{workflowName}/matches` — `GetMatchId`, the reader of
     /// the records a rule-based workflow has processed.
-    async fn get_match_id(&self, workflow_name: &str, record: Value) -> Reply {
+    pub(crate) async fn get_match_id(&self, workflow_name: &str, record: Value) -> Reply {
         self.call(
             "POST",
             &format!("/matchingworkflows/{workflow_name}/matches"),
@@ -354,7 +354,7 @@ impl Emulator {
 
     /// Poll `GetMatchingJob` until the job reports a terminal `JobStatus`, and answer
     /// that reply.
-    async fn settle(&self, case: &str, workflow_name: &str, job_id: &str) -> Reply {
+    pub(crate) async fn settle(&self, case: &str, workflow_name: &str, job_id: &str) -> Reply {
         let started = Instant::now();
         loop {
             let reply = self.get_job(workflow_name, job_id).await;
@@ -377,7 +377,7 @@ impl Emulator {
 }
 
 /// A rule-based `resolutionTechniques` carrying `rules`.
-fn rule_based(rules: Value) -> Value {
+pub(crate) fn rule_based(rules: Value) -> Value {
     json!({
         "resolutionType": "RULE_MATCHING",
         "ruleBasedProperties": {
@@ -388,7 +388,7 @@ fn rule_based(rules: Value) -> Value {
 }
 
 /// A `CreateMatchingWorkflow` request over one input table and one output path.
-fn workflow_request(
+pub(crate) fn workflow_request(
     name: &str,
     schema_name: &str,
     table: &str,
@@ -452,7 +452,7 @@ struct Case {
 
 /// The schema mapping most cases use: `id` as the unique id, `email` and `phone` each
 /// their own matching key.
-fn id_email_phone_fields() -> Value {
+pub(crate) fn id_email_phone_fields() -> Value {
     json!([
         { "fieldName": "id", "type": "UNIQUE_ID" },
         { "fieldName": "email", "type": "EMAIL_ADDRESS", "matchKey": "email" },
@@ -461,7 +461,7 @@ fn id_email_phone_fields() -> Value {
 }
 
 /// The output attributes most cases use: the record's own `id` and `email`, unhashed.
-fn id_email_output() -> Value {
+pub(crate) fn id_email_output() -> Value {
     json!([{ "name": "id" }, { "name": "email" }])
 }
 
@@ -724,13 +724,13 @@ fn matching_cases() -> Vec<Case> {
 
 /// The output table one run wrote, as `id -> (column -> value)` plus the header, read
 /// back out of Amazon S3 through the `csv` crate.
-struct OutputTable {
-    header: Vec<String>,
-    rows: Vec<BTreeMap<String, String>>,
+pub(crate) struct OutputTable {
+    pub(crate) header: Vec<String>,
+    pub(crate) rows: Vec<BTreeMap<String, String>>,
 }
 
 impl OutputTable {
-    fn parse(case: &str, document: &str) -> Self {
+    pub(crate) fn parse(case: &str, document: &str) -> Self {
         let mut reader = ::csv::Reader::from_reader(document.as_bytes());
         let header: Vec<String> = reader
             .headers()
@@ -757,7 +757,7 @@ impl OutputTable {
     }
 
     /// The row whose `id` column is `id`.
-    fn row(&self, id: &str) -> Option<&BTreeMap<String, String>> {
+    pub(crate) fn row(&self, id: &str) -> Option<&BTreeMap<String, String>> {
         self.rows
             .iter()
             .find(|row| row.get("id").map(String::as_str) == Some(id))

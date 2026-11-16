@@ -1693,21 +1693,44 @@ pub(crate) fn matching_key_value(
     present.then(|| parts.join(MATCHING_KEY_FIELD_SEPARATOR))
 }
 
-/// A newly minted `matchId`.
+/// A newly minted `matchId`: 32 lowercase hex characters, the same hyphen-free form
+/// [`new_job_id`] mints, which is the form this service serves an opaque generated
+/// identifier in.
 ///
-/// The value is opaque to a client — `MatchGroup$matchId` is a plain `String` with no
-/// modelled form — and it is minted ONCE per group and stored, so every later read of
-/// that group answers the same id and two groups never share one.
+/// `MatchGroup$matchId` carries no modelled length or pattern
+/// (`smithy_query(query="shape",shape="MatchGroup")`), so the FORM here is the one the
+/// service is observed to serve rather than one the model fixes; the sibling `JobId`
+/// this crate mints beside it does fix it (`^[a-f0-9]{32}$`), and the two identifiers
+/// agree. The value is opaque to a client, and it is minted ONCE per group and stored,
+/// so every later read of that group answers the same id and two groups never share
+/// one.
 ///
-/// The entropy is a random v4 UUID's, reached through `emulator_telemetry`'s
-/// `BatchId::random()` constructor (`uuid::Uuid::new_v4().as_hyphenated()` verbatim,
-/// `vendor/emulator-telemetry/src/types.rs`) — the same in-crate generator
-/// [`new_job_id`] and [`new_policy_token`] borrow, because `emulator-telemetry` is
-/// already one of this crate's dependencies, so nothing new enters the workspace
-/// lockfile. Only the generator is borrowed; the newtype's telemetry meaning is
-/// dropped here.
+/// The entropy is [`new_hex_id`]'s.
 pub fn new_match_id() -> String {
-    ::emulator_telemetry::BatchId::random().as_str().to_string()
+    new_hex_id()
+}
+
+/// A freshly minted opaque identifier: exactly 32 lowercase hexadecimal characters and
+/// nothing else.
+///
+/// The entropy is a random v4 UUID's — the `uuid` crate's generator, reached through
+/// `emulator_telemetry`'s `BatchId::random()` constructor
+/// (`uuid::Uuid::new_v4().as_hyphenated()` verbatim, `vendor/emulator-telemetry/src/types.rs`)
+/// because `emulator-telemetry` is already one of this crate's dependencies, so nothing
+/// new enters the workspace lockfile for it. A hyphenated UUID is exactly 32 lowercase
+/// hex digits plus four hyphens, so dropping the hyphens yields that form; only the
+/// generator is borrowed, and the newtype's telemetry meaning is dropped here.
+///
+/// Every generated id this service serves in that form is minted HERE
+/// ([`new_job_id`], [`new_match_id`]), so two of them cannot drift apart. An identifier
+/// whose modelled form is a different one keeps it — [`new_policy_token`]'s
+/// `PolicyToken` is a hyphenated 36-character UUID by its own pattern.
+pub fn new_hex_id() -> String {
+    ::emulator_telemetry::BatchId::random()
+        .as_str()
+        .chars()
+        .filter(|ch| *ch != '-')
+        .collect()
 }
 
 /// The resource-type segment every `IdNamespaceArn` carries
@@ -1807,11 +1830,12 @@ pub const MAX_RESOURCE_POLICIES: usize =
 /// `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`,
 /// `smithy_query(query="shape",shape="PolicyToken")`).
 ///
-/// The entropy is the same audited generator [`new_job_id`] borrows —
+/// The entropy is the same audited generator [`new_hex_id`] borrows —
 /// `emulator_telemetry`'s `BatchId::random()`, `uuid::Uuid::new_v4().as_hyphenated()`
 /// verbatim — so nothing new enters the workspace lockfile for it, and only the
-/// generator is borrowed: the newtype's telemetry meaning is dropped here. A revision
-/// token is an identifier, never a credential.
+/// generator is borrowed: the newtype's telemetry meaning is dropped here. The hyphens
+/// are KEPT here, unlike [`new_hex_id`], because this shape's own pattern requires
+/// them. A revision token is an identifier, never a credential.
 pub fn new_policy_token() -> String {
     ::emulator_telemetry::BatchId::random().as_str().to_string()
 }
@@ -2693,20 +2717,9 @@ pub fn now_millis() -> i64 {
 /// A freshly minted `jobId`: 32 lowercase hex characters, as the modelled `JobId`
 /// (`^[a-f0-9]{32}$`, `smithy_query(query="shape",shape="JobId")`) requires.
 ///
-/// The entropy is a random v4 UUID's — the `uuid` crate's generator, reached through
-/// `emulator_telemetry`'s `BatchId::random()` constructor
-/// (`uuid::Uuid::new_v4().as_hyphenated()` verbatim, `vendor/emulator-telemetry/src/types.rs`)
-/// because `emulator-telemetry` is already one of this crate's dependencies, so
-/// nothing new enters the workspace lockfile for it. A hyphenated UUID is exactly 32
-/// lowercase hex digits plus four hyphens, so dropping the hyphens yields the modelled
-/// pattern; only the generator is borrowed, and the newtype's telemetry meaning is
-/// dropped here.
+/// The entropy and the form are [`new_hex_id`]'s.
 pub fn new_job_id() -> String {
-    ::emulator_telemetry::BatchId::random()
-        .as_str()
-        .chars()
-        .filter(|ch| *ch != '-')
-        .collect()
+    new_hex_id()
 }
 
 /// The page size to serve for a `@paginated` operation whose `maxResults` member is
