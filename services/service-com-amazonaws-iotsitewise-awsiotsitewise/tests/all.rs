@@ -12,19 +12,12 @@
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
 //
-// `query_results` is declared HERE, between that note and the first suite below,
-// rather than in the sorted list or at the END of the file: those are the two
-// stretches every concurrent iotsitewise change puts a declaration of its own in,
-// and each attempt to land this one in either collided with a branch that had just
-// inserted beside it. Fold it into the list once the churn settles.
-// `task_delete` is declared HERE, at the head of the file, rather than in the
-// sorted list or at the END: those are the two stretches every concurrent
-// iotsitewise change puts a declaration of its own in. Fold it into the list once
-// the churn settles.
-// `describe_dataset_reads` is declared HERE, at the head of the file, rather than
-// in the sorted list or at the END: those are the two stretches every concurrent
-// iotsitewise change puts a declaration of its own in. Fold it into the list once
-// the churn settles.
+// `query_results`, `task_delete` and `describe_dataset_reads` are declared out
+// of the sorted list below, each beside the suites it is read with, rather than
+// in that list or at the END of the file: those are the two stretches every
+// concurrent iotsitewise change puts a declaration of its own in, and each
+// attempt to land one of these three in either collided with a branch that had
+// just inserted beside it. Fold them into the list once the churn settles.
 // `asset_model_definition_validation` is declared HERE, beside the suites below,
 // for the reason the notes above give: the sorted list and the END of this file
 // are both stretches every concurrent iotsitewise change puts a declaration of
