@@ -209,7 +209,7 @@ async fn given_rule(
 
 /// `aged_seconds` before now, as an entry's `Time` carries it (epoch seconds,
 /// which `awsJson` takes a timestamp as).
-fn published_at(aged_seconds: u64) -> f64 {
+pub fn published_at(aged_seconds: u64) -> f64 {
     let now = ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .expect("the clock is after the epoch")

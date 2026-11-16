@@ -50,7 +50,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-west-2";
 
 /// The `detail-type` every event this suite publishes carries.
-const DETAIL_TYPE: &str = "Hook Fired";
+pub const DETAIL_TYPE: &str = "Hook Fired";
 
 /// The module and attribute the deployment package carries its handler as.
 const HANDLER: &str = "lambda_function.lambda_handler";
@@ -62,7 +62,7 @@ const BASIC_PASSWORD: &str = "hook-password";
 
 /// The method every destination here is invoked with — not the default, so a request made
 /// with some other method fails the row.
-const HTTP_METHOD: &str = "PUT";
+pub const HTTP_METHOD: &str = "PUT";
 
 /// How many retries the target of every row allows, which is what the retried rows have to
 /// report as `RETRY_ATTEMPTS`.
@@ -82,12 +82,12 @@ const LOOK_INTERVAL: Duration = Duration::from_millis(100);
 /// EventBridge, Lambda and Amazon SQS over ONE shared engine, as `core/router/src/lib.rs`
 /// mounts them: the api-destination invocation is dispatched back into this same router, so
 /// the function URL the destination names is served by the function this suite created.
-struct Emulator {
+pub struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -144,7 +144,7 @@ async fn rpc(
 }
 
 /// An EventBridge call (`awsJson1_1`, `AWSEvents.<Operation>`) that must answer 200.
-async fn events(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
+pub async fn events(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
     let (status, parsed) = rpc(emulator, "events", "AWSEvents", "1.1", operation, body).await;
     assert_eq!(
         status, 200,
@@ -190,7 +190,7 @@ async fn lambda(emulator: &Emulator, method: &str, uri: &str, body: Value) -> (u
 }
 
 /// A required string member of a body.
-fn member(case: &str, body: &Value, name: &str) -> String {
+pub fn member(case: &str, body: &Value, name: &str) -> String {
     body[name]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a {name}, got {body}"))
@@ -246,7 +246,7 @@ fn package() -> String {
 /// Create the echo function, wait out the span it is `Pending` for, publish a function URL
 /// over it and grant the anonymous caller the invocation; answers the URL with no trailing
 /// separator, so a row appends its own path.
-async fn given_echo_endpoint(emulator: &Emulator) -> String {
+pub async fn given_echo_endpoint(emulator: &Emulator) -> String {
     let case = "the echo endpoint";
     let name = "api-destination-echo";
     let (status, created) = lambda(
@@ -331,7 +331,7 @@ async fn given_echo_endpoint(emulator: &Emulator) -> String {
 
 /// A `BASIC` connection, waited until it reports `AUTHORIZED` — which is what makes a
 /// destination invoking through it `ACTIVE`; answers its ARN.
-async fn given_basic_connection(emulator: &Emulator) -> String {
+pub async fn given_basic_connection(emulator: &Emulator) -> String {
     let case = "the basic connection";
     let name = "api-destination-basic";
     let created = events(
@@ -378,7 +378,11 @@ async fn given_basic_connection(emulator: &Emulator) -> String {
 
 /// The queue one row's target dead-letters to, carrying the policy this service's own send
 /// needs; answers its URL and its ARN.
-async fn given_dead_letter_queue(emulator: &Emulator, case: &str, name: &str) -> (String, String) {
+pub async fn given_dead_letter_queue(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let created = sqs(emulator, case, "CreateQueue", &json!({ "QueueName": name })).await;
     let url = member(case, &created, "QueueUrl");
     let attributes = sqs(
@@ -412,7 +416,7 @@ async fn given_dead_letter_queue(emulator: &Emulator, case: &str, name: &str) ->
 }
 
 /// Every message waiting on the queue at `url`, with its attributes, taken off it.
-async fn drain(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
+pub async fn drain(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
     let answered = sqs(
         emulator,
         case,
@@ -428,7 +432,7 @@ async fn drain(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
 }
 
 /// Wait until something is on the queue at `url`, and answer what was taken off it.
-async fn until_dead_lettered(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
+pub async fn until_dead_lettered(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
     let deadline = Instant::now() + WORK_WAIT;
     while Instant::now() < deadline {
         let held = drain(emulator, case, url).await;
@@ -442,7 +446,7 @@ async fn until_dead_lettered(emulator: &Emulator, case: &str, url: &str) -> Vec<
 
 /// The value of one dead-letter attribute of `message`, or `None` when the message does not
 /// carry it.
-fn attribute(message: &Value, name: &str) -> Option<String> {
+pub fn attribute(message: &Value, name: &str) -> Option<String> {
     message["MessageAttributes"][name]["StringValue"]
         .as_str()
         .map(str::to_string)
