@@ -1,15 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssignPrivateIpAddresses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssignPrivateIpAddresses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes secondary private IPv4 addresses out of the IPv4 CIDR block of the
+//! subnet the named network interface sits in — the ones the request names, or as many as
+//! it asks the service to choose — and records them on that interface, so a later
+//! `DescribeNetworkInterfaces` reports them beside the addresses it already held.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssignPrivateIpAddresses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! The addresses an interface holds live on the interface record itself
+//! (`NetworkInterface$PrivateIpAddresses`), and every subnet address of the account comes
+//! out of one pool ([`crate::state::ComAmazonawsEc2Amazonec2State::reserve_private_ip`] /
+//! `mint_private_ip_in_cidr`), so what a caller may name and what the service may choose
+//! are judged against the same records: no two resources of a subnet can be handed the same
+//! address.
+//!
+//! What it refuses, and why:
+//!
+//! * `InvalidNetworkInterfaceId.Malformed` (400) — the value is not a network interface id
+//!   at all, so there is nothing to look up
+//!   ([`crate::state::network_interface_id_is_well_formed`]).
+//! * `InvalidNetworkInterfaceID.NotFound` (400) — a well-formed id the account holds no
+//!   interface for.
+//! * `InvalidParameterCombination` (400) — the addresses AND a count of them: "You can't
+//!   specify this parameter when also specifying a number of secondary IP addresses"
+//!   (below); or an `efa-only` interface, which carries no IP addresses at all.
+//! * `MissingParameter` (400) — neither the addresses nor a count of them: "You must
+//!   specify either the IP addresses or the IP address count in the request" (below), so the
+//!   request asks for nothing.
+//! * `InvalidParameterValue` (400) — a negative count, a value that is not an IPv4 address,
+//!   or one outside the subnet's assignable range.
+//! * `InvalidIPAddress.InUse` (400) — an address something in the account already holds,
+//!   which only `AllowReassignment` admits, and only for a SECONDARY address of another
+//!   interface: the primary address of an interface is not one that can be moved away.
+//! * `PrivateIpAddressLimitExceeded` (400) — the assignment would leave the interface
+//!   holding more private IPv4 addresses than one may hold.
+//! * `InsufficientFreeAddressesInSubnet` (400) — the subnet has fewer free addresses than
+//!   the request asked the service to choose.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +189,275 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssignPrivateIpAddresses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssignPrivateIpAddressesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssignPrivateIpAddresses"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        let network_interface_id = input.network_interface_id.as_str();
+
+        // A value that is not a network interface id at all is refused BEFORE the store is
+        // asked about it, the way the service orders the two: there is nothing to look up.
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+
+        // "You can optionally use Prefix Delegation on the network interface" (above). A
+        // delegated prefix is a RANGE of the subnet taken out of its addresses, which this
+        // slice does not hold for IPv4 — `CreateNetworkInterface` refuses the same members
+        // for the same reason — so a request that asks for one is refused as unwritten
+        // rather than answered with an interface that silently lacks it.
+        if input
+            .ipv4_prefixes
+            .as_ref()
+            .is_some_and(|prefixes| !prefixes.is_empty())
+            || input.ipv4_prefix_count.is_some_and(|count| count > 0)
+        {
+            return Err(Scaffolded::not_implemented(
+                "AssignPrivateIpAddresses with IPv4 Prefix Delegation prefixes",
+            ));
+        }
+
+        // "You must specify either the IP addresses or the IP address count in the request"
+        // (above): the ask is either NAMED or COUNTED — "You can't specify this parameter
+        // when also specifying a number of secondary IP addresses"
+        // (`PrivateIpAddresses`) — and a request that does neither asks for nothing.
+        let named: Vec<&str> = input
+            .private_ip_addresses
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let secondary_count = input.secondary_private_ip_address_count.unwrap_or_default();
+        if !named.is_empty() && secondary_count > 0 {
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify both privateIpAddresses and \
+                 secondaryPrivateIpAddressCount",
+            ));
+        }
+        // The model declares no `@range` on the count, so a negative one reaches here; a
+        // number of addresses to assign cannot be below zero.
+        if secondary_count < 0 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{secondary_count}' for secondaryPrivateIpAddressCount. \
+                 It cannot be negative"
+            )));
+        }
+        if named.is_empty() && secondary_count == 0 {
+            return Err(state::missing_parameter(
+                "Either 'privateIpAddresses' or 'secondaryPrivateIpAddressCount' must be \
+                 specified",
+            ));
+        }
+        // "Indicates whether to allow an IP address that is already assigned to another
+        // network interface or instance to be reassigned to the specified network interface"
+        // (`AllowReassignment`).
+        let allow_reassignment = input.allow_reassignment.unwrap_or(false);
+
+        // `PrivateIpAddressStringList` carries no `@length`, so the list a caller may send
+        // is unbounded; the per-interface ceiling is asked of it HERE, before any work
+        // proportional to its size — parsing an address, scanning the account's interfaces
+        // for who holds it — is done. The same ceiling is asked again below of what the
+        // interface would then HOLD, which is the question the limit is about.
+        let wanted_count = usize::try_from(secondary_count).unwrap_or_default();
+        if named.len() > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE
+            || wanted_count > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE
+        {
+            return Err(state::private_ip_address_limit_exceeded());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        // The Region the request was signed for, which is what the private DNS name of each
+        // assigned address is built from — the same reading `CreateNetworkInterface` takes.
+        let region = state::request_region(ctx.parts());
+        let mut store = state_handle.lock();
+        // The clock-owed transitions every path that reads an interface and its subnet
+        // applies, whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The ID of the network interface" (`NetworkInterfaceId`): an id the account holds
+        // no interface for is a refusal — there is nothing to assign to.
+        let Some(interface) = store.network_interfaces.get(network_interface_id) else {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        };
+        let subnet_id = interface.subnet_id.clone().unwrap_or_default();
+        let interface_type = interface.interface_type.clone().unwrap_or_default();
+        let held_here = interface.private_ip_addresses.iter().flatten().count();
+
+        // "If you specify efa-only, do not assign any IP addresses to the network interface"
+        // (`InterfaceType`) — refused through the crate's ONE wording site for that rule, the
+        // same one a create that names addresses on such an interface is refused by.
+        if interface_type == state::NETWORK_INTERFACE_TYPE_EFA_ONLY {
+            return Err(state::efa_only_interface_has_no_ip_addresses());
+        }
+
+        // "If you don't specify an IP address, Amazon EC2 automatically selects an IP
+        // address within the subnet range" (`PrivateIpAddresses`): the subnet's own IPv4
+        // CIDR block is the range every address this call assigns comes out of, and every
+        // interface sits in a subnet that has one — so a missing block is this store having
+        // lost the subnet an interface it holds names.
+        let Some(cidr_block) = store
+            .subnets
+            .get(&subnet_id)
+            .and_then(|subnet| subnet.cidr_block.clone())
+        else {
+            return Err(state::internal_error(
+                "the subnet the network interface sits in could not be read",
+            ));
+        };
+
+        // What this call will do, resolved BEFORE anything is written, so every refusal
+        // below leaves the interface, the pool and the subnet's count exactly as they were:
+        // the addresses to record (`to_record`), the secondary addresses to take off the
+        // interfaces that hold them (`to_move`), and what the answer reports in the order
+        // the request named them (`reported`).
+        let mut to_record: Vec<String> = Vec::new();
+        let mut to_move: Vec<(String, String)> = Vec::new();
+        let mut reported: Vec<String> = Vec::new();
+        for address in &named {
+            let Ok(parsed) = address.parse::<::std::net::Ipv4Addr>() else {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({address}) for parameter privateIpAddresses is invalid. \
+                     This is not a valid IPv4 address."
+                )));
+            };
+            let canonical = parsed.to_string();
+            // An address has to be one of the subnet's assignable addresses: outside its
+            // CIDR block, or one of the five AWS reserves in it, there is nothing to assign.
+            // The same question a service-chosen address is drawn by
+            // ([`crate::state::is_assignable_subnet_address`]), so the two cannot disagree.
+            if !state::is_assignable_subnet_address(&cidr_block, &canonical) {
+                return Err(state::address_outside_subnet_range());
+            }
+            // An address named twice in one request is in use the second time, the way one
+            // another resource holds is: nothing has been written yet, so the request's own
+            // plan is what answers for it.
+            if reported.contains(&canonical) {
+                return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
+            }
+            match store.interface_holding_private_ip(&canonical) {
+                // Already on the interface the request names, which is what the request
+                // asks for: an assignment is IDEMPOTENT in the address it assigns, so the
+                // address is reported as assigned and nothing is recorded twice. That is
+                // not the case `AllowReassignment` governs either — it is about "an IP
+                // address that is already assigned to ANOTHER network interface or
+                // instance" (`AllowReassignment`) — so it is not asked here.
+                Some((holder, _)) if holder == network_interface_id => {}
+                // Held by another interface. "An IP address that is already assigned to
+                // another network interface or instance [may] be reassigned to the specified
+                // network interface" (`AllowReassignment`) — but only a SECONDARY address
+                // moves: an interface cannot be left without the primary address it was
+                // created with, so that one stays in use.
+                Some((holder, primary)) => {
+                    if !allow_reassignment || primary {
+                        return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
+                    }
+                    to_move.push((holder, canonical.clone()));
+                    to_record.push(canonical.clone());
+                }
+                // Held by no interface — which still leaves everything else of the account
+                // that holds a subnet address, the one question
+                // [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_address_in_use`]
+                // answers for every resource at once.
+                None => {
+                    if store.subnet_address_in_use(&canonical) {
+                        return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
+                    }
+                    to_record.push(canonical.clone());
+                }
+            }
+            reported.push(canonical);
+        }
+
+        // "The number of secondary IP addresses that you can assign to an instance varies by
+        // instance type" (`SecondaryPrivateIpAddressCount`), held here at the one
+        // per-interface ceiling this crate publishes — asked of what the interface would
+        // HOLD after the call, so the addresses it already has count towards it.
+        let holds_after = held_here
+            .saturating_add(to_record.len())
+            .saturating_add(wanted_count);
+        if holds_after > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE {
+            return Err(state::private_ip_address_limit_exceeded());
+        }
+
+        // The addresses the request did not name, EC2 selects: "If you don't specify an IP
+        // address, Amazon EC2 automatically selects an IP address within the subnet range"
+        // (`PrivateIpAddresses`). Each one is the store's own choice-and-take, so a chosen
+        // address can collide neither with one this request already took nor with one
+        // another resource holds — and a refusal below hands back what it took.
+        let mut minted: Vec<String> = Vec::new();
+        while minted.len() < wanted_count {
+            let Some(free) = store.mint_private_ip_in_cidr(&cidr_block) else {
+                // "The subnet does not have enough free private IPv4 addresses to satisfy
+                // the request" — EC2's `InsufficientFreeAddressesInSubnet`.
+                store.release_private_ips(&minted);
+                return Err(Scaffolded::insufficient_free_addresses());
+            };
+            minted.push(free);
+        }
+        to_record.extend(minted.iter().cloned());
+
+        // The caller-chosen bytes this call adds to the record, counted the way
+        // [`crate::state::network_interface_spec_bytes`] counts the addresses of a create,
+        // so the store's budget is asked for exactly what the write will charge.
+        let payload_bytes: usize = to_record.iter().map(String::len).sum();
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            store.release_private_ips(&minted);
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The writes, under the one lock this handler holds: the addresses a reassignment
+        // moves come off the interfaces that hold them FIRST, so an address is never
+        // recorded on two interfaces at once. Each of those interfaces was read a moment ago
+        // under this same lock, so a `false` on either write is the store losing a record
+        // between two reads of one lock — and even then every address this call had already
+        // taken goes back, to the donor that held it or to the pool, so a call that does not
+        // answer success leaves the account exactly as it found it.
+        let mut moved: Vec<(String, String)> = Vec::new();
+        for (holder, address) in &to_move {
+            if store.release_secondary_private_ip(holder, address) {
+                moved.push((holder.clone(), address.clone()));
+                continue;
+            }
+            store.restore_secondary_private_ips(&moved, &region);
+            store.release_private_ips(&minted);
+            return Err(state::internal_error(
+                "a network interface checked a moment ago no longer holds the address \
+                 the request reassigns",
+            ));
+        }
+        if !store.assign_secondary_private_ips(network_interface_id, &to_record, &region) {
+            store.restore_secondary_private_ips(&moved, &region);
+            store.release_private_ips(&minted);
+            return Err(state::internal_error(
+                "the network interface checked a moment ago could not be read back",
+            ));
+        }
+
+        // "The private IP addresses assigned to the network interface"
+        // (`AssignedPrivateIpAddresses`) — what THIS call assigned: the addresses it named,
+        // in the order it named them, or the ones the service chose for it. One of the two
+        // lists is empty by the combination rule above.
+        let assigned: Vec<AssignedPrivateIpAddress> = reported
+            .into_iter()
+            .chain(minted)
+            .map(|address| AssignedPrivateIpAddress {
+                private_ip_address: Some(address),
+            })
+            .collect();
+        Ok(AssignPrivateIpAddressesOutput {
+            network_interface_id: Some(network_interface_id.to_string()),
+            assigned_private_ip_addresses: (!assigned.is_empty()).then_some(assigned),
+            // Reported only by a request that asked for prefixes, which this operation
+            // refuses above as unwritten.
+            assigned_ipv4_prefixes: None,
+        })
     }
 }

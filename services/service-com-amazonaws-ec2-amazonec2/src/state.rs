@@ -2256,6 +2256,13 @@ pub use launched_interfaces::*;
 mod interface_private_ips;
 pub use interface_private_ips::*;
 
+/// The SECONDARY private IPv4 addresses an interface that ALREADY EXISTS holds — who holds
+/// an address, and the two writers that record one on an interface and take it off again —
+/// in a module of its own beside the addresses a create asks for. Everything it declares is
+/// re-exported below.
+mod secondary_private_ips;
+pub use secondary_private_ips::*;
+
 /// The FIXED detail every instance reports — the machine facts of its AMI, the CPU layout of
 /// its instance type, the volumes it holds, where it runs and the option sets its launch
 /// chose — in a module of its own, re-exported so a handler reaches its words as

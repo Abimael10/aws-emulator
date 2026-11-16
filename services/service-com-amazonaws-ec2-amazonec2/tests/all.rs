@@ -27,6 +27,15 @@ mod image_deprecation;
 // tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/aws_managed_prefix_list_name_scopes.rs"]
 mod aws_managed_prefix_list_name_scopes;
+// What an assignment of SECONDARY private IPv4 addresses records on a network interface: the
+// addresses a request names or the number it asks for, taken out of its subnet's block, read
+// back through `DescribeNetworkInterfaces` beside the primary address it already held, and off
+// the subnet's available count — with the refusal table that says why anything else is not
+// assigned. Declared beside `aws_managed_prefix_list_name_scopes` for the reason the note above
+// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
+// inserts its lines.
+#[path = "all/assign_private_ip_addresses.rs"]
+mod assign_private_ip_addresses;
 // Reading the whole Amazon-published AMI catalog with no name pattern: the two documented ways
 // of naming the `amazon` owner — in `Owners` and by the `owner-alias` filter — report the same
 // set, which is the catalog's own current builds, and a pattern no published family carries

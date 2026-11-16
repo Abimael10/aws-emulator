@@ -72,6 +72,7 @@ const NOT_IMPLEMENTED_STATUS: u16 = 501;
 /// `not_implemented` belongs here, which is what
 /// `tests/all/dry_run_verdict_and_ordering.rs` asserts.
 pub const OPERATIONS_WHOSE_HANDLER_ANSWERS_NOT_IMPLEMENTED: &[&str] = &[
+    "AssignPrivateIpAddresses",
     "AssociateRouteTable",
     "AssociateSubnetCidrBlock",
     "AssociateVpcCidrBlock",

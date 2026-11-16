@@ -36,6 +36,18 @@ pub struct RequestedPrivateIps {
     pub wanted: usize,
 }
 
+/// Refuse a request that asks for IP addresses on an interface type that carries none:
+/// HTTP 400 `InvalidParameterCombination`.
+///
+/// "If you specify efa-only, do not assign any IP addresses to the network interface.
+/// EFA-only network interfaces do not support IP addresses" (`InterfaceType`) — the ONE
+/// wording site for that rule, read both by the create path below and by an assignment to an
+/// interface that already exists, so the two cannot refuse the same interface with two
+/// sentences.
+pub fn efa_only_interface_has_no_ip_addresses<E>() -> Scaffolded<E> {
+    invalid_parameter_combination("An efa-only network interface does not support IP addresses")
+}
+
 /// Read the private IPv4 address members of ONE interface specification.
 ///
 /// `private_ip_address` is the specification's `PrivateIpAddress`, `specified` its
@@ -82,9 +94,7 @@ pub fn requested_private_ips<E>(
     if efa_only
         && (private_ip_address.is_some() || !specified.is_empty() || secondary_address_count > 0)
     {
-        return Err(invalid_parameter_combination(
-            "An efa-only network interface does not support IP addresses",
-        ));
+        return Err(efa_only_interface_has_no_ip_addresses());
     }
     if secondary_address_count > 0 && specified.len() > 1 {
         return Err(invalid_parameter_combination(
