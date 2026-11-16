@@ -72,7 +72,8 @@
 //! more of that load balancer's own attributes decide the request before any target does:
 //! [`request_framing`] is the framing a load balancer refuses itself rather than passing on,
 //! and [`forwarded_for`] is what it does to the request's `X-Forwarded-For` before a target
-//! receives it.
+//! receives it. A rule of that listener may AUTHENTICATE the user of the request before the
+//! action it guards is performed at all, which is [`user_authentication`].
 //!
 //! The fourth: this API answers every request it refuses before a handler ran under ONE
 //! error code, which the framework's two pre-dispatch layers do not agree on, so
@@ -113,6 +114,8 @@ pub mod request_head;
 pub mod forwarded_for;
 
 pub mod target_group_selection;
+
+pub mod user_authentication;
 
 pub mod web_acl;
 

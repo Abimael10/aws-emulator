@@ -48,6 +48,24 @@ pub(super) const COOKIE_HEADER: &str = "cookie";
 /// the header a request chooses to send.
 const MAX_COOKIES_READ: usize = 64;
 
+/// Every cookie one request's `Cookie` header carries, as a name and a value with their
+/// surrounding space taken off, and bounded by [`MAX_COOKIES_READ`].
+///
+/// The ONE reading of that header in this crate: the pin a `forward` action's stickiness
+/// minted is found among these ([`pinned_token`]), and so is the session cookie a
+/// user-authentication action's own behaviour is about ([`super::user_authentication`]) — so
+/// neither the reading nor the bound on it can drift between the two.
+pub(super) fn carried_cookies<'c>(
+    cookie_header: Option<&'c str>,
+) -> impl Iterator<Item = (&'c str, &'c str)> + 'c {
+    cookie_header
+        .into_iter()
+        .flat_map(|carried| carried.split(';'))
+        .take(MAX_COOKIES_READ)
+        .filter_map(|cookie| cookie.split_once('='))
+        .map(|(name, value)| (name.trim(), value.trim()))
+}
+
 /// How one performance of a `forward` action distributes the request it was matched for.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Distribution {
@@ -141,12 +159,9 @@ pub(super) fn group_token(target_group_arn: &str) -> String {
 /// The token this request is pinned to, read off the `Cookie` header it carried: the value
 /// of [`STICKINESS_COOKIE`], or `None` for a request carrying no such cookie.
 pub(super) fn pinned_token(cookie_header: Option<&str>) -> Option<&str> {
-    cookie_header?
-        .split(';')
-        .take(MAX_COOKIES_READ)
-        .filter_map(|cookie| cookie.split_once('='))
-        .find(|(name, _)| name.trim() == STICKINESS_COOKIE)
-        .map(|(_, value)| value.trim())
+    carried_cookies(cookie_header)
+        .find(|(name, _)| *name == STICKINESS_COOKIE)
+        .map(|(_, value)| value)
 }
 
 /// The `Set-Cookie` field that pins a client to `target_group_arn`.

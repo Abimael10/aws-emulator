@@ -353,20 +353,24 @@ async fn deployment() -> Deployment {
     fields.push(p("Actions.member.1.TargetGroupArn", &empty));
     add_rule(&router, "forward to an empty group", &listener_arn, 110, &fields).await;
 
-    // An action this emulator cannot perform, in front of one it can: the request it
-    // guards must not be served by falling through to the action behind it.
+    // An action this emulator cannot perform, in front of one it can: a `jwt-validation`
+    // action has to FETCH the key set it judges a token against, which is an outbound
+    // connection this emulator makes none of, so the request it guards must not be served by
+    // falling through to the action behind it. (What a rule's AUTHENTICATION action answers
+    // instead — the 401, the redirect to the provider's authorization endpoint, or the action
+    // behind it — is pinned in `alb_authenticate_users`.)
     let mut fields = path_pattern("/auth");
-    fields.push(p("Actions.member.1.Type", "authenticate-oidc"));
+    fields.push(p("Actions.member.1.Type", "jwt-validation"));
     fields.push(p("Actions.member.1.Order", "1"));
     for (member, value) in [
+        (
+            "JwksEndpoint",
+            "https://idp.example.com/.well-known/jwks.json",
+        ),
         ("Issuer", "https://idp.example.com"),
-        ("AuthorizationEndpoint", "https://idp.example.com/authorize"),
-        ("TokenEndpoint", "https://idp.example.com/token"),
-        ("UserInfoEndpoint", "https://idp.example.com/userinfo"),
-        ("ClientId", "client-id"),
     ] {
         fields.push(p(
-            &format!("Actions.member.1.AuthenticateOidcConfig.{member}"),
+            &format!("Actions.member.1.JwtValidationConfig.{member}"),
             value,
         ));
     }
@@ -380,7 +384,7 @@ async fn deployment() -> Deployment {
         "Actions.member.2.FixedResponseConfig.MessageBody",
         "behind-the-idp",
     ));
-    add_rule(&router, "authenticate-oidc", &listener_arn, 120, &fields).await;
+    add_rule(&router, "jwt-validation", &listener_arn, 120, &fields).await;
 
     // One target in the forwarded group, which a load balancer now forwards to.
     let mut form = action("RegisterTargets");
@@ -486,7 +490,7 @@ async fn a_listener_answers_a_request_from_the_rule_its_conditions_match() {
         answers("a forward to a healthy target", "GET", "/tg", 502, ""),
         answers("a forward to a group with no target", "GET", "/empty", 503, ""),
         // An action this emulator cannot perform is not bypassed.
-        answers("an action needing an identity provider", "GET", "/auth", 500, ""),
+        answers("an action this emulator cannot perform", "GET", "/auth", 500, ""),
     ];
     // The conditions read off a header, the query string and the client address, each
     // with a matching and a non-matching value.

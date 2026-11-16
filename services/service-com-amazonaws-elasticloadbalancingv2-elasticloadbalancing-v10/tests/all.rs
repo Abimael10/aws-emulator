@@ -59,6 +59,8 @@ mod health_check_matcher_codes;
 mod host_count_health_checks;
 #[path = "all/identifier_arn_forms.rs"]
 mod identifier_arn_forms;
+#[path = "all/in_request_duplicate_rule_priorities.rs"]
+mod in_request_duplicate_rule_priorities;
 #[path = "all/input_rejection_classes.rs"]
 mod input_rejection_classes;
 #[path = "all/ip_targets.rs"]
@@ -180,8 +182,8 @@ mod target_security_group_health_check;
 // own internet gateway decides about an internet-facing placement.
 #[path = "all/internet_facing_placement.rs"]
 mod internet_facing_placement;
-// Declared after the sorted list for the same reason the suites above are. What
-// `SetRulePriorities` answers a list that carries one value twice, told apart from what it
-// answers a conflict with what is stored.
-#[path = "all/in_request_duplicate_rule_priorities.rs"]
-mod in_request_duplicate_rule_priorities;
+// Declared after the sorted list for the same reason the three suites above are. What a
+// listener's rule carrying a user-authentication action answers a request whose user is not
+// authenticated.
+#[path = "all/alb_authenticate_users.rs"]
+mod alb_authenticate_users;

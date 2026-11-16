@@ -79,8 +79,13 @@ rand = "0.9"
 # (`src/service/target_group_selection.rs`).
 sha2 = { workspace = true }
 # The rendering of an authenticated page marker's bytes as the opaque string a paginated
-# read hands back in `NextMarker` (`src/state/pagination.rs`).
+# read hands back in `NextMarker` (`src/state/pagination.rs`), and of the opaque state and
+# nonce an unauthenticated request's redirect to an identity provider carries
+# (`src/service/user_authentication.rs`).
 hex = { workspace = true }
+# One query component of the authorization request such a redirect sends a client with, as a
+# URL carries it (`src/service/user_authentication.rs`).
+percent-encoding = "2"
 # The WAFv2 web ACL in front of a load balancer, and the evaluation of it: a web ACL is
 # associated with an Application Load Balancer through `AssociateWebACL`, so the records
 # and the semantics are that service's, and the data plane here asks it for the decision

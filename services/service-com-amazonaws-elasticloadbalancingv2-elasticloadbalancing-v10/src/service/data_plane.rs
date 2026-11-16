@@ -94,14 +94,15 @@
 //! [`NO_HEALTHY_TARGET_STATUS`] when the group has no target to send the request to, and
 //! [`TARGET_UNREACHABLE_STATUS`] when it has one and the connection to it cannot be made.
 //!
-//! An `authenticate-oidc`, `authenticate-cognito` or `jwt-validation` action needs the
-//! identity provider it names, and this emulator makes no outbound connection to one, so
-//! such a rule is answered [`ACTION_NOT_PERFORMED_STATUS`] rather than by letting an
-//! unauthenticated request through to the action behind it. What AWS answers an
-//! unauthenticated client — a 302 to the action's own authorization endpoint — is NOT
-//! rendered: the client would be sent to a provider this emulator cannot reach, and the
-//! session cookie it would come back with is one nothing here can issue, so the redirect
-//! would only move the failure one hop away from its cause.
+//! An `authenticate-oidc` or `authenticate-cognito` action IS performed, ahead of the
+//! action it guards: no request reaching this emulator carries a session an Application
+//! Load Balancer could verify, so each is answered as the unauthenticated request it is —
+//! the 401 of `OnUnauthenticatedRequest=deny`, the redirect to the identity provider's own
+//! authorization endpoint of `authenticate`, and the action behind it for `allow`
+//! ([`super::user_authentication`]). A `jwt-validation` action has to FETCH the key set it
+//! judges a token against, which is an outbound connection this emulator makes none of, so
+//! such a rule is answered [`ACTION_NOT_PERFORMED_STATUS`] rather than by letting the
+//! request through to the action behind it.
 
 use std::time::SystemTime;
 
@@ -204,9 +205,9 @@ pub const NO_HEALTHY_TARGET_STATUS: u16 = 503;
 pub const TARGET_UNREACHABLE_STATUS: u16 = 502;
 
 /// The status an action this emulator cannot perform earns, rather than serving what is
-/// behind it: an `authenticate-oidc`, `authenticate-cognito` or `jwt-validation` action
-/// has to reach the identity provider it names, and this emulator makes no outbound
-/// connection.
+/// behind it: a `jwt-validation` action has to FETCH the key set it judges a token against,
+/// and this emulator makes no outbound connection — as does an authentication action naming
+/// no endpoint a client could be sent to at all ([`super::user_authentication`]).
 pub const ACTION_NOT_PERFORMED_STATUS: u16 = 500;
 
 /// How many times one request may be passed from a load balancer on to a load balancer of
@@ -727,7 +728,7 @@ impl DataPlaneRequest {
     }
 
     /// The first value of `name`, read case-insensitively.
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(held, _)| held == name)
@@ -1542,9 +1543,11 @@ struct PassedOn {
     port: Option<i32>,
 }
 
-/// Perform the matched action list: the terminating action answers the client, and an
-/// action this emulator cannot perform answers [`ACTION_NOT_PERFORMED_STATUS`] rather than
-/// serving what is behind it.
+/// Perform the matched action list, in the order the actions carry: a user-authentication
+/// action in front of the list decides the request first — it answers the client itself
+/// unless its own configuration lets an unauthenticated request through
+/// ([`super::user_authentication`]) — and an action this emulator cannot perform answers
+/// [`ACTION_NOT_PERFORMED_STATUS`] rather than serving what is behind it.
 ///
 /// "The last action to be performed must be one of the following types of actions: a
 /// forward, fixed-response, or redirect" — so the answer is the terminating action with
@@ -1556,16 +1559,31 @@ fn performed(
     request: &DataPlaneRequest,
     now: SystemTime,
 ) -> Performed {
-    if let Some(action) = actions
+    // The actions that GUARD the list, performed before the one they guard — "[t]he action
+    // with the lowest value for order is performed first" (`Action$Order`) — of which a rule
+    // carries at most one ([`crate::state::AUTHENTICATION_ACTION_TYPES`]). What each decides
+    // about a request whose user is not authenticated decides whether the routing action
+    // behind it runs at all ([`super::user_authentication`]).
+    let mut guarding: Vec<&Action> = actions
         .iter()
-        .find(|action| !is_terminating(&action.r#type))
-    {
-        tracing::warn!(
-            action = %action.r#type,
-            "the action needs an identity provider this emulator makes no connection to, \
-             so the request it guards is not served"
-        );
-        return Performed::Answered(Served::status(ACTION_NOT_PERFORMED_STATUS));
+        .filter(|action| !is_terminating(&action.r#type))
+        .collect();
+    guarding.sort_by_key(|action| action.order.unwrap_or_default());
+    for action in guarding {
+        match super::user_authentication::guarded(action, request) {
+            super::user_authentication::Guarded::Allowed => {}
+            super::user_authentication::Guarded::Answered(served) => {
+                return Performed::Answered(acted(served, &action.r#type));
+            }
+            super::user_authentication::Guarded::NotPerformed => {
+                tracing::warn!(
+                    action = %action.r#type,
+                    "the action needs an identity provider this emulator makes no connection \
+                     to, so the request it guards is not served"
+                );
+                return Performed::Answered(Served::status(ACTION_NOT_PERFORMED_STATUS));
+            }
+        }
     }
     let Some(action) = actions
         .iter()

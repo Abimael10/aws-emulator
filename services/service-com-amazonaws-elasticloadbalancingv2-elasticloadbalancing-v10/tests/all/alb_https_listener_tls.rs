@@ -61,7 +61,12 @@ pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A router carrying this service and Certificate Manager over ONE shared engine, exactly
 /// as the assembled router mounts them: the certificate a listener presents is a resource
 /// of that service, imported through its own API.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because the authentication suite beside this one
+/// (`alb_authenticate_users`) drives the same two services over one engine: an
+/// authentication action is an HTTPS listener's, so that suite needs a certificate imported
+/// through Certificate Manager too.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
