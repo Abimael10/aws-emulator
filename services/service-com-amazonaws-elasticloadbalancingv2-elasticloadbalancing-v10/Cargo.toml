@@ -35,6 +35,13 @@ http = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# Parses the HEAD of one HTTP/1.x request off the bytes of a load balancer's own connection —
+# the same head parser `hyper` above is built on. What a load balancer does with an
+# ambiguously framed request is decided by the framing the CLIENT wrote, which the server's own
+# parse has already resolved by the time a handler sees the request
+# (`src/service/request_head.rs`), so the head is read once more on the way past rather than
+# by anything hand-written.
+httparse = "1.10"
 # Runs the SERVER side of the TLS handshake an HTTPS or TLS listener terminates, under the
 # certificate Certificate Manager holds for that listener: the core's own TLS server
 # presents the emulator's certificate and takes no other, so a listener that must present

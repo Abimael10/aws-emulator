@@ -792,7 +792,12 @@ impl Served {
 ///
 /// A load balancer whose own attribute collection has it drop invalid header fields removes
 /// them from the request here, before its listener's rules or its targets see any of it
-/// ([`super::invalid_header_fields`]).
+/// ([`super::invalid_header_fields`]). Two more of its attributes decide the request on the
+/// way through: the FRAMING its `routing.http.desync_mitigation_mode` refuses is answered
+/// `400` by the load balancer itself, with no rule evaluated and no target reached
+/// ([`super::request_framing`]), and what its `routing.http.xff_header_processing.mode` does
+/// to the request's `X-Forwarded-For` is done where the request leaves for a target
+/// ([`super::forwarded_for`]).
 ///
 /// A listener that HANDS THE CONNECTION ON — a `forward` to an `alb` target group — is
 /// served by going round again on the load balancer it was handed to: the same request,
@@ -829,6 +834,12 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // Every load balancer this request has already been served against, so a chain that
     // leads back to one of them is answered rather than walked again.
     let mut walked: Vec<String> = Vec::new();
+    // The address the request came from, which is what an `append` of its `X-Forwarded-For`
+    // adds ([`super::forwarded_for`]): the address a client reaches this emulator from for the
+    // load balancer it addressed, and the forwarding load balancer's own published address for
+    // each later hop of a chain, because that is the address the next load balancer receives
+    // the request from.
+    let mut connecting_address = super::forwarded_for::CONNECTION_ADDRESS.to_string();
     let served = loop {
         // What this service holds about the addressed load balancer and the listener the
         // request reached, under a lock that is RELEASED before anything else is asked.
@@ -836,7 +847,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         // A load balancer the clock still owes its move out of `provisioning` is not serving
         // traffic on the name it published yet. Read, never written: this plane moves no
         // status.
-        let (published_name, drops_invalid_header_fields) = {
+        let (published_name, drops_invalid_header_fields, mitigation, xff_processing) = {
             let store = state.lock();
             let Some(record) = store.load_balancers.get(&load_balancer_arn) else {
                 return rendered(&Served::status(PROVISIONING_STATUS));
@@ -851,6 +862,8 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             (
                 record.dns_name.clone(),
                 super::invalid_header_fields::drops_invalid_header_fields(record),
+                super::request_framing::mitigation(record),
+                super::forwarded_for::processing(record),
             )
         };
         // The host the CLIENT addressed, for a request this plane did not receive from the
@@ -862,6 +875,32 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         // own attribute, because the removal is the load balancer's.
         if drops_invalid_header_fields {
             super::invalid_header_fields::dropped(&mut request.headers);
+        }
+        // How this load balancer FRAMES what it has just read, judged by what its own
+        // `routing.http.desync_mitigation_mode` refuses ([`super::request_framing`]): a
+        // framing the mode refuses is answered by the load balancer here, so no rule of its
+        // listener is evaluated and no target is reached. Each load balancer in a chain reads
+        // its own attribute, because the refusal is the load balancer's.
+        //
+        // A request a load balancer's own socket accepted was framed by the client there and
+        // re-framed by the leg that socket hands this plane, so that address judges the
+        // client's own framing before it forwards ([`super::listener_socket`]); what reaches
+        // this plane carrying a framing header of its own is a request made against this
+        // plane directly.
+        let framing = super::request_framing::framing(
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        if super::request_framing::refuses(mitigation, framing) {
+            tracing::warn!(
+                load_balancer = %load_balancer_arn,
+                ?framing,
+                "the load balancer's desync mitigation mode refuses the framing of this \
+                 request, so it is answered here and reaches no target"
+            );
+            break Served::status(super::request_framing::REFUSED_FRAMING_STATUS);
         }
 
         // The web ACL `AssociateWebACL` bound to this load balancer, which decides the
@@ -914,6 +953,16 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                     );
                     return rendered(&Served::status(super::lambda_target::BAD_GATEWAY_STATUS));
                 };
+                // What this load balancer's own attribute collection has it do to the
+                // request's `X-Forwarded-For` before the target receives it
+                // ([`super::forwarded_for`]). Applied HERE, where the request leaves the load
+                // balancer for a target, so the rules its listener evaluated were matched
+                // against the request as the client sent it.
+                super::forwarded_for::processed(
+                    &mut request.headers,
+                    xff_processing,
+                    &connecting_address,
+                );
                 break super::lambda_target::served(ctx, &forwarded, &request, body).await;
             }
             // The listener handed the connection to a load balancer of its own, which is
@@ -940,6 +989,16 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                 }
                 load_balancer_arn = passed.load_balancer_arn;
                 addressed_port = passed.port;
+                // The request is reaching a TARGET of this load balancer — one that is a load
+                // balancer of its own — so the same processing is applied before it leaves,
+                // and the next hop receives the request from THIS load balancer's own
+                // published address.
+                super::forwarded_for::processed(
+                    &mut request.headers,
+                    xff_processing,
+                    &connecting_address,
+                );
+                connecting_address = host_only(&published_name).to_string();
             }
         }
     };

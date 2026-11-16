@@ -43,18 +43,24 @@ const ATTRIBUTE: &str = "routing.http.drop_invalid_header_fields.enabled";
 /// The function the load balancer forwards to, and the module and attribute its package
 /// carries the handler as.
 const FUNCTION: &str = "alb-header-echo";
-const HANDLER: &str = "lambda_function.lambda_handler";
+pub(crate) const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// The runtime the package is created for.
-const RUNTIME: &str = "python3.12";
+pub(crate) const RUNTIME: &str = "python3.12";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
-const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// The handler every case runs: it answers with the headers of the event it was handed, so
 /// what the TARGET saw is what the suite reads. A header the load balancer removed is absent
 /// from this document, and one it passed on carries the value the client sent.
-const HANDLER_SOURCE: &str = r#"
+///
+/// `pub(crate)` with the three constants above and the three helpers below: the suite that
+/// drives the two attributes deciding a request on its way to the target
+/// (`crate::alb_desync_mitigation_and_forwarded_for`) needs exactly this target — one that
+/// reports the headers it was handed — and a second copy of it would be a second fixture to
+/// keep in step.
+pub(crate) const HANDLER_SOURCE: &str = r#"
 import json
 
 
@@ -133,7 +139,7 @@ fn rows() -> Vec<Row> {
 
 /// A .zip deployment package holding [`HANDLER_SOURCE`] as `lambda_function.py`, written in
 /// memory the way a caller uploads one.
-fn package() -> Vec<u8> {
+pub(crate) fn package() -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -151,7 +157,7 @@ fn package() -> Vec<u8> {
 
 /// This service and Lambda over ONE shared engine, as `core/router/src/lib.rs` mounts them:
 /// the function the load balancer forwards to is run by that Lambda.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -167,7 +173,12 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One Lambda `restJson1` call.
-async fn lambda(router: &MultiServiceRouter, method: &str, path: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn lambda(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (u16, Value) {
     let payload = if body.is_null() {
         Vec::new()
     } else {

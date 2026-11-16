@@ -68,7 +68,11 @@
 //! function, while [`invalid_header_fields`] is the header fields that plane REMOVES from a
 //! request before anything behind the load balancer sees them. A
 //! request that plane serves is decided first by the WAFv2 web ACL `AssociateWebACL` put
-//! in front of the load balancer ([`web_acl`]), which is what refuses it at the edge.
+//! in front of the load balancer ([`web_acl`]), which is what refuses it at the edge. Two
+//! more of that load balancer's own attributes decide the request before any target does:
+//! [`request_framing`] is the framing a load balancer refuses itself rather than passing on,
+//! and [`forwarded_for`] is what it does to the request's `X-Forwarded-For` before a target
+//! receives it.
 //!
 //! The fourth: this API answers every request it refuses before a handler ran under ONE
 //! error code, which the framework's two pre-dispatch layers do not agree on, so
@@ -96,6 +100,12 @@ pub mod access_logs;
 pub mod lambda_target;
 
 pub mod invalid_header_fields;
+
+pub mod request_framing;
+
+pub mod request_head;
+
+pub mod forwarded_for;
 
 pub mod target_group_selection;
 

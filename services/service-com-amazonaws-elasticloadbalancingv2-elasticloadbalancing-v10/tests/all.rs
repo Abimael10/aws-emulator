@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alb_data_plane.rs"]
 mod alb_data_plane;
+#[path = "all/alb_desync_mitigation_and_forwarded_for.rs"]
+mod alb_desync_mitigation_and_forwarded_for;
 #[path = "all/alb_drop_invalid_header_fields.rs"]
 mod alb_drop_invalid_header_fields;
 #[path = "all/alb_https_listener_tls.rs"]

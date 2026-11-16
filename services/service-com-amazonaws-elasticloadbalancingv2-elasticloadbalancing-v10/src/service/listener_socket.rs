@@ -53,8 +53,14 @@
 //!
 //! Nothing about the ANSWER is decided here: the listener's rules, its default actions, the
 //! web ACL in front of the load balancer and the target it forwards to all stay in
-//! [`super::data_plane`], which serves the same request however it was addressed. So a
-//! request this socket accepts is handed to that one plane over the in-process transport
+//! [`super::data_plane`], which serves the same request however it was addressed. The one
+//! thing this address decides is what only it can see: the FRAMING the client wrote the
+//! request with. The leg handed on re-frames the body itself and carries neither framing
+//! header, so the load balancer's own `routing.http.desync_mitigation_mode` is applied here
+//! ([`super::request_framing`]) — a framing it refuses is answered `400` by the load balancer
+//! with nothing forwarded.
+//!
+//! So a request this socket accepts is handed to that one plane over the in-process transport
 //! this emulator reaches itself on, addressed as the RESERVED data-plane path of the load
 //! balancer this socket was opened for, and carrying the PORT of the listener the
 //! connection reached — so the plane evaluates the listener the client actually connected
@@ -187,9 +193,54 @@ impl NativeHandler for ListenerSocket {
 /// speak HTTP on, and the PORT of the listener it reached — which is what decides whose
 /// rules answer the request.
 struct Accepted {
+    /// The load balancer this socket was opened for, which is what the request's own framing
+    /// is judged against ([`Framing`]).
+    load_balancer_arn: String,
     load_balancer_name: String,
     conn: ListenerConn,
     listener_port: Option<i32>,
+    /// The framing of each request on this connection, as the CLIENT wrote it
+    /// ([`crate::service::request_head`]).
+    framings: Arc<crate::service::request_head::Framings>,
+}
+
+/// What one request's FRAMING is judged against: the framings the client wrote on this
+/// connection, the store the control plane writes, and the load balancer whose
+/// `routing.http.desync_mitigation_mode` decides which framings it refuses
+/// ([`crate::service::request_framing`]).
+///
+/// The framing is read off the CONNECTION rather than off the parsed request: the server this
+/// address speaks through normalises a request's framing as it parses it, and the leg this
+/// socket hands the data plane re-frames the body itself and carries neither framing header
+/// ([`HEADERS_NOT_FORWARDED`]), so the client's own framing exists only here.
+struct Framing {
+    state: ::engine::ServiceState<ElbState>,
+    load_balancer_arn: String,
+    framings: Arc<crate::service::request_head::Framings>,
+}
+
+impl Framing {
+    /// Whether the load balancer refuses the next request of this connection rather than
+    /// passing it on: the framing the client wrote it with, judged by the mode the load
+    /// balancer is at.
+    ///
+    /// Read under the store's lock, which is released before the answer is produced. A request
+    /// no framing was read for — one on a connection whose framings can no longer be followed
+    /// — and a load balancer this store no longer holds are each passed on: the request is
+    /// then answered as the plane answers it.
+    fn refuses(&self) -> bool {
+        let Some(framing) = self.framings.next_request() else {
+            return false;
+        };
+        let store = self.state.lock();
+        let Some(record) = store.load_balancers.get(&self.load_balancer_arn) else {
+            return false;
+        };
+        crate::service::request_framing::refuses(
+            crate::service::request_framing::mitigation(record),
+            framing,
+        )
+    }
 }
 
 impl ListenerSocket {
@@ -200,15 +251,27 @@ impl ListenerSocket {
             return;
         };
         let Accepted {
+            load_balancer_arn,
             load_balancer_name,
             conn,
             listener_port,
+            framings,
         } = accepted;
         let io = ::hyper_util::rt::TokioIo::new(conn);
         let callback = self.callback.clone();
+        let state = self.state.clone();
         let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
             let callback = callback.clone();
             let load_balancer_name = load_balancer_name.clone();
+            // What this request was framed with, the store, and the load balancer it reached,
+            // so each request of the connection is judged by the mode that load balancer is
+            // at WHEN it arrives: a client that modifies the attribute between two requests
+            // is answered out of the value it wrote.
+            let framing = Framing {
+                state: state.clone(),
+                load_balancer_arn: load_balancer_arn.clone(),
+                framings: Arc::clone(&framings),
+            };
             async move {
                 // A panic anywhere behind this address — in the dispatch machinery or in
                 // the plane the forwarded leg reaches — is CONTAINED here and answered as
@@ -220,7 +283,7 @@ impl ListenerSocket {
                 Ok::<_, ::std::convert::Infallible>(
                     ::emulator_server::contain_panics(
                         facts,
-                        answer(callback, load_balancer_name, listener_port, request),
+                        answer(callback, framing, load_balancer_name, listener_port, request),
                     )
                     .await,
                 )
@@ -263,10 +326,15 @@ impl ListenerSocket {
         // store the control plane writes and RELEASED before the handshake is run.
         let plan = self.plan(&load_balancer_arn, first[0] == TLS_RECORD_FIRST_BYTE)?;
         if first[0] != TLS_RECORD_FIRST_BYTE {
+            // The framing of every request on this connection, read off the bytes the client
+            // wrote before the server parses them.
+            let (sniffed, framings) = crate::service::request_head::sniffed(prefixed);
             return Some(Accepted {
+                load_balancer_arn,
                 load_balancer_name: plan.load_balancer_name,
-                conn: prefixed,
+                conn: Box::new(sniffed),
                 listener_port: plan.listener_port,
+                framings,
             });
         }
         let conn = match tls_server_config(&plan.certificates, plan.ssl_policy.as_deref()) {
@@ -309,10 +377,15 @@ impl ListenerSocket {
                 }
             }
         };
+        // The framing of every request on the connection, read off the DECRYPTED bytes: the
+        // client's own, as it wrote them under TLS.
+        let (sniffed, framings) = crate::service::request_head::sniffed(conn);
         Some(Accepted {
+            load_balancer_arn,
             load_balancer_name: plan.load_balancer_name,
-            conn,
+            conn: Box::new(sniffed),
             listener_port: plan.listener_port,
+            framings,
         })
     }
 
@@ -483,13 +556,29 @@ fn body_ceiling() -> usize {
 }
 
 /// Answer one request from the data plane of the load balancer this socket was opened for.
+///
+/// The FRAMING the client wrote the request with is judged first ([`Framing`]): a framing this
+/// load balancer's `routing.http.desync_mitigation_mode` refuses is answered by the LOAD
+/// BALANCER here, with nothing forwarded, so no rule of its listener is evaluated and no
+/// target is reached — and the CONNECTION it arrived on is not continued either
+/// ([`CLOSE_CONNECTION`]): the bytes after a request whose end could not be agreed on are not
+/// bytes this address can go on reading requests from.
 async fn answer(
     callback: EmbeddedEmulator,
+    framing: Framing,
     load_balancer_name: String,
     listener_port: Option<i32>,
     request: ::http::Request<::hyper::body::Incoming>,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
+    if framing.refuses() {
+        let mut refused = generated(BAD_REQUEST, REFUSED_FRAMING);
+        refused.headers_mut().insert(
+            ::http::header::CONNECTION,
+            ::http::HeaderValue::from_static(CLOSE_CONNECTION),
+        );
+        return refused;
+    }
     // One permit per request IN FLIGHT, taken BEFORE a byte of the body is read: what the
     // bodies being read hold at once is then the in-flight cap times the ceiling below,
     // rather than the connection cap (or the number of load balancers) times it.
@@ -627,8 +716,9 @@ fn carries_a_dot_segment(request_path: &str) -> bool {
 /// target.
 const BAD_GATEWAY: u16 = 502;
 
-/// What it answers a request whose target it will not forward: one carrying a dot segment,
-/// which does not render as a request under this load balancer's own reserved path.
+/// What it answers a request it will not forward at all: one carrying a dot segment, which
+/// does not render as a request under this load balancer's own reserved path, and one whose
+/// framing this load balancer's own desync mitigation mode refuses.
 const BAD_REQUEST: u16 = 400;
 
 /// What it answers a request that arrived while this service was already reading as many
@@ -649,6 +739,15 @@ const NO_LOAD_BALANCER: &str = "This address serves no load balancer.\n";
 
 /// The body of an answer for a request whose target this address will not forward.
 const MALFORMED_REQUEST_TARGET: &str = "This request target cannot be served.\n";
+
+/// The body of an answer for a request whose FRAMING the load balancer's own desync
+/// mitigation mode refuses ([`crate::service::request_framing`]).
+const REFUSED_FRAMING: &str = "This request is not framed as HTTP/1.1 states it.\n";
+
+/// What such an answer states about the connection it is sent on: the request's own end was
+/// not agreed on, so where the next one would begin is not either, and the load balancer does
+/// not read further requests from it.
+const CLOSE_CONNECTION: &str = "close";
 
 /// The body of an answer for a request larger than this address accepts.
 const BODY_TOO_LARGE: &str = "This request is larger than this address accepts.\n";
