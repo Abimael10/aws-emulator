@@ -83,3 +83,5 @@ mod validation_report_single_source;
 mod workload_catalogue;
 #[path = "all/workload_deployment_patterns.rs"]
 mod workload_deployment_patterns;
+#[path = "all/workload_icon_address.rs"]
+mod workload_icon_address;

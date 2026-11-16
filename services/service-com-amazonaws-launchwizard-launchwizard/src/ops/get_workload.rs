@@ -5,6 +5,12 @@
 //! Reports one entry of the seeded workload catalogue in [`crate::state`]. This is the
 //! ONLY file to touch for this operation.
 //!
+//! `iconUrl` is the one member not reported as stored text: the icon of a catalogue entry
+//! is an artifact THIS emulator serves, so the member addresses this emulator's own base
+//! URL at the path the entry's icon is served on, signed through `ctx.url_signer()` (see
+//! [`crate::state::workload_icons`] for the address and
+//! `crate::service::workload_icon` for the route that answers it).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -137,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetWorkloadErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Launch Wizard state store is unavailable".to_string()),
@@ -159,9 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Every member comes from the stored catalogue entry — nothing is echoed from
-        // this request.
+        // this request. `iconUrl` addresses an artifact this emulator serves, so it is
+        // built from the entry's name against the endpoint this request arrived on
+        // (`ctx.url_signer()`) and carries the authenticator this store minted for that
+        // entry, which is why the projection is handed both.
+        let icon_token = store.icon_token(&workload.workload_name);
         Ok(GetWorkloadOutput {
-            workload: Some(workload.to_data()),
+            workload: Some(workload.to_data(&ctx.url_signer(), &icon_token)),
         })
     }
 }

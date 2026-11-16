@@ -27,6 +27,13 @@ hex = { workspace = true }
 # The digest `state::fresh_uuid_v4` lays out as a deployment id, so minting one
 # pulls in no crate this workspace does not already build.
 sha2 = { workspace = true }
+# Writes the PNG a workload catalogue entry's icon is served as
+# (`state::workload_icons`), so the image is a real PNG rather than hand-rolled bytes.
+png = "0.18"
+# `service-common` carries the workspace's ONE authenticator over a value a store hands out
+# and takes back (`page_tokens::PageTokenKey`), which the address of a catalogue entry's icon
+# carries so only an address this store minted resolves.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

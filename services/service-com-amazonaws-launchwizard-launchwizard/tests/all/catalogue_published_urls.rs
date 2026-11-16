@@ -9,10 +9,13 @@
 //! member of its output shape that the catalogue entry it projects holds a value for,
 //! and a catalogue entry holds the document and the icon the service publishes for it.
 //! So each of those members is reported for EVERY entry, as an absolute URL that is the
-//! entry's own and that reading does not change — and a member the entry holds NO value
-//! for is left out rather than filled from another record, which is why a deployment
-//! pattern VERSION publishes no document of its own: the catalogue publishes one
-//! deployment document per application, not one per pattern version.
+//! entry's own and that addresses the same artifact on every read — and a member the
+//! entry holds NO value for is left out rather than filled from another record, which is
+//! why a deployment pattern VERSION publishes no document of its own: the catalogue
+//! publishes one deployment document per application, not one per pattern version.
+//!
+//! WHERE the icon address points, and the image this emulator serves there, is
+//! `tests/all/workload_icon_address.rs`.
 //!
 //! Every assertion therefore runs over a TABLE: every workload the catalogue reports
 //! (not only the one entry the report cited), every deployment pattern of each, and
@@ -77,6 +80,23 @@ fn url_member(reported: &Value, case: &str, member: &str) -> String {
     value
 }
 
+/// The artifact `iconUrl` addresses: the reported URL without the query its signature
+/// travels in, which is the part that does not depend on WHEN the entry was read.
+fn icon_address(reported: &Value, case: &str) -> String {
+    let url = url_member(reported, case, "iconUrl");
+    url.split('?').next().unwrap_or_default().to_string()
+}
+
+/// `reported` with the `iconUrl` member dropped, for comparing everything a read reports
+/// EXCEPT the time-limited address (compared through [`icon_address`]).
+fn without_icon_url(reported: &Value) -> Value {
+    let mut stripped = reported.clone();
+    if let Some(members) = stripped.as_object_mut() {
+        members.remove("iconUrl");
+    }
+    stripped
+}
+
 /// True when `value` is an absolute `https` URL: the scheme, a non-empty host, and no
 /// whitespace anywhere.
 ///
@@ -117,10 +137,20 @@ async fn every_catalogue_entry_reports_its_own_document_and_icon_url() {
         icons.insert(url_member(&workload, name, "iconUrl"));
 
         // Reading an entry changes nothing a later caller sees: the same request
-        // answers the same record, URLs included.
+        // answers the same record, URLs included — the icon's address down to the
+        // artifact it names. Its SIGNED query is left out of the comparison because
+        // that address is time-limited (it is signed for the endpoint the read arrived
+        // on, at the instant of the read), so the signature and signing instant of two
+        // reads differ while the icon they address does not.
         let again = get_workload(&harness, name, name).await;
         assert_eq!(
-            again, workload,
+            icon_address(&again, name),
+            icon_address(&workload, name),
+            "case {name:?}: reading a workload must not change which icon its entry addresses"
+        );
+        assert_eq!(
+            without_icon_url(&again),
+            without_icon_url(&workload),
             "case {name:?}: reading a workload must not change what a later caller sees"
         );
     }

@@ -9,6 +9,8 @@
 //! beside this one — shared service logic lives here rather than being copied into
 //! each operation file.
 
+pub mod workload_icons;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
@@ -587,9 +589,6 @@ pub struct Workload {
     /// workload — the page of [`DOCUMENTATION_BASE`] that documents deploying this
     /// application. Never empty for a catalogue entry (see [`seeded_workloads`]).
     pub documentation_url: String,
-    /// `WorkloadData$iconUrl`: the icon the catalogue publishes for this workload,
-    /// under [`ICON_BASE`]. Never empty for a catalogue entry.
-    pub icon_url: String,
     /// The `DeploymentPatternName`s this workload supports (len 1..256,
     /// `^[A-Za-z0-9][a-zA-Z0-9-]*$`), each with its catalogue record.
     pub patterns: BTreeMap<String, DeploymentPattern>,
@@ -618,10 +617,20 @@ impl Workload {
     ///
     /// `accountConstraints` is the empty list [`Workload::to_summary`] reports, for the
     /// reason [`no_account_constraints`] gives.
-    /// `documentationUrl` and `iconUrl` are the catalogue metadata the entry carries,
-    /// read off it like every other member; `statusMessage` is absent because an
-    /// `ACTIVE` catalogue entry has nothing to say about its status.
-    pub fn to_data(&self) -> WorkloadData {
+    /// `documentationUrl` is the catalogue metadata the entry carries, read off it like
+    /// every other member; `statusMessage` is absent because an `ACTIVE` catalogue entry
+    /// has nothing to say about its status.
+    ///
+    /// `iconUrl` is the one member that is not read off the entry as text: it addresses an
+    /// artifact THIS emulator serves, so it is built for the endpoint this read arrived on
+    /// ([`workload_icons::icon_url`], signed with `signer`) over the entry's own name and
+    /// the authenticator `icon_token` the store minted for it, rather than stored as an
+    /// absolute URL naming some other host.
+    pub fn to_data(
+        &self,
+        signer: &::smithy_server_runtime::UrlSigner,
+        icon_token: &str,
+    ) -> WorkloadData {
         WorkloadData {
             workload_name: Some(self.workload_name.clone()),
             display_name: Some(self.display_name.clone()),
@@ -629,7 +638,7 @@ impl Workload {
             account_constraints: no_account_constraints(),
             description: Some(self.description.clone()),
             documentation_url: Some(self.documentation_url.clone()),
-            icon_url: Some(self.icon_url.clone()),
+            icon_url: workload_icons::icon_url(signer, &self.workload_name, icon_token),
             status_message: None,
         }
     }
@@ -986,6 +995,10 @@ pub struct ComAmazonawsLaunchwizardLaunchwizardState {
     /// Sequence behind
     /// [`ComAmazonawsLaunchwizardLaunchwizardState::next_creation_sequence`].
     pub next_sequence: u64,
+    /// The secret the addresses this store hands out for a catalogue entry's icon are
+    /// authenticated under, so an address is a value only this store could have produced
+    /// (see [`workload_icons`]).
+    pub icon_address_key: ::service_common::page_tokens::PageTokenKey,
 }
 
 impl Default for ComAmazonawsLaunchwizardLaunchwizardState {
@@ -994,6 +1007,7 @@ impl Default for ComAmazonawsLaunchwizardLaunchwizardState {
             workloads: seeded_workloads(),
             deployments: BTreeMap::new(),
             next_sequence: 1,
+            icon_address_key: ::service_common::page_tokens::PageTokenKey::new(),
         }
     }
 }
@@ -1935,15 +1949,6 @@ struct SeededPattern {
 /// A workload's own page is named by its catalogue row's `documentation_page`.
 const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/launchwizard/latest/userguide";
 
-/// Where the icon a catalogue entry publishes lives: a static asset host under this
-/// service's own prefix. The host, the prefix and the `.png` file name are the
-/// EMULATOR's convention rather than a URL AWS documents — the catalogue is
-/// service-owned, so the emulator seeds this metadata the way it seeds an entry's
-/// display name. The file is named after the entry's `workloadName`, so an entry's icon
-/// is DERIVED from the catalogue key rather than listed a second time, and no two
-/// entries can share one.
-const ICON_BASE: &str = "https://d1.awsstatic.com/launchwizard/workloads";
-
 /// The `WorkloadName` of the solution entry the catalogue publishes beside its
 /// application entries.
 ///
@@ -1997,9 +2002,11 @@ struct SeededWorkload {
 ///
 /// `description`, `documentation_page` and the entry's name are the per-workload
 /// metadata `WorkloadData` (and therefore `GetWorkload`) reports: what the entry's
-/// application deploys, the document that describes deploying it and the icon the
-/// catalogue publishes for it; each pattern carries its own display name, description,
-/// specification schema and version.
+/// application deploys and the document that describes deploying it; each pattern
+/// carries its own display name, description, specification schema and version. The icon
+/// the catalogue publishes for an entry is addressed on this emulator's own endpoint and
+/// derived from the entry's name, so it is seeded as no value at all
+/// ([`workload_icons`]).
 fn seeded_workloads() -> BTreeMap<String, Workload> {
     let catalogue: [SeededWorkload; 4] = [
         SeededWorkload {
@@ -2141,10 +2148,11 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
         .into_iter()
         .map(|workload| {
             let workload_name = workload.name;
-            // The two URLs a catalogue entry publishes, built once per entry.
+            // The document a catalogue entry publishes, built once per entry. The icon it
+            // publishes is addressed on this emulator's own endpoint and so is not seeded
+            // as text at all: see `state::workload_icons`.
             let documentation_url =
                 format!("{DOCUMENTATION_BASE}/{}.html", workload.documentation_page);
-            let icon_url = format!("{ICON_BASE}/{workload_name}.png");
             let patterns = workload
                 .patterns
                 .iter()
@@ -2173,7 +2181,6 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     description: workload.description.to_string(),
                     status: WORKLOAD_ACTIVE.to_string(),
                     documentation_url,
-                    icon_url,
                     patterns,
                 },
             )

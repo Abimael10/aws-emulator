@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The route that serves the ICON of a workload catalogue entry at the signed address
+/// `GetWorkload` hands out for it. See the module docs of that file: the icon is an
+/// artifact this emulator serves, so its address names this emulator and this route
+/// answers it.
+pub(crate) mod workload_icon;
+
 /// The `com-amazonaws-launchwizard-launchwizard` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +58,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves the signed addresses `GetWorkload` hands out for a catalogue entry's icon.
+    /// Claimed through [`Service::override_operation`], which hands it the requests it
+    /// claims (see [`workload_icon`]).
+    workload_icon: workload_icon::WorkloadIconRoute<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +70,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            workload_icon: workload_icon::WorkloadIconRoute::new(engine),
         }
     }
 }
@@ -91,7 +102,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // The fetch of a catalogue entry's ICON, which the generated table cannot serve:
+        // the model binds no operation to that path, because an icon is the artifact a
+        // `WorkloadData` member points at rather than an API call (see [`workload_icon`]).
+        if self.workload_icon.claims(req).is_some() {
+            return Some(&self.workload_icon as &dyn ErasedOperation);
+        }
         None
     }
 

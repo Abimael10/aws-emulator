@@ -25,6 +25,14 @@ pub struct Reply {
     pub body: Value,
 }
 
+/// One answer to a [`Harness::fetch`] of an address the service handed out: the status,
+/// the media type it was served under, and its exact bytes.
+pub struct Fetched {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
 /// A router carrying only this service, over one shared engine — the same dispatch
 /// path the production emulator uses.
 pub struct Harness {
@@ -49,6 +57,22 @@ impl Harness {
         Self { router, engine }
     }
 
+    /// [`Harness::new`] for a router that publishes `base` as the endpoint this emulator
+    /// is reached on, so a suite can assert that an address the service hands out for an
+    /// artifact of its own follows that endpoint rather than naming a fixed host.
+    ///
+    /// `base` must be a bare absolute `https` URL
+    /// (`smithy_server_runtime::EndpointUrl::parse`).
+    pub fn published_at(base: &str) -> Self {
+        let harness = Self::new();
+        let mut router = harness.router;
+        router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("{base:?} must be usable as an emulator base URL")),
+        );
+        Self { router, ..harness }
+    }
+
     /// The ONE engine this router's service reads and writes through — the same store
     /// every request reaches (see `tests/all/state_roundtrip.rs`).
     ///
@@ -63,6 +87,29 @@ impl Harness {
     /// take.
     pub async fn call(&self, path: &str, body: &Value) -> Reply {
         self.send("POST", path, Some(body)).await
+    }
+
+    /// Follow an ABSOLUTE URL this service handed out, the way a client follows one: a
+    /// bare `GET` of the address itself, with no `Authorization` header and no body — so
+    /// what is driven is the request a browser or `curl` sends, not an SDK call.
+    pub async fn fetch(&self, url: &str) -> Fetched {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(url)
+            .body(bytes::Bytes::new())
+            .expect("a test fetch builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        Fetched {
+            status,
+            content_type,
+            body: response.body().to_vec(),
+        }
     }
 
     /// Dispatch one request with the given HTTP method and request target, so a suite
