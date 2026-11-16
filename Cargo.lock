@@ -13700,6 +13700,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-acm",
  "aws-sdk-ec2",
  "aws-sdk-lambda",
  "aws-sdk-s3",

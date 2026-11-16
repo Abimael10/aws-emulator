@@ -43,6 +43,8 @@ mod cascaded_delete_idempotency;
 mod catalog_reads;
 #[path = "all/certificate_consumer_registry.rs"]
 mod certificate_consumer_registry;
+#[path = "all/certificate_existence.rs"]
+mod certificate_existence;
 #[path = "all/certificate_resolution_and_redirect_protocol.rs"]
 mod certificate_resolution_and_redirect_protocol;
 #[path = "all/declared_action_set.rs"]
@@ -63,8 +65,12 @@ mod identifier_arn_forms;
 mod in_request_duplicate_rule_priorities;
 #[path = "all/input_rejection_classes.rs"]
 mod input_rejection_classes;
+#[path = "all/ip_pool_modification_members.rs"]
+mod ip_pool_modification_members;
 #[path = "all/ip_targets.rs"]
 mod ip_targets;
+#[path = "all/lambda_target_identifier_form.rs"]
+mod lambda_target_identifier_form;
 #[path = "all/listener_lifecycle_certificates_and_rules.rs"]
 mod listener_lifecycle_certificates_and_rules;
 #[path = "all/listener_port_and_target_group_exclusivity.rs"]

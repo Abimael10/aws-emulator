@@ -156,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
@@ -202,14 +201,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The listener is resolved and its protocol judged BEFORE the certificates are
+        // resolved against the service that OWNS them, so a call naming no listener of this
+        // store — or one that presents no certificate at all — is answered on its own terms
+        // and asks that service nothing. The lock is taken for that reading alone and
+        // released with this block: no store of this service is held while another one is
+        // asked ([`crate::state::certificate_resolution`]).
+        {
+            let guard = state.lock();
+            let Some(listener) = guard.listeners.get(&input.listener_arn) else {
+                return Err(listener_not_found(&input.listener_arn));
+            };
+            if !listener.terminates_tls() {
+                return Err(not_a_tls_listener(listener.protocol.as_deref()));
+            }
+            if let Some(arn) = crate::state::unresolvable_certificate(&input.certificates) {
+                return Err(certificate_not_found(arn));
+            }
+        }
+
+        // And the certificate itself is resolved against the service that HOLDS it: a
+        // well-formed ARN that service reports no certificate for names no certificate of
+        // the account either, so the listener's list is left as it was rather than carrying
+        // an entry nothing backs.
+        if let Some(arn) = crate::state::absent_certificate(ctx, &input.certificates).await {
+            return Err(certificate_not_found(arn));
+        }
+
         let mut guard = state.lock();
         let Some(listener) = guard.listeners.get_mut(&input.listener_arn) else {
-            return Err(AddListenerCertificatesErrorModeled::ListenerNotFoundException(
-                ListenerNotFoundException {
-                    message: Some(crate::state::listener_not_found_message(&input.listener_arn)),
-                },
-            )
-            .into());
+            return Err(listener_not_found(&input.listener_arn));
         };
 
         // A certificate list belongs to the listeners the model brackets certificates
@@ -217,12 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the refusal is this service's own `ValidationError` naming the protocol it
         // judged — the same rule `CreateListener` enforces on the default certificate.
         if !listener.terminates_tls() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Certificates cannot be added to a listener whose protocol is {}: a \
-                 certificate list applies only to {} listeners",
-                listener.protocol.as_deref().unwrap_or("unset"),
-                crate::state::TLS_TERMINATING_PROTOCOLS.join(" and ")
-            )));
+            return Err(not_a_tls_listener(listener.protocol.as_deref()));
         }
 
         // Each certificate the request names is RESOLVED before the list is touched: a
@@ -273,6 +289,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             certificates: Some(certificates),
         })
     }
+}
+
+/// The modelled refusal for a `ListenerArn` this store holds no listener for.
+fn listener_not_found(arn: &str) -> AddListenerCertificatesError {
+    AddListenerCertificatesErrorModeled::ListenerNotFoundException(ListenerNotFoundException {
+        message: Some(crate::state::listener_not_found_message(arn)),
+    })
+    .into()
+}
+
+/// The refusal a call adding to the certificate list of a listener that terminates no TLS
+/// earns: the model declares no error shape for the bracket, so it is this service's own
+/// `ValidationError`, naming the protocol it judged.
+fn not_a_tls_listener(protocol: Option<&str>) -> AddListenerCertificatesError {
+    crate::scaffolded::Scaffolded::validation_error(format!(
+        "Certificates cannot be added to a listener whose protocol is {}: a certificate \
+         list applies only to {} listeners",
+        protocol.unwrap_or("unset"),
+        crate::state::TLS_TERMINATING_PROTOCOLS.join(" and ")
+    ))
 }
 
 /// The modelled refusal for a certificate ARN that resolves to no certificate, which is

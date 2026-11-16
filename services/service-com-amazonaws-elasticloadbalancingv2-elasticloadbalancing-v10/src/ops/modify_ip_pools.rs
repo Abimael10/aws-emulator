@@ -157,6 +157,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
+        // A request naming NEITHER member asks for no change at all, and this operation
+        // "modify[ies] the IP pool associated to a load balancer": there is nothing to
+        // modify, so it is the request that has to be fixed rather than a load balancer to
+        // write nothing to. The model declares no error shape for it, so the refusal is
+        // this service's own `ValidationError` ([`AT_LEAST_ONE_POOL_MEMBER_MESSAGE`]), and
+        // it is answered BEFORE the store is read: the rule reads the request alone.
+        //
+        // An EMPTY `RemoveIpamPools`, or one whose entries name no address family, names
+        // nothing to remove — and the wire form this API is called over cannot tell an
+        // empty list from an absent one, so both count as absent.
+        let removes_pool = input.remove_ipam_pools.as_ref().is_some_and(|families| {
+            families.iter().any(|family| !family.trim().is_empty())
+        });
+        if input.ipam_pools.is_none() && !removes_pool {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                AT_LEAST_ONE_POOL_MEMBER_MESSAGE,
+            ));
+        }
+
         let mut guard = state.lock();
         let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
             return Err(ModifyIpPoolsErrorModeled::LoadBalancerNotFoundException(
@@ -199,3 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`smithy_query(query="shape",shape="RemoveIpamPoolEnum")` -> `ipv4`): the address
 /// family whose pool a removal releases.
 const REMOVE_IPV4_POOL: &str = "ipv4";
+
+/// The sentence a request naming neither of this operation's two optional members is
+/// refused with.
+///
+/// Recorded behaviour, and fixed text apart from nothing: the two quoted names are the
+/// MODELLED member names of the input shape (`ModifyIpPoolsInput$IpamPools` and
+/// `ModifyIpPoolsInput$RemoveIpamPools`), which are what the caller has to add to the
+/// request, and the request itself contributes no value to it.
+pub const AT_LEAST_ONE_POOL_MEMBER_MESSAGE: &str =
+    "Either 'IpamPools' or 'RemoveIpamPools' must be specified.";

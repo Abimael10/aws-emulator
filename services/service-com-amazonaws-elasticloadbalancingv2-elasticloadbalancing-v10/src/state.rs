@@ -35,6 +35,12 @@ mod certificate_consumers;
 
 pub use certificate_consumers::{certificate_association_directory, record_certificate_consumers};
 
+/// Whether the certificate an operation NAMES is one the account holds, asked of the
+/// service that owns the certificate.
+pub mod certificate_resolution;
+
+pub use certificate_resolution::absent_certificate;
+
 /// Whether a load balancer is a managed resource of Amazon Application Recovery
 /// Controller, recorded where the service that reports managed resources can read it.
 mod zonal_shift_registration;
@@ -179,7 +185,8 @@ pub use identifier_syntax::{
     arn_format_message, check_arn_format, check_resource_arn, check_target_forms,
     check_target_group_name, check_target_group_name_as, check_target_id, invalid_arn_message,
     invalid_instance_id_message, invalid_instance_targets_message, is_resource_arn, ArnKind,
-    SELECTED_TARGET_GROUP_NAME_SUBJECT, TARGET_GROUP_NAME_SUBJECT,
+    INVALID_LAMBDA_FUNCTION_ARN_MESSAGE, SELECTED_TARGET_GROUP_NAME_SUBJECT,
+    TARGET_GROUP_NAME_SUBJECT,
 };
 
 use crate::ops::types::{
@@ -1142,7 +1149,7 @@ pub fn certificate_count_message(limit: usize, requested: usize) -> String {
 /// Certificate Manager. Stated as a requirement of the shared ARN reader, which already
 /// carries the Certificate Manager one (`service_common::arn::ACM_CERTIFICATE`), so both
 /// forms are read by the workspace's one parse of a caller-supplied ARN.
-const IAM_SERVER_CERTIFICATE: ::service_common::arn::Requirement =
+pub(crate) const IAM_SERVER_CERTIFICATE: ::service_common::arn::Requirement =
     ::service_common::arn::Requirement {
         vendor: "iam",
         resource_type: Some("server-certificate"),

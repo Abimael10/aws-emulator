@@ -266,10 +266,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         // The certificate the request names is RESOLVED: a value that is no certificate
-        // ARN names no certificate of the account, so no listener is created for it.
-        if let Some(arn) =
-            crate::state::unresolvable_certificate(input.certificates.as_deref().unwrap_or_default())
-        {
+        // ARN names no certificate of the account, so no listener is created for it — and
+        // neither is one for a well-formed ARN the service that HOLDS the certificate
+        // reports none for ([`crate::state::certificate_resolution`]). No store of this
+        // service is locked yet, so nothing of it is held while that service is asked.
+        let certificates = input.certificates.as_deref().unwrap_or_default();
+        let unresolved = match crate::state::unresolvable_certificate(certificates) {
+            Some(arn) => Some(arn),
+            None => crate::state::absent_certificate(ctx, certificates).await,
+        };
+        if let Some(arn) = unresolved {
             return Err(CreateListenerErrorModeled::CertificateNotFoundException(
                 CertificateNotFoundException {
                     message: Some(crate::state::certificate_not_found_message(arn)),

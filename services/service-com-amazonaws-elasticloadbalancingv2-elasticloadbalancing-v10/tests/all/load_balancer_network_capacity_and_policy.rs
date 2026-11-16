@@ -840,27 +840,36 @@ async fn modify_ip_pools_stores_the_pools_a_load_balancer_draws_from() {
         "case a load balancer created with a pool: expected it reported, got {reported:?}"
     );
 
-    // (case, the fields the request carries, the pool a later read must report)
-    type PoolStep<'a> = (&'a str, Vec<(&'a str, &'a str)>, Option<&'a str>);
+    // (case, the fields the request carries, the status it is answered with, the pool a
+    // later read must report)
+    type PoolStep<'a> = (&'a str, Vec<(&'a str, &'a str)>, u16, Option<&'a str>);
     let steps: Vec<PoolStep<'_>> = vec![
         (
             "setting a pool on a load balancer that drew from none",
             vec![("IpamPools.Ipv4IpamPoolId", pool)],
+            200,
             Some(pool),
         ),
         (
             "replacing it with another pool",
             vec![("IpamPools.Ipv4IpamPoolId", other_pool)],
+            200,
             Some(other_pool),
         ),
         (
-            "a request that names no pool at all, which leaves it as it was",
+            // A request naming NEITHER member asks for no change at all, so it is refused
+            // and the pool it carried stays. The sentence and the code are pinned in
+            // `crate::ip_pool_modification_members`; here the walk only has to show the
+            // refusal changes nothing.
+            "a request that names no pool at all, which is refused",
             vec![],
+            400,
             Some(other_pool),
         ),
         (
             "removing the IPv4 pool",
             vec![("RemoveIpamPools.member.1", "ipv4")],
+            200,
             None,
         ),
         (
@@ -869,29 +878,33 @@ async fn modify_ip_pools_stores_the_pools_a_load_balancer_draws_from() {
                 ("IpamPools.Ipv4IpamPoolId", pool),
                 ("RemoveIpamPools.member.1", "ipv4"),
             ],
+            200,
             None,
         ),
         (
             "setting it again after the removal",
             vec![("IpamPools.Ipv4IpamPoolId", pool)],
+            200,
             Some(pool),
         ),
     ];
 
     let arn = create_load_balancer(&router, "lb-pool-modified", &[]).await;
-    for (case, request, expected) in &steps {
+    for (case, request, status, expected) in &steps {
         let reply = call_on(&router, "ModifyIpPools", &arn, request).await;
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: expected 200, got {} body {}",
+            reply.status, *status,
+            "case {case:?}: expected {status}, got {} body {}",
             reply.status, reply.body
         );
-        assert_eq!(
-            reply.text("Ipv4IpamPoolId").as_deref(),
-            *expected,
-            "case {case:?}: expected the stored pool answered, got {}",
-            reply.body
-        );
+        if *status == 200 {
+            assert_eq!(
+                reply.text("Ipv4IpamPoolId").as_deref(),
+                *expected,
+                "case {case:?}: expected the stored pool answered, got {}",
+                reply.body
+            );
+        }
         let reported = described_member(&router, &arn, "Ipv4IpamPoolId").await;
         assert_eq!(
             reported.as_deref(),

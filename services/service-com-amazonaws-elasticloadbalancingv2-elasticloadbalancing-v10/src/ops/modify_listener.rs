@@ -223,7 +223,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
@@ -234,6 +233,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an invalid ARN rather than a missing listener.
         crate::state::check_listener_arn(&input.listener_arn)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // A certificate the request names is resolved against the service that HOLDS it
+        // before the store is reached, so the listener keeps the certificate it had when
+        // that service reports none for the one the request named
+        // ([`crate::state::certificate_resolution`]) — and nothing of this store is held
+        // while that service is asked. The COUNT is judged FIRST, so no request can make
+        // this handler ask that service once per certificate it chose to carry; the FORM of
+        // each value is judged under the lock with the rest of the certificate rules
+        // ([`apply_certificate_rules`]).
+        let requested = input.certificates.as_deref().unwrap_or_default();
+        check_certificate_count(requested)?;
+        if let Some(arn) = crate::state::absent_certificate(ctx, requested).await {
+            return Err(ModifyListenerErrorModeled::CertificateNotFoundException(
+                CertificateNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(arn)),
+                },
+            )
+            .into());
+        }
 
         let mut guard = state.lock();
         let Some(stored) = guard.listeners.get(&input.listener_arn).cloned() else {
@@ -436,6 +454,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Refuse a request carrying more certificate ARNs than ONE call may name, as the modelled
+/// `TooManyCertificatesException` ([`crate::state::certificate_count_message`]).
+///
+/// A rule of the REQUEST alone, so it is read in ONE place for this operation and asked
+/// before anything else is done with the list: by the handler, ahead of resolving the
+/// certificates against the service that holds them, and by [`apply_certificate_rules`]
+/// ahead of the protocol bracket.
+fn check_certificate_count(requested: &[Certificate]) -> Result<(), ModifyListenerError> {
+    if requested.len() > crate::state::CERTIFICATES_PER_CALL {
+        return Err(ModifyListenerErrorModeled::TooManyCertificatesException(
+            TooManyCertificatesException {
+                message: Some(crate::state::certificate_count_message(
+                    crate::state::CERTIFICATES_PER_CALL,
+                    requested.len(),
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Apply the model's certificate and security-policy rules to the listener the call
 /// LEAVES behind, and refuse a request that breaks them.
 ///
@@ -465,17 +505,7 @@ fn apply_certificate_rules(
     // The COUNT is judged before the protocol bracket: how many certificate ARNs one
     // call may carry does not depend on which listener the request is for, exactly as
     // `CreateListener` judges it.
-    if requested.len() > crate::state::CERTIFICATES_PER_CALL {
-        return Err(ModifyListenerErrorModeled::TooManyCertificatesException(
-            TooManyCertificatesException {
-                message: Some(crate::state::certificate_count_message(
-                    crate::state::CERTIFICATES_PER_CALL,
-                    requested.len(),
-                )),
-            },
-        )
-        .into());
-    }
+    check_certificate_count(requested)?;
 
     if !listener.terminates_tls() {
         if !requested.is_empty() {

@@ -73,11 +73,14 @@ const LOAD_BALANCER_TARGET: ::service_common::arn::Requirement =
 /// `ValidationError`, before anything is resolved against the service that owns the
 /// target.
 ///
+/// Each class is worded the way Elastic Load Balancing words it: a verdict on the INSTANCE
+/// ID for an `instance` group ([`invalid_instance_id_message`]) and the fixed sentence
+/// [`INVALID_LAMBDA_FUNCTION_ARN_MESSAGE`] for a `lambda` one, both recorded behaviour.
+///
 /// An `ip` target's form is read by [`network::parse_ip_target`], which answers the
 /// address itself, so it is not restated here; the model puts no form on an id this
 /// service does not resolve at all.
 pub fn check_target_id(target_type: &str, id: &str) -> Result<(), String> {
-    let refuse = |form: &str| Err(format!("'{id}' in Targets is not {form}"));
     match target_type {
         "instance" => {
             let digits = id.strip_prefix(INSTANCE_ID_PREFIX).unwrap_or_default();
@@ -90,11 +93,24 @@ pub fn check_target_id(target_type: &str, id: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        "lambda" if !LAMBDA_FUNCTION.admits(id) => refuse(LAMBDA_FUNCTION.label),
-        "alb" if !LOAD_BALANCER_TARGET.admits(id) => refuse(LOAD_BALANCER_TARGET.label),
+        "lambda" if !LAMBDA_FUNCTION.admits(id) => {
+            Err(INVALID_LAMBDA_FUNCTION_ARN_MESSAGE.to_string())
+        }
+        "alb" if !LOAD_BALANCER_TARGET.admits(id) => Err(format!(
+            "'{id}' in Targets is not {}",
+            LOAD_BALANCER_TARGET.label
+        )),
         _ => Ok(()),
     }
 }
+
+/// The sentence a target of a `lambda` target group that is no Lambda function ARN is
+/// refused with.
+///
+/// Recorded behaviour, and ENTIRELY fixed text: Elastic Load Balancing states the form it
+/// expected and quotes nothing of the request, so the value the caller sent appears
+/// nowhere in it.
+pub const INVALID_LAMBDA_FUNCTION_ARN_MESSAGE: &str = "Invalid Lambda function ARN";
 
 /// The `TargetType` whose targets are named by an ADDRESS rather than by the id or ARN of
 /// a resource, which is the one form this module reads through the parse that answers the
