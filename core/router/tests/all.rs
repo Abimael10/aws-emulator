@@ -94,6 +94,8 @@ mod apigateway_sns_service_integration;
 mod apigateway_sqs_service_integration;
 #[path = "all/apigateway_vpc_link_private_integration.rs"]
 mod apigateway_vpc_link_private_integration;
+#[path = "all/apigateway_vpc_link_status_message_surfaces.rs"]
+mod apigateway_vpc_link_status_message_surfaces;
 #[path = "all/apigateway_wafv2_waf_log_destination_gate.rs"]
 mod apigateway_wafv2_waf_log_destination_gate;
 #[path = "all/apigatewaymanagementapi_manage_connections_authorization.rs"]
