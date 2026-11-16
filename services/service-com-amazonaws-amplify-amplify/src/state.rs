@@ -1423,6 +1423,68 @@ pub fn branch_name_not_supported_message(branch_name: &str) -> String {
 const BRANCH_NAME_CHARACTERS_MESSAGE: &str =
     "The name can only contain letters, numbers, and the symbols /_.-";
 
+/// The fewest characters a backend environment name a create brings into being may
+/// carry. See [`is_backend_environment_name`].
+const BACKEND_ENVIRONMENT_NAME_MIN: usize = 2;
+
+/// The most characters a backend environment name a create brings into being may carry.
+/// See [`is_backend_environment_name`].
+const BACKEND_ENVIRONMENT_NAME_MAX: usize = 10;
+
+/// Whether `name` is a backend environment name this service will CREATE: between
+/// [`BACKEND_ENVIRONMENT_NAME_MIN`] and [`BACKEND_ENVIRONMENT_NAME_MAX`] characters,
+/// every one of them a lowercase letter.
+///
+/// `EnvironmentName` is modelled `@length 1..255, pattern ^(?s).+$`
+/// (`smithy_query(query="operation",operation="CreateBackendEnvironment")`), which admits
+/// any non-empty value, so the form is recorded behaviour: a rule the service enforces
+/// and the model does not express, refused with HTTP 400 and the error code
+/// `ValidationException` the model does not declare either
+/// ([`backend_environment_name_message`]). It is the SAME rule, with the same bounds and
+/// the same alphabet, that the AmplifyBackend API holds a Gen 1 environment name to, and
+/// the refusal states it in the same sentence.
+///
+/// The bound is on the name a create brings into being; a name a request merely ADDRESSES
+/// is not checked against it, so a read or a delete of an environment outside the form
+/// answers the same not-found as any other environment this store does not hold.
+pub fn is_backend_environment_name(name: &str) -> bool {
+    let characters = name.chars().count();
+    (BACKEND_ENVIRONMENT_NAME_MIN..=BACKEND_ENVIRONMENT_NAME_MAX).contains(&characters)
+        && name.chars().all(|character| character.is_ascii_lowercase())
+}
+
+/// The message a backend environment name outside [`is_backend_environment_name`] is
+/// refused with.
+///
+/// The sentence states the RULE the value broke — the length window and the alphabet —
+/// and quotes nothing back: it is the same text for every name that breaks it, whatever
+/// the request sent, and nothing from this store enters it.
+pub fn backend_environment_name_message() -> String {
+    format!(
+        "Environment name must be between {BACKEND_ENVIRONMENT_NAME_MIN} and \
+         {BACKEND_ENVIRONMENT_NAME_MAX} characters, and lowercase only."
+    )
+}
+
+/// Refuse the request unless `name` is a backend environment name this service may create
+/// ([`is_backend_environment_name`]): HTTP 400 with the error code `ValidationException`,
+/// which this model does not declare, so it is raised through the crate's own
+/// [`crate::scaffolded::Scaffolded::validation`] channel.
+///
+/// Generic over the operation's modelled error enum, so one rule serves every operation
+/// that brings an environment into being and cannot be worded two ways.
+pub fn require_backend_environment_name<E>(
+    name: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if is_backend_environment_name(name) {
+        Ok(())
+    } else {
+        Err(crate::scaffolded::Scaffolded::validation(
+            backend_environment_name_message(),
+        ))
+    }
+}
+
 /// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].
 ///
 /// The apps map is NOT partitioned by region: an app's ARN records the region of the
@@ -2518,6 +2580,24 @@ pub fn not_found_message(entity: &str, identifier: &str) -> String {
     format!("{entity} {identifier} not found.")
 }
 
+/// The `message` an Amplify `NotFoundException` carries for a BACKEND ENVIRONMENT the
+/// request addressed by `environmentName` and the owning app does not hold.
+///
+/// Amplify words this entity's absence as its own sentence rather than through the
+/// generic `<Entity> <identifier> not found.` of [`not_found_message`]: the entity is
+/// the single modelled shape name `BackendEnvironment`, and the predicate is
+/// `does not exist.` — `BackendEnvironment <environmentName> does not exist.`, closed by
+/// the sentence-terminating period. The model spells out only the exception (404,
+/// `NotFoundException`), so the wording is recorded behaviour. Like
+/// [`not_found_message`], the text is built FROM THE REQUEST and from nothing else, and
+/// the identifier is NEVER inspected here. Both operations that address a backend
+/// environment by name (`GetBackendEnvironment` and `DeleteBackendEnvironment`) format
+/// their 404 through this one function, so the two cannot drift — and the other
+/// entities' 404s keep [`not_found_message`], which this does not touch.
+pub fn backend_environment_not_found_message(environment_name: &str) -> String {
+    format!("BackendEnvironment {environment_name} does not exist.")
+}
+
 /// The `message` an Amplify `BadRequestException` carries when a create is refused
 /// because the owning app ALREADY HOLDS a resource of that kind under the name the
 /// request asked for.
@@ -2555,8 +2635,9 @@ pub const WEBHOOK_ENTITY: &str = "Webhook";
 /// domain association addressed by `domainName`.
 pub const DOMAIN_ENTITY: &str = "Domain";
 
-/// The entity name [`not_found_message`] and [`already_exists_message`] use for a
-/// backend environment addressed by `environmentName`.
+/// The entity name [`already_exists_message`] uses for a backend environment addressed
+/// by `environmentName`. Its 404 is NOT built from this: Amplify words that one
+/// differently, through [`backend_environment_not_found_message`].
 pub const BACKEND_ENVIRONMENT_ENTITY: &str = "Backend environment";
 
 /// The entity name [`not_found_message`] uses for a resource addressed by its ARN

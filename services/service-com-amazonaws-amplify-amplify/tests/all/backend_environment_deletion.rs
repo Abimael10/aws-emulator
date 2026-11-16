@@ -15,11 +15,12 @@
 //! entity the request addressed; a delete is therefore NOT idempotent-successful — the
 //! second one is that same 404.
 //!
-//! The table spans the class the rule generalises over — `environmentName` at one
-//! character (its modelled `length` minimum), at ordinary names, at names carrying the
-//! punctuation an environment name admits and at the modelled maximum of 255, with
-//! `stackName` and `deploymentArtifacts` absent, supplied singly and supplied together —
-//! rather than one recorded request. The bounds come from
+//! The table spans the class the rule generalises over — `environmentName` at the
+//! shortest and the longest name this service will create (two and ten lowercase
+//! letters, the form `backend_environment_name_rule` has under test) and at ordinary
+//! names in between, with `stackName` and `deploymentArtifacts` absent, supplied singly
+//! and supplied together — rather than one recorded request. The modelled bounds come
+//! from
 //! `smithy_query(query="operation",operation="DeleteBackendEnvironment,CreateBackendEnvironment")`.
 
 use serde_json::{json, Value};
@@ -88,7 +89,7 @@ struct DeletionCase {
 /// The `DeleteBackendEnvironment` table: the names and optional members a delete has to
 /// behave identically over.
 fn deletion_cases() -> Vec<DeletionCase> {
-    let max_name = "e".repeat(255);
+    let max_name = "e".repeat(10);
     vec![
         DeletionCase {
             case: "an ordinary name, no optional members",
@@ -96,9 +97,9 @@ fn deletion_cases() -> Vec<DeletionCase> {
             request: json!({ "environmentName": "staging" }),
         },
         DeletionCase {
-            case: "a name of one character, the modelled length minimum",
-            environment_name: "x".to_string(),
-            request: json!({ "environmentName": "x" }),
+            case: "a name of two characters, the shortest the service creates",
+            environment_name: "qa".to_string(),
+            request: json!({ "environmentName": "qa" }),
         },
         DeletionCase {
             case: "stackName and deploymentArtifacts both supplied",
@@ -119,22 +120,22 @@ fn deletion_cases() -> Vec<DeletionCase> {
         },
         DeletionCase {
             case: "only deploymentArtifacts supplied",
-            environment_name: "integration".to_string(),
+            environment_name: "integ".to_string(),
             request: json!({
-                "environmentName": "integration",
+                "environmentName": "integ",
                 "deploymentArtifacts": "amplify-demo-integration-deployment",
             }),
         },
         DeletionCase {
-            case: "a name carrying case, dots, dashes and underscores",
-            environment_name: "Feature.Test-1_env".to_string(),
+            case: "a stackName carrying case, dots, dashes and underscores",
+            environment_name: "featuretst".to_string(),
             request: json!({
-                "environmentName": "Feature.Test-1_env",
+                "environmentName": "featuretst",
                 "stackName": "amplify-demo-Feature.Test-1_env",
             }),
         },
         DeletionCase {
-            case: "a name at the modelled length maximum of 255",
+            case: "a name at ten characters, the longest the service creates",
             environment_name: max_name.clone(),
             request: json!({ "environmentName": max_name }),
         },
@@ -177,7 +178,7 @@ async fn delete_answers_the_record_as_it_stood_and_frees_its_name() {
         assert_eq!(
             gone.message(),
             Some(format!(
-                "Backend environment {} not found.",
+                "BackendEnvironment {} does not exist.",
                 case.environment_name
             )),
             "case {label:?}: the 404 names the entity the request addressed, got {:?}",
@@ -369,7 +370,7 @@ async fn a_delete_of_something_not_in_state_is_the_modelled_404() {
         );
         assert_eq!(
             refused.message(),
-            Some(format!("Backend environment {absent} not found.")),
+            Some(format!("BackendEnvironment {absent} does not exist.")),
             "case {absent:?}: the 404 names the entity the request addressed, got {:?}",
             refused.message()
         );

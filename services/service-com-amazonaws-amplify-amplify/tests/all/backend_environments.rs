@@ -16,11 +16,11 @@
 //! the stored record alone, an unknown app is refused, and the resource is reachable
 //! only through its own app, so it goes when that app goes.
 //!
-//! The table spans the class the rule generalises over — `environmentName` at one
-//! character (its modelled `length` minimum), at ordinary names and at the modelled
-//! maximum of 255; `stackName` and `deploymentArtifacts` absent, supplied singly,
-//! supplied together and at their modelled `length` maxima — rather than one recorded
-//! request.
+//! The table spans the class the rule generalises over — `environmentName` at the
+//! shortest and the longest name this service will create (see
+//! `backend_environment_name_rule`) and at ordinary names in between; `stackName` and
+//! `deploymentArtifacts` absent, supplied singly, supplied together and at their
+//! modelled `length` maxima — rather than one recorded request.
 
 use std::collections::BTreeSet;
 
@@ -117,12 +117,12 @@ struct EnvironmentCase {
 
 /// The `CreateBackendEnvironment` table.
 ///
-/// It varies `environmentName` over one character (its modelled `length` minimum), an
-/// ordinary name, a name with the punctuation an environment name admits and the
-/// modelled maximum of 255, and `stackName` / `deploymentArtifacts` over absent,
-/// supplied singly, supplied together and at their modelled `length` maxima of 255 and
-/// 1000. The bounds come from
-/// `smithy_query(query="operation",operation="CreateBackendEnvironment")`.
+/// It varies `environmentName` over the shortest name the service creates (two lowercase
+/// letters), ordinary names, and the longest it creates (ten), and `stackName` /
+/// `deploymentArtifacts` over absent, supplied singly, supplied together and at their
+/// modelled `length` maxima of 255 and 1000. The modelled bounds come from
+/// `smithy_query(query="operation",operation="CreateBackendEnvironment")`; the name form
+/// is the service's own rule, under test in `backend_environment_name_rule`.
 fn environment_cases() -> Vec<EnvironmentCase> {
     vec![
         EnvironmentCase {
@@ -133,9 +133,9 @@ fn environment_cases() -> Vec<EnvironmentCase> {
             deployment_artifacts: Value::Null,
         },
         EnvironmentCase {
-            case: "environmentName of one character, its modelled length minimum",
-            request: json!({ "environmentName": "x" }),
-            environment_name: "x".to_string(),
+            case: "environmentName of two characters, the shortest the service creates",
+            request: json!({ "environmentName": "qa" }),
+            environment_name: "qa".to_string(),
             stack_name: Value::Null,
             deployment_artifacts: Value::Null,
         },
@@ -163,10 +163,10 @@ fn environment_cases() -> Vec<EnvironmentCase> {
         EnvironmentCase {
             case: "only deploymentArtifacts supplied",
             request: json!({
-                "environmentName": "integration",
+                "environmentName": "integ",
                 "deploymentArtifacts": "amplify-demo-integration-deployment",
             }),
-            environment_name: "integration".to_string(),
+            environment_name: "integ".to_string(),
             stack_name: Value::Null,
             deployment_artifacts: json!("amplify-demo-integration-deployment"),
         },
@@ -182,19 +182,19 @@ fn environment_cases() -> Vec<EnvironmentCase> {
             deployment_artifacts: json!("a".repeat(1000)),
         },
         EnvironmentCase {
-            case: "environmentName at the modelled length maximum of 255",
-            request: json!({ "environmentName": "e".repeat(255) }),
-            environment_name: "e".repeat(255),
+            case: "environmentName at ten characters, the longest the service creates",
+            request: json!({ "environmentName": "e".repeat(10) }),
+            environment_name: "e".repeat(10),
             stack_name: Value::Null,
             deployment_artifacts: Value::Null,
         },
         EnvironmentCase {
-            case: "an environmentName carrying case, dots, dashes and underscores",
+            case: "an environmentName whose stackName carries case, dots and dashes",
             request: json!({
-                "environmentName": "Feature.Test-1_env",
+                "environmentName": "featuretst",
                 "stackName": "amplify-demo-Feature.Test-1_env",
             }),
-            environment_name: "Feature.Test-1_env".to_string(),
+            environment_name: "featuretst".to_string(),
             stack_name: json!("amplify-demo-Feature.Test-1_env"),
             deployment_artifacts: Value::Null,
         },
@@ -429,7 +429,9 @@ async fn an_unknown_app_or_environment_is_the_modelled_404() {
     }
 
     // A name no environment of this app has is the same modelled refusal, naming the
-    // environment rather than the app.
+    // environment rather than the app. A name the service would not CREATE is addressed
+    // the same way: the form rule binds the name a create brings into being, not the one
+    // a read quotes.
     for absent in ["staging", "e", &"z".repeat(255)] {
         let refused = get_environment(&emulator, &app_id, absent).await;
         assert_eq!(
@@ -444,15 +446,15 @@ async fn an_unknown_app_or_environment_is_the_modelled_404() {
         );
         assert_eq!(
             refused.message(),
-            Some(format!("Backend environment {absent} not found.")),
+            Some(format!("BackendEnvironment {absent} does not exist.")),
             "case {absent:?}: the 404 names the entity the request addressed, got {:?}",
             refused.message()
         );
     }
 
     // The refusals stored nothing: the real app still accepts the first create of
-    // each name they named.
-    for name in ["staging", "e", &"z".repeat(255)] {
+    // each name they named that the service will create at all.
+    for name in ["staging", "ea", "zzzzzzzzzz"] {
         let created =
             create_environment(&emulator, &app_id, &json!({ "environmentName": name })).await;
         assert_eq!(

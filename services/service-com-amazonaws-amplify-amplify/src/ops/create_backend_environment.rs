@@ -155,6 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // `environmentName` is the name Amplify brings a Gen 1 environment into being
+        // under, so the service holds it to a form the model's `^(?s).+$` does not
+        // express — a name outside that form is refused before any state is touched,
+        // rather than stored and reported as created.
+        crate::state::require_backend_environment_name(&input.environment_name)?;
+
         // One instant for both stamps: an environment Amplify has only just created
         // has not been updated since, so `createTime` and `updateTime` are equal.
         let created = crate::state::now();

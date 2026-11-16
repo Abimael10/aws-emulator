@@ -110,7 +110,14 @@ fn next_token(reply: &Reply) -> Option<String> {
 async fn environments_of(emulator: &Emulator, app_id: &str, count: usize) -> Vec<String> {
     let mut names = BTreeSet::new();
     for index in 0..count {
-        let name = format!("env-{index:02}");
+        // Every seeded name is one this service will CREATE: two to ten lowercase
+        // letters (the form `backend_environment_name_rule` has under test), and the
+        // suffix letter ascends with the index, so the seeding order is also the
+        // ascending `environmentName` order a page must report.
+        let name = format!(
+            "env{}",
+            char::from(b'a' + u8::try_from(index).expect("a seeded index inside one byte"))
+        );
         let request = if index % 2 == 0 {
             json!({ "environmentName": name })
         } else {
@@ -329,7 +336,7 @@ async fn list_backend_environments_refuses_a_token_it_never_issued_and_resumes_a
     // A token the service could have issued resumes the scan at the first name AT OR
     // AFTER it — including a name the app does not hold, which is how a page boundary
     // survives a collection that changed between two calls. The seeded names all start
-    // with "env-", so "a" sorts below every one of them and "z" above all of them.
+    // with "env", so "a" sorts below every one of them and "z" above all of them.
     let resumptions: Vec<(String, String, usize)> = vec![
         (
             "token naming the first environment".to_string(),
@@ -388,7 +395,7 @@ async fn the_environment_name_member_filters_the_page_by_exact_name() {
     let other_app = emulator.app_id_of_new_app("backend-env-list-filter-other").await;
     let mut other_names = environments_of(&emulator, &other_app, 2).await;
     // A name ONLY the other app holds, so a filter for it on this app matches nothing.
-    let only_other = "only-other".to_string();
+    let only_other = "onlyother".to_string();
     let created = emulator
         .call(
             "POST",
@@ -443,7 +450,7 @@ async fn the_environment_name_member_filters_the_page_by_exact_name() {
         ("a name only another app holds".to_string(), only_other),
         (
             "a strict prefix of a stored name".to_string(),
-            "env-".to_string(),
+            "env".to_string(),
         ),
         (
             "a stored name with a suffix".to_string(),

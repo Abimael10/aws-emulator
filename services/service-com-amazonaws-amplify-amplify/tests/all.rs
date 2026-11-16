@@ -19,10 +19,14 @@ mod app_branch_lifecycle;
 mod app_branch_projection;
 #[path = "all/app_branch_updates.rs"]
 mod app_branch_updates;
+#[path = "all/backend_environment_absence_wording.rs"]
+mod backend_environment_absence_wording;
 #[path = "all/backend_environment_deletion.rs"]
 mod backend_environment_deletion;
 #[path = "all/backend_environment_listing.rs"]
 mod backend_environment_listing;
+#[path = "all/backend_environment_name_rule.rs"]
+mod backend_environment_name_rule;
 #[path = "all/backend_environments.rs"]
 mod backend_environments;
 #[path = "all/branch_active_job_identity.rs"]

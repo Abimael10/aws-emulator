@@ -173,8 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.environment_name)
             .ok_or_else(|| {
                 DeleteBackendEnvironmentErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        crate::state::BACKEND_ENVIRONMENT_ENTITY,
+                    message: Some(crate::state::backend_environment_not_found_message(
                         &input.environment_name,
                     )),
                 })
