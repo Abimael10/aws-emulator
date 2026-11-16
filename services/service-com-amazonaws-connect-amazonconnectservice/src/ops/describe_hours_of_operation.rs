@@ -154,12 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // The instance is resolved on its own first: an `InstanceId` that names no
-        // instance is refused as the instance not being found, whichever resource inside
-        // it the request asks for.
+        // The instance is resolved on its own first, and a missing one is reported as
+        // the instance it is: Connect's not-found message is per resource plane, so an
+        // `InstanceId` that names no instance carries the instance plane's sentence
+        // whichever resource inside it the request asks for, while a resource missing
+        // from a resolved instance carries the resource-agnostic one.
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
             DescribeHoursOfOperationErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
+                crate::state::instance_not_found(&input.instance_id),
             )
         })?;
         let hours = instance

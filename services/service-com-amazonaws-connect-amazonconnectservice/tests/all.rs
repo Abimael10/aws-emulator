@@ -33,6 +33,8 @@ mod instance_queue_lifecycle;
 mod instance_registry_seam;
 #[path = "all/instance_storage_config.rs"]
 mod instance_storage_config;
+#[path = "all/not_found_message_per_plane.rs"]
+mod not_found_message_per_plane;
 #[path = "all/phone_number_inventory.rs"]
 mod phone_number_inventory;
 #[path = "all/queue_crud_refusals.rs"]

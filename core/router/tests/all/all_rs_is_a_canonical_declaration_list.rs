@@ -89,7 +89,13 @@ fn out_of_order(names: &[String]) -> Vec<String> {
 
 #[test]
 fn the_declaration_list_holds_nothing_but_declaration_pairs() {
-    let (names, reports) = read_list(&all_rs());
+    // This crate keeps a hand-maintained declaration root only while its target has one;
+    // where its suites are declared with `automod` instead, this rule has no subject here
+    // and the workspace-wide siblings read it for every crate that does have one.
+    let Some(source) = all_rs() else {
+        return;
+    };
+    let (names, reports) = read_list(&source);
     assert!(
         reports.is_empty(),
         "expected tests/all.rs to hold its module doc, then one `#[path]`/`mod` pair per \
@@ -106,7 +112,10 @@ fn the_declaration_list_holds_nothing_but_declaration_pairs() {
 
 #[test]
 fn the_declaration_list_is_sorted_by_suite_name() {
-    let (names, _) = read_list(&all_rs());
+    let Some(source) = all_rs() else {
+        return;
+    };
+    let (names, _) = read_list(&source);
     let reports = out_of_order(&names);
     assert!(
         reports.is_empty(),

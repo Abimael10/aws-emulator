@@ -155,9 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
+        // A missing instance is reported as the instance it is: Connect's not-found
+        // message is per resource plane, and the instance plane's names the identifier
+        // the request addressed. The association missing from a resolved instance is a
+        // different plane, and keeps the resource-agnostic sentence below.
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
             DescribeInstanceStorageConfigErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
+                crate::state::instance_not_found(&input.instance_id),
             )
         })?;
 

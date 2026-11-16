@@ -153,16 +153,29 @@ fn unreachable_declarations(tests: &Path, declared: &[Declaration]) -> Vec<Strin
     reports
 }
 
-/// This crate's declaration root, read from disk. A sibling suite checking another rule of
-/// the same file reads it from here rather than opening it again.
-pub(crate) fn all_rs() -> String {
+/// This crate's declaration root, read from disk, or `None` where this crate has none.
+///
+/// The router declares the suites of its one integration-test target with `automod` from
+/// the vendored `tests/all/main.rs`, so the hand-maintained root the rules of this suite
+/// are read for need not exist here; where it does not, those rules have no subject in
+/// this crate and the workspace-wide siblings read them for every crate that does have
+/// one. A sibling suite checking another rule of the same file reads it from here rather
+/// than opening it again.
+pub(crate) fn all_rs() -> Option<String> {
     let path = tests_dir().join("all.rs");
-    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    match fs::read_to_string(&path) {
+        Ok(source) => Some(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read {}: {error}", path.display()),
+    }
 }
 
 #[test]
 fn every_suite_is_declared_exactly_once() {
-    let declared = declarations(&all_rs());
+    let Some(source) = all_rs() else {
+        return;
+    };
+    let declared = declarations(&source);
     assert!(
         declared.len() > 200,
         "expected tests/all.rs to declare the router's suites, read {} declarations",
@@ -181,7 +194,10 @@ fn every_suite_is_declared_exactly_once() {
 #[test]
 fn every_declaration_names_a_suite_file_that_exists() {
     let tests = tests_dir();
-    let declared = declarations(&all_rs());
+    let Some(source) = all_rs() else {
+        return;
+    };
+    let declared = declarations(&source);
     let reports = unreachable_declarations(&tests, &declared);
     assert!(
         reports.is_empty(),
@@ -202,7 +218,7 @@ pub(crate) fn workspace_root() -> PathBuf {
 }
 
 /// Every integration-test declaration root in the workspace: one `tests/all.rs` per
-/// service crate that has one, plus this crate's own.
+/// service crate that has one, plus this crate's own where it has one.
 ///
 /// The rule the tests above pin belongs to the single-target layout rather than to this
 /// crate, and the crate that breaks it cannot pin it itself: a repeated `mod` makes that
@@ -210,11 +226,19 @@ pub(crate) fn workspace_root() -> PathBuf {
 /// the repetition. This target is the one that links every service crate, so it is where
 /// the rule can be checked for all of them. A sibling suite checking another rule of the
 /// same layout reads the same roots, so this enumerator is shared rather than copied.
+///
+/// A root is listed only where it is a file: a crate whose target declares its suites
+/// with `automod` keeps no hand-maintained root, and a rule about a root's contents has
+/// nothing to read there.
 pub(crate) fn declaration_roots() -> Vec<PathBuf> {
     let services = workspace_root().join("services");
     let entries = fs::read_dir(&services)
         .unwrap_or_else(|error| panic!("read {}: {error}", services.display()));
-    let mut roots = vec![tests_dir().join("all.rs")];
+    let own = tests_dir().join("all.rs");
+    let mut roots = Vec::new();
+    if own.is_file() {
+        roots.push(own);
+    }
     for entry in entries {
         let entry = entry
             .unwrap_or_else(|error| panic!("read an entry of {}: {error}", services.display()));

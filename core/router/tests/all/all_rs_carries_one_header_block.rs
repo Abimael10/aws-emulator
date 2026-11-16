@@ -96,7 +96,12 @@ pub(crate) fn repeated_header_lines(source: &str) -> Vec<String> {
 
 #[test]
 fn the_declaration_root_carries_one_header_block() {
-    let source = all_rs();
+    // No subject where this crate's target declares its suites with `automod` instead of a
+    // hand-maintained root; the workspace-wide siblings read this rule for every crate
+    // that keeps one.
+    let Some(source) = all_rs() else {
+        return;
+    };
     let reports = repeated_header_lines(&source);
     assert!(
         reports.is_empty(),

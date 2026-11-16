@@ -20,10 +20,11 @@
 //! nothing but whitespace carries no identifier, so the request is refused as the
 //! malformed request it is — `InvalidRequestException` (400), `Invalid request`. A label
 //! longer than the maximum is not an identifier the service can read — the same error,
-//! `Instance id is not valid`. Every other label is RESOLVED, however unlike a minted
-//! identifier it looks, and one that holds nothing is `ResourceNotFoundException` (404),
-//! `Resource not found`. All three sentences are fixed: none of them quotes the label the
-//! request carried.
+//! `Instance id is not valid`. Both those sentences are fixed and quote no label. Every
+//! other label is RESOLVED, however unlike a minted identifier it looks, and one that
+//! holds nothing is `ResourceNotFoundException` (404) with the instance plane's own
+//! sentence, `Instance <InstanceId> not found`, which names the identifier it resolved
+//! nothing for.
 
 use serde_json::{json, Value};
 
@@ -36,8 +37,12 @@ const INVALID_REQUEST: &str = "Invalid request";
 /// The sentence it answers an identifier longer than the modelled maximum with.
 const INSTANCE_ID_NOT_VALID: &str = "Instance id is not valid";
 
-/// The sentence it answers an identifier that resolves to nothing with.
-const RESOURCE_NOT_FOUND: &str = "Resource not found";
+/// The sentence it answers an identifier that resolves to nothing with: the instance
+/// plane's own, spelled out here as the template it is — the fixed `Instance ` /
+/// ` not found` halves around the identifier the request addressed.
+fn instance_not_found(instance_id: &str) -> String {
+    format!("Instance {instance_id} not found")
+}
 
 /// The modelled `@length` maximum of `com.amazonaws.connect#InstanceId`
 /// (`smithy_query(query="shape",shape="InstanceId")` -> length min 1 max 100), written
@@ -252,14 +257,16 @@ struct Expected {
     status: u16,
     /// The `x-amzn-errortype` the modelled error shape is named by.
     code: &'static str,
-    /// The `Message` the error carries.
-    message: &'static str,
+    /// The `Message` the error carries, or `None` where it is the instance plane's
+    /// not-found sentence, which is built from the label the request carried.
+    message: Option<&'static str>,
 }
 
 /// RULE: the instance plane places its `InstanceId` label in one of three classes before
 /// resolving any state — carrying no identifier, longer than the identifier's modelled
 /// `@length` maximum, or a label to resolve — and the first two are 400s with fixed
-/// sentences, not 404s.
+/// sentences, not 404s; the third, when it resolves nothing, is the 404 that names the
+/// identifier.
 ///
 /// The rows differ along the FORM and LENGTH of the label: three ways to carry no
 /// identifier, both ends of the modelled bound (1..100) and two past the maximum, and
@@ -275,17 +282,17 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
     let blank = Expected {
         status: 400,
         code: "InvalidRequestException",
-        message: INVALID_REQUEST,
+        message: Some(INVALID_REQUEST),
     };
     let too_long = Expected {
         status: 400,
         code: "InvalidRequestException",
-        message: INSTANCE_ID_NOT_VALID,
+        message: Some(INSTANCE_ID_NOT_VALID),
     };
     let absent = Expected {
         status: 404,
         code: "ResourceNotFoundException",
-        message: RESOURCE_NOT_FOUND,
+        message: None,
     };
 
     // (case, the label as the request carries it, the label after decoding, the answer)
@@ -364,6 +371,9 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
                 .send_answer(method, &format!("/instance/{sent}"), None)
                 .await;
             let actual = message_of(&answer.body);
+            let expected_message = expected
+                .message
+                .map_or_else(|| instance_not_found(&label), str::to_string);
             assert_eq!(
                 answer.status, expected.status,
                 "case {case:?}/{operation}: expected HTTP {}, got {} {}",
@@ -375,14 +385,16 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
                 expected.code, answer.error_code
             );
             assert_eq!(
-                actual, expected.message,
-                "case {case:?}/{operation}: expected message {:?}, got {actual:?}",
-                expected.message
+                actual, expected_message,
+                "case {case:?}/{operation}: expected message {expected_message:?}, got \
+                 {actual:?}"
             );
-            // Every sentence above is fixed, so the label cannot appear in the reply.
-            // Only a label long enough not to occur in those sentences by accident is
-            // checked: a one-character label is a letter of the sentence itself.
-            if label.trim().len() >= 4 {
+            // The two 400 sentences are fixed, so the label cannot appear in those
+            // replies. Only a label long enough not to occur in those sentences by
+            // accident is checked: a one-character label is a letter of the sentence
+            // itself. The 404 is the other plane of the rule — it quotes the label, which
+            // the assertion above already pins.
+            if expected.message.is_some() && label.trim().len() >= 4 {
                 assert!(
                     !answer.body.to_string().contains(label.trim()),
                     "case {case:?}/{operation}: the refusal must not quote the label, got {}",
@@ -406,7 +418,7 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
 /// RULE (the round trip the two classes sit either side of): an identifier of the minted
 /// form is RESOLVED — a created instance reads back through `DescribeInstance`, lists
 /// through `ListInstances`, and once `DeleteInstance` retires it both the delete and the
-/// read answer the fixed not-found sentence.
+/// read answer the not-found sentence naming that identifier.
 #[tokio::test]
 async fn a_minted_identifier_is_resolved_through_the_whole_plane() {
     let connect = Connect::new();
@@ -455,14 +467,15 @@ async fn a_minted_identifier_is_resolved_through_the_whole_plane() {
             .send_answer(method, &format!("/instance/{instance_id}"), None)
             .await;
         let actual = message_of(&answer.body);
+        let expected = instance_not_found(&instance_id);
         assert_eq!(
             answer.status, 404,
             "{operation} of a retired identifier: expected HTTP 404, got {} {}",
             answer.status, answer.body
         );
         assert_eq!(
-            actual, RESOURCE_NOT_FOUND,
-            "{operation} of a retired identifier: expected {RESOURCE_NOT_FOUND:?}, got {actual:?}"
+            actual, expected,
+            "{operation} of a retired identifier: expected {expected:?}, got {actual:?}"
         );
     }
 

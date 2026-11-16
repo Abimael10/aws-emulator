@@ -4,19 +4,20 @@
 //! hold, driven over HTTP through the same `MultiServiceRouter` the emulator serves
 //! with.
 //!
-//! RULE: when a request names a resource that resolves to nothing — an `InstanceId`
-//! that never existed or that `DeleteInstance` retired, or a resource inside an instance
-//! that is not there — the service answers `ResourceNotFoundException` (HTTP 404, from
-//! the model's error binding) and its `Message` is the FIXED sentence `Resource not
-//! found`: it names no resource kind, and it quotes none of the identifiers the request
-//! carried.
+//! RULE: Connect's `ResourceNotFoundException` message is written per resource plane.
+//! When the resource that resolves to nothing is the INSTANCE the request's `InstanceId`
+//! names — an identifier that never existed or that `DeleteInstance` retired — the
+//! service answers HTTP 404 (the model's error binding) with `Instance <InstanceId> not
+//! found`, whose one variable part is the identifier the request's path label carried.
+//! When the instance resolves and a resource INSIDE it does not, the refusal carries the
+//! resource-agnostic sentence `Resource not found` instead, naming no resource kind and
+//! quoting no identifier.
 //!
 //! The suites below assert that rule over a TABLE: every operation of this service that
 //! has to resolve an `InstanceId` crossed with identifiers of several forms and lengths,
 //! including both ends of the modelled `InstanceId` length bound and an identifier whose
 //! instance really existed until it was deleted. The last suite pins the other side of
-//! the rule: when the instance IS there and the resource inside it is not, the refusal
-//! is that same sentence, so no identifier of the request reaches the reply.
+//! the rule, where the instance IS there and the resource inside it is not.
 
 use std::time::{Duration, Instant};
 
@@ -182,9 +183,17 @@ fn message_of(body: &Value) -> String {
     body["Message"].as_str().unwrap_or_default().to_string()
 }
 
-/// The one sentence every `ResourceNotFoundException` of this service carries, written
-/// out here rather than read off the implementation so the suite pins the text itself.
+/// The sentence a `ResourceNotFoundException` of a plane with no wording of its own
+/// carries — a resource missing from an instance that IS there — written out here rather
+/// than read off the implementation so the suite pins the text itself.
 const RESOURCE_NOT_FOUND: &str = "Resource not found";
+
+/// The sentence the instance plane carries for an `InstanceId` that resolves to nothing,
+/// spelled out here as its template rather than read off the implementation: the fixed
+/// `Instance ` / ` not found` halves around the identifier the request addressed.
+fn instance_not_found(instance_id: &str) -> String {
+    format!("Instance {instance_id} not found")
+}
 
 /// Whether an operation checks the FORM of its `InstanceId` label before it resolves
 /// anything: the queue plane does, so a label that is not an identifier this service
@@ -201,7 +210,8 @@ fn checks_the_labels_form(operation: &str) -> bool {
 }
 
 /// Drive every instance-resolving call against `instance_id` and assert the rule on each
-/// answer: 404, `ResourceNotFoundException`, and AWS's fixed sentence.
+/// answer: 404, `ResourceNotFoundException`, and AWS's instance-plane sentence naming
+/// the identifier the request carried.
 ///
 /// `of_the_identifier_form` says whether `instance_id` has the form this service mints;
 /// when it does not, the operations that check that form first are left out, since their
@@ -220,6 +230,7 @@ async fn assert_every_call_reports_the_instance_missing(
             .send_answer(call.method, &call.uri, call.body.clone())
             .await;
         let actual = message_of(&answer.body);
+        let expected = instance_not_found(instance_id);
         assert_eq!(
             answer.status, 404,
             "case {case:?}/{}: expected HTTP 404, got {} {}",
@@ -231,15 +242,23 @@ async fn assert_every_call_reports_the_instance_missing(
             call.operation, answer.error_code
         );
         assert_eq!(
-            actual, RESOURCE_NOT_FOUND,
-            "case {case:?}/{}: expected message {RESOURCE_NOT_FOUND:?}, got {actual:?}",
+            actual, expected,
+            "case {case:?}/{}: expected message {expected:?}, got {actual:?}",
+            call.operation
+        );
+        // The variable part is the label as the request carried it, so the identifier
+        // asked for is the one reported gone.
+        assert!(
+            actual.contains(instance_id),
+            "case {case:?}/{}: the message must quote the identifier the request \
+             carried, got {actual:?}",
             call.operation
         );
     }
 }
 
 /// RULE: an `InstanceId` that names no instance is refused with
-/// `ResourceNotFoundException` (404) whose message is the fixed `Resource not found`,
+/// `ResourceNotFoundException` (404) whose message is `Instance <InstanceId> not found`,
 /// for every operation that resolves an `InstanceId`.
 ///
 /// The table spans the identifier's form and length: the UUID shape Connect mints, both
@@ -305,7 +324,7 @@ async fn an_unknown_instance_id_is_refused_in_awss_sentence() {
 
 /// RULE (the same one, on an identifier that really named an instance): deleting an
 /// instance retires its identifier, so every later call carrying it is refused with the
-/// same fixed sentence.
+/// same sentence, naming that identifier.
 #[tokio::test]
 async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
     let connect = Connect::new();
@@ -359,10 +378,10 @@ async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
     .await;
 }
 
-/// RULE (the other half of the one above): the sentence does not depend on WHICH
-/// resource was missing. When the instance is there and the resource inside it is not,
-/// the refusal is still `ResourceNotFoundException` (404) with that same fixed text, and
-/// it quotes neither the instance nor the resource the request named.
+/// RULE (the other plane): a resource missing from an instance that IS there is a
+/// different plane's refusal — still `ResourceNotFoundException` (404), but carrying the
+/// resource-agnostic sentence, which quotes neither the instance nor the resource the
+/// request named.
 #[tokio::test]
 async fn a_present_instance_with_an_absent_child_reports_the_same_sentence() {
     let connect = Connect::new();

@@ -78,7 +78,12 @@ fn repeated_list_lines(source: &str) -> Vec<String> {
 
 #[test]
 fn the_declaration_root_says_nothing_twice() {
-    let source = all_rs();
+    // No subject where this crate's target declares its suites with `automod` instead of a
+    // hand-maintained root; the workspace-wide siblings read this rule for every crate
+    // that keeps one.
+    let Some(source) = all_rs() else {
+        return;
+    };
     let mut reports = repeated_header_lines(&source);
     reports.extend(repeated_list_lines(&source));
     assert!(
