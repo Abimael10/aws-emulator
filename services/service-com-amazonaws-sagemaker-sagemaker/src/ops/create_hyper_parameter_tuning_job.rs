@@ -14,12 +14,18 @@
 //! `ValidationException` and nothing is stored (see [`crate::state::admission`]) — which is
 //! also why the `Stop`/`Describe` that follow such a request report the job as not found.
 //!
-//! ## No training job ever runs here
+//! ## The accepted job LAUNCHES its training jobs, server-side
 //!
-//! A tuning job's work is the training jobs it launches, and this emulator runs no
-//! training container, so the job it accepts ends `Failed` with
-//! [`crate::state::NO_TRAINING_RUNNER_FAILURE_REASON`] rather than reporting a best
-//! training job, an objective metric value or model artifacts nothing computed.
+//! A tuning job's work is the training jobs it launches, and they are launched here
+//! ([`crate::state::launched_training_jobs`]): each is a real training job in this service's
+//! store, carrying this tuning job's ARN as its `TuningJobArn`, run by the one training
+//! runner a caller's own `CreateTrainingJob` gets ([`crate::state::run_training_job`]) over
+//! the hyperparameter values the search picked for it. Their outcomes are RECORDED rather
+//! than revealed: each child's terminal status is owed by its own clock, and the tuning
+//! job's by [`crate::state::HyperParameterTuningJob::record_run`] once the last of them is
+//! over, so a caller that describes any of them straight after the create still observes
+//! `InProgress`. The job then reports the child the objective picked as `BestTrainingJob`,
+//! and fails with the reason its training jobs reported when every one of them failed.
 //!
 //! ## Shape of an operation
 //!
@@ -630,8 +636,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "hyper-parameter-tuning-job",
             &input.hyper_parameter_tuning_job_name,
         );
+        // The name identifies the job and is not case sensitive, so it is folded through the
+        // crate's one key helper.
+        let key = crate::state::entity_key(&input.hyper_parameter_tuning_job_name);
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The store is reached inside a block of its own, so the guard is released before the
+        // runs below await: nothing holds this service's state across an await. The block
+        // answers the training jobs the tuning job launches, which are built only once the
+        // request has been ADMITTED — a request past a quota or breaking a documented rule is
+        // refused before anything is built for it.
+        let children: Vec<(crate::state::LaunchedTrainingJob, String)> = {
+            let mut store = state.lock();
         // The capacity the request asks for, against the account's published quotas on the
         // training jobs a tuning job runs. This comes first: a request for more training
         // jobs than the account may run is a limit failure whatever else is wrong with its
@@ -653,11 +670,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        // The name identifies the job, so a second create under a name already taken is
-        // the modelled `ResourceInUse` rather than a second record. Checked before the
-        // store bound: a collision adds no record, so it cannot be a limit failure. The
-        // name is not case sensitive, so it is folded through the crate's one key helper.
-        let key = crate::state::entity_key(&input.hyper_parameter_tuning_job_name);
+        // The store bound is the emulator's OWN (`crate::state::MODEL_QUOTA`) rather than one
+        // of the published quotas the capacity check above evaluates.
         if let Some(held) = store.tuning_jobs.get(&key) {
             return Err(CreateHyperParameterTuningJobErrorModeled::ResourceInUse(
                 ResourceInUse {
@@ -712,9 +726,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let now = ::std::time::SystemTime::now();
+        // Every training job this tuning job launches, with the hyperparameter values the
+        // search picked for each ([`crate::state::launched_training_jobs`], which bounds how
+        // many it builds whatever the request asked for). They are a real training job each:
+        // stored here as `InProgress` the way a caller's own `CreateTrainingJob` stores one,
+        // carrying this tuning job's ARN as their `TuningJobArn`, and RUN once the store is
+        // released.
+        let definitions: Vec<&HyperParameterTrainingJobDefinition> = input
+            .training_job_definition
+            .iter()
+            .chain(input.training_job_definitions.iter().flatten())
+            .collect();
+        let children: Vec<(crate::state::LaunchedTrainingJob, String)> =
+            crate::state::launched_training_jobs(
+                &input.hyper_parameter_tuning_job_name,
+                &input.hyper_parameter_tuning_job_config,
+                &definitions,
+            )
+            .into_iter()
+            .map(|child| {
+                let child_arn = crate::state::resource_arn(
+                    &region,
+                    "training-job",
+                    &child.request.training_job_name,
+                );
+                (child, child_arn)
+            })
+            .collect();
+
         store.tuning_jobs.insert(
-            key,
+            key.clone(),
             crate::state::HyperParameterTuningJob {
                 name: input.hyper_parameter_tuning_job_name.clone(),
                 arn: arn.clone(),
@@ -732,10 +773,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modified_time: now,
                 end_time: None,
                 settles_at: now + crate::state::TUNING_JOB_SETTLES_AFTER,
+                // Filled in by the run below, once its training jobs have reported.
+                run: None,
             },
         );
-        drop(store);
+        for (child, child_arn) in &children {
+            store.training_jobs.insert(
+                child.request.training_job_name.clone(),
+                crate::state::TrainingJob::accepted(
+                    child_arn.clone(),
+                    &child.request,
+                    Some(arn.clone()),
+                    now,
+                ),
+            );
+        }
+        children
+        };
 
+        // The tuning job's own WORK: each launched training job's run, performed with the one
+        // training runner a caller's own job gets, and then recorded on the stored jobs. The
+        // outcome is RECORDED, not revealed: each child's terminal status is owed by its own
+        // clock, and the tuning job's by `HyperParameterTuningJob::record_run`, so a caller
+        // that describes any of them straight away still observes `InProgress`.
+        let mut summaries: Vec<crate::ops::types::HyperParameterTrainingJobSummary> = Vec::new();
+        let mut children_end = now;
+        for (child, child_arn) in &children {
+            let outcome = crate::state::run_training_job(
+                ctx,
+                &region,
+                &child.request.training_job_name,
+                &child.request,
+            )
+            .await;
+            let reported_at = ::std::time::SystemTime::now();
+            let ends_at = {
+                let mut store = state.lock();
+                match store
+                    .training_jobs
+                    .get_mut(&child.request.training_job_name)
+                {
+                    Some(job) => {
+                        job.record_run(outcome.clone(), reported_at);
+                        job.ends_at
+                    }
+                    None => reported_at,
+                }
+            };
+            children_end = children_end.max(ends_at);
+            summaries.push(crate::state::child_summary(
+                child,
+                &input.hyper_parameter_tuning_job_name,
+                child_arn,
+                now,
+                ends_at,
+                &outcome,
+            ));
+        }
+        let best = crate::state::best_child(&summaries);
+        {
+            let mut store = state.lock();
+            if let Some(job) = store.tuning_jobs.get_mut(&key) {
+                job.record_run(crate::state::TuningRunResult {
+                    children: summaries,
+                    best,
+                    children_end,
+                });
+            }
+        }
+
+        for (_, child_arn) in &children {
+            crate::state::record_state_change(Self::NAME, child_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateHyperParameterTuningJobOutput {
             hyper_parameter_tuning_job_arn: arn,

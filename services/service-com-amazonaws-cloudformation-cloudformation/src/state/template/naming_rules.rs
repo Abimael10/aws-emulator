@@ -90,7 +90,8 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         | crate::state::provisioning::logs_resources::LOGS_METRIC_FILTER => {
             rules(512, Characters::AsGenerated)
         }
-        // Amazon SageMaker AI `CreateModel.ModelName`, `CreateNotebookInstance.\
+        // Amazon SageMaker AI `CreateModel.ModelName`, `CreateEndpointConfig.\
+        // EndpointConfigName`, `CreateEndpoint.EndpointName`, `CreateNotebookInstance.\
         // NotebookInstanceName` and `CreateNotebookInstanceLifecycleConfig.\
         // NotebookInstanceLifecycleConfigName`: each `@length(min: 0, max: 63)` with a pattern
         // admitting letters, digits and inner hyphens and requiring an alphanumeric at each
@@ -100,6 +101,8 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // leading letter and carries only letters, digits and single hyphens, but may be
         // longer than.
         crate::state::provisioner::sagemaker_resources::SAGEMAKER_MODEL
+        | crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT_CONFIG
+        | crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT
         | crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE
         | crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG => {
             rules(63, Characters::AsGenerated)

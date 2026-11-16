@@ -29,6 +29,32 @@ use crate::inference_deployment_lifecycle::{
 /// Long enough to pass `state::RECOMMENDATION_JOB_SETTLES_AFTER` (400 ms).
 const PAST_JOB_END_DUE: Duration = Duration::from_millis(700);
 
+/// How long a poll for a recommendation job's terminal status may take before the test gives
+/// up, and how often it looks. What is waited for is the CONDITION, re-read in a loop, so a
+/// loaded host cannot fail a case the clock would have served.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The `RecommendationJobStatus` members a job's work has ENDED in (smithy_query
+/// shape=RecommendationJobStatus).
+const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "FAILED", "STOPPED"];
+
+/// Describe `name` until its status is terminal, and answer that `(status, body)` read.
+async fn ended(emulator: &Emulator, name: &str) -> (u16, Value) {
+    let deadline = ::std::time::Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let (status, described) = describe(emulator, name).await;
+        if TERMINAL_STATUSES.contains(&str_field(&described, "Status").as_str()) {
+            return (status, described);
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {name:?}: the job never reached a terminal Status, last read {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// A `RoleArn` matching the modelled pattern
 /// `^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/SageMakerRecommenderRole";
@@ -425,27 +451,27 @@ async fn the_status_moves_out_of_pending_only_when_the_clock_owes_it() {
         }
     }
 
-    tokio::time::sleep(PAST_JOB_END_DUE).await;
-
-    let (status, settled) = describe(&emulator, "clock-owed").await;
+    // Wait for the CONDITION — the job leaving `PENDING` — rather than for a fixed time.
+    let (status, settled) = ended(&emulator, "clock-owed").await;
     assert_eq!(status, 200, "case settled: describe, got {status} with {settled}");
     let reached = str_field(&settled, "Status");
     // `RecommendationJobStatus`'s terminal members are COMPLETED | FAILED | STOPPED
-    // (smithy_query shape=RecommendationJobStatus), and FAILED is the one a job nothing
-    // benchmarked can honestly reach.
+    // (smithy_query shape=RecommendationJobStatus). This job's model carries no model
+    // artifact, so its benchmark had nothing to invoke and measured nothing.
     assert_eq!(
         reached, "FAILED",
-        "case settled: no benchmark traffic ran, so the run must end FAILED, got {settled}"
+        "case settled: the benchmark could not invoke the model under test, so the run must \
+         end FAILED, got {settled}"
     );
     assert!(
         !str_field(&settled, "FailureReason").is_empty(),
         "case settled: a FAILED job must say why, got {settled}"
     );
-    // Nothing measured a recommendation, so none is reported even in a terminal status.
+    // Nothing was measured, so no recommendation is reported even in a terminal status.
     for absent in ["InferenceRecommendations", "EndpointPerformances"] {
         assert!(
             settled.get(absent).is_none(),
-            "case settled: {absent} must be absent when no benchmark ran, got {:?}",
+            "case settled: {absent} must be absent when the benchmark measured nothing, got {:?}",
             settled.get(absent)
         );
     }

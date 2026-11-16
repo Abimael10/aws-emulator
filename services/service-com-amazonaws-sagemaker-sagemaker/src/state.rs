@@ -449,14 +449,16 @@ pub fn account_quota_exceeded(
 /// same bound the model states per list.
 pub const MAX_SEARCHED_HYPERPARAMETERS: usize = 30;
 
-/// How long after `CreateHyperParameterTuningJob` the clock owes the tuning job's
-/// `InProgress` -> terminal transition.
+/// How long after the END of its launched training jobs' work the clock owes the tuning
+/// job's `InProgress` -> terminal transition.
 ///
-/// A caller that describes the job straight after creating it still observes
-/// `InProgress`; one that waits observes the terminal status, so a waiter terminates.
-/// Real tuning jobs take hours; the span is compressed, never zero, and sits at the top
-/// of the band this emulator uses for a clock-owed transition so a caller (or a test)
-/// reading the transient status right after the create is not racing the clock.
+/// A tuning job is a COMPOSITE of the training jobs it launches, so it reaches its terminal
+/// status only once those are over ([`HyperParameterTuningJob::record_run`]) and this is the
+/// span it takes past them. A caller that describes the job straight after creating it still
+/// observes `InProgress`; one that waits observes the terminal status, so a waiter
+/// terminates. Real tuning jobs take hours; the span is compressed, never zero, and sits at
+/// the top of the band this emulator uses for a clock-owed transition so a caller (or a
+/// test) reading the transient status right after the create is not racing the clock.
 pub const TUNING_JOB_SETTLES_AFTER: Duration = Duration::from_millis(700);
 
 /// `HyperParameterTuningJobStatus`'s members this emulator moves a tuning job through.
@@ -479,18 +481,6 @@ pub const TUNING_STATUS_STOPPED: &str = "Stopped";
 /// straight after asking it to stop still observes `Stopping`, and one that waits
 /// observes `Stopped`.
 pub const TUNING_JOB_STOPS_AFTER: Duration = Duration::from_millis(300);
-
-/// Why a hyperparameter tuning job this emulator accepted ends in `Failed`.
-///
-/// A tuning job's work is the training jobs it launches, and this emulator runs no
-/// training container: nothing evaluates an objective metric and nothing writes model
-/// artifacts. Reporting `Completed`, a best training job or a metric value would claim
-/// results of work that never ran, so the job ends in the modelled failure status
-/// carrying this reason instead.
-pub const NO_TRAINING_RUNNER_FAILURE_REASON: &str =
-    "This emulator does not run training jobs: no training job was launched for this \
-hyperparameter tuning job, so no objective metric was evaluated and no model artifacts were \
-written to the output S3 location.";
 
 /// How long after `CreateProcessingJob` the clock owes the job's move out of
 /// `InProgress` into its terminal status.
@@ -558,19 +548,6 @@ pub fn processing_job_not_running(name: &str, status: &str) -> String {
          nothing to stop."
     )
 }
-
-/// `FailureReason` of a processing job whose container image could not be run here.
-///
-/// A processing job runs a customer Docker image (`AppSpecification$ImageUri`). This
-/// emulator has no container runtime, and the engine contract
-/// (`vendor/engine/src/lib.rs`) forbids reporting a status, duration or exit code for
-/// work nothing ran — so the run the caller asked for ends in the modelled `Failed`
-/// state with this reason, and no `ProcessingStartTime` or `ExitMessage` is invented.
-/// Everything around the run — accepting the job, validating it, minting its ARN,
-/// replaying it, reporting its terminal status — is real.
-pub const NO_CONTAINER_RUNTIME_REASON: &str =
-    "This emulator has no container runtime, so the processing job's container image was \
-     never started";
 
 /// The instance count a processing cluster runs when the request names none, per
 /// `ProcessingClusterConfig$InstanceCount`'s doc: "The default value is 1."
@@ -1142,6 +1119,23 @@ pub use jobs::*;
 /// it fits, the artifact it writes and the metrics it measures: see `state/training_run.rs`.
 pub mod training_run;
 pub use training_run::*;
+
+/// The server-side RUN of an accepted Inference Recommender job — the endpoint it
+/// benchmarks, the traffic it sends and what it measured: see `state/recommendation_run.rs`.
+pub mod recommendation_run;
+pub use recommendation_run::*;
+
+/// The server-side RUN of an accepted hyperparameter tuning job — the training jobs it
+/// launches, the hyperparameter values each is given and which of them is best: see
+/// `state/tuning_run.rs`.
+pub mod tuning_run;
+pub use tuning_run::*;
+
+/// The PROGRAM a job's container runs — the argument vector a request declares for it, the
+/// status it exits with and the `AlgorithmError` wording a non-zero one is reported in: see
+/// `state/container_run.rs`.
+pub mod container_run;
+pub use container_run::*;
 
 /// The lineage-action slice: see `state/lineage_action.rs`.
 pub mod lineage_action;
@@ -2288,11 +2282,15 @@ impl VolumeAttachment {
     }
 }
 
-/// One benchmarked recommendation of an Inference Recommender job.
+/// One benchmarked recommendation of an Inference Recommender job: what the job's own load
+/// test MEASURED on one endpoint (see [`recommendation_run`]).
 #[derive(Debug, Clone)]
 pub struct InferenceRecommendation {
     pub recommendation_id: String,
     pub endpoint_name: String,
+    /// `EndpointOutputConfiguration$VariantName`: the production variant the traffic was
+    /// served by.
+    pub variant_name: String,
     pub instance_type: String,
     /// What one instance of `instance_type` sustained, in invocations per minute.
     pub max_invocations_per_minute: i32,
@@ -3005,10 +3003,7 @@ impl ComAmazonawsSagemakerSagemakerState {
     ///
     /// The quota is counted in TrainingJobs, so the utilisation is a count of training-job
     /// records — the ones a tuning job owns ([`TrainingJob::tuning_job_arn`]) and that have
-    /// not yet reached a terminal status. Nothing in this emulator launches a training job
-    /// on a tuning job's behalf, so an account that has only ever created training jobs
-    /// itself is using none of this quota, and that is read off the store rather than
-    /// assumed.
+    /// not yet reached a terminal status, which is read off the store rather than assumed.
     pub fn parallel_training_jobs_in_use(&self) -> usize {
         self.training_jobs
             .values()

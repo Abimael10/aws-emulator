@@ -211,6 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // waiter terminates and no caller's read changes the outcome.
         let settled = job.settle_status(::std::time::SystemTime::now());
 
+        // What the job's run produced is reported once the clock has SETTLED the job: the
+        // training jobs it launched are its own work, so until that work is over the counters
+        // report a job that has launched nothing yet and no best job is named — the same way
+        // every other reader here reveals only what the clock has already made due.
+        let run = job.is_terminal().then(|| job.run.clone()).flatten();
         let output = DescribeHyperParameterTuningJobOutput {
             hyper_parameter_tuning_job_name: job.name.clone(),
             hyper_parameter_tuning_job_arn: job.arn.clone(),
@@ -221,30 +226,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(job.creation_time),
             hyper_parameter_tuning_end_time: job.end_time.map(crate::state::timestamp),
             last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
-            // Both counter structures are `@required`, and every counter in them is zero:
-            // no training job was launched, so none is in progress, completed, stopped or
-            // failed, and no objective metric was evaluated.
+            // One counter per status the launched training jobs reached. Nothing is retried
+            // here, so a job that failed is counted as the non-retryable error it is, and no
+            // job is still in progress once the tuning job's own work is over.
             training_job_status_counters: TrainingJobStatusCounters {
-                completed: Some(0),
+                completed: Some(run.as_ref().map_or(0, crate::state::TuningRunResult::completed)),
                 in_progress: Some(0),
                 retryable_error: Some(0),
-                non_retryable_error: Some(0),
-                stopped: Some(0),
+                non_retryable_error: Some(
+                    run.as_ref().map_or(0, crate::state::TuningRunResult::failed),
+                ),
+                stopped: Some(run.as_ref().map_or(0, crate::state::TuningRunResult::stopped)),
             },
             objective_status_counters: ObjectiveStatusCounters {
-                succeeded: Some(0),
+                succeeded: Some(
+                    run.as_ref()
+                        .map_or(0, crate::state::TuningRunResult::objective_succeeded),
+                ),
                 pending: Some(0),
-                failed: Some(0),
+                failed: Some(
+                    run.as_ref()
+                        .map_or(0, crate::state::TuningRunResult::objective_failed),
+                ),
             },
-            // No training job ran, so there is no best one and no overall best one to
-            // name; reporting either would claim an objective metric nothing computed.
-            best_training_job: None,
-            overall_best_training_job: None,
+            // "Returns the training job that results in either the highest or lowest value
+            // for this metric" (`HyperParameterTuningJobObjective`): the child the objective
+            // picked, once the job's work is over and when any child evaluated the objective
+            // metric at all. This tuning job launched its own training jobs rather than
+            // inheriting any, so the best job overall is the best of its own.
+            best_training_job: run
+                .as_ref()
+                .and_then(crate::state::TuningRunResult::best_training_job),
+            overall_best_training_job: run
+                .as_ref()
+                .and_then(crate::state::TuningRunResult::best_training_job),
             warm_start_config: job.warm_start_config.clone(),
             autotune: job.autotune.clone(),
             failure_reason: job.failure_reason.clone(),
             // Completion details report convergence an optimisation run detected, and
-            // consumed resources the runtime it spent; nothing ran, so neither exists.
+            // consumed resources the runtime it spent; neither is measured here.
             tuning_job_completion_details: None,
             consumed_resources: None,
         };

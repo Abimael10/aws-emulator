@@ -123,8 +123,12 @@ mod inference_deployment_lifecycle;
 mod inference_recommendation_refusals;
 #[path = "all/inference_recommendations_jobs.rs"]
 mod inference_recommendations_jobs;
+#[path = "all/job_container_program.rs"]
+mod job_container_program;
 #[path = "all/job_experiment_tracking.rs"]
 mod job_experiment_tracking;
+#[path = "all/managed_job_orchestration.rs"]
+mod managed_job_orchestration;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
 #[path = "all/lineage_and_config_updates.rs"]

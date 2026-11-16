@@ -218,10 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(job.creation_time),
             last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
             processing_end_time: job.processing_end_time.map(crate::state::timestamp),
-            // Nothing ran the job's container image, so there is no instant it started
-            // at and no message it exited with. See
-            // `crate::state::NO_CONTAINER_RUNTIME_REASON`.
-            processing_start_time: None,
+            // The instant the job's container program began, for a job whose program ran.
+            processing_start_time: job.processing_start_time.map(crate::state::timestamp),
+            // "Metadata from the processing container when the processing job exits": the
+            // message a container leaves in its own output directory, which nothing the job
+            // ran wrote here.
             exit_message: None,
             // These three report the resource that OWNS a processing job SageMaker
             // created on a caller's behalf (a monitoring schedule, an AutoML job, a

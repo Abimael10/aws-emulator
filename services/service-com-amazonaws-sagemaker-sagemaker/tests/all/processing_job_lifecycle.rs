@@ -23,8 +23,34 @@ use serde_json::{json, Value};
 // and one set of body accessors.
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
-/// Long enough to pass `state::PROCESSING_JOB_ENDS_AFTER` (400 ms).
-const PAST_JOB_END_DUE: Duration = Duration::from_millis(700);
+/// How long a poll for a processing job's terminal status may take before the test gives up,
+/// and how often it looks. What is waited for is the CONDITION, re-read in a loop, so a loaded
+/// host cannot fail a case the clock would have served.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The `ProcessingJobStatus` members a job's work has ENDED in (smithy_query
+/// shape=ProcessingJobStatus: Completed | Failed | InProgress | Stopped | Stopping).
+const TERMINAL_STATUSES: [&str; 3] = ["Completed", "Failed", "Stopped"];
+
+/// Describe `name` until its status is terminal, and answer that read.
+async fn ended(emulator: &Emulator, name: &str) -> Value {
+    let deadline = ::std::time::Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let described = emulator
+            .ok("DescribeProcessingJob", &json!({ "ProcessingJobName": name }))
+            .await;
+        if TERMINAL_STATUSES.contains(&str_field(&described, "ProcessingJobStatus").as_str()) {
+            return described;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {name:?}: the job never reached a terminal ProcessingJobStatus, last read \
+             {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// A `RoleArn` matching the modelled pattern
 /// `^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
@@ -353,22 +379,19 @@ async fn the_status_moves_out_of_in_progress_only_when_the_clock_owes_it() {
         }
     }
 
-    tokio::time::sleep(PAST_JOB_END_DUE).await;
-
-    let settled = emulator
-        .ok("DescribeProcessingJob", &json!({ "ProcessingJobName": "clock-owed" }))
-        .await;
+    // Wait for the CONDITION — the job leaving `InProgress` — rather than for a fixed time.
+    let settled = ended(&emulator, "clock-owed").await;
     let status = str_field(&settled, "ProcessingJobStatus");
     // `ProcessingJobStatus`'s terminal members (smithy_query shape=ProcessingJobStatus:
     // Completed | Failed | InProgress | Stopped | Stopping).
     assert!(
-        ["Completed", "Failed", "Stopped"].contains(&status.as_str()),
+        TERMINAL_STATUSES.contains(&status.as_str()),
         "case settled: the job must reach a terminal status, got {status}"
     );
     assert_eq!(
         status, "Failed",
-        "case settled: nothing ran the container image, so the run must end Failed, got \
-         {settled:?}"
+        "case settled: this job's specification declares no program, so nothing was started \
+         for it and the run must end Failed, got {settled:?}"
     );
     assert!(
         !str_field(&settled, "FailureReason").is_empty(),

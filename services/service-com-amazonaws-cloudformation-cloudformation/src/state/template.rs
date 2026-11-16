@@ -3284,6 +3284,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     S3VECTORS_VECTOR_BUCKET,
     // The Amazon SageMaker AI types `provisioner::sagemaker_resources` creates: each
     // publishes the one attribute carrying the resource's own name.
+    crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT,
+    crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT_CONFIG,
     crate::state::provisioner::sagemaker_resources::SAGEMAKER_MODEL,
     crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE,
     crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG,

@@ -743,6 +743,15 @@ pub(super) enum Provisioner {
     /// the template decided — the name every SageMaker call on a model takes — and
     /// `DeleteModel` removes.
     SageMakerModel,
+    /// `AWS::SageMaker::EndpointConfig`: the production variants `CreateEndpointConfig`
+    /// registers under the name the template decided — the name an endpoint's own
+    /// `EndpointConfigName` takes — and `DeleteEndpointConfig` removes.
+    SageMakerEndpointConfig,
+    /// `AWS::SageMaker::Endpoint`: the hosted endpoint `CreateEndpoint` provisions from one of
+    /// those configurations. That create answers the endpoint `Creating`, in which it serves
+    /// no inference, so the resource's creation is held open until SageMaker reports it
+    /// `InService`, and its deletion is finished once that service no longer holds it.
+    SageMakerEndpoint,
     /// `AWS::SageMaker::NotebookInstance`: the managed Jupyter instance
     /// `CreateNotebookInstance` launches under that name. That create answers the instance
     /// `Pending`, in which it serves no session, so the resource's creation is held open
@@ -1187,6 +1196,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
         SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
         SAGEMAKER_MODEL => Some(Provisioner::SageMakerModel),
+        SAGEMAKER_ENDPOINT_CONFIG => Some(Provisioner::SageMakerEndpointConfig),
+        SAGEMAKER_ENDPOINT => Some(Provisioner::SageMakerEndpoint),
         SAGEMAKER_NOTEBOOK_INSTANCE => Some(Provisioner::SageMakerNotebookInstance),
         SAGEMAKER_NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG => {
             Some(Provisioner::SageMakerNotebookInstanceLifecycleConfig)
@@ -1458,6 +1469,15 @@ impl Provisioner {
             // CloudFormation gives them beside the ones their declaration asks for.
             Self::SageMakerModel => {
                 create_sagemaker_model(ctx, region, resource, propagated).await
+            }
+            // Both endpoint types take a `Tags` list of their own, so a configuration and an
+            // endpoint a stack creates each carry the tags CloudFormation gives them beside
+            // the ones their declaration asks for.
+            Self::SageMakerEndpointConfig => {
+                create_sagemaker_endpoint_config(ctx, region, resource, propagated).await
+            }
+            Self::SageMakerEndpoint => {
+                create_sagemaker_endpoint(ctx, region, resource, propagated).await
             }
             Self::SageMakerNotebookInstance => {
                 create_sagemaker_notebook_instance(ctx, region, resource, propagated).await
@@ -2406,6 +2426,14 @@ impl Provisioner {
             Self::SageMakerNotebookInstance => {
                 notebook_instance_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateEndpoint` answers the endpoint `Creating` — SageMaker launches the ML
+            // compute instances of its production variants after the create has answered, and
+            // the endpoint serves no inference and takes no inference component until it is
+            // `InService` — so the resource is held open until that service reports it there
+            // ([`sagemaker_resources::sagemaker_endpoint_readiness`]).
+            Self::SageMakerEndpoint => {
+                sagemaker_endpoint_readiness(ctx, region, physical_resource_id).await
+            }
             // `CreateDocument` answers a document `Creating` — "the document is being
             // created" — and Systems Manager reports it `Active` once it is in place, so the
             // resource is held open until that service resolves the document by the name the
@@ -2604,6 +2632,14 @@ impl Provisioner {
             // ([`sagemaker_resources::notebook_instance_removal`]).
             Self::SageMakerNotebookInstance => {
                 notebook_instance_removal(ctx, region, physical_resource_id).await
+            }
+            // "SageMaker frees up all of the resources that were deployed when the endpoint
+            // was created" (`DeleteEndpoint`) after that call has answered, so the deletion is
+            // finished once SageMaker no longer holds the endpoint
+            // ([`sagemaker_resources::sagemaker_endpoint_removal`]) — which is what keeps a
+            // stack from deleting the endpoint configuration it is still deployed from.
+            Self::SageMakerEndpoint => {
+                sagemaker_endpoint_removal(ctx, region, physical_resource_id).await
             }
             // `DeleteApplication` "deletes the specified application along with all
             // associated versions and configurations" and answers before it has — the
@@ -3345,6 +3381,14 @@ impl Provisioner {
             Self::SageMakerModel => {
                 delete_sagemaker_model(ctx, region, physical_resource_id).await
             }
+            Self::SageMakerEndpointConfig => {
+                delete_sagemaker_endpoint_config(ctx, region, physical_resource_id).await
+            }
+            // The endpoint is deleted by name; the removal above waits for SageMaker to free
+            // the resources it deployed.
+            Self::SageMakerEndpoint => {
+                delete_sagemaker_endpoint(ctx, region, physical_resource_id).await
+            }
             // The instance has to be stopped before SageMaker will take it away, which is
             // what that arm asks for; the removal below finishes the deletion.
             Self::SageMakerNotebookInstance => {
@@ -3942,6 +3986,12 @@ impl Provisioner {
             // under, reported under the property names the type spells its members with.
             Self::SageMakerModel => {
                 describe_sagemaker_model(ctx, region, physical_resource_id).await
+            }
+            Self::SageMakerEndpointConfig => {
+                describe_sagemaker_endpoint_config(ctx, region, physical_resource_id).await
+            }
+            Self::SageMakerEndpoint => {
+                describe_sagemaker_endpoint(ctx, region, physical_resource_id).await
             }
             Self::SageMakerNotebookInstance => {
                 describe_sagemaker_notebook_instance(ctx, region, physical_resource_id).await

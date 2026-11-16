@@ -9,11 +9,30 @@
 //! `DescribeInferenceRecommendationsJob`. This is the ONLY file to touch for this
 //! operation.
 //!
-//! No benchmark is RUN: this emulator serves no model inference container and generates
-//! no load, so the run ends in the modelled `FAILED` status with
-//! `crate::state::NO_INFERENCE_BENCHMARK_REASON` and no recommendation metrics are
-//! invented; see that constant for why nothing else would be honest. Everything around
-//! the run - accepting, validating, minting the ARN, replaying the job - is real.
+//! ## The accepted job is BENCHMARKED, server-side
+//!
+//! The load test is this emulator's own ([`crate::state::run_inference_recommendations_job`]):
+//! it loads the model behind each endpoint under test out of THIS EMULATOR'S OWN Amazon S3 and
+//! applies it to the benchmark's traffic through the same serving path an `InvokeEndpoint`
+//! takes, measuring the latency those invocations took and the rate they sustained. It is
+//! performed HERE, before this handler answers, and its outcome is RECORDED on the stored job
+//! rather than revealed: the terminal status is owed by the clock, which
+//! `crate::state::InferenceRecommendationsJob::settle_status` materialises. A benchmark that
+//! could not invoke the model measures nothing, which leaves the job's modelled `FAILED`
+//! status with the condition that stopped it — never `COMPLETED` with metrics no invocation
+//! produced.
+//!
+//! NOTHING OF THIS LEAVES THE PROCESS, and none of it scales with the request. Every object
+//! read goes through this service's ONE Amazon S3 client (`crate::state::s3_client`), which is
+//! built over the emulator's own in-process callback into its own Amazon S3 — the same client
+//! a training run reads its channels with — so no socket is opened, no host is resolved, no
+//! address from the request is dialled and no credential of the host is used. The
+//! "invocation" is a function call in this process. The WORK is a constant: at most
+//! `crate::state::MAX_BENCHMARKED_CONFIGURATIONS` endpoints are tested, each with
+//! `crate::state::BENCHMARK_INVOCATIONS` invocations of a payload bounded by
+//! `crate::state::MAX_SAMPLE_PAYLOADS` records — the request's `TrafficPattern`,
+//! `ResourceLimit` and `JobDurationInSeconds` cannot enlarge any of those — and the measuring
+//! itself runs on the blocking pool.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::resource_arn(&region, "inference-recommendations-job", &input.job_name);
 
         let now = ::std::time::SystemTime::now();
+        // The store is reached inside a block of its own, so the guard is released before the
+        // benchmark below awaits: nothing holds this service's state across an await. What
+        // the block answers is where the load test sends its traffic.
+        let targets = {
         let mut store = state.lock();
         // `JobName`'s doc: "The name must be unique within the Amazon Web Services Region
         // and within your Amazon Web Services account." A name already in use is refused
@@ -261,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: arn.clone(),
                 job_type: input.job_type,
                 role_arn: input.role_arn,
-                input_config: input.input_config,
+                input_config: input.input_config.clone(),
                 job_description: input.job_description,
                 stopping_conditions: input.stopping_conditions,
                 output_config: input.output_config,
@@ -275,13 +298,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modified_time: now,
                 completion_time: None,
                 ends_at: now + crate::state::RECOMMENDATION_JOB_SETTLES_AFTER,
-                // Nothing benchmarked this job, so it has measured no recommendation;
-                // `GetScalingConfigurationRecommendation` refuses rather than computing
-                // a configuration from an invented one.
+                // Both are filled in by the benchmark below, once it has reported.
                 recommendations: Vec::new(),
+                run: None,
             },
         );
-        drop(store);
+        // The endpoints the job's load test sends its traffic to, resolved against the store
+        // the job's references name while it is still locked.
+        crate::state::benchmark_targets(&store, &input.job_name, &input.input_config)
+        };
+
+        // The job's own WORK: the load test, performed here against the same serving path an
+        // `InvokeEndpoint` takes — in this process, over this emulator's own Amazon S3, with no
+        // socket opened and no address from the request dialled — and RECORDED on the stored
+        // job rather than revealed, so a caller that describes the job straight after creating
+        // it still observes `PENDING`. The work is a constant bounded by this emulator's own
+        // ceilings and does not grow with the request (see the module docs).
+        let outcome = crate::state::run_inference_recommendations_job(
+            ctx,
+            &region,
+            &input.job_name,
+            &input.input_config,
+            &targets,
+        )
+        .await;
+        {
+            let mut store = state.lock();
+            if let Some(job) = store.inference_recommendations_jobs.get_mut(&input.job_name) {
+                job.record_run(outcome, ::std::time::SystemTime::now());
+            }
+        }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateInferenceRecommendationsJobOutput { job_arn: arn })

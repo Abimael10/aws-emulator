@@ -65,6 +65,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # gzip codec rather than laid out here.
 tar = "0.4"
 flate2 = "1"
+# `shell-words`: the maintained POSIX word quoter, so the argument vector a job's container
+# declares reaches the shared shell session as ONE command line with each word still one word
+# (`state::container_run`), rather than being joined by hand.
+shell-words = "1.1"
 # The maintained regex engine, so a container image path is matched against the PUBLISHED
 # image-reference grammar's own expression rather than a hand-rolled walk over its characters
 # (`state::container_image`).

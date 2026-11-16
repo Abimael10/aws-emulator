@@ -197,6 +197,7 @@ fn seed_recommendations_job(
             |(id, endpoint, instance_type, invocations, latency)| sm::InferenceRecommendation {
                 recommendation_id: (*id).to_string(),
                 endpoint_name: (*endpoint).to_string(),
+                variant_name: format!("{endpoint}-variant"),
                 instance_type: (*instance_type).to_string(),
                 max_invocations_per_minute: *invocations,
                 model_latency_millis: *latency,
@@ -208,9 +209,9 @@ fn seed_recommendations_job(
         .inference_recommendations_jobs
         .insert(
             name.to_string(),
-            // The create path mints a job with no measured recommendation (nothing
-            // benchmarks one here), so a seeded record is built through the state
-            // slice's own constructor for a job whose results the store was given.
+            // The create path mints a job whose benchmark reported in the same call, so a
+            // record whose RESULTS the store was given — rather than measured — is built
+            // through the state slice's own constructor for one.
             sm::InferenceRecommendationsJob::seeded(
                 name.to_string(),
                 sm::resource_arn(REGION, "inference-recommendations-job", name),

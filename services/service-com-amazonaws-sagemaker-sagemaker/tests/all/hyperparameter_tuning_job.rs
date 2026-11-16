@@ -21,9 +21,9 @@
 //! * an invalid hyperparameter range is named in a bracketed list built from the request,
 //!   followed by the constraint its kind requires;
 //! * a name already in use is the modelled `ResourceInUse` and keeps the stored job;
-//! * the job ends `Failed` with a reason saying no training job ran, once the clock owes
-//!   that transition — never with a best training job or an objective metric value for
-//!   work nothing performed;
+//! * the job LAUNCHES the training jobs its definition declares and ends in the status
+//!   they produced, once the clock owes that transition — with the child the objective
+//!   picked as its best training job, and never a metric value for work nothing performed;
 //! * a stop moves a running job to `Stopping` and leaves `Stopped` to the clock, and a
 //!   job that has already ended has nothing to stop;
 //! * a call that CHANGES this service's state leaves a structured audit record naming the
@@ -39,11 +39,49 @@ use serde_json::{json, Value};
 use crate::hyperpod_cluster_audit_record::audit_capture;
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
-/// Long enough to pass `state::TUNING_JOB_SETTLES_AFTER`.
-const PAST_SETTLE_DUE: Duration =
-    service_com_amazonaws_sagemaker_sagemaker::state::TUNING_JOB_SETTLES_AFTER
-        .saturating_mul(2)
-        .saturating_add(Duration::from_millis(100));
+/// How long a poll for a tuning job's own terminal status may take before the test gives up.
+///
+/// A tuning job is over only once the training jobs it launched are, so the wait is for that
+/// CONDITION rather than for a fixed time; this deadline is generous against the span those
+/// jobs take so the test does not depend on how fast the host runs.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long the poll below waits between reads.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Describe the tuning job until its status satisfies `settled`, and answer that read.
+///
+/// Waits for the condition, not for a duration: the status a tuning job moves into is owed by
+/// the clock, and a loaded host must not decide whether the test sees it.
+async fn poll_until(
+    emulator: &Emulator,
+    describe: &Value,
+    case: &str,
+    settled: impl Fn(&str) -> bool,
+) -> Value {
+    let deadline = ::std::time::Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let described = emulator
+            .ok("DescribeHyperParameterTuningJob", describe)
+            .await;
+        if settled(&str_field(&described, "HyperParameterTuningJobStatus")) {
+            return described;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {case:?}: the tuning job's status never settled, last read {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Describe the tuning job until it has left `InProgress`, and answer that read.
+///
+/// Waits for the condition, not for a duration: the job's own terminal status falls due only
+/// once its launched training jobs are over.
+async fn poll_until_terminal(emulator: &Emulator, describe: &Value, case: &str) -> Value {
+    poll_until(emulator, describe, case, |status| status != "InProgress").await
+}
 
 /// An IAM role ARN matching `RoleArn`'s modelled pattern.
 const ROLE: &str = "arn:aws:iam::123456789012:role/SageMakerTuningRole";
@@ -339,12 +377,14 @@ async fn describe_replays_every_member_the_create_stored() {
 }
 
 /// RULE: a tuning job is accepted `InProgress` and reaches its terminal status only once
-/// the clock owes that transition; because this emulator launches no training job, the
-/// terminal status is `Failed` with a reason that says so — never `Completed`, never a
-/// best training job, never an objective metric value for work nothing ran. The settled
-/// job is then stable across reads.
+/// the clock owes that transition — which is after the training jobs it LAUNCHED are over.
+/// The status it ends in is the one those jobs produced: with no Amazon S3 mounted beside
+/// this service, their runs cannot read the channels the definition names, so every one of
+/// them fails and the tuning job fails with the reason they reported, counted as the
+/// non-retryable errors they are and with no best training job to name. The settled job is
+/// then stable across reads.
 #[tokio::test]
-async fn a_tuning_job_ends_failed_because_no_training_job_ever_runs() {
+async fn a_tuning_job_ends_in_the_status_its_launched_training_jobs_produced() {
     let emulator = Emulator::new();
     let name = "settles-to-failed";
     let created = emulator
@@ -364,38 +404,46 @@ async fn a_tuning_job_ends_failed_because_no_training_job_ever_runs() {
         "case {name:?}: the span before the terminal status is never zero, got {before}"
     );
 
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
-
-    let settled = emulator
-        .ok("DescribeHyperParameterTuningJob", &describe)
-        .await;
+    // Wait for the CONDITION — the job leaving `InProgress` — rather than for a fixed time.
+    let settled = poll_until_terminal(&emulator, &describe, name).await;
     assert_eq!(
         str_field(&settled, "HyperParameterTuningJobStatus"),
         "Failed",
-        "case {name:?}: a tuning job no training runner serves cannot complete, got {settled}"
+        "case {name:?}: every training job this tuning job launched failed, so the tuning \
+         job cannot complete, got {settled}"
     );
     let reason = str_field(&settled, "FailureReason");
     assert!(
-        reason.contains("training job"),
-        "case {name:?}: the failure reason must say no training job ran, got {reason:?}"
-    );
-    assert_eq!(
-        reason,
-        service_com_amazonaws_sagemaker_sagemaker::state::NO_TRAINING_RUNNER_FAILURE_REASON,
-        "case {name:?}: the reason is the one the service states once, got {reason:?}"
+        reason.starts_with("ClientError: Data download failed"),
+        "case {name:?}: the failure reason is the one its training jobs reported, got \
+         {reason:?}"
     );
     assert!(
         settled.get("HyperParameterTuningEndTime").is_some(),
         "case {name:?}: a terminal job has an end time, got {settled}"
     );
-    assert_subset(&zero_counters(), &settled, name, "$");
+    assert_subset(
+        &json!({
+            "TrainingJobStatusCounters": {
+                "Completed": 0,
+                "InProgress": 0,
+                "RetryableError": 0,
+                "NonRetryableError": 4,
+                "Stopped": 0,
+            },
+            "ObjectiveStatusCounters": { "Succeeded": 0, "Pending": 0, "Failed": 4 },
+        }),
+        &settled,
+        name,
+        "$",
+    );
     assert!(
         settled.get("BestTrainingJob").is_none()
             && settled.get("OverallBestTrainingJob").is_none()
             && settled.get("TuningJobCompletionDetails").is_none()
             && settled.get("ConsumedResources").is_none(),
-        "case {name:?}: nothing ran, so no best job, completion detail or consumed \
-         resource may be reported, got {settled}"
+        "case {name:?}: no training job evaluated the objective metric, so no best job, \
+         completion detail or consumed resource may be reported, got {settled}"
     );
     assert_eq!(
         str_field(&settled, "HyperParameterTuningJobArn"),
@@ -956,10 +1004,14 @@ async fn stopping_a_tuning_job_moves_it_through_stopping_to_stopped() {
         );
     }
 
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
-    let stopped = emulator
-        .ok("DescribeHyperParameterTuningJob", &describe)
-        .await;
+    // Wait for the CONDITION — the job leaving the transient `Stopping` — not for a fixed time.
+    let stopped = poll_until(
+        &emulator,
+        &describe,
+        "stopped",
+        |status| status != "Stopping",
+    )
+    .await;
     assert_eq!(
         str_field(&stopped, "HyperParameterTuningJobStatus"),
         "Stopped",
@@ -992,7 +1044,12 @@ async fn stopping_a_tuning_job_moves_it_through_stopping_to_stopped() {
     emulator
         .ok("CreateHyperParameterTuningJob", &valid_body(ended))
         .await;
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    poll_until_terminal(
+        &emulator,
+        &json!({ "HyperParameterTuningJobName": ended }),
+        ended,
+    )
+    .await;
     let (status, refused) = emulator
         .call(
             "StopHyperParameterTuningJob",
@@ -1411,7 +1468,7 @@ async fn a_state_changing_call_leaves_one_audit_record() {
     );
 
     // The transition the clock owed IS a change, so it leaves the same record — once.
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    poll_until_terminal(&emulator, &describe, name).await;
     emulator
         .ok("DescribeHyperParameterTuningJob", &describe)
         .await;

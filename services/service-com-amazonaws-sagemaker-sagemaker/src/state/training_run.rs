@@ -49,8 +49,13 @@
 //! that wrote no artifact.
 //!
 //! What fails a run is a LEG of its work that failed: an object it could not download under
-//! the execution role, or an artifact it could not write. The SHAPE of the caller's data is
-//! not one of them — nothing in the API models what a channel's bytes mean, `Channel$ContentType`
+//! the execution role, an artifact it could not write, or the container PROGRAM the request
+//! declared for the algorithm exiting non-zero — `AlgorithmSpecification$ContainerEntrypoint`
+//! "takes precedence over the default train processing instructions", so when a request
+//! declares one it is performed ([`crate::state::run_container_program`]) and the status it
+//! exits with is the job's own outcome, reported in AWS's `AlgorithmError` form
+//! ([`crate::state::algorithm_error`]). The SHAPE of the caller's data is not one of them —
+//! nothing in the API models what a channel's bytes mean, `Channel$ContentType`
 //! being the caller's own MIME type and the algorithm, not SageMaker, reading them — so data
 //! that holds no record of the form above leaves a run that still fits, writes its artifact
 //! and completes, with how many rows held no record reported in that artifact.
@@ -480,6 +485,53 @@ pub async fn run_training_job(
     // "Training - Training is in progress" (`DescribeTrainingJob$SecondaryStatus`): the fit
     // the run performs over the records it read.
     phases.push(TRAINING_SECONDARY_STATUS_TRAINING.to_string());
+
+    // The program the request DECLARED for the algorithm container, when it declared one:
+    // `AlgorithmSpecification$ContainerEntrypoint` "takes precedence over the default train
+    // processing instructions", so that argument vector is what the container runs and the
+    // status it exits with is the job's own outcome — a non-zero status is a failure inside
+    // the algorithm, which AWS reports as the `AlgorithmError` class carrying the container's
+    // standard-error tail and that status ([`super::algorithm_error`]). A program that exits
+    // zero leaves the default train instructions — performed below — to produce the artifact
+    // `ModelArtifacts` promises, and a request declaring no program runs those instructions
+    // alone.
+    if let Some(specification) = request.algorithm_specification.as_ref() {
+        let program = crate::state::container_program(
+            specification.container_entrypoint.as_deref(),
+            specification.container_arguments.as_deref(),
+        );
+        // A job that declares NO program runs the default train instructions, which are
+        // SageMaker's own and which this run performs below; only a DECLARED program takes
+        // precedence over them.
+        if !program.is_empty() {
+            // Performed off the request worker, in the ONE bounded session this workspace
+            // performs caller-supplied shell text with: no host process, no host filesystem,
+            // no host environment and no network (see `crate::state::container_run`). A
+            // program that session performs none of is not performed at all, and no exit
+            // status is claimed for it; a run this process could not carry out is the
+            // server's own failure.
+            let image = specification.training_image.clone().unwrap_or_default();
+            let outcome = crate::state::run_container_program_off_worker(
+                &program,
+                &image,
+                request.environment.as_ref(),
+            )
+            .await;
+            match outcome {
+                Some(outcome) => {
+                    if let Some(reason) = outcome.failure_reason() {
+                        return TrainingRunOutcome::failed_in(phases, reason);
+                    }
+                }
+                None => {
+                    return TrainingRunOutcome::failed_in(
+                        phases,
+                        crate::state::INTERNAL_FAILURE_REASON,
+                    )
+                }
+            }
+        }
+    }
 
     // Fitting a model and measuring it are synchronous, CPU-bound work with no await of
     // their own, so they go to the blocking pool and the worker serving this request is

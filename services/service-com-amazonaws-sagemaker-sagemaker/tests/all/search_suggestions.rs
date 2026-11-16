@@ -353,8 +353,14 @@ async fn seeded() -> Emulator {
 /// caller-named key for has none at all.
 fn seeded_property_names(resource: &str) -> BTreeSet<String> {
     let names: &[&str] = match resource {
+        // The training jobs the tuning job LAUNCHED are training jobs of this account too
+        // (each carries the tuning job's `TuningJobArn`), so the hyperparameters they were
+        // given — the searched `max_depth` and the static `objective` of its definition — are
+        // indexed property names of this resource type beside the seed job's own.
         "TrainingJob" => &[
             "hyperparameters.momentum",
+            "hyperparameters.max_depth",
+            "hyperparameters.objective",
             "environment.VERBOSITY",
             "tags.unit",
         ],

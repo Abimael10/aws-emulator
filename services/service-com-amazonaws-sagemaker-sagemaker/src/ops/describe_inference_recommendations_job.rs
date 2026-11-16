@@ -206,11 +206,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(job.creation_time),
             last_modified_time: crate::state::timestamp(job.last_modified_time),
             completion_time: job.completion_time.map(crate::state::timestamp),
-            // No benchmark ran, so there is no measured recommendation and no measured
-            // endpoint performance to report. Both members are absent rather than empty:
-            // `InferenceRecommendations` is modelled `len 1..10`, so an empty list would
-            // not even satisfy the model.
-            inference_recommendations: None,
+            // What the job's own load test MEASURED, once the clock has revealed it. The
+            // member is modelled `len 1..10`, so a job that measured nothing reports none
+            // rather than an empty list. `InvocationStartTime` and `InvocationEndTime` are
+            // the instants the job's benchmark ran between: it starts when the job is
+            // accepted and is over when the job completes.
+            inference_recommendations: (!job.recommendations.is_empty()).then(|| {
+                job.recommendations
+                    .iter()
+                    .map(|measured| InferenceRecommendation {
+                        recommendation_id: Some(measured.recommendation_id.clone()),
+                        metrics: Some(RecommendationMetrics {
+                            max_invocations: Some(measured.max_invocations_per_minute),
+                            model_latency: Some(measured.model_latency_millis),
+                            ..RecommendationMetrics::default()
+                        }),
+                        endpoint_configuration: EndpointOutputConfiguration {
+                            endpoint_name: measured.endpoint_name.clone(),
+                            variant_name: measured.variant_name.clone(),
+                            instance_type: (!measured.instance_type.is_empty())
+                                .then(|| measured.instance_type.clone()),
+                            initial_instance_count: None,
+                            serverless_config: None,
+                        },
+                        model_configuration: ModelConfiguration::default(),
+                        invocation_start_time: Some(crate::state::timestamp(job.creation_time)),
+                        invocation_end_time: job.completion_time.map(crate::state::timestamp),
+                    })
+                    .collect()
+            }),
+            // The load test measured each endpoint it benchmarked as the recommendation
+            // above reports it; no separate per-endpoint performance was measured beside it.
             endpoint_performances: None,
         };
         drop(store);

@@ -9,11 +9,25 @@
 //! clock (`crate::state::ProcessingJob::settle_status`) and materialised by
 //! `DescribeProcessingJob`. This is the ONLY file to touch for this operation.
 //!
-//! The job's container image is NOT run: this emulator has no container runtime, so the
-//! run ends in the modelled `Failed` status with
-//! `crate::state::NO_CONTAINER_RUNTIME_REASON`; see that constant for why nothing else
-//! would be honest. Everything around the run — accepting, validating, minting the ARN,
+//! The job's container PROGRAM is RUN, in process: the argument vector the
+//! `AppSpecification` declares is performed by the shared bounded shell session
+//! (`crate::state::run_container_program_off_worker`), its outcome is recorded on the stored
+//! job, and the clock reveals it — so the job ends `Completed` when that program exited zero
+//! and `Failed` with the `AlgorithmError` reason when it exited non-zero. A specification that
+//! declares no program names one this emulator cannot start, which is the could-not-run
+//! status. Everything around the run — accepting, validating, minting the ARN,
 //! replaying the job — is real.
+//!
+//! WHAT THAT PROGRAM CAN REACH, which is nothing of the machine: the session
+//! (`crate::state::container_run`, over `service_common::posix_shell_session`) has no host
+//! process to start, no host filesystem to open, no host environment to read and no socket —
+//! it performs a fixed catalog of session-local utilities over the real shell grammar's tree
+//! and NEVER performs a command outside that catalog, answering such a command the status a
+//! shell gives one it could not run. The vector's size is bounded where it is built
+//! (`crate::state::MAX_PROGRAM_WORDS` / `MAX_PROGRAM_WORD_BYTES`), the variables it starts
+//! with are the request's own declared `Environment` and nothing else, the work one run may do
+//! is bounded by that session's own command budget, and it is performed on the blocking pool
+//! so the request worker is released while it runs.
 //!
 //! ## Shape of an operation
 //!
@@ -207,10 +221,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn =
             crate::state::resource_arn(&region, "processing-job", &input.processing_job_name);
 
+        // The argument vector the `AppSpecification` declares, which is the program this job's
+        // container runs, and the image whose own entrypoint a job declaring no vector would
+        // have run. The program is performed BELOW, once the request has been admitted, so a
+        // request this operation refuses performs nothing at all.
+        let program = crate::state::container_program(
+            input.app_specification.container_entrypoint.as_deref(),
+            input.app_specification.container_arguments.as_deref(),
+        );
+        let image_uri = input.app_specification.image_uri.clone();
+
         let now = ::std::time::SystemTime::now();
         // Read from STS's and IAM's own records — other services' stores on the same engine
         // — BEFORE this service's store is reached.
         let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+        // The environment the declared program is given: the job's own, and nothing of this
+        // process's. Taken before the request's members are moved into the stored job.
+        let environment = input.environment.clone();
+        let tracked_component;
+        {
         let mut store = state.lock();
         // `ProcessingJobName`'s doc: "The name must be unique within an Amazon Web
         // Services Region in the Amazon Web Services account." A name already in use is
@@ -265,8 +294,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 failure_reason: None,
                 creation_time: now,
                 last_modified_time: now,
+                processing_start_time: None,
                 processing_end_time: None,
                 ends_at: now + crate::state::PROCESSING_JOB_ENDS_AFTER,
+                // Filled in by the run below, once it has reported.
+                run: None,
             },
         );
         // "Associates a SageMaker job as a trial component with an experiment and trial"
@@ -274,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // source-keyed listing of this job's ARN reports one and the named trial holds it.
         // Recorded through the ONE writer of a job's component, so every
         // `ExperimentConfig`-carrying create records it alike.
-        let tracked_component = input.experiment_config.as_ref().and_then(|config| {
+        tracked_component = input.experiment_config.as_ref().and_then(|config| {
             store.record_job_trial_component(
                 &region,
                 crate::state::TrackedJob {
@@ -287,7 +319,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             )
         });
-        drop(store);
+        }
+
+        // The job's own WORK, now that the request has been admitted: the declared program is
+        // performed off the request worker, and its outcome is RECORDED on the stored job
+        // rather than revealed — the terminal status is owed by the clock, which
+        // `ProcessingJob::settle_status` materialises, so a caller that describes the job
+        // straight after creating it still observes `InProgress`. A specification that declares
+        // no program at all, one past this emulator's ceilings on how many words a vector may
+        // carry and how long one may be, and one naming a program this emulator provides none
+        // for are all answered the same way: NOTHING is performed, so no exit status is claimed
+        // and the job fails with the reason naming what was not performed.
+        //
+        // A program that IS performed reaches nothing of the machine: it runs in the ONE
+        // bounded session this workspace performs caller-supplied shell text with, which has no
+        // host process, no host filesystem, no host environment and no socket, performs only
+        // its own catalog of session-local utilities, is bounded by that session's own command
+        // budget, and sees only the variables this request declared (see
+        // `crate::state::container_run`).
+        let outcome = crate::state::run_container_program_off_worker(
+            &program,
+            &image_uri,
+            environment.as_ref(),
+        )
+        .await;
+        {
+            let mut store = state.lock();
+            if let Some(job) = store.processing_jobs.get_mut(&input.processing_job_name) {
+                job.record_run(outcome, ::std::time::SystemTime::now());
+            }
+        }
 
         // The component the configuration brought into being is a resource of its own, so
         // it leaves the same record the job does.

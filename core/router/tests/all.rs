@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: this header, then one
+// `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under `tests/all/`, sorted by
+// name, and no other line — no prose between the pairs, no blank line, and nothing after the
+// last pair. Put a new suite at `tests/all/<name>.rs` and insert its pair where its name
+// sorts to, so two branches landing at once insert two lines in two places and have no prose
+// to duplicate, re-word or mistype, which is what had gone wrong here: both this header and
+// the tail of the list had grown hundreds of re-typed copies of these paragraphs.
 // Single integration-test target for the router: this header, the one inner attribute below
 // it, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
 // `tests/all/`, sorted by name, and no other line.
@@ -535,6 +542,8 @@ mod cloudformation_provisions_route53resolver_rules;
 mod cloudformation_provisions_s3tables_table_buckets;
 #[path = "all/cloudformation_provisions_s3vectors_resources.rs"]
 mod cloudformation_provisions_s3vectors_resources;
+#[path = "all/cloudformation_provisions_sagemaker_endpoint.rs"]
+mod cloudformation_provisions_sagemaker_endpoint;
 #[path = "all/cloudformation_provisions_sagemaker_model_package_group.rs"]
 mod cloudformation_provisions_sagemaker_model_package_group;
 #[path = "all/cloudformation_provisions_sagemaker_notebook_estate.rs"]

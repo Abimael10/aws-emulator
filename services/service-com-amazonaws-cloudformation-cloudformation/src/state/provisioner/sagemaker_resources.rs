@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The per-type provisioning arms of Amazon SageMaker AI's own control plane: the MODEL an
-//! `AWS::SageMaker::Model` declares, the NOTEBOOK INSTANCE an
+//! `AWS::SageMaker::Model` declares, the ENDPOINT CONFIGURATION an
+//! `AWS::SageMaker::EndpointConfig` declares, the ENDPOINT an `AWS::SageMaker::Endpoint`
+//! declares, the NOTEBOOK INSTANCE an
 //! `AWS::SageMaker::NotebookInstance` declares and the LIFECYCLE CONFIGURATION an
 //! `AWS::SageMaker::NotebookInstanceLifecycleConfig` declares. One file of [`super`]'s
 //! per-type arms, dispatched to by its `Provisioner`, beside the model-registry arm of the
@@ -70,6 +72,14 @@ pub(crate) const SAGEMAKER_MODEL: &str = "AWS::SageMaker::Model";
 /// `CreateNotebookInstance` launches.
 pub(crate) const SAGEMAKER_NOTEBOOK_INSTANCE: &str = "AWS::SageMaker::NotebookInstance";
 
+/// The type of a SageMaker ENDPOINT CONFIGURATION: the production variants
+/// `CreateEndpointConfig` registers, which an endpoint is created from.
+pub(crate) const SAGEMAKER_ENDPOINT_CONFIG: &str = "AWS::SageMaker::EndpointConfig";
+
+/// The type of a SageMaker ENDPOINT: the hosted endpoint `CreateEndpoint` provisions from one
+/// of those configurations, which `InvokeEndpoint` serves inferences from.
+pub(crate) const SAGEMAKER_ENDPOINT: &str = "AWS::SageMaker::Endpoint";
+
 /// The type of a notebook instance LIFECYCLE CONFIGURATION: the `OnCreate`/`OnStart` shell
 /// scripts a notebook instance's `LifecycleConfigName` names.
 pub(crate) const SAGEMAKER_NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG: &str =
@@ -112,6 +122,40 @@ const NOTEBOOK_INSTANCE_PROPERTIES: &[&str] = &[
     "VolumeSizeInGB",
 ];
 
+/// Every property `AWS::SageMaker::EndpointConfig` publishes, each a `CreateEndpointConfig`
+/// member of the same name (the asynchronous-inference and data-capture settings, the
+/// network-isolation switch, the configuration's name, the role its containers run as, the
+/// explainability settings, the KMS key, its production and shadow variants, its tags and its
+/// VPC configuration).
+const ENDPOINT_CONFIG_PROPERTIES: &[&str] = &[
+    "AsyncInferenceConfig",
+    "DataCaptureConfig",
+    "EnableNetworkIsolation",
+    "EndpointConfigName",
+    "ExecutionRoleArn",
+    "ExplainerConfig",
+    "KmsKeyId",
+    "ProductionVariants",
+    "ShadowProductionVariants",
+    "Tags",
+    "VpcConfig",
+];
+
+/// Every property `AWS::SageMaker::Endpoint` this arm APPLIES, each a `CreateEndpoint` member
+/// of the same name: the configuration the endpoint deploys, the endpoint's own name, the
+/// deployment settings and its tags.
+///
+/// The type also publishes `RetainAllVariantProperties` and
+/// `ExcludeRetainedVariantProperties`, which are `UpdateEndpoint` members rather than create
+/// members — nothing a create can carry — so a declaration stating one is REFUSED
+/// ([`refuse_unapplied_properties`]) rather than passed off as applied.
+const ENDPOINT_PROPERTIES: &[&str] = &[
+    "DeploymentConfig",
+    "EndpointConfigName",
+    "EndpointName",
+    "Tags",
+];
+
 /// Every property `AWS::SageMaker::NotebookInstanceLifecycleConfig` publishes: its name,
 /// the two hook lists and its tags, each a `CreateNotebookInstanceLifecycleConfig` member of
 /// the same name.
@@ -126,6 +170,8 @@ const NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_PROPERTIES: &[&str] = &[
 /// the declaration's own, or the generated one — rather than whatever the property document
 /// happens to hold.
 const MODEL_NAME: &str = "ModelName";
+const ENDPOINT_CONFIG_NAME: &str = "EndpointConfigName";
+const ENDPOINT_NAME: &str = "EndpointName";
 const NOTEBOOK_INSTANCE_NAME: &str = "NotebookInstanceName";
 const NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_NAME: &str = "NotebookInstanceLifecycleConfigName";
 
@@ -269,6 +315,274 @@ pub(super) async fn describe_sagemaker_model(
         ],
     )))
 }
+
+/// Create the endpoint configuration an `AWS::SageMaker::EndpointConfig` declares, so the
+/// `EndpointConfigName` an endpoint of the same stack names is one SageMaker holds — and so
+/// the variants it declares are the variants that endpoint deploys.
+///
+/// The declared properties ARE `CreateEndpointConfig`'s own members
+/// ([`ENDPOINT_CONFIG_PROPERTIES`]), with the configuration's NAME — this resource's physical
+/// id — set on the way out and the tag list carrying the tags CloudFormation gives the
+/// resource beside the declared ones.
+pub(super) async fn create_sagemaker_endpoint_config(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unapplied_properties(&resource.properties, resource, ENDPOINT_CONFIG_PROPERTIES)?;
+    let mut request = declared_document(resource);
+    request.insert(
+        ENDPOINT_CONFIG_NAME.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    // "Sets whether all model containers deployed to the endpoint are isolated": the member is
+    // a boolean, so a declaration spelling it as text is sent as the boolean it spells, read
+    // by the ONE reading this crate gives a template boolean.
+    if let Some(declared) = request.get("EnableNetworkIsolation").cloned() {
+        let isolated = declared_flag(&request, "EnableNetworkIsolation")
+            .ok_or_else(|| not_a(resource, "EnableNetworkIsolation", "boolean", &declared))?;
+        request.insert("EnableNetworkIsolation".to_string(), Value::Bool(isolated));
+    }
+    tagged(&mut request, &resource.properties, propagated);
+    call_sagemaker(ctx, region, "CreateEndpointConfig", &Value::Object(request)).await?;
+    // The configuration's own name is what `Ref` and `Fn::GetAtt EndpointConfigName` report,
+    // and the naming rules already computed it.
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Delete the endpoint configuration a stack created, on the same terms the model's delete is
+/// decided on: the operation models no not-found error, so "already gone" is settled by
+/// READING the configuration back rather than by matching a refusal's text.
+pub(super) async fn delete_sagemaker_endpoint_config(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ ENDPOINT_CONFIG_NAME: physical_resource_id });
+    let refusal = match call_sagemaker(ctx, region, "DeleteEndpointConfig", &request).await {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    if absent(call_sagemaker(ctx, region, "DescribeEndpointConfig", &request).await) {
+        return Ok(());
+    }
+    Err(refusal)
+}
+
+/// The endpoint configuration as SageMaker reports it, for drift detection.
+///
+/// `DescribeEndpointConfig` answers the declaration's own members under the same names; a
+/// configuration that service no longer holds answers `ValidationException`, which is the
+/// `DELETED` drift status.
+pub(super) async fn describe_sagemaker_endpoint_config(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ ENDPOINT_CONFIG_NAME: physical_resource_id });
+    let described = match call_sagemaker(ctx, region, "DescribeEndpointConfig", &request).await {
+        Ok(described) => described,
+        Err(refusal) if refusal.code == SAGEMAKER_VALIDATION_EXCEPTION => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    Ok(Some(reported_properties(
+        &described,
+        &[
+            ("AsyncInferenceConfig", "AsyncInferenceConfig"),
+            ("DataCaptureConfig", "DataCaptureConfig"),
+            ("EnableNetworkIsolation", "EnableNetworkIsolation"),
+            (ENDPOINT_CONFIG_NAME, ENDPOINT_CONFIG_NAME),
+            ("ExecutionRoleArn", "ExecutionRoleArn"),
+            ("ExplainerConfig", "ExplainerConfig"),
+            ("KmsKeyId", "KmsKeyId"),
+            ("ProductionVariants", "ProductionVariants"),
+            ("ShadowProductionVariants", "ShadowProductionVariants"),
+            ("VpcConfig", "VpcConfig"),
+        ],
+    )))
+}
+
+/// Create the endpoint an `AWS::SageMaker::Endpoint` declares, so a client that deployed the
+/// stack reads it back with `DescribeEndpoint`, attaches an inference component to it and
+/// invokes it — and so a declaration SageMaker will not accept (an endpoint configuration it
+/// holds none of) fails THAT resource with that service's own refusal instead of being
+/// reported deployed.
+///
+/// The declared properties ARE `CreateEndpoint`'s own members ([`ENDPOINT_PROPERTIES`]), with
+/// the endpoint's NAME — this resource's physical id — set on the way out and the tag list
+/// carrying the tags CloudFormation gives the resource beside the declared ones.
+pub(super) async fn create_sagemaker_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unapplied_properties(&resource.properties, resource, ENDPOINT_PROPERTIES)?;
+    let mut request = declared_document(resource);
+    request.insert(
+        ENDPOINT_NAME.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    tagged(&mut request, &resource.properties, propagated);
+    call_sagemaker(ctx, region, "CreateEndpoint", &Value::Object(request)).await?;
+    // The endpoint's own name is what `Ref` and `Fn::GetAtt EndpointName` report, and the
+    // naming rules already computed it; the create answers the ARN SageMaker built around
+    // that name, which this type publishes no return value for.
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Whether SageMaker reports the created endpoint ready for a client to use.
+///
+/// `CreateEndpoint` answers the endpoint [`ENDPOINT_STATUS_CREATING`] — SageMaker launches the
+/// ML compute instances of its production variants after the create has answered, and the
+/// endpoint serves no inference and takes no inference component until it is
+/// [`ENDPOINT_STATUS_IN_SERVICE`] — so the stack holds the resource's creation open until that
+/// service reports it there, in whichever non-terminal status it reports on the way. An
+/// endpoint it reports `Failed` is one nothing is going to bring up, so the resource fails with
+/// the `FailureReason` SageMaker gave; so is an endpoint that service holds none of.
+pub(super) async fn sagemaker_endpoint_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(described) = read_endpoint(ctx, region, physical_resource_id).await? else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon SageMaker holds no endpoint {physical_resource_id}"
+        )));
+    };
+    let status = described
+        .get("EndpointStatus")
+        .and_then(Value::as_str)
+        .filter(|status| !status.is_empty());
+    match status {
+        Some(ENDPOINT_STATUS_IN_SERVICE) => Ok(Readiness::Ready),
+        // The statuses a created or re-deployed endpoint is still coming up in: the wait stays
+        // open on the status that service reported, not on a constant.
+        Some(status @ (ENDPOINT_STATUS_CREATING | ENDPOINT_STATUS_UPDATING)) => {
+            Ok(Readiness::Pending(status.to_string()))
+        }
+        Some(other) => {
+            // `DescribeEndpoint$FailureReason` carries "if the status of the endpoint is
+            // Failed, the reason why it failed"; the status speaks for itself where that
+            // service reported no reason.
+            let reason = described.get("FailureReason").and_then(Value::as_str);
+            Ok(Readiness::Failed(match reason {
+                Some(reason) => format!(
+                    "Amazon SageMaker reports endpoint {physical_resource_id} as {other}: \
+                     {reason}"
+                ),
+                None => {
+                    format!("Amazon SageMaker reports endpoint {physical_resource_id} as {other}")
+                }
+            }))
+        }
+        None => Ok(Readiness::Failed(format!(
+            "Amazon SageMaker reports no status for endpoint {physical_resource_id}"
+        ))),
+    }
+}
+
+/// Delete the endpoint a stack created. `DeleteEndpoint` models no not-found error, so
+/// "already gone" is settled by READING the endpoint back.
+pub(super) async fn delete_sagemaker_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ ENDPOINT_NAME: physical_resource_id });
+    let refusal = match call_sagemaker(ctx, region, "DeleteEndpoint", &request).await {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    if read_endpoint(ctx, region, physical_resource_id).await?.is_none() {
+        return Ok(());
+    }
+    Err(refusal)
+}
+
+/// Whether SageMaker has finished removing a deleted endpoint.
+///
+/// "SageMaker frees up all of the resources that were deployed when the endpoint was created"
+/// (`DeleteEndpoint`), which it does after the delete has answered, so the endpoint is still
+/// described while that runs and the deletion is finished once that service no longer holds
+/// it — which is what keeps a stack from deleting the endpoint configuration an endpoint is
+/// still deployed from.
+pub(super) async fn sagemaker_endpoint_removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    let Some(described) = read_endpoint(ctx, region, physical_resource_id).await? else {
+        return Ok(Removal::Gone);
+    };
+    Ok(Removal::Pending(
+        described
+            .get("EndpointStatus")
+            .and_then(Value::as_str)
+            .unwrap_or(ENDPOINT_STATUS_DELETING)
+            .to_string(),
+    ))
+}
+
+/// The endpoint as SageMaker reports it, for drift detection: the configuration it is deployed
+/// from and its own name, which is the whole of what a declaration states besides its tags and
+/// the deployment settings that service does not report back. An endpoint that service no
+/// longer holds answers `ValidationException`, which is the `DELETED` drift status.
+pub(super) async fn describe_sagemaker_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let Some(described) = read_endpoint(ctx, region, physical_resource_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(reported_properties(
+        &described,
+        &[
+            (ENDPOINT_CONFIG_NAME, ENDPOINT_CONFIG_NAME),
+            (ENDPOINT_NAME, ENDPOINT_NAME),
+        ],
+    )))
+}
+
+/// What SageMaker reports about the endpoint `physical_resource_id`, or `None` for an endpoint
+/// it holds none of.
+///
+/// The ONE read behind [`sagemaker_endpoint_readiness`], [`delete_sagemaker_endpoint`],
+/// [`sagemaker_endpoint_removal`] and [`describe_sagemaker_endpoint`], so all four ask that
+/// service the same question and read its answer the same way. `DescribeEndpoint` models no
+/// not-found error, so absence is its `ValidationException` — judged on the CODE, never on the
+/// message, which carries the request's own name.
+async fn read_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ ENDPOINT_NAME: physical_resource_id });
+    match call_sagemaker(ctx, region, "DescribeEndpoint", &request).await {
+        Ok(described) => Ok(Some(described)),
+        Err(refusal) if refusal.code == SAGEMAKER_VALIDATION_EXCEPTION => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `EndpointStatus` an endpoint serving inferences is in: "InService", the status
+/// `CreateEndpoint` leaves the endpoint coming up towards and the one an invocation and an
+/// inference component need (`smithy_query(query="shape",shape="EndpointStatus")`).
+const ENDPOINT_STATUS_IN_SERVICE: &str = "InService";
+
+/// The `EndpointStatus` a created endpoint is answered in: "Creating", while SageMaker
+/// launches the ML compute instances of its production variants.
+const ENDPOINT_STATUS_CREATING: &str = "Creating";
+
+/// The `EndpointStatus` of an endpoint a deployment is being applied to, which is equally one
+/// a wait is still open on.
+const ENDPOINT_STATUS_UPDATING: &str = "Updating";
+
+/// The `EndpointStatus` an endpoint being taken away is in, which is what a removal still in
+/// flight reports.
+const ENDPOINT_STATUS_DELETING: &str = "Deleting";
 
 /// Create the notebook instance an `AWS::SageMaker::NotebookInstance` declares, so a client
 /// that deployed the stack reads it back with `DescribeNotebookInstance` and can mint a

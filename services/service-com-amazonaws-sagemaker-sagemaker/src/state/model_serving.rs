@@ -176,7 +176,8 @@ pub fn endpoint_serving_variants(
 /// "PrimaryContainer - The location of the primary docker image containing inference code"
 /// and `Containers` carries the pipeline's containers; either way the artifact a prediction is
 /// computed from is the `ModelDataUrl` the container names.
-fn model_artifact_url(model: &Model) -> Option<String> {
+#[must_use]
+pub fn model_artifact_url(model: &Model) -> Option<String> {
     let containers = model
         .primary_container
         .iter()

@@ -119,9 +119,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         BACKUP_VAULT => &["BackupVaultArn", "BackupVaultName"],
         "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
         SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
-        // Each of the three SageMaker AI types publishes the one attribute that carries the
+        // Each of the SageMaker AI types publishes the one attribute that carries the
         // resource's own name.
         crate::state::provisioner::sagemaker_resources::SAGEMAKER_MODEL => &["ModelName"],
+        crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT_CONFIG => {
+            &["EndpointConfigName"]
+        }
+        crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT => &["EndpointName"],
         crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE => {
             &["NotebookInstanceName"]
         }

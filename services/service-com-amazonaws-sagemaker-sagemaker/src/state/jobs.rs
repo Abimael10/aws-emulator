@@ -211,8 +211,8 @@ pub struct TrainingJob {
     pub entered: usize,
     /// The hyperparameter tuning job that launched this training job, when one did
     /// (`DescribeTrainingJob$TuningJobArn`). A training job a caller creates has no
-    /// parent, and nothing here launches one on a tuning job's behalf — which is why
-    /// [`ComAmazonawsSagemakerSagemakerState::parallel_training_jobs_in_use`] counts none.
+    /// parent; one a tuning job launched carries that job's ARN, which is also what
+    /// [`ComAmazonawsSagemakerSagemakerState::parallel_training_jobs_in_use`] counts.
     pub tuning_job_arn: Option<String>,
     /// The `CreateTrainingJob` request the job was accepted with, kept verbatim so
     /// `DescribeTrainingJob` replays what was stored rather than a reconstruction of it.
@@ -235,6 +235,60 @@ pub struct TrainingPhase {
 }
 
 impl TrainingJob {
+    /// The record an ACCEPTED training job is stored as: `InProgress` with nothing of its
+    /// work begun, the stages it will enter still to be laid out by [`Self::record_run`], and
+    /// the instant the clock owes its terminal status.
+    ///
+    /// The one constructor of a stored training job, so a job a caller's own
+    /// `CreateTrainingJob` admits and one a hyperparameter tuning job LAUNCHES are the same
+    /// record — the second differs only in the `TuningJobArn` of the job that launched it
+    /// (`DescribeTrainingJob$TuningJobArn`).
+    #[must_use]
+    pub fn accepted(
+        arn: String,
+        request: &crate::ops::types::CreateTrainingJobInput,
+        tuning_job_arn: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: request.training_job_name.clone(),
+            arn,
+            // AWS returns an accepted training job `InProgress` with nothing of its work
+            // begun, so the move out of it is owed by the clock rather than taken on the
+            // call that accepted it.
+            status: TRAINING_STATUS_IN_PROGRESS.to_string(),
+            secondary_status: Some(TRAINING_SECONDARY_STATUS_STARTING.to_string()),
+            creation_time: now,
+            last_modified_time: now,
+            training_end_time: None,
+            // A warm pool is the cluster KEPT ALIVE after a run finishes
+            // (`ResourceConfig$KeepAlivePeriodInSeconds`); no cluster is provisioned for this
+            // job, so there is none to retain and no retained billable time to report.
+            warm_pool_status: None,
+            training_plan_arn: request
+                .resource_config
+                .as_ref()
+                .and_then(|config| config.training_plan_arn.clone()),
+            failure_reason: None,
+            // Filled in by the job's run, once it has reported.
+            run: None,
+            training_start_time: None,
+            model_artifacts: None,
+            final_metrics: Vec::new(),
+            ends_at: now + TRAINING_JOB_ENDS_AFTER,
+            // The job is accepted in `Starting` and enters the stages of its work as its run
+            // reports them ([`Self::record_run`]).
+            phases: vec![TrainingPhase {
+                status: TRAINING_SECONDARY_STATUS_STARTING.to_string(),
+                starts_at: now,
+            }],
+            entered: 1,
+            tuning_job_arn,
+            tags: request.tags.clone().unwrap_or_default(),
+            request: request.clone(),
+        }
+    }
+
     /// Materialise the move out of a non-terminal status the clock already owes this job.
     ///
     /// This is the one write a reporting operation may make: the transition was due at
@@ -599,20 +653,28 @@ pub struct HyperParameterTuningJob {
     /// `HyperParameterTuningEndTime`: set when the job reaches a terminal status.
     pub end_time: Option<SystemTime>,
     pub settles_at: SystemTime,
+    /// What the job's own RUN produced ([`crate::state::TuningRunResult`]): the training jobs
+    /// it launched, which of them is best and when the last of them was over. Recorded by the
+    /// create that started it and revealed by the clock ([`Self::settle_status`]); `None`
+    /// while the run has not reported.
+    pub run: Option<crate::state::TuningRunResult>,
 }
 
 impl HyperParameterTuningJob {
-    /// Materialise the transition the clock already owes: `InProgress` -> `Failed` for a
-    /// job left to run, `Stopping` -> `Stopped` for one that was asked to stop.
+    /// Materialise the transition the clock already owes: `InProgress` -> the status the
+    /// job's own RUN produced, and `Stopping` -> `Stopped` for one that was asked to stop.
     ///
     /// The one write a reporting operation may make: the transition was due at
     /// `settles_at` whether or not anybody described the job, so the observer makes no
     /// difference to the result. The end and last-modified times move to the instant the
     /// transition was due rather than to "now", so they are stable across later reads.
     ///
-    /// A job left to run fails because this emulator launches no training job — see
-    /// [`NO_TRAINING_RUNNER_FAILURE_REASON`]; a job asked to stop carries no failure
-    /// reason, because stopping is what the caller asked for.
+    /// A job left to run ends `Completed` once one of the training jobs it launched completed
+    /// — the tuning job's work IS those training jobs — and `Failed` with the reason the first
+    /// of them reported when every one of them failed. A job asked to stop carries no failure
+    /// reason, because stopping is what the caller asked for. A job whose run has not reported
+    /// is not settled at all, however late the read is: the terminal status is the run's, so
+    /// there is none to materialise until the run has one.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
@@ -621,8 +683,16 @@ impl HyperParameterTuningJob {
         }
         match self.status.as_str() {
             TUNING_STATUS_IN_PROGRESS => {
-                self.status = TUNING_STATUS_FAILED.to_string();
-                self.failure_reason = Some(NO_TRAINING_RUNNER_FAILURE_REASON.to_string());
+                let Some(run) = self.run.as_ref() else {
+                    return false;
+                };
+                match run.failure_reason() {
+                    Some(reason) => {
+                        self.status = TUNING_STATUS_FAILED.to_string();
+                        self.failure_reason = Some(reason);
+                    }
+                    None => self.status = STATUS_COMPLETED.to_string(),
+                }
             }
             TUNING_STATUS_STOPPING => self.status = TUNING_STATUS_STOPPED.to_string(),
             _ => return false,
@@ -630,6 +700,20 @@ impl HyperParameterTuningJob {
         self.end_time = Some(self.settles_at);
         self.last_modified_time = self.settles_at;
         true
+    }
+
+    /// Record what the job's RUN produced, which is the training jobs it launched.
+    ///
+    /// The tuning job is a COMPOSITE of those jobs, so its own terminal status cannot fall due
+    /// before the last of them is over: the due instant is pushed out to
+    /// [`TUNING_JOB_SETTLES_AFTER`] past the end of their work. A job the caller has already
+    /// asked to stop keeps the due instant that stop set, because the terminal status it is
+    /// waiting for does not depend on what the abandoned run produced.
+    pub fn record_run(&mut self, run: crate::state::TuningRunResult) {
+        if self.status == TUNING_STATUS_IN_PROGRESS {
+            self.settles_at = run.children_end + TUNING_JOB_SETTLES_AFTER;
+        }
+        self.run = Some(run);
     }
 
     /// Whether the job has reached a status from which nothing more happens on its own.
@@ -701,8 +785,16 @@ pub struct ProcessingJob {
     pub failure_reason: Option<String>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
+    /// "The time at which the processing job started"
+    /// (`DescribeProcessingJob$ProcessingStartTime`): set once the clock has settled a job
+    /// whose container program RAN, and left absent for one whose program never started.
+    pub processing_start_time: Option<SystemTime>,
     pub processing_end_time: Option<SystemTime>,
     pub ends_at: SystemTime,
+    /// What the job's container PROGRAM did ([`crate::state::run_container_program`]),
+    /// recorded by the create that started it and revealed by the clock
+    /// ([`Self::settle_status`]). `None` while the create has not reported at all.
+    pub run: Option<crate::state::ContainerOutcome>,
 }
 
 impl ProcessingJob {
@@ -713,11 +805,14 @@ impl ProcessingJob {
     /// difference to the result. `LastModifiedTime` and `ProcessingEndTime` take the
     /// instant the move was due, not "now", so both are stable across later reads.
     ///
-    /// A job left to run ends in [`PROCESSING_STATUS_FAILED`] with
-    /// [`NO_CONTAINER_RUNTIME_REASON`]: nothing ran the job's container image, so no
-    /// `Completed` status, `ProcessingStartTime` or `ExitMessage` is invented for it. A
-    /// job the caller asked to stop ends in [`PROCESSING_STATUS_STOPPED`] with no failure
-    /// reason instead: stopping is what the caller asked for, not a failure.
+    /// A job left to run ends in the status its container PROGRAM produced ([`Self::run`]):
+    /// `Completed` for a program that exited zero, and [`PROCESSING_STATUS_FAILED`] with the
+    /// `AlgorithmError` reason ([`crate::state::algorithm_error`]) for one that exited
+    /// non-zero. A job whose program was never PERFORMED claims no exit status at all: it
+    /// fails with the reason naming what was not performed
+    /// ([`crate::state::ContainerOutcome::NotPerformed`]), and reports no instant its work
+    /// started. A job the caller asked to stop ends in [`PROCESSING_STATUS_STOPPED`] with no
+    /// failure reason instead: stopping is what the caller asked for, not a failure.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
@@ -726,8 +821,29 @@ impl ProcessingJob {
         }
         match self.status.as_str() {
             PROCESSING_STATUS_IN_PROGRESS => {
-                self.status = PROCESSING_STATUS_FAILED.to_string();
-                self.failure_reason = Some(NO_CONTAINER_RUNTIME_REASON.to_string());
+                // A job whose create never reported an outcome at all is the server's own
+                // failure, not a status the program produced.
+                let failure = match self.run.as_ref() {
+                    Some(outcome) => outcome.failure_reason(),
+                    None => Some(INTERNAL_FAILURE_REASON.to_string()),
+                };
+                match failure {
+                    Some(reason) => {
+                        self.status = PROCESSING_STATUS_FAILED.to_string();
+                        self.failure_reason = Some(reason);
+                    }
+                    None => self.status = STATUS_COMPLETED.to_string(),
+                }
+                // "The time at which the processing job started": the program's work began
+                // once the job was accepted, so a job whose program ran reports that instant
+                // and one whose program was never performed reports none.
+                if self
+                    .run
+                    .as_ref()
+                    .is_some_and(crate::state::ContainerOutcome::performed)
+                {
+                    self.processing_start_time = Some(self.creation_time);
+                }
             }
             PROCESSING_STATUS_STOPPING => {
                 self.status = PROCESSING_STATUS_STOPPED.to_string();
@@ -736,8 +852,7 @@ impl ProcessingJob {
             _ => return false,
         }
         // The instant the run ended, which is when the move was due rather than "now", so
-        // both are stable across later reads. No start time is recorded beside it: the
-        // container never started.
+        // both are stable across later reads.
         self.processing_end_time = Some(self.ends_at);
         self.last_modified_time = self.ends_at;
         true
@@ -758,6 +873,19 @@ impl ProcessingJob {
         self.status == PROCESSING_STATUS_STOPPING
     }
 
+    /// Record what the job's container PROGRAM did, `at` the instant it reported.
+    ///
+    /// `None` is a run that could not be carried out in this process at all, which is the
+    /// server's own failure rather than anything the program produced. The clock cannot owe the
+    /// job its terminal status before the program is over, so a run that took longer than
+    /// [`PROCESSING_JOB_ENDS_AFTER`] pushes the due instant out to the moment it reported.
+    pub fn record_run(&mut self, run: Option<crate::state::ContainerOutcome>, at: SystemTime) {
+        if self.status == PROCESSING_STATUS_IN_PROGRESS {
+            self.ends_at = self.ends_at.max(at);
+        }
+        self.run = run;
+    }
+
     /// Record that the caller asked this job to stop: it moves to the transient
     /// `Stopping` now, and the clock owes it `Stopped` at
     /// [`PROCESSING_JOB_STOPS_AFTER`]. The span is never zero, so the transient status is
@@ -767,6 +895,7 @@ impl ProcessingJob {
         // The run is being abandoned on request, not failing, so nothing is reported
         // beside `Stopping` or the `Stopped` that follows it.
         self.failure_reason = None;
+        self.processing_start_time = None;
         self.processing_end_time = None;
         self.last_modified_time = now;
         self.ends_at = now + PROCESSING_JOB_STOPS_AFTER;
@@ -788,7 +917,9 @@ pub const INFERENCE_RECOMMENDATIONS_JOB_QUOTA: usize = 1_000;
 /// `STOPPED`, `DELETING` and `DELETED`, which this slice does not reach). Named once
 /// here so no handler compares a bare string literal.
 pub const RECOMMENDATION_JOB_STATUS_PENDING: &str = "PENDING";
-/// See [`RECOMMENDATION_JOB_STATUS_PENDING`].
+/// Why a recommendation job's own benchmark could not run is the job's `FailureReason`
+/// ([`crate::state::RecommendationRunOutcome`]); a job whose benchmark measured a
+/// recommendation ends in [`RECOMMENDATION_JOB_STATUS_COMPLETED`].
 pub const RECOMMENDATION_JOB_STATUS_FAILED: &str = "FAILED";
 
 /// How long after `CreateInferenceRecommendationsJob` the clock owes the job's move out
@@ -806,22 +937,6 @@ pub const RECOMMENDATION_JOB_SETTLES_AFTER: Duration = Duration::from_millis(400
 /// seconds." The model constrains the member only from below (`range 1..`), so the
 /// ceiling is enforced in the handler.
 pub const MAX_RECOMMENDATION_JOB_DURATION_IN_SECONDS: i32 = 18_000;
-
-/// Why a recommendation job this emulator accepted ends in the modelled `FAILED` status.
-///
-/// An Inference Recommender job provisions endpoints, replays the job's sample payload
-/// against the model's inference container under the requested traffic pattern and
-/// reports the latency, throughput and cost it measured. This emulator runs no inference
-/// container and generates no load, so nothing is measured: reporting `COMPLETED` with
-/// `InferenceRecommendations` or `EndpointPerformances` would be metrics synthesised to
-/// look computed, which the engine contract (`vendor/engine/src/lib.rs`) forbids. The run
-/// therefore ends in the status the model carries for a job that produced no
-/// recommendation, with this reason saying why. Everything around the run — accepting the
-/// job, validating it, minting its ARN, replaying it, reporting its terminal status — is
-/// real.
-pub const NO_INFERENCE_BENCHMARK_REASON: &str =
-    "This emulator runs no model inference container and generates no benchmark traffic, so \
-     no load test was performed and no inference recommendation was measured.";
 
 /// How the recommendation surfaces OVER a job state that the job itself is not there:
 /// the entity as the service words it, the `JobName` the request carried, and
@@ -874,11 +989,10 @@ pub const NEITHER_RECOMMENDATION_ID_NOR_ENDPOINT_NAME: &str =
 /// neither), the way [`CodeRepository`] stores its tags.
 ///
 /// `recommendations` holds what the job MEASURED, which
-/// `GetScalingConfigurationRecommendation` computes a scaling configuration from. It is
-/// empty for a job this service accepted, because this emulator serves no model inference
-/// container and generates no benchmark traffic (see
-/// [`NO_INFERENCE_BENCHMARK_REASON`]); nothing synthesises an entry, and a reader with no
-/// entry to answer from refuses rather than inventing one.
+/// `GetScalingConfigurationRecommendation` computes a scaling configuration from: the
+/// benchmark the create performed ([`crate::state::run_inference_recommendations_job`])
+/// records it, and the clock reveals it. A job whose benchmark measured nothing holds none,
+/// and a reader with no entry to answer from refuses rather than inventing one.
 #[derive(Debug, Clone)]
 pub struct InferenceRecommendationsJob {
     pub name: String,
@@ -897,6 +1011,9 @@ pub struct InferenceRecommendationsJob {
     pub completion_time: Option<SystemTime>,
     pub ends_at: SystemTime,
     pub recommendations: Vec<InferenceRecommendation>,
+    /// What the job's own BENCHMARK reported, recorded by the create that performed it and
+    /// revealed by the clock ([`Self::settle_status`]). `None` while it has not reported.
+    pub run: Option<crate::state::RecommendationRunOutcome>,
 }
 
 impl InferenceRecommendationsJob {
@@ -931,6 +1048,9 @@ impl InferenceRecommendationsJob {
             completion_time: Some(creation_time),
             ends_at: creation_time,
             recommendations,
+            // No create call accepted this job, so no benchmark of its own reported for it;
+            // the results above are what the store was given.
+            run: None,
         }
     }
     /// Materialise the move out of `PENDING` the clock already owes.
@@ -940,20 +1060,43 @@ impl InferenceRecommendationsJob {
     /// difference to the result. `LastModifiedTime` and `CompletionTime` take the instant
     /// the move was due, not "now", so both are stable across later reads.
     ///
-    /// The terminal status is [`RECOMMENDATION_JOB_STATUS_FAILED`] with
-    /// [`NO_INFERENCE_BENCHMARK_REASON`]: see that constant for why a job this emulator
-    /// accepted cannot end `COMPLETED`.
+    /// The terminal status is the one the job's own BENCHMARK produced:
+    /// [`RECOMMENDATION_JOB_STATUS_COMPLETED`] with the recommendations it measured, or
+    /// [`RECOMMENDATION_JOB_STATUS_FAILED`] with the condition that stopped it. A job whose
+    /// benchmark has not reported is not settled at all, however late the read is.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == RECOMMENDATION_JOB_STATUS_PENDING && now >= self.ends_at {
-            self.status = RECOMMENDATION_JOB_STATUS_FAILED.to_string();
-            self.failure_reason = Some(NO_INFERENCE_BENCHMARK_REASON.to_string());
-            self.completion_time = Some(self.ends_at);
-            self.last_modified_time = self.ends_at;
-            return true;
+        if self.status != RECOMMENDATION_JOB_STATUS_PENDING || now < self.ends_at {
+            return false;
         }
-        false
+        match self.run.clone() {
+            Some(crate::state::RecommendationRunOutcome::Completed(measured)) => {
+                self.status = RECOMMENDATION_JOB_STATUS_COMPLETED.to_string();
+                self.recommendations = measured;
+            }
+            Some(crate::state::RecommendationRunOutcome::Failed { reason }) => {
+                self.status = RECOMMENDATION_JOB_STATUS_FAILED.to_string();
+                self.failure_reason = Some(reason);
+            }
+            // The benchmark has not reported: nothing is owed until it does.
+            None => return false,
+        }
+        self.completion_time = Some(self.ends_at);
+        self.last_modified_time = self.ends_at;
+        true
+    }
+
+    /// Record what the job's BENCHMARK reported, `at` the instant it reported.
+    ///
+    /// The clock cannot owe the job its terminal status before the benchmark is over, so a
+    /// benchmark that took longer than [`RECOMMENDATION_JOB_SETTLES_AFTER`] pushes the due
+    /// instant out to the moment it reported.
+    pub fn record_run(&mut self, outcome: crate::state::RecommendationRunOutcome, at: SystemTime) {
+        if self.status == RECOMMENDATION_JOB_STATUS_PENDING {
+            self.ends_at = self.ends_at.max(at);
+        }
+        self.run = Some(outcome);
     }
 }
 

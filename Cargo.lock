@@ -19441,6 +19441,7 @@ dependencies = [
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
+ "shell-words",
  "tar",
  "tokio",
  "tracing",

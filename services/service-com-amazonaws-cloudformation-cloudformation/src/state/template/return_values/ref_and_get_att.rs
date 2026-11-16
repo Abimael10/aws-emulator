@@ -134,7 +134,7 @@ pub(crate) fn return_values(
             attributes.insert("Name".to_string(), machine);
             (arn, attributes)
         }
-        // The three Amazon SageMaker AI types `super::provisioning` creates in SageMaker
+        // The Amazon SageMaker AI types `super::provisioning` creates in SageMaker
         // itself ([`crate::state::provisioner::sagemaker_resources`]). Each publishes ONE
         // `Fn::GetAtt` attribute, which is the resource's own NAME — `ModelName` ("the name
         // of the model"), `NotebookInstanceName` ("the name of the notebook instance") and
@@ -153,6 +153,19 @@ pub(crate) fn return_values(
         // value for it.
         crate::state::provisioner::sagemaker_resources::SAGEMAKER_MODEL => {
             attributes.insert("ModelName".to_string(), name.to_string());
+            (name.to_string(), attributes)
+        }
+        // The endpoint pair publishes its own name the same way: `EndpointConfigName` ("the
+        // name of the endpoint configuration") and `EndpointName` ("the name of the
+        // endpoint"), each the name every SageMaker call addresses that resource by —
+        // `CreateEndpoint` takes an `EndpointConfigName`, and `DescribeEndpoint`,
+        // `InvokeEndpoint` and `CreateInferenceComponent` an `EndpointName`.
+        crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT_CONFIG => {
+            attributes.insert("EndpointConfigName".to_string(), name.to_string());
+            (name.to_string(), attributes)
+        }
+        crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT => {
+            attributes.insert("EndpointName".to_string(), name.to_string());
             (name.to_string(), attributes)
         }
         crate::state::provisioner::sagemaker_resources::SAGEMAKER_NOTEBOOK_INSTANCE => {

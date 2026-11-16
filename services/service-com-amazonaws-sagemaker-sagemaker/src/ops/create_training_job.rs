@@ -611,48 +611,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             store.training_jobs.insert(
                 input.training_job_name.clone(),
-                crate::state::TrainingJob {
-                    name: input.training_job_name.clone(),
-                    arn: arn.clone(),
-                    // AWS returns an accepted training job `InProgress` with nothing of its
-                    // work begun, so the move out of it is owed by the clock rather than
-                    // taken on this call.
-                    status: crate::state::TRAINING_STATUS_IN_PROGRESS.to_string(),
-                    secondary_status: Some(
-                        crate::state::TRAINING_SECONDARY_STATUS_STARTING.to_string(),
-                    ),
-                    creation_time: now,
-                    last_modified_time: now,
-                    training_end_time: None,
-                    // A warm pool is the cluster KEPT ALIVE after a run finishes
-                    // (`ResourceConfig$KeepAlivePeriodInSeconds`); no cluster is provisioned
-                    // for this job, so there is none to retain and no retained billable time
-                    // to report.
-                    warm_pool_status: None,
-                    training_plan_arn: input
-                        .resource_config
-                        .as_ref()
-                        .and_then(|config| config.training_plan_arn.clone()),
-                    failure_reason: None,
-                    // Filled in by the run below, once it has reported.
-                    run: None,
-                    training_start_time: None,
-                    model_artifacts: None,
-                    final_metrics: Vec::new(),
-                    ends_at: now + crate::state::TRAINING_JOB_ENDS_AFTER,
-                    // The job is accepted in `Starting` and enters the stages of its work as
-                    // its run reports them (`crate::state::TrainingJob::record_run`).
-                    phases: vec![crate::state::TrainingPhase {
-                        status: crate::state::TRAINING_SECONDARY_STATUS_STARTING.to_string(),
-                        starts_at: now,
-                    }],
-                    entered: 1,
-                    // Set only on a training job a tuning job launched; a caller's own create
-                    // has no parent.
-                    tuning_job_arn: None,
-                    tags: input.tags.clone().unwrap_or_default(),
-                    request: input.clone(),
-                },
+                // The ONE constructor of a stored training job, so a job admitted here and
+                // one a hyperparameter tuning job launches are the same record. A caller's
+                // own create has no parent tuning job.
+                crate::state::TrainingJob::accepted(arn.clone(), &input, None, now),
             );
 
             // "Associates a SageMaker job as a trial component with an experiment and
