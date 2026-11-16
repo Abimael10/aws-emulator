@@ -74,8 +74,17 @@ use crate::ops::types::{
 
 use super::property_graph::{GraphWriteError, PropertyGraph};
 
+mod plan;
+mod request;
 mod values;
 
+pub use plan::{
+    explain_query, BranchRun, ExplainMode, RunTrace, StepRun, OPEN_CYPHER_EXPLAIN_MODES,
+};
+pub use request::{
+    query_outcome, query_refusal, request_parameters, QueryRefusal, OPEN_CYPHER_QUERY_MEMBER,
+    PARAMETERS_MEMBER,
+};
 pub use values::{is_aggregate, CypherValue, Row};
 
 use values::{created_labels, group_key, order, property_json, row_bytes, truth, Reader};
@@ -583,6 +592,10 @@ pub fn run_query(
                     source,
                     parameters,
                     budget: Budget::of(MAX_QUERY_WORK_UNITS, deadline),
+                    // A query answered through the query endpoint is run UNTRACED: the
+                    // per-operator measurements only an explain reports are only taken
+                    // when one is asked for.
+                    trace: None,
                 };
                 let result = run.execute(&parsed)?;
                 let rendered = run.rendered(&result)?;
@@ -801,6 +814,11 @@ struct QueryRun<'run> {
     parameters: BTreeMap<String, Value>,
     /// What this run may still spend.
     budget: Budget,
+    /// What each operator of the pipeline did, for a run that is being traced — which is
+    /// what an explain in a measuring mode reports from. `None` for an untraced run, and
+    /// nothing in the evaluation reads it: it is written to and never branched on, so a
+    /// traced run answers exactly what an untraced one answers.
+    trace: Option<RunTrace>,
 }
 
 /// What one projected item answers: a variable already in scope (`RETURN *`), or an
@@ -826,9 +844,20 @@ impl Executor for QueryRun<'_> {
                     "All sub queries in an UNION must have the same column names".to_string(),
                 ));
             }
+            let units_in = answered.rows.len().saturating_add(more.rows.len());
+            let started = ::std::time::Instant::now();
             answered.rows.extend(more.rows);
             if !union.all {
                 answered.rows = self.distinct(&answered.columns, answered.rows);
+            }
+            let elapsed = started.elapsed();
+            let units_out = answered.rows.len();
+            if let Some(trace) = &mut self.trace {
+                trace.merge(StepRun {
+                    units_in,
+                    units_out,
+                    elapsed,
+                });
             }
             self.check_rows(answered.rows.len())?;
         }
@@ -853,7 +882,15 @@ impl QueryRun<'_> {
     /// which is what makes a query with no reading clause answer one row — and each
     /// clause reads the rows before it and answers the rows after it.
     fn run_single(&mut self, single: &SingleQuery) -> Result<ResultSet, QueryFailure> {
+        let injected = Instant::now();
         let mut rows: Vec<Row> = vec![Row::new()];
+        if let Some(trace) = &mut self.trace {
+            trace.begin_branch(StepRun {
+                units_in: 0,
+                units_out: rows.len(),
+                elapsed: injected.elapsed(),
+            });
+        }
         let mut answered: Option<ResultSet> = None;
         for clause in &single.clauses {
             self.budget.charge(1)?;
@@ -862,6 +899,8 @@ impl QueryRun<'_> {
                     "RETURN can only be used at the end of a query".to_string(),
                 ));
             }
+            let units_in = rows.len();
+            let started = Instant::now();
             rows = match clause {
                 Clause::Match(matching) => self.run_match(matching, rows)?,
                 Clause::Unwind(unwind) => self.run_unwind(unwind, rows)?,
@@ -905,6 +944,19 @@ impl QueryRun<'_> {
                     })
                 }
             };
+            let elapsed = started.elapsed();
+            if let Some(trace) = &mut self.trace {
+                // A `RETURN` answers the result set rather than more rows, so what it
+                // answered is counted off that set.
+                let units_out = answered
+                    .as_ref()
+                    .map_or(rows.len(), |result| result.rows.len());
+                trace.clause(StepRun {
+                    units_in,
+                    units_out,
+                    elapsed,
+                });
+            }
             self.check_rows(rows.len())?;
         }
         // A query with no `RETURN` answers no rows, which is what a write-only query

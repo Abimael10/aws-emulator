@@ -157,6 +157,37 @@ impl PropertyGraph {
         self.relationships.len()
     }
 
+    /// How many nodes the store holds carrying each label, by label.
+    ///
+    /// ONE pass over the store answers every label at once, so a caller asking about many
+    /// labels costs no more than a caller asking about one: the work is bounded by what the
+    /// store holds ([`MAX_NODES`] nodes of at most [`MAX_LABELS_PER_NODE`] labels each) and
+    /// not by the request. A label no node carries is absent from the map, which is the
+    /// count zero.
+    #[must_use]
+    pub fn label_counts(&self) -> BTreeMap<String, usize> {
+        let mut counted: BTreeMap<String, usize> = BTreeMap::new();
+        for node in self.nodes.values() {
+            for label in &node.labels {
+                *counted.entry(label.clone()).or_default() += 1;
+            }
+        }
+        counted
+    }
+
+    /// How many relationships the store holds of each type, by type. One pass, for the same
+    /// reason [`Self::label_counts`] takes one.
+    #[must_use]
+    pub fn relationship_type_counts(&self) -> BTreeMap<String, usize> {
+        let mut counted: BTreeMap<String, usize> = BTreeMap::new();
+        for relationship in self.relationships.values() {
+            *counted
+                .entry(relationship.rel_type.clone())
+                .or_default() += 1;
+        }
+        counted
+    }
+
     /// How many bytes of element data the store holds: every id, label, relationship
     /// type, endpoint id and property it keeps.
     #[must_use]

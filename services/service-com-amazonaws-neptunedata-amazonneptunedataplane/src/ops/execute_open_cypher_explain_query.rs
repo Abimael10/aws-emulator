@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteOpenCypherExplainQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteOpenCypherExplainQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! This operation PLANS the submitted openCypher query and reports how this engine
+//! answers it: the text is read by a real openCypher parser, and the plan reported is the
+//! operator pipeline the query compiles to (see [`crate::state::explain_query`]). In the
+//! `dynamic` and `details` modes the query is EVALUATED against the stored graph and the
+//! report carries what each operator did — the solutions it was handed, the solutions it
+//! answered and how long it took — so no number in a report is synthesised: `static`
+//! measures nothing and reports no measurement.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteOpenCypherExplainQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is a READ (`@readonly` in the model), so nothing it does changes what a
+//! later caller sees: an explain of a query that WRITES is evaluated against a copy of the
+//! graph that is dropped when the report is written, and the query is not recorded in the
+//! openCypher query registry the status family reports from, which holds the queries the
+//! engine was asked to ANSWER.
+//!
+//! What the modelled contract below says about IAM (the `neptune-db:ReadDataViaQuery`
+//! action a cluster with IAM authentication enabled requires, and the
+//! `neptune-db:QueryLanguage:OpenCypher` condition key) is NOT enforced here, and no
+//! handler in this emulator evaluates a policy: it verifies a request's signature and
+//! serves it.
 //!
 //! ## Shape of an operation
 //!
@@ -181,6 +191,11 @@ impl<Eng> ExecuteOpenCypherExplainQuery<Eng> {
     }
 }
 
+/// The input member the explain mode arrives in, by its wire name (`explainMode`'s
+/// `jsonName`), which is the name a refusal has to name for the caller to fix the request
+/// from it.
+const EXPLAIN_MODE_MEMBER: &str = "explain";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ExecuteOpenCypherExplainQuery<Eng>
 {
@@ -198,18 +213,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteOpenCypherExplainQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteOpenCypherExplainQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteOpenCypherExplainQuery"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input, "store-unavailable");
+            return Err(
+                ExecuteOpenCypherExplainQueryErrorModeled::FailureByQueryException(
+                    crate::state::store_unavailable_failure(),
+                )
+                .into(),
+            );
+        };
+
+        // The member is required, so it is here — but a blank one carries no query, and
+        // an explain endpoint with nothing to explain is the parameter being missing.
+        if input.open_cypher_query.trim().is_empty() {
+            record_access(ctx, &input, "missing-query");
+            return Err(
+                ExecuteOpenCypherExplainQueryErrorModeled::MissingParameterException(
+                    crate::state::missing_parameter(crate::state::OPEN_CYPHER_QUERY_MEMBER),
+                )
+                .into(),
+            );
+        }
+
+        // `explainMode` is a modelled enum, so a value outside it names no mode: the
+        // caller is told which member was wrong and what it takes.
+        let Some(mode) = crate::state::ExplainMode::read(input.explain_mode.trim()) else {
+            record_access(ctx, &input, "invalid-explain-mode");
+            return Err(
+                ExecuteOpenCypherExplainQueryErrorModeled::InvalidParameterException(
+                    crate::state::invalid_open_cypher_parameters(&format!(
+                        "Supplied {EXPLAIN_MODE_MEMBER} {} is not an openCypher explain \
+                         mode, which is one of: {}",
+                        crate::state::echoed(&input.explain_mode),
+                        crate::state::OPEN_CYPHER_EXPLAIN_MODES.join(", ")
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        let parameters = match crate::state::request_parameters(input.parameters.as_deref()) {
+            Ok(parameters) => parameters,
+            Err(reason) => {
+                record_access(ctx, &input, "invalid-parameters");
+                return Err(
+                    ExecuteOpenCypherExplainQueryErrorModeled::InvalidParameterException(
+                        crate::state::invalid_open_cypher_parameters(&reason),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // Reading the query and planning it are CPU-bound, and a measuring mode evaluates
+        // the query while holding the store's lock, so the work runs on the blocking pool
+        // rather than on the worker serving this request: the `.await` below is a real
+        // yield point, so health checks, request timeouts and a graceful shutdown go on
+        // working while an explain runs.
+        let store = state.clone();
+        let text = input.open_cypher_query.clone();
+        let explained = ::tokio::task::spawn_blocking(move || {
+            let mut held = store.lock();
+            // The span starts when the run does: neither the wait for a free thread nor
+            // the wait for the store's lock comes out of the budget the query is given.
+            let deadline = ::std::time::Instant::now() + crate::state::QUERY_RUN_TIMEOUT;
+            crate::state::explain_query(&mut held.graph, &text, parameters, mode, deadline)
+        })
+        .await
+        .unwrap_or_else(|joined| {
+            Err(crate::state::QueryFailure::Interrupted(format!(
+                "the openCypher engine did not finish explaining this query: {joined}"
+            )))
+        });
+
+        match explained {
+            Ok(report) => {
+                record_access(ctx, &input, "explained");
+                Ok(ExecuteOpenCypherExplainQueryOutput {
+                    // `results` is the text blob the explain results are carried in.
+                    results: report.into_bytes(),
+                })
+            }
+            Err(failure) => {
+                record_access(ctx, &input, crate::state::query_outcome(&failure));
+                Err(refusal(failure))
+            }
+        }
     }
+}
+
+/// The modelled error one failure is reported through, lifted into this operation's error
+/// channel. Which error states which fact is the openCypher endpoints' shared reading of
+/// a failure ([`crate::state::query_refusal`]), so this endpoint and the one that
+/// evaluates a query refuse the same query the same way.
+fn refusal(failure: crate::state::QueryFailure) -> ExecuteOpenCypherExplainQueryError {
+    use crate::state::QueryRefusal;
+    match crate::state::query_refusal(failure) {
+        QueryRefusal::Malformed(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::MalformedQueryException(payload)
+        }
+        QueryRefusal::Unsupported(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::UnsupportedOperationException(payload)
+        }
+        QueryRefusal::Constraint(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::ConstraintViolationException(payload)
+        }
+        QueryRefusal::InvalidParameter(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::InvalidParameterException(payload)
+        }
+        QueryRefusal::TooLarge(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::QueryTooLargeException(payload)
+        }
+        QueryRefusal::Limit(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::QueryLimitException(payload)
+        }
+        QueryRefusal::TimeLimit(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::TimeLimitExceededException(payload)
+        }
+        QueryRefusal::Memory(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::MemoryLimitExceededException(payload)
+        }
+        QueryRefusal::Failure(payload) => {
+            ExecuteOpenCypherExplainQueryErrorModeled::FailureByQueryException(payload)
+        }
+    }
+    .into()
+}
+
+/// Record one explain request: what was asked (the method, the URI, the mode, how long the
+/// query was and whether it carried parameters), who asked (the access key the request
+/// presented), and how it ended — refusals included.
+///
+/// The query itself and its parameters are deliberately absent: both carry the caller's
+/// own data, and a log is a file. Their LENGTH is recorded instead, which is what tells an
+/// oversized request from an empty one, and no secret is recorded (the access key id is an
+/// identifier, never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    input: &ExecuteOpenCypherExplainQueryInput,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "ExecuteOpenCypherExplainQuery",
+        method = %parts.method,
+        uri = %parts.uri,
+        explain_mode = %input.explain_mode,
+        query_length = input.open_cypher_query.len(),
+        parameters_length = input.parameters.as_ref().map_or(0, String::len),
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata execute openCypher explain query"
+    );
 }

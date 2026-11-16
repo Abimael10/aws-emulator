@@ -38,6 +38,12 @@
 //! `ExecuteOpenCypherQuery` is the one operation that both reads and writes the graph: it
 //! parses the submitted query with a real openCypher parser and evaluates it against
 //! [`PropertyGraph`], so what a query answers is what this store holds.
+//!
+//! `ExecuteOpenCypherExplainQuery` reports the PLAN for a query (see
+//! [`open_cypher::explain_query`]) and changes nothing: it is a read, so the query it
+//! explains is not recorded in the openCypher registry, and the modes that report what an
+//! evaluation measured evaluate a query that writes against a copy of the graph which is
+//! dropped when the report is written.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

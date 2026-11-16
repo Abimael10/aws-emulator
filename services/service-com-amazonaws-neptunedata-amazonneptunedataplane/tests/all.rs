@@ -19,6 +19,8 @@ mod gremlin_explain;
 mod loader_jobs;
 #[path = "all/neptune_data_plane.rs"]
 mod neptune_data_plane;
+#[path = "all/open_cypher_explain.rs"]
+mod open_cypher_explain;
 #[path = "all/open_cypher_query.rs"]
 mod open_cypher_query;
 #[path = "all/refusal_paths.rs"]
