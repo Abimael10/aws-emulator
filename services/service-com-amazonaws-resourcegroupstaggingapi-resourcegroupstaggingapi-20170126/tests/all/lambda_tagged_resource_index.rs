@@ -16,8 +16,9 @@
 //! resource type holds the tags (and with it the ARN form and the resource-type
 //! key), how many tags a create carried, a resource carrying none at all, the key
 //! and value a filter selects by, how a match set is paged, which Region a
-//! resource lives in, and each form of ARN that names no tag set. The function
-//! carrying one colon-bearing key is one row of each.
+//! resource lives in, which plane WROTE the tag set and which took it away, and
+//! each form of ARN that names no tag set. The function carrying one
+//! colon-bearing key is one row of each.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1159,5 +1160,398 @@ async fn the_clause_about_the_tags_map_quotes_the_map_the_request_carried() {
             held.is_empty(),
             "case {case:?}: a refused request writes no tag, got {held:?}"
         );
+    }
+}
+
+/// `lambda:TagResource` on `arn` — the OWNING service's own tag write
+/// (`smithy_query(query="operation", operation="TagResource")`:
+/// `POST /2017-03-31/tags/{Resource}`, answering 204).
+async fn lambda_tag_resource(router: &MultiServiceRouter, arn: &str, tags: &[(&str, &str)]) {
+    lambda_ok(
+        router,
+        REGION,
+        "POST",
+        &format!("/2017-03-31/tags/{arn}"),
+        &json!({ "Tags": tag_object(tags) }),
+        204,
+    )
+    .await;
+}
+
+/// `lambda:UntagResource` on `arn`. Its `TagKeys` is bound to the `tagKeys` query
+/// parameter (`smithy_query(query="operation", operation="UntagResource")`:
+/// `DELETE /2017-03-31/tags/{Resource}`, answering 204), so each key is one
+/// repetition of it.
+async fn lambda_untag_resource(router: &MultiServiceRouter, arn: &str, keys: &[&str]) {
+    let query = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "tagKeys={}",
+                percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC)
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("&");
+    lambda_ok(
+        router,
+        REGION,
+        "DELETE",
+        &format!("/2017-03-31/tags/{arn}?{query}"),
+        &Value::Null,
+        204,
+    )
+    .await;
+}
+
+/// Which plane wrote the tags a resource carries beside the ones its create
+/// recorded — the dimension the rule below generalises over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePlane {
+    /// No write after the create: the tag set is the one `CreateFunction`'s
+    /// `Tags` recorded.
+    CreateOnly,
+    /// The owning service's OWN `TagResource`.
+    Owner,
+    /// This API's `TagResources`.
+    ThisApi,
+}
+
+/// One tag set and the plane that wrote the part of it the create did not.
+struct WriteRow {
+    case: &'static str,
+    /// The tags `CreateFunction` carried.
+    created: &'static [(&'static str, &'static str)],
+    plane: WritePlane,
+    /// The tags that plane wrote after the create.
+    written: &'static [(&'static str, &'static str)],
+}
+
+/// The write planes, spanning how many tags the write carries, whether the create
+/// carried any, and whether the write ADDS a key or replaces one the resource
+/// already held.
+fn write_rows() -> Vec<WriteRow> {
+    vec![
+        WriteRow {
+            case: "the create alone carries the colon-bearing key",
+            created: &[(BLUEPRINT_KEY, "blank-python")],
+            plane: WritePlane::CreateOnly,
+            written: &[],
+        },
+        WriteRow {
+            case: "the owner's own TagResource on a function created untagged",
+            created: &[],
+            plane: WritePlane::Owner,
+            written: &[(BLUEPRINT_KEY, "blank-nodejs")],
+        },
+        WriteRow {
+            case: "the owner's own TagResource merging two keys beside the create's",
+            created: &[(BLUEPRINT_KEY, "hello-world-python")],
+            plane: WritePlane::Owner,
+            written: &[("Environment", "prod"), ("owner", "billing")],
+        },
+        WriteRow {
+            case: "the owner's own TagResource replacing the value the create recorded",
+            created: &[(BLUEPRINT_KEY, "blank-python")],
+            plane: WritePlane::Owner,
+            written: &[(BLUEPRINT_KEY, "microservice-http-endpoint")],
+        },
+        WriteRow {
+            case: "this API's TagResources on a function created untagged",
+            created: &[],
+            plane: WritePlane::ThisApi,
+            written: &[(BLUEPRINT_KEY, "blank-go"), ("Environment", "dev")],
+        },
+        WriteRow {
+            case: "this API's TagResources replacing the value the create recorded",
+            created: &[(BLUEPRINT_KEY, "blank-python"), ("owner", "billing")],
+            plane: WritePlane::ThisApi,
+            written: &[(BLUEPRINT_KEY, "s3-get-object")],
+        },
+    ]
+}
+
+/// RULE: the tag set this API projects for a resource is the ONE tag set the
+/// owning service holds for it, so every plane that writes that set — the
+/// create's own `Tags`, the owning service's own tag operation, or this API's
+/// `TagResources` — leaves the resource selectable by key and by key+value, with
+/// its whole merged tag set, and its keys and values in the account's summaries.
+#[tokio::test]
+async fn every_tag_write_plane_lands_in_the_one_indexed_tag_set() {
+    for (index, row) in write_rows().into_iter().enumerate() {
+        // One engine per row: `GetTagKeys` and `GetTagValues` summarise the whole
+        // account, so each row's summaries are about its own resource alone.
+        let router = emulator();
+        let case = row.case;
+        let name = format!("write-plane-{index}");
+        let arn = create_function(&router, REGION, &name, row.created).await;
+        match row.plane {
+            WritePlane::CreateOnly => assert!(
+                row.written.is_empty(),
+                "case {case:?}: a row that writes nothing after the create carries no \
+                 written tags"
+            ),
+            WritePlane::Owner => lambda_tag_resource(&router, &arn, row.written).await,
+            WritePlane::ThisApi => {
+                tagging_ok(
+                    &router,
+                    "TagResources",
+                    json!({ "ResourceARNList": [&arn], "Tags": tag_object(row.written) }),
+                )
+                .await;
+            }
+        }
+
+        // The whole tag set the resource then carries: the create's tags, with
+        // every key the later write named taking the value that write gave it.
+        let mut want = expected(row.created);
+        want.extend(expected(row.written));
+
+        // The owning service's own read is that set, whichever plane wrote it.
+        let reported = lambda_tags(&router, &arn).await;
+        assert_eq!(
+            reported, want,
+            "case {case:?}: expected the owner's own read to report {want:?}, got {reported:?}"
+        );
+
+        // And so is this API's projection, selected by the key alone.
+        let body = tagging_ok(
+            &router,
+            "GetResources",
+            json!({ "TagFilters": [{ "Key": BLUEPRINT_KEY }] }),
+        )
+        .await;
+        let mut selected = page_arns(&body);
+        selected.sort();
+        assert_eq!(
+            selected,
+            vec![arn.clone()],
+            "case {case:?}: the key filter must select the tagged function, got {selected:?}"
+        );
+        let projected = page_tags(&body, &arn);
+        assert_eq!(
+            projected, want,
+            "case {case:?}: expected the projection to report {want:?}, got {projected:?}"
+        );
+
+        // The resource-type key its own ARN carries narrows to it as well.
+        let selected = selected_arns(
+            &router,
+            json!({
+                "TagFilters": [{ "Key": BLUEPRINT_KEY }],
+                "ResourceTypeFilters": ["lambda:function"],
+            }),
+        )
+        .await;
+        assert_eq!(
+            selected,
+            vec![arn.clone()],
+            "case {case:?}: the qualified resource-type filter must select it, got {selected:?}"
+        );
+
+        // Every pair of the set is selectable by value and is in the summaries.
+        let keys = all_tag_keys(&router).await;
+        for (key, value) in &want {
+            let selected = selected_arns(
+                &router,
+                json!({ "TagFilters": [{ "Key": key, "Values": [value] }] }),
+            )
+            .await;
+            assert_eq!(
+                selected,
+                vec![arn.clone()],
+                "case {case:?}: the filter {key:?}={value:?} must select it, got {selected:?}"
+            );
+            assert!(
+                keys.contains(key),
+                "case {case:?}: GetTagKeys must list {key:?}, got {keys:?}"
+            );
+            let values = all_tag_values(&router, key).await;
+            assert_eq!(
+                values,
+                vec![value.clone()],
+                "case {case:?}: GetTagValues({key:?}) must list exactly the value the \
+                 resource carries, got {values:?}"
+            );
+        }
+    }
+}
+
+/// Which plane took the tags away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalPlane {
+    /// The owning service's OWN `UntagResource`.
+    OwnerUntag,
+    /// This API's `UntagResources`.
+    ThisApiUntag,
+    /// The owning service DELETING the resource, with no untag call at all.
+    OwnerDelete,
+}
+
+/// One removal: the plane that performed it and the keys it took off the
+/// resource.
+struct RemoveRow {
+    case: &'static str,
+    plane: RemovalPlane,
+    /// The keys the removal named — for a delete, every key, because the tag set
+    /// goes with the resource.
+    removed: &'static [&'static str],
+}
+
+/// The tag set every removal row starts from: the colon-bearing key the filters
+/// select by, and a second key no removal row of one key names.
+const REMOVAL_TAGS: &[(&str, &str)] = &[(BLUEPRINT_KEY, "blank-python"), ("Environment", "prod")];
+
+/// The removal planes, spanning how many of the resource's keys go.
+fn remove_rows() -> Vec<RemoveRow> {
+    vec![
+        RemoveRow {
+            case: "the owner's own UntagResource removes the one key it names",
+            plane: RemovalPlane::OwnerUntag,
+            removed: &[BLUEPRINT_KEY],
+        },
+        RemoveRow {
+            case: "the owner's own UntagResource removes every key",
+            plane: RemovalPlane::OwnerUntag,
+            removed: &[BLUEPRINT_KEY, "Environment"],
+        },
+        RemoveRow {
+            case: "this API's UntagResources removes the one key it names",
+            plane: RemovalPlane::ThisApiUntag,
+            removed: &[BLUEPRINT_KEY],
+        },
+        RemoveRow {
+            case: "this API's UntagResources removes every key",
+            plane: RemovalPlane::ThisApiUntag,
+            removed: &[BLUEPRINT_KEY, "Environment"],
+        },
+        RemoveRow {
+            case: "the owner's DeleteFunction withdraws the resource whole",
+            plane: RemovalPlane::OwnerDelete,
+            removed: &[BLUEPRINT_KEY, "Environment"],
+        },
+    ]
+}
+
+/// RULE: this API projects the tag set the owning service currently holds, so a
+/// key that set loses — to the owning service's own untag, to this API's
+/// `UntagResources`, or to the owning service deleting the resource — stops
+/// selecting it and leaves the account's tag summaries, while a key the removal
+/// did not name goes on selecting it.
+#[tokio::test]
+async fn every_tag_removal_plane_withdraws_what_it_removed() {
+    for (index, row) in remove_rows().into_iter().enumerate() {
+        // One engine per row, for the same reason as the write table above.
+        let router = emulator();
+        let case = row.case;
+        let name = format!("removal-plane-{index}");
+        let arn = create_function(&router, REGION, &name, REMOVAL_TAGS).await;
+        let selected = selected_arns(
+            &router,
+            json!({ "TagFilters": [{ "Key": BLUEPRINT_KEY }] }),
+        )
+        .await;
+        assert_eq!(
+            selected,
+            vec![arn.clone()],
+            "case {case:?}: the function must be indexed before the removal, got {selected:?}"
+        );
+
+        match row.plane {
+            RemovalPlane::OwnerUntag => lambda_untag_resource(&router, &arn, row.removed).await,
+            RemovalPlane::ThisApiUntag => {
+                tagging_ok(
+                    &router,
+                    "UntagResources",
+                    json!({ "ResourceARNList": [&arn], "TagKeys": row.removed }),
+                )
+                .await;
+            }
+            RemovalPlane::OwnerDelete => {
+                lambda_ok(
+                    &router,
+                    REGION,
+                    "DELETE",
+                    &format!("/2015-03-31/functions/{name}"),
+                    &Value::Null,
+                    204,
+                )
+                .await;
+            }
+        }
+
+        // What the resource still carries: every pair whose key the removal did
+        // not name, and nothing at all once the resource itself is gone.
+        let remaining: BTreeMap<String, String> = if row.plane == RemovalPlane::OwnerDelete {
+            BTreeMap::new()
+        } else {
+            expected(REMOVAL_TAGS)
+                .into_iter()
+                .filter(|(key, _)| !row.removed.contains(&key.as_str()))
+                .collect()
+        };
+
+        // The owning service's own read, wherever the resource is still there.
+        if row.plane != RemovalPlane::OwnerDelete {
+            let reported = lambda_tags(&router, &arn).await;
+            assert_eq!(
+                reported, remaining,
+                "case {case:?}: expected the owner's own read to report {remaining:?}, got \
+                 {reported:?}"
+            );
+        }
+
+        // A removed key neither selects the resource nor is in the summaries.
+        let keys = all_tag_keys(&router).await;
+        for key in row.removed {
+            let selected =
+                selected_arns(&router, json!({ "TagFilters": [{ "Key": key }] })).await;
+            assert!(
+                !selected.contains(&arn),
+                "case {case:?}: {key:?} must no longer select {arn}, got {selected:?}"
+            );
+            assert!(
+                !keys.contains(*key),
+                "case {case:?}: GetTagKeys must no longer list {key:?}, got {keys:?}"
+            );
+            let values = all_tag_values(&router, key).await;
+            assert!(
+                values.is_empty(),
+                "case {case:?}: GetTagValues({key:?}) must list no value, got {values:?}"
+            );
+        }
+
+        // A key the removal did not name goes on selecting it, with what is left.
+        for (key, value) in &remaining {
+            let body = tagging_ok(
+                &router,
+                "GetResources",
+                json!({ "TagFilters": [{ "Key": key, "Values": [value] }] }),
+            )
+            .await;
+            let mut selected = page_arns(&body);
+            selected.sort();
+            assert_eq!(
+                selected,
+                vec![arn.clone()],
+                "case {case:?}: {key:?}={value:?} must still select it, got {selected:?}"
+            );
+            let projected = page_tags(&body, &arn);
+            assert_eq!(
+                projected, remaining,
+                "case {case:?}: expected the projection to report {remaining:?}, got \
+                 {projected:?}"
+            );
+        }
+
+        // A resource left carrying no tag at all is no row of the projection.
+        if remaining.is_empty() {
+            let selected = selected_arns(&router, json!({ "ResourceARNList": [&arn] })).await;
+            assert!(
+                selected.is_empty(),
+                "case {case:?}: a resource carrying no tag is no row of the projection, got \
+                 {selected:?}"
+            );
+        }
     }
 }

@@ -56,6 +56,10 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Percent-encodes a tag key into the `tagKeys` query parameter Lambda's own
+# `UntagResource` binds it to, so a key carrying a URI delimiter survives the
+# query string. Already in the lock as a transitive dependency.
+percent-encoding = "2.3"
 # Amazon EC2 Auto Scaling owns the Auto Scaling group an ECS capacity provider binds onto,
 # and ECS resolves that reference against this service's records, so the propagation suite
 # creates the group through its OWN API before creating the provider it tags.

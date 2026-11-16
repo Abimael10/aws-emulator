@@ -18842,6 +18842,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
