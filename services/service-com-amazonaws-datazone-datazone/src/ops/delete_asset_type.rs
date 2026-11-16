@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAssetType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAssetType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAssetType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored asset type from its domain in [`crate::state`], so the next
+//! `GetAssetType` answers `ResourceNotFoundException` and a second `DeleteAssetType` on
+//! the same identifier does too.
+//!
+//! The documented prerequisites (`smithy_query(query="doc",shape="DeleteAssetType")`)
+//! are what this handler enforces: "The asset type must exist in the domain" and "The
+//! asset type must not be in use (e.g., assigned to any asset). If used, deletion will
+//! fail." An asset type some stored asset is of is refused with the `ConflictException`
+//! the operation models, naming the asset type and the stored asset that prevented the
+//! delete ([`crate::state::deletion_prevented_message`]), and the refusal stores
+//! nothing: the asset type is still readable afterwards. Which stored objects count as
+//! a dependency is decided by [`crate::state::Domain::asset_type_blocker`], which
+//! matches an asset's stored type reference the same way `GetAssetType` resolves an
+//! identifier.
+//!
+//! The operation's output carries no status member, so there is no in-progress state to
+//! report and nothing for the clock to settle: the removal is complete when the call
+//! returns 204.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +159,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAssetType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAssetTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAssetType"))
+        let _ = ctx;
+        use crate::state::{
+            deletion_prevented_message, graph_object, now_ms, ResourceKind, DOMAIN_STATUS_DELETING,
+            GRAPH_TAG_ASSET,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAssetTypeErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(DeleteAssetTypeErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // A domain already being deleted is gone as far as its contents go — the same
+        // liveness rule `GetAssetType` reads an asset type through.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .filter(|domain| domain.status != DOMAIN_STATUS_DELETING)
+            .ok_or_else(|| {
+                DeleteAssetTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                })
+            })?;
+
+        // "The asset type must exist in the domain": an asset type is stored under the
+        // `TypeName` that IS the `identifier` addressing it, so the identifier is looked
+        // up exactly as `GetAssetType` looks it up — an identifier that reads an asset
+        // type is the identifier that deletes it, and no other.
+        if !domain.asset_types.contains_key(&input.identifier) {
+            return Err(DeleteAssetTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::AssetType.not_found_message(),
+                },
+            )
+            .into());
+        }
+        // "The asset type must not be in use (e.g., assigned to any asset). If used,
+        // deletion will fail." Checked BEFORE the removal, so a refused delete leaves
+        // the store exactly as it was, and the refusal names the stored object that
+        // prevented it.
+        if let Some(blocker) = domain.asset_type_blocker(&input.identifier) {
+            let object = graph_object(GRAPH_TAG_ASSET, &domain.id, &input.identifier);
+            let blocker = graph_object(blocker.tag, &domain.id, &blocker.identifier);
+            return Err(DeleteAssetTypeErrorModeled::ConflictException(ConflictException {
+                message: deletion_prevented_message(&object, &blocker),
+            })
+            .into());
+        }
+
+        // Nothing addresses one revision of an asset type — `DeleteAssetType` takes no
+        // `revision` member (smithy_query operation="DeleteAssetType") — so the whole
+        // record goes.
+        domain.asset_types.remove(&input.identifier);
+        Ok(DeleteAssetTypeOutput {})
     }
 }

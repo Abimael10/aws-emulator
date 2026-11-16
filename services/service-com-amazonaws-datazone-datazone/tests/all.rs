@@ -25,6 +25,8 @@ mod asset_lifecycle;
 mod asset_revision_listing;
 #[path = "all/asset_revisions.rs"]
 mod asset_revisions;
+#[path = "all/asset_type_deletion.rs"]
+mod asset_type_deletion;
 #[path = "all/asset_types.rs"]
 mod asset_types;
 #[path = "all/create_project_domain_resolution.rs"]

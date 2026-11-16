@@ -417,6 +417,37 @@ impl Domain {
         })
     }
 
+    /// The object stored in this domain that is still OF the asset type
+    /// `asset_type_name` and so prevents that type's deletion, or `None` when nothing
+    /// is.
+    ///
+    /// "The asset type must not be in use (e.g., assigned to any asset). If used,
+    /// deletion will fail." (smithy_query query="doc" shape="DeleteAssetType"): what an
+    /// asset type is assigned to is an ASSET of it, which records the type it was
+    /// created with ([`Asset::type_identifier`]) — the only place an asset type is
+    /// referenced outside the type itself. The reference is matched EXACTLY, the way
+    /// [`asset_type_revision`] resolves an asset's type and `GetAssetType` reads one: an
+    /// asset type is addressed by the whole name it is stored under, and `TypeName`
+    /// admits the dots a qualified name carries, so there is no shorter name to resolve
+    /// a reference to. Every asset counts whichever revision it is at — an asset's type
+    /// identifies the asset itself and no revision changes it
+    /// (`CreateAssetRevisionInput` names no `typeIdentifier`).
+    ///
+    /// A walk over a `BTreeMap`, so the asset reported for a type several assets are of
+    /// is the same one on every call. `None` exactly when no asset in this domain is of
+    /// that type, which is what lets `DeleteAssetType` remove it. A linear scan over a
+    /// map bounded by [`MAX_ASSETS_PER_DOMAIN`], the same trade
+    /// [`Self::form_type_blocker`] makes.
+    pub fn asset_type_blocker(&self, asset_type_name: &str) -> Option<DeletionBlocker> {
+        self.assets
+            .values()
+            .find(|asset| asset.type_identifier == asset_type_name)
+            .map(|asset| DeletionBlocker {
+                tag: GRAPH_TAG_ASSET,
+                identifier: asset.id.clone(),
+            })
+    }
+
     /// The user profile this domain holds for the identity a user-profile request
     /// names: the `userIdentifier` (and, for a role session, the `sessionName`) it was
     /// created with, or — when the domain holds no profile under that identity — the
