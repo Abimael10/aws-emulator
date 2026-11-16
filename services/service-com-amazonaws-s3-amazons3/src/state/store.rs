@@ -241,7 +241,7 @@ impl ComAmazonawsS3Amazons3State {
     /// and the SCOPE the session was created with — the directory bucket it is for and the
     /// token a Zonal endpoint request presents it with.
     ///
-    /// The session is recorded in the DEFAULT mode and under no encryption algorithm, which
+    /// The session is recorded in the DEFAULT mode and under no encryption settings, which
     /// is what a `CreateSession` naming neither establishes; a vend that names either records
     /// the whole scope through [`Self::record_vended_session_scoped`].
     pub fn record_vended_session_on(
@@ -258,13 +258,13 @@ impl ComAmazonawsS3Amazons3State {
                 bucket: bucket.to_string(),
                 token: token.to_string(),
                 mode: SessionMode::default(),
-                encryption_algorithm: None,
+                encryption: ObjectEncryption::default(),
             },
         )
     }
 
     /// [`Self::record_vended_session_on`] with the WHOLE scope the vend settled: the bucket,
-    /// the token, the mode the session was created in and the encryption algorithm it was
+    /// the token, the mode the session was created in and the encryption settings it was
     /// established under.
     pub fn record_vended_session_scoped(
         &mut self,

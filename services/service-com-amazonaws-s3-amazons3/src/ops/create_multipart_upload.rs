@@ -599,6 +599,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is stored under exactly the encryption a write of the same bytes would be. Reading
         // it writes nothing: a never-configured bucket's default is computed, not
         // materialised.
+        //
+        // An initiation made under a directory bucket's SESSION settles that session's own
+        // encryption settings instead of the bucket's default — the same member says so, and
+        // the block below applies it once the session has been read.
         let mut encryption = if requested.names_no_member() {
             let store = state.lock();
             match store.bucket(&input.bucket) {
@@ -637,26 +641,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }) {
                 return Err(refusal);
             }
-            if store
+        }
+        let committed = {
+            let store = state.lock();
+            match store
                 .bucket(&input.bucket)
                 .is_some_and(crate::state::Bucket::is_directory)
             {
-                let committed = crate::service::object_write::committed_encryption(
+                true => crate::service::object_write::committed_encryption(
                     &store,
                     &input.bucket,
                     &ctx.parts().headers,
                     ::std::time::SystemTime::now(),
-                );
-                if let Some(message) = crate::service::object_write::session_encryption_refusal(
-                    committed.as_deref(),
-                    input.server_side_encryption.as_deref(),
-                ) {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_REQUEST_CODE,
-                        crate::state::INVALID_REQUEST_STATUS,
-                        message,
-                    ));
-                }
+                ),
+                false => None,
+            }
+        };
+        if let Some(message) = crate::service::object_write::session_encryption_refusal(
+            committed
+                .as_ref()
+                .and_then(|committed| committed.sse_algorithm.as_deref()),
+            input.server_side_encryption.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                message,
+            ));
+        }
+        // And an initiation that names NO encryption member settles the settings its session
+        // committed: "you don't need to explicitly specify these encryption settings values in
+        // Zonal endpoint API calls, and Amazon S3 will use the encryption settings values from
+        // the CreateSession request to protect new objects in the directory bucket" (same
+        // member) — so what every part write and the finished object report is the session's,
+        // not the bucket's default.
+        if requested.names_no_member() {
+            if let Some(committed) = &committed {
+                encryption = committed.clone();
             }
         }
 

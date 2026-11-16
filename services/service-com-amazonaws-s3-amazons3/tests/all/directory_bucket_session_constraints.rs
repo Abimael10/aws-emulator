@@ -39,40 +39,26 @@ use super::object_and_tagging_roundtrip::{bucket, put_object, text};
 /// The header `CreateSession` takes its mode on: `SessionMode` is bound to
 /// `x-amz-create-session-mode`
 /// (`smithy_query(query="operation",operation="CreateSession")`).
-const SESSION_MODE_HEADER: &str = "x-amz-create-session-mode";
+///
+/// `pub(crate)`, like the encryption header below it: the suite that spans what a session's
+/// committed encryption decides about a write
+/// ([`super::directory_bucket_session_write_semantics`]) names the same two headers.
+pub(crate) const SESSION_MODE_HEADER: &str = "x-amz-create-session-mode";
 
 /// The header a write names the server-side encryption algorithm on:
 /// `PutObjectRequest$ServerSideEncryption` is bound to `x-amz-server-side-encryption`.
-const SSE_HEADER: &str = "x-amz-server-side-encryption";
+pub(crate) const SSE_HEADER: &str = "x-amz-server-side-encryption";
 
 /// `GET /<bucket>?session` with the given mode — `CreateSession` — and the session token it
-/// vended.
+/// vended, through the one vend helper of this crate's session suites
+/// ([`super::directory_bucket_session_write_semantics::session_token`]).
 async fn session_token(router: &MultiServiceRouter, bucket_name: &str, mode: &str) -> String {
     let headers: Vec<(&str, &str)> = match mode.is_empty() {
         true => Vec::new(),
         false => vec![(SESSION_MODE_HEADER, mode)],
     };
-    let vended = send(
-        router,
-        "GET",
-        &format!("/{bucket_name}?session"),
-        &headers,
-        "",
-    )
-    .await;
-    assert_eq!(
-        vended.status, 200,
-        "a {mode:?} session on {bucket_name:?} must be vended, got {} with body {:?}",
-        vended.status,
-        text(&vended)
-    );
-    let token = vended.element("SessionToken").unwrap_or_default();
-    assert!(
-        !token.is_empty(),
-        "the vended session must carry a SessionToken, got {:?}",
-        text(&vended)
-    );
-    token
+    super::directory_bucket_session_write_semantics::session_token(router, bucket_name, &headers)
+        .await
 }
 
 /// One Zonal endpoint call, as `(the operation it names, method, the path and query under the

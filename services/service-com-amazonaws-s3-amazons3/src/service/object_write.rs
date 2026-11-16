@@ -205,17 +205,22 @@ pub fn directory_bucket_only_query_parameter(query: &str) -> Option<&'static str
         .find(|parameter| crate::service::query_carries(query, parameter))
 }
 
-/// The server-side encryption algorithm a Zonal endpoint write into the directory bucket
-/// `bucket` is judged against — the algorithm the write's own `x-amz-server-side-encryption`
-/// has to match ([`session_encryption_refusal`]) — or `None` for a request that presents no
-/// live session of that bucket, which committed nothing for a write to differ from.
+/// The server-side encryption settings a Zonal endpoint write into the directory bucket
+/// `bucket` is governed by — the settings the write's own `x-amz-server-side-encryption` has
+/// to match ([`session_encryption_refusal`]) and the ones it is STORED under when it names no
+/// encryption member of its own — or `None` for a request that presents no live session of
+/// that bucket, or a session that settled no encryption settings at all: neither commits
+/// anything for a write to differ from or to be stored under.
 ///
 /// "In the Zonal endpoint API calls … the encryption request headers must match the encryption
-/// settings that are specified in the `CreateSession` request"
-/// (`PutObjectRequest$ServerSideEncryption`, of a directory bucket), so it is the algorithm the
-/// SESSION the request presents was established with: a session that named one was established
-/// under it, and one that named none under the bucket's own default encryption configuration
-/// (`CreateSession` settles that, which is why this reads the session rather than the bucket).
+/// settings that are specified in the `CreateSession` request. … You don't need to explicitly
+/// specify these encryption settings values in Zonal endpoint API calls, and Amazon S3 will
+/// use the encryption settings values from the `CreateSession` request to protect new objects
+/// in the directory bucket" (`PutObjectRequest$ServerSideEncryption`, of a directory bucket),
+/// so it is the settings the SESSION the request presents was established with: a session that
+/// named any were established under those, and one that named none under the bucket's own
+/// default encryption configuration (`CreateSession` settles that, which is why this reads the
+/// session rather than the bucket).
 ///
 /// Read-only: the session is read, and nothing is written.
 pub fn committed_encryption(
@@ -223,13 +228,13 @@ pub fn committed_encryption(
     bucket: &str,
     headers: &::http::HeaderMap,
     now: ::std::time::SystemTime,
-) -> Option<String> {
+) -> Option<state::ObjectEncryption> {
     let presented = state::presented_session(headers)?;
     let scope = store.presented_session_scope(&presented, now)?;
     if scope.bucket != bucket {
         return None;
     }
-    scope.encryption_algorithm.clone()
+    (!scope.encryption.names_no_member()).then(|| scope.encryption.clone())
 }
 
 /// The sentence S3 refuses a Zonal endpoint write naming `requested` under a session

@@ -412,11 +412,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // and a request naming no mode takes "the maximum allowable privilege"
                     // ([`crate::state::SessionMode::requested`]).
                     mode: crate::state::SessionMode::requested(input.session_mode.as_deref()),
-                    // The algorithm the session was ESTABLISHED under, settled above: "the
-                    // encryption request headers must match the encryption settings that are
-                    // specified in the CreateSession request", so the writes made under this
-                    // session are judged against this value.
-                    encryption_algorithm: encryption.sse_algorithm.clone(),
+                    // The encryption settings the session was ESTABLISHED under, settled
+                    // above: "the encryption request headers must match the encryption
+                    // settings that are specified in the CreateSession request", and "Amazon
+                    // S3 will use the encryption settings values from the CreateSession
+                    // request to protect new objects in the directory bucket" — so the writes
+                    // made under this session are both judged against these settings and
+                    // stored under them.
+                    encryption: encryption.clone(),
                 },
             );
             (released, recorded)

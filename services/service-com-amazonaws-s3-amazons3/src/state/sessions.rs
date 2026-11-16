@@ -62,16 +62,23 @@ pub struct SessionScope {
     /// The MODE the session was created in, which decides WHICH Zonal endpoint operations
     /// the caller may execute under it — see [`SessionMode`].
     pub mode: SessionMode,
-    /// The server-side encryption algorithm the session was ESTABLISHED with: "Amazon S3
-    /// will use the encryption settings values from the `CreateSession` request to protect
-    /// new objects in the directory bucket", and "in the Zonal endpoint API calls … the
+    /// The encryption settings the session was ESTABLISHED with — the algorithm and, for a
+    /// KMS one, the key the session's objects are protected by: "Amazon S3 will use the
+    /// encryption settings values from the `CreateSession` request to protect new objects in
+    /// the directory bucket. You don't need to explicitly specify these encryption settings
+    /// values in Zonal endpoint API calls", and "in the Zonal endpoint API calls … the
     /// encryption request headers must match the encryption settings that are specified in
     /// the `CreateSession` request" (`PutObjectRequest$ServerSideEncryption`, of a directory
-    /// bucket) — so a write naming another algorithm is refused against this one.
+    /// bucket).
     ///
-    /// `None` for a session established under no algorithm at all, which names nothing for a
-    /// write to differ from.
-    pub encryption_algorithm: Option<String>,
+    /// Both halves of that rule are read off this one record: a write naming another
+    /// algorithm is refused against it, and a write naming no encryption member at all is
+    /// stored under it ([`crate::service::object_write::committed_encryption`]).
+    ///
+    /// Names no member at all ([`ObjectEncryption::names_no_member`]) for a session
+    /// established under no encryption settings at all, which settles nothing for a write to
+    /// match or to be stored under.
+    pub encryption: ObjectEncryption,
 }
 
 /// The MODE one session was created in: "specifies the mode of the session that will be

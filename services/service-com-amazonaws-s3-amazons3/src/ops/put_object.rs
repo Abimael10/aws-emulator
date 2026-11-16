@@ -678,43 +678,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // write that would have used it.
         // A Zonal endpoint write is stored under the encryption its SESSION was established
         // with: "you can't override the values of the encryption settings … that are specified
-        // in the CreateSession request. … Amazon S3 will use the encryption settings values
-        // from the CreateSession request to protect new objects in the directory bucket"
-        // (`PutObjectRequest$ServerSideEncryption`, of a directory bucket). So a write naming
-        // ANOTHER algorithm names an encryption the object cannot be stored under, and is
-        // refused here — before KMS is asked anything and before anything is written — rather
-        // than silently switching the object's encryption per request. See
+        // in the CreateSession request. … You don't need to explicitly specify these encryption
+        // settings values in Zonal endpoint API calls, and Amazon S3 will use the encryption
+        // settings values from the CreateSession request to protect new objects in the
+        // directory bucket" (`PutObjectRequest$ServerSideEncryption`, of a directory bucket).
+        // So a write naming ANOTHER algorithm names an encryption the object cannot be stored
+        // under, and is refused here — before KMS is asked anything and before anything is
+        // written — rather than silently switching the object's encryption per request; and a
+        // write naming no encryption member at all is stored under the session's own settings
+        // rather than under the bucket's default. See
         // [`crate::service::object_write::session_encryption_refusal`] for the rule and
         // [`crate::service::object_write::committed_encryption`] for what it is matched
         // against. A bucket this emulator does not hold is answered by the write below.
-        {
+        let committed = {
             let store = state.lock();
-            if store
+            match store
                 .bucket(&input.bucket)
                 .is_some_and(crate::state::Bucket::is_directory)
             {
-                let committed = crate::service::object_write::committed_encryption(
+                true => crate::service::object_write::committed_encryption(
                     &store,
                     &input.bucket,
                     &ctx.parts().headers,
                     ::std::time::SystemTime::now(),
-                );
-                if let Some(message) = crate::service::object_write::session_encryption_refusal(
-                    committed.as_deref(),
-                    input.server_side_encryption.as_deref(),
-                ) {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_REQUEST_CODE,
-                        crate::state::INVALID_REQUEST_STATUS,
-                        message,
-                    ));
-                }
+                ),
+                false => None,
             }
+        };
+        if let Some(message) = crate::service::object_write::session_encryption_refusal(
+            committed
+                .as_ref()
+                .and_then(|committed| committed.sse_algorithm.as_deref()),
+            input.server_side_encryption.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                message,
+            ));
         }
         let mut stored_under = {
             let store = state.lock();
             match store.bucket(&input.bucket) {
-                Some(bucket) if requested.names_no_member() => bucket.default_object_encryption(),
+                // The session's own settings come first, and the bucket's default encryption
+                // configuration answers every write that is under no session at all.
+                Some(bucket) if requested.names_no_member() => committed
+                    .clone()
+                    .unwrap_or_else(|| bucket.default_object_encryption()),
                 // A bucket this emulator does not hold is answered below, where the write is;
                 // nothing about a key is decided for it.
                 _ => requested.clone(),
@@ -807,7 +817,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         }
         let encryption = {
             let mut encryption = if requested.names_no_member() {
-                bucket_record.default_object_encryption()
+                // The SESSION comes first for a Zonal endpoint write: "you don't need to
+                // explicitly specify these encryption settings values in Zonal endpoint API
+                // calls, and Amazon S3 will use the encryption settings values from the
+                // CreateSession request to protect new objects in the directory bucket"
+                // (`PutObjectRequest$ServerSideEncryption`) — the settings resolved above, the
+                // same ones this write was judged against. A write under no session at all
+                // takes the bucket's own default encryption configuration.
+                committed
+                    .clone()
+                    .unwrap_or_else(|| bucket_record.default_object_encryption())
             } else {
                 requested
             };

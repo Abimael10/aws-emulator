@@ -175,6 +175,8 @@ mod directory_bucket_listings;
 mod directory_bucket_renames;
 #[path = "all/directory_bucket_session_constraints.rs"]
 mod directory_bucket_session_constraints;
+#[path = "all/directory_bucket_session_write_semantics.rs"]
+mod directory_bucket_session_write_semantics;
 #[path = "all/delete_marker_refusal_headers.rs"]
 mod delete_marker_refusal_headers;
 #[path = "all/delete_marker_subresource_refusal_headers.rs"]
