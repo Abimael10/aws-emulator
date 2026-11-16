@@ -35,6 +35,8 @@ mod certificate_listing;
 mod certificate_providers;
 #[path = "all/certificate_status_update.rs"]
 mod certificate_status_update;
+#[path = "all/command_deletion.rs"]
+mod command_deletion;
 #[path = "all/command_execution_listing.rs"]
 mod command_execution_listing;
 #[path = "all/command_execution_read.rs"]

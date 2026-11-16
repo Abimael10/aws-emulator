@@ -17,7 +17,10 @@
 //! may be created from.
 //!
 //! A `commandId` the store holds no command under is 404 `ResourceNotFoundException`
-//! rather than a 200 that wrote nothing.
+//! rather than a 200 that wrote nothing, and a command whose deletion is already scheduled
+//! (`pendingDeletion`, see [`crate::state::command_deletion`]) is 409 `ConflictException`:
+//! it is on its way out of the account, so a request to change it conflicts with the state
+//! it is in.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(unavailable("command registry"));
         };
 
+        let now = ::std::time::SystemTime::now();
+
+        // A command whose scheduled deletion the clock has already made due is gone from
+        // the account (`crate::state::command_deletion`), so that removal is materialised
+        // before this update reads the store: an id the account no longer holds a command
+        // under is not one this call writes to.
+        crate::state::purge_due_command_deletions(&*self.engine, now);
+
         // LOCK ORDER: this service's store first, the shared index second, the order
         // `crate::state::command_registry` documents.
         let mut store = state.lock();
@@ -199,6 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A command whose deletion is already scheduled is on its way out of the account,
+        // so a request to change it "conflicts with the current state of the resource" —
+        // the modelled `ConflictException` (HTTP 409) — and writes nothing.
+        if command.pending_deletion {
+            return Err(UpdateCommandErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::pending_deletion_message(&input.command_id)),
+                resource_id: None,
+            })
+            .into());
+        }
+
         // Each member the request carries is written as supplied; one it omits names no
         // change, which is what makes this a partial update (`PATCH /commands/{id}`)
         // rather than a replace.
@@ -209,11 +231,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             command.description = Some(description);
         }
         if let Some(deprecated) = input.deprecated {
-            command.deprecated = deprecated;
+            // Recorded with the instant it was made: that instant is what a later
+            // `DeleteCommand` counts the deletion timeout from
+            // (`crate::state::command_deletion`).
+            command.set_deprecated(deprecated, now);
         }
         // "The date and time when the command was last updated": this call is now that
         // write, whichever members it moved.
-        command.last_updated_at = ::std::time::SystemTime::now();
+        command.last_updated_at = now;
 
         // The answer is built from the record that was just stored, so what this call
         // reports and what the next `GetCommand` reads are one value.

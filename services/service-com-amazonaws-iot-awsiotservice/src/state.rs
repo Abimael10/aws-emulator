@@ -2588,6 +2588,13 @@ pub struct RegisteredCommand {
     /// Whether the command is being deleted (`GetCommand$pendingDeletion`,
     /// "Indicates whether the command is being deleted"). A created command is not.
     pub pending_deletion: bool,
+    /// When the command was DEPRECATED, and `None` while it is not. The instant the
+    /// deletion timeout is counted from, which is why the flag alone is not enough:
+    /// see [`command_deletion`].
+    pub deprecated_at: Option<SystemTime>,
+    /// When the command's scheduled removal falls due, and `None` while no delete has
+    /// asked for it ([`command_deletion`]).
+    pub deletion_due_at: Option<SystemTime>,
 }
 
 impl RegisteredCommand {
@@ -2621,6 +2628,8 @@ impl RegisteredCommand {
             last_updated_at: created_at,
             deprecated: false,
             pending_deletion: false,
+            deprecated_at: None,
+            deletion_due_at: None,
         }
     }
 
@@ -3354,6 +3363,15 @@ pub mod policy_document_conditions;
 pub use policy_document_conditions::{
     condition_compares_a_non_address, names_condition_operator, unknown_condition_type,
     CONDITION_OPERATORS,
+};
+
+// WHEN a command leaves the account — the deletion timeout a delete is answered against, the
+// `pendingDeletion` state a scheduled removal puts the command in, and the removal the clock
+// makes due — lives in `state/command_deletion.rs`, beside the command record it is about.
+pub mod command_deletion;
+pub use command_deletion::{
+    pending_deletion_message, purge_due_command_deletions, CommandDeleted, CommandDeletion,
+    COMMAND_DELETION_TIMEOUT,
 };
 
 // Whether the software bill of materials an association names is one the service can READ

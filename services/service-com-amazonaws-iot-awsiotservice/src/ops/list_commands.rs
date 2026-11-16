@@ -189,6 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One row per command this listing is about, carrying the key it is ordered
         // by: when the command was created, with its id breaking a tie between two
         // commands created in the same instant.
+        //
+        // A command whose scheduled deletion the clock has already made due is gone from
+        // the account (`crate::state::command_deletion`), so that removal is materialised
+        // before anything is read rather than listed as a command that still exists.
+        crate::state::purge_due_command_deletions(
+            &*self.engine,
+            ::std::time::SystemTime::now(),
+        );
         let store = state.lock();
         let mut rows: Vec<(SortKey, CommandSummary)> = store
             .commands

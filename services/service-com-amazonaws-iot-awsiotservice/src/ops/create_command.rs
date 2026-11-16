@@ -250,6 +250,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let command_arn = crate::state::command_arn(&region, &input.command_id);
         let created_at = ::std::time::SystemTime::now();
 
+        // A command whose scheduled deletion the clock has already made due is gone from
+        // the account (`crate::state::command_deletion`), so that removal is materialised
+        // first: its id is free for this create, in both stores, rather than conflicting
+        // with a command that no longer exists.
+        crate::state::purge_due_command_deletions(&*self.engine, created_at);
+
         // LOCK ORDER: this service's store first, the shared index second, the order
         // `crate::state::command_registry` documents.
         let mut store = state.lock();

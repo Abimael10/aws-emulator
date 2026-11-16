@@ -175,7 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read NEVER writes: the store is only borrowed, and what it hands back is a
         // clone of the persisted record, so two reads of one command are identical and
-        // a later caller sees exactly what the writer left.
+        // a later caller sees exactly what the writer left. The one exception is the
+        // removal the CLOCK has already made due — a command whose scheduled deletion
+        // has been reached is gone from the account (`crate::state::command_deletion`),
+        // owed at that instant whether or not this call happened — which is materialised
+        // before the read so this reader cannot report a command that no longer exists.
+        crate::state::purge_due_command_deletions(
+            &*self.engine,
+            ::std::time::SystemTime::now(),
+        );
         let store = state.lock();
         let Some(command) = store.commands.get(&input.command_id) else {
             return Err(GetCommandErrorModeled::ResourceNotFoundException(
