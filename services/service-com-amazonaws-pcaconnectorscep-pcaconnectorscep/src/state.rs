@@ -565,6 +565,35 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
         }
     }
 
+    /// Why a tagging WRITE on `resource_arn` cannot be served from the state the resource is
+    /// in, as the sentence that says so — or `None` when the resource's state admits the
+    /// change.
+    ///
+    /// The ONE place this service decides and words that precondition, for every operation
+    /// that changes a resource's tags (`TagResource` over the entries it merges, and
+    /// `UntagResource` over the keys it drops), so the sibling writes cannot answer one state
+    /// with two sentences. A handler maps the sentence into its own error channel and adds
+    /// nothing to it.
+    ///
+    /// A connector whose `DeleteConnector` has been accepted is a record this service only
+    /// REPORTS until its teardown completes: a tag change written onto it — or onto a
+    /// challenge hanging off it, which the teardown takes with it — would be dropped with the
+    /// record, so it is refused for the status the record is in. The refusal is for a resource
+    /// that EXISTS: an ARN this service holds no record under is the tagging layer's own
+    /// not-found refusal instead ([`TaggingError::not_found`]), so the owning connector's
+    /// status is consulted only once the resource's tag map is known to be there.
+    pub fn tag_write_refusal(&self, region: &str, resource_arn: &str) -> Option<String> {
+        self.tags_of(region, resource_arn)?;
+        let connector = self
+            .owning_connector(region, resource_arn)
+            .filter(|connector| connector.is_deleting())?;
+        Some(tags_cannot_be_changed_message(
+            resource_arn,
+            &connector.arn,
+            &connector.status,
+        ))
+    }
+
     /// The record a still-live `ClientToken` of `CreateConnector`, sent to `region`, is
     /// bound to.
     pub fn connector_for_token(
@@ -783,6 +812,32 @@ const VALIDATION_ERROR_PREFIX: &str = "Validation error detected: ";
 /// one precondition in two sentences.
 pub fn resources_not_active_message(resource_arn: &str) -> String {
     format!("{VALIDATION_ERROR_PREFIX}Resource(s) are not active: {resource_arn}.")
+}
+
+/// The sentence a tag change is refused with when the connector the resource hangs off has
+/// been accepted for teardown: the resource named, the connector whose status governs it, and
+/// the status that record is in.
+///
+/// Two forms, one per resource kind, because the connector IS the resource for a connector ARN
+/// and is the owner for a challenge ARN ([`resource_type_of`]) — so the sentence names the
+/// challenge and its connector separately only where they are two resources.
+///
+/// Reached through [`ComAmazonawsPcaconnectorscepPcaconnectorscepState::tag_write_refusal`],
+/// which is what decides the refusal applies, so the decision and the wording stay together.
+fn tags_cannot_be_changed_message(
+    resource_arn: &str,
+    connector_arn: &str,
+    status: &str,
+) -> String {
+    if resource_arn == connector_arn {
+        format!("Connector {connector_arn} has status {status}; its tags cannot be changed")
+    } else {
+        format!(
+            "{} {resource_arn} belongs to connector {connector_arn}, which has status {status}; \
+             its tags cannot be changed",
+            resource_type_of(resource_arn)
+        )
+    }
 }
 
 /// The sentence a call is refused with when the resource it names is in a state the call

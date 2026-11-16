@@ -77,6 +77,8 @@ mod tag_resource;
 mod tag_updated_at;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
+#[path = "all/tag_write_state_agreement.rs"]
+mod tag_write_state_agreement;
 #[path = "all/tag_write_under_teardown.rs"]
 mod tag_write_under_teardown;
 #[path = "all/tagging_absent_resource_request_shape.rs"]

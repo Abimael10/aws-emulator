@@ -224,25 +224,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resource_arn = input.resource_arn.clone();
 
-        // A connector whose deletion has already been accepted is a record this service only
-        // REPORTS until it disappears: a tag written onto it — or onto a challenge hanging off
-        // it, which goes with it — would be dropped with the record, so the write is refused
-        // for the status it is in instead of being answered as a success that is discarded.
-        // A status refusal is for a resource that EXISTS: an ARN this service holds no record
-        // under is the tagging layer's refusal below, so the owning connector's status is
-        // consulted only once the tag map is known to be there. The connector's own strings
-        // are cloned out, so the write below takes the store mutably with nothing borrowed
-        // from this lookup.
-        let under_teardown = if store.tags_of(&region, &resource_arn).is_some() {
-            store
-                .owning_connector(&region, &resource_arn)
-                .filter(|connector| connector.is_deleting())
-                .map(|connector| (connector.arn.clone(), connector.status.clone()))
-        } else {
-            None
-        };
-        if let Some((connector_arn, status)) = under_teardown {
-            return Err(invalid_state(&resource_arn, &connector_arn, &status));
+        // Whether the state the resource is in admits a tag change at all is the one rule both
+        // tagging writes hold a caller to, so it is asked of the store
+        // ([`crate::state::ComAmazonawsPcaconnectorscepPcaconnectorscepState::tag_write_refusal`])
+        // rather than decided here: that is also where the sentence it is refused with is
+        // worded, and this handler only lifts it into its own error channel. The sentence is
+        // owned, so the write below takes the store mutably with nothing borrowed from this
+        // lookup.
+        if let Some(message) = store.tag_write_refusal(&region, &resource_arn) {
+            return Err(invalid_state(message));
         }
 
         // The write's own lookup, taken mutably: the ceiling below is computed from the very
@@ -301,20 +291,16 @@ fn validation(message: String) -> TagResourceError {
     .into()
 }
 
-/// The resource exists, but the connector it hangs off has been accepted for teardown, so
-/// nothing may be written onto it — HTTP 400 `ValidationException` carrying the modelled
-/// `Reason` for a call a connector's status does not allow. The record is still READ through
-/// `ListTagsForResource` and `GetConnector`; only the write is refused.
-fn invalid_state(resource_arn: &str, connector_arn: &str, status: &str) -> TagResourceError {
-    let message = if resource_arn == connector_arn {
-        format!("Connector {connector_arn} has status {status}; its tags cannot be changed")
-    } else {
-        format!(
-            "{} {resource_arn} belongs to connector {connector_arn}, which has status {status}; \
-             its tags cannot be changed",
-            crate::state::resource_type_of(resource_arn)
-        )
-    };
+/// The resource exists, but its state does not admit a tag change — HTTP 400
+/// `ValidationException` carrying the modelled `Reason` for a call a connector's status does
+/// not allow. The record is still READ through `ListTagsForResource` and `GetConnector`; only
+/// the write is refused.
+///
+/// `message` is the sentence the store worded
+/// ([`crate::state::ComAmazonawsPcaconnectorscepPcaconnectorscepState::tag_write_refusal`]),
+/// so this is purely the lift into this operation's error channel: nothing about which states
+/// refuse a write, or about what the sentence names, is decided here.
+fn invalid_state(message: String) -> TagResourceError {
     TagResourceErrorModeled::ValidationException(ValidationException {
         message,
         reason: Some(crate::state::REASON_INVALID_STATE.to_string()),
