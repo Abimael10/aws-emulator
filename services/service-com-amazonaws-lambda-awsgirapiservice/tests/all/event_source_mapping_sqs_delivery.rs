@@ -71,7 +71,11 @@ async fn send_message(router: &MultiServiceRouter, case: &str, url: &str, body: 
 
 /// One `ReceiveMessage` on the queue `url` addresses, asking for the receive count: the
 /// `(body, ApproximateReceiveCount)` of every message it handed over.
-async fn receive(
+///
+/// `pub(crate)` because the suite that watches a partial-batch report feed the same redrive
+/// (`tests/all/sqs_event_source_partial_batch_redrive.rs`) reads a dead-lettered message's
+/// delivery count through this one reader rather than a second copy of it.
+pub(crate) async fn receive(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,

@@ -595,6 +595,8 @@ mod sqs_event_source_handler_run;
 mod sqs_event_source_hold;
 #[path = "all/sqs_event_source_log_delivery.rs"]
 mod sqs_event_source_log_delivery;
+#[path = "all/sqs_event_source_partial_batch_redrive.rs"]
+mod sqs_event_source_partial_batch_redrive;
 #[path = "all/sqs_event_source_revoked_downstream_grant.rs"]
 mod sqs_event_source_revoked_downstream_grant;
 #[path = "all/state_roundtrip.rs"]

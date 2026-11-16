@@ -128,7 +128,11 @@ fn expected_line(body: &str) -> String {
 
 /// Lambda, Amazon SQS and CloudWatch Logs over ONE shared engine — the three services this
 /// chain spans, mounted the way the production router mounts them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` for the reason [`logged_lines`] is: the suite that watches a partial-batch
+/// report feed a queue's redrive (`tests/all/sqs_event_source_partial_batch_redrive.rs`) spans
+/// the same three services, so it mounts them through this one harness.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
