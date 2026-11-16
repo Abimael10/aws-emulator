@@ -336,15 +336,41 @@ pub fn daily_snapshot_time_refusal(requested: &str) -> Option<String> {
     })
 }
 
-/// Why a serverless cache running `engine` cannot carry the
-/// `MajorEngineVersion` a request named, or `None` when it may; see
-/// [`is_version_label`].
+/// Why the value a request named cannot be read as a `MajorEngineVersion` AT
+/// ALL, or `None` when it names a version; see [`is_version_label`].
+///
+/// A value that names no version is a bad value of that one member. A value that
+/// IS a version but one the engine does not run is a different refusal — see
+/// [`unsupported_major_engine_version`].
 pub fn major_engine_version_refusal(engine: &str, requested: &str) -> Option<String> {
     (!is_version_label(requested)).then(|| {
         format!(
             "Invalid value {requested} for MajorEngineVersion: must be a version such as {}.",
             default_major_engine_version(engine)
         )
+    })
+}
+
+/// Why a serverless cache cannot run the major engine version `requested` of
+/// `engine`, or `None` when that engine offers it.
+///
+/// WHICH versions an engine offers is the published engine-version catalog's
+/// answer ([`version_is_offered`], the same catalog
+/// `DescribeCacheEngineVersions` reports and a cluster's `EngineVersion` is held
+/// against): `MajorEngineVersion` carries no modelled enum or pattern, so the set
+/// of versions is enforced server-side, and a request naming a major line the
+/// catalog publishes no version of asks for an `Engine` and a
+/// `MajorEngineVersion` that do not go together rather than for a malformed
+/// value. That is why the refusal is the INCOMPATIBLE-COMBINATION one ("Two or
+/// more incompatible parameters were specified") and why its sentence names the
+/// engine's support for the version rather than the member.
+///
+/// The one variable part of the sentence is the version the request named; the
+/// rest is fixed text. One statement, so the create and the modify of a
+/// serverless cache refuse the same versions with the same words.
+pub fn unsupported_major_engine_version(engine: &str, requested: &str) -> Option<String> {
+    (!version_is_offered(engine, requested)).then(|| {
+        format!("Specified engine does not support major engine version ({requested}).")
     })
 }
 

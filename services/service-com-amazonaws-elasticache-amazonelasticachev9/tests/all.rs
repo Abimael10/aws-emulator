@@ -302,3 +302,10 @@ mod lifecycle_convergence;
 // cluster in its transient phase through the convergence suite's clock helper.
 #[path = "all/replication_group_delete.rs"]
 mod replication_group_delete;
+// Appended for the same reason: the suite about the major engine versions a serverless cache
+// may be created on or moved to (the ones `DescribeCacheEngineVersions` offers), and the
+// suite about the TEMPLATE a mixed parameter batch's refusal is worded in.
+#[path = "all/serverless_major_engine_version_catalog.rs"]
+mod serverless_major_engine_version_catalog;
+#[path = "all/parameter_batch_refusal_template.rs"]
+mod parameter_batch_refusal_template;

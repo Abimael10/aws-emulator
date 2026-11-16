@@ -1351,17 +1351,16 @@ pub fn cache_parameter_group_already_exists_message(name: &str) -> String {
     format!("Parameter group {name} already exists")
 }
 
-/// How ElastiCache words a cache parameter group this account does not hold:
-/// `CacheParameterGroup <name> not found.`
+/// How `DescribeCacheParameterGroups` words a cache parameter group this account
+/// does not hold: `CacheParameterGroup <name> not found.` — the type name, the
+/// name the request supplied, then the words.
 ///
-/// One helper, so every surface that resolves a `CacheParameterGroupName` — the
-/// describes, the delete, and the creates and modifies that take a group for a
-/// cluster or a replication group — words its `CacheParameterGroupNotFoundFault`
-/// the one way the service does. The name is reported as the request spelled it,
-/// because the message is built from the request.
-///
-/// The two operations that WRITE parameter values word the same fault the other
-/// way round; see [`parameter_writer_group_not_found_message`].
+/// The name is reported as the request spelled it, because the message is built
+/// from the request. Which of the service's templates for that fault each
+/// operation answers with is stated once, in
+/// [`crate::service::cache_parameter_group_not_found`]; the operations that WRITE
+/// parameter values word it the other way round — see
+/// [`parameter_writer_group_not_found_message`].
 pub fn cache_parameter_group_not_found_message(name: &str) -> String {
     format!("CacheParameterGroup {name} not found.")
 }

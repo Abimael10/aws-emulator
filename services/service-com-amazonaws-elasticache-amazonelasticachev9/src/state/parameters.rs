@@ -1505,8 +1505,40 @@ pub fn check_parameter_value(parameter: &ParameterRecord, value: &str) -> Result
     }
     // The refusal names the published set the value is outside of, which is the
     // parameter's own `Parameter$AllowedValues` as a read reports it: the client
-    // that asked for the value learns which values it may ask for instead.
-    Err(format!("{INVALID_PARAMETER_VALUE}, allowed values are:{allowed}"))
+    // that asked for the value learns which values it may ask for instead, in
+    // the template that set's own KIND is worded with
+    // ([`published_set_refusal`]).
+    Err(published_set_refusal(allowed, value))
+}
+
+/// How ElastiCache words a value a parameter's published
+/// `Parameter$AllowedValues` do not cover, in whichever of its two sibling
+/// templates that published set calls for.
+///
+/// The set's own KIND picks the template, because the two say different things:
+///
+/// * A set that BOUNDS A NUMBER — one whose terms include a numeric range
+///   ([`allowed_value_range`]), `0-` or `1-75` or the `0,20-` form that carries a
+///   discrete value beside its range — is reported as the value being outside
+///   that range, carrying the REJECTED value as well as the bounds, because the
+///   bounds alone do not say which of several values of one request was refused.
+/// * A set that ENUMERATES literal values (`volatile-lru,allkeys-lru,…`,
+///   `yes,no`, `0,1,2`) is reported by LISTING the values the parameter takes,
+///   and does not echo the rejected value: the enumeration is the whole
+///   diagnosis, since the client's value is simply not one of its entries.
+///
+/// Both variable parts come from the request and from the service's own
+/// parameter metadata — the rejected value as the request spelled it, and the
+/// published set exactly as `DescribeCacheParameters` reports it.
+pub(super) fn published_set_refusal(allowed_values: &str, value: &str) -> String {
+    let bounds_a_number = allowed_values
+        .split(',')
+        .any(|term| allowed_value_range(term).is_some());
+    if bounds_a_number {
+        format!("value:{value} is outside of range:{allowed_values}")
+    } else {
+        format!("{INVALID_PARAMETER_VALUE}, allowed values are:{allowed_values}")
+    }
 }
 
 /// Whether a customer may change what the parameter `parameter` describes is

@@ -257,13 +257,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A requested `MajorEngineVersion` is checked against the engine the
         // cache will be running AFTER this call, the same rule the create
-        // applies.
+        // applies: a value that names no version is a bad value of that member,
+        // and a version that engine does not run is a pair the service cannot
+        // serve.
         let major_engine_version = match input.major_engine_version.as_deref() {
             Some(requested) => {
                 if let Some(message) =
                     crate::state::major_engine_version_refusal(&engine, requested)
                 {
                     return Err(invalid_value(message));
+                }
+                if let Some(message) =
+                    crate::state::unsupported_major_engine_version(&engine, requested)
+                {
+                    return Err(invalid_combination(message));
                 }
                 requested.to_string()
             }

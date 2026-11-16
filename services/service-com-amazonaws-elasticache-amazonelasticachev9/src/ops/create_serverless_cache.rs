@@ -238,14 +238,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MajorEngineVersion` is "the version of the cache engine that will be
         // used to create the serverless cache"; omitted, the cache is created on
         // the engine's current major line. The same version rule a
-        // `ModifyServerlessCache` applies, so one implementation decides it
-        // (`crate::state::major_engine_version_refusal`).
+        // `ModifyServerlessCache` applies, so one implementation decides it: a
+        // value that names no version at all is a bad value of that member
+        // (`crate::state::major_engine_version_refusal`), and a version the
+        // engine does not run is an `Engine`/`MajorEngineVersion` pair the
+        // service cannot serve
+        // (`crate::state::unsupported_major_engine_version`).
         let major_engine_version = match input.major_engine_version {
             Some(requested) => {
                 if let Some(message) =
                     crate::state::major_engine_version_refusal(&engine, &requested)
                 {
                     return Err(invalid_value(message));
+                }
+                if let Some(message) =
+                    crate::state::unsupported_major_engine_version(&engine, &requested)
+                {
+                    return Err(invalid_combination(message));
                 }
                 requested
             }
@@ -649,3 +658,18 @@ fn invalid_value(message: impl Into<String>) -> CreateServerlessCacheError {
     )
     .into()
 }
+
+/// The modelled refusal for members of this request that cannot hold TOGETHER:
+/// `InvalidParameterCombinationException` ("Two or more incompatible parameters
+/// were specified"), HTTP 400 — the refusal for an `Engine` and a
+/// `MajorEngineVersion` the service does not offer as a pair, so every place
+/// that raises it words it the same way.
+fn invalid_combination(message: impl Into<String>) -> CreateServerlessCacheError {
+    CreateServerlessCacheErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+

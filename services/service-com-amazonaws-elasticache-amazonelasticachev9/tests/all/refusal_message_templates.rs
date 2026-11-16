@@ -6,24 +6,28 @@
 //! Three rules are under test, each over a SET of inputs rather than the one request that
 //! showed it:
 //!
-//! 1. A `CacheParameterGroupNotFoundFault` is worded with one of TWO sibling templates,
-//!    `CacheParameterGroupnot found: <name>` (no separator before `not`) and
-//!    `CacheParameterGroup not found: <name>`, each carrying the `CacheParameterGroupName`
-//!    the request named and nothing from the store. Which of the two an operation answers
+//! 1. A `CacheParameterGroupNotFoundFault` is worded with one of THREE sibling templates,
+//!    `CacheParameterGroupnot found: <name>` (no separator before `not`),
+//!    `CacheParameterGroup not found: <name>` and `CacheParameterGroup <name> not found.`
+//!    (the name first, with a trailing stop), each carrying the `CacheParameterGroupName`
+//!    the request named and nothing from the store. Which of the three an operation answers
 //!    with is that operation's own, so the suite asserts the template PER OPERATION:
 //!    `DeleteCacheParameterGroup`, `DescribeCacheParameters` and
-//!    `ResetCacheParameterGroup` answer the first, and `ModifyCacheParameterGroup`,
-//!    `DescribeCacheParameterGroups` and `CreateCacheCluster`'s resolution of the member
-//!    answer the second.
+//!    `ResetCacheParameterGroup` answer the first, `ModifyCacheParameterGroup` and
+//!    `CreateCacheCluster`'s resolution of the member answer the second, and
+//!    `DescribeCacheParameterGroups` answers the third.
 //! 2. `ModifyReplicationGroup` words its `ReplicationGroupNotFoundFault`
 //!    `Replication group '<id>' not found` — the id single-quoted, no trailing stop —
 //!    while `DescribeReplicationGroups`, asserted beside it on the same id, keeps the
 //!    other template the service has for that fault, `ReplicationGroup <id> not found.`
 //! 3. A parameter value the row's published `Parameter$AllowedValues` do not cover is
-//!    refused `value:<the value> is outside of range:<the published set>`: the only place
-//!    the REJECTED value is reported, which is what tells a client which of several
-//!    `ParameterNameValues` of one request was refused. A value refused for its DATA TYPE
-//!    instead keeps naming that type, so the two classes stay apart.
+//!    refused in whichever of TWO sibling templates that published set's own kind calls
+//!    for: a set that bounds a number is reported `value:<the value> is outside of
+//!    range:<the published set>`, which is the only place the REJECTED value is reported
+//!    and so tells a client which of several `ParameterNameValues` of one request was
+//!    refused, while a set that enumerates literal values is reported `invalid parameter
+//!    value, allowed values are:<the published set>`. A value refused for its DATA TYPE
+//!    instead keeps naming that type, so the classes stay apart.
 //!
 //! The rows differ along what each rule generalises over: the way a name misses, its case,
 //! its length and its form; the operation that resolves it; and, for the parameter rule,
@@ -56,6 +60,12 @@ fn joined(name: &str) -> String {
 /// The second template, the one with the separator.
 fn spaced(name: &str) -> String {
     format!("CacheParameterGroup not found: {name}")
+}
+
+/// The third template: the name comes FIRST, between the type name and the words, and the
+/// sentence carries a trailing stop.
+fn named(name: &str) -> String {
+    format!("CacheParameterGroup {name} not found.")
 }
 
 /// Assert `reply` is the refusal `status` / `code` worded exactly `message`.
@@ -147,10 +157,6 @@ async fn assert_both_templates(emulator: &Emulator, index: usize, case: &str, na
             modify(emulator, name, &[("timeout", "300")]).await,
         ),
         (
-            "DescribeCacheParameterGroups",
-            describe_group(emulator, name).await,
-        ),
-        (
             "CreateCacheCluster",
             create_cluster_with_group(emulator, &format!("group-miss-{index}"), name).await,
         ),
@@ -163,6 +169,15 @@ async fn assert_both_templates(emulator: &Emulator, index: usize, case: &str, na
             &spaced(name),
         );
     }
+
+    // The read a client confirms a group is GONE with words the fault its own third way.
+    assert_refusal(
+        &format!("{case} through DescribeCacheParameterGroups"),
+        &describe_group(emulator, name).await,
+        404,
+        CODE,
+        &named(name),
+    );
 }
 
 #[tokio::test]
@@ -264,8 +279,18 @@ async fn published_set(emulator: &Emulator, case: &str, group: &str, parameter: 
     allowed
 }
 
+/// Which of the two templates a published set's own kind calls for; the row states it, so
+/// the suite asserts the choice rather than recomputing it.
+#[derive(Debug, Clone, Copy)]
+enum Template {
+    /// The set BOUNDS A NUMBER, so the rejected value is reported beside the bounds.
+    OutsideRange,
+    /// The set ENUMERATES literal values, so the values allowed are listed instead.
+    AllowedValues,
+}
+
 #[tokio::test]
-async fn a_value_outside_a_published_set_is_refused_with_the_value_and_the_set() {
+async fn a_value_outside_a_published_set_is_refused_in_that_sets_own_template() {
     let emulator = Emulator::new();
     let redis = "outside-redis";
     let memcached = "outside-memcached";
@@ -274,36 +299,63 @@ async fn a_value_outside_a_published_set_is_refused_with_the_value_and_the_set()
 
     // The axis: the form of the published set the value falls outside of — a
     // bottom-bounded range, a bounded range at each end, a range with a literal term
-    // beside it, an enumeration of words (including one that misses by case alone) and an
-    // enumeration of flags — over both engine catalogs, and the form of the rejected value
-    // (negative, zero, past the top, not a member of the enumeration).
-    let rows: [(&str, &str, &str); 9] = [
-        (redis, "slowlog-max-len", "-5"),
-        (redis, "slowlog-log-slower-than", "-1"),
-        (redis, "active-defrag-cycle-max", "0"),
-        (redis, "active-defrag-cycle-max", "76"),
-        (redis, "timeout", "19"),
-        (redis, "maxmemory-policy", "not-a-policy"),
-        (redis, "maxmemory-policy", "VOLATILE-LRU"),
-        (redis, "activedefrag", "true"),
-        (memcached, "slab_automove", "3"),
+    // beside it, an enumeration of words (including one that misses by case alone), an
+    // enumeration of flags and an enumeration of numbers — over both engine catalogs, and
+    // the form of the rejected value (negative, zero, past the top, not a member of the
+    // enumeration).
+    let rows: [(&str, &str, &str, Template); 10] = [
+        (redis, "slowlog-max-len", "-5", Template::OutsideRange),
+        (
+            redis,
+            "slowlog-log-slower-than",
+            "-1",
+            Template::OutsideRange,
+        ),
+        (redis, "active-defrag-cycle-max", "0", Template::OutsideRange),
+        (
+            redis,
+            "active-defrag-cycle-max",
+            "76",
+            Template::OutsideRange,
+        ),
+        (redis, "timeout", "19", Template::OutsideRange),
+        (
+            redis,
+            "maxmemory-policy",
+            "not-a-policy",
+            Template::AllowedValues,
+        ),
+        (
+            redis,
+            "maxmemory-policy",
+            "VOLATILE-LRU",
+            Template::AllowedValues,
+        ),
+        (redis, "activedefrag", "true", Template::AllowedValues),
+        (
+            redis,
+            "acl-pubsub-default",
+            "allchannel",
+            Template::AllowedValues,
+        ),
+        (memcached, "slab_automove", "3", Template::AllowedValues),
     ];
 
-    for (group, parameter, value) in rows {
+    for (group, parameter, value, template) in rows {
         let case = format!("{group}/{parameter}={value:?}");
         let allowed = published_set(&emulator, &case, group, parameter).await;
         // What the group reports for the parameter before the refused request, so the
         // read below shows the refusal changed nothing.
         let before = effective(&emulator, &case, group, parameter).await;
 
+        let expected = match template {
+            Template::OutsideRange => format!("value:{value} is outside of range:{allowed}"),
+            Template::AllowedValues => {
+                format!("invalid parameter value, allowed values are:{allowed}")
+            }
+        };
         let reply = modify(&emulator, group, &[(parameter, value)]).await;
-        assert_refusal(
-            &case,
-            &reply,
-            400,
-            "InvalidParameterValue",
-            &format!("value:{value} is outside of range:{allowed}"),
-        );
+        assert_refusal(&case, &reply, 400, "InvalidParameterValue", &expected);
 
         let after = effective(&emulator, &case, group, parameter).await;
         assert_eq!(

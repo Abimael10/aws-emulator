@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The two templates this service answers a `CacheParameterGroupNotFoundFault`
+//! The three templates this service answers a `CacheParameterGroupNotFoundFault`
 //! with, and which of them each operation takes.
 //!
-//! ElastiCache words that fault two ways. Each is fixed text followed by the
-//! `CacheParameterGroupName` the request named, and neither carries anything this
-//! store holds; the two differ only in the separator between the type name and
-//! `not found: `:
+//! ElastiCache words that fault three ways. Each carries the
+//! `CacheParameterGroupName` the request named and nothing this store holds; they
+//! differ in where the name sits and in the separator between the type name and
+//! the words:
 //!
 //! ```text
 //! CacheParameterGroupnot found: <name>     <- no separator at all
 //! CacheParameterGroup not found: <name>
+//! CacheParameterGroup <name> not found.    <- the name first, with a full stop
 //! ```
 //!
-//! WHICH of the two an operation answers with is that operation's own — the two
+//! WHICH of the three an operation answers with is that operation's own — they
 //! are observable apart on the live service, so one service-wide template cannot
 //! serve them all. [`joined_message`] is the first, which
 //! `DeleteCacheParameterGroup`, `DescribeCacheParameters` and
@@ -21,13 +22,12 @@
 //! slip here, because the type name and `not found: ` arrive joined.
 //! [`spaced_message`] is the second, which `ModifyCacheParameterGroup` answers and
 //! which the operations resolving a `CacheParameterGroupName` as part of a larger
-//! request take too.
+//! request take too. [`named_message`] is the third, which
+//! `DescribeCacheParameterGroups` answers — the read a client uses to confirm a
+//! group is gone.
 //!
-//! Both templates in one place, so no operation has to restate one and the
-//! handlers answering the same template cannot drift apart about its text. No
-//! handler answers the third wording `CacheParameterGroup <name> not found.`
-//! that [`crate::state::cache_parameter_group_not_found_message`] carries: it is
-//! neither of the two the service emits.
+//! All three templates in one place, so no operation has to restate one and the
+//! handlers answering the same template cannot drift apart about its text.
 
 /// The first template: `CacheParameterGroupnot found: <name>`.
 ///
@@ -43,8 +43,19 @@ pub fn joined_message(cache_parameter_group_name: &str) -> String {
 ///
 /// The text itself is the one `ModifyCacheParameterGroup` already answers with
 /// ([`crate::state::parameter_writer_group_not_found_message`]), reached through
-/// here so that every operation choosing between the two templates names them
-/// the same way and the two spellings cannot drift apart.
+/// here so that every operation choosing between the templates names them
+/// the same way and the spellings cannot drift apart.
 pub fn spaced_message(cache_parameter_group_name: &str) -> String {
     crate::state::parameter_writer_group_not_found_message(cache_parameter_group_name)
+}
+
+/// The third template: `CacheParameterGroup <name> not found.` — the type name,
+/// then the name the request supplied, then the words, with a trailing stop. The
+/// same one variable part as [`joined_message`].
+///
+/// The text itself is [`crate::state::cache_parameter_group_not_found_message`],
+/// the form this service words a resource's own not-found with, reached through
+/// here for the reason [`spaced_message`] gives.
+pub fn named_message(cache_parameter_group_name: &str) -> String {
+    crate::state::cache_parameter_group_not_found_message(cache_parameter_group_name)
 }
