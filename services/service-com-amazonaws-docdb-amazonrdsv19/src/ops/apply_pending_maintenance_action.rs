@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplyPendingMaintenanceAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ApplyPendingMaintenanceAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation resolves the resource the request names in this service's
+//! store and reports that resource's pending maintenance actions. It is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ApplyPendingMaintenanceAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +72,17 @@
 //! * `InvalidDBInstanceStateFault` (HTTP 400) — The specified instance isn't in the available
 //!   state.
 //! * `ResourceNotFoundFault` (HTTP 404) — The specified resource ID was not found.
+//!
+//! `ResourceIdentifier` SELECTS the resource this call acts on, and a value that selects no
+//! resource of this service is reported ABSENT: the modelled `ResourceNotFoundFault`
+//! (HTTP 404, awsQuery code `ResourceNotFoundFault`) carrying the `Resource not found:
+//! <resource>` sentence ([`resource_not_found_message`]), which names the resource the
+//! value addresses — the resource identifier an ARN of this service carries, or the value
+//! itself when it is no ARN of this service. The two state faults need a maintenance action
+//! to be pending, and nothing in this service schedules one, so a resolved resource is
+//! answered with its (empty) action list. Were a recording to show AWS refusing an
+//! `ApplyAction` that is not pending on the resource, that refusal belongs on this same
+//! branch.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -113,6 +121,51 @@ impl From<ApplyPendingMaintenanceActionErrorModeled> for ApplyPendingMaintenance
     }
 }
 
+/// The values `ApplyPendingMaintenanceActionMessage$ApplyAction` documents: "Valid values:
+/// system-update, db-upgrade". A request naming anything else is refused rather than
+/// answered, because the member is a plain `String` in the model, so the boundary validator
+/// cannot refuse it.
+const APPLY_ACTION_VALUES: [&str; 2] = ["db-upgrade", "system-update"];
+
+/// The values `ApplyPendingMaintenanceActionMessage$OptInType` documents: "Valid values:
+/// immediate … next-maintenance … undo-opt-in". Refused for the same reason as
+/// [`APPLY_ACTION_VALUES`].
+const OPT_IN_TYPE_VALUES: [&str; 3] = ["immediate", "next-maintenance", "undo-opt-in"];
+
+/// The sentence AWS answers a `ResourceIdentifier` that selects no resource with: the fixed
+/// text `Resource not found: `, then the resource the value ADDRESSES.
+///
+/// The variable part is the resource rather than the whole ARN: the identifier the caller
+/// gave the resource is what every other operation of this service answers about, and it is
+/// what the caller has to correct.
+fn resource_not_found_message(resource: &str) -> String {
+    format!("Resource not found: {resource}")
+}
+
+/// The modelled `ResourceNotFoundFault` — HTTP 404, awsQuery code `ResourceNotFoundFault`,
+/// "The specified resource ID was not found." — for a value that selects no resource.
+fn resource_not_found(resource: &str) -> ApplyPendingMaintenanceActionError {
+    ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+        message: Some(resource_not_found_message(resource)),
+    })
+    .into()
+}
+
+/// The resource a `ResourceIdentifier` ADDRESSES: the resource identifier an ARN of this
+/// service carries (the `my-cluster` of `arn:aws:rds:…:cluster:my-cluster`), or the value
+/// itself when it is no ARN of this service.
+///
+/// The ARN is read through the shared ARN reader, so which resource a value names is decided
+/// here exactly as every other service that reads a caller-supplied ARN decides it.
+fn addressed_resource(value: &str) -> &str {
+    let Some(arn) = ::service_common::arn::parse_of(value, crate::state::ARN_NAMESPACE) else {
+        return value;
+    };
+    ::service_common::arn::resource_id_of_type(value, arn.resource_type())
+        .filter(|identifier| !identifier.is_empty())
+        .unwrap_or(value)
+}
+
 /// The `ApplyPendingMaintenanceAction` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +202,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ApplyPendingMaintenanceAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ApplyPendingMaintenanceActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ApplyPendingMaintenanceAction"))
+        // This operation reports the named resource's pending maintenance actions, so
+        // nothing beyond the request itself is needed from `ctx`.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        // The report names a resource, so the transitions the clock already owed are
+        // materialised first — exactly as they would have been by any other call.
+        store.settle_clock();
+
+        // `ResourceIdentifier` names "the resource that the pending maintenance action
+        // applies to", and the resources that carry pending maintenance actions at all are
+        // the cluster and the instance. Both are resolved through the store's own readers,
+        // so a value is read here as the identifier-or-ARN every other operation of this
+        // service reads it as, and exactly as the request supplied it — a value this service
+        // would not accept as an identifier names no resource of it.
+        let requested = input.resource_identifier.as_str();
+        let resolved = store
+            .resolve_cluster_key(requested)
+            .and_then(|key| store.clusters.get(&key).map(|record| record.arn()))
+            .or_else(|| {
+                store
+                    .resolve_instance_key(requested)
+                    .and_then(|key| store.instances.get(&key).map(|record| record.arn()))
+            });
+        // A value that selects no resource of this service is reported ABSENT: the modelled
+        // `ResourceNotFoundFault` (HTTP 404), naming the resource the value addresses. ONE
+        // answer for every value that selects nothing, whatever form it takes — a cluster or
+        // instance identifier this store does not hold, an ARN of this service naming one of
+        // them, an ARN of another resource type or vendor, or a value that is no ARN at all.
+        // The resource is what this member selects, so nothing else about the request is
+        // judged first.
+        let Some(resource_arn) = resolved else {
+            return Err(resource_not_found(addressed_resource(requested)));
+        };
+
+        // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do
+        // WITH it, so a request naming a resource this service does not hold is answered
+        // with the refusal above rather than with a complaint about those members. A value
+        // outside the list either member publishes is one the parameter does not accept,
+        // which is the Query API's `InvalidParameterValue`. The refusal is worded by the
+        // crate's one reader for a value outside a documented list, so this operation states
+        // it exactly as every other operation of this service does.
+        crate::state::validate_value_from_list("ApplyAction", &input.apply_action, &APPLY_ACTION_VALUES)
+            .map_err(ApplyPendingMaintenanceActionError::invalid_parameter_value)?;
+        crate::state::validate_value_from_list("OptInType", &input.opt_in_type, &OPT_IN_TYPE_VALUES)
+            .map_err(ApplyPendingMaintenanceActionError::invalid_parameter_value)?;
+
+        // What the resource has pending. This service schedules no maintenance action —
+        // nothing in it ever writes one — so a resolved resource has none, and the honest
+        // answer is its EMPTY action list rather than a detail for work nothing scheduled and
+        // nothing applied. `ResourcePendingMaintenanceActions` is exactly that report:
+        // "Represents the output of ApplyPendingMaintenanceAction." The resource is reported
+        // by the ARN the store derives for it, so the answer names the resource that was
+        // resolved rather than the form the request addressed it by.
+        Ok(ApplyPendingMaintenanceActionOutput {
+            resource_pending_maintenance_actions: Some(ResourcePendingMaintenanceActions {
+                resource_identifier: Some(resource_arn),
+                pending_maintenance_action_details: Some(Vec::new()),
+            }),
+        })
     }
 }

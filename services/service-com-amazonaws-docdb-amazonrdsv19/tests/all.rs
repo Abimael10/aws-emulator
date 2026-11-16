@@ -25,6 +25,8 @@ mod cluster_networking_and_restore_window;
 mod cluster_parameter_groups;
 #[path = "all/cluster_snapshot_lifecycle.rs"]
 mod cluster_snapshot_lifecycle;
+#[path = "all/pending_maintenance_actions.rs"]
+mod pending_maintenance_actions;
 #[path = "all/query_boolean_member_values.rs"]
 mod query_boolean_member_values;
 #[path = "all/state_roundtrip.rs"]

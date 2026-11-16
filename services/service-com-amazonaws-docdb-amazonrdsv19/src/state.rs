@@ -1140,15 +1140,26 @@ pub fn validate_snapshot_attribute_value(member: &str, value: &str) -> Result<()
     ))
 }
 
-/// Refuse a `SnapshotType` outside the documented list; see [`SNAPSHOT_TYPES`].
-pub fn validate_snapshot_type(value: &str) -> Result<(), String> {
-    if SNAPSHOT_TYPES.contains(&value) {
+/// Refuse a member whose value is outside the list that member's own documentation
+/// publishes, naming the member, the value and the values it admits.
+///
+/// Several members of this model are plain strings whose documentation states "Valid values:
+/// …", so the boundary validator cannot refuse one and each handler has to — and every one of
+/// them refuses it in this ONE sentence, so a client reads the same wording whichever member it
+/// got wrong.
+pub fn validate_value_from_list(member: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
         return Ok(());
     }
     Err(format!(
-        "Invalid value '{value}' for SnapshotType: valid values are {}",
-        SNAPSHOT_TYPES.join(", ")
+        "Invalid value '{value}' for {member}: valid values are {}",
+        allowed.join(", ")
     ))
+}
+
+/// Refuse a `SnapshotType` outside the documented list; see [`SNAPSHOT_TYPES`].
+pub fn validate_snapshot_type(value: &str) -> Result<(), String> {
+    validate_value_from_list("SnapshotType", value, &SNAPSHOT_TYPES)
 }
 
 /// Refuse an `Engine` that is not the one Amazon DocumentDB runs; see [`DOCDB_ENGINE`].
