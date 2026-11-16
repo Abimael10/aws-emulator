@@ -51,6 +51,8 @@ mod configuration_bundle_deletion;
 mod configuration_bundle_lifecycle;
 #[path = "all/configuration_bundle_version_read.rs"]
 mod configuration_bundle_version_read;
+#[path = "all/consent_portal_lifecycle.rs"]
+mod consent_portal_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
 mod control_plane_preconditions;
 #[path = "all/credential_provider_external_secret_decryption.rs"]

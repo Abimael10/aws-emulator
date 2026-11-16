@@ -85,8 +85,19 @@
 //! for a URL this service handed out — and `override_operation` names [`mcp`]'s surface
 //! for it, so the emulator verifies the credential the request carries before anything is
 //! served. [`mcp`] documents what answers there.
+//!
+//! ## This service's other edited seam: the page a consent portal publishes
+//!
+//! A consent portal reports `portalUrl` for an end user to open, and this emulator
+//! publishes that address on its OWN endpoint ([`crate::state::consent_portal_url`]) because
+//! AWS serves its portals on a host this emulator neither owns nor answers on. `can_handle`
+//! therefore also claims a fetch of exactly that path and `override_routing_error` answers
+//! it with the stored portal's page, unauthenticated and as a web page rather than a modelled
+//! API envelope — which is how that address is opened. [`consent_portal`] documents what
+//! answers there.
 
 pub mod authorization;
+pub mod consent_portal;
 pub mod mcp;
 pub(crate) mod validation;
 
@@ -578,7 +589,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service PUBLISHES in a gateway's `gatewayUrl`, and no route key can name
         // either. See [`mcp`]: without this the router answers `404 UnknownService` for a
         // URL this service handed out.
-        mcp::addresses_gateway_endpoint_parts(parts)
+        if mcp::addresses_gateway_endpoint_parts(parts) {
+            return true;
+        }
+        // And a fetch of a CONSENT PORTAL's published page: the portal URL this service
+        // hands back in `portalUrl` is opened by whatever browser, probe or test holds it —
+        // anonymously, with no credential scope and no target header naming this service,
+        // only the path this service itself minted under the plane segment that is this
+        // service's alone. See [`consent_portal`].
+        consent_portal::claimed(parts)
     }
 
     fn override_operation(
@@ -664,8 +683,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // The ONE address this service serves that no modelled operation describes: the
+        // page of a stored consent portal, which `portalUrl` publishes for an end user to
+        // follow. It is answered here because the router consults this seam before it
+        // authenticates anything, which is how AWS serves its own portal host —
+        // unauthenticated, and as a web page rather than a modelled API call.
+        consent_portal::answer(&*self.engine, req)
     }
 
     fn override_framework_error(

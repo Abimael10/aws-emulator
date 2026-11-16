@@ -53,6 +53,9 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 aws-sdk-secretsmanager = { version = "1", default-features = false }
 # Encodes the opaque `nextToken` ListAgentRuntimes pages with.
 hex = { workspace = true }
+# Escapes the stored strings written into the consent portal page this service serves
+# at the address a portal publishes (src/state/consent_portals.rs).
+html-escape = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

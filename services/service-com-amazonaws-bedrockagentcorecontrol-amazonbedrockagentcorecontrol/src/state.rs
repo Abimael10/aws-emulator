@@ -74,7 +74,13 @@
 //! * the resource-based policy (`/resourcepolicy/`): the one document a
 //!   runtime or a gateway carries, keyed by the resource the policy's ARN
 //!   names, so `PutResourcePolicy`, `GetResourcePolicy` and
-//!   `DeleteResourcePolicy` answer from one store.
+//!   `DeleteResourcePolicy` answer from one store;
+//! * the consent portal: one [`ConsentPortalRecord`] per `consentPortalId`,
+//!   holding the sources it serves, the identity provider it authenticates end
+//!   users against, the statuses the clock owes it and the address this
+//!   emulator publishes for its page, so `CreateConsentPortal`,
+//!   `GetConsentPortal`, `ListConsentPortals`, `UpdateConsentPortal` and
+//!   `DeleteConsentPortal` answer from one store.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -2017,8 +2023,15 @@ pub mod oauth2_credential_providers;
 /// whose record lives in this module. Re-exported, so a handler names
 /// `crate::state::…` for them exactly as it does for the records themselves.
 mod listings;
+/// The consent portal this account holds: the record `CreateConsentPortal`
+/// persists, the ARN and id forms it is addressed by, the statuses the clock
+/// owes it, and the address this emulator publishes and serves its page at.
+/// Re-exported, so a handler names `crate::state::…` for it exactly as it does
+/// for the resources beside it.
+pub mod consent_portals;
 pub use api_key_credential_providers::*;
 pub use capacity_providers::*;
+pub use consent_portals::*;
 pub use datasets::*;
 pub use gateway_rate_limits::*;
 pub use gateway_rules::*;
@@ -3354,6 +3367,8 @@ impl ConfigurationBundleRecord {
 /// [`MAX_PAYMENT_MANAGERS`] the payment managers,
 /// [`MAX_CAPACITY_PROVIDERS`] the capacity providers (and with them their 1:1
 /// name index),
+/// [`MAX_CONSENT_PORTALS`] the consent portals (and with them their 1:1 name
+/// index),
 /// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY)
 /// the rate limits one gateway holds,
 /// [`MAX_POLICY_ENGINES`](policies::MAX_POLICY_ENGINES) the policy engines and
@@ -3594,6 +3609,15 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// were first recorded, so the oldest record is the one evicted at the
     /// ceiling.
     capacity_provider_idempotency_order: VecDeque<String>,
+    /// Every consent portal, keyed by `consentPortalId` — the identifier every
+    /// consent-portal operation addresses it by, `ConsentPortalIdentifier`
+    /// admitting nothing else. The key order is the deterministic list order
+    /// `ListConsentPortals` pages over.
+    pub consent_portals: BTreeMap<String, ConsentPortalRecord>,
+    /// `name` -> `consentPortalId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The name must be unique within your account"). One
+    /// entry per stored consent portal.
+    pub consent_portal_names: BTreeMap<String, String>,
     /// Every payment manager, keyed by `paymentManagerId` — the identifier every
     /// payment-manager route addresses it by. The key order is the deterministic
     /// list order a payment-manager listing pages over.
