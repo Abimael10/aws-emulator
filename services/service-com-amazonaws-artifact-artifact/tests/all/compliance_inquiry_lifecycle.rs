@@ -63,8 +63,8 @@ fn account_id() -> String {
     engine::emulator_account_id().to_string()
 }
 
-/// A SigV4 credential scope for `region` naming this service — what routes the request
-/// and what region an inquiry ARN is built for.
+/// A SigV4 credential scope for `region` naming this service — what routes the request.
+/// The region it carries is the caller's; it is not what an inquiry ARN names.
 fn signed_for(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/artifact/aws4_request, \
@@ -74,6 +74,11 @@ fn signed_for(region: &str) -> String {
 
 /// The region the suite signs for unless a case names another.
 const REGION: &str = "eu-west-1";
+
+/// The Region every ARN this service mints names, whatever Region a request was signed
+/// for: this service is reached through one partitional endpoint, so every resource it
+/// reports is homed in that one Region (`crate::state::SERVICE_REGION`).
+const HOME_REGION: &str = "us-east-1";
 
 /// Base64 of an uploaded document's bytes, as restJson1 carries a blob. Two distinct
 /// payloads, so a case can change the content without changing anything else.
@@ -409,10 +414,14 @@ async fn every_submission_is_created_and_read_back_identically() {
         assert_eq!(
             summary["arn"].as_str(),
             Some(
-                format!("arn:aws:artifact:{REGION}:{}:compliance-inquiry/{id}", account_id())
-                    .as_str()
+                format!(
+                    "arn:aws:artifact:{HOME_REGION}:{}:compliance-inquiry/{id}",
+                    account_id()
+                )
+                .as_str()
             ),
-            "case {label:?}: the arn must name this region, account and inquiry, got {:?}",
+            "case {label:?}: the arn must name this service's Region, account and inquiry, \
+             got {:?}",
             summary["arn"]
         );
         assert_eq!(
@@ -568,16 +577,13 @@ async fn an_inquiry_reaches_its_terminal_status_on_the_clock_and_then_stops_chan
 }
 
 #[tokio::test]
-async fn an_inquiry_arn_names_the_region_the_request_was_signed_for() {
+async fn an_inquiry_arn_names_this_service_s_own_region() {
     let router = emulator();
-    // Two regions and the fallback for a scope that names none usable: the ARN is built
-    // from the request's credential scope, never from a header's arbitrary text.
-    let cases = [
-        ("us-east-1", "us-east-1"),
-        ("ap-southeast-3", "ap-southeast-3"),
-        ("not_a_region", "us-east-1"),
-    ];
-    for (signed, expected) in cases {
+    // The rule generalises over the Region a caller signs for, so the rows are scopes:
+    // this service's own Region, two others, and one whose region field is not a region
+    // at all — none of which shapes the ARN.
+    let cases = [HOME_REGION, "eu-west-1", "ap-southeast-3", "not_a_region"];
+    for signed in cases {
         let body = text_body("Region", "Which region serves this?", None, &[]);
         let created = create_in(&router, signed, &body).await;
         assert_eq!(
@@ -590,12 +596,12 @@ async fn an_inquiry_arn_names_the_region_the_request_was_signed_for() {
             created.summary()["arn"].as_str(),
             Some(
                 format!(
-                    "arn:aws:artifact:{expected}:{}:compliance-inquiry/{id}",
+                    "arn:aws:artifact:{HOME_REGION}:{}:compliance-inquiry/{id}",
                     account_id()
                 )
                 .as_str()
             ),
-            "case {signed:?}: expected an ARN in {expected:?}, got {:?}",
+            "case {signed:?}: expected an ARN in {HOME_REGION:?}, got {:?}",
             created.summary()["arn"]
         );
     }

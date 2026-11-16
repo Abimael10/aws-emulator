@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListReportVersionsErrorModeled::InternalServerException(
@@ -175,7 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // issued for another report — and anything that does not decode to one of this
         // operation's own cursors — is refused rather than honoured as an offset, with
         // the service's one fixed invalid-token text, which does not say which it was.
-        let region = crate::state::request_region(ctx.parts());
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
@@ -202,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resume_at,
             page_size,
             |position| crate::state::report_versions_token(&page_tokens, &report.id, position),
-            |record| report.to_summary(record, &region),
+            |record| report.to_summary(record),
         );
 
         Ok(ListReportVersionsOutput {

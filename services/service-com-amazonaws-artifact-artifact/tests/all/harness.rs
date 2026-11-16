@@ -31,7 +31,8 @@ use smithy_server_runtime::MultiServiceRouter;
 pub const ENDPOINT: &str = "artifact.eu-west-1.amazonaws.com";
 
 /// A SigV4 credential scope naming this service. It is what routes a request to the
-/// artifact service, and its region is what a report ARN is built for.
+/// artifact service; its region is the one the CALLER presented, which is not what an ARN
+/// this service mints names (see [`HOME_REGION`]).
 pub const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/eu-west-1/artifact/aws4_request, \
      SignedHeaders=host, Signature=abc";
@@ -40,14 +41,16 @@ pub const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 pub const REGION: &str = "eu-west-1";
 
 /// A credential scope whose region field does not have an AWS region's shape. It still
-/// names the `artifact` signing name, so the request routes and the handler runs — and
-/// has to choose the region a report ARN names without letting a header shape it.
+/// names the `artifact` signing name, so the request routes and the handler runs.
 pub const SIGNED_FOR_A_MALFORMED_REGION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/not_a_region/artifact/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// The region a report ARN names when the request's scope offers none usable.
-pub const FALLBACK_REGION: &str = "us-east-1";
+/// The Region every ARN this service mints names, whatever Region a request was signed
+/// for: this service's endpoints are partitional, so a call reaches it in the partition's
+/// one Region and the resources it reports are homed there
+/// (`crate::state::SERVICE_REGION`).
+pub const HOME_REGION: &str = "us-east-1";
 
 /// A credential scope for `region`, in the shape SigV4 declares.
 pub fn signed_for(region: &str) -> String {
@@ -358,12 +361,31 @@ pub async fn get(router: &MultiServiceRouter, uri: &str) -> Answer {
 /// needs for a write, a removal or a read alike, so no suite grows a second copy of the
 /// request builder. `get` above is this one specialised to a read.
 pub async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Bytes) -> Answer {
-    let request = ::http::Request::builder()
+    send_signed(router, method, uri, body, Some(SIGNED_FOR_EU_WEST_1)).await
+}
+
+/// The ONE request builder of this harness: `method` and `uri`, the body that method
+/// carries, and the credential scope to present — `None` for a request that presents none
+/// at all, which is a request a client can make and which the service still has to answer
+/// from its own state.
+pub async fn send_signed(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Bytes,
+    authorization: Option<&str>,
+) -> Answer {
+    let mut builder = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", ENDPOINT)
-        .header("content-type", "application/json")
-        .header("authorization", SIGNED_FOR_EU_WEST_1)
+        .header("host", ENDPOINT);
+    if !body.is_empty() {
+        builder = builder.header("content-type", "application/json");
+    }
+    if let Some(scope) = authorization {
+        builder = builder.header("authorization", scope);
+    }
+    let request = builder
         .body(body)
         .expect("the test request is well formed");
 
@@ -399,33 +421,7 @@ fn error_type_of(response: &::http::Response<Bytes>) -> String {
 }
 
 pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &str) -> Answer {
-    let request = ::http::Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("host", ENDPOINT)
-        .header("authorization", authorization)
-        .body(Bytes::new())
-        .expect("the test request is well formed");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = error_type_of(&response);
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            panic!(
-                "GET {uri} answered a body that is not JSON ({error}): {:?}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
+    send_signed(router, "GET", uri, Bytes::new(), Some(authorization)).await
 }
 
 pub async fn list_reports(router: &MultiServiceRouter, query: &str) -> Answer {

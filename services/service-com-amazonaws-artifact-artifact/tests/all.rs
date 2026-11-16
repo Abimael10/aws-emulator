@@ -99,6 +99,8 @@ mod resource_tag_write_audit;
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_region_arns.rs"]
+mod service_region_arns;
 #[path = "all/service_stated_validation_envelope.rs"]
 mod service_stated_validation_envelope;
 #[path = "all/state_roundtrip.rs"]

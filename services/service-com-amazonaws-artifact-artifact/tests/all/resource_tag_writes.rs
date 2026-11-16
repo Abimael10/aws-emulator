@@ -39,9 +39,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request in this suite is signed for: an inquiry's ARN names the
-/// region of the request that created it.
+/// The region every request in this suite is signed for.
 const REGION: &str = "eu-west-1";
+
+/// The Region every ARN this service mints names, whatever Region a request was signed
+/// for: this service is reached through one partitional endpoint, so every resource it
+/// reports is homed in that one Region (`crate::state::SERVICE_REGION`).
+const HOME_REGION: &str = "us-east-1";
 
 /// How many tags one resource holds at most, from `TagsMap`'s modelled
 /// `@length(max: 50)` (`smithy_query(query="shape",shape="TagsMap")`). Spelled out here
@@ -667,29 +671,29 @@ async fn an_arn_naming_no_resource_this_account_holds_is_refused_unauthorized() 
         (
             "a never-issued inquiry id".to_string(),
             format!(
-                "arn:aws:artifact:{REGION}:{account}:compliance-inquiry/\
+                "arn:aws:artifact:{HOME_REGION}:{account}:compliance-inquiry/\
                  compliance-inquiry-0000000000000000"
             ),
         ),
         (
-            "this inquiry in another region".to_string(),
-            format!("arn:aws:artifact:us-east-1:{account}:compliance-inquiry/{id}"),
+            "this inquiry in a Region this service is not served in".to_string(),
+            format!("arn:aws:artifact:{REGION}:{account}:compliance-inquiry/{id}"),
         ),
         (
             "this inquiry in another account".to_string(),
-            format!("arn:aws:artifact:{REGION}:111122223333:compliance-inquiry/{id}"),
+            format!("arn:aws:artifact:{HOME_REGION}:111122223333:compliance-inquiry/{id}"),
         ),
         (
             "this inquiry in another partition".to_string(),
-            format!("arn:aws-cn:artifact:{REGION}:{account}:compliance-inquiry/{id}"),
+            format!("arn:aws-cn:artifact:{HOME_REGION}:{account}:compliance-inquiry/{id}"),
         ),
         (
             "this inquiry's suffix under another resource type".to_string(),
-            format!("arn:aws:artifact:{REGION}:{account}:report/report-{suffix}"),
+            format!("arn:aws:artifact:{HOME_REGION}:{account}:report/report-{suffix}"),
         ),
         (
             "another service's ARN".to_string(),
-            format!("arn:aws:s3:{REGION}:{account}:bucket/compliance"),
+            format!("arn:aws:s3:{HOME_REGION}:{account}:bucket/compliance"),
         ),
         ("a report the catalog publishes".to_string(), report_arn),
     ];
@@ -732,13 +736,14 @@ async fn an_arn_naming_no_resource_this_account_holds_is_refused_unauthorized() 
 async fn a_tag_set_follows_the_resource_and_not_the_request() {
     let router = emulator();
 
-    // Two inquiries, created in two regions, each with its own tag set: a write
-    // addressed to one ARN is a write to that one resource, and the region an inquiry's
-    // ARN names is the one its create was signed for.
+    // Two inquiries, created under two signing regions, each with its own tag set: a
+    // write addressed to one ARN is a write to that one resource, and both ARNs name this
+    // service's own Region, because that is the Region a create is served in whatever it
+    // was signed for.
     let mut created = Vec::new();
     for (region, name, tags) in [
         ("eu-west-1", "first", pairs(&[("team", "legal")])),
-        ("us-east-1", "second", pairs(&[("team", "compliance")])),
+        ("ap-southeast-2", "second", pairs(&[("team", "compliance")])),
     ] {
         let body = json!({
             "name": name,
@@ -765,10 +770,10 @@ async fn a_tag_set_follows_the_resource_and_not_the_request() {
         assert_eq!(
             arn,
             format!(
-                "arn:aws:artifact:{region}:{}:compliance-inquiry/{id}",
+                "arn:aws:artifact:{HOME_REGION}:{}:compliance-inquiry/{id}",
                 engine::emulator_account_id()
             ),
-            "case {name:?}: the ARN must name the region the create was signed for, got {arn:?}"
+            "case {name:?}: the ARN must name {HOME_REGION}, got {arn:?}"
         );
         created.push((name, id, arn, tags));
     }

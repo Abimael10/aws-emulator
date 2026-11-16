@@ -117,9 +117,23 @@ pub use resource_arn::is_resource_arn;
 /// [`SEED`].
 mod accessibility_reports;
 
-/// The region a report ARN names when the request carries no SigV4 credential scope to
-/// read one from.
-pub const DEFAULT_REGION: &str = "us-east-1";
+/// The Region this service is served in, and the one every ARN it mints names.
+///
+/// This service's endpoints are PARTITIONAL: the model binds one endpoint per partition,
+/// resolved at that partition's implicit global Region, so a call reaches the service in
+/// that one Region whatever Region a caller configured a client for, and every resource
+/// the service reports is homed there. For the partition this emulator writes its ARNs in
+/// (`arn:aws:…`, the form [`::engine::emulator_arn`] builds) that Region is `us-east-1`.
+pub const SERVICE_REGION: &str = "us-east-1";
+
+/// The Region every ARN this service mints names — see [`SERVICE_REGION`].
+///
+/// A function rather than the constant at each use site, so an ARN builder reads the
+/// service's own Region the one way and a caller-supplied value can never stand in for
+/// it.
+pub fn service_region() -> &'static str {
+    SERVICE_REGION
+}
 
 /// The `resourceType` the modelled `ResourceNotFoundException` reports for a report
 /// version that names nothing.
@@ -613,12 +627,12 @@ impl Report {
     /// the recorded AWS response for a published, PUBLIC catalog entry carries neither,
     /// while the single-report metadata read ([`Report::to_detail`]) carries both — so
     /// they are left unset here and reported there, from the one stored record.
-    pub fn to_summary(&self, version: &ReportVersion, region: &str) -> ReportSummary {
+    pub fn to_summary(&self, version: &ReportVersion) -> ReportSummary {
         ReportSummary {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             state: Some(version.state.clone()),
-            arn: Some(report_arn(region, &self.id, version.version)),
+            arn: Some(report_arn(&self.id, version.version)),
             version: Some(version.version),
             upload_state: None,
             description: Some(version.description.clone()),
@@ -637,7 +651,7 @@ impl Report {
     /// The `ReportDetail` projection `GetReportMetadata` returns for one version of this
     /// report. Every member it shares with [`Report::to_summary`] takes the same value:
     /// both read the one stored record.
-    pub fn to_detail(&self, version: &ReportVersion, region: &str) -> ReportDetail {
+    pub fn to_detail(&self, version: &ReportVersion) -> ReportDetail {
         ReportDetail {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
@@ -652,7 +666,7 @@ impl Report {
             // deleted report carries one, and the catalog holds none.
             deleted_at: None,
             state: Some(version.state.clone()),
-            arn: Some(report_arn(region, &self.id, version.version)),
+            arn: Some(report_arn(&self.id, version.version)),
             series: Some(self.series.clone()),
             category: Some(self.category.clone()),
             company_name: Some(self.company_name.clone()),
@@ -660,7 +674,7 @@ impl Report {
             // The term is the REPORT's, one for every version of it, so the ARN that
             // identifies it is read off that one stored document and never off the version
             // this projection was asked for.
-            term_arn: Some(term_arn(region, &self.term)),
+            term_arn: Some(term_arn(&self.term)),
             version: Some(version.version),
             acceptance_type: Some(self.acceptance_type.clone()),
             sequence_number: Some(version.sequence_number),
@@ -713,11 +727,11 @@ impl CustomerAgreement {
     }
 
     /// The `CustomerAgreementSummary` projection `ListCustomerAgreements` returns.
-    pub fn to_summary(&self, region: &str) -> CustomerAgreementSummary {
+    pub fn to_summary(&self) -> CustomerAgreementSummary {
         CustomerAgreementSummary {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
-            arn: Some(customer_agreement_arn(region, &self.id)),
+            arn: Some(customer_agreement_arn(&self.id)),
             agreement_arn: Some(agreement_arn(&self.agreement_id)),
             aws_account_id: Some(::engine::emulator_account_id().to_string()),
             // "ARN of the organization that owns the resource": this emulator presents a
@@ -2099,8 +2113,8 @@ pub fn mint_counter_id<Record>(
 
 /// The ARN of one VERSION of a report resource.
 ///
-/// AWS Artifact reports are service-owned, so the ARN carries the region the request was
-/// signed for and an EMPTY account id. The version is part of the ARN
+/// AWS Artifact reports are service-owned, so the ARN carries this service's own Region
+/// ([`service_region`]) and an EMPTY account id. The version is part of the ARN
 /// (`arn:aws:artifact:<region>::report/<reportId>:<version>`), because the resource an
 /// Artifact report ARN names is one published version of a report: `ListReportVersions`
 /// reports one entry per version, and two of them must not name the same resource.
@@ -2111,8 +2125,11 @@ pub fn mint_counter_id<Record>(
 /// show (`arn:aws:artifact:us-east-1::report/report-7g5j2DTVeNXWx7St:1`). It supersedes
 /// the version-less form the model's `ListReports` example sketches, which cannot name
 /// one version of a report at all.
-pub fn report_arn(region: &str, report_id: &str, version: i64) -> String {
-    format!("arn:aws:artifact:{region}::report/{report_id}:{version}")
+pub fn report_arn(report_id: &str, version: i64) -> String {
+    format!(
+        "arn:aws:artifact:{region}::report/{report_id}:{version}",
+        region = service_region()
+    )
 }
 
 /// The ARN of a TERM resource, in the same service-owned form as [`report_arn`]
@@ -2128,8 +2145,12 @@ pub fn report_arn(region: &str, report_id: &str, version: i64) -> String {
 /// term ([`Report::term`]) for all of its versions, and naming one term per version would
 /// tell a client to accept as many terms as the report has versions while a single
 /// acceptance authorises every one of them.
-pub fn term_arn(region: &str, term: &Document) -> String {
-    format!("arn:aws:artifact:{region}::term/{}", term_id(term))
+pub fn term_arn(term: &Document) -> String {
+    format!(
+        "arn:aws:artifact:{region}::term/{}",
+        term_id(term),
+        region = service_region()
+    )
 }
 
 /// How many hex digits of a term document's digest the term's resource id carries — enough
@@ -2152,10 +2173,11 @@ fn term_id(term: &Document) -> String {
 ///
 /// A customer-agreement is ACCOUNT-owned — it is one account's acceptance of an
 /// agreement, which is what its `awsAccountId` reports — so unlike [`report_arn`] its ARN
-/// carries the account id beside the region the request was signed for.
-pub fn customer_agreement_arn(region: &str, id: &str) -> String {
+/// carries the account id beside this service's own Region.
+pub fn customer_agreement_arn(id: &str) -> String {
     format!(
         "arn:aws:artifact:{region}:{account}:customer-agreement/{id}",
+        region = service_region(),
         account = ::engine::emulator_account_id()
     )
 }
@@ -2355,17 +2377,21 @@ pub fn term_document_url(host: &str, report: &Report, version: i64, term_token: 
     )
 }
 
-/// The region this request was signed for — what a report ARN and a document URL name.
+/// The Region this request was signed for — what an audit record attributes the call to.
+///
+/// This is the Region the CALLER presented in its credential scope, and it is reported as
+/// such and nothing else: no ARN and no URL is built from it, because this service is
+/// served in one Region whatever a caller signed for ([`service_region`]).
 ///
 /// The scope's region is only honoured when it has an AWS region's SHAPE
-/// (`<partition>-<area>[-<area>]-<number>`, e.g. `us-east-1`, `ap-southeast-3`): the value
-/// is interpolated into an ARN and a URL host, so an arbitrary header value must not be
-/// able to shape either. Anything else falls back to [`DEFAULT_REGION`].
+/// (`<partition>-<area>[-<area>]-<number>`, e.g. `us-east-1`, `ap-southeast-3`), so a
+/// record never carries arbitrary header text as a Region. Anything else falls back to
+/// [`SERVICE_REGION`], the Region the call was in fact served in.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .filter(|region| is_region_shaped(region))
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+        .unwrap_or_else(|| SERVICE_REGION.to_string())
 }
 
 /// True when `value` has an AWS region's shape: lowercase alphabetic segments joined by
@@ -2716,9 +2742,15 @@ impl ReportRefusal {
 /// The ARN of a compliance inquiry.
 ///
 /// Unlike a report, an inquiry is CALLER-owned, so its ARN carries the account id this
-/// emulator presents, through `engine::emulator_arn`.
-pub fn inquiry_arn(region: &str, inquiry_id: &str) -> String {
-    ::engine::emulator_arn("artifact", region, &format!("compliance-inquiry/{inquiry_id}"))
+/// emulator presents, through `engine::emulator_arn`. Its Region is this service's own
+/// ([`service_region`]), like every other ARN minted here: a caller cannot reach this
+/// service in another one.
+pub fn inquiry_arn(inquiry_id: &str) -> String {
+    ::engine::emulator_arn(
+        "artifact",
+        service_region(),
+        &format!("compliance-inquiry/{inquiry_id}"),
+    )
 }
 
 // There is deliberately no not-found payload for a compliance inquiry id: an id the

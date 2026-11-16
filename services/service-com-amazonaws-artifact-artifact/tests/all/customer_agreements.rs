@@ -41,12 +41,14 @@ const MAX_RESULTS_CEILING: i32 = 300;
 /// The region the default test request is signed for.
 const REGION: &str = "eu-west-1";
 
-/// The region an ARN names when the request's credential scope offers none usable.
-const FALLBACK_REGION: &str = "us-east-1";
+/// The Region every ARN this service mints names, whatever Region a request was signed
+/// for: this service is reached through one partitional endpoint, so every resource it
+/// reports is homed in that one Region (`crate::state::SERVICE_REGION`).
+const HOME_REGION: &str = "us-east-1";
 
 /// A credential scope for `region`, in the shape SigV4 declares. Its signing name is
-/// what routes the request to the artifact service, and its region is what a
-/// customer-agreement ARN is built for.
+/// what routes the request to the artifact service; its region is the one the caller
+/// presented, which is not what a customer-agreement ARN names.
 fn signed_for(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/artifact/aws4_request, \
@@ -223,11 +225,11 @@ async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
     list_signed(router, query, &signed_for(REGION)).await
 }
 
-/// The ARN form a customer-agreement resource carries: account-owned, in the region the
-/// request was signed for.
-fn agreement_resource_arn(region: &str, id: &str) -> String {
+/// The ARN form a customer-agreement resource carries: account-owned, in this service's
+/// own Region.
+fn agreement_resource_arn(id: &str) -> String {
     format!(
-        "arn:aws:artifact:{region}:{account}:customer-agreement/{id}",
+        "arn:aws:artifact:{HOME_REGION}:{account}:customer-agreement/{id}",
         account = engine::emulator_account_id()
     )
 }
@@ -370,9 +372,9 @@ async fn every_active_agreement_is_projected_from_the_persisted_record() {
         );
         assert_eq!(
             actual["arn"].as_str(),
-            Some(agreement_resource_arn(REGION, expected.id).as_str()),
+            Some(agreement_resource_arn(expected.id).as_str()),
             "case {case:?}: expected the account-owned ARN {:?}, got {actual:?}",
-            agreement_resource_arn(REGION, expected.id)
+            agreement_resource_arn(expected.id)
         );
         assert_eq!(
             actual["agreementArn"].as_str(),
@@ -528,7 +530,7 @@ async fn the_answer_follows_the_store_a_write_changes() {
         .clone();
     assert_eq!(
         added["arn"].as_str(),
-        Some(agreement_resource_arn(REGION, added_active).as_str()),
+        Some(agreement_resource_arn(added_active).as_str()),
         "case {added_active:?}: the ARN must be built for the stored id, got {added:?}"
     );
     assert_eq!(
@@ -736,16 +738,16 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
 }
 
 #[tokio::test]
-async fn an_agreement_arn_names_the_signed_region_and_the_owning_account() {
-    // The rule generalises over the signing region, so the rows are regions: the usual
-    // shapes, a three-segment one, and a scope whose region field is not shaped like a
-    // region at all — which falls back rather than letting a header shape an ARN.
-    for (case, region, expected_region) in [
-        ("us-east-1", "us-east-1", FALLBACK_REGION),
-        ("eu-west-1", REGION, REGION),
-        ("ap-southeast-3", "ap-southeast-3", "ap-southeast-3"),
-        ("not_a_region", "not_a_region", FALLBACK_REGION),
-        ("an empty region", "", FALLBACK_REGION),
+async fn an_agreement_arn_names_this_service_s_region_and_the_owning_account() {
+    // The rule generalises over the Region a caller signs for, so the rows are regions:
+    // the usual shapes, a three-segment one, this service's own, and scopes whose region
+    // field is not shaped like a region at all — none of which can shape an ARN.
+    for (case, region) in [
+        ("us-east-1", "us-east-1"),
+        ("eu-west-1", REGION),
+        ("ap-southeast-3", "ap-southeast-3"),
+        ("not_a_region", "not_a_region"),
+        ("an empty region", ""),
     ] {
         let router = emulator();
         let answer = list_signed(&router, "", &signed_for(region)).await;
@@ -768,9 +770,9 @@ async fn an_agreement_arn_names_the_signed_region_and_the_owning_account() {
             let id = item["id"].as_str().unwrap_or_default();
             assert_eq!(
                 item["arn"].as_str(),
-                Some(agreement_resource_arn(expected_region, id).as_str()),
+                Some(agreement_resource_arn(id).as_str()),
                 "case {case:?}: expected the ARN {:?}, got {item:?}",
-                agreement_resource_arn(expected_region, id)
+                agreement_resource_arn(id)
             );
             // The published agreement is neither account- nor region-scoped, so its ARN
             // does not move with the request.

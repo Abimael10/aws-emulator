@@ -22,7 +22,7 @@
 //!    answer the same tags, and the other reader of the same record agrees.
 //!
 //! Rows differ along what the rules generalise over: the number of tags, the length and
-//! the character classes of the keys and values, the region the resource was created in,
+//! the character classes of the keys and values, the Region the create was signed for,
 //! and which field of the ARN is wrong.
 //!
 //! The WRITE side of the same tag set — `TagResource` and `UntagResource` — is
@@ -38,9 +38,14 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region this suite signs for unless a case names another.
 const REGION: &str = "eu-west-1";
 
-/// A second region, so a case can create a resource under one region and address it
-/// under another.
-const OTHER_REGION: &str = "us-east-1";
+/// A second region, so a case can sign a create under one region and address the
+/// resource under another.
+const OTHER_REGION: &str = "ap-southeast-2";
+
+/// The Region every ARN this service mints names, whatever Region a request was signed
+/// for: this service is reached through one partitional endpoint, so every resource it
+/// reports is homed in that one Region (`crate::state::SERVICE_REGION`).
+const HOME_REGION: &str = "us-east-1";
 
 /// An account id that is not the one this emulator serves.
 const FOREIGN_ACCOUNT: &str = "111122223333";
@@ -77,8 +82,9 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A SigV4 credential scope for `region` naming this service — what routes the request
-/// and what region a created inquiry's ARN is built for.
+/// A SigV4 credential scope for `region` naming this service — what routes the request.
+/// The region it carries is the caller's, and it is not what a created inquiry's ARN
+/// names ([`HOME_REGION`]).
 fn signed_for(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/artifact/aws4_request, \
@@ -374,20 +380,20 @@ async fn list_tags_for_resource_reports_the_tags_the_create_persisted() {
     }
 }
 
-/// Rule 1, on the region the resource was created in: the ARN the service minted names
-/// the resource whatever region the request was signed for, because the ARN is the key.
+/// Rule 1, on the Region the create was signed for: the ARN the service minted names the
+/// resource whatever Region the request carried, because the ARN is the key.
 #[tokio::test]
 async fn a_resource_is_listed_by_the_arn_its_create_minted_in_any_region() {
     let router = emulator();
     let tags = json!({ "scope": "per-account" });
 
     for region in [REGION, OTHER_REGION] {
-        let case = format!("created in {region}");
+        let case = format!("signed for {region}");
         let resource_arn =
             tagged_inquiry(&router, region, &case, &format!("inquiry in {region}"), &tags).await;
         assert!(
-            resource_arn.contains(&format!(":{region}:")),
-            "case {case:?}: the minted ARN must name the region the request was signed for, \
+            resource_arn.contains(&format!(":{HOME_REGION}:")),
+            "case {case:?}: the minted ARN must name this service's Region {HOME_REGION}, \
              got {resource_arn:?}"
         );
 
@@ -481,13 +487,13 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 "ec2",
-                REGION,
+                HOME_REGION,
                 engine::emulator_account_id(),
                 &format!("instance/{id}"),
             ),
         ),
         (
-            "this account in another region".to_string(),
+            "this account in a Region this service is not served in".to_string(),
             arn(
                 "aws",
                 ARN_SERVICE,
@@ -501,7 +507,7 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 ARN_SERVICE,
-                REGION,
+                HOME_REGION,
                 FOREIGN_ACCOUNT,
                 &format!("compliance-inquiry/{id}"),
             ),
@@ -511,7 +517,7 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 ARN_SERVICE,
-                REGION,
+                HOME_REGION,
                 FOREIGN_ACCOUNT,
                 "compliance-inquiry/0123456789abcdef",
             ),
@@ -521,7 +527,7 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 ARN_SERVICE,
-                REGION,
+                HOME_REGION,
                 "000000000001",
                 &format!("compliance-inquiry/{id}"),
             ),
@@ -531,7 +537,7 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 ARN_SERVICE,
-                REGION,
+                HOME_REGION,
                 "",
                 &format!("compliance-inquiry/{id}"),
             ),
@@ -541,7 +547,7 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 ARN_SERVICE,
-                REGION,
+                HOME_REGION,
                 engine::emulator_account_id(),
                 &format!("inquiry/{id}"),
             ),
@@ -551,7 +557,7 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
             arn(
                 "aws",
                 ARN_SERVICE,
-                REGION,
+                HOME_REGION,
                 engine::emulator_account_id(),
                 "compliance-inquiry/compliance-inquiry-ffffffffffffffff",
             ),

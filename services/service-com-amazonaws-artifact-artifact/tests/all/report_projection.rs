@@ -15,7 +15,8 @@
 //! * RULE P — a report projection reports the report's own published identity: a catalog
 //!   entry carries exactly the published-report members, and the document-upload progress
 //!   members belong to the single-report metadata read alone.
-//! * RULE A — a report ARN names the region the request was signed for, an empty account
+//! * RULE A — a report ARN names this service's own Region (the one its partitional
+//!   endpoint resolves to, whatever Region a caller signed for), an empty account
 //!   id, the report and the VERSION the projection was taken from.
 //! * RULE K — a `nextToken` is an OPAQUE continuation value: it is none of the resource
 //!   identifiers of the collection it pages, handing it back resumes exactly where the
@@ -30,7 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     emulator, get_report_metadata, get_signed, list_report_versions, list_reports, signed_for,
-    Answer, CATALOG, FALLBACK_REGION, REGION, SIGNED_FOR_A_MALFORMED_REGION,
+    Answer, CATALOG, HOME_REGION, REGION, SIGNED_FOR_A_MALFORMED_REGION,
 };
 
 /// The members `ReportSummary` projects for a published catalog report, exactly.
@@ -264,7 +265,10 @@ async fn a_report_arn_names_the_version_the_projection_was_taken_from() {
             let arn = summary["arn"].as_str().unwrap_or_default();
             assert_eq!(
                 arn,
-                format!("arn:aws:artifact:{REGION}::report/{}:{version}", expected.id),
+                format!(
+                    "arn:aws:artifact:{HOME_REGION}::report/{}:{version}",
+                    expected.id
+                ),
                 "case {case:?}: expected a service-owned ARN naming that version, got {arn:?}"
             );
             assert!(
@@ -280,20 +284,18 @@ async fn a_report_arn_names_the_version_the_projection_was_taken_from() {
         );
     }
 
-    // The region comes from the request's credential scope, and an unusable scope falls
-    // back rather than letting a header shape the ARN.
-    let regions: Vec<(String, String)> = vec![
-        (signed_for(REGION), REGION.to_string()),
-        (signed_for("us-west-2"), "us-west-2".to_string()),
-        (signed_for("ap-southeast-3"), "ap-southeast-3".to_string()),
-        (
-            SIGNED_FOR_A_MALFORMED_REGION.to_string(),
-            FALLBACK_REGION.to_string(),
-        ),
+    // The ARN names THIS SERVICE's Region whatever a request was signed for, and an
+    // unusable scope cannot shape it either.
+    let scopes: Vec<String> = vec![
+        signed_for(REGION),
+        signed_for("us-west-2"),
+        signed_for("ap-southeast-3"),
+        signed_for(HOME_REGION),
+        SIGNED_FOR_A_MALFORMED_REGION.to_string(),
     ];
-    for (authorization, region) in regions {
+    for authorization in scopes {
         for expected in CATALOG {
-            let case = format!("{} in {region}", expected.id);
+            let case = format!("{} signed for {authorization:?}", expected.id);
             let answer = get_signed(
                 &router,
                 &format!("/v1/report/getMetadata?reportId={}", expected.id),
@@ -304,13 +306,13 @@ async fn a_report_arn_names_the_version_the_projection_was_taken_from() {
                 answer.body["reportDetails"]["arn"].as_str(),
                 Some(
                     format!(
-                        "arn:aws:artifact:{region}::report/{}:{}",
+                        "arn:aws:artifact:{HOME_REGION}::report/{}:{}",
                         expected.id,
                         expected.latest()
                     )
                     .as_str()
                 ),
-                "case {case:?}: expected the ARN to name that region and the latest version, \
+                "case {case:?}: expected the ARN to name {HOME_REGION} and the latest version, \
                  got {:?}",
                 answer.body
             );
@@ -328,7 +330,7 @@ fn resource_identifiers() -> Vec<String> {
             values.push(version.to_string());
             values.push(format!("{}:{version}", expected.id));
             values.push(format!(
-                "arn:aws:artifact:{REGION}::report/{}:{version}",
+                "arn:aws:artifact:{HOME_REGION}::report/{}:{version}",
                 expected.id
             ));
         }

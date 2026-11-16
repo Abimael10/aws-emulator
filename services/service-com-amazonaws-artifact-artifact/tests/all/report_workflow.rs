@@ -27,8 +27,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     a_report_requiring_acceptance, emulator, get_report, get_report_metadata, get_signed,
-    get_term_for_report, list_report_versions, list_reports, signed_for, CATALOG,
-    FALLBACK_REGION, REGION, SIGNED_FOR_A_MALFORMED_REGION,
+    get_term_for_report, list_report_versions, list_reports, signed_for, CATALOG, HOME_REGION,
+    REGION, SIGNED_FOR_A_MALFORMED_REGION,
 };
 
 /// The bounds `MaxResultsAttribute` declares (`@range(min: 1, max: 300)`), spelled out
@@ -183,8 +183,8 @@ async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
             expected.acceptance_type,
             actual
         );
-        // A report ARN is service-owned: the region the request was signed for, an empty
-        // account id, and the VERSION this entry projects.
+        // A report ARN is service-owned: this service's own Region, an empty account id,
+        // and the VERSION this entry projects.
         let latest = expected
             .versions
             .iter()
@@ -195,12 +195,12 @@ async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
             actual["arn"].as_str(),
             Some(
                 format!(
-                    "arn:aws:artifact:{REGION}::report/{}:{latest}",
+                    "arn:aws:artifact:{HOME_REGION}::report/{}:{latest}",
                     expected.id
                 )
                 .as_str()
             ),
-            "case {case:?}: expected a service-owned ARN for region {REGION}, got {:?}",
+            "case {case:?}: expected a service-owned ARN for region {HOME_REGION}, got {:?}",
             actual
         );
         // ListReports reports one entry per report, at its LATEST published version.
@@ -384,12 +384,13 @@ async fn every_listed_report_is_fetchable_by_id_and_by_version() {
             detail
         );
         // `termArn` identifies the TERM resource governing this report — one term for every
-        // version of it — so it is service-owned (the signed region, an empty account id)
-        // and names a term resource. That it does not vary with the version, and tracks the
-        // term DOCUMENT, is pinned over the whole catalog in `report_term_identity.rs`.
+        // version of it — so it is service-owned (this service's own Region, an empty
+        // account id) and names a term resource. That it does not vary with the version, and
+        // tracks the term DOCUMENT, is pinned over the whole catalog in
+        // `report_term_identity.rs`.
         let term_arn = detail["termArn"].as_str().unwrap_or_default().to_string();
         assert!(
-            term_arn.starts_with(&format!("arn:aws:artifact:{REGION}::term/term-")),
+            term_arn.starts_with(&format!("arn:aws:artifact:{HOME_REGION}::term/term-")),
             "case {case:?}: expected a service-owned term ARN naming a term resource, got {:?}",
             detail
         );
@@ -500,7 +501,7 @@ async fn list_report_versions_returns_every_stored_version_of_one_report() {
                 report["arn"].as_str(),
                 Some(
                     format!(
-                        "arn:aws:artifact:{REGION}::report/{}:{}",
+                        "arn:aws:artifact:{HOME_REGION}::report/{}:{}",
                         expected.id,
                         report["version"].as_i64().unwrap_or_default()
                     )
@@ -948,23 +949,22 @@ async fn a_next_token_this_service_never_issued_is_refused() {
 }
 
 #[tokio::test]
-async fn a_report_arn_names_the_region_the_request_was_signed_for() {
+async fn a_report_arn_names_this_service_s_own_region_whatever_was_signed_for() {
     let router = emulator();
-    // The rule generalises over the signing region, so the rows are regions: the usual
-    // two-word form, a three-word one, a region whose number is more than one digit, and
-    // a scope whose region field is not a region at all — which must not be allowed to
-    // shape the ARN, because the ARN is a value a client parses.
-    let cases: Vec<(String, String)> = vec![
-        (signed_for(REGION), REGION.to_string()),
-        (signed_for("us-west-2"), "us-west-2".to_string()),
-        (signed_for("ap-southeast-3"), "ap-southeast-3".to_string()),
-        (signed_for("us-gov-east-1"), "us-gov-east-1".to_string()),
-        (
-            SIGNED_FOR_A_MALFORMED_REGION.to_string(),
-            FALLBACK_REGION.to_string(),
-        ),
+    // The rule generalises over the Region a caller signs for, so the rows are regions —
+    // the usual two-word form, a three-word one, one of another partition's shape, and a
+    // scope whose region field is not a region at all — and the ARN names this service's
+    // own Region in every one of them.
+    let cases: Vec<String> = vec![
+        signed_for(REGION),
+        signed_for("us-west-2"),
+        signed_for("ap-southeast-3"),
+        signed_for("us-gov-east-1"),
+        signed_for(HOME_REGION),
+        SIGNED_FOR_A_MALFORMED_REGION.to_string(),
     ];
-    for (authorization, expected_region) in cases {
+    for authorization in cases {
+        let case = authorization.clone();
         let answer = get_signed(
             &router,
             &format!("/v1/report/getMetadata?reportId={}", CATALOG[0].id),
@@ -973,14 +973,14 @@ async fn a_report_arn_names_the_region_the_request_was_signed_for() {
         .await;
         assert_eq!(
             answer.status, 200,
-            "case {expected_region:?}: expected HTTP 200, got {} with {:?}",
+            "case {case:?}: expected HTTP 200, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.body["reportDetails"]["arn"].as_str(),
             Some(
                 format!(
-                    "arn:aws:artifact:{expected_region}::report/{}:{}",
+                    "arn:aws:artifact:{HOME_REGION}::report/{}:{}",
                     CATALOG[0].id,
                     CATALOG[0]
                         .versions
@@ -991,7 +991,7 @@ async fn a_report_arn_names_the_region_the_request_was_signed_for() {
                 )
                 .as_str()
             ),
-            "case {expected_region:?}: expected the ARN to name that region, got {:?}",
+            "case {case:?}: expected the ARN to name {HOME_REGION}, got {:?}",
             answer.body
         );
     }

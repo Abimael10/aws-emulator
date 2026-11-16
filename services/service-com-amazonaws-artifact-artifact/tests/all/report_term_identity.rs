@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     emulator, follow_announced_url, get_report, get_signed, get_term_for_report, signed_for,
-    Answer, CATALOG, REGION,
+    Answer, CATALOG, HOME_REGION, REGION,
 };
 
 /// How many characters a term resource id carries after its `term-` prefix: the same
@@ -63,11 +63,12 @@ fn term_arn_of(case: &str, answer: &Answer) -> String {
 }
 
 /// The term resource id a term ARN names: everything after its service-owned
-/// `arn:aws:artifact:<region>::term/` prefix. Asserts the ARN is service-owned (the signed
-/// region, an empty account id) and that the id has this service's resource-id shape, so
-/// nothing version-bearing or otherwise report-shaped can pass as a term id.
-fn term_id_of(case: &str, region: &str, arn: &str) -> String {
-    let prefix = format!("arn:aws:artifact:{region}::term/");
+/// `arn:aws:artifact:<region>::term/` prefix. Asserts the ARN is service-owned (this
+/// service's own Region, an empty account id) and that the id has this service's
+/// resource-id shape, so nothing version-bearing or otherwise report-shaped can pass as a
+/// term id.
+fn term_id_of(case: &str, arn: &str) -> String {
+    let prefix = format!("arn:aws:artifact:{HOME_REGION}::term/");
     let id = arn.strip_prefix(&prefix).unwrap_or_else(|| {
         panic!("case {case}: expected a service-owned term ARN under {prefix:?}, got {arn:?}")
     });
@@ -163,7 +164,7 @@ async fn term_arn_names_one_term_for_every_version_of_a_report() {
         for query in &queries {
             let case = format!("{} {query}", expected.id);
             let first = term_arn_of(&case, &metadata(&router, REGION, query).await);
-            term_id_of(&case, REGION, &first);
+            term_id_of(&case, &first);
             // A read changes nothing a later caller sees, the term ARN included.
             let again = term_arn_of(&case, &metadata(&router, REGION, query).await);
             assert_eq!(
@@ -197,7 +198,7 @@ async fn term_arn_identifies_the_term_document_and_nothing_else() {
             &case,
             &metadata(&router, REGION, &format!("?reportId={}", expected.id)).await,
         );
-        let id = term_id_of(&case, REGION, &arn);
+        let id = term_id_of(&case, &arn);
 
         // Every version of the report serves the one term document the ARN names.
         let mut documents = BTreeSet::new();
@@ -246,11 +247,12 @@ async fn term_arn_identifies_the_term_document_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn term_arn_is_scoped_to_the_signed_region_and_names_the_same_term_in_each() {
+async fn term_arn_names_this_service_s_region_and_the_same_term_whatever_was_signed_for() {
     let router = emulator();
     // The rule generalises over the region the request was signed for, so the rows are
-    // regions in different partitions' shapes, including the harness's own.
-    let regions = [REGION, "us-east-1", "ap-southeast-2", "eu-central-1"];
+    // regions in different partitions' shapes, including the harness's own and this
+    // service's.
+    let regions = [REGION, HOME_REGION, "ap-southeast-2", "eu-central-1"];
 
     for expected in CATALOG {
         let mut ids = BTreeSet::new();
@@ -266,14 +268,14 @@ async fn term_arn_is_scoped_to_the_signed_region_and_names_the_same_term_in_each
                     )
                     .await,
                 );
-                ids.insert(term_id_of(&case, region, &arn));
+                ids.insert(term_id_of(&case, &arn));
             }
         }
         assert_eq!(
             ids.len(),
             1,
-            "case {:?}: the region scopes the ARN, but the term resource it names is the same \
-             one everywhere; got {ids:?}",
+            "case {:?}: the ARN names this service's own Region, and the term resource it \
+             names is the same one whatever a caller signed for; got {ids:?}",
             expected.id
         );
     }

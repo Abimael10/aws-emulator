@@ -181,8 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Nothing in the request metadata shapes the grant this mints; the request's
-        // credential scope names the endpoint's region AND attributes the acceptance below,
-        // exactly as the account-wide write and the tag writes read it.
+        // credential scope attributes the acceptance below, exactly as the account-wide
+        // write and the tag writes read it.
         let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
         let region = crate::state::request_region(ctx.parts());
 

@@ -35,7 +35,8 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    emulator, get_report_metadata, list_report_versions, list_reports, Expected, CATALOG, REGION,
+    emulator, get_report_metadata, list_report_versions, list_reports, Expected, CATALOG,
+    HOME_REGION,
 };
 
 /// The page sizes the enumeration is walked at: the floor and the ceiling of
@@ -252,7 +253,7 @@ async fn every_catalog_report_is_enumerated_on_exactly_one_page_at_every_page_si
             assert_eq!(
                 found.arn,
                 format!(
-                    "arn:aws:artifact:{REGION}::report/{}:{}",
+                    "arn:aws:artifact:{HOME_REGION}::report/{}:{}",
                     found.id, found.version
                 ),
                 "case {case:?}: an enumerated report is keyed by its own ARN, got {:?}",

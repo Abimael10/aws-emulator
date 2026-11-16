@@ -216,8 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Nothing in the request metadata shapes the inquiry's content; the request's
-        // credential scope names the region the minted ARN lives in AND attributes the
-        // creation below, exactly as the account-wide write and the tag writes read it.
+        // credential scope attributes the creation below, exactly as the account-wide
+        // write and the tag writes read it. The ARN the create mints carries this
+        // service's own Region rather than the scope's, because that is the Region the
+        // call was served in whatever the caller signed for.
         let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
         let region = crate::state::request_region(ctx.parts());
 
@@ -377,7 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_inquiry_id();
         let inquiry = crate::state::ComplianceInquiry {
-            arn: crate::state::inquiry_arn(&region, &id),
+            arn: crate::state::inquiry_arn(&id),
             // The submitted title, kept verbatim as the title of record. The name every
             // read REPORTS is the projection
             // [`crate::state::ComplianceInquiry::display_name`]: content that derives its

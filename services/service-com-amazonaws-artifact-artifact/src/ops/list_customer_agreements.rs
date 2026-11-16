@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListCustomerAgreementsErrorModeled::InternalServerException(
@@ -173,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The cursor is sealed under the secret THIS store drew, so the key comes off the
         // store before anything is read.
-        let region = crate::state::request_region(ctx.parts());
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
@@ -198,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resume_at,
             page_size,
             |position| crate::state::customer_agreements_page_token(&page_tokens, position),
-            |agreement| agreement.to_summary(&region),
+            |agreement| agreement.to_summary(),
         );
 
         Ok(ListCustomerAgreementsOutput {

@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetReportMetadataErrorModeled::InternalServerException(
@@ -169,7 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // Which of the two refusals a request that resolves no report version gets is the
         // service's one rule, decided in `crate::state`; this handler only lifts it into
@@ -181,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetReportMetadataOutput {
-            report_details: Some(report.to_detail(version, &region)),
+            report_details: Some(report.to_detail(version)),
         })
     }
 }
