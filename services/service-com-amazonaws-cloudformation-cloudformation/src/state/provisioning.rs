@@ -342,6 +342,11 @@ mod model_validation;
 /// resource-signal wait of a resource whose signals come from the instances it consists of
 /// ([`instance_signals`]).
 mod instance_signals;
+/// The DEPLOYMENT WALK's own helpers — what a create or an update reads about each
+/// declaration before it asks the service that owns it ([`deployment_walk`]). Their own file
+/// so this module stays inside the length the build holds every file to.
+mod deployment_walk;
+use deployment_walk::*;
 /// Re-pointing a deployment's stand-ins at the identifiers the owning services MINTED: what
 /// brings a declaration, and the identity of the resource it names, into step with what each
 /// create really answered ([`repointing`]).
@@ -1558,6 +1563,7 @@ pub async fn advance_stabilisations_in(
                     needs: &needs,
                     on_refusal: OnRefusal::Stop,
                     policies,
+                    left_alone: NOTHING_LEFT_ALONE,
                 },
             )
             .await;
@@ -1572,7 +1578,21 @@ pub async fn advance_stabilisations_in(
             // operation this rollback follows.
             stack.record_stabilisations(&deleted.removing, SystemTime::now());
             if let Some(failure) = deleted.failure {
-                stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+                // Reported once this teardown has asked about every resource it still can
+                // ([`super::StoredStack::hold_teardown_failure`]).
+                if !stack.hold_teardown_failure(
+                    &deleted.transitions,
+                    &deleted.removing,
+                    &deleted.refused,
+                    super::status::ROLLBACK_FAILED,
+                    &failure,
+                ) {
+                    stack.fail_transition(
+                        SystemTime::now(),
+                        super::status::ROLLBACK_FAILED,
+                        failure,
+                    );
+                }
             }
         }
     }
@@ -1855,6 +1875,7 @@ async fn settle_expired_waits(
                 needs: &needs,
                 on_refusal: OnRefusal::Stop,
                 policies,
+                left_alone: NOTHING_LEFT_ALONE,
             },
         )
         .await;
@@ -1868,7 +1889,17 @@ async fn settle_expired_waits(
         // rollback open: it is not reported complete while a resource it removed is there.
         stack.record_stabilisations(&deleted.removing, SystemTime::now());
         if let Some(failure) = deleted.failure {
-            stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+            // Reported once this teardown has asked about every resource it still can
+            // ([`super::StoredStack::hold_teardown_failure`]).
+            if !stack.hold_teardown_failure(
+                &deleted.transitions,
+                &deleted.removing,
+                &deleted.refused,
+                super::status::ROLLBACK_FAILED,
+                &failure,
+            ) {
+                stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+            }
         }
     }
 }
@@ -3088,6 +3119,7 @@ pub async fn reconcile(
         // ([`Policies::Replaced`]), while a resource the deployment no longer declares is
         // governed by the `DeletionPolicy` the caller's own walk chose.
         policies: Policies::Replaced,
+        left_alone: NOTHING_LEFT_ALONE,
     };
     let mut deleted = delete_pass(ctx, region, &replacements, &replacement_walk, &mut opened).await;
     if deleted.failure.is_some() {
@@ -3134,24 +3166,6 @@ pub async fn reconcile(
     // ([`super::stabilising`]).
     outcome.stabilising.extend(deleted.removing);
     outcome
-}
-
-/// Record the identity an owning service ASSIGNED to a resource it created: the id its
-/// `Ref` resolves to from here on, and the `Id`/`<Type>Id` attributes read off that id,
-/// which the naming rules had computed from the name instead.
-///
-/// Taking an identifier over is [`super::template::adopt_identity`], the one place that
-/// step is written — the same one a binding's composite primary identifier goes through —
-/// so the attributes and the id a resource reports cannot drift apart whichever of them
-/// produced it.
-///
-/// `None` is every type whose physical id CloudFormation computes, which the create already
-/// carried out to that service: nothing to adopt.
-fn adopt_minted_identity(resource: &mut StoredResource, assigned: Option<String>) {
-    let Some(assigned) = assigned else {
-        return;
-    };
-    super::template::adopt_identity(resource, assigned);
 }
 
 /// Record what an owning service already created: the resource exists there with the
@@ -3239,6 +3253,13 @@ pub struct Deleted {
     /// ([`super::StoredStack::record_stabilisations`]), exactly as
     /// [`Materialised::stabilising`] is.
     pub removing: Vec<Stabilising>,
+    /// The resources the owning service REFUSED to delete, in the order this walk reached
+    /// them: the logical ids [`Deleted::failure`] summarises.
+    ///
+    /// What a FURTHER pass of the same teardown must leave alone ([`Teardown::left_alone`]):
+    /// the refusal has already been reported on each of them, so a pass that asks about the
+    /// resources an unfinished removal held back asks about none of these a second time.
+    pub refused: Vec<String>,
 }
 
 /// What a teardown does with a resource the service that owns it REFUSES to delete.
@@ -3417,7 +3438,21 @@ pub struct Teardown<'a> {
     pub on_refusal: OnRefusal,
     /// Whether the walk reads each resource's own `DeletionPolicy` ([`Policies`]).
     pub policies: Policies,
+    /// The resources this walk LEAVES ALONE whatever it finds: the ones an earlier pass of
+    /// the same teardown was refused ([`Deleted::refused`]) and everything those need
+    /// ([`needed_by`]).
+    ///
+    /// A refusal has been reported on each of them already, and a resource a refused one
+    /// needs cannot be deleted while that one is still there — so a pass that is only there
+    /// to ask about the resources an unfinished removal held back asks about none of them,
+    /// and reports no second refusal of its own. [`NOTHING_LEFT_ALONE`] for the first pass of
+    /// a teardown, which has been refused nothing yet.
+    pub left_alone: &'a BTreeSet<String>,
 }
+
+/// The [`Teardown::left_alone`] of a walk no earlier pass of the same teardown was refused
+/// anything by — every walk but the owed pass that follows a held refusal.
+pub const NOTHING_LEFT_ALONE: &BTreeSet<String> = &BTreeSet::new();
 
 /// The DIRECT dependency relation of the resources a teardown is walking, keyed by logical
 /// id: what each resource needs ([`super::StoredStack::resource_dependencies`]).
@@ -3505,34 +3540,6 @@ fn depends_on_a_failure(
     needed_by(dependencies, logical_id)
         .iter()
         .any(|needed| failed.iter().any(|(id, _)| id == needed))
-}
-
-/// The stack-level reason a deployment whose RESOURCES failed reports, or `None` for a walk
-/// that failed none of them.
-///
-/// One summary sentence per verb the failures fall under
-/// ([`super::resource_failure_summary`]), each naming every resource that failed under that
-/// verb in the order the walk reached them. A deployment attempts every resource whose
-/// dependencies allow it, so more than one can have failed — and the field a client parses
-/// to recover the set of failed logical ids has to name all of them. One deployment can be
-/// doing two things at once (creating one resource while changing another), and then each
-/// verb reports its own set, which is what keeps the sentence true of the resources it names.
-fn failed_resource_summary(failed: &[(String, &'static str)]) -> Option<String> {
-    let mut verbs: Vec<&'static str> = Vec::new();
-    for (_, action) in failed {
-        if !verbs.contains(action) {
-            verbs.push(action);
-        }
-    }
-    let mut summary = String::new();
-    for verb in verbs {
-        let named = failed
-            .iter()
-            .filter(|(_, action)| *action == verb)
-            .map(|(logical_id, _)| logical_id.as_str());
-        summary.push_str(&super::resource_failure_summary(verb, named));
-    }
-    (!summary.is_empty()).then_some(summary)
 }
 
 /// Put ONE resource whose change this deployment could not carry through back the way it
@@ -3776,19 +3783,23 @@ async fn delete_pass(
         needs,
         on_refusal,
         policies,
+        left_alone,
     } = *walk;
     let mut outcome = Deleted {
         resources: resources.to_vec(),
         failure: None,
         transitions: Vec::new(),
         removing: Vec::new(),
+        refused: Vec::new(),
     };
     // The resources an owning service REFUSED to delete, and everything those resources need
     // ([`needed_by`]): the refusals are what the teardown reports as its failure, and what
     // they need is what it leaves alone, because a resource that is still there is one
-    // whatever it depends on is still in use by.
+    // whatever it depends on is still in use by. The walk starts from what an earlier pass of
+    // the same teardown was refused ([`Teardown::left_alone`]), which it leaves alone for
+    // exactly that reason.
     let mut refused: Vec<String> = Vec::new();
-    let mut still_needed: BTreeSet<String> = BTreeSet::new();
+    let mut still_needed: BTreeSet<String> = left_alone.clone();
     // Newest first, over the indices of the set being reported back, so each resource's
     // record is updated in place as its deletion succeeds.
     for index in (0..outcome.resources.len()).rev() {
@@ -4063,6 +4074,7 @@ async fn delete_pass(
             refused.iter().map(String::as_str),
         ));
     }
+    outcome.refused = refused;
     outcome
 }
 

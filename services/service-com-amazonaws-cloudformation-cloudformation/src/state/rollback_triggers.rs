@@ -432,6 +432,8 @@ pub(super) async fn settle_triggered_rollbacks(
                 needs: &needs,
                 on_refusal: OnRefusal::Stop,
                 policies,
+                // The first walk of this rollback: nothing has been refused yet.
+                left_alone: super::provisioning::NOTHING_LEFT_ALONE,
             },
         )
         .await;
@@ -445,7 +447,17 @@ pub(super) async fn settle_triggered_rollbacks(
         // rollback open, exactly as it holds the operation being rolled back open.
         stack.record_stabilisations(&deleted.removing, SystemTime::now());
         if let Some(failure) = deleted.failure {
-            stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+            // Reported once this teardown has asked about every resource it still can
+            // ([`super::StoredStack::hold_teardown_failure`]).
+            if !stack.hold_teardown_failure(
+                &deleted.transitions,
+                &deleted.removing,
+                &deleted.refused,
+                super::status::ROLLBACK_FAILED,
+                &failure,
+            ) {
+                stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+            }
         }
     }
 }

@@ -43,8 +43,8 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    acknowledging_iam, call, create_stack, iam, member, router, router_with_engine, store,
-    wait_for_the_transition, xml_text, xml_texts, REGION,
+    acknowledging_iam, call, create_stack, iam, member, resource_event_reason, router,
+    router_with_engine, store, wait_for_the_transition, xml_text, xml_texts, REGION,
 };
 
 /// Every `(LogicalResourceId, ResourceStatus)` pair one `DescribeStackEvents` response
@@ -800,12 +800,22 @@ async fn an_update_whose_wait_runs_out_is_rolled_back_in_the_services_that_own_i
             "case {:?}: expected the stack to settle at {}, got {settled:?}",
             case.case, case.settles_to
         );
-        // The reason is the wait condition's own diagnosis, which is what failed the update.
+        // The stack names the resource it could not get through, and the wait condition's own
+        // diagnosis — what failed the update — is carried by that resource's event.
         let reason = reason_of(&router, case.stack).await;
         assert!(
-            reason.contains("WaitCondition timed out"),
-            "case {:?}: expected the reason to carry the wait condition's diagnosis, got \
+            reason.starts_with("The following resource(s) failed to create: [Wait]. "),
+            "case {:?}: expected the stack to name the resource it could not create, got \
              {reason:?}",
+            case.case
+        );
+        let diagnosed =
+            resource_event_reason(&router, case.stack, "Wait", resource_status::CREATE_FAILED)
+                .await;
+        assert!(
+            diagnosed.contains("WaitCondition timed out"),
+            "case {:?}: expected the resource to carry the wait condition's diagnosis, got \
+             {diagnosed:?}",
             case.case
         );
         for (name, expected) in &case.after_rollback {

@@ -41,7 +41,9 @@ use std::time::Duration;
 use serde_json::json;
 use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 
-use crate::stack_lifecycle::{call, create_stack, member, router, wait_for_the_transition};
+use crate::stack_lifecycle::{
+    call, create_stack, member, resource_event_reason, router, wait_for_the_transition,
+};
 use crate::update_rollback_recovery::{
     parameter_value, stack_events, status_of, reason_of, resource_status_of,
 };
@@ -218,10 +220,25 @@ async fn a_create_whose_wait_runs_out_rolls_back_and_removes_what_it_made() {
             "case {case:?}: expected the create whose wait ran out to roll back, got \
              {settled:?}"
         );
+        // The STACK names the resource the wait was for, and that RESOURCE carries the
+        // sentence the expiry is worded with: the stack-level field reports WHICH resources
+        // the operation could not carry through, the per-resource field reports why.
         let reason = reason_of(&router, row.stack).await;
+        let summary = format!(
+            "The following resource(s) failed to create: [{}]. ",
+            row.gate
+        );
+        assert!(
+            reason.starts_with(&summary),
+            "case {case:?}: expected the stack to report {summary:?}, got {reason:?}"
+        );
+        let diagnosed =
+            resource_event_reason(&router, row.stack, row.gate, resource_status::CREATE_FAILED)
+                .await;
         assert_eq!(
-            reason, row.reason,
-            "case {case:?}: expected the stack to report {:?}, got {reason:?}",
+            diagnosed, row.reason,
+            "case {case:?}: expected the resource the wait was for to report {:?}, got \
+             {diagnosed:?}",
             row.reason
         );
 

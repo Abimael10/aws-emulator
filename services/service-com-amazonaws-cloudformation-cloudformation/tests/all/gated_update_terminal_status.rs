@@ -42,6 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{call, create_stack, member, router, wait_for_the_transition};
 use crate::held_signal_waits::listed_resources;
+use crate::stack_lifecycle::resource_event_reason;
 use crate::update_rollback_recovery::{
     parameter, parameter_value, reason_of, stack_events, status_of, template,
 };
@@ -344,15 +345,24 @@ async fn an_update_whose_gate_is_never_satisfied_settles_on_a_rolled_back_status
             "case {:?}: expected the failed update to be rolled back, got {terminal:?}",
             case.case
         );
+        // The stack names the resource it could not get through; the gate's own event is
+        // where what it was waiting for is reported.
         let reason = reason_of(&router, case.stack).await;
+        let summary = format!("The following resource(s) failed to create: [{GATE}]. ");
+        assert!(
+            reason.starts_with(&summary),
+            "case {:?}: expected the stack to report {summary:?}, got {reason:?}",
+            case.case
+        );
         let expected_reason = format!(
             "WaitCondition timed out. Received {} conditions when expecting {}",
             case.signals, case.expects
         );
+        let diagnosed = resource_event_reason(&router, case.stack, GATE, "CREATE_FAILED").await;
         assert_eq!(
-            reason, expected_reason,
-            "case {:?}: expected the stack to report what the gate was waiting for, got \
-             {reason:?}",
+            diagnosed, expected_reason,
+            "case {:?}: expected the gate to report what it was waiting for, got \
+             {diagnosed:?}",
             case.case
         );
 

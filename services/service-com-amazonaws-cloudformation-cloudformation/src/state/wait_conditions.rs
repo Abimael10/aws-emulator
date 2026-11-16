@@ -471,8 +471,9 @@ impl super::StoredStack {
         let failed_status = failed_status(&self.status);
         // The RESOURCE the wait was for did not come up: its own terminal event becomes that
         // failure rather than the completion the walk had planned for it, so the event stream
-        // says which resource the operation failed at and why.
-        self.fail_expired_wait_resources(now, &reason);
+        // says which resource the operation failed at and why — and the STACK's own report is
+        // the summary naming those resources ([`Self::fail_expired_wait_resources`]).
+        let summary = self.fail_expired_wait_resources(now, &reason);
         // What a rollback of this update would have to put back, and so which of the
         // previous configuration's wait conditions it re-creates — read BEFORE the failure
         // below retires the plan that says so.
@@ -486,15 +487,15 @@ impl super::StoredStack {
         // that rollback at this very instant and the rollback's own event carries the
         // failure ([`super::StoredStack::fail_transition_superseded`]).
         if !self.disable_rollback && (updating || creating) {
-            self.fail_transition_superseded(now, failed_status, reason.clone());
+            self.fail_transition_superseded(now, failed_status, summary.clone());
         } else {
-            self.fail_transition(now, failed_status, reason.clone());
+            self.fail_transition(now, failed_status, summary.clone());
         }
         if self.disable_rollback {
             return None;
         }
         if updating {
-            self.begin_owed_update_rollback(now, reason);
+            self.begin_owed_update_rollback(now, summary);
             // The rollback deploys the previous configuration, so a wait condition it
             // re-creates waits for signals exactly as the deployment that first created it
             // did: the rollback is not complete while one of them is unsatisfied, and a wait
@@ -512,7 +513,7 @@ impl super::StoredStack {
             // back ([`crate::ops::continue_update_rollback`]).
             return None;
         }
-        self.begin_rollback(now, reason);
+        self.begin_rollback(now, summary);
         Some(ExpiredWaitOwes::Removal {
             resources: self.current_resources(),
             held: self.held_resource_ids(),
@@ -522,7 +523,8 @@ impl super::StoredStack {
     }
 
     /// Record, on each RESOURCE an expired, unsatisfied wait of the operation in flight was
-    /// for, that it is what the operation could not get through.
+    /// for, that it is what the operation could not get through, and answer the STACK-level
+    /// summary of that failure.
     ///
     /// "If the wait condition doesn't receive the specified number of success signals before
     /// the `Timeout` period expires, CloudFormation assumes that the wait condition has
@@ -534,9 +536,17 @@ impl super::StoredStack {
     /// failure owes the owning services ([`Self::fail_expired_wait`]) and the one that runs
     /// under the store lock and cannot ([`super::StoredStack::settle_wait_conditions`]).
     ///
+    /// The summary is what the STACK reports, for the reason it reports one for a resource an
+    /// owning service refused ([`super::resource_failure_summary`], and
+    /// [`super::StoredStack::fail_stabilisation`] for a wait an owning service's own answer
+    /// ended): the stack-level field names WHICH of its resources the operation could not
+    /// carry through, and the diagnosis of each one — the sentence the wait's expiry is worded
+    /// with — is that resource's own, carried on that resource's event. A wait that ran out is
+    /// no different: the stack names the resources, the resources carry the sentence.
+    ///
     /// Called with the stack still in the status of the operation that expired, which is what
     /// says WHICH transition of the resource failed.
-    pub(super) fn fail_expired_wait_resources(&mut self, now: SystemTime, reason: &str) {
+    pub(super) fn fail_expired_wait_resources(&mut self, now: SystemTime, reason: &str) -> String {
         let creating = self.status == super::status::CREATE_IN_PROGRESS;
         let updating = self.status == super::status::UPDATE_IN_PROGRESS;
         // A ROLLBACK is the third operation a wait can run out in: it deploys the previous
@@ -549,6 +559,7 @@ impl super::StoredStack {
             .filter(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
             .map(|barrier| barrier.logical_id().to_string())
             .collect();
+        let mut failed: Vec<(String, &'static str)> = Vec::new();
         for logical_id in &expired {
             let deployed_before = self
                 .resources
@@ -567,7 +578,9 @@ impl super::StoredStack {
                 // that is what it reports — with the event that says so.
                 self.fail_deployed_resource(logical_id, resource_status, reason, now);
             }
+            failed.push((logical_id.clone(), resource_status));
         }
+        expired_wait_summary(&failed).unwrap_or_else(|| reason.to_string())
     }
 
     /// Record that the resource `logical_id` names is the one the operation in flight could
@@ -701,4 +714,29 @@ impl super::StoredStack {
             })
         });
     }
+}
+
+/// The `StackStatusReason` a stack whose WAIT ran out reports: the summary naming the
+/// resources it could not carry through ([`super::resource_failure_summary`]), or `None`
+/// where the expiry failed no resource of the stack at all.
+///
+/// One sentence, so one verb: what the operation was doing to the resources the wait was for,
+/// read off the failed status each of them took — a resource the stack already had and was
+/// CHANGING failed to be updated, and every other one failed to be created. The resources are
+/// named in the order the walk reached them, which is the order the stack declared them.
+fn expired_wait_summary(failed: &[(String, &'static str)]) -> Option<String> {
+    if failed.is_empty() {
+        return None;
+    }
+    let updating = failed
+        .iter()
+        .all(|(_, status)| *status == super::resource_status::UPDATE_FAILED);
+    let action = match updating {
+        true => super::failed_action::UPDATE,
+        false => super::failed_action::CREATE,
+    };
+    Some(super::resource_failure_summary(
+        action,
+        failed.iter().map(|(logical_id, _)| logical_id.as_str()),
+    ))
 }

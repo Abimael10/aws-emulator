@@ -44,6 +44,9 @@ use super::*;
 /// the stack in.
 struct Outstanding {
     stack_id: String,
+    /// The resources this pass LEAVES ALONE: the ones the same teardown has already been
+    /// refused and everything those need ([`Teardown::left_alone`]).
+    left_alone: BTreeSet<String>,
     /// The stack's resource records, which is the set the walk reports back
     /// ([`crate::state::StoredStack::record_materialised_resources`] installs the set, not a
     /// delta).
@@ -93,6 +96,7 @@ pub(super) async fn settle_outstanding_teardowns(
                 needs: &owed.needs,
                 on_refusal: owed.on_refusal,
                 policies: owed.policies,
+                left_alone: &owed.left_alone,
             },
         ))
         .await;
@@ -107,13 +111,32 @@ pub(super) async fn settle_outstanding_teardowns(
         stack.record_stabilisations(&deleted.removing, now);
         stack.schedule_resource_events(&deleted.transitions);
         stack.record_materialised_resources(deleted.resources);
+        let concluded = SystemTime::now();
         if let Some(failure) = deleted.failure {
             // A resource no owning service would delete is the teardown's own failure, and
             // each resource's record takes the status this pass left it in — exactly as the
-            // first walk of this teardown reports them.
-            let concluded = SystemTime::now();
+            // first walk of this teardown reports them. A refusal an EARLIER pass of the same
+            // teardown reported is part of that failure too: the stack names every resource
+            // it could not delete, not only the ones the last pass asked about.
             stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
+            let failure = match stack.teardown_refusals.is_empty() {
+                true => failure,
+                false => super::super::resource_failure_summary(
+                    super::super::failed_action::DELETE,
+                    stack
+                        .teardown_refusals
+                        .iter()
+                        .chain(deleted.refused.iter())
+                        .map(String::as_str),
+                ),
+            };
             stack.fail_transition(concluded, owed.failed_status, failure);
+        } else if !stack.teardown_refusals.is_empty() {
+            // The failure this teardown is HEADED for was held until the resources it owed
+            // had been asked about ([`super::super::StoredStack::hold_teardown_failure`]):
+            // this pass asked about them, so each takes the status it left them in and the
+            // operation settles into that failed status with the reason it was held with.
+            stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
         }
     }
 }
@@ -127,6 +150,7 @@ pub(super) async fn settle_outstanding_teardowns(
 /// resource in a service that owns one.
 fn claimed_teardown(stack: &mut super::super::StoredStack) -> Option<Outstanding> {
     let (policies, on_refusal, failed_status) = teardown_in_flight(stack)?;
+    let left_alone = left_alone(stack, &stack.teardown_refusals);
     if stack.waiting_for_stabilisation() {
         return None;
     }
@@ -149,6 +173,7 @@ fn claimed_teardown(stack: &mut super::super::StoredStack) -> Option<Outstanding
         .retain(|barrier| barrier.awaited != super::super::stabilising::Awaited::Gone);
     Some(Outstanding {
         stack_id: stack.stack_id.clone(),
+        left_alone,
         resources: stack.current_resources().to_vec(),
         held,
         needs: dependencies_in_flight(stack),
@@ -170,6 +195,12 @@ fn teardown_in_flight(
     stack: &super::super::StoredStack,
 ) -> Option<(Policies, OnRefusal, &'static str)> {
     let settling_into = stack.pending.as_ref()?.status.as_str();
+    // A teardown headed for its own FAILED status is one whose failure is HELD: the walk was
+    // refused a resource and still owes the ones an unfinished removal held back
+    // ([`super::super::StoredStack::hold_teardown_failure`]), which is what those refusals
+    // record. Any other pending transition redirected to a failure is not a teardown with
+    // work left to do.
+    let held_failure = !stack.teardown_refusals.is_empty();
     match (stack.status.as_str(), settling_into) {
         // The rollback of a failed CREATE removes what that create had made, under the
         // policies the operation asked for — the same walk the failure's own path ran.
@@ -181,6 +212,15 @@ fn teardown_in_flight(
             OnRefusal::Stop,
             super::super::status::ROLLBACK_FAILED,
         )),
+        (super::super::status::ROLLBACK_IN_PROGRESS, super::super::status::ROLLBACK_FAILED)
+            if held_failure =>
+        {
+            Some((
+                stack.rolled_back_resource_policies(),
+                OnRefusal::Stop,
+                super::super::status::ROLLBACK_FAILED,
+            ))
+        }
         // The stack's own deletion removes every resource it holds, under each resource's
         // `DeletionPolicy` and the `DeletionMode` the request chose.
         (
@@ -191,19 +231,67 @@ fn teardown_in_flight(
             super::super::on_refused_resource_deletion(stack.deletion_mode.as_deref()),
             super::super::status::DELETE_FAILED,
         )),
+        (super::super::status::DELETE_IN_PROGRESS, super::super::status::DELETE_FAILED)
+            if held_failure =>
+        {
+            Some((
+                Policies::Honoured,
+                super::super::on_refused_resource_deletion(stack.deletion_mode.as_deref()),
+                super::super::status::DELETE_FAILED,
+            ))
+        }
         _ => None,
     }
 }
 
 /// The resources `stack` still HOLDS in a service that owns them — what a teardown of it has
 /// left to ask about.
+///
+/// A resource the same teardown has already been refused is not among them, and neither is
+/// one such a resource needs: nothing is asked about either again ([`left_alone`]), so a
+/// teardown whose only resources left are those owes no further pass and settles into the
+/// failed status it is headed for.
 fn still_held(stack: &super::super::StoredStack) -> BTreeSet<String> {
+    still_held_past(stack, &stack.teardown_refusals)
+}
+
+/// [`still_held`] for a teardown that has just been refused `refusals` — the resources it
+/// would still have to ask about once those refusals are left alone.
+fn still_held_past(
+    stack: &super::super::StoredStack,
+    refusals: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let left_alone = left_alone(stack, refusals);
     let holding = stack.held_resource_ids();
     stack
         .current_resources()
         .iter()
-        .filter(|resource| resource.materialised && holding.contains(&resource.logical_id))
+        .filter(|resource| {
+            resource.materialised
+                && holding.contains(&resource.logical_id)
+                && !left_alone.contains(&resource.logical_id)
+        })
         .map(|resource| resource.logical_id.clone())
+        .collect()
+}
+
+/// What a teardown refused `refusals` leaves alone: those resources, and everything they
+/// need ([`needed_by`], over the relation the teardown in flight is judged against).
+///
+/// A resource whose deletion an owning service refused is still there, so whatever it depends
+/// on is still in use by it; and the refusal itself has been reported on it already.
+fn left_alone(
+    stack: &super::super::StoredStack,
+    refusals: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if refusals.is_empty() {
+        return BTreeSet::new();
+    }
+    let needs = dependencies_in_flight(stack);
+    refusals
+        .iter()
+        .flat_map(|logical_id| needed_by(&needs, logical_id))
+        .chain(refusals.iter().cloned())
         .collect()
 }
 
@@ -216,5 +304,12 @@ impl super::super::StoredStack {
     /// can run, so the clock owes nothing until it has.
     pub fn owes_a_teardown(&self) -> bool {
         teardown_in_flight(self).is_some() && !still_held(self).is_empty()
+    }
+
+    /// Whether the teardown in flight still owes a call about a resource that is NOT one of
+    /// `refusals`, nor one of those needs — which is what
+    /// [`Self::hold_teardown_failure`] holds a teardown's failure for.
+    pub(crate) fn teardown_owes_resources_past(&self, refusals: &BTreeSet<String>) -> bool {
+        !still_held_past(self, refusals).is_empty()
     }
 }

@@ -462,6 +462,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // An instance's stack is being deleted, so each resource's own
                     // `DeletionPolicy` decides what becomes of the physical resource.
                     policies: crate::state::provisioning::Policies::Honoured,
+                    // The first walk of this deletion: nothing has been refused yet.
+                    left_alone: crate::state::provisioning::NOTHING_LEFT_ALONE,
                 },
             )
             .await;
@@ -475,10 +477,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(failure) = failure.clone() {
                     // A resource the owning service refused to delete: the stack stays, in
                     // DELETE_FAILED with that service's own refusal as the reason, rather
-                    // than reporting a deletion that did not happen.
-                    let concluded = ::std::time::SystemTime::now();
-                    stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
-                    stack.fail_transition(concluded, status::DELETE_FAILED, failure);
+                    // than reporting a deletion that did not happen — once this deletion has
+                    // asked about every resource it still can
+                    // ([`crate::state::StoredStack::hold_teardown_failure`]).
+                    if !stack.hold_teardown_failure(
+                        &deleted.transitions,
+                        &deleted.removing,
+                        &deleted.refused,
+                        status::DELETE_FAILED,
+                        &failure,
+                    ) {
+                        let concluded = ::std::time::SystemTime::now();
+                        stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
+                        stack.fail_transition(concluded, status::DELETE_FAILED, failure);
+                    }
                 }
             }
             if let Some(failure) = failure {

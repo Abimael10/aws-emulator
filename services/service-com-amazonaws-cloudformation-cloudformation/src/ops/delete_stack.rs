@@ -575,6 +575,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // `DeletionPolicy` governs: "preserve, and in some cases, backup a resource
                     // when its stack is deleted".
                     policies: crate::state::provisioning::Policies::Honoured,
+                    // The first walk of this deletion: nothing has been refused yet.
+                    left_alone: crate::state::provisioning::NOTHING_LEFT_ALONE,
                 },
             ),
         )
@@ -596,14 +598,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(failure) = deleted.failure {
                 // A resource the owning service refused to delete: the stack stays, in
                 // DELETE_FAILED with that service's own refusal as the reason, rather
-                // than reporting a deletion that did not happen.
-                let concluded = ::std::time::SystemTime::now();
-                // Each resource's own record takes the status this deletion left it in,
-                // so the per-resource view reports what became of it — the refusal on the
-                // one that could not be deleted, the completed deletion on the ones that
-                // were — rather than the status its create left behind.
-                stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
-                stack.fail_transition(concluded, status::DELETE_FAILED, failure);
+                // than reporting a deletion that did not happen — once this deletion has
+                // asked about every resource it still can. A removal only ACCEPTED is not a
+                // resource that is gone, so the resources it held back are asked about when
+                // it answers and the failure is reported after that pass
+                // ([`crate::state::StoredStack::hold_teardown_failure`]).
+                if !stack.hold_teardown_failure(
+                    &deleted.transitions,
+                    &deleted.removing,
+                    &deleted.refused,
+                    status::DELETE_FAILED,
+                    &failure,
+                ) {
+                    let concluded = ::std::time::SystemTime::now();
+                    // Each resource's own record takes the status this deletion left it in,
+                    // so the per-resource view reports what became of it — the refusal on the
+                    // one that could not be deleted, the completed deletion on the ones that
+                    // were — rather than the status its create left behind.
+                    stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
+                    stack.fail_transition(concluded, status::DELETE_FAILED, failure);
+                }
             }
         }
 

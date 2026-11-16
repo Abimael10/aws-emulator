@@ -134,6 +134,20 @@ pub struct StoredStack {
     /// [`provisioning::advance_stabilisations`] is what reads the owning service's answer
     /// and releases one.
     pub stabilisations: Vec<stabilising::StabilisationBarrier>,
+    /// The resources the TEARDOWN in flight has already been REFUSED by the services that own
+    /// them, while the failure those refusals owe is still HELD
+    /// ([`Self::hold_teardown_failure`]).
+    ///
+    /// "CloudFormation deletes the resources in reverse order", so a teardown walk leaves what
+    /// a resource still being removed depends on alone: a removal only ACCEPTED is not a
+    /// resource that is gone. Those resources are asked about once that removal answers
+    /// ([`provisioning`]'s owed pass), and this is what keeps that pass from asking about a
+    /// resource the same teardown has already been refused — or from asking again about the
+    /// ones such a resource needs, which cannot be deleted while it is there.
+    ///
+    /// Empty for every stack with no held teardown failure, and emptied by
+    /// [`Self::begin_transition`]: a teardown asked for again starts from no refusal.
+    pub teardown_refusals: BTreeSet<String>,
     /// What the ROLLBACK of the UPDATE in flight would owe the services that own the
     /// stack's resources, if that update fails ([`OwedRollback`]) — computed by the handler
     /// that started it, because only that handler knows what it changed there.
@@ -314,6 +328,7 @@ impl StoredStack {
             resource_timeline: None,
             wait_conditions: Vec::new(),
             stabilisations: Vec::new(),
+            teardown_refusals: BTreeSet::new(),
             rollback_plan: None,
             owed_rollback: None,
             previous_configuration: None,
@@ -1923,6 +1938,10 @@ impl StoredStack {
         // one has not created anything yet, and what it creates opens its own
         // ([`Self::record_stabilisations`]).
         self.stabilisations.clear();
+        // ...and so do the refusals an earlier TEARDOWN was held by: the operation now
+        // starting has been refused nothing, so a deletion asked for again asks the owning
+        // services about every resource the stack still holds.
+        self.teardown_refusals.clear();
     }
 
     /// The wait conditions the operation now opening has to wait at.
@@ -2285,7 +2304,23 @@ impl StoredStack {
             Some(reason.to_string()),
             now,
         );
-        let summary = resource_failure_summary(action, [logical_id]);
+        // A TEARDOWN whose failure is HELD has already been refused resources
+        // ([`Self::teardown_refusals`]), and the stack names every resource it could not
+        // delete: a removal of that teardown that then runs out is reported beside those
+        // refusals rather than on its own — the same union the owed pass reports when it is
+        // refused something of its own ([`provisioning`]). Every other failure is this one
+        // resource's.
+        let held_refusals: Vec<&str> = match action == failed_action::DELETE {
+            true => self
+                .teardown_refusals
+                .iter()
+                .map(String::as_str)
+                .filter(|refused| *refused != logical_id)
+                .collect(),
+            false => Vec::new(),
+        };
+        let summary =
+            resource_failure_summary(action, held_refusals.into_iter().chain([logical_id]));
         // Whether the stack RESTS in the failed status decides whether an event of its own
         // reports that status: a rollback this failure owes begins at this very instant and
         // carries the failure on its own event
@@ -2446,20 +2481,20 @@ impl StoredStack {
         let updating = self.status == status::UPDATE_IN_PROGRESS;
         // The RESOURCE the wait was for is what the operation could not get through, recorded
         // before the barriers are retired and before the failure below flushes the walk: a
-        // wait that ran out is not a resource that came up
-        // ([`Self::fail_expired_wait_resources`]).
-        self.fail_expired_wait_resources(now, &reason);
+        // wait that ran out is not a resource that came up — and the STACK's own report is the
+        // summary naming those resources ([`Self::fail_expired_wait_resources`]).
+        let summary = self.fail_expired_wait_resources(now, &reason);
         self.wait_conditions.clear();
         // The UPDATE whose rollback is opened right below never rests in the failed status,
         // so no event of the stack's reports it ([`Self::fail_transition_superseded`]);
         // every other barrier timeout leaves the stack in the failed status it reports.
         if updating && !self.disable_rollback {
-            self.fail_transition_superseded(now, failed_status, reason.clone());
+            self.fail_transition_superseded(now, failed_status, summary.clone());
         } else {
-            self.fail_transition(now, failed_status, reason.clone());
+            self.fail_transition(now, failed_status, summary.clone());
         }
         if updating {
-            self.begin_owed_update_rollback(now, reason);
+            self.begin_owed_update_rollback(now, summary);
         }
     }
 
@@ -3188,6 +3223,53 @@ impl StoredStack {
     /// it ([`timeline::Timeline::compress_into`]).
     pub fn fail_transition(&mut self, now: SystemTime, failed_status: &str, reason: String) {
         self.record_failure(now, failed_status, reason, FailureReport::Rested);
+    }
+
+    /// HOLD the failure a teardown walk reported, where that walk still owes resources a
+    /// call: `true` when the failure was held, `false` when the caller is to report it now
+    /// ([`Self::fail_transition`]).
+    ///
+    /// "CloudFormation deletes the resources in reverse order", so a teardown leaves what a
+    /// resource still being removed depends on ALONE: a removal the owning service — or a
+    /// custom resource's PROVIDER — has only ACCEPTED is not a resource that is gone. Those
+    /// resources are asked about once that removal answers, so a teardown reports its own
+    /// failure only after it has asked about every resource it still can — a refusal of one
+    /// resource holds back only the resources that refused one needs, and a sibling it has
+    /// nothing to do with is deleted rather than left behind under the status its create left
+    /// it in.
+    ///
+    /// What is held is the PENDING transition: the operation goes on in its `*_IN_PROGRESS`
+    /// status, headed for the same failed status with the same reason
+    /// ([`Self::fail_pending_transition`]), and settles into it once the owed pass is through
+    /// ([`Self::owes_a_teardown`] is what holds the clock back until then). The refusals are
+    /// remembered so that pass asks about none of them a second time
+    /// ([`Self::teardown_refusals`]).
+    ///
+    /// Nothing is held where the walk accepted no removal — there is no answer to wait for,
+    /// so the failure is final — nor where every resource left is one the refusals hold back,
+    /// which no pass could delete either.
+    pub fn hold_teardown_failure(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+        removing: &[provisioning::Stabilising],
+        refused: &[String],
+        failed_status: &str,
+        reason: &str,
+    ) -> bool {
+        if removing.is_empty() || self.pending.is_none() {
+            return false;
+        }
+        let refusals: BTreeSet<String> = refused.iter().cloned().collect();
+        if !self.teardown_owes_resources_past(&refusals) {
+            return false;
+        }
+        // Each resource this pass acted on takes the status it left it in: a teardown that
+        // ends in a failure disposes of no record ([`Self::record_resource_deletion_statuses`]),
+        // so what became of each one is recorded as the pass that did it reports back.
+        self.record_resource_deletion_statuses(transitions, SystemTime::now());
+        self.teardown_refusals.extend(refusals);
+        self.fail_pending_transition(failed_status, reason.to_string());
+        true
     }
 
     /// Record a failure of the operation in flight that the stack does NOT rest in, because

@@ -30,8 +30,8 @@
 use std::time::Duration;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, router_with_engine, store,
-    wait_for_the_transition, xml_text, REGION,
+    call, create_stack, describe_stack, member, resource_event_reason, router,
+    router_with_engine, store, wait_for_the_transition, xml_text, REGION,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_status;
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
@@ -670,8 +670,11 @@ async fn a_resource_signal_wait_that_runs_out_fails_the_create_as_aws_words_it()
         );
         // "Failed to receive N resource signal(s) within the specified duration" is how
         // CloudFormation words a creation policy's wait running out, and N is what never
-        // arrived.
-        let reason = status_reason_of(&router, case.stack).await;
+        // arrived. It is the RESOURCE's own diagnosis: the stack-level field names which
+        // resources the create could not carry through.
+        let reason =
+            resource_event_reason(&router, case.stack, "Gate", resource_status::CREATE_FAILED)
+                .await;
         let expected = format!(
             "Failed to receive {} resource signal(s) within the specified duration",
             case.outstanding
@@ -679,6 +682,13 @@ async fn a_resource_signal_wait_that_runs_out_fails_the_create_as_aws_words_it()
         assert!(
             reason.contains(&expected),
             "case {:?}: expected the failure to say {expected:?}, got {reason:?}",
+            case.case
+        );
+        let summary = status_reason_of(&router, case.stack).await;
+        assert!(
+            summary.starts_with("The following resource(s) failed to create: [Gate]. "),
+            "case {:?}: expected the stack to name the resource it could not create, got \
+             {summary:?}",
             case.case
         );
     }

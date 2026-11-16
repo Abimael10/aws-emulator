@@ -43,6 +43,8 @@ mod apigateway_vpc_link_resources;
 mod apigatewayv2_api_property_updates;
 #[path = "all/application_auto_scaling_resources.rs"]
 mod application_auto_scaling_resources;
+#[path = "all/auto_emptied_bucket_deletion.rs"]
+mod auto_emptied_bucket_deletion;
 #[path = "all/bedrock_flow_resource_type.rs"]
 mod bedrock_flow_resource_type;
 #[path = "all/appsync_event_and_merged_api_resources.rs"]
@@ -541,6 +543,8 @@ mod scratch;
 mod scratch_diag;
 #[path = "all/scratch_probe.rs"]
 mod scratch_probe;
+#[path = "all/scratch_rollback_log.rs"]
+mod scratch_rollback_log;
 #[path = "all/search_indexing_pipeline_outputs.rs"]
 mod search_indexing_pipeline_outputs;
 #[path = "all/section_loop_expansion.rs"]

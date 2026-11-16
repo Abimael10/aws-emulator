@@ -379,6 +379,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         needs: &needs,
                         on_refusal: crate::state::provisioning::OnRefusal::Stop,
                         policies,
+                        // The first walk of this rollback: nothing has been refused yet.
+                        left_alone: crate::state::provisioning::NOTHING_LEFT_ALONE,
                     },
                 ),
             )
@@ -395,12 +397,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.record_materialised_resources(deleted.resources);
                 if let Some(failure) = deleted.failure {
                     // A resource an owning service would not let go: the rollback cannot be
-                    // reported as one that removed what it did not.
-                    stack.fail_transition(
-                        ::std::time::SystemTime::now(),
+                    // reported as one that removed what it did not — reported once this
+                    // teardown has asked about every resource it still can
+                    // ([`crate::state::StoredStack::hold_teardown_failure`]).
+                    if !stack.hold_teardown_failure(
+                        &deleted.transitions,
+                        &deleted.removing,
+                        &deleted.refused,
                         status::ROLLBACK_FAILED,
-                        failure,
-                    );
+                        &failure,
+                    ) {
+                        stack.fail_transition(
+                            ::std::time::SystemTime::now(),
+                            status::ROLLBACK_FAILED,
+                            failure,
+                        );
+                    }
                 }
             }
         }

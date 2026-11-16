@@ -186,6 +186,8 @@ async fn resume_pass(
                 needs: &needs,
                 on_refusal: OnRefusal::Stop,
                 policies,
+                // The first walk of this rollback: nothing has been refused yet.
+                left_alone: NOTHING_LEFT_ALONE,
             },
         )
         .await;
@@ -197,11 +199,21 @@ async fn resume_pass(
         stack.record_materialised_resources(deleted.resources);
         stack.record_stabilisations(&deleted.removing, SystemTime::now());
         if let Some(failure) = deleted.failure {
-            stack.fail_transition(
-                SystemTime::now(),
+            // Reported once this teardown has asked about every resource it still can
+            // ([`super::super::StoredStack::hold_teardown_failure`]).
+            if !stack.hold_teardown_failure(
+                &deleted.transitions,
+                &deleted.removing,
+                &deleted.refused,
                 super::super::status::ROLLBACK_FAILED,
-                failure,
-            );
+                &failure,
+            ) {
+                stack.fail_transition(
+                    SystemTime::now(),
+                    super::super::status::ROLLBACK_FAILED,
+                    failure,
+                );
+            }
         }
     }
     progressed

@@ -622,11 +622,22 @@ async fn a_wait_condition_whose_timeout_runs_out_fails_the_operation() {
             "case {case:?}: expected the create to roll back once the wait ran out, got \
              {settled:?}"
         );
+        // The stack's reason summarises which resource failed it; the counts the wait was
+        // judged on are reported on that resource's own event, exactly as a FAILURE signal's
+        // own case above.
         let reason = status_reason_of(&router, stack).await;
+        assert_eq!(
+            reason,
+            resource_failure_summary(failed_action::CREATE, ["Wait"]),
+            "case {case:?}: expected the stack to summarise the resource that failed the \
+             create, got {reason:?}"
+        );
+        let on_the_resource =
+            resource_event_reason(&router, stack, "Wait", resource_status::CREATE_FAILED).await;
         assert!(
-            reason.contains("Received 0 conditions when expecting 2"),
-            "case {case:?}: expected the reason to carry the counts the wait was judged on, \
-             got {reason:?}"
+            on_the_resource.contains("Received 0 conditions when expecting 2"),
+            "case {case:?}: expected the resource's own event to carry the counts the wait \
+             was judged on, got {on_the_resource:?}"
         );
     }
 }
