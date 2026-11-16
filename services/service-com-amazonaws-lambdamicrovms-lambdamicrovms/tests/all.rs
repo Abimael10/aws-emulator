@@ -69,6 +69,8 @@ mod microvm_lifecycle;
 mod microvm_network_attachment;
 #[path = "all/microvm_runtime_path.rs"]
 mod microvm_runtime_path;
+#[path = "all/microvm_shell_access.rs"]
+mod microvm_shell_access;
 #[path = "all/microvm_suspend_resume.rs"]
 mod microvm_suspend_resume;
 #[path = "all/recorded_image_identity.rs"]

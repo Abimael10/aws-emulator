@@ -304,6 +304,27 @@ impl GuestMachine {
         self.files.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Hand this machine's tree to `run` — a session RUNS IN a volume
+    /// ([`::service_common::posix_shell_session::ShellSession::in_volume`]) rather than
+    /// borrowing one — and put back the tree it answers with, so every file the session's
+    /// commands wrote is the MACHINE's from then on, exactly as the guest's own writes
+    /// are.
+    ///
+    /// The tree is the machine's disk, so it is held for the whole run: another run waits
+    /// for this one rather than working in a copy of the disk that would be dropped. A
+    /// `run` that answers no tree (a session that was given none to begin with) leaves the
+    /// machine the empty one its disk was swapped for, which is what a session that
+    /// consumed the tree left behind.
+    pub fn in_volume<T>(&self, run: impl FnOnce(ShellVolume) -> (T, Option<ShellVolume>)) -> T {
+        let mut held = self.hold();
+        let tree = ::std::mem::replace(&mut *held, ShellVolume::new(volume_limits()));
+        let (answered, left) = run(tree);
+        if let Some(left) = left {
+            *held = left;
+        }
+        answered
+    }
+
     /// `path` as the guest's own process resolves it: a relative path against the working
     /// directory its command runs from ([`GUEST_WORKING_DIRECTORY`], which is what
     /// `process.cwd()` reports), and an absolute one as it is.

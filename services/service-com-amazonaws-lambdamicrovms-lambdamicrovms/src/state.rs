@@ -66,6 +66,10 @@ pub mod guest_runtime;
 /// `egressNetworkConnectors` carry, and what the guest observes of the one they do.
 pub mod microvm_network;
 
+/// The interactive SHELL of a MicroVM: what a shell authentication token grants, and
+/// what running a command line inside a MicroVM answers.
+pub mod microvm_shell;
+
 /// The region an ARN carries when the request is unsigned, matching the region
 /// the emulator's generated client config defaults to.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -1029,6 +1033,69 @@ fn parse_image_version(version: &str) -> Option<(u64, u64)> {
 /// token for it would grant access to nothing.
 pub fn is_connectable_microvm_state(state: &str) -> bool {
     state != MICROVM_STATE_TERMINATING && state != MICROVM_STATE_TERMINATED
+}
+
+/// The AWS-managed network connector that carries a MicroVM's interactive SHELL.
+///
+/// `CreateMicrovmShellAuthToken` documents "The MicroVM must have been run with the
+/// SHELL_INGRESS network connector attached", so a MicroVM reaches its shell through
+/// this ingress connector and through no other — the same managed namespace
+/// [`DEFAULT_INGRESS_NETWORK_CONNECTOR`] and [`DEFAULT_EGRESS_NETWORK_CONNECTOR`]
+/// belong to.
+pub const SHELL_INGRESS_NETWORK_CONNECTOR: &str = "SHELL_INGRESS";
+
+/// The AWS-MANAGED connector one connector reference names, or `None` where it names
+/// something else: a connector of the account's own, or an ARN of another namespace.
+///
+/// `NetworkConnector` is a plain string the model puts no form on, and a request names
+/// a managed connector either way — by the ARN this service mints for it
+/// ([`managed_network_connector_arn`], which is what a stored list carries for a
+/// MicroVM that asked for none) or by the connector's own NAME, which is what a request
+/// naming `HTTP_INGRESS` carries. Both spellings name the one connector, so both resolve
+/// here.
+pub fn managed_network_connector_name(reference: &str) -> Option<&str> {
+    let reference = reference.trim();
+    if let Some(parsed) = ::service_common::arn::parse(reference) {
+        if parsed.vendor != "lambda" || parsed.account != MANAGED_RESOURCE_ACCOUNT {
+            return None;
+        }
+        // The name is the last segment of the connector's resource field; an ARN of
+        // another resource type of the same namespace names no connector.
+        return parsed
+            .resource
+            .strip_prefix(MANAGED_NETWORK_CONNECTOR_RESOURCE_TYPE)?
+            .rsplit(':')
+            .next()
+            .filter(|name| !name.is_empty());
+    }
+    // A bare name carries no ARN field separator at all; anything else is a reference
+    // this service mints no managed connector for.
+    (!reference.is_empty() && !reference.contains(':')).then_some(reference)
+}
+
+/// Whether `connectors` attaches the AWS-managed [`SHELL_INGRESS_NETWORK_CONNECTOR`] —
+/// the precondition `CreateMicrovmShellAuthToken` documents, read off the connectors the
+/// MicroVM was RUN with rather than off the request asking for a token.
+pub fn attaches_shell_ingress(connectors: &[String]) -> bool {
+    connectors
+        .iter()
+        .filter_map(|connector| managed_network_connector_name(connector))
+        .any(|name| name == SHELL_INGRESS_NETWORK_CONNECTOR)
+}
+
+/// 400: the MicroVM the request addressed was not run with the connector its shell is
+/// carried by, so there is no shell to authenticate to.
+///
+/// The sentence is the requirement `CreateMicrovmShellAuthToken` states in its own
+/// documentation, verbatim: "The MicroVM must have been run with the SHELL_INGRESS
+/// network connector attached." It carries no variable part, because the condition is a
+/// property of the MicroVM the address already names rather than of anything the request
+/// chose.
+pub fn no_shell_ingress_message() -> String {
+    format!(
+        "The MicroVM must have been run with the {SHELL_INGRESS_NETWORK_CONNECTOR} \
+         network connector attached."
+    )
 }
 
 /// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`).
@@ -2089,6 +2156,12 @@ pub fn microvm_image_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("lambda", region, &format!("microvm-image:{name}"))
 }
 
+/// The resource-type prefix of an AWS-MANAGED network connector's ARN, shared by the
+/// ARN this service mints for one ([`managed_network_connector_arn`]) and the reader
+/// that resolves a reference back to the connector's name
+/// ([`managed_network_connector_name`]), so the two cannot disagree about the form.
+pub const MANAGED_NETWORK_CONNECTOR_RESOURCE_TYPE: &str = "network-connector:";
+
 /// The ARN of an AWS-MANAGED network connector named `name`, in `region`.
 ///
 /// The connector is an AWS-owned resource, so its ARN carries `aws` in the account
@@ -2097,7 +2170,10 @@ pub fn microvm_image_arn(region: &str, name: &str) -> String {
 /// The form is recorded AWS behaviour:
 /// `arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:<NAME>`.
 pub fn managed_network_connector_arn(region: &str, name: &str) -> String {
-    format!("arn:aws:lambda:{region}:aws:network-connector:aws-network-connector:{name}")
+    format!(
+        "arn:aws:lambda:{region}:aws:{MANAGED_NETWORK_CONNECTOR_RESOURCE_TYPE}\
+         aws-network-connector:{name}"
+    )
 }
 
 /// The ARN of the MicroVM `microvm_id` in `region`.

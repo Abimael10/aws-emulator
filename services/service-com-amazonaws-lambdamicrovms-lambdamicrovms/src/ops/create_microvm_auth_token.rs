@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &microvm_id,
             &token,
             input.expiration_in_minutes,
-            input.allowed_ports,
+            crate::state::microvm_endpoint::TokenGrant::Ports(input.allowed_ports),
             now,
         );
 

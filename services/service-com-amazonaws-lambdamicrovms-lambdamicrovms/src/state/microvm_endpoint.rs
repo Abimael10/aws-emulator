@@ -22,8 +22,8 @@
 //!   the path names (another MicroVM's, one the clock has expired, or one whose
 //!   `allowedPorts` do not cover the port THE REQUEST ADDRESSES) — `403`, the answer
 //!   `CreateMicrovmAuthToken`'s token is what avoids;
-//! * an authenticated request — the GUEST's own HTTP response belongs here, so the
-//!   request is handed to the guest the MicroVM's image version holds
+//! * a request a token of `CreateMicrovmAuthToken` granted — the GUEST's own HTTP response
+//!   belongs here, so the request is handed to the guest the MicroVM's image version holds
 //!   ([`super::guest_program`]) and RUN in the engine embedded in this process
 //!   ([`super::guest_runtime`]): the status, the headers and the body a client reads
 //!   back are the ones the guest's own program produced. Nothing is synthesised in the
@@ -31,7 +31,11 @@
 //!   whose guest is not running (one still provisioning, and one resting under
 //!   `SuspendMicrovm`) and a guest that produced no response are each answered with the
 //!   status the PROXY itself answers for a MicroVM it reached nothing inside of
-//!   ([`NO_GUEST_RESPONSE_STATUS`]).
+//!   ([`NO_GUEST_RESPONSE_STATUS`]);
+//! * a request a token of `CreateMicrovmShellAuthToken` granted — that token grants the
+//!   MicroVM's SHELL rather than a port of its endpoint, so the program the request
+//!   carries is performed in the MicroVM's own machine and answered with what it wrote
+//!   ([`super::microvm_shell`], which states the form of that channel).
 //!
 //! A guest's outbound connections are decided by the MicroVM's `egressNetworkConnectors`
 //! ([`super::microvm_network`]), which this listener answers from the emulated network
@@ -121,6 +125,19 @@ pub const NO_GUEST_RESPONSE_STATUS: u16 = 502;
 /// rather than a client's to probe for.
 const NO_GUEST_RESPONSE: &str = "The MicroVM returned no response.\n";
 
+/// What one live token of a MicroVM's endpoint GRANTS — the two things this API mints a
+/// token for, so a token grants its own and nothing else.
+#[derive(Debug, Clone)]
+pub enum TokenGrant {
+    /// `CreateMicrovmAuthToken`'s `allowedPorts`: "The ports on the MicroVM endpoint the
+    /// token grants access to", judged against the port the request addresses.
+    Ports(Vec<PortSpecification>),
+    /// `CreateMicrovmShellAuthToken`: "interactive shell access to a running MicroVM",
+    /// which is the MicroVM's shell rather than a port of the server its guest bound
+    /// ([`super::microvm_shell`]).
+    Shell,
+}
+
 /// One live authentication token for one MicroVM's endpoint, held in
 /// [`ServiceState::auth_tokens`] under [`auth_token_digest`] of the token.
 #[derive(Debug, Clone)]
@@ -135,8 +152,8 @@ pub struct MicrovmAuthToken {
     /// an authentication token for", so it authenticates at that MicroVM's address and
     /// at no other.
     pub microvm_id: String,
-    /// `allowedPorts`: "The ports on the MicroVM endpoint the token grants access to."
-    pub allowed_ports: Vec<PortSpecification>,
+    /// What the token grants at that address: the ports of it, or the MicroVM's shell.
+    pub grant: TokenGrant,
     /// When `expirationInMinutes` runs out, never later than the MicroVM's own
     /// lifetime ([`ServiceState::record_auth_token`]).
     pub expires_at: Instant,
@@ -340,7 +357,7 @@ pub async fn serve_request(
                     && token.microvm_id == microvm_id
                     && token.expires_at > now
             })
-            .map(|token| token.allowed_ports.clone());
+            .map(|token| token.grant.clone());
         let vm = store.microvm(&region, &microvm_id);
         // The run state the MicroVM is in AT THIS INSTANT, after the clock's own moves
         // have been materialised: whether a guest is executing inside it at all.
@@ -354,16 +371,26 @@ pub async fn serve_request(
                 .map(|vm| vm.link_local_address.clone())
                 .unwrap_or_default(),
         };
+        // The MACHINE the MicroVM's shell runs in, for a request a shell token granted:
+        // its tree, its environment and the identity its kernel published, which a
+        // MicroVM holds from the instant it reached `RUNNING` until it terminates.
+        let machine = match &granted {
+            Some(TokenGrant::Shell) => vm.and_then(|vm| vm.guest_machine.clone()),
+            _ => None,
+        };
         // The guest is the PROCESS this MicroVM runs its image version's program in,
         // started where it is not running yet and reached again where it is — which is
         // what makes what the guest holds survive from one request to the next. A request
-        // presenting no live token starts nothing.
-        let process = (granted.is_some() && run_state == super::MICROVM_STATE_RUNNING)
+        // presenting no live token starts nothing, and neither does one presenting a SHELL
+        // token: the shell is performed in the MicroVM's machine rather than by the
+        // program the guest process runs.
+        let process = (matches!(granted, Some(TokenGrant::Ports(_)))
+            && run_state == super::MICROVM_STATE_RUNNING)
             .then(|| store.guest_process(&region, &microvm_id, now))
             .flatten();
-        (microvm_id, granted, run_state, egress, process)
+        (microvm_id, granted, run_state, egress, process, machine)
     };
-    let (microvm_id, granted, run_state, egress, process) = resolved;
+    let (microvm_id, granted, run_state, egress, process, machine) = resolved;
 
     // Every attempt on a published endpoint is attributable: the MicroVM addressed and the
     // outcome. The presented token is NEVER logged — only the caller holds it — and
@@ -380,8 +407,19 @@ pub async fn serve_request(
         endpoint_response(head, 403, AUTH_TOKEN_REQUIRED)
     };
 
-    let Some(allowed_ports) = granted else {
+    let Some(granted) = granted else {
         return refused(head);
+    };
+
+    // What the token grants decides which of the MicroVM's two channels this request
+    // reaches: a SHELL token grants the MicroVM's shell and no port of its endpoint, so
+    // the request is performed in the MicroVM's machine rather than handed to the server
+    // its guest bound.
+    let allowed_ports = match granted {
+        TokenGrant::Shell => {
+            return shell_answer(head, &microvm_id, run_state.as_str(), machine, req).await;
+        }
+        TokenGrant::Ports(allowed_ports) => allowed_ports,
     };
 
     // The port the request ADDRESSES, which is what the token's `allowedPorts` has to
@@ -443,6 +481,94 @@ pub async fn serve_request(
             endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE)
         }
     }
+}
+
+/// What a published endpoint answers a request a SHELL token granted: what the MicroVM's
+/// own shell ([`super::microvm_shell`]) wrote for the program the request carried, and the
+/// status that program ended on.
+///
+/// A MicroVM that is not RUNNING has no shell to reach — one still provisioning has not
+/// booted the machine its shell runs in, and one resting under `SuspendMicrovm` is
+/// executing nothing — which the endpoint answers for exactly as it does for a guest it
+/// reached nothing inside of.
+///
+/// The program is performed on a BLOCKING worker: it is the caller's own text, bounded
+/// ([`super::microvm_shell`]) but synchronous, so performing it on the async worker would
+/// hold a runtime thread for the whole of it. A shell that ended without answering (a
+/// panic inside the session) is answered as a MicroVM nothing was reached inside of.
+async fn shell_answer(
+    head: bool,
+    microvm_id: &str,
+    run_state: &str,
+    machine: Option<::std::sync::Arc<super::guest_machine::GuestMachine>>,
+    req: &::http::Request<Vec<u8>>,
+) -> ::http::Response<Vec<u8>> {
+    let Some(machine) = machine.filter(|_| run_state == super::MICROVM_STATE_RUNNING) else {
+        ::tracing::debug!(
+            microvm_id = %microvm_id,
+            state = %run_state,
+            "the MicroVM is not running, so it has no shell to reach"
+        );
+        return endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE);
+    };
+    // The program is the request's own body, one command per line
+    // ([`super::microvm_shell`] states the form of the channel), and it is performed in
+    // the MicroVM's machine.
+    let program = String::from_utf8_lossy(req.body()).to_string();
+    let performed = ::tokio::task::spawn_blocking(move || {
+        super::microvm_shell::run_in_machine(&machine, &program)
+    })
+    .await;
+    let Ok(answered) = performed else {
+        ::tracing::debug!(
+            microvm_id = %microvm_id,
+            "the MicroVM's shell ended without answering the program it was given"
+        );
+        return endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE);
+    };
+    // Attributable like every other attempt on the address: the MicroVM and the status its
+    // shell ended on. The program is the client's own text and is not logged, and neither
+    // is anything the shell wrote.
+    ::tracing::info!(
+        audit = true,
+        operation = "MicrovmShellRequest",
+        outcome = "performed",
+        microvm_id = %microvm_id,
+        status = answered.status,
+        "a MicroVM's shell performed the program a shell token granted"
+    );
+    shell_response(head, &answered)
+}
+
+/// One answer from a MicroVM's shell: the lines the program wrote, and the status it ended
+/// on in [`super::microvm_shell::SHELL_STATUS_HEADER`].
+///
+/// The HTTP status is the PROXY's — whether the shell was reached at all — so a program
+/// that ended on a failure is still an answer the channel delivered; what the program
+/// itself answered is the shell status beside it.
+fn shell_response(
+    head: bool,
+    answered: &super::microvm_shell::ShellAnswer,
+) -> ::http::Response<Vec<u8>> {
+    let mut written = answered.output.join("\n");
+    if !written.is_empty() {
+        written.push('\n');
+    }
+    let length = written.len();
+    let body = if head { Vec::new() } else { written.into_bytes() };
+    ::http::Response::builder()
+        .status(200)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("content-length", length.to_string())
+        .header(
+            super::microvm_shell::SHELL_STATUS_HEADER,
+            answered.status.to_string(),
+        )
+        .body(body)
+        // Every header this builds is this module's own constant and the status is a
+        // number, so the builder cannot fail; answer the proxy's own status rather than
+        // panicking if it ever does.
+        .unwrap_or_else(|_| endpoint_response(head, NO_GUEST_RESPONSE_STATUS, NO_GUEST_RESPONSE))
 }
 
 /// Hand `request` to the MicroVM's guest PROCESS, answering the outbound connections it
@@ -633,8 +759,9 @@ fn endpoint_response(head: bool, status: u16, message: &'static str) -> ::http::
 }
 
 impl ServiceState {
-    /// Record the token `CreateMicrovmAuthToken` just minted for `microvm_id`: its
-    /// digest, what it grants and when it stops being accepted.
+    /// Record the token `CreateMicrovmAuthToken` or `CreateMicrovmShellAuthToken` just
+    /// minted for `microvm_id`: its digest, what it grants and when it stops being
+    /// accepted.
     ///
     /// `expirationInMinutes` is "the duration in minutes before the authentication
     /// token expires" and the model gives it no maximum, so the stored expiry is capped
@@ -647,7 +774,7 @@ impl ServiceState {
         microvm_id: &str,
         token: &str,
         expiration_in_minutes: i32,
-        allowed_ports: Vec<PortSpecification>,
+        grant: TokenGrant,
         now: Instant,
     ) -> Instant {
         let requested_seconds = u64::try_from(expiration_in_minutes)
@@ -680,7 +807,7 @@ impl ServiceState {
             MicrovmAuthToken {
                 region: region.to_string(),
                 microvm_id: microvm_id.to_string(),
-                allowed_ports,
+                grant,
                 expires_at,
             },
         );
