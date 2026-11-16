@@ -75,7 +75,11 @@ fn served_for(member: &str) -> Option<&'static str> {
 
 /// A CamelCase wire value read back as the SCREAMING_SNAKE member name it belongs to, so
 /// the pairing can be checked as a round trip rather than taken on trust.
-fn member_name_of(wire_value: &str) -> String {
+///
+/// `pub(crate)` because a refusal that spells an environment's state out carries the MEMBER
+/// name of the value the document serves, so the suite asserting such a refusal derives it
+/// here rather than keeping a second copy of the mapping.
+pub(crate) fn member_name_of(wire_value: &str) -> String {
     let mut name = String::new();
     for (position, character) in wire_value.char_indices() {
         if character.is_uppercase() && position > 0 {
