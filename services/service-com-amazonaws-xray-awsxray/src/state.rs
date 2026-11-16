@@ -87,6 +87,7 @@
 //! can be a value a reader cannot convert to the modelled `Timestamp`; the
 //! conversion itself goes through [`timestamp_of`].
 
+pub mod destination_switch;
 pub mod encryption_key;
 pub mod filter;
 pub mod group_scope;
@@ -212,8 +213,9 @@ const MULTI_REGION_KEY_ID_DIGITS: usize = 32;
 /// Whether `candidate` is a KMS key id (`PutEncryptionConfig$KeyId`: "Key ID -
 /// The KMS key ID of the key").
 ///
-/// The emulator resolves no KMS key, so only the FORM is judged, and it is judged
-/// no more narrowly than the id's two shapes: [`KEY_ID_GROUPS`] non-empty groups
+/// Only the FORM is judged here — whether KMS holds a key the selector names is
+/// what KMS itself answers ([`resolved_key`]) — and it is judged no more
+/// narrowly than the id's two shapes: [`KEY_ID_GROUPS`] non-empty groups
 /// of hexadecimal digits for a single-region key — which covers both the
 /// canonical 8-4-4-4-12 grouping and the differently grouped example that
 /// member's own documentation gives — or `mrk-` and
@@ -284,8 +286,8 @@ fn is_kms_arn(candidate: &str) -> bool {
 
 /// Whether `key_id` selects a KMS key in one of the three forms
 /// `PutEncryptionConfig$KeyId` documents — an alias, a key id, or the full ARN of
-/// either. Anything else is refused: the emulator holds no KMS keys, so the form
-/// of the selector is all there is to judge.
+/// either. Anything else names no key at all, so it is refused before KMS is
+/// asked about it ([`resolved_key`]).
 pub fn is_kms_key_selector(key_id: &str) -> bool {
     is_kms_alias(key_id) || is_kms_key_id(key_id) || is_kms_arn(key_id)
 }
@@ -3405,9 +3407,12 @@ impl ComAmazonawsXrayAwsxrayState {
     /// when one was supplied.
     ///
     /// A change becomes effective [`DESTINATION_ACTIVATION_SPAN`] after `now`, so
-    /// it reports `PENDING` until then. A request that names the destination
-    /// already configured changes nothing — there is no switch to apply — and so
-    /// leaves the reported status as it stands. A destination other than
+    /// it reports `PENDING` until then. Storing the destination already
+    /// configured changes nothing — there is no switch to apply — and so leaves
+    /// the reported status as it stands, which is why the operation refuses such
+    /// a request rather than reaching here
+    /// ([`destination_switch::destination_already_set_message`]). A destination
+    /// other than
     /// [`CLOUD_WATCH_LOGS_DESTINATION`] takes no `CloudWatchLogsConfiguration`,
     /// so pointing the service there drops the stored key rather than keeping a
     /// key for a log group nothing writes to.

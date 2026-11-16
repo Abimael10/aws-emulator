@@ -31,37 +31,85 @@
 //! about the key, so the configuration keeps the qualified form of the selector
 //! the request submitted ([`super::kms_key_arn`]) rather than reporting a key
 //! nothing stands behind.
+//!
+//! What KMS DOES answer about a selector it holds no key for is a definite
+//! negative, and that is not a configuration to store at all: X-Ray has to
+//! create a grant on the key before it can encrypt the account's trace data
+//! under it, and no grant can be created on a key that is not there. Such a
+//! request is refused ([`ResolvedKey::NoSuchKey`], [`KEY_GRANT_FAILED_MESSAGE`]),
+//! which is the one answer that leaves the account's stored configuration alone
+//! rather than pointing it at a key ingestion could never use.
 
-/// The ARN of the KMS key `key_id` selects, as KMS reports it at `region`'s
-/// endpoint, or `None` when no KMS answered for it.
+/// What X-Ray answers a request whose `KeyId` names a key KMS holds none for.
 ///
-/// The ARN is KMS's own `KeyMetadata$Arn` — the `key/<key id>` form, whichever
-/// selector was submitted — so a caller comparing the configuration against
-/// `kms:DescribeKey`, a key policy or a key's audit records is comparing the
-/// same identifier.
-pub async fn resolved_key_arn(
+/// FIXED text: the refusal states the condition that was broken — the grant
+/// X-Ray has to create on the key could not be created, because KMS reported no
+/// such key — and interpolates nothing from the request.
+pub const KEY_GRANT_FAILED_MESSAGE: &str =
+    "Failed to create grant for customer master key. KMSKeyNotFound";
+
+/// What KMS answered about one key selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedKey {
+    /// KMS resolved the selector to a key, and reported it under this ARN.
+    Key(String),
+    /// KMS reported that this account and Region hold no key the selector
+    /// resolves to.
+    NoSuchKey,
+    /// KMS said nothing about the key itself. Not a negative, so not a refusal.
+    Unknown,
+}
+
+/// What KMS says about the key `key_id` selects at `region`'s endpoint.
+///
+/// The ARN a resolved key is reported under is KMS's own `KeyMetadata$Arn` — the
+/// `key/<key id>` form, whichever selector was submitted — so a caller comparing
+/// the configuration against `kms:DescribeKey`, a key policy or a key's audit
+/// records is comparing the same identifier.
+///
+/// A definite negative is only KMS's own "no such key" answer, with the client
+/// status it came with; see the module docs for why everything else is
+/// [`ResolvedKey::Unknown`].
+pub async fn resolved_key(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     key_id: &str,
-) -> Option<String> {
-    match kms_client(ctx, region)
+) -> ResolvedKey {
+    let error = match kms_client(ctx, region)
         .describe_key()
         .key_id(key_id)
         .send()
         .await
     {
-        Ok(described) => described.key_metadata?.arn,
-        Err(error) => {
-            // A key KMS does not hold, a refusal of the selector, a KMS this
-            // emulator was assembled without: none of them says what key the
-            // selector names, which is what the caller is left with.
-            ::tracing::debug!(
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "KMS did not resolve the key the encryption configuration names"
-            );
-            None
+        Ok(described) => {
+            return match described.key_metadata.and_then(|metadata| metadata.arn) {
+                Some(arn) => ResolvedKey::Key(arn),
+                // A key KMS reported without an ARN is still the key the request
+                // named, but nothing said WHICH key that is.
+                None => ResolvedKey::Unknown,
+            };
         }
+        Err(error) => error,
+    };
+    let about_the_key = error.as_service_error().is_some_and(
+        ::aws_sdk_kms::operation::describe_key::DescribeKeyError::is_not_found_exception,
+    );
+    // A 5xx is about KMS, not about the key, whatever code travels with it.
+    let client_error = error
+        .raw_response()
+        .is_some_and(|response| response.status().is_client_error());
+    if about_the_key && client_error {
+        return ResolvedKey::NoSuchKey;
     }
+    // A selector KMS did not answer about, a refusal of the call, a KMS this
+    // emulator was assembled without: none of them says what key the selector
+    // names, which is what the caller is left with. Visible to an operator,
+    // because an answer nothing can be read from refuses nothing.
+    ::tracing::debug!(
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "KMS did not resolve the key the encryption configuration names"
+    );
+    ResolvedKey::Unknown
 }
 
 /// A KMS client over the in-process callback into this same emulator, addressed

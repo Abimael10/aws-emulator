@@ -36,6 +36,10 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
+use service_com_amazonaws_xray_awsxray::state::destination_switch::{
+    SPANS_DELIVERY_ACTION, XRAY_SERVICE_PRINCIPAL,
+};
 use service_com_amazonaws_xray_awsxray::state::span_delivery::{
     SPANS_LOG_GROUP, SPANS_LOG_STREAM,
 };
@@ -134,9 +138,42 @@ fn trace_id(n: u32) -> String {
     format!("1-{n:08x}-{n:024x}")
 }
 
+/// Grant X-Ray the delivery the `CloudWatchLogs` destination needs, through
+/// CloudWatch Logs' OWN `PutResourcePolicy`: the spans only arrive where the
+/// service principal that writes them may put log events, so the switch to that
+/// destination is refused until the account's resource policy says so.
+async fn grant_spans_delivery(case: &str, spans: &Spans) {
+    let document = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "TransactionSearchXRayAccess",
+            "Effect": "Allow",
+            "Principal": { "Service": XRAY_SERVICE_PRINCIPAL },
+            "Action": SPANS_DELIVERY_ACTION,
+            "Resource": logs::log_group_arn(REGION, SPANS_LOG_GROUP, true),
+        }],
+    });
+    let (status, answered) = spans
+        .logs(
+            "PutResourcePolicy",
+            &json!({
+                "policyName": "XRayTransactionSearchAccess",
+                "policyDocument": document.to_string(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the spans delivery grant must be accepted, got {status} {answered:?}"
+    );
+}
+
 /// Configure `destination` and look again until the switch the clock owes it is
 /// in effect.
 async fn settled(case: &str, spans: &Spans, destination: &str) {
+    if destination == CLOUD_WATCH_LOGS_DESTINATION {
+        grant_spans_delivery(case, spans).await;
+    }
     let (status, answered) = spans
         .xray(
             "/UpdateTraceSegmentDestination",

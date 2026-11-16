@@ -117,7 +117,15 @@ async fn poll_settled(case: &str, xray: &Xray, expected: &str) -> usize {
 
 /// The whole documented enablement flow: configure `destination`, then wait for
 /// the switch to be in effect, and answer how many reads the wait took.
+///
+/// A `CloudWatchLogs` destination is one this service DELIVERS to, so the grant
+/// that admits the account's spans into the log group they go to is put first —
+/// the step AWS's own Transaction Search enablement flow starts with, and
+/// without which the switch is refused.
 async fn settle(case: &str, xray: &Xray, destination: &str) -> usize {
+    if destination == CLOUD_WATCH_LOGS_DESTINATION {
+        xray.grant_spans_delivery(case).await;
+    }
     let updated = xray
         .call(
             "/UpdateTraceSegmentDestination",
@@ -228,8 +236,9 @@ fn assert_datapoint(case: &str, datapoint: &Value, timestamp: f64, requests: i64
 #[tokio::test]
 async fn polling_for_the_settled_destination_terminates() {
     // Rows: the account nothing configured, and a switch to each value the
-    // model's `TraceSegmentDestination` enum publishes — including the one
-    // already in effect, which applies no switch at all.
+    // model's `TraceSegmentDestination` enum publishes that is not the one
+    // already in effect — naming that one applies no switch at all and is
+    // refused, which `trace_segment_destination.rs` owns.
     let xray = Xray::new();
     let reads = poll_settled(
         "a never-configured account",
@@ -244,8 +253,11 @@ async fn polling_for_the_settled_destination_terminates() {
     );
 
     for destination in TRACE_SEGMENT_DESTINATION_VALUES {
+        if *destination == DEFAULT_TRACE_SEGMENT_DESTINATION {
+            continue;
+        }
         let case = format!("a switch to {destination}");
-        let xray = Xray::new();
+        let xray = Xray::with_cloud_watch_logs();
         settle(&case, &xray, destination).await;
         // And it stays settled: the next read of a settled account reports the
         // settled status straight away.
@@ -337,10 +349,10 @@ fn bucketing_cases() -> Vec<Case> {
 async fn buckets_a_service_s_requests_into_period_wide_datapoints() {
     for (row, case) in bucketing_cases().into_iter().enumerate() {
         let label = case.case;
-        let xray = Xray::new();
-        // The flow a client runs: wait for the destination to settle, then
-        // instrument. A service name per row, so one row's traffic is never
-        // another's.
+        let xray = Xray::with_cloud_watch_logs();
+        // The flow a client runs: grant the delivery, wait for the destination
+        // to settle, then instrument. A service name per row, so one row's
+        // traffic is never another's.
         settle(label, &xray, CLOUD_WATCH_LOGS_DESTINATION).await;
         let service = format!("checkout-{row}");
 
@@ -447,7 +459,7 @@ async fn the_rule_holds_for_times_the_live_clock_produces() {
     const GAP: f64 = 120.0;
 
     let case = "two live-clock submissions a whole number of periods apart";
-    let xray = Xray::new();
+    let xray = Xray::with_cloud_watch_logs();
     settle(case, &xray, CLOUD_WATCH_LOGS_DESTINATION).await;
     let service = "live-clock-checkout";
 

@@ -12,6 +12,11 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
+use service_com_amazonaws_xray_awsxray::state::destination_switch::{
+    SPANS_DELIVERY_ACTION, XRAY_SERVICE_PRINCIPAL,
+};
+use service_com_amazonaws_xray_awsxray::state::span_delivery::SPANS_LOG_GROUP;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator with an empty store.
@@ -149,6 +154,92 @@ impl Xray {
                 format!(
                     "AWS4-HMAC-SHA256 Credential={access_key_id}/20240101/{region}/xray/aws4_request, \
                      SignedHeaders=host, Signature=not-verified"
+                ),
+            )
+            .body(::bytes::Bytes::from(body.to_string()))
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        Answer {
+            status,
+            error_type,
+            body,
+        }
+    }
+
+    /// One emulator with CloudWatch Logs mounted beside this service on ONE
+    /// engine — the shape `core/router/src/lib.rs` mounts them in — for a case
+    /// whose rule reaches the state that service's own API owns.
+    pub fn with_cloud_watch_logs() -> Self {
+        Self::beside(service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new)
+    }
+
+    /// Grant X-Ray the delivery a `CloudWatchLogs` trace segment destination
+    /// needs, through CloudWatch Logs' OWN `PutResourcePolicy` — the API AWS's
+    /// Transaction Search setup flow uses.
+    ///
+    /// The spans are written into the spans log group BY X-Ray under its own
+    /// service principal, so the switch to that destination is refused until the
+    /// account's resource policy lets that principal put log events there. The
+    /// grant is account-scoped because the group is vended by the first delivery
+    /// and so need not exist when the policy is put.
+    ///
+    /// Mount CloudWatch Logs first ([`Self::with_cloud_watch_logs`]).
+    pub async fn grant_spans_delivery(&self, case: &str) {
+        let document = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "TransactionSearchXRayAccess",
+                "Effect": "Allow",
+                "Principal": { "Service": XRAY_SERVICE_PRINCIPAL },
+                "Action": SPANS_DELIVERY_ACTION,
+                "Resource": logs::log_group_arn(DEFAULT_REGION, SPANS_LOG_GROUP, true),
+            }],
+        });
+        let put = self
+            .logs_call(
+                "PutResourcePolicy",
+                &json!({
+                    "policyName": "XRayTransactionSearchAccess",
+                    "policyDocument": document.to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: the spans delivery grant must be accepted, got {put:?}"
+        );
+    }
+
+    /// One call to the CloudWatch Logs service of this emulator, for a case whose
+    /// rule is about state that service's own API owns (a log group, a resource
+    /// policy). `operation` is the operation name its `x-amz-target` names; the
+    /// service speaks awsJson1_1 at its own endpoint host, and the call is signed
+    /// for the same Region as the X-Ray calls above, so both see one account and
+    /// Region.
+    ///
+    /// Mount it beside this service first — `Xray::beside(
+    /// service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new)`
+    /// — or the request reaches nothing.
+    pub async fn logs_call(&self, operation: &str, body: &Value) -> Answer {
+        let region = DEFAULT_REGION;
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri(format!("https://logs.{region}.amazonaws.com/"))
+            .header("host", format!("logs.{region}.amazonaws.com"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("Logs_20140328.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={DEFAULT_ACCESS_KEY_ID}/20240101/{region}/logs/\
+                     aws4_request, SignedHeaders=host, Signature=not-verified"
                 ),
             )
             .body(::bytes::Bytes::from(body.to_string()))

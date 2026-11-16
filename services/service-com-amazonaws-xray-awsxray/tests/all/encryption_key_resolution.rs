@@ -16,8 +16,15 @@
 //! customer managed or one of the Amazon Web Services managed keys a predefined
 //! `alias/aws/…` resolves to, and which alias of a key with two was used — the
 //! ARN reported is the key's in every case, never the selector re-rendered.
+//!
+//! The second rule here is the other side of the same resolution: a selector KMS
+//! holds no key for is REFUSED, because the grant X-Ray creates on the key
+//! cannot be created on a key that is not there, and the account's stored
+//! configuration is left as it was.
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_xray_awsxray::state::KEY_GRANT_FAILED_MESSAGE;
 
 use super::xray_wire::{Answer, Xray, DEFAULT_REGION};
 
@@ -227,51 +234,85 @@ async fn a_stored_configuration_reports_the_key_its_selector_resolves_to() {
 }
 
 #[tokio::test]
-async fn a_selector_no_kms_resolves_keeps_the_form_it_was_submitted_in() {
-    // The fail-safe direction, with KMS mounted and holding no such key: nothing
-    // resolved it, so the configuration reports the qualified form of the
-    // selector the request submitted rather than a key's identity nothing
-    // stands behind. Whether such a request is answered at all, or refused, is
-    // the subject of its own open issue
-    // (20261022T045628Z-xray-x-ray-account-config-surfaces-are-overly-permissive),
-    // so an answer that is not a 200 leaves this rule with nothing to say.
-    let emulator = emulator();
+async fn a_selector_kms_holds_no_key_for_is_refused_and_stores_nothing() {
+    // X-Ray has to create a grant on the key before it can encrypt the account's
+    // trace data under it, and no grant can be created on a key KMS does not
+    // hold: such a request is refused, and the configuration the account already
+    // had is left alone — rather than pointing the account at a key ingestion
+    // could never use.
+    //
+    // The rows differ along the FORM of the selector that resolves to nothing
+    // (an alias name, an alias ARN, a bare key id, a key ARN, a multi-region key
+    // id), each of them well formed, so what is refused is the key's absence
+    // rather than the shape of the selector.
     let account = emulator_server::emulator_account_id();
-
-    // (the selector submitted, the qualified form of it)
-    let rows: Vec<(String, String)> = vec![
+    let rows: Vec<(&str, String)> = vec![
+        ("an alias nothing created", "alias/never-created".to_string()),
         (
-            "alias/never-created".to_string(),
+            "the full ARN of an alias nothing created",
             format!("arn:aws:kms:{REGION}:{account}:alias/never-created"),
         ),
         (
-            format!("arn:aws:kms:{REGION}:{account}:alias/never-created"),
-            format!("arn:aws:kms:{REGION}:{account}:alias/never-created"),
-        ),
-        (
+            "the id of a key nothing created",
             "ae4aa6d4-9a4d-489d-9a47-54ff6d789845".to_string(),
+        ),
+        (
+            "the full ARN of a key nothing created",
             format!("arn:aws:kms:{REGION}:{account}:key/ae4aa6d4-9a4d-489d-9a47-54ff6d789845"),
+        ),
+        (
+            "the id of a multi-region key nothing created",
+            "mrk-1234abcd12ab34cd56ef1234567890ab".to_string(),
         ),
     ];
 
-    for (selector, qualified) in rows {
-        let put = put_kms(&emulator, &selector).await;
-        // Either answer is a rule this case can state: a 200 reports the
-        // qualified selector and nothing else, and a refusal is the modelled
-        // one. What no answer may do is report a key.
-        if put.status == 200 {
+    for (case, selector) in rows {
+        let emulator = emulator();
+
+        // A configuration the refusal must not disturb, put with a key KMS DOES
+        // hold — the positive control for every row below.
+        let created = kms(&emulator)
+            .create_key()
+            .description("the key the account is encrypting with")
+            .send()
+            .await
+            .expect("KMS must create a key");
+        let seeded_arn = created
+            .key_metadata()
+            .and_then(::aws_sdk_kms::types::KeyMetadata::arn)
+            .expect("a created key carries an ARN")
+            .to_string();
+        let seeded = put_kms(&emulator, &seeded_arn).await;
+        assert_eq!(
+            config(&seeded, "KeyId"),
+            json!(seeded_arn),
+            "case {case:?}: seeding a configuration with a key KMS holds must succeed, \
+             got {seeded:?}"
+        );
+        let before = active_config(&emulator, case).await;
+
+        let refused = put_kms(&emulator, &selector).await;
+        assert_eq!(
+            (refused.status, refused.error_type.as_deref()),
+            (400, Some("InvalidRequestException")),
+            "case {case:?}: selector {selector:?} resolves to no key, so expected 400 \
+             InvalidRequestException, got {refused:?}"
+        );
+        assert_eq!(
+            refused.message(),
+            Some(KEY_GRANT_FAILED_MESSAGE),
+            "case {case:?}: expected the message {KEY_GRANT_FAILED_MESSAGE:?}, got {:?}",
+            refused.message()
+        );
+
+        // Nothing was stored: the reader still reports the key the account was
+        // already encrypting with.
+        let after = get_config(&emulator).await;
+        for member in ["Type", "KeyId", "Status"] {
             assert_eq!(
-                config(&put, "KeyId"),
-                json!(qualified),
-                "selector {selector:?}: expected the qualified selector {qualified:?}, got {:?}",
-                config(&put, "KeyId")
-            );
-        } else {
-            assert_eq!(
-                (put.status, put.error_type.as_deref()),
-                (400, Some("InvalidRequestException")),
-                "selector {selector:?}: a selector KMS does not resolve is either stored as \
-                 submitted or refused as invalid, got {put:?}"
+                config(&after, member),
+                config(&before, member),
+                "case {case:?}: the refusal must leave {member} as it was, got {after:?}"
             );
         }
     }

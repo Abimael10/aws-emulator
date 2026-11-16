@@ -10,7 +10,13 @@
 //! A request that names no destination, names one outside
 //! `TraceSegmentDestination`, or carries a `CloudWatchLogsConfiguration` with a
 //! destination other than `CloudWatchLogs` (which the member's documentation
-//! restricts it to) is refused with the modelled `InvalidRequestException`.
+//! restricts it to) is refused with the modelled `InvalidRequestException`, and
+//! so is a request naming the destination the account is already on: an account
+//! singleton that is already there has no switch to apply. A switch to
+//! `CloudWatchLogs` is refused with `AccessDeniedException` while no CloudWatch
+//! Logs resource policy lets this service deliver the account's spans to the log
+//! group they go to — both preconditions are stated in
+//! [`crate::state::destination_switch`].
 //!
 //! ## Shape of an operation
 //!
@@ -168,7 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let invalid = |message: String| -> Self::Error {
             UpdateTraceSegmentDestinationErrorModeled::InvalidRequestException(
                 InvalidRequestException {
@@ -232,10 +237,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::Instant::now();
-        let mut store = state.lock();
         // Settle first, so a change still owed from an earlier call is in effect
-        // before this one decides whether it is switching anything.
-        store.settle_trace_segment_destination(now);
+        // before this one decides whether it is switching anything. The guard is
+        // released before the preconditions below, which reach the store of
+        // another service (LOCK ORDER, see
+        // [`crate::state::destination_switch`]).
+        let current = {
+            let mut store = state.lock();
+            store.settle_trace_segment_destination(now);
+            store.trace_segment_destination.destination.clone()
+        };
+
+        // The destination is an account singleton, so a request naming the one it
+        // is already on applies no switch at all: there is no transition for the
+        // caller to wait on, which is what the service reports rather than
+        // starting a second one.
+        if current == destination {
+            return Err(invalid(
+                crate::state::destination_switch::destination_already_set_message(destination),
+            ));
+        }
+        // And a destination this service cannot deliver to is not accepted: with
+        // no CloudWatch Logs resource policy letting X-Ray put the account's
+        // spans into the log group they go to, a switch to that destination would
+        // report a delivery path nothing reaches.
+        if destination == crate::state::CLOUD_WATCH_LOGS_DESTINATION
+            && crate::state::destination_switch::spans_delivery_is_ungranted(
+                &*self.engine,
+                &crate::state::request_region(ctx.parts()),
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::destination_switch::spans_delivery_ungranted_message(),
+            ));
+        }
+
+        let mut store = state.lock();
         let record = store.set_trace_segment_destination(destination, kms_key_id, now);
 
         Ok(UpdateTraceSegmentDestinationOutput {

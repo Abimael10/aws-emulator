@@ -8,17 +8,17 @@
 //! `UPDATING` span, so `GetEncryptionConfig` reports the new `Type` and `KeyId`
 //! at once and `Status` `ACTIVE` once the clock owes it
 //! ([`crate::state::ENCRYPTION_SETTLE_AFTER`]). A `KeyId` that is not a KMS key
-//! selector, a `KMS` request without one, and a `NONE` request that carries one
+//! selector, a `KMS` request without one, a `NONE` request that carries one, and
+//! a selector KMS holds no key for ([`crate::state::KEY_GRANT_FAILED_MESSAGE`])
 //! are each refused with `InvalidRequestException` rather than stored.
 //!
 //! What is stored under `KMS` is the ARN of the KEY the submitted selector
-//! RESOLVES to ([`crate::state::resolved_key_arn`]), whatever of the three
-//! selector forms the request used: the configuration a reader takes to a KMS
-//! policy or compares across accounts has to identify WHICH key protects the
-//! data, and an alias names whatever key it currently targets while a bare id is
-//! the same text in every account and region. A selector no KMS answered for
-//! keeps the qualified form it was submitted in
-//! ([`crate::state::kms_key_arn`]).
+//! RESOLVES to ([`crate::state::resolved_key`]), whatever of the three selector
+//! forms the request used: the configuration a reader takes to a KMS policy or
+//! compares across accounts has to identify WHICH key protects the data, and an
+//! alias names whatever key it currently targets while a bare id is the same
+//! text in every account and region. A selector KMS answered nothing about keeps
+//! the qualified form it was submitted in ([`crate::state::kms_key_arn`]).
 //!
 //! ## Shape of an operation
 //!
@@ -201,14 +201,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // is the one `EncryptionConfig$KeyId` reports: an alias names
                 // whatever key it currently targets, so only the key's own ARN
                 // identifies what protects the account's trace data
-                // ([`crate::state::resolved_key_arn`]). A selector no KMS
-                // answered for keeps the qualified form it was submitted in.
-                Some(
-                    match crate::state::resolved_key_arn(ctx, &region, &key_id).await {
-                        Some(resolved) => resolved,
-                        None => crate::state::kms_key_arn(&key_id, &region),
-                    },
-                )
+                // ([`crate::state::resolved_key`]). A selector KMS holds no key
+                // for is refused instead of stored — the grant X-Ray creates on
+                // the key cannot be created on a key that is not there — while a
+                // selector KMS said nothing about keeps the qualified form it
+                // was submitted in.
+                match crate::state::resolved_key(ctx, &region, &key_id).await {
+                    crate::state::ResolvedKey::Key(resolved) => Some(resolved),
+                    crate::state::ResolvedKey::NoSuchKey => {
+                        return Err(refuse(crate::state::KEY_GRANT_FAILED_MESSAGE.to_string()));
+                    }
+                    crate::state::ResolvedKey::Unknown => {
+                        Some(crate::state::kms_key_arn(&key_id, &region))
+                    }
+                }
             }
             crate::state::ENCRYPTION_TYPE_NONE => {
                 if let Some(key_id) = input.key_id {
