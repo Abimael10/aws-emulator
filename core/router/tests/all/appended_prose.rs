@@ -41,7 +41,10 @@
 //! re-typed copies of its paragraphs, and below the last declaration stood another run of them
 //! with three landings' own declaration pairs scattered through it. The header was written back
 //! as ONE block, each of those pairs was moved into the place its name sorts to, and the prose
-//! was dropped, for the same reason as the six runs before it.
+//! was dropped, for the same reason as the six runs before it. Two branches repaired that run
+//! at once, and the second found a fourth pair stranded in the same prose — the root's only
+//! declaration of that suite — which is now declared in the place its name sorts to, like the
+//! other three.
 //!
 //! An EIGHTH run had grown back in both places again while that repair was under review, with
 //! one more landing's declaration pair appended past the end of the prose. The header was left
@@ -49,6 +52,14 @@
 //! to, and the prose was dropped, for the same reason as the seven runs before it. The same run
 //! reached a branch already in review, which dropped the prose it had grown there and re-sorted
 //! the pair stranded in it; the two cleanups agree, so the list carries that pair once.
+//!
+//! A NINTH run had grown back inside the header, four times over, while this repair was in
+//! review: each landing that merged a stale base re-typed those paragraphs into the block, and
+//! `all_rs_carries_one_header_block.rs` reports every copy, which fails every suite of this
+//! target. The header was written back as ONE block each time, and the last time as a SHORT
+//! one — six lines stating the rule and naming the suites that pin it, because a block that
+//! says less has fewer lines for the next stale-base merge to re-type. The declaration list
+//! below it was left exactly as it stood, for the same reason as the eight runs before it.
 //!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

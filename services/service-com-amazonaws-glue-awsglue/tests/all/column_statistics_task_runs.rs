@@ -58,7 +58,10 @@ const OWED_TRANSITION_WINDOW: (Duration, Duration) =
 
 /// An emulator plus the engine it runs on, so a test can read and move the due instants
 /// the run lifecycle turns on instead of waiting for them.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// Shared with the suites that drive this lifecycle through the clock helpers below
+/// ([`crate::column_statistics_task_settings_first_run`]), so one constructor serves them.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     (emulator_on(engine.clone()), engine)
 }
@@ -189,7 +192,11 @@ pub(crate) fn already_past() -> SystemTime {
 }
 
 /// The `ColumnNameList` a reported run carries, in the order it reports them.
-fn reported_columns(run: &Value) -> Vec<String> {
+///
+/// Shared with the suite that reads the run a settings create started
+/// ([`crate::column_statistics_task_settings_first_run`]), so one copy reads the member for
+/// every suite that asserts on a reported run.
+pub(crate) fn reported_columns(run: &Value) -> Vec<String> {
     run.get("ColumnNameList")
         .and_then(Value::as_array)
         .map(|names| {
@@ -203,7 +210,9 @@ fn reported_columns(run: &Value) -> Vec<String> {
 
 /// A numeric member of a reported run, taking an absent member as the model's own default
 /// of 0 — awsJson omits a member whose value equals its modelled default.
-fn reported_number(run: &Value, member: &str) -> f64 {
+///
+/// Shared for the same reason as [`reported_columns`].
+pub(crate) fn reported_number(run: &Value, member: &str) -> f64 {
     run.get(member).and_then(Value::as_f64).unwrap_or(0.0)
 }
 

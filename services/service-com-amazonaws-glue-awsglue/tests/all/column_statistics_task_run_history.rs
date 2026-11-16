@@ -137,16 +137,28 @@ async fn start_in_flight_run(
         .to_string()
 }
 
+/// The `ColumnStatisticsTaskRun` entries one page of the listing reports, in the order it
+/// reports them.
+///
+/// Shared with the suite that reads the run a settings create started
+/// ([`crate::column_statistics_task_settings_first_run`]), so one reader of the listing's own
+/// member serves every suite that asserts on it.
+pub(crate) fn reported_runs(page: &Value) -> Vec<Value> {
+    page.get("ColumnStatisticsTaskRuns")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("the listing must report a ColumnStatisticsTaskRuns list, got {page}")
+        })
+        .clone()
+}
+
 /// One page of the history of `table`, as (the ids it reports in order, its NextToken).
 async fn history_page(
     router: &MultiServiceRouter,
     body: &Value,
 ) -> (Vec<String>, Option<String>) {
     let page = ok(router, "GetColumnStatisticsTaskRuns", body).await;
-    let ids = page
-        .get("ColumnStatisticsTaskRuns")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("the listing must report a ColumnStatisticsTaskRuns list, got {page}"))
+    let ids = reported_runs(&page)
         .iter()
         .map(|run| {
             run.get("ColumnStatisticsTaskRunId")
@@ -333,7 +345,9 @@ async fn single_run(router: &MultiServiceRouter, run_id: &str) -> Value {
 }
 
 /// The `Status` a reported run stands in.
-fn status_of(run: &Value) -> String {
+///
+/// Shared for the same reason as [`reported_runs`].
+pub(crate) fn status_of(run: &Value) -> String {
     run.get("Status")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("each reported run carries its Status, got {run}"))
