@@ -50,7 +50,25 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/PodIdentityRole";
 
 /// The audience an EKS Pod Identity token is projected for, as the EKS Auth
 /// service documents it ("This value is always pods.eks.amazonaws.com").
-const PODS_AUDIENCE: &str = "pods.eks.amazonaws.com";
+pub(crate) const PODS_AUDIENCE: &str = "pods.eks.amazonaws.com";
+
+/// The sentence `AssumeRoleForPodIdentity` refuses a token whose `(namespace, service
+/// account)` identity the cluster holds no pod identity association for with — one
+/// fixed sentence, naming nothing of the request.
+///
+/// Here rather than in each suite that drives an exchange, so the two cannot assert
+/// different wording for one refusal.
+pub(crate) const NO_ASSOCIATION_REFUSAL: &str =
+    "The token included in the request has no service account role association for it.";
+
+/// The sentence `AssumeRoleForPodIdentity` refuses an exchange whose association names a
+/// TARGET role that role's own trust policy does not let the association's role assume —
+/// one fixed sentence, naming nothing of the request.
+///
+/// Beside [`NO_ASSOCIATION_REFUSAL`] for the same reason: one refusal, one wording.
+pub(crate) const TARGET_ROLE_REFUSAL: &str =
+    "The target role of the EKS Pod Identity association cannot be assumed by the \
+     association's role with the association's external ID.";
 
 /// One answer from a cluster's Kubernetes API address.
 #[derive(Debug)]
@@ -64,7 +82,7 @@ pub(crate) struct ApiAnswer {
 /// exchangeable at `AssumeRoleForPodIdentity`. The engine handle comes back with it,
 /// so a suite can read the SESSION the exchange vended where every service resolves
 /// a temporary credential's principal.
-fn emulator_with_pod_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_pod_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (mut router, engine) = emulator_with_engine();
     router.register_service(
         service_com_amazonaws_eksauth_eksauthfrontend::EmulatedService::new(Arc::clone(&engine)),
@@ -87,7 +105,7 @@ pub(crate) struct Kubeconfig {
 ///
 /// The wait is for the CONDITION, re-read until it holds or a generous deadline passes,
 /// so a loaded host only makes it slower rather than failing it.
-async fn provisioned_cluster(
+pub(crate) async fn provisioned_cluster(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -315,27 +333,54 @@ fn token_claims(case: &str, token: &str) -> serde_json::Value {
 }
 
 /// `POST /clusters/{cluster}/assume-role-for-pod-identity` on the EKS Auth plane of
-/// the same emulator, as the EKS Pod Identity Agent calls it.
-async fn assume_role_for_pod_identity(
+/// the same emulator, as the EKS Pod Identity Agent calls it: the `host` header names
+/// that service's own signing name, which is the routing key, and the `Authorization`
+/// header names the credential the request speaks for.
+///
+/// It answers the crate's own [`crate::wire::Answer`], so a suite can read the error
+/// SHAPE and the refusal sentence of a refused exchange as well as its status.
+pub(crate) async fn assume_role_for_pod_identity(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
     token: &str,
-) -> ApiAnswer {
+) -> crate::wire::Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("/clusters/{cluster}/assume-role-for-pod-identity"))
         // The routing key: the endpoint host names the `eks-auth` signing name.
         .header("host", format!("eks-auth.{region}.amazonaws.com"))
         .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/20260101/{region}/eks-auth/aws4_request, \
+                 SignedHeaders=host, Signature=deadbeef",
+                crate::wire::DEFAULT_ACCESS_KEY_ID
+            ),
+        )
         .body(bytes::Bytes::from(
             serde_json::json!({ "token": token }).to_string(),
         ))
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    let body = serde_json::from_slice(response.body()).unwrap_or(serde_json::Value::Null);
-    ApiAnswer { status, body }
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap_or_default();
+    let error_type = error_type.or_else(|| {
+        body.get("__type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    crate::wire::Answer {
+        status,
+        error_type,
+        body,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,10 +968,7 @@ async fn a_pod_bound_token_is_exchanged_for_the_associated_role() {
         );
         assert_eq!(
             after_delete.body["message"],
-            serde_json::json!(
-                "The token included in the request has no service account role association \
-                 for it."
-            ),
+            serde_json::json!(NO_ASSOCIATION_REFUSAL),
             "case {label:?}: the refusal states that the token has no association, got {:?}",
             after_delete.body
         );

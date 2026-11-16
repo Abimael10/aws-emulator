@@ -73,13 +73,13 @@ const ABSENT_ROLE: &str = "podIdentityOrderNoSuchRole";
 
 /// The ARN of a role of the account this emulator serves, so the pass-role authorization
 /// (403) is never what answers a row.
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
 }
 
 /// A trust policy that lets `principal` assume the role, in the form AWS publishes for a
 /// service principal.
-fn service_trust_policy(principal: &str) -> String {
+pub(crate) fn service_trust_policy(principal: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -93,7 +93,7 @@ fn service_trust_policy(principal: &str) -> String {
 
 /// Create the role `name` in IAM with `trust` as its trust policy, through IAM's own
 /// `CreateRole`, so what this suite asserts is grounded in what IAM holds.
-async fn create_role(router: &MultiServiceRouter, name: &str, trust: String) {
+pub(crate) async fn create_role(router: &MultiServiceRouter, name: &str, trust: String) {
     let (status, body) = query(
         router,
         "iam",
