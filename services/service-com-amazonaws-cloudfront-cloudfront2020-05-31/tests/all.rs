@@ -146,6 +146,8 @@ mod duplicate_name_conflict_wording;
 mod edge_additional_metric_reconciliation;
 #[path = "all/edge_additional_metrics.rs"]
 mod edge_additional_metrics;
+#[path = "all/edge_additional_metrics_over_an_s3_origin.rs"]
+mod edge_additional_metrics_over_an_s3_origin;
 #[path = "all/edge_data_plane.rs"]
 mod edge_data_plane;
 #[path = "all/edge_deployed_distribution_effects.rs"]
