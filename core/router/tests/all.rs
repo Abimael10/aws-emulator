@@ -184,6 +184,8 @@ mod billing_access_denied_principal_agrees_with_sts;
 mod billingconductor_payer_account;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
+#[path = "all/cdk_context_provider_lookups_are_answered.rs"]
+mod cdk_context_provider_lookups_are_answered;
 #[path = "all/cfn_deployed_backup_pipeline_delivers_job_events.rs"]
 mod cfn_deployed_backup_pipeline_delivers_job_events;
 #[path = "all/cfn_provisions_declared_resources.rs"]
