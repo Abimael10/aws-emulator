@@ -77,6 +77,8 @@ mod capacity_provider_refusal_messages;
 mod capacity_provider_update;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
+#[path = "all/cli_deployed_email_sender.rs"]
+mod cli_deployed_email_sender;
 #[path = "all/code_signing_config_deletion.rs"]
 mod code_signing_config_deletion;
 #[path = "all/code_signing_config_listing.rs"]
