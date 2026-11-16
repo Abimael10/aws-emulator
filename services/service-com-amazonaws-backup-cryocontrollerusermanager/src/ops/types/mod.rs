@@ -110,6 +110,7 @@ pub mod put_backup_vault_access_policy_types;
 pub mod put_backup_vault_lock_configuration_types;
 pub mod put_backup_vault_notifications_types;
 pub mod put_restore_validation_result_types;
+pub mod report_plan_wire;
 pub mod revoke_restore_access_backup_vault_types;
 pub mod shared_types;
 pub mod start_backup_job_types;
@@ -323,6 +324,8 @@ pub use put_backup_vault_lock_configuration_types::*;
 pub use put_backup_vault_notifications_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_restore_validation_result_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use report_plan_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use revoke_restore_access_backup_vault_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

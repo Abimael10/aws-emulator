@@ -370,19 +370,9 @@ pub struct ReportDestination {
     pub s3_keys: Option<Vec<String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.backup#ReportPlan")]
-#[derive(Debug, Clone, Default)]
-pub struct ReportPlan {
-    pub report_plan_arn: Option<String>,
-    pub report_plan_name: Option<String>,
-    pub report_plan_description: Option<String>,
-    pub report_setting: Option<ReportSetting>,
-    pub report_delivery_channel: Option<ReportDeliveryChannel>,
-    pub deployment_status: Option<String>,
-    pub creation_time: Option<::aws_smithy_types::DateTime>,
-    pub last_attempted_execution_time: Option<::aws_smithy_types::DateTime>,
-    pub last_successful_execution_time: Option<::aws_smithy_types::DateTime>,
-}
+// `ReportPlan` is declared in `types::report_plan_wire`, not here: the recorded wire
+// carries a member on it the on-disk model does not declare, so its schema and codec
+// are written out rather than derived (that module's note says why).
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#RestoreJobCreator")]
 #[derive(Debug, Clone, Default)]

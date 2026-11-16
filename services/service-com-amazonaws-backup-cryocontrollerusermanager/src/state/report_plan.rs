@@ -15,10 +15,14 @@
 //! * a name the account holds no plan under is the not-found condition
 //!   ([`report_plan_not_found`]), which every read of a plan answers;
 //! * the plan body a create carries is stored as submitted, except for the
-//!   members the model gives a rule for — the delivery formats, which "default
-//!   \[to\] CSV" where the request lists none, and `NumberOfFrameworks`, which is
-//!   "the number of frameworks a report covers" and so is counted from the
-//!   frameworks the setting names — and is reported back through the ONE read
+//!   members that carry a rule of their own — the delivery formats, which
+//!   "default \[to\] CSV" where the request lists none, `NumberOfFrameworks`,
+//!   which is "the number of frameworks a report covers" and so is counted from
+//!   the frameworks the setting names, the setting's four LIST members, which are
+//!   stored (and reported) as the empty list where the request names no entry,
+//!   and the plan's report timing, which no create states and so takes this
+//!   service's own schedule ([`stored_report_setting`],
+//!   [`stored_report_timing`]) — and is reported back through the ONE read
 //!   projection below ([`ReportPlanRecord::reported`]), so the plan a create
 //!   stored and the plan a read reports can never differ;
 //! * a report template or a delivery format outside the published values is
@@ -28,19 +32,19 @@
 //!   answers: a plan starts in the non-terminal status AWS reports for one and
 //!   reaches [`REPORT_PLAN_DEPLOYMENT_STATUS_COMPLETED`] when the clock makes
 //!   that due ([`ComAmazonawsBackupCryocontrollerusermanagerState::settle_report_plans`]);
-//! * Backup performs ONE action on a report plan at a time, so a mutation that
-//!   arrives while that plan's deployment is still in flight is refused
-//!   ([`report_plan_action_in_progress`]) and the stored plan is left as it was,
-//!   exactly as the sibling framework's mutations are refused
-//!   ([`super::framework_action_in_progress`]).
+//! * a report plan is REMOVED by the delete of its name, whatever stage that
+//!   plan's own deployment has reached — the model binds `DeleteReportPlan` as an
+//!   `@idempotent` `DELETE` answering 200 with an empty body, and the only
+//!   condition it refuses is a name the account holds no plan under — so every
+//!   later read of the name is [`report_plan_not_found`].
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    AlreadyExistsException, ConflictException, InvalidParameterValueException,
-    ReportDeliveryChannel, ReportPlan, ReportSetting, ResourceNotFoundException,
+    AlreadyExistsException, InvalidParameterValueException, ReportDeliveryChannel, ReportPlan,
+    ReportSetting, ReportTiming, ResourceNotFoundException,
 };
 
 /// The most report plans this emulator keeps.
@@ -92,6 +96,22 @@ pub const REPORT_FORMATS: [&str; 2] = ["CSV", "JSON"];
 /// the default format is CSV" (model doc for the member).
 pub const DEFAULT_REPORT_FORMAT: &str = "CSV";
 
+/// How often the report of a plan runs, where the plan says nothing else: a
+/// report is delivered once a day.
+///
+/// A report plan's create carries no member that states this or the start hour
+/// below (`smithy_query` operation `CreateReportPlan` lists `ReportPlanName`,
+/// `ReportPlanDescription`, `ReportDeliveryChannel`, `ReportSetting`,
+/// `ReportPlanTags` and `IdempotencyToken`), so these are the values a stored
+/// plan's timing takes and every read reports them from the plan
+/// ([`ReportPlanRecord::report_timing`]).
+pub const DEFAULT_REPORT_FREQUENCY_HOURS: i32 = 24;
+
+/// The hour of the day, in UTC, a plan's report run starts at where the plan
+/// says nothing else: the top of the day. Chosen for the reason given on
+/// [`DEFAULT_REPORT_FREQUENCY_HOURS`] — no create states it.
+pub const DEFAULT_REPORT_START_HOUR: i32 = 0;
+
 /// The ARN of a report plan:
 /// `arn:aws:backup:<region>:<account>:report-plan:<name>-<uniquifier>`.
 ///
@@ -116,7 +136,7 @@ pub fn report_plan_arn(region: &str, name: &str, uniquifier: &str) -> String {
 /// presents. No `Code`: this condition has no observed token.
 pub fn report_plan_not_found_message(name: &str) -> String {
     format!(
-        "Report Plan {name} not found in account {}.",
+        "Report plan {name} not found in account {}.",
         ::engine::emulator_account_id()
     )
 }
@@ -127,7 +147,7 @@ pub fn report_plan_not_found_message(name: &str) -> String {
 /// framework's state them. No observed `Code`.
 pub fn report_plan_already_exists_message(name: &str) -> String {
     format!(
-        "Report Plan {name} already exists in account {}.",
+        "Report plan with name {name} already exists in account {} .",
         ::engine::emulator_account_id()
     )
 }
@@ -137,31 +157,6 @@ pub fn report_plan_already_exists_message(name: &str) -> String {
 pub fn report_plan_not_found(name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(report_plan_not_found_message(name)),
-        ..Default::default()
-    }
-}
-
-/// The sentence AWS states for "a previous action on this report plan is still
-/// running, so the one just requested cannot be performed": the sentence this
-/// service states for the sibling Backup Audit Manager resource
-/// ([`super::framework_action_in_progress_message`]) around the report plan the
-/// call addressed and the account it was made in, which are its variable parts.
-/// No `Code`: this condition has no observed token.
-pub fn report_plan_action_in_progress_message(name: &str) -> String {
-    format!(
-        "Operation failed because of a concurrent update for the report plan {name} in account \
-         {}. Try again later.",
-        ::engine::emulator_account_id()
-    )
-}
-
-/// The modelled refusal for an action on a report plan whose previous action has
-/// not finished — see [`report_plan_action_in_progress_message`]. Backup
-/// serializes the deployment of one report plan, so the action that loses the
-/// race is refused rather than blended into the one already running.
-pub fn report_plan_action_in_progress(name: &str) -> ConflictException {
-    ConflictException {
-        message: Some(report_plan_action_in_progress_message(name)),
         ..Default::default()
     }
 }
@@ -227,18 +222,33 @@ pub fn stored_report_delivery_channel(channel: ReportDeliveryChannel) -> ReportD
 /// "the number of frameworks a report covers" (model doc for the member), so it
 /// is derived from the stored `FrameworkArns` rather than taken from the
 /// request, and the two can never disagree.
+///
+/// Each of the setting's four LIST members — the frameworks a report covers and
+/// the accounts, organizational units and Regions it is scoped to (`smithy_query`
+/// shape `ReportSetting`) — is a set of entries a plan carries, empty where the
+/// request named none, so a plan stores (and every read reports) an empty list
+/// rather than nothing at all: a client scoping a report can tell "none scoped"
+/// from "not reported".
 pub fn stored_report_setting(setting: ReportSetting) -> ReportSetting {
-    let number_of_frameworks = i32::try_from(
-        setting
-            .framework_arns
-            .as_deref()
-            .unwrap_or_default()
-            .len(),
-    )
-    .unwrap_or(i32::MAX);
+    let framework_arns = setting.framework_arns.unwrap_or_default();
+    let number_of_frameworks = i32::try_from(framework_arns.len()).unwrap_or(i32::MAX);
     ReportSetting {
         number_of_frameworks,
+        framework_arns: Some(framework_arns),
+        accounts: Some(setting.accounts.unwrap_or_default()),
+        organization_units: Some(setting.organization_units.unwrap_or_default()),
+        regions: Some(setting.regions.unwrap_or_default()),
         ..setting
+    }
+}
+
+/// When the report of a stored plan runs: the schedule this service gives a plan
+/// whose create states none, which is every plan (see
+/// [`DEFAULT_REPORT_FREQUENCY_HOURS`]).
+pub fn stored_report_timing() -> ReportTiming {
+    ReportTiming {
+        report_frequency_hours: DEFAULT_REPORT_FREQUENCY_HOURS,
+        report_start_hour: DEFAULT_REPORT_START_HOUR,
     }
 }
 
@@ -256,6 +266,9 @@ pub struct ReportPlanRecord {
     pub description: Option<String>,
     pub report_setting: ReportSetting,
     pub report_delivery_channel: ReportDeliveryChannel,
+    /// When this plan's report runs — the schedule the plan was stored with
+    /// ([`stored_report_timing`]).
+    pub report_timing: ReportTiming,
     pub creation_time: SystemTime,
     /// Where this plan's deployment has got to: one of the statuses on
     /// [`REPORT_PLAN_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS`].
@@ -282,6 +295,7 @@ impl ReportPlanRecord {
             report_plan_description: self.description.clone(),
             report_setting: Some(self.report_setting.clone()),
             report_delivery_channel: Some(self.report_delivery_channel.clone()),
+            report_timing: Some(self.report_timing.clone()),
             deployment_status: Some(self.deployment_status.clone()),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
             last_attempted_execution_time: self

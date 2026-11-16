@@ -285,6 +285,15 @@ async fn a_created_report_plan_round_trips_through_the_read() {
             .get("FrameworkArns")
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
+        // A scoping list the create named nothing for is reported as the empty
+        // list rather than left out — the rule `report_plan_wire_form.rs` pins
+        // over the whole class.
+        let submitted_list = |member: &str| -> Value {
+            submitted_setting
+                .get(member)
+                .cloned()
+                .unwrap_or_else(|| json!([]))
+        };
         assert_eq!(
             (
                 string_at(&setting, "ReportTemplate"),
@@ -295,10 +304,10 @@ async fn a_created_report_plan_round_trips_through_the_read() {
             ),
             (
                 string_at(&submitted_setting, "ReportTemplate"),
-                at(&submitted_setting, "FrameworkArns"),
-                at(&submitted_setting, "Accounts"),
-                at(&submitted_setting, "OrganizationUnits"),
-                at(&submitted_setting, "Regions"),
+                submitted_list("FrameworkArns"),
+                submitted_list("Accounts"),
+                submitted_list("OrganizationUnits"),
+                submitted_list("Regions"),
             ),
             "case {case:?}: the report setting is stored as submitted, got {setting:?}"
         );
@@ -420,7 +429,7 @@ async fn a_second_create_of_one_name_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             string_at(&refused, "Message"),
-            format!("Report Plan {name} already exists in account {ACCOUNT}."),
+            format!("Report plan with name {name} already exists in account {ACCOUNT} ."),
             "case {case:?}: the refusal names the plan and the account, got {refused:?}"
         );
 
@@ -583,7 +592,7 @@ async fn a_read_of_an_unknown_report_plan_name_is_refused() {
             (
                 400,
                 "ResourceNotFoundException",
-                format!("Report Plan {name} not found in account {ACCOUNT}.").as_str(),
+                format!("Report plan {name} not found in account {ACCOUNT}.").as_str(),
             ),
             "case {name:?}: a name holding no plan is not found, got {status} {refused:?}"
         );

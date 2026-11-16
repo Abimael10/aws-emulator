@@ -6,10 +6,10 @@
 //! so every later read of that name is refused as a name this account holds no
 //! report plan under, and the name is free for a later create to take.
 //!
-//! Backup performs one action on a report plan at a time, so a delete that
-//! arrives while that plan's deployment is still in flight is refused
-//! `ConflictException` and the plan is left intact; a name this account holds no
-//! report plan under is `ResourceNotFoundException`.
+//! The model binds this operation as an `@idempotent` `DELETE` answering 200
+//! with an empty body, and the plan is removed whatever stage its own deployment
+//! has reached: the ONE condition this operation refuses is a name this account
+//! holds no report plan under, which is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -180,30 +180,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // ONE lock for the whole read-modify-write: resolving the plan, deciding
-        // whether a previous action on it is still running and removing it are a
-        // single critical section, so two deletes of one name cannot both report
-        // success.
+        // ONE lock for the whole read-modify-write: resolving the plan and
+        // removing it are a single critical section, so two deletes of one name
+        // cannot both report success.
         let mut store = state.lock();
         // The deployments the clock has already made due, materialised first, so
-        // a delete is refused only while an action is REALLY still running.
+        // a plan this delete leaves alone is not left reporting a status the
+        // clock has moved past.
         store.settle_report_plans(now);
 
         // Resolved exactly as a read resolves it, so the delete and the read
-        // cannot disagree about which names this account holds.
-        let plan = store
+        // cannot disagree about which names this account holds. A plan whose
+        // create is still deploying is removed like any other: the model gives
+        // this operation no second condition to refuse.
+        store
             .report_plan(&input.report_plan_name)
             .map_err(DeleteReportPlanErrorModeled::ResourceNotFoundException)?;
-
-        // A plan whose create or update has not finished deploying: Backup
-        // performs one action on a report plan at a time, so this delete is
-        // refused and the plan is left exactly as it was.
-        if plan.deployment_in_flight() {
-            return Err(DeleteReportPlanErrorModeled::ConflictException(
-                crate::state::report_plan_action_in_progress(&input.report_plan_name),
-            )
-            .into());
-        }
 
         // The record is REMOVED, so the name becomes one this account holds no
         // report plan under: every later read of it is refused, the tags it

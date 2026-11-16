@@ -12,10 +12,11 @@
 //!   take — which stores a NEW plan rather than resurrecting the deleted one;
 //! * a delete is scoped to the plan it names: every other plan the account holds
 //!   reads back unchanged;
-//! * Backup performs one action on a report plan at a time, so a delete that
-//!   arrives while that plan's deployment is still in flight is refused 409
-//!   `ConflictException` and leaves the plan readable and in flight; once the
-//!   clock has made that deployment due the same delete succeeds.
+//! * a delete REMOVES the plan whatever stage that plan's own deployment has
+//!   reached, so a delete arriving while the deployment is still in flight
+//!   answers 200 and leaves the name holding no plan — the model binds the
+//!   delete as an `@idempotent` `DELETE` answering 200 with an empty body, and
+//!   the only condition it refuses is a name the account holds no plan under.
 //!
 //! Every case drives real HTTP through the router; the harness is the shared one
 //! in `vault_and_backup_job.rs`. The in-flight case states when the deployment
@@ -106,15 +107,6 @@ fn read_plan(body: &Value) -> Value {
 /// the sentence is about the plan, rather than keeping a second copy of it.
 fn names_the_plan_and_the_account(message: &str, name: &str) -> bool {
     message.contains(name) && message.contains(ACCOUNT)
-}
-
-/// How this service words "a previous action on this report plan has not
-/// finished".
-fn concurrent_update_message(name: &str) -> String {
-    format!(
-        "Operation failed because of a concurrent update for the report plan {name} in account \
-         {ACCOUNT}. Try again later."
-    )
 }
 
 /// A name of `length` characters the `ReportPlanName` pattern admits
@@ -401,13 +393,12 @@ async fn deleting_one_report_plan_leaves_every_other_plan_untouched() {
     }
 }
 
-/// A delete that arrives while the plan's deployment is still in flight is
-/// refused with the sentence naming the plan and the account, and leaves the
-/// plan readable; once the clock has made that deployment due the same delete
-/// succeeds.
+/// A delete that arrives while the plan's deployment is still in flight removes
+/// the plan all the same: it answers 200 and the name afterwards holds no plan,
+/// exactly as the delete of a plan whose deployment has finished does.
 #[tokio::test]
-async fn a_delete_during_the_deployment_is_refused_and_keeps_the_plan() {
-    // The rows differ in the body the in-flight plan carries, so the refusal is
+async fn a_delete_during_the_deployment_removes_the_plan() {
+    // The rows differ in the body the in-flight plan carries, so the rule is
     // not keyed to one shape of plan.
     let cases: Vec<(&str, Value)> = vec![
         (
@@ -442,42 +433,25 @@ async fn a_delete_during_the_deployment_is_refused_and_keeps_the_plan() {
         // runs.
         let far_ahead = SystemTime::now() + Duration::from_secs(3_600);
         given_the_deployment_falls_due_at(&engine, name, far_ahead);
-
-        let (status, errortype, refused) = delete_plan(&router, name).await;
-        assert_eq!(
-            (status, errortype.as_str(), error_code(&refused).as_str()),
-            (409, "ConflictException", "ConflictException"),
-            "case {case:?}: expected 409 ConflictException while the deployment runs, got \
-             {status} {errortype} {refused:?}"
-        );
-        assert_eq!(
-            string_at(&refused, "Message"),
-            concurrent_update_message(name),
-            "case {case:?}: the refusal must name the plan and the account, got {refused:?}"
-        );
-
-        // The refused delete left the plan exactly as it was, deployment and all.
-        let (status, _errortype, read) = describe_plan(&router, name).await;
-        let stored = read_plan(&read);
+        let (status, _errortype, in_flight) = describe_plan(&router, name).await;
         assert_eq!(
             (
                 status,
-                string_at(&stored, "ReportPlanArn").as_str(),
-                string_at(&stored, "DeploymentStatus").as_str()
+                string_at(&read_plan(&in_flight), "ReportPlanArn").as_str(),
+                string_at(&read_plan(&in_flight), "DeploymentStatus").as_str()
             ),
             (200, arn.as_str(), STATUS_CREATE_IN_PROGRESS),
-            "case {case:?}: a refused delete must keep the in-flight plan, got {status} {read:?}"
+            "case {case:?}: setup: the plan must still be deploying, got {status} {in_flight:?}"
         );
 
-        // Once the clock has made the deployment due the same delete succeeds.
-        let already_due = SystemTime::now() - Duration::from_secs(1);
-        given_the_deployment_falls_due_at(&engine, name, already_due);
-        let (status, _errortype, deleted) = delete_plan(&router, name).await;
+        let (status, errortype, deleted) = delete_plan(&router, name).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected the delete to succeed once the deployment fell due, got \
-             {status} {deleted:?}"
+            (status, errortype.as_str()),
+            (200, "<unset>"),
+            "case {case:?}: a delete during the deployment must be served, got {status} \
+             {errortype} {deleted:?}"
         );
+
         let (status, errortype, missing) = describe_plan(&router, name).await;
         assert_eq!(
             (status, errortype.as_str(), error_code(&missing).as_str()),

@@ -278,6 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             report_delivery_channel: crate::state::stored_report_delivery_channel(
                 input.report_delivery_channel,
             ),
+            // No create states when the plan's report runs, so it carries the
+            // schedule this service gives one.
+            report_timing: crate::state::stored_report_timing(),
             creation_time: now,
             // The plan is not deployed the instant the create answers, so it
             // starts in the non-terminal status AWS reports for one and settles
