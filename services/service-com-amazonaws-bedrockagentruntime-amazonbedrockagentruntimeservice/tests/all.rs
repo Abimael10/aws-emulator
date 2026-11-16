@@ -69,3 +69,5 @@ mod state_roundtrip;
 mod streaming_retrieval;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/tagging_arn_constraint_gate.rs"]
+mod tagging_arn_constraint_gate;
