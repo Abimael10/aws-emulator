@@ -455,7 +455,9 @@ async fn a_rolled_back_update_leaves_the_stack_reporting_the_deployed_revision()
         );
 
         submit(&router, case, row.stack, &row.rejected, row.driver, &[]).await;
-        wait_for_the_transition().await;
+        // Polled for: the update's conclusion, and the rollback a failed one owes, are each
+        // due at an instant this service records.
+        crate::stack_lifecycle::settled_stack(&router, case, row.stack).await;
 
         let (after, settled, description_after) = reported(&router, case, row.stack).await;
         assert_eq!(
@@ -595,7 +597,9 @@ async fn use_previous_value_after_a_rollback_resolves_to_the_deployed_value() {
     let router = router();
     deploy(&router, case, stack, &deployed).await;
     submit(&router, case, stack, &rejected, Driver::UpdateStack, &[]).await;
-    wait_for_the_transition().await;
+    // Polled for: the update's conclusion, and the rollback a failed one owes, are each due
+    // at an instant this service records.
+    crate::stack_lifecycle::settled_stack(&router, case, stack).await;
     let (_, settled, _) = reported(&router, case, stack).await;
     assert_eq!(
         settled,

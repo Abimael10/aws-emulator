@@ -358,11 +358,14 @@ async fn a_refused_update_is_rolled_back_however_far_it_got() {
         }
 
         submit_the_update(&router, &case).await;
-        wait_for_the_transition().await;
 
         // Where the stack ENDS UP: rolled back unless the caller asked for the failed state
-        // to be kept — not decided by how much the update had managed to change.
-        let settled = stack_status(&router, case.case, case.stack).await;
+        // to be kept — not decided by how much the update had managed to change. Polled for,
+        // because the update's conclusion and the rollback it owes are each due at an instant
+        // this service records.
+        let settled_body =
+            crate::stack_lifecycle::settled_stack(&router, case.case, case.stack).await;
+        let settled = xml_text(&settled_body, "StackStatus").unwrap_or_default();
         assert_eq!(
             settled, case.settles_to,
             "case {:?}: expected the stack to settle at {}, got {settled:?}",

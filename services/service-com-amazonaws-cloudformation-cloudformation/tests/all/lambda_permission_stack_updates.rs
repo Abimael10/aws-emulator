@@ -196,8 +196,9 @@ async fn deployed_revision(
         code, 200,
         "case {case:?}: expected UpdateStack to be accepted, got {code} {answered}"
     );
-    wait_for_the_transition().await;
-    let (_, described) = describe_stack(router, stack).await;
+    // Polled for: the update's conclusion, and the rollback a failed one owes, are each due
+    // at an instant this service records.
+    let described = crate::stack_lifecycle::settled_stack(router, case, stack).await;
     (
         xml_text(&described, "StackStatus").unwrap_or_default(),
         xml_text(&described, "StackStatusReason").unwrap_or_default(),

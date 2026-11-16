@@ -350,10 +350,11 @@ async fn every_resource_an_update_breaks_reports_its_own_failure_and_is_put_back
             status_code, 200,
             "case {case:?}: expected UpdateStack to be accepted, got {status_code} {body}"
         );
-        wait_for_the_transition().await;
-
-        // The stack ends where the request asked a failure to leave it.
-        let settled = stack_status(&router, case, row.stack).await;
+        // The stack ends where the request asked a failure to leave it — polled for, because
+        // the conclusion of the update and the rollback it owes are each due at an instant
+        // this service records.
+        let settled_body = crate::stack_lifecycle::settled_stack(&router, case, row.stack).await;
+        let settled = xml_text(&settled_body, "StackStatus").unwrap_or_default();
         let expected_status = if row.disables_rollback {
             "UPDATE_FAILED"
         } else {

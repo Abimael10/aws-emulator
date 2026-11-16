@@ -1549,51 +1549,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the resources an owning service refused, whose own refusals are on those
                 // resources' events, or CloudFormation's own diagnostic where it refused the
                 // deployment before asking anybody.
-                let failed_at = ::std::time::SystemTime::now();
-                // ...and the failed update is rolled back, unless its caller asked for the
-                // failed state to be kept (`DisableRollback`), which says what it wants left
-                // behind: that stack stays at UPDATE_FAILED with the plan still held, since
-                // `RollbackStack` is the call that clears it up and the plan is the only
-                // record of what the failed update changed in the owning services. Only that
-                // stack rests in the failed status, and only it carries a stack-level event
-                // for it ([`crate::state::StoredStack::fail_transition_superseded`]) — the
-                // one exception being a failure the PRE-DEPLOYMENT VALIDATION stage reached,
-                // which no resource's event could carry because nothing was asked of any
-                // owning service, so the stack's own event reports it either way
-                // ([`crate::state::StoredStack::fail_transition_on_validation`]).
-                if stack.disable_rollback {
-                    if refused_by_validation {
-                        stack.fail_transition_on_validation(
-                            failed_at,
-                            status::UPDATE_FAILED,
-                            failure,
-                            true,
-                        );
-                    } else {
-                        stack.fail_transition(failed_at, status::UPDATE_FAILED, failure);
-                    }
-                } else {
-                    if refused_by_validation {
-                        stack.fail_transition_on_validation(
-                            failed_at,
-                            status::UPDATE_FAILED,
-                            failure.clone(),
-                            false,
-                        );
-                    } else {
-                        stack.fail_transition_superseded(
-                            failed_at,
-                            status::UPDATE_FAILED,
-                            failure.clone(),
-                        );
-                    }
-                    stack.begin_owed_update_rollback(failed_at, failure);
-                }
-                // A failed update is not an update that did nothing: every resource it acted
-                // on reports what became of it — the ones it changed, the one whose change
-                // its provider refused, and the ones it put back again — which is what a
-                // client reads to see how far the update got and which resource stopped it.
-                stack.record_failed_resource_statuses(&materialised.transitions, failed_at);
+                //
+                // The update is STILL IN FLIGHT, though: an operation is in flight from the
+                // call that opened it until the clock makes its conclusion due, whichever way
+                // that conclusion went, so this failure is held and reported at that instant
+                // ([`crate::state::StoredStack::hold_failed_deployment`]) — which is what
+                // leaves `CancelUpdateStack` the span it acts in, and what reports the
+                // failure's own consequences: the stack rests in UPDATE_FAILED where its
+                // caller asked for the failed state to be kept (`DisableRollback`) and is
+                // rolled back to the previous stack configuration where it did not, with the
+                // resources the update had already changed put back in the services that own
+                // them.
+                stack.hold_failed_deployment(
+                    ::std::time::SystemTime::now(),
+                    status::UPDATE_FAILED,
+                    failure,
+                    refused_by_validation,
+                    &materialised.transitions,
+                );
             }
         }
 

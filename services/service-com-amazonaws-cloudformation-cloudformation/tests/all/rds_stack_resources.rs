@@ -1238,9 +1238,10 @@ async fn a_parameter_value_rds_refuses_fails_the_update_and_leaves_the_group_unc
         "case {:?}: UpdateStack must answer 200, got {status_code} {updated}",
         case.case
     );
-    wait_for_the_transition().await;
-
-    let (_, described) = describe_stack(&router, case.stack_name).await;
+    // Polled for: the update's conclusion, and the rollback a failed one owes, are each due
+    // at an instant this service records.
+    let described =
+        crate::stack_lifecycle::settled_stack(&router, case.case, case.stack_name).await;
     // The refusal came on the first resource the update asked anything of, so the rollback
     // has nothing to put back — and the stack still goes through the rollback: a failed
     // update is undone, which is the terminal status a client waiting on one reads.

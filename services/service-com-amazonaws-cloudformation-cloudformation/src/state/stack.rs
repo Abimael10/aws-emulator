@@ -157,6 +157,18 @@ pub struct StoredStack {
     /// it when the operation completes, and [`Self::begin_owed_update_rollback`] is what
     /// turns it into work now owed when the update fails.
     pub rollback_plan: Option<OwedRollback>,
+    /// The FAILURE the operation in flight has already reached, held until the clock makes
+    /// that operation's conclusion due ([`HeldFailure`]).
+    ///
+    /// An operation is in flight until its conclusion falls due, whichever way that
+    /// conclusion went, so a failure the call's OWN walk over the resources reached is not
+    /// reported before that instant: the stack reports the operation's `*_IN_PROGRESS`
+    /// status for the span the clock owes it, and the calls that act on an operation in
+    /// flight are answered throughout that span. `None` for every stack whose operation in
+    /// flight has not failed yet, and retired by the report
+    /// ([`Self::report_held_failure`]) and by the next operation to open
+    /// ([`Self::begin_transition`]).
+    pub held_failure: Option<HeldFailure>,
     /// The rollback work this stack owes the owning services RIGHT NOW: the plan above,
     /// promoted by the failure of the update that held it.
     ///
@@ -330,6 +342,7 @@ impl StoredStack {
             stabilisations: Vec::new(),
             teardown_refusals: BTreeSet::new(),
             rollback_plan: None,
+            held_failure: None,
             owed_rollback: None,
             previous_configuration: None,
             unreverted_rollback: None,
@@ -1579,6 +1592,20 @@ impl StoredStack {
         // operation as a whole is due: a deployment in flight is reported as far as it has
         // got.
         self.record_due_resource_events(now);
+        // A failure the operation's own deployment already reached is the conclusion the
+        // clock owes that operation, so it is reported when that conclusion falls due —
+        // exactly as the completion it would otherwise have been is
+        // ([`Self::hold_failed_deployment`]). Nothing else of the operation is owed: it is
+        // not going to proceed on a signal or on an owning service's answer.
+        if self.held_failure.is_some() {
+            match self.pending.as_ref().map(|pending| pending.due_at) {
+                Some(due_at) if due_at <= now => self.report_held_failure(due_at),
+                // A held failure with no operation in flight belongs to nothing.
+                None => self.held_failure = None,
+                _ => {}
+            }
+            return;
+        }
         if self.waiting_for_signals() {
             // The operation is still waiting for its signals: nothing is due.
             return;
@@ -1923,6 +1950,9 @@ impl StoredStack {
         // ([`Self::hold_rollback_plan`]); whatever the operation before it held belongs to
         // nothing.
         self.rollback_plan = None;
+        // ...and so does a failure held for an operation that is over: this one has not
+        // failed ([`Self::hold_failed_deployment`]).
+        self.held_failure = None;
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
             // A completion carries no reason, and nothing has failed yet:
@@ -2436,6 +2466,116 @@ enum Reported {
 // ---------------------------------------------------------------------------
 // Failures, rollbacks and the resources a read reports
 // ---------------------------------------------------------------------------
+
+/// The CONCLUSION a stack operation's own deployment reached before the clock made that
+/// operation's conclusion due: what failed it, and how that failure is reported.
+///
+/// The deployment a call performs asks the services that own the resources for what the
+/// template declares, so the call can come back knowing the operation cannot be carried
+/// through. That is not an operation that concluded sooner: CloudFormation reports the
+/// `*_IN_PROGRESS` status for as long as the operation is in flight, which is the span the
+/// clock owes it ([`crate::state::STATUS_TRANSITION_DELAY`]), and only then the status the
+/// operation ended in — so the failure is held here and reported at that instant
+/// ([`StoredStack::report_held_failure`]).
+#[derive(Debug, Clone)]
+pub struct HeldFailure {
+    /// The status the operation settles into — the modelled `*_FAILED` one of the
+    /// operation in flight.
+    pub failed_status: String,
+    /// `StackStatusReason`: what failed the operation, as the deployment reported it.
+    pub reason: String,
+    /// Whether a PRE-DEPLOYMENT VALIDATION is what reached it, which decides which report
+    /// carries it ([`StoredStack::fail_transition_on_validation`]).
+    pub on_validation: bool,
+    /// What the deployment did to each resource it acted on, which those resources' records
+    /// take when the failure is reported
+    /// ([`StoredStack::record_failed_resource_statuses`]).
+    pub transitions: Vec<provisioning::ResourceTransition>,
+}
+
+impl StoredStack {
+    /// HOLD the failure the operation in flight has reached, until the clock makes that
+    /// operation's conclusion due.
+    ///
+    /// An operation is in flight from the call that opened it until its conclusion falls
+    /// due, whichever way that conclusion went: "you can cancel only stacks that are in the
+    /// UPDATE_IN_PROGRESS state" is a span a client acts within, so a failure the call's own
+    /// walk over the resources reached must not end the operation at the call. The report
+    /// itself — the status, the event, the resources' own statuses and the rollback a failed
+    /// update owes — is what [`Self::report_held_failure`] writes at the due instant.
+    ///
+    /// Nothing of the operation is waited for any more: it will not proceed on a signal or
+    /// on an owning service's answer, so the barriers holding it are retired here exactly as
+    /// the report retires them. An operation the clock has ALREADY concluded has no span
+    /// left to hold the failure in, so that one is reported at once.
+    pub fn hold_failed_deployment(
+        &mut self,
+        now: SystemTime,
+        failed_status: &str,
+        reason: String,
+        on_validation: bool,
+        transitions: &[provisioning::ResourceTransition],
+    ) {
+        self.wait_conditions.clear();
+        self.stabilisations.clear();
+        self.held_failure = Some(HeldFailure {
+            failed_status: failed_status.to_string(),
+            reason,
+            on_validation,
+            transitions: transitions.to_vec(),
+        });
+        if self.pending.is_none() {
+            self.report_held_failure(now);
+        }
+    }
+
+    /// Report the failure the operation in flight reached, at `at` — the instant the clock
+    /// made that operation's conclusion due.
+    ///
+    /// Exactly the report the deployment that reached the failure would have written, with
+    /// the same consequences: the stack takes the failed status, each resource the
+    /// deployment acted on reports what became of it, and the ROLLBACK a failed UPDATE owes
+    /// becomes work this stack owes the services that own its resources
+    /// ([`Self::begin_owed_update_rollback`], carried out by [`settle_due_rollbacks`]) —
+    /// which is the rollback of the one operation that has a previous configuration to put
+    /// back. A conclusion of any other operation owes its own removal instead, performed by
+    /// the call that reached it, so nothing holds a failure of one ([`Self::begin_rollback`]).
+    pub(super) fn report_held_failure(&mut self, at: SystemTime) {
+        let Some(held) = self.held_failure.take() else {
+            return;
+        };
+        // Which operation this is the conclusion of, read BEFORE the failure installs the
+        // status it ends in.
+        let updating = self.status == status::UPDATE_IN_PROGRESS;
+        // A caller that asked for the failed state to be kept (`DisableRollback`) gets a
+        // stack that RESTS in the failed status, so its own event reports it; one whose
+        // rollback begins at this instant never rests in it and the rollback's own event is
+        // what carries the failure ([`Self::fail_transition_superseded`]).
+        let rests = self.disable_rollback || !updating;
+        if held.on_validation {
+            self.fail_transition_on_validation(
+                at,
+                &held.failed_status,
+                held.reason.clone(),
+                rests,
+            );
+        } else if rests {
+            self.fail_transition(at, &held.failed_status, held.reason.clone());
+        } else {
+            self.fail_transition_superseded(at, &held.failed_status, held.reason.clone());
+        }
+        // "If the stack update fails, CloudFormation rolls back the stack to the previous
+        // stack configuration": the one path a failed update's rollback is opened through,
+        // and the one a caller that asked for the failed state to be kept gets none of.
+        if updating {
+            self.begin_owed_update_rollback(at, held.reason);
+        }
+        // A failed operation is not an operation that did nothing: the resource whose change
+        // its provider refused, and every resource the operation had already changed before
+        // it, report what became of them.
+        self.record_failed_resource_statuses(&held.transitions, at);
+    }
+}
 
 impl StoredStack {
     /// Materialise what the wait conditions of the operation in flight owe at `now`.
@@ -3375,6 +3515,11 @@ impl StoredStack {
         // not going to proceed on a signal.
         self.wait_conditions.clear();
         self.stabilisations.clear();
+        // ...and a failure HELD for this operation is not reported on top of the one being
+        // recorded here: this is the operation's conclusion, so whatever it had reached
+        // before belongs to nothing ([`Self::hold_failed_deployment`]). The report of a held
+        // failure comes through here too, having taken it first, so nothing is lost.
+        self.held_failure = None;
         self.status = failed_status.to_string();
         self.status_reason = Some(reason.clone());
         let operation_id = pending.as_ref().and_then(|p| p.operation_id.clone());

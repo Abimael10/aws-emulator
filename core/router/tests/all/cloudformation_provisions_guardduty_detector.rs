@@ -40,6 +40,17 @@ use super::query_wire::{elements, form_encode, opt_element};
 /// due, so the stack reports the template it deployed.
 const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 
+/// How long a case waits for a stack operation to reach a status no operation is still in
+/// flight in, and how often it looks.
+///
+/// A stack operation's conclusion — and the rollback a failed one owes — is due at an instant
+/// this service records, so a case that waits for the END of such a walk waits for the
+/// CONDITION rather than for a span of its own choosing. The deadline is generous, so a loaded
+/// host cannot decide the outcome, and nothing here asserts on the time it took.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+/// See [`SETTLE_DEADLINE`].
+const SETTLE_POLL: Duration = Duration::from_millis(100);
+
 /// The length and alphabet of a GuardDuty detector id: 32 lowercase hexadecimal
 /// characters (`DETECTOR_ID_LEN` in that service's own state module).
 const DETECTOR_ID_LEN: usize = 32;
@@ -99,6 +110,38 @@ async fn cloudformation(
     let status = response.status().as_u16();
     let payload = String::from_utf8_lossy(response.body()).to_string();
     (status, payload)
+}
+
+/// Poll `DescribeStacks` until the stack reports a status no operation is still in flight in,
+/// and answer the body that reported it.
+///
+/// The conclusion of a stack operation, and the rollback a failed one owes, are each due at an
+/// instant this service records — so a case that waits for the end of that walk looks again
+/// until the status it reports is a terminal one, under [`SETTLE_DEADLINE`].
+async fn settled_stack(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    stack: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let (_, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack)]).await;
+        let reported = opt_element(&described, "StackStatus").unwrap_or_default();
+        if !reported.is_empty() && !reported.ends_with("_IN_PROGRESS") {
+            return described;
+        }
+        if seen.last().map(String::as_str) != Some(reported.as_str()) {
+            seen.push(reported);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected {stack} to settle, saw {seen:?}"
+        );
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
 }
 
 /// Call one GuardDuty operation over its restJson1 wire, signed for `region`.
@@ -592,9 +635,9 @@ async fn re_deploying_a_detector_stack_keeps_the_detector_it_already_created() {
         "case \"the first deployment\": expected HTTP 200 from CreateStack, got {status} with \
          body {body}"
     );
-    tokio::time::sleep(PAST_STACK_SPAN).await;
-    let (_, created) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+    // The deployment's own clock-owed span is waited for as the CONDITION: the stack reports
+    // the template it deployed once the create has reached a terminal status.
+    let created = settled_stack("the first deployment", &router, region, stack_name).await;
     let detector_id = outputs_of(&created)
         .get("DetectorId")
         .cloned()
@@ -670,9 +713,8 @@ async fn re_deploying_a_detector_stack_keeps_the_detector_it_already_created() {
             status, 200,
             "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {answer}"
         );
-        tokio::time::sleep(PAST_STACK_SPAN).await;
-        let (_, described) =
-            cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+        // ...and its conclusion is waited for as the CONDITION, never as a span.
+        let described = settled_stack(case, &router, region, stack_name).await;
         assert_eq!(
             opt_element(&described, "StackStatus").as_deref(),
             Some("UPDATE_COMPLETE"),
@@ -740,9 +782,9 @@ async fn re_deploying_a_detector_stack_keeps_the_detector_it_already_created() {
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {answer}"
     );
-    tokio::time::sleep(PAST_STACK_SPAN).await;
-    let (_, described) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+    // The update's conclusion, and the rollback its failure owes, are each due at an instant
+    // this service records: waited for as the CONDITION rather than as a span.
+    let described = settled_stack(case, &router, region, stack_name).await;
     assert_eq!(
         opt_element(&described, "StackStatus").as_deref(),
         Some("UPDATE_ROLLBACK_COMPLETE"),

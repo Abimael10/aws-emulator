@@ -290,9 +290,9 @@ async fn a_failed_update_reports_the_summary_sentence_alone() {
         code, 200,
         "case {case:?}: UpdateStack must be accepted, got {code} {updated}"
     );
-    wait_for_the_transition().await;
-
-    let (_, described) = describe_stack(&router, stack).await;
+    // Polled for: the update's conclusion, and the rollback a failed one owes, are each due
+    // at an instant this service records.
+    let described = crate::stack_lifecycle::settled_stack(&router, case, stack).await;
     // The refused change failed the update, and a failed update is rolled back: the stack's
     // terminal status is the rolled-back one, still carrying the failure's own reason.
     assert_eq!(

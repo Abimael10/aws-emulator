@@ -427,8 +427,12 @@ async fn a_change_this_emulator_cannot_apply_fails_the_update_naming_the_resourc
     )
     .await;
     assert_eq!(code, 200, "expected UpdateStack to succeed, got {code} {body}");
-    wait_for_the_transition().await;
-    let reported = status_of(&router, "inplace-subscribed").await;
+    // Polled for: the update's conclusion and the rollback it owes are each due at an
+    // instant this service records.
+    let settled =
+        crate::stack_lifecycle::settled_stack(&router, "inplace-subscribed", "inplace-subscribed")
+            .await;
+    let reported = xml_text(&settled, "StackStatus").unwrap_or_default();
     // The update failed and is therefore UNDONE: rollback is at its default, so the stack
     // reaches the rolled-back terminal status rather than parking at UPDATE_FAILED.
     assert_eq!(

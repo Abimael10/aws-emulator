@@ -85,6 +85,10 @@ mod built_in_types_in_submitted_hierarchies;
 mod callback_signature;
 #[path = "all/cancelled_update.rs"]
 mod cancelled_update;
+// An update whose own deployment was refused is in flight for the span the clock owes its
+// conclusion, so `CancelUpdateStack` is answered throughout it.
+#[path = "all/cancelling_a_refused_update.rs"]
+mod cancelling_a_refused_update;
 #[path = "all/cdk_asset_function_writes_its_granted_table.rs"]
 mod cdk_asset_function_writes_its_granted_table;
 #[path = "all/cdk_deployed_table_estate.rs"]
@@ -233,6 +237,9 @@ mod elbv2_resource_provisioning;
 mod elbv2_rule_priority_collision;
 #[path = "all/elbv2_stack_update_lifecycle.rs"]
 mod elbv2_stack_update_lifecycle;
+// The envelope an operation whose modelled output is `Unit` answers with.
+#[path = "all/empty_result_envelopes.rs"]
+mod empty_result_envelopes;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/estimate_template_cost.rs"]

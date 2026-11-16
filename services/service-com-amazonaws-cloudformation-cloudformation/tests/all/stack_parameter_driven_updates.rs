@@ -430,7 +430,11 @@ async fn a_refused_parameter_value_rolls_the_stack_back_to_the_last_accepted_one
     );
     wait_for_the_transition().await;
 
-    let settled = stack_status(&router, case, stack).await;
+    // Polled for: the update's conclusion, and the rollback a failed one owes, are each due
+    // at an instant this service records.
+    let settled_body = crate::stack_lifecycle::settled_stack(&router, case, stack).await;
+    let settled = crate::stack_lifecycle::xml_text(&settled_body, "StackStatus")
+        .unwrap_or_default();
     assert_eq!(
         settled,
         status::UPDATE_ROLLBACK_COMPLETE,

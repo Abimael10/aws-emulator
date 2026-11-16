@@ -987,36 +987,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // whose own refusals are on those resources' events, or
                             // CloudFormation's own diagnostic where it refused the
                             // deployment before asking anybody.
-                            let failed = if creating {
-                                status::CREATE_FAILED
-                            } else {
-                                status::UPDATE_FAILED
-                            };
-                            let failed_at = ::std::time::SystemTime::now();
-                            // The stack rests in the failed status only where nothing
-                            // follows it: a rollback (or the removal `DELETE` asks for)
-                            // begins at this very instant and its own event is what reports
-                            // the failure
-                            // ([`crate::state::StoredStack::fail_transition_superseded`]).
-                            if stack.disable_rollback {
-                                stack.fail_transition(failed_at, failed, failure.clone());
-                            } else {
-                                stack.fail_transition_superseded(
-                                    failed_at,
-                                    failed,
-                                    failure.clone(),
-                                );
-                            }
-                            // A failed operation is not an operation that did nothing: every
-                            // resource it acted on reports what became of it — the ones it
-                            // changed, the one whose change its provider refused, and the
-                            // ones it put back again — exactly as a failed `UpdateStack`
-                            // records them.
-                            stack.record_failed_resource_statuses(
-                                &materialised.transitions,
-                                failed_at,
-                            );
                             if creating {
+                                let failed_at = ::std::time::SystemTime::now();
+                                // The stack rests in the failed status only where nothing
+                                // follows it: a rollback (or the removal `DELETE` asks for)
+                                // begins at this very instant and its own event is what
+                                // reports the failure
+                                // ([`crate::state::StoredStack::fail_transition_superseded`]).
+                                if stack.disable_rollback {
+                                    stack.fail_transition(
+                                        failed_at,
+                                        status::CREATE_FAILED,
+                                        failure.clone(),
+                                    );
+                                } else {
+                                    stack.fail_transition_superseded(
+                                        failed_at,
+                                        status::CREATE_FAILED,
+                                        failure.clone(),
+                                    );
+                                }
+                                // A failed operation is not an operation that did nothing:
+                                // every resource it acted on reports what became of it — the
+                                // ones it changed, the one whose change its provider refused,
+                                // and the ones it put back again — exactly as a failed
+                                // `UpdateStack` records them.
+                                stack.record_failed_resource_statuses(
+                                    &materialised.transitions,
+                                    failed_at,
+                                );
                                 if stack.disable_rollback {
                                     None
                                 } else {
@@ -1053,15 +1052,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     ))
                                 }
                             } else {
-                                // A failed UPDATE is rolled back to the previous stack
-                                // configuration, exactly as one `UpdateStack` started is and
-                                // however far this execution got: the plan says what those
-                                // services have to be asked to put back, and the rollback
-                                // this opens is carried out below
-                                // ([`crate::state::settle_due_rollbacks`]) before the
-                                // terminal status falls due.
+                                // The UPDATE this execution drives is still IN FLIGHT: an
+                                // operation is in flight from the call that opened it until
+                                // the clock makes its conclusion due, whichever way that
+                                // conclusion went, so the failure is held and reported at
+                                // that instant — with the rollback it owes opened there,
+                                // against the plan held here
+                                // ([`crate::state::StoredStack::hold_failed_deployment`]).
+                                // That span is the one `CancelUpdateStack` acts in, and an
+                                // update executed from a change set is no less cancellable
+                                // than one `UpdateStack` started.
                                 stack.hold_rollback_plan(Some(owed));
-                                stack.begin_owed_update_rollback(failed_at, failure);
+                                stack.hold_failed_deployment(
+                                    ::std::time::SystemTime::now(),
+                                    status::UPDATE_FAILED,
+                                    failure,
+                                    false,
+                                    &materialised.transitions,
+                                );
                                 None
                             }
                         }
