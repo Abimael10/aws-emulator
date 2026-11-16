@@ -23,5 +23,13 @@
 //! kept both reductions, so the block said each paragraph twice over. It was reduced to one
 //! copy of each paragraph again, which is the rule `all_rs_carries_one_header_block.rs` reads.
 //!
+//! A FOURTH run had grown by the time the suite that reads the rule ran again: eight more
+//! re-typed copies of those paragraphs inside the header, two hundred more lines of them past
+//! the last declaration — where `all/appended_notes_tail.rs` and `all/appended_prose.rs` record
+//! the earlier ones — and one declaration pair appended after that prose instead of into the
+//! sorted list. The header was reduced to one copy of each paragraph again, the appended prose
+//! is gone rather than kept, and the pair stands where its name sorts to, for the same reason as
+//! the runs before it.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

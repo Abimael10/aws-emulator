@@ -365,6 +365,8 @@ mod handler_rest_api_answer_fidelity;
 mod handler_rest_api_sdk;
 #[path = "all/handler_step_functions_sdk.rs"]
 mod handler_step_functions_sdk;
+#[path = "all/handler_stream_and_item_store_sdk.rs"]
+mod handler_stream_and_item_store_sdk;
 #[path = "all/handler_user_pool_sdk.rs"]
 mod handler_user_pool_sdk;
 #[path = "all/handler_s3_bucket_policy_principal.rs"]
