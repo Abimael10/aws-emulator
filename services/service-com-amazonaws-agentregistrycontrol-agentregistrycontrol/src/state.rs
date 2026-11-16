@@ -18,6 +18,13 @@ use crate::ops::types::{
     Descriptors, DiscoveryConfiguration, EncryptionConfiguration, Provenance,
 };
 
+mod descriptor_payload;
+
+/// The refusal message for a descriptor payload that is not the JSON a descriptor's content
+/// is serialized as, or `None` when every payload of the set parses. The ONE check a record
+/// write runs its descriptors through, so a create and an edit admit the same payloads.
+pub use descriptor_payload::refusal as descriptor_payload_refusal;
+
 /// The region used for an ARN when the request carries no usable SigV4 credential
 /// scope (an unsigned request). Every emulator defaults to `us-east-1`.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -423,14 +430,50 @@ pub struct RegistryRecord {
     pub pending: Option<DueTransition<RecordTransition>>,
 }
 
-/// What one `@idempotencyToken` replay remembers: the ARN the first call answered, a
+/// What one `@idempotencyToken` replay remembers: the ANSWER the first call returned, a
 /// fingerprint of the parameters it was presented with ([`idempotency_fingerprint`]), and
 /// the order it was remembered in, so the oldest entry is the one evicted at the cap.
 #[derive(Debug, Clone)]
 pub struct IdempotentAnswer {
-    arn: String,
+    answer: RememberedCreate,
     fingerprint: String,
     seq: u64,
+}
+
+/// The answer a create returned, remembered so a replay of its `@idempotencyToken` can
+/// return it again.
+///
+/// A replay "ignores the request", so it decides nothing and computes nothing from the
+/// resource as it stands now: the members it answers are the ones the first call answered,
+/// which is what makes two calls carrying one token indistinguishable to their caller. A
+/// create of this service answers the new resource's ARN and, where the operation models
+/// the member, the status that call reported — the transient status an asynchronous create
+/// reports, which the resource itself has since left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RememberedCreate {
+    /// The ARN the first call minted.
+    pub arn: String,
+    /// The resource status the first call reported, for a create whose output models one.
+    pub status: Option<String>,
+}
+
+impl RememberedCreate {
+    /// The answer of a create whose output carries the new resource's ARN alone.
+    pub fn from_arn(arn: &str) -> Self {
+        Self {
+            arn: arn.to_string(),
+            status: None,
+        }
+    }
+
+    /// The answer of a create whose output carries the new resource's ARN and the status it
+    /// reported it in.
+    pub fn from_arn_and_status(arn: &str, status: &str) -> Self {
+        Self {
+            arn: arn.to_string(),
+            status: Some(status.to_string()),
+        }
+    }
 }
 
 /// What a presented `@idempotencyToken` means for the call presenting it.
@@ -445,8 +488,8 @@ pub enum TokenReplay {
     /// No remembered call used this token: the request is a first call and creates.
     Unused,
     /// A remembered call used it with the SAME parameters: the request is ignored and
-    /// answered with the ARN that call minted.
-    Replayed(String),
+    /// answered with what that call answered.
+    Replayed(RememberedCreate),
     /// A remembered call used it with DIFFERENT parameters: the token is already bound to
     /// another request, which is a conflict rather than a create
     /// ([`IDEMPOTENCY_PARAMETER_MISMATCH`]).
@@ -559,7 +602,7 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
         match self.idempotency.get(&idempotency_key(operation, token)) {
             None => TokenReplay::Unused,
             Some(answer) if answer.fingerprint == fingerprint => {
-                TokenReplay::Replayed(answer.arn.clone())
+                TokenReplay::Replayed(answer.answer.clone())
             }
             Some(_) => TokenReplay::ParametersDiffer,
         }
@@ -573,7 +616,7 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
         operation: &str,
         token: &str,
         fingerprint: &str,
-        arn: &str,
+        answer: RememberedCreate,
     ) {
         self.idempotency_seq = self.idempotency_seq.wrapping_add(1);
         let key = idempotency_key(operation, token);
@@ -591,7 +634,7 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
         self.idempotency.insert(
             key,
             IdempotentAnswer {
-                arn: arn.to_string(),
+                answer,
                 fingerprint: fingerprint.to_string(),
                 seq: self.idempotency_seq,
             },
@@ -604,9 +647,10 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
     /// `/` that starts a nested resource, so one id that is a text prefix of another
     /// (`RegistryId` is 12..16 characters) cannot take the other's tokens with it.
     pub fn forget_idempotency_under(&mut self, arn: &str) {
-        self.idempotency.retain(|_, answer| {
-            answer.arn != arn
-                && !answer
+        self.idempotency.retain(|_, remembered| {
+            remembered.answer.arn != arn
+                && !remembered
+                    .answer
                     .arn
                     .strip_prefix(arn)
                     .is_some_and(|nested| nested.starts_with('/'))

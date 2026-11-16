@@ -201,13 +201,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         if let Some(token) = token.as_deref() {
             match state.token_replay(Self::NAME, token, &fingerprint) {
-                crate::state::TokenReplay::Replayed(arn) => {
+                crate::state::TokenReplay::Replayed(answer) => {
                     if state
                         .registries
                         .values()
-                        .any(|registry| registry.registry_arn == arn)
+                        .any(|registry| registry.registry_arn == answer.arn)
                     {
-                        return Ok(CreateRegistryOutput { registry_arn: arn });
+                        return Ok(CreateRegistryOutput {
+                            registry_arn: answer.arn,
+                        });
                     }
                 }
                 crate::state::TokenReplay::ParametersDiffer => {
@@ -292,7 +294,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .insert(input.name, registry_id.clone());
         state.registries.insert(registry_id, registry);
         if let Some(token) = token {
-            state.remember_idempotent_answer(Self::NAME, &token, &fingerprint, &registry_arn);
+            state.remember_idempotent_answer(
+                Self::NAME,
+                &token,
+                &fingerprint,
+                crate::state::RememberedCreate::from_arn(&registry_arn),
+            );
         }
 
         Ok(CreateRegistryOutput { registry_arn })

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/date_time_timestamp_wire_form.rs"]
 mod date_time_timestamp_wire_form;
+#[path = "all/descriptor_payload_json.rs"]
+mod descriptor_payload_json;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/idempotency_token_binding.rs"]
@@ -21,6 +23,8 @@ mod idempotency_token_binding;
 mod idempotency_tokens;
 #[path = "all/record_approval.rs"]
 mod record_approval;
+#[path = "all/record_create_replay_answer.rs"]
+mod record_create_replay_answer;
 #[path = "all/record_patch_semantics.rs"]
 mod record_patch_semantics;
 #[path = "all/record_status_curation.rs"]

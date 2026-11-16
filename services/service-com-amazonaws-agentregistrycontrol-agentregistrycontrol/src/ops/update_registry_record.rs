@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
@@ -334,6 +334,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The descriptors this edit would leave on the record: the stored set with the
+        // patch applied. A descriptor's content is "serialized as descriptor payload data"
+        // and validated against the protocol schema of the descriptor's type, so a patch
+        // that would leave a payload which is not even JSON is refused — the same check a
+        // create runs, applied to the result of the patch, so the invariant holds whichever
+        // operation wrote the payload. Nothing of the record has been written yet.
+        let patched_descriptors = {
+            let mut descriptors = record.descriptors.clone();
+            patch_structure(
+                &mut descriptors,
+                input.descriptors.take().map(|wrapper| wrapper.optional_value),
+                patch_descriptors,
+            );
+            descriptors
+        };
+        if let Some(message) = crate::state::descriptor_payload_refusal(patched_descriptors.as_ref())
+        {
+            return Err(UpdateRegistryRecordErrorModeled::ValidationException(
+                ValidationException {
+                    message,
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         // Where the record lands once the asynchronous update has been processed: an edit
         // to a record under review takes it back out of the approval workflow, so it
         // settles at DRAFT and can be submitted again; any other record settles back at
@@ -402,11 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut record.custom_metadata,
             input.custom_metadata.map(|wrapper| wrapper.optional_value),
         );
-        patch_structure(
-            &mut record.descriptors,
-            input.descriptors.map(|wrapper| wrapper.optional_value),
-            patch_descriptors,
-        );
+        record.descriptors = patched_descriptors;
         // `triggerSynchronization` asks the service to re-read the record's descriptor
         // content from the source the descriptors name. Nothing in this emulator reaches
         // that source, so the flag changes no descriptor content and nothing here reports

@@ -187,6 +187,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialise_due_transitions();
 
+        // A descriptor's content is "serialized as descriptor payload data" and validated
+        // against the protocol schema of the descriptor's type, so a payload that is not
+        // even JSON is refused here — before the request is remembered for its token and
+        // before any state precondition, since what does not hold is the request itself.
+        if let Some(message) = crate::state::descriptor_payload_refusal(Some(&input.descriptors)) {
+            return Err(CreateRegistryRecordErrorModeled::ValidationException(
+                ValidationException {
+                    message,
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
         let token = input.client_token.clone().filter(|t| !t.is_empty());
         // The parameters the token names: the request with its token cleared, so a replay
@@ -212,24 +227,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             // `clientToken` is an @idempotencyToken: a replay of the SAME request answers
-            // with what the first call created and creates no second record, while the
+            // with what the first call answered and creates no second record, while the
             // same token presented with OTHER parameters is a conflict — the token is
             // already bound to a different request. This is checked BEFORE any state
             // refusal, so a replay stays idempotent even once the parent registry has
             // left READY. The record a replay named is looked up, so once that record has
             // been deleted the token names nothing and this call falls through to a fresh
-            // create.
+            // create. What is answered is the REMEMBERED answer, not the record as it
+            // stands now: the request is ignored, so the status this call reports is the
+            // one the first call reported (the transient creation status) even after the
+            // record itself has settled.
             if let Some(token) = token.as_deref() {
                 match state.token_replay(Self::NAME, token, &fingerprint) {
-                    crate::state::TokenReplay::Replayed(arn) => {
-                        if let Some(record) = registry
+                    crate::state::TokenReplay::Replayed(answer) => {
+                        // The token is remembered under this operation's name, so the
+                        // answer it carries is one of THIS create's: both members it
+                        // answers were written when it answered them. The record is looked
+                        // up only to establish that it is still there — a token whose
+                        // record has been deleted names nothing — and the status this
+                        // operation always remembers beside the ARN is what it answers.
+                        let still_there = registry
                             .records
                             .values()
-                            .find(|record| record.record_arn == arn)
-                        {
+                            .any(|record| record.record_arn == answer.arn);
+                        if still_there {
+                            // The status is remembered beside the ARN by this operation's
+                            // own answer, so an answer without one is this service's bug
+                            // rather than anything the request did: it is reported as a
+                            // server error, the same way as a lookup that cannot fail.
+                            let Some(status) = answer.status else {
+                                return Err(
+                                    CreateRegistryRecordErrorModeled::InternalServerException(
+                                        InternalServerException {
+                                            message: Some(format!(
+                                                "the remembered answer for this {} token \
+                                                 carries no record status",
+                                                Self::NAME
+                                            )),
+                                        },
+                                    )
+                                    .into(),
+                                );
+                            };
                             return Ok(CreateRegistryRecordOutput {
-                                record_arn: record.record_arn.clone(),
-                                status: record.status.clone(),
+                                record_arn: answer.arn,
+                                status,
                             });
                         }
                     }
@@ -353,7 +395,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         registry.records.insert(record_id, record);
         if let Some(token) = token {
-            state.remember_idempotent_answer(Self::NAME, &token, &fingerprint, &record_arn);
+            state.remember_idempotent_answer(
+                Self::NAME,
+                &token,
+                &fingerprint,
+                crate::state::RememberedCreate::from_arn_and_status(&record_arn, &status),
+            );
         }
 
         Ok(CreateRegistryRecordOutput { record_arn, status })
