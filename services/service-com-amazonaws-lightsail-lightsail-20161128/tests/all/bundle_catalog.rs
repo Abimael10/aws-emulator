@@ -64,13 +64,15 @@ const WINDOWS: &str = "WINDOWS";
 ///
 /// SOURCE: the Lightsail instance-plan table (the "Instances" plans of the
 /// Lightsail pricing page, which `GetBundles` answers from) — each step doubles
-/// RAM while the SSD size and monthly transfer follow the plan table, the vCPU
-/// count is two up to the 8 GB plan and doubles with the plan above it, and the
-/// Windows plan of a size costs more because it carries an operating-system
-/// licence. The rows span what the rule generalises over: the smallest plan, a
-/// mid-sized one, the two largest published on both platforms (whose size token
-/// carries a multiplier), the largest published on Linux/Unix alone, and Windows
-/// plans of two different sizes.
+/// RAM while the SSD size and monthly transfer are the plan table's own columns
+/// (both stop growing at the figure the 64 GB and 192 GB plans carry, which every
+/// larger plan then repeats), the vCPU count is two up to the 8 GB plan and
+/// doubles with the plan above it, and the Windows column of a size carries its
+/// own price, SSD size and power. The rows span what the rule generalises over:
+/// the smallest plan, a mid-sized one, the two largest published on both
+/// platforms (whose size token carries a multiplier), the largest published on
+/// Linux/Unix alone, the Windows plan whose SSD size and power differ from its
+/// Linux/Unix twin's, and Windows plans of two further sizes.
 struct Expected {
     bundle_id: &'static str,
     instance_type: &'static str,
@@ -140,10 +142,26 @@ const EXPECTED: &[Expected] = &[
         platform: LINUX_UNIX,
         cpu_count: 64,
         ram_size_in_gb: 256.0,
-        disk_size_in_gb: 5_120,
-        transfer_per_month_in_gb: 11_264,
+        // The largest plan carries the SSD size and the monthly transfer the
+        // plan table's columns stop at, not figures scaled with its hardware.
+        disk_size_in_gb: 1_280,
+        transfer_per_month_in_gb: 10_240,
         power: 8_000,
         price: 1_764.0,
+    },
+    Expected {
+        bundle_id: "nano_win_3_0",
+        instance_type: "nano",
+        name: "Nano",
+        platform: WINDOWS,
+        cpu_count: 2,
+        ram_size_in_gb: 0.5,
+        // The Windows column of the smallest size publishes its own SSD size and
+        // power, where the Linux/Unix row of it carries 20 GB and 298.
+        disk_size_in_gb: 30,
+        transfer_per_month_in_gb: 1_024,
+        power: 300,
+        price: 9.5,
     },
     Expected {
         bundle_id: "micro_win_3_0",
@@ -382,11 +400,13 @@ async fn every_reported_bundle_reports_its_own_plan() {
     }
 
     // Every reported id resolves in the catalog, and reports that entry's
-    // hardware: the answer is the catalog's, not the request's.
+    // hardware in the column of its own platform: the answer is the catalog's,
+    // not the request's.
     for bundle in &bundles {
         let case = member(bundle, "bundleId");
         let spec = state::bundle_spec(&case)
             .unwrap_or_else(|| panic!("case {case:?}: a reported id must resolve in the catalog"));
+        let platform = want_platform(&case);
         assert_eq!(
             bundle["cpuCount"].as_i64(),
             Some(i64::from(spec.cpu_count)),
@@ -394,8 +414,9 @@ async fn every_reported_bundle_reports_its_own_plan() {
         );
         assert_eq!(
             bundle["diskSizeInGb"].as_i64(),
-            Some(i64::from(spec.disk_size_in_gb)),
-            "case {case:?}: the reported SSD size must be the catalog's, got {bundle:?}"
+            Some(i64::from(spec.disk_size_in_gb_on(platform))),
+            "case {case:?}: the reported SSD size must be the catalog's for {platform}, \
+             got {bundle:?}"
         );
     }
 
@@ -481,9 +502,11 @@ async fn the_published_sample_plans_report_their_published_figures() {
     }
 }
 
-/// The Windows plan of a size provides the same hardware as its Linux/Unix plan
-/// and costs more: the licence is what the extra buys. A size the plan table
-/// publishes no Windows price for has no Windows plan at all.
+/// The Windows plan of a size shares the size's vCPU count, RAM, monthly
+/// transfer, instance type and label with its Linux/Unix plan, carries the SSD
+/// size and power the plan table's Windows column publishes for it, and costs
+/// more: the licence is what the extra buys. A size the plan table publishes no
+/// Windows column for has no Windows plan at all.
 #[tokio::test]
 async fn the_windows_plan_of_a_size_costs_more_than_its_linux_plan() {
     let emulator = Emulator::new();
@@ -513,12 +536,25 @@ async fn the_windows_plan_of_a_size_costs_more_than_its_linux_plan() {
              got {windows:?}"
         );
 
+        for (member, want) in [
+            (
+                "diskSizeInGb",
+                i64::from(spec.disk_size_in_gb_on(WINDOWS)),
+            ),
+            ("power", i64::from(spec.power_on(WINDOWS))),
+        ] {
+            assert_eq!(
+                windows[member].as_i64(),
+                Some(want),
+                "case {case}: the Windows plan reports the Windows column's {member} {want}, \
+                 got {windows:?}"
+            );
+        }
+
         for hardware in [
             "cpuCount",
-            "diskSizeInGb",
             "ramSizeInGb",
             "transferPerMonthInGb",
-            "power",
             "instanceType",
             "name",
         ] {
@@ -762,7 +798,11 @@ fn synthetic(size: &'static str, is_active: bool) -> state::BundleSpec {
         transfer_gb_per_month: 2_048,
         power: 500,
         price_usd_per_month: 5.0,
-        windows_price_usd_per_month: Some(12.0),
+        windows: Some(state::WindowsPlan {
+            price_usd_per_month: 12.0,
+            disk_size_in_gb: 40,
+            power: 500,
+        }),
         is_active,
         app_categories: &[],
     }

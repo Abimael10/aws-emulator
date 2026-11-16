@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let from_bundle_id = instance.bundle_id.clone();
             // The snapshotted volume is the instance bundle's own SSD — the
             // system disk `GetInstance` reports first in its hardware.
-            let size_in_gb = instance.bundle.disk_size_in_gb;
+            let size_in_gb = instance.root_disk_size_in_gb();
 
             let id = store.mint_uuid();
             // A snapshot is not restorable yet: the clock owes it `available`,

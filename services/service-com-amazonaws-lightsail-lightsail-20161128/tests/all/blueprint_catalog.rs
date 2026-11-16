@@ -68,6 +68,15 @@ const BLUEPRINT_TYPES: &[&str] = &["os", "app"];
 /// (`smithy_query(query="shape",shape="InstancePlatform")`).
 const PLATFORMS: &[&str] = &["LINUX_UNIX", "WINDOWS"];
 
+/// Where a published blueprint's `productUrl` leads: the AWS Marketplace product
+/// view the image's listing is served at. Written out here rather than read off
+/// the crate, so the host and path form are pinned by this suite.
+const MARKETPLACE_PRODUCT_VIEW_PREFIX: &str = "https://aws.amazon.com/marketplace/pp/prodview-";
+
+/// Where a published blueprint's `licenseUrl` leads: the end-user licence
+/// agreement AWS serves for the image.
+const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfront.net/eula/product/";
+
 /// One expected catalog entry.
 ///
 /// Source: the blueprint ids this service publishes (`state::BLUEPRINTS`, whose
@@ -112,6 +121,17 @@ const EXPECTED: &[Expected] = &[
         blueprint_type: "app",
         name: "SQL Server 2022 Express",
         group: "windows_2022_sql_exp_2022",
+        platform: "WINDOWS",
+        is_active: true,
+        min_power: 2_000,
+        publishes_product_url: true,
+        publishes_license_url: true,
+    },
+    Expected {
+        blueprint_id: "windows_server_2022_sql_2019_express",
+        blueprint_type: "app",
+        name: "SQL Server 2019 Express",
+        group: "windows_2022_sql_exp_2019",
         platform: "WINDOWS",
         is_active: true,
         min_power: 2_000,
@@ -469,35 +489,62 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             "case {case:?}: expected at least the floor of {platform}, got {min_power}"
         );
 
-        // The description is derived from the entry's own name and type, so it
-        // names the blueprint and says which kind of image it is.
+        // The description is the catalog's own text for the entry, carried per
+        // row: it is not a sentence built from the entry's name and type, which
+        // would tell a caller nothing the other members do not already say.
         let description = member(blueprint, "description");
         assert!(
-            description.contains(&name),
-            "case {case:?}: expected the description to name the blueprint, got {description:?}"
+            description.len() > 80,
+            "case {case:?}: expected the catalog's published text for the image, got \
+             {description:?}"
         );
-        let expected_kind = if blueprint_type == "app" {
-            "application stack"
-        } else {
-            "operating system image"
+        for derived in [
+            format!("{name} operating system image for a Lightsail instance."),
+            format!("{name} application stack, preinstalled on a Lightsail instance."),
+        ] {
+            assert_ne!(
+                description, derived,
+                "case {case:?}: the description must be the catalog's text, not one derived \
+                 from the entry's name and type"
+            );
+        }
+        // And the text is about THIS image: the first word of the catalog's own
+        // name for the image appears in it. Both sides are compared as their
+        // alphanumeric characters alone, since the catalog's prose may spell a
+        // product's name with punctuation the entry's name does not carry
+        // (`Node.js` for the `nodejs` entry).
+        let squashed = |text: &str| -> String {
+            text.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .flat_map(char::to_lowercase)
+                .collect()
         };
+        let product = name.split_whitespace().next().unwrap_or_default();
         assert!(
-            description.contains(expected_kind),
-            "case {case:?}: expected a {expected_kind} description, got {description:?}"
+            squashed(&description).contains(&squashed(product)),
+            "case {case:?}: expected the catalog's text for this image to be about \
+             {product:?}, got {description:?}"
         );
 
-        // The image's published revision is reported, and a vendor link the
-        // catalog publishes is an absolute `https` URL. `appCategory` belongs to
-        // the Research catalog alone, so this listing reports none.
+        // The image's published revision is reported, and a link the catalog
+        // publishes leads to the page THIS service serves for the image: its AWS
+        // Marketplace listing and the end-user licence agreement AWS publishes
+        // for it, never the upstream vendor's own product or licensing page.
+        // `appCategory` belongs to the Research catalog alone, so this listing
+        // reports none.
         assert!(
             !member(blueprint, "versionCode").is_empty(),
             "case {case:?}: expected the published versionCode, got {blueprint:?}"
         );
-        for link in ["productUrl", "licenseUrl"] {
+        for (link, prefix) in [
+            ("productUrl", MARKETPLACE_PRODUCT_VIEW_PREFIX),
+            ("licenseUrl", LICENSE_AGREEMENT_PREFIX),
+        ] {
             if let Some(url) = blueprint[link].as_str() {
                 assert!(
-                    url.starts_with("https://"),
-                    "case {case:?}: {link} must be an absolute https URL, got {url:?}"
+                    url.starts_with(prefix) && url.len() > prefix.len(),
+                    "case {case:?}: {link} must be the service's own {prefix}… URL for the \
+                     image, got {url:?}"
                 );
             }
         }
@@ -859,8 +906,9 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         group: "synthetic-os",
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: true,
-        product_url: "",
-        license_url: "",
+        description: "A synthetic operating-system image, for the slice and paging rules.",
+        product_view: "",
+        license_agreement: "",
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_os_2",
@@ -869,8 +917,9 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         group: "synthetic-os",
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: false,
-        product_url: "",
-        license_url: "",
+        description: "A synthetic retired operating-system image.",
+        product_view: "",
+        license_agreement: "",
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_app",
@@ -879,8 +928,10 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         group: "synthetic-app",
         blueprint_type: state::BLUEPRINT_TYPE_APP,
         is_active: true,
-        product_url: "https://example.invalid/synthetic",
-        license_url: "https://example.invalid/synthetic/licence",
+        description: "A synthetic application image that publishes its own name, power floor, \
+                      listing and licence agreement.",
+        product_view: "prodview-synthetic1",
+        license_agreement: "synthetic-product/synthetic-agreement.txt",
     },
     state::BlueprintSpec {
         blueprint_id: "windows_synthetic_2030",
@@ -889,8 +940,9 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         group: "windows_2030",
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: true,
-        product_url: "",
-        license_url: "",
+        description: "A synthetic Windows operating-system image.",
+        product_view: "",
+        license_agreement: "",
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_retired_3",
@@ -899,8 +951,9 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         group: "synthetic-retired",
         blueprint_type: state::BLUEPRINT_TYPE_APP,
         is_active: false,
-        product_url: "",
-        license_url: "",
+        description: "A synthetic retired application image.",
+        product_view: "",
+        license_agreement: "",
     },
 ];
 

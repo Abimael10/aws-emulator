@@ -129,6 +129,13 @@ const WINDOWS_IMAGES: &[WindowsImage] = &[
         // needs the 4 GB plan, whose power this is.
         min_power: 2_000,
     },
+    WindowsImage {
+        blueprint_id: "windows_server_2022_sql_2019_express",
+        name: "SQL Server 2019 Express",
+        group: "windows_2022_sql_exp_2019",
+        blueprint_type: "app",
+        min_power: 2_000,
+    },
 ];
 
 /// The minimum bundle power a Windows operating-system image requires: it does
@@ -260,12 +267,20 @@ struct Plan {
     size: &'static str,
     name: &'static str,
     cpu_count: i64,
+    /// The power of the Linux/Unix plan of the size.
     power: i64,
     linux_price: f64,
-    /// The Windows price of the size, and `None` where the plan table publishes
-    /// no Windows plan of it — the sizes above the 64 GB plan, which Lightsail
-    /// offers on Linux/Unix only.
-    windows_price: Option<f64>,
+    /// The Windows COLUMN of the size: its monthly price and its own published
+    /// power. `None` where the plan table publishes no Windows plan of the size
+    /// — the sizes above the 64 GB plan, which Lightsail offers on Linux/Unix
+    /// only.
+    windows: Option<WindowsColumn>,
+}
+
+/// The plan table's Windows column for one size.
+struct WindowsColumn {
+    price: f64,
+    power: i64,
 }
 
 const PLANS: &[Plan] = &[
@@ -275,7 +290,12 @@ const PLANS: &[Plan] = &[
         cpu_count: 2,
         power: 298,
         linux_price: 5.0,
-        windows_price: Some(9.5),
+        // The Windows column publishes the smallest plan with a power of its
+        // own, where its Linux/Unix twin carries 298.
+        windows: Some(WindowsColumn {
+            price: 9.5,
+            power: 300,
+        }),
     },
     Plan {
         size: "micro",
@@ -283,7 +303,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 2,
         power: 500,
         linux_price: 7.0,
-        windows_price: Some(16.0),
+        windows: Some(WindowsColumn {
+            price: 16.0,
+            power: 500,
+        }),
     },
     Plan {
         size: "small",
@@ -291,7 +314,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 2,
         power: 1_000,
         linux_price: 12.0,
-        windows_price: Some(26.0),
+        windows: Some(WindowsColumn {
+            price: 26.0,
+            power: 1_000,
+        }),
     },
     Plan {
         size: "medium",
@@ -299,7 +325,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 2,
         power: 2_000,
         linux_price: 24.0,
-        windows_price: Some(46.0),
+        windows: Some(WindowsColumn {
+            price: 46.0,
+            power: 2_000,
+        }),
     },
     Plan {
         size: "large",
@@ -307,7 +336,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 2,
         power: 3_000,
         linux_price: 44.0,
-        windows_price: Some(86.0),
+        windows: Some(WindowsColumn {
+            price: 86.0,
+            power: 3_000,
+        }),
     },
     Plan {
         size: "xlarge",
@@ -315,7 +347,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 4,
         power: 4_000,
         linux_price: 84.0,
-        windows_price: Some(166.0),
+        windows: Some(WindowsColumn {
+            price: 166.0,
+            power: 4_000,
+        }),
     },
     Plan {
         size: "2xlarge",
@@ -323,7 +358,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 8,
         power: 5_000,
         linux_price: 164.0,
-        windows_price: Some(326.0),
+        windows: Some(WindowsColumn {
+            price: 326.0,
+            power: 5_000,
+        }),
     },
     Plan {
         size: "4xlarge",
@@ -331,7 +369,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 16,
         power: 6_000,
         linux_price: 384.0,
-        windows_price: Some(646.0),
+        windows: Some(WindowsColumn {
+            price: 646.0,
+            power: 6_000,
+        }),
     },
     Plan {
         size: "8xlarge",
@@ -339,7 +380,7 @@ const PLANS: &[Plan] = &[
         cpu_count: 32,
         power: 7_000,
         linux_price: 884.0,
-        windows_price: None,
+        windows: None,
     },
     Plan {
         size: "12xlarge",
@@ -347,7 +388,7 @@ const PLANS: &[Plan] = &[
         cpu_count: 48,
         power: 7_500,
         linux_price: 1_324.0,
-        windows_price: None,
+        windows: None,
     },
     Plan {
         size: "16xlarge",
@@ -355,7 +396,7 @@ const PLANS: &[Plan] = &[
         cpu_count: 64,
         power: 8_000,
         linux_price: 1_764.0,
-        windows_price: None,
+        windows: None,
     },
 ];
 
@@ -404,7 +445,7 @@ async fn the_instance_plan_catalog_reports_the_linux_plans_before_the_windows_on
     let published_sizes: Vec<String> = PLANS.iter().map(|plan| plan.size.to_string()).collect();
     let windows_sizes: Vec<String> = PLANS
         .iter()
-        .filter(|plan| plan.windows_price.is_some())
+        .filter(|plan| plan.windows.is_some())
         .map(|plan| plan.size.to_string())
         .collect();
     assert_eq!(
@@ -419,22 +460,29 @@ async fn the_instance_plan_catalog_reports_the_linux_plans_before_the_windows_on
     );
 
     for plan in PLANS {
-        let mut cases = vec![(
-            LINUX_UNIX,
-            format!("{}_3_0", plan.size),
-            Some(plan.linux_price),
-        )];
-        cases.push((
-            WINDOWS,
-            format!("{}_win_3_0", plan.size),
-            plan.windows_price,
-        ));
-        for (platform, bundle_id, price) in cases {
+        // Each case is a platform's column of the row: its bundle id, and the
+        // price and power that column publishes — `None` where the table
+        // publishes no plan of the size there.
+        let cases = [
+            (
+                LINUX_UNIX,
+                format!("{}_3_0", plan.size),
+                Some((plan.linux_price, plan.power)),
+            ),
+            (
+                WINDOWS,
+                format!("{}_win_3_0", plan.size),
+                plan.windows
+                    .as_ref()
+                    .map(|windows| (windows.price, windows.power)),
+            ),
+        ];
+        for (platform, bundle_id, published) in cases {
             let case = format!("{bundle_id} on {platform}");
             let reported = bundles
                 .iter()
                 .find(|bundle| text(bundle, "bundleId") == bundle_id);
-            let Some(price) = price else {
+            let Some((price, power)) = published else {
                 // A size the plan table does not publish on this platform has no
                 // bundle at all: a plan priced like its Linux/Unix twin would
                 // announce one the service does not sell.
@@ -461,9 +509,9 @@ async fn the_instance_plan_catalog_reports_the_linux_plans_before_the_windows_on
             );
             assert_eq!(
                 reported["power"].as_i64(),
-                Some(plan.power),
-                "case {case}: expected power {}, got {reported:?}",
-                plan.power
+                Some(power),
+                "case {case}: expected the power this platform's column publishes, {power}, \
+                 got {reported:?}"
             );
             assert!(
                 is_price(reported["price"].as_f64(), price),

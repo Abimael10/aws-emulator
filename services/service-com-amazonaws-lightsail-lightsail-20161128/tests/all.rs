@@ -321,6 +321,8 @@ mod paging;
 mod published_catalog_contents;
 #[path = "all/published_catalog_reference_data.rs"]
 mod published_catalog_reference_data;
+#[path = "all/published_catalog_text_and_links.rs"]
+mod published_catalog_text_and_links;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/relational_database_blueprints.rs"]

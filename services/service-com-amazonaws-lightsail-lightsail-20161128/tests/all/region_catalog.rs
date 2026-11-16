@@ -410,7 +410,7 @@ async fn the_regions_with_a_known_description_report_it() {
             "ap-southeast-2",
             "Austalia, New Zealand, and the South Pacific",
         ),
-        ("ca-central-1", "Canada and the northeastern United States"),
+        ("ca-central-1", "eastern and central Canada"),
         ("eu-central-1", "Europe, the Middle East, and Africa"),
         ("eu-west-1", "Ireland, the United Kingdom, and Iceland"),
         ("eu-west-2", "Ireland, the United Kingdom, and Iceland"),

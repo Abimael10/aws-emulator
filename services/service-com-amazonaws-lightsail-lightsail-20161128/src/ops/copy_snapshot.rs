@@ -545,7 +545,7 @@ fn automatic_snapshot(
             content: Content::InstanceSnapshot {
                 // The system volume is the instance plan's own SSD, the disk
                 // `GetInstance` reports as the instance's system disk.
-                size_in_gb: instance.bundle.disk_size_in_gb,
+                size_in_gb: instance.root_disk_size_in_gb(),
                 from_instance_name: instance.name.clone(),
                 from_instance_arn: instance.arn.clone(),
                 from_blueprint_id: instance.blueprint_id.clone(),

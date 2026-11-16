@@ -321,13 +321,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so the plan it is restored onto cannot carry a smaller SSD than
             // the volume that was snapshotted; a larger plan is accepted and the
             // extra space is the new instance's.
-            if bundle.disk_size_in_gb < snapshotted.size_in_gb {
+            // The plan's SSD is the one its own platform's column of the plan
+            // table publishes, which is what the restored instance would get.
+            let bundle_disk_size_in_gb = bundle
+                .disk_size_in_gb_on(crate::state::bundle_platform(&input.bundle_id));
+            if bundle_disk_size_in_gb < snapshotted.size_in_gb {
                 return Err(invalid(format!(
                     "bundleId '{}' provides a {} GB SSD, smaller than the {} GB system volume \
                      {} captured: an instance restored from a snapshot must be created on a \
                      bundle at least as large as the snapshotted volume",
                     input.bundle_id,
-                    bundle.disk_size_in_gb,
+                    bundle_disk_size_in_gb,
                     snapshotted.size_in_gb,
                     snapshotted.described
                 )));
@@ -778,7 +782,7 @@ fn snapshotted_instance(
                 blueprint_id: instance.blueprint_id.clone(),
                 // The system volume is the instance plan's own SSD, the disk
                 // `GetInstance` reports as the instance's system disk.
-                size_in_gb: instance.bundle.disk_size_in_gb,
+                size_in_gb: instance.root_disk_size_in_gb(),
                 attached_disks: copy.from_attached_disks.clone().unwrap_or_default(),
                 described: format!(
                     "the automatic snapshot of the {} {instance_name} dated {}",

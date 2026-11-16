@@ -254,7 +254,7 @@ pub const REGION_SPECS: &[RegionSpec] = &[
     RegionSpec {
         name: "ca-central-1",
         display_name: "Montreal",
-        serves: "Canada and the northeastern United States",
+        serves: "eastern and central Canada",
         is_opt_in: false,
         availability_zone_letters: "ab",
     },

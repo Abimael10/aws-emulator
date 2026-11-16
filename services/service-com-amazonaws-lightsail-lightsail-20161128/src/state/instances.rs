@@ -396,6 +396,19 @@ impl StoredInstance {
         });
     }
 
+    /// The size of this instance's system disk, in GB: the SSD the plan table
+    /// publishes for the plan the instance runs on, in the column of the plan's
+    /// own platform ([`BundleSpec::disk_size_in_gb_on`]) — the Windows plan of a
+    /// size is published with its own SSD figure.
+    ///
+    /// The one owner of that resolution: every report of this instance's root
+    /// disk size — the system disk, a snapshot taken of it, the size a restore
+    /// is checked against — asks here.
+    pub fn root_disk_size_in_gb(&self) -> i32 {
+        self.bundle
+            .disk_size_in_gb_on(bundle_platform(&self.bundle_id))
+    }
+
     /// The instance's system disk: the bundle's SSD, mounted at the root and
     /// attached for as long as the instance exists.
     ///
@@ -408,7 +421,7 @@ impl StoredInstance {
         crate::ops::types::Disk {
             created_at: Some(timestamp(self.created_at_ms)),
             location: Some(self.location.view()),
-            size_in_gb: Some(self.bundle.disk_size_in_gb),
+            size_in_gb: Some(self.root_disk_size_in_gb()),
             is_system_disk: Some(true),
             path: Some(SYSTEM_DISK_PATH.to_string()),
             // `DiskState` enum: a disk an instance is using is `in-use`.

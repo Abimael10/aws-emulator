@@ -83,9 +83,11 @@ fn is_price(reported: Option<f64>, expected: f64) -> bool {
 ///
 /// SOURCE: the "Instances" plans of the Lightsail pricing page, which
 /// `GetBundles` answers from: the hardware, the included monthly transfer and the
-/// plan power of each size, the Linux/Unix monthly price, and the Windows price of
-/// the same size where the table publishes a Windows plan of it — which it does up
-/// to the 64 GB plan, above which the sizes are offered on Linux/Unix only.
+/// plan power of each size, the Linux/Unix monthly price, and the Windows column
+/// of the same size where the table publishes one — which it does up to the 64 GB
+/// plan, above which the sizes are offered on Linux/Unix only. Every figure is
+/// the table's published one: the SSD column stops growing at 1,280 GB and the
+/// monthly transfer at 10,240 GB, which every larger plan then carries.
 ///
 /// The rows are every published size, so they span a size published on both
 /// platforms and the larger sizes published on one, and the figures are pinned on
@@ -98,7 +100,17 @@ struct PlanRow {
     transfer_per_month_in_gb: i64,
     power: i64,
     linux_price: f64,
-    windows_price: Option<f64>,
+    /// The plan table's Windows column for the size: its price, and the SSD size
+    /// and power that column publishes, which are not always the Linux/Unix
+    /// row's. `None` where the table publishes no Windows plan of the size.
+    windows: Option<WindowsColumn>,
+}
+
+/// The plan table's Windows column for one size.
+struct WindowsColumn {
+    price: f64,
+    disk_size_in_gb: i64,
+    power: i64,
 }
 
 const PLAN_TABLE: &[PlanRow] = &[
@@ -110,7 +122,13 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 1_024,
         power: 298,
         linux_price: 5.0,
-        windows_price: Some(9.5),
+        // The Windows column publishes the smallest plan with a 30 GB SSD and a
+        // power of its own, where the Linux/Unix row carries 20 GB and 298.
+        windows: Some(WindowsColumn {
+            price: 9.5,
+            disk_size_in_gb: 30,
+            power: 300,
+        }),
     },
     PlanRow {
         size: "micro",
@@ -120,7 +138,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 2_048,
         power: 500,
         linux_price: 7.0,
-        windows_price: Some(16.0),
+        windows: Some(WindowsColumn {
+            price: 16.0,
+            disk_size_in_gb: 40,
+            power: 500,
+        }),
     },
     PlanRow {
         size: "small",
@@ -130,7 +152,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 3_072,
         power: 1_000,
         linux_price: 12.0,
-        windows_price: Some(26.0),
+        windows: Some(WindowsColumn {
+            price: 26.0,
+            disk_size_in_gb: 60,
+            power: 1_000,
+        }),
     },
     PlanRow {
         size: "medium",
@@ -140,7 +166,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 4_096,
         power: 2_000,
         linux_price: 24.0,
-        windows_price: Some(46.0),
+        windows: Some(WindowsColumn {
+            price: 46.0,
+            disk_size_in_gb: 80,
+            power: 2_000,
+        }),
     },
     PlanRow {
         size: "large",
@@ -150,7 +180,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 5_120,
         power: 3_000,
         linux_price: 44.0,
-        windows_price: Some(86.0),
+        windows: Some(WindowsColumn {
+            price: 86.0,
+            disk_size_in_gb: 160,
+            power: 3_000,
+        }),
     },
     PlanRow {
         size: "xlarge",
@@ -160,7 +194,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 6_144,
         power: 4_000,
         linux_price: 84.0,
-        windows_price: Some(166.0),
+        windows: Some(WindowsColumn {
+            price: 166.0,
+            disk_size_in_gb: 320,
+            power: 4_000,
+        }),
     },
     PlanRow {
         size: "2xlarge",
@@ -170,7 +208,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 7_168,
         power: 5_000,
         linux_price: 164.0,
-        windows_price: Some(326.0),
+        windows: Some(WindowsColumn {
+            price: 326.0,
+            disk_size_in_gb: 640,
+            power: 5_000,
+        }),
     },
     PlanRow {
         size: "4xlarge",
@@ -180,37 +222,45 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 8_192,
         power: 6_000,
         linux_price: 384.0,
-        windows_price: Some(646.0),
+        windows: Some(WindowsColumn {
+            price: 646.0,
+            disk_size_in_gb: 1_280,
+            power: 6_000,
+        }),
     },
     PlanRow {
         size: "8xlarge",
         cpu_count: 32,
         ram_size_in_gb: 128.0,
-        disk_size_in_gb: 2_560,
+        // The SSD column stops at the 64 GB plan's 1,280 GB: this plan and the
+        // two above it carry that same published figure.
+        disk_size_in_gb: 1_280,
         transfer_per_month_in_gb: 9_216,
         power: 7_000,
         linux_price: 884.0,
-        windows_price: None,
+        windows: None,
     },
     PlanRow {
         size: "12xlarge",
         cpu_count: 48,
         ram_size_in_gb: 192.0,
-        disk_size_in_gb: 3_840,
+        disk_size_in_gb: 1_280,
         transfer_per_month_in_gb: 10_240,
         power: 7_500,
         linux_price: 1_324.0,
-        windows_price: None,
+        windows: None,
     },
     PlanRow {
         size: "16xlarge",
         cpu_count: 64,
         ram_size_in_gb: 256.0,
-        disk_size_in_gb: 5_120,
-        transfer_per_month_in_gb: 11_264,
+        disk_size_in_gb: 1_280,
+        // The transfer column stops at the 192 GB plan's 10,240 GB allowance,
+        // which this plan carries too.
+        transfer_per_month_in_gb: 10_240,
         power: 8_000,
         linux_price: 1_764.0,
-        windows_price: None,
+        windows: None,
     },
 ];
 
@@ -275,27 +325,43 @@ async fn the_plan_catalog_reports_every_size_of_the_plan_table_with_its_own_figu
         );
 
         // The Windows plan of the size exists exactly where the table publishes a
-        // Windows price for it, carries the SAME hardware, and costs the table's
-        // Windows figure.
+        // Windows column for it, shares the size's vCPU count, RAM and monthly
+        // transfer, and carries that column's own price, SSD size and power.
         let windows_id = format!("{}_win_{GENERATION}", row.size);
         let windows_case = format!("{windows_id} on {WINDOWS}");
         let windows = plan_of(&bundles, &windows_id);
-        match row.windows_price {
+        match &row.windows {
             None => assert!(
                 windows.is_none(),
                 "case {windows_case}: the plan table publishes no Windows plan of this size, so \
                  the catalog must report none, got {windows:?}"
             ),
-            Some(price) => {
+            Some(column) => {
                 let windows = windows.unwrap_or_else(|| {
                     panic!("case {windows_case}: expected the published Windows plan")
                 });
                 assert!(
-                    is_price(windows["price"].as_f64(), price),
-                    "case {windows_case}: expected the plan table's Windows price {price}, got {:?}",
+                    is_price(windows["price"].as_f64(), column.price),
+                    "case {windows_case}: expected the plan table's Windows price {}, got {:?}",
+                    column.price,
                     windows["price"]
                 );
-                for member in ["cpuCount", "ramSizeInGb", "diskSizeInGb", "power"] {
+                for (member, want, got) in [
+                    (
+                        "diskSizeInGb",
+                        column.disk_size_in_gb,
+                        windows["diskSizeInGb"].as_i64(),
+                    ),
+                    ("power", column.power, windows["power"].as_i64()),
+                ] {
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "case {windows_case}: expected the Windows column's {member} {want}, \
+                         got {got:?}"
+                    );
+                }
+                for member in ["cpuCount", "ramSizeInGb", "transferPerMonthInGb"] {
                     assert_eq!(
                         windows[member], reported[member],
                         "case {windows_case}: the two platforms of a size share their {member}, \
@@ -312,7 +378,7 @@ async fn the_plan_catalog_reports_every_size_of_the_plan_table_with_its_own_figu
         .iter()
         .flat_map(|row| {
             let mut ids = vec![format!("{}_{GENERATION}", row.size)];
-            if row.windows_price.is_some() {
+            if row.windows.is_some() {
                 ids.push(format!("{}_win_{GENERATION}", row.size));
             }
             ids

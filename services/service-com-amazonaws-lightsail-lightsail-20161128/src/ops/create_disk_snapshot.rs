@@ -275,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // The system volume is the instance bundle's own SSD —
                         // the disk `GetInstance` reports as the instance's
                         // system disk.
-                        instance.bundle.disk_size_in_gb,
+                        instance.root_disk_size_in_gb(),
                         instance.location.clone(),
                         crate::state::DiskSnapshotSource::Instance {
                             name: instance.name.clone(),
