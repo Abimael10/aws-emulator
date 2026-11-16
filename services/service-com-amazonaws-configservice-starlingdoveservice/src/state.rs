@@ -2744,6 +2744,11 @@ pub use recording::*;
 pub mod observed_iam;
 pub use observed_iam::*;
 
+// What a pass OBSERVES in Amazon EC2 — this Region's instances — lives in
+// `state/observed_ec2.rs`, re-exported here for the same reason.
+pub mod observed_ec2;
+pub use observed_ec2::*;
+
 // The managed rules whose subject is the ACCOUNT rather than a recorded resource live in
 // `state/account_rule.rs`, re-exported here for the same reason.
 pub mod account_rule;

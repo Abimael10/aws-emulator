@@ -222,6 +222,8 @@ mod conformance_pack_rule_evaluation;
 mod recorder_discovers_iam_roles;
 #[path = "all/recorder_discovers_iam_managed_policies.rs"]
 mod recorder_discovers_iam_managed_policies;
+#[path = "all/recorder_discovers_ec2_instances.rs"]
+mod recorder_discovers_ec2_instances;
 #[path = "all/conformance_pack_deletion.rs"]
 mod conformance_pack_deletion;
 #[path = "all/delete_conformance_pack_resources.rs"]

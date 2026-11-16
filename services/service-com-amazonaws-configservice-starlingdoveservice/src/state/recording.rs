@@ -31,7 +31,7 @@ use super::{
     compliance_change_detail, managed_rule_identifier, publish_service_event_via,
     run_remediation_actions, service_state, stream_recorded_item_changes,
     ComAmazonawsConfigserviceStarlingdoveserviceState, DiscoveredResourceEntry,
-    EvaluationResultEntry, RecordedItemChange, COMPLIANCE_CHANGE_DETAIL_TYPE,
+    EvaluationResultEntry, RecordedItemChange, RuleParameters, COMPLIANCE_CHANGE_DETAIL_TYPE,
     COMPLIANCE_TYPE_COMPLIANT, COMPLIANCE_TYPE_NON_COMPLIANT, CONFIG_RULE_STATE_ACTIVE,
     EVALUATION_MODE_DETECTIVE,
 };
@@ -51,9 +51,10 @@ pub const SQS_QUEUE_RESOURCE_TYPE: &str = "AWS::SQS::Queue";
 /// group names, so a recording group of `allSupported` records exactly these — less the
 /// GLOBAL types, which such a group covers only when it asks for them
 /// ([`super::observed_iam::is_global_resource_type`]).
-pub const OBSERVABLE_RESOURCE_TYPES: [&str; 4] = [
+pub const OBSERVABLE_RESOURCE_TYPES: [&str; 5] = [
     S3_BUCKET_RESOURCE_TYPE,
     SQS_QUEUE_RESOURCE_TYPE,
+    super::observed_ec2::EC2_INSTANCE_RESOURCE_TYPE,
     super::observed_iam::IAM_ROLE_RESOURCE_TYPE,
     super::observed_iam::IAM_POLICY_RESOURCE_TYPE,
 ];
@@ -154,16 +155,34 @@ const VERSIONING_STATUS_ENABLED: &str = "Enabled";
 ///
 /// `identifier` is the `SourceIdentifier` Config knows the managed rule by
 /// (`Source$SourceIdentifier`: "For Config Managed rules, a predefined identifier from
-/// a list"), `resource_type` the type of resource it evaluates, and `verdict` the
-/// `ComplianceType` it places a resource at — computed from the CONFIGURATION ITEM the
-/// recorder wrote for that resource, never from a request.
+/// a list"), `resource_type` the type of resource it evaluates — `None` for a rule whose
+/// check is about a resource of ANY type, which is then narrowed by the rule's own scope —
+/// and `verdict` the `ComplianceType` it places a resource at, computed from what the
+/// recorder wrote for that resource and from the rule's own parameters, never from a
+/// request.
 pub struct ManagedRule {
     /// See [`ManagedRule`].
     pub identifier: &'static str,
     /// See [`ManagedRule`].
-    pub resource_type: &'static str,
+    pub resource_type: Option<&'static str>,
     /// See [`ManagedRule`].
-    pub verdict: fn(&RecordedConfiguration) -> &'static str,
+    pub verdict: fn(&RecordedSubject<'_>) -> &'static str,
+}
+
+/// What a managed rule's check reads about ONE recorded resource: the configuration item
+/// the recorder captured for it, the tags that item was recorded with, and the
+/// requirements the rule itself states (`ConfigRule$InputParameters`).
+///
+/// One subject for every entry of [`MANAGED_RULES`], so a rule whose check is about the
+/// resource's configuration and one whose check is about its tags are evaluated through
+/// the same seam rather than through two catalogues.
+pub struct RecordedSubject<'a> {
+    /// The configuration item the recorder captured for the resource.
+    pub recorded: &'a RecordedConfiguration,
+    /// The tags that configuration item was recorded with.
+    pub tags: &'a BTreeMap<String, String>,
+    /// The requirements the rule states.
+    pub parameters: &'a RuleParameters,
 }
 
 /// The AWS managed rules this emulator evaluates, each one paired with the member of
@@ -175,16 +194,24 @@ pub struct ManagedRule {
 /// listed here is left unevaluated — Config records no verdict for it rather than a
 /// made-up one — which is why this table is the single statement of what this emulator
 /// can judge.
-pub const MANAGED_RULES: [ManagedRule; 2] = [
+pub const MANAGED_RULES: [ManagedRule; 3] = [
     ManagedRule {
         identifier: "S3_BUCKET_VERSIONING_ENABLED",
-        resource_type: S3_BUCKET_RESOURCE_TYPE,
+        resource_type: Some(S3_BUCKET_RESOURCE_TYPE),
         verdict: bucket_versioning_verdict,
     },
     ManagedRule {
         identifier: "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED",
-        resource_type: S3_BUCKET_RESOURCE_TYPE,
+        resource_type: Some(S3_BUCKET_RESOURCE_TYPE),
         verdict: bucket_encryption_verdict,
+    },
+    ManagedRule {
+        identifier: "REQUIRED_TAGS",
+        // "Checks if your resources have the tags that you specify": the check is about
+        // the resource's TAGS rather than about one kind of resource, so which resources
+        // it judges is what the rule's own scope says.
+        resource_type: None,
+        verdict: required_tags_verdict,
     },
 ];
 
@@ -236,9 +263,9 @@ const BUCKET_ENCRYPTION_BLOCK: &str = "ServerSideEncryptionConfiguration";
 /// `GetBucketVersioning`. A bucket whose versioning has never been set carries no
 /// status at all, and one whose versioning was suspended carries `Suspended`; neither
 /// has versioning enabled.
-fn bucket_versioning_verdict(recorded: &RecordedConfiguration) -> &'static str {
+fn bucket_versioning_verdict(subject: &RecordedSubject<'_>) -> &'static str {
     verdict(
-        recorded.block(BUCKET_VERSIONING_BLOCK)["status"].as_str()
+        subject.recorded.block(BUCKET_VERSIONING_BLOCK)["status"].as_str()
             == Some(VERSIONING_STATUS_ENABLED),
     )
 }
@@ -247,9 +274,9 @@ fn bucket_versioning_verdict(recorded: &RecordedConfiguration) -> &'static str {
 /// default encryption enabled": COMPLIANT exactly while a default server-side
 /// encryption algorithm is in force for the bucket, which the recorder records in the
 /// [`BUCKET_ENCRYPTION_BLOCK`] block from `GetBucketEncryption`.
-fn bucket_encryption_verdict(recorded: &RecordedConfiguration) -> &'static str {
+fn bucket_encryption_verdict(subject: &RecordedSubject<'_>) -> &'static str {
     verdict(
-        recorded.block(BUCKET_ENCRYPTION_BLOCK)["rules"]
+        subject.recorded.block(BUCKET_ENCRYPTION_BLOCK)["rules"]
             .as_array()
             .is_some_and(|rules| {
                 rules.iter().any(|rule| {
@@ -259,6 +286,57 @@ fn bucket_encryption_verdict(recorded: &RecordedConfiguration) -> &'static str {
                 })
             }),
     )
+}
+
+/// How many tag requirements one `REQUIRED_TAGS` rule states: "you can check up to 6 tags
+/// at a time", which the rule takes as the numbered parameter pairs
+/// [`required_tag_key_parameter`] names.
+const REQUIRED_TAG_PAIRS: usize = 6;
+
+/// The parameter a `REQUIRED_TAGS` rule names its `pair`th required tag KEY in, as the
+/// managed rule's own documentation spells it (`tag1Key` … `tag6Key`).
+fn required_tag_key_parameter(pair: usize) -> String {
+    format!("tag{pair}Key")
+}
+
+/// The parameter a `REQUIRED_TAGS` rule names the values that `pair`th tag may carry in
+/// (`tag1Value` … `tag6Value`), which is optional: a pair naming only a key requires the
+/// tag whatever its value.
+fn required_tag_value_parameter(pair: usize) -> String {
+    format!("tag{pair}Value")
+}
+
+/// `REQUIRED_TAGS` — "Checks if your resources have the tags that you specify": COMPLIANT
+/// exactly while the resource carries every tag key the rule names and, for a key whose
+/// pair also names values, carries one of those values under it.
+///
+/// The rule states its requirements as up to [`REQUIRED_TAG_PAIRS`] numbered parameter
+/// pairs, and "separate multiple values with commas" is how a pair names more than one
+/// acceptable value. A pair the rule leaves out — or one naming an empty key — requires
+/// nothing, so a rule stating no requirement at all finds every resource compliant; the
+/// tags the check reads are the ones the configuration item was RECORDED with, never ones
+/// a request supplied.
+fn required_tags_verdict(subject: &RecordedSubject<'_>) -> &'static str {
+    verdict((1..=REQUIRED_TAG_PAIRS).all(|pair| {
+        let Some(key) = subject.parameters.text(&required_tag_key_parameter(pair)) else {
+            return true;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return true;
+        }
+        let Some(held) = subject.tags.get(key) else {
+            return false;
+        };
+        let accepted = subject
+            .parameters
+            .text(&required_tag_value_parameter(pair))
+            .unwrap_or_default();
+        accepted.trim().is_empty()
+            || accepted
+                .split(',')
+                .any(|accepted| accepted.trim() == held.trim())
+    }))
 }
 
 /// The `ComplianceType` a managed rule's check places a resource at: a check the
@@ -304,6 +382,18 @@ struct RecordedResource {
     /// The tags recorded with the configuration item, which a rule's scope can narrow
     /// by.
     tags: BTreeMap<String, String>,
+}
+
+impl RecordedResource {
+    /// This resource as a managed rule's check reads it, under the requirements `parameters`
+    /// states.
+    fn subject<'a>(&'a self, parameters: &'a RuleParameters) -> RecordedSubject<'a> {
+        RecordedSubject {
+            recorded: &self.recorded,
+            tags: &self.tags,
+            parameters,
+        }
+    }
 }
 
 /// Whether a rule with `scope` covers the RECORDED resource `resource`: the rules
@@ -618,8 +708,14 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             // reports as the rule's invocation time; a pass no write asked for is
             // invoked at the instant it runs.
             let invoked_at = rule.evaluation.invoked_at.unwrap_or(now);
+            // The requirements this rule states, read once for every resource it judges.
+            let parameters = RuleParameters::of(rule.input_parameters.as_deref());
             for resource in &recorded {
-                if resource.resource_type != managed.resource_type
+                // A rule whose check is about one kind of resource judges that kind alone;
+                // one whose check is about any resource is narrowed by its scope only.
+                if managed
+                    .resource_type
+                    .is_some_and(|wanted| wanted != resource.resource_type)
                     || !scope_covers_recorded(rule.scope.as_ref(), resource)
                 {
                     continue;
@@ -635,7 +731,7 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
                         &resource.resource_type,
                         &resource.resource_id,
                         EVALUATION_MODE_DETECTIVE,
-                        (managed.verdict)(&resource.recorded),
+                        (managed.verdict)(&resource.subject(&parameters)),
                         resource.captured_at,
                     )
                 };
@@ -685,6 +781,13 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
         if resource_type == SQS_QUEUE_RESOURCE_TYPE {
             if let Some(queues) = observed_sqs_queues(callback, region, now).await {
                 observed.push((resource_type, queues));
+            }
+        }
+        if resource_type == super::observed_ec2::EC2_INSTANCE_RESOURCE_TYPE {
+            if let Some(instances) =
+                super::observed_ec2::observed_ec2_instances(callback, region, now).await
+            {
+                observed.push((resource_type, instances));
             }
         }
         if resource_type == super::observed_iam::IAM_ROLE_RESOURCE_TYPE {
@@ -1363,7 +1466,8 @@ mod tests {
                 .find(|managed| managed.identifier == identifier)
                 .unwrap_or_else(|| panic!("case {case:?}: {identifier} is not in the catalogue"));
             let recorded = bucket("a-bucket", versioning, algorithms, &[]);
-            let placed = (managed.verdict)(&recorded.recorded);
+            let parameters = RuleParameters::default();
+            let placed = (managed.verdict)(&recorded.subject(&parameters));
             assert_eq!(
                 placed, expected,
                 "case {case:?}: expected {identifier} to place the bucket at {expected}, \

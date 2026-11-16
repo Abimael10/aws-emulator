@@ -116,6 +116,21 @@ impl RuleParameters {
             _ => None,
         }
     }
+
+    /// The text the parameter `name` requires, or `None` when the rule does not name it
+    /// (or names it as something with no text of its own, a list or an object).
+    ///
+    /// A value a client sent as a JSON number or boolean reads as the text it was written
+    /// as, for the same reason [`Self::flag`] reads both spellings: Config states a rule's
+    /// parameters as text, and a client may equally send them as JSON scalars.
+    pub fn text(&self, name: &str) -> Option<String> {
+        match self.parameters.get(name)? {
+            ::serde_json::Value::String(text) => Some(text.clone()),
+            ::serde_json::Value::Number(number) => Some(number.to_string()),
+            ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    }
 }
 
 /// The parameter names `IAM_PASSWORD_POLICY` takes, as the managed rule's own
