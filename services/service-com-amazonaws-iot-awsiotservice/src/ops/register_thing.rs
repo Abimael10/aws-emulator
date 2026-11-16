@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Provisions a thing in the device registry from the provisioning template the request
+//! carries: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterThing"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterThingErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let parameters = input.parameters.unwrap_or_default();
+
+        // The whole provisioning run is ONE pass over the store: the thing the template's
+        // thing resource describes, the certificate and the policy its other resources
+        // name, and the policy's attachment to that certificate — each in the registry
+        // that owns it, so every ARN reported below addresses a record a later read of
+        // that registry returns.
+        let provisioned = crate::state::provision_template(
+            &mut state.lock(),
+            &region,
+            &input.template_body,
+            &parameters,
+            ::std::time::SystemTime::now(),
+        );
+        let provisioned = match provisioned {
+            Ok(provisioned) => provisioned,
+            // A body that is no provisioning template is a fact about the REQUEST, so it
+            // is the modelled `InvalidRequestException` (HTTP 400) naming the rule it
+            // broke; a template this service could not carry out against the account's
+            // state is the modelled `ResourceRegistrationFailureException` (HTTP 400),
+            // "The resource registration failed".
+            Err(refusal @ crate::state::ProvisioningRefusal::Template(_)) => {
+                return Err(RegisterThingErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(refusal.message()),
+                    },
+                )
+                .into())
+            }
+            Err(refusal @ crate::state::ProvisioningRefusal::Resource(_)) => {
+                return Err(
+                    RegisterThingErrorModeled::ResourceRegistrationFailureException(
+                        ResourceRegistrationFailureException {
+                            message: Some(refusal.message()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // The response is built from the records that were just persisted, so what this
+        // call reports and what the next read of each registry returns are one value.
+        Ok(RegisterThingOutput {
+            certificate_pem: provisioned.certificate_pem,
+            resource_arns: Some(provisioned.resource_arns.into_iter().collect()),
+        })
     }
 }

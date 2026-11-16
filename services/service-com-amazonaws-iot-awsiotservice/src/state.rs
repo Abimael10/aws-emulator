@@ -3302,6 +3302,15 @@ pub use provisioning_templates::{
     UNASSUMABLE_PROVISIONING_ROLE_MESSAGE,
 };
 
+// What ONE `RegisterThing` provisions — the resources a provisioning template declares,
+// read with the call's parameters substituted into them, and the ARN each one is reported
+// under — lives in `state/thing_provisioning.rs`, beside the template reader the bulk
+// provisioning path shares with it.
+pub mod thing_provisioning;
+pub use thing_provisioning::{
+    provision_template, ProvisionedResources, ProvisioningRefusal,
+};
+
 // What a STREAM is — the record one holds, the files it streams and what every reader of
 // one reports — lives in `state/streams.rs`.
 pub mod streams;

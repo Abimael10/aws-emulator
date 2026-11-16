@@ -287,7 +287,12 @@ impl ProvisioningTemplate {
 
     /// The value each `Ref` of the thing properties resolves to for one line: the parameter
     /// values the line supplies, over the defaults the template declares.
-    fn substitutions(&self, parameters: &Map<String, Value>) -> BTreeMap<String, String> {
+    ///
+    /// Reachable from the rest of the state module because the SAME substitutions apply to
+    /// every resource a template declares, not only to its thing: the single-device
+    /// provisioning path ([`super::thing_provisioning`]) renders the certificate and policy
+    /// resources with these, so the two paths read one template the same way.
+    pub(super) fn substitutions(&self, parameters: &Map<String, Value>) -> BTreeMap<String, String> {
         let mut substitutions = self.defaults.clone();
         for (name, value) in parameters {
             if let Some(text) = scalar_text(value) {
@@ -363,7 +368,10 @@ fn declared_defaults(parameters: &Map<String, Value>) -> BTreeMap<String, String
 /// `None` when the value is one this reading cannot render as the text the property means: a
 /// `Ref` to a parameter with no value, any other intrinsic function, and a structure or list
 /// where a property's value is a scalar.
-fn render_text(value: &Value, substitutions: &BTreeMap<String, String>) -> Option<String> {
+pub(super) fn render_text(
+    value: &Value,
+    substitutions: &BTreeMap<String, String>,
+) -> Option<String> {
     match value {
         Value::Object(function) if function.len() == 1 => {
             let parameter = function.get(REF_FUNCTION)?.as_str()?;

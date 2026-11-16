@@ -261,6 +261,45 @@ impl PolicyAttachmentLimit {
 }
 
 impl PolicyAttachments {
+    /// Why attaching `policy_name` to the resolved target would be refused, or `None` when
+    /// the relation would take it.
+    ///
+    /// READ-ONLY, and the one place the ceilings are read: [`PolicyAttachments::attach`]
+    /// answers this before it writes, so a caller that has to know whether an attachment is
+    /// admissible BEFORE making other writes asks the same question and cannot drift from
+    /// what the write then does.
+    ///
+    /// A pair already recorded is admissible and no nearer a ceiling, because recording it
+    /// again adds nothing.
+    pub fn refusal_for(
+        &self,
+        target: &ResolvedPolicyTarget,
+        policy_name: &str,
+    ) -> Option<PolicyAttachmentLimit> {
+        match self.targets.get(&target.key) {
+            Some(attached) => {
+                if attached.policies.contains(policy_name) {
+                    return None;
+                }
+                (attached.policies.len() >= MAX_POLICIES_PER_TARGET).then(|| {
+                    PolicyAttachmentLimit {
+                        message: format!(
+                            "a target may hold at most {MAX_POLICIES_PER_TARGET} attached \
+                             policies; {} already holds that many",
+                            attached.reported
+                        ),
+                    }
+                })
+            }
+            None => (self.targets.len() >= MAX_ATTACHED_TARGETS).then(|| PolicyAttachmentLimit {
+                message: format!(
+                    "the maximum of {MAX_ATTACHED_TARGETS} targets holding attached policies \
+                     is already reached"
+                ),
+            }),
+        }
+    }
+
     /// Attach `policy_name` to the resolved target, or answer the ceiling that refused
     /// it.
     ///
@@ -272,31 +311,14 @@ impl PolicyAttachments {
         target: &ResolvedPolicyTarget,
         policy_name: &str,
     ) -> Result<(), PolicyAttachmentLimit> {
+        if let Some(limit) = self.refusal_for(target, policy_name) {
+            return Err(limit);
+        }
         match self.targets.get_mut(&target.key) {
             Some(attached) => {
-                if attached.policies.contains(policy_name) {
-                    return Ok(());
-                }
-                if attached.policies.len() >= MAX_POLICIES_PER_TARGET {
-                    return Err(PolicyAttachmentLimit {
-                        message: format!(
-                            "a target may hold at most {MAX_POLICIES_PER_TARGET} attached \
-                             policies; {} already holds that many",
-                            attached.reported
-                        ),
-                    });
-                }
                 attached.policies.insert(policy_name.to_string());
             }
             None => {
-                if self.targets.len() >= MAX_ATTACHED_TARGETS {
-                    return Err(PolicyAttachmentLimit {
-                        message: format!(
-                            "the maximum of {MAX_ATTACHED_TARGETS} targets holding attached \
-                             policies is already reached"
-                        ),
-                    });
-                }
                 self.targets.insert(
                     target.key.clone(),
                     AttachedTarget {

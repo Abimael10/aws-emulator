@@ -143,6 +143,8 @@ mod thing_group_membership;
 mod thing_group_update;
 #[path = "all/thing_listing.rs"]
 mod thing_listing;
+#[path = "all/thing_provisioning.rs"]
+mod thing_provisioning;
 #[path = "all/thing_registry_lifecycle.rs"]
 mod thing_registry_lifecycle;
 #[path = "all/thing_type_registry.rs"]
