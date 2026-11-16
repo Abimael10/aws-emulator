@@ -157,28 +157,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Both members are optional in the model, but the pair is not: each doc says
-        // "You must provide either the ResourceArn of the protected resource or the
-        // ProtectionID of the protection, but not both."
+        // Both members are optional in the model, but the pair is not: the call has to
+        // name exactly one of the two addresses, and a call that names the wrong number
+        // of them is refused on the parameters alone — before the account's subscription
+        // or the store is consulted at all.
         let address = match (input.protection_id.as_deref(), input.resource_arn.as_deref()) {
             (Some(protection_id), None) => Address::ProtectionId(protection_id),
             (None, Some(resource_arn)) => Address::ResourceArn(resource_arn),
-            (Some(_), Some(_)) => {
-                return Err(invalid_parameter(
-                    "You must provide either the ResourceArn of the protected resource or \
-                     the ProtectionID of the protection, but not both.",
-                ));
-            }
-            (None, None) => {
-                return Err(invalid_parameter(
-                    "You must provide either the ResourceArn of the protected resource or \
-                     the ProtectionID of the protection.",
-                ));
-            }
+            (Some(_), Some(_)) => return Err(invalid_parameter(BOTH_ADDRESSES_MESSAGE)),
+            (None, None) => return Err(invalid_parameter(NO_ADDRESS_MESSAGE)),
         };
 
         // A pure read: whichever address was given, the answer is the stored record.
         let guard = state.lock();
+
+        // A protection is something a Shield Advanced subscription grants, so an account
+        // holding no live subscription holds no protection to describe: the absence it
+        // reports is the account-level one, decided before any protection is looked up.
+        if guard.subscription_state_at(::std::time::SystemTime::now())
+            != crate::state::SUBSCRIPTION_STATE_ACTIVE
+        {
+            return Err(DescribeProtectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
         let found = match address {
             Address::ProtectionId(protection_id) => guard.protection_by_id(protection_id),
             Address::ResourceArn(resource_arn) => guard.protection_by_resource_arn(resource_arn),
@@ -186,14 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = found else {
             return Err(DescribeProtectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(match address {
-                        Address::ProtectionId(protection_id) => {
-                            format!("The protection {protection_id} does not exist.")
-                        }
-                        Address::ResourceArn(resource_arn) => {
-                            format!("The resource {resource_arn} has no protection.")
-                        }
-                    }),
+                    message: Some(crate::state::PROTECTION_NOT_FOUND_MESSAGE.to_string()),
                     resource_type: Some(crate::state::PROTECTION_RESOURCE_TYPE.to_string()),
                 },
             )
@@ -214,6 +214,24 @@ enum Address<'a> {
     ResourceArn(&'a str),
 }
 
+/// The input name this service spells `ProtectionId` with in a refusal: a parameter
+/// names itself in lowerCamel there, whatever casing the wire member uses.
+const PROTECTION_ID_PARAMETER: &str = "protectionId";
+
+/// The input name this service spells `ResourceArn` with in a refusal.
+const RESOURCE_ARN_PARAMETER: &str = "resourceArn";
+
+/// How this service states that a call named BOTH of the two addresses, when the pair
+/// admits exactly one. Fixed text: it names the two parameters and carries no value
+/// from the request.
+const BOTH_ADDRESSES_MESSAGE: &str = "Invalid parameter. You must provide one value, either \
+     protectionId or resourceArn, but not both.";
+
+/// How this service states that a call named NEITHER address, which leaves the same
+/// pair unsatisfied from the other side.
+const NO_ADDRESS_MESSAGE: &str =
+    "Invalid parameter. You must provide one value, either protectionId or resourceArn.";
+
 /// The modelled `InvalidParameterException` (HTTP 400) this operation refuses a request
 /// with, naming the two members whose combination was wrong.
 fn invalid_parameter(message: &str) -> DescribeProtectionError {
@@ -222,11 +240,11 @@ fn invalid_parameter(message: &str) -> DescribeProtectionError {
         reason: Some("FIELD_VALIDATION_FAILED".to_string()),
         fields: Some(vec![
             ValidationExceptionField {
-                name: "ProtectionId".to_string(),
+                name: PROTECTION_ID_PARAMETER.to_string(),
                 message: message.to_string(),
             },
             ValidationExceptionField {
-                name: "ResourceArn".to_string(),
+                name: RESOURCE_ARN_PARAMETER.to_string(),
                 message: message.to_string(),
             },
         ]),

@@ -25,5 +25,7 @@ mod shield_protection_groups_tags_and_account;
 mod shield_subscription_and_protections;
 #[path = "all/shield_unsubscribed_account.rs"]
 mod shield_unsubscribed_account;
+#[path = "all/shield_validation_refusal_messages.rs"]
+mod shield_validation_refusal_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

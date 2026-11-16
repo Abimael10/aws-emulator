@@ -74,6 +74,13 @@ pub const PROTECTION_GROUP_LIMIT_TYPE: &str = "protection-group";
 /// code's cases by this text.
 pub const SUBSCRIPTION_NOT_FOUND_MESSAGE: &str = "The subscription does not exist.";
 
+/// How this service states that the protection a request addresses is absent. One
+/// sentence for the whole service, naming the resource class rather than the
+/// identifier the call carried: a client separates the same `ResourceNotFoundException`
+/// code's cases by this text, and the identifier it sent tells it nothing it did not
+/// already know.
+pub const PROTECTION_NOT_FOUND_MESSAGE: &str = "The referenced protection does not exist.";
+
 /// How this service states that the protection group a request addresses is absent —
 /// deliberately distinct from [`SUBSCRIPTION_NOT_FOUND_MESSAGE`], which shares the
 /// `ResourceNotFoundException` code.

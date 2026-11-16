@@ -41,9 +41,42 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
+
+/// The error code this service names when a request breaks one of the model's own
+/// rules. It is also the framework's default for such a refusal, and is restated here
+/// so the code and the message below are chosen in one place.
+const VALIDATION_ERROR_CODE: &str = "ValidationException";
+
+/// The fixed text of that refusal's message. What follows it is the list of inputs the
+/// request was refused on; nothing else — no submitted value, and no constraint from the
+/// model — goes into it.
+const VALIDATION_MESSAGE_PREFIX: &str = "Error validating the following inputs: ";
+
+/// The inputs a validation refusal names: one entry per refused input, in the order the
+/// refusals were found and without repeats.
+///
+/// A refusal carries the dotted path of the offending position, which the framework
+/// spells in lowerCamel and may extend into a collection — where the following segments
+/// are an index or a key the CALLER chose. This service names the request's own inputs,
+/// so only the leading segment is kept, which is also what keeps every value the caller
+/// sent out of the message.
+fn refused_inputs(violations: &[Violation]) -> Vec<&str> {
+    let mut inputs: Vec<&str> = Vec::new();
+    for violation in violations {
+        let input = violation
+            .path
+            .split('.')
+            .next()
+            .unwrap_or(violation.path.as_str());
+        if !input.is_empty() && !inputs.contains(&input) {
+            inputs.push(input);
+        }
+    }
+    inputs
+}
 
 /// The `com-amazonaws-shield-awsshield-20160616` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,17 +129,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // This service answers a request that breaks one of the model's own rules —
+            // an absent required member, a value outside a declared length or range, a
+            // string outside its pattern — with one sentence that names the inputs it
+            // refused and nothing else. The framework's default states the requirement
+            // instead, echoing the submitted value and the model's own regular
+            // expression; a client separating this service's same-code failures by their
+            // text would not recognise that, and the value the caller sent belongs in no
+            // response. The code is the one the framework already chose, restated so
+            // both halves of the answer are picked here.
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: VALIDATION_ERROR_CODE.to_string(),
+                message: format!(
+                    "{VALIDATION_MESSAGE_PREFIX}{}",
+                    refused_inputs(violations).join(", ")
+                ),
+            }),
+            // An authentication refusal is the emulator's, not this service's: keep the
+            // framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

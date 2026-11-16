@@ -148,15 +148,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // A protection is something a Shield Advanced subscription grants, so an account
+        // holding no live subscription holds no protection to release: the absence it
+        // reports is the account-level one, decided before any protection is looked up.
+        if guard.subscription_state_at(::std::time::SystemTime::now())
+            != crate::state::SUBSCRIPTION_STATE_ACTIVE
+        {
+            return Err(DeleteProtectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // Deleting is not idempotent here: a protection that is not in the store —
-        // never created, or already deleted — cannot be found.
+        // never created, or already deleted — cannot be found. The refusal names the
+        // resource class, not the identifier the call carried.
         if guard.remove_protection(&input.protection_id).is_none() {
             return Err(DeleteProtectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "The protection {} does not exist.",
-                        input.protection_id
-                    )),
+                    message: Some(crate::state::PROTECTION_NOT_FOUND_MESSAGE.to_string()),
                     resource_type: Some(crate::state::PROTECTION_RESOURCE_TYPE.to_string()),
                 },
             )
