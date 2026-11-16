@@ -349,6 +349,8 @@ mod websocket_lambda_routes;
 mod websocket_message_reassembly;
 #[path = "all/websocket_message_refusals.rs"]
 mod websocket_message_refusals;
+#[path = "all/websocket_push_framing.rs"]
+mod websocket_push_framing;
 #[path = "all/websocket_non_proxy_integration.rs"]
 mod websocket_non_proxy_integration;
 #[path = "all/websocket_stage_metrics.rs"]

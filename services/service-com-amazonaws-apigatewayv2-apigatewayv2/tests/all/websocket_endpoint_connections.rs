@@ -47,16 +47,19 @@ const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The `Data` maximum the `@connections` model declares (`@length(min: 0, max: 131072)` on
 /// the `Data` blob). Read from the owning crate's constant so the two cannot disagree.
-const MAX_DATA_BYTES: usize =
+///
+/// Shared with `websocket_push_framing`, which reads the frames a payload of that size
+/// travels in.
+pub(crate) const MAX_DATA_BYTES: usize =
     service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::ops::post_to_connection::MAX_DATA_BYTES;
 
 /// The stage every case deploys.
-const STAGE: &str = "prod";
+pub(crate) const STAGE: &str = "prod";
 
 /// An emulator serving this service's control plane AND the `@connections` management API
 /// over ONE engine, which is how a connection the api's socket carries is the connection
 /// that API addresses.
-fn emulator_with_connections() -> MultiServiceRouter {
+pub(crate) fn emulator_with_connections() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -191,12 +194,12 @@ async fn deploy(emulator: &MultiServiceRouter, case: &str, name: &str) -> Deploy
 
 /// What one `@connections` call was answered: everything a client reads before it looks at
 /// the body, and the body.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` the answer named, or `"<absent>"` — the field a restJson1
     /// client resolves an error SHAPE from.
     error_type: String,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Answer {
@@ -228,7 +231,7 @@ impl Answer {
 ///
 /// The request is written and the answer read by hand because the point of these cases is
 /// what arrives on the WIRE — that a complete HTTP response arrives at all.
-async fn connections_call(
+pub(crate) async fn connections_call(
     case: &str,
     authority: &str,
     method: &str,

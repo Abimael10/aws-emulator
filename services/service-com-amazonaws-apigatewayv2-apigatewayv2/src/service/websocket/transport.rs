@@ -38,7 +38,8 @@
 //!    `@connections` management API is published at that same endpoint.
 //! 3. The FRAMES, each dispatched to the route the api's `RouteSelectionExpression` selects
 //!    and answered by that route's integration PERFORMED ([`super::integration`]), and each
-//!    frame pushed TO the connection written back over the same socket. A message this plane
+//!    frame pushed TO the connection written back over the same socket, in frames of at most
+//!    the api's frame quota ([`frames_of`]). A message this plane
 //!    does NOT serve is classified before any route is selected, and refused with the close
 //!    its refusal carries rather than reaching a backend ([`refused`]): a client data frame
 //!    that is not text, and a message past the frame quota ([`MAX_FRAME_BYTES`]) or the
@@ -68,7 +69,8 @@ use ::tokio::sync::mpsc::{channel, Receiver, Sender};
 use ::tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
 };
-use ::tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use ::tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
+use ::tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use ::tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use ::tokio_tungstenite::tungstenite::{Error as SocketError, Message};
 
@@ -429,10 +431,11 @@ impl Offer {
 /// [`CloseCode::Size`]).
 const MAX_MESSAGE_BYTES: usize = 131_072;
 
-/// The largest FRAME a client may send over a WEBSOCKET api, in bytes: the 32 KiB an API
-/// Gateway WebSocket api publishes as its frame quota, so a message at [`MAX_MESSAGE_BYTES`]
-/// is fragmented and no single frame may be larger. A frame past it is refused with the same
-/// close the ceiling carries, and the reader is what stops at it.
+/// The largest FRAME an API Gateway WebSocket api carries, in bytes: the 32 KiB it publishes as
+/// its frame quota, so a message at [`MAX_MESSAGE_BYTES`] is fragmented and no single frame may
+/// be larger. It bounds BOTH directions of the socket: a client frame past it is refused with
+/// the same close the ceiling carries, and the reader is what stops at it, while a message this
+/// end sends is split into frames of at most this many bytes ([`frames_of`]).
 const MAX_FRAME_BYTES: usize = 32 * 1024;
 
 /// How many bytes of ASSEMBLED fragments this socket's reader buffers for one message before
@@ -997,7 +1000,7 @@ async fn carry_frames<S>(
                     let _ = outgoing.send(Message::Close(Some(server_close()))).await;
                     break;
                 };
-                if outgoing.send(frame_of(frame)).await.is_err() {
+                if !write_message(&mut outgoing, &frame).await {
                     break;
                 }
                 // A payload pushed to this connection is a message the api sent the client,
@@ -1098,7 +1101,7 @@ async fn carry_frames<S>(
                 let served =
                     served_frame(&state, &callback, &metrics, &connection, &body).await;
                 if let Some(reply) = served.reply {
-                    if outgoing.send(frame_of(reply)).await.is_err() {
+                    if !write_message(&mut outgoing, &reply).await {
                         break;
                     }
                     // The reply reached the client, which is one more message of the stage.
@@ -1221,13 +1224,55 @@ async fn disconnected(
 /// loopback, so that is what a connection is attributed to.
 const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
 
-/// A pushed payload as a frame: always a TEXT frame, which is what API Gateway delivers a
-/// `PostToConnection` payload as — bytes that are not valid UTF-8 travel with each invalid
-/// sequence replaced by the Unicode replacement character, as a text frame's payload must be
-/// (RFC 6455 §5.6, "text frames … interpreted as UTF-8"), rather than being relayed as a
-/// binary frame the client would read as a different kind of message.
-fn frame_of(frame: Vec<u8>) -> Message {
-    Message::Text(String::from_utf8_lossy(&frame).into_owned().into())
+/// A pushed payload as the FRAMES it travels in: a TEXT message, which is what API Gateway
+/// delivers a `PostToConnection` payload as — bytes that are not valid UTF-8 travel with each
+/// invalid sequence replaced by the Unicode replacement character, as a text frame's payload
+/// must be (RFC 6455 §5.6, "text frames … interpreted as UTF-8"), rather than being relayed as
+/// a binary frame the client would read as a different kind of message.
+///
+/// A message whose payload passes the api's frame quota ([`MAX_FRAME_BYTES`]) is FRAGMENTED
+/// over it, as RFC 6455 §5.4 has a sender split one message: the first frame carries the text
+/// opcode and is not final, every later frame continues it, and the last one ends the message.
+/// No frame carries more than the quota, so a client reading under that bound reads the whole
+/// message instead of losing the connection to a frame larger than the api publishes. The
+/// message is ONE message however many frames carried it, which is what the client reassembles
+/// and what the stage counts.
+fn frames_of(payload: &[u8]) -> Vec<Message> {
+    let text = String::from_utf8_lossy(payload).into_owned();
+    let bytes = text.as_bytes();
+    // An EMPTY payload is one empty final frame: it is a message the client reads as the empty
+    // string, not an absence of frames.
+    let count = bytes.len().div_ceil(MAX_FRAME_BYTES).max(1);
+    (0..count)
+        .map(|index| {
+            let start = index * MAX_FRAME_BYTES;
+            let end = (start + MAX_FRAME_BYTES).min(bytes.len());
+            let opcode = match index {
+                0 => OpCode::Data(Data::Text),
+                _ => OpCode::Data(Data::Continue),
+            };
+            Message::Frame(Frame::message(
+                ::bytes::Bytes::copy_from_slice(&bytes[start..end]),
+                opcode,
+                index + 1 == count,
+            ))
+        })
+        .collect()
+}
+
+/// Write ONE message to the client as the frames it travels in ([`frames_of`]), answering
+/// whether every one of them reached the socket: a connection the rest of a message cannot be
+/// written to is one this socket is done with.
+async fn write_message<W>(outgoing: &mut W, payload: &[u8]) -> bool
+where
+    W: ::futures_util::Sink<Message> + Unpin,
+{
+    for frame in frames_of(payload) {
+        if outgoing.send(frame).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// The close the GATEWAY states when it ends a connection the client did not close: the
