@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The attributes a brand profile holds, and the default attribute template every
-//! created profile is seeded with.
+//! The attributes a brand profile holds, the default attribute template every
+//! created profile is seeded with, and where the media of one is downloaded from.
 //!
 //! `CreateBrandProfile` reports `attributesCreated`, "the number of default
 //! attributes that were created for the brand profile", so a profile is minted with
@@ -9,9 +9,18 @@
 //! pages exactly those entries back. The template lives here, next to the record it
 //! fills, so the create path and every reader of an attribute agree on one
 //! rendering of one stored attribute.
+//!
+//! An `IMAGE` or `DOCUMENT` attribute also holds MEDIA, which a caller downloads
+//! rather than reads out of a response: `mediaDownloadUrl` is "a presigned Amazon S3
+//! URL that you can use to download the attribute media", and the location this
+//! emulator keeps that media at is this emulator itself. The address is therefore
+//! built and read back here, in one place ([`attribute_media_path`] and
+//! [`parse_attribute_media_path`]), so the URL an operation hands out and the request
+//! `crate::service`'s media plane serves cannot disagree about which attribute it
+//! names.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// One brand-profile attribute, keyed in [`super::BrandProfile::attributes`] by its
 /// name (`BrandProfileAttributeName` is unique within a profile).
@@ -28,8 +37,130 @@ pub struct BrandProfileAttribute {
     pub description: Option<String>,
     /// `category`, absent until a request supplies one.
     pub category: Option<String>,
+    /// The media an `IMAGE` or `DOCUMENT` attribute holds, as the request that
+    /// supplied it through `attachmentBody` sent it. `None` for a `TEXT` attribute,
+    /// which carries its value inline, and for a media attribute nothing has
+    /// supplied media for yet: no bytes are invented for one.
+    pub media: Option<BrandProfileAttributeMedia>,
+    /// The `clientToken` of the request that created this attribute, when it carried
+    /// one. Kept on the record rather than in a map beside it, so the token lives and
+    /// dies with the attribute it names and is bounded by the same ceiling.
+    pub client_token: Option<String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+}
+
+/// The media one attribute holds: the uploaded bytes and the media type they
+/// announce.
+#[derive(Debug, Clone)]
+pub struct BrandProfileAttributeMedia {
+    /// The `attachmentBody` exactly as it arrived, so the download serves the very
+    /// bytes that were uploaded.
+    pub bytes: Vec<u8>,
+    /// `mediaContentType`, "The MIME content type of the attribute media": read from
+    /// the bytes themselves, because the request declares no type for them.
+    pub content_type: String,
+}
+
+impl BrandProfileAttributeMedia {
+    /// The media `bytes` make up, under the media type they announce.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        let content_type = media_content_type(&bytes).to_string();
+        Self {
+            bytes,
+            content_type,
+        }
+    }
+
+    /// `mediaSizeBytes`, "The size of the attribute media, in bytes".
+    #[must_use]
+    pub fn size_bytes(&self) -> i64 {
+        i64::try_from(self.bytes.len()).unwrap_or(i64::MAX)
+    }
+}
+
+/// The media type `bytes` announce in their own leading bytes.
+///
+/// `mediaContentType` is reported for media no request declares a type for — the
+/// input carries `attachmentBody` and nothing beside it — so the type is read from
+/// the content's own magic-number signature by the `infer` crate, which matches the
+/// published signature of each format it knows rather than guessing from a name.
+/// Bytes announcing no format at all are reported as unnamed binary rather than as a
+/// format they are not.
+fn media_content_type(bytes: &[u8]) -> &'static str {
+    ::infer::get(bytes)
+        .map(|kind| kind.mime_type())
+        .unwrap_or(::service_common::web_media_type::GENERIC_MEDIA_TYPE)
+}
+
+/// The `attributeType` values whose content is uploaded MEDIA rather than an inline
+/// value: `BrandProfileAttributeType` documents `IMAGE` and `DOCUMENT` as the types
+/// that "store binary media that you upload", and `TEXT` as the one that "stores an
+/// inline value".
+pub const MEDIA_ATTRIBUTE_TYPES: [&str; 2] = ["IMAGE", "DOCUMENT"];
+
+/// Whether an attribute of `attribute_type` carries uploaded media
+/// ([`MEDIA_ATTRIBUTE_TYPES`]), which is what decides both where its content comes
+/// from — `attachmentBody` rather than `attributeValue` — and whether a
+/// `mediaDownloadUrl` is reported for it.
+#[must_use]
+pub fn carries_media(attribute_type: &str) -> bool {
+    MEDIA_ATTRIBUTE_TYPES.contains(&attribute_type)
+}
+
+/// The most attributes this emulator holds for one brand profile: the modelled
+/// `@length` ceiling of `ListBrandProfileAttributes`' own
+/// `brandProfileAttributes` list (0..100), which is as many as a reader of a profile's
+/// attributes can page back. `CreateBrandProfileAttributes` models
+/// `ServiceQuotaExceededException`, which is the refusal once a profile is full.
+pub const MAX_BRAND_PROFILE_ATTRIBUTES: usize = 100;
+
+/// The most attribute media this emulator holds across the whole store, in bytes.
+///
+/// A ceiling, not a guess at AWS's published quota: `AttachmentBody` admits 5 MiB per
+/// attribute, so it exists so a create loop cannot grow the emulator's heap without
+/// bound. A create that would push the store past it is refused with
+/// `ServiceQuotaExceededException`.
+pub const MAX_ATTRIBUTE_MEDIA_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a `mediaDownloadUrl` stays valid: `MediaDownloadUrl` documents it as "A
+/// presigned Amazon S3 URL that you can use to download the attribute media. The URL
+/// is valid for one hour".
+pub const MEDIA_DOWNLOAD_URL_EXPIRY: Duration = Duration::from_secs(60 * 60);
+
+/// The `resourceType` an attribute error reports, in the hyphenated resource
+/// vocabulary this API names its resources by — the same vocabulary
+/// [`super::BRAND_PROFILE_RESOURCE_TYPE`] is spelled in, with the attribute as the
+/// resource rather than the profile that holds it.
+pub const BRAND_PROFILE_ATTRIBUTE_RESOURCE_TYPE: &str = "brand-profile-attribute";
+
+/// The conflict `Reason` token for a create refused because the name it asks for is
+/// already taken: `attributeName` "is unique within a brand profile", so the state
+/// that causes the conflict is that the resource already exists.
+pub const RESOURCE_ALREADY_EXISTS_REASON: &str = "RESOURCE_ALREADY_EXISTS";
+
+/// `ResourceNotFoundException` for a `BrandProfileAttributeName` the addressed
+/// profile holds no attribute under. The message is built from the request, so it
+/// names the value given.
+#[must_use]
+pub fn brand_profile_attribute_not_found(
+    attribute_name: &str,
+) -> crate::ops::types::ResourceNotFoundException {
+    super::resource_not_found(BRAND_PROFILE_ATTRIBUTE_RESOURCE_TYPE, attribute_name)
+}
+
+/// `ConflictException` for a create of an attribute whose name is already taken
+/// within the profile.
+#[must_use]
+pub fn brand_profile_attribute_exists_conflict(
+    attribute_name: &str,
+) -> crate::ops::types::ConflictException {
+    super::resource_conflict(
+        RESOURCE_ALREADY_EXISTS_REASON,
+        BRAND_PROFILE_ATTRIBUTE_RESOURCE_TYPE,
+        attribute_name,
+    )
 }
 
 /// One slot of the default attribute template: the attribute's name and the type
@@ -90,6 +221,8 @@ pub fn default_brand_profile_attributes(
                     value: None,
                     description: None,
                     category: None,
+                    media: None,
+                    client_token: None,
                     created_at,
                     updated_at: created_at,
                 },
@@ -111,5 +244,114 @@ pub fn brand_profile_attribute_summary(
         category: attribute.category.clone(),
         created_at: super::timestamp(attribute.created_at),
         updated_at: super::timestamp(attribute.updated_at),
+    }
+}
+
+impl super::ComAmazonawsEndusermessagingEndusermessagingState {
+    /// How many bytes of attribute media this store holds, which is what
+    /// [`MAX_ATTRIBUTE_MEDIA_BYTES`] bounds.
+    ///
+    /// Summed over the profiles rather than carried as a counter beside them, so the
+    /// figure cannot drift from the media actually held: both maps are bounded, so
+    /// the walk is bounded too.
+    #[must_use]
+    pub fn attribute_media_bytes(&self) -> usize {
+        self.brand_profiles
+            .values()
+            .flat_map(|profile| profile.attributes.values())
+            .filter_map(|attribute| attribute.media.as_ref())
+            .map(|media| media.bytes.len())
+            .sum()
+    }
+
+    /// The attribute `attribute_name` of the profile `brand_profile_id` names, when
+    /// this store holds both.
+    ///
+    /// The profile is addressed by its STORED id here rather than by a
+    /// `BrandProfileIdOrArn`, because this is the reader the media plane uses and a
+    /// media address carries the resolved id.
+    #[must_use]
+    pub fn brand_profile_attribute(
+        &self,
+        brand_profile_id: &str,
+        attribute_name: &str,
+    ) -> Option<&BrandProfileAttribute> {
+        self.brand_profiles
+            .get(brand_profile_id)?
+            .attributes
+            .get(attribute_name)
+    }
+}
+
+/// The plane segment every attribute-media address carries, under the reserved
+/// data-plane namespace: `/_aws/brand-profile-attribute-media/…`.
+pub const MEDIA_PLANE: &str = "brand-profile-attribute-media";
+
+/// The path one attribute's media is addressed at: the plane, then the profile that
+/// holds the attribute and the attribute's own name, DECODED as the model lays both
+/// out (the signer encodes them).
+///
+/// ONE place states the form, so the URL this service hands out and the request its
+/// media plane serves back cannot disagree about it (see
+/// [`parse_attribute_media_path`]). The profile is named by its stored id, which is
+/// minted and so carries none of the separators a `BrandProfileIdOrArn` may.
+#[must_use]
+pub fn attribute_media_path(brand_profile_id: &str, attribute_name: &str) -> String {
+    format!(
+        "/{}/{MEDIA_PLANE}/{brand_profile_id}/{attribute_name}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
+/// The profile id and attribute name a media request's decoded path `segments` name,
+/// or `None` when they address no attribute media at all.
+///
+/// Read from the same two parts [`attribute_media_path`] builds the published URL out
+/// of. Any signature the URL carries is not part of WHICH media it names, so it plays
+/// no part here.
+#[must_use]
+pub fn parse_attribute_media_path(segments: &[String]) -> Option<(String, String)> {
+    let [namespace, plane, brand_profile_id, attribute_name] = segments else {
+        return None;
+    };
+    if namespace != ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+        || plane != MEDIA_PLANE
+        || brand_profile_id.is_empty()
+        || attribute_name.is_empty()
+    {
+        return None;
+    }
+    Some((brand_profile_id.clone(), attribute_name.clone()))
+}
+
+/// `mediaDownloadUrl` for one attribute of one profile: where a caller downloads the
+/// attribute's media from.
+///
+/// Signed through the framework's URL signer, which is what makes the URL both a
+/// presigned one and one this emulator ANSWERS: it signs for the emulator's current
+/// base URL, so the announced host is the host the caller reached this service on
+/// rather than a host only AWS serves, and the signature is what authorises the fetch
+/// for the one hour [`MEDIA_DOWNLOAD_URL_EXPIRY`] announces.
+#[must_use]
+pub fn attribute_media_download_url(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    brand_profile_id: &str,
+    attribute_name: &str,
+) -> String {
+    let path = attribute_media_path(brand_profile_id, attribute_name);
+    let request = smithy_server_runtime::SignedUrlRequest::new(
+        smithy_server_runtime::http::Method::GET,
+        ctx.identity().signing_name(),
+        &path,
+    );
+    match ctx.url_signer().sign(request, MEDIA_DOWNLOAD_URL_EXPIRY) {
+        Ok(signed) => signed.as_str().to_string(),
+        // Nothing about a minted profile id, a modelled attribute name or this
+        // emulator's own endpoint makes a request unsignable, so this is unreachable
+        // in practice; the media is still served at that address, so the address is
+        // what is reported rather than no URL at all. The endpoint is
+        // `scheme://host[:port]` with no path of its own, and a trailing separator is
+        // dropped so the media's path is the only one the URL carries.
+        Err(_) => format!("{}{path}", ctx.endpoint().as_str().trim_end_matches('/')),
     }
 }

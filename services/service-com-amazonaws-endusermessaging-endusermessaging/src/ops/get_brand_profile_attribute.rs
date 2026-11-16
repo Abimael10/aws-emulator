@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBrandProfileAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBrandProfileAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBrandProfileAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored attribute of one brand profile.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +164,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBrandProfileAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBrandProfileAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBrandProfileAttribute"))
+        // `@readonly`: reporting one attribute changes nothing a later caller sees.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBrandProfileAttributeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // An attribute belongs to one profile, so an identifier naming no stored
+        // profile is a not-found of the PROFILE, reported against the value given.
+        let Some(brand_profile_id) = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .map(str::to_string)
+        else {
+            return Err(
+                GetBrandProfileAttributeErrorModeled::ResourceNotFoundException(
+                    crate::state::brand_profile_not_found(&input.brand_profile_id),
+                )
+                .into(),
+            );
+        };
+        // A name that profile holds no attribute under is a not-found of the
+        // ATTRIBUTE, reported against the name the request named it by.
+        let Some(attribute) = store.brand_profile_attribute(&brand_profile_id, &input.attribute_name)
+        else {
+            return Err(
+                GetBrandProfileAttributeErrorModeled::ResourceNotFoundException(
+                    crate::state::brand_profile_attribute_not_found(&input.attribute_name),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetBrandProfileAttributeOutput {
+            attribute_name: attribute.name.clone(),
+            attribute_type: attribute.attribute_type.clone(),
+            attribute_value: attribute.value.clone(),
+            description: attribute.description.clone(),
+            category: attribute.category.clone(),
+            // The two media facts are read off the media actually held, so an
+            // attribute nothing has uploaded media for reports neither.
+            media_content_type: attribute
+                .media
+                .as_ref()
+                .map(|media| media.content_type.clone()),
+            media_size_bytes: attribute.media.as_ref().map(|media| media.size_bytes()),
+            // `mediaDownloadUrl` addresses the media this attribute HOLDS: it is
+            // "present only for attributes of type IMAGE or DOCUMENT", and of those
+            // only one media has been supplied for has anything to download.
+            media_download_url: (crate::state::carries_media(&attribute.attribute_type)
+                && attribute.media.is_some())
+                .then(|| {
+                    crate::state::attribute_media_download_url(
+                        ctx,
+                        &brand_profile_id,
+                        &attribute.name,
+                    )
+                }),
+            created_at: crate::state::timestamp(attribute.created_at),
+            updated_at: crate::state::timestamp(attribute.updated_at),
+        })
     }
 }

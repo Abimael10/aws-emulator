@@ -27,12 +27,23 @@ hex = { workspace = true }
 # Draws the characters of a one-time passcode uniformly from the character set the
 # resolved code type names.
 rand = "0.9"
+# Reads the media type an uploaded brand-profile attachment announces in its own
+# magic-number signature, which is what `mediaContentType` reports: the request
+# carries the bytes alone and declares no type for them.
+infer = "0.22"
+# `service-common` carries `data_plane_addressing`: the reserved path namespace every
+# emulated data plane is addressed under, so the attribute-media plane claims no path
+# another plane or control route could.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Encodes an attachment body the way restJson1 carries a blob member, so the tests
+# upload media over the same wire an SDK client does.
+base64 = "0.22"
 
 [lints]
 workspace = true

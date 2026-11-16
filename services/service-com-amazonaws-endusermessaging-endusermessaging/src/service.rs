@@ -39,11 +39,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One data plane is mounted here as well: the presigned `mediaDownloadUrl` an attribute
+//! read hands out names no modelled operation, so it is claimed through
+//! [`Service::override_operation`] and served by [`brand_profile_attribute_media`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+mod brand_profile_attribute_media;
 
 /// The `com-amazonaws-endusermessaging-endusermessaging` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +58,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves the presigned addresses an attribute read hands out for the attribute's
+    /// media. Claimed through [`Service::override_operation`], which hands it the
+    /// requests it claims (see [`brand_profile_attribute_media`]).
+    attribute_media: brand_profile_attribute_media::AttributeMediaRoute<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +70,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            attribute_media: brand_profile_attribute_media::AttributeMediaRoute::new(engine),
         }
     }
 }
@@ -91,7 +102,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // The fetch of an attribute's MEDIA, which the generated table cannot serve: the
+        // model binds no operation to that path, because the media is the artifact
+        // `mediaDownloadUrl` points at rather than an API call (see
+        // [`brand_profile_attribute_media`]).
+        if self.attribute_media.claims(req).is_some() {
+            return Some(&self.attribute_media as &dyn ErasedOperation);
+        }
         None
     }
 

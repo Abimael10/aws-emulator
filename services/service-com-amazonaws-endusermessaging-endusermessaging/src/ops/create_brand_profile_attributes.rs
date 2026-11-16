@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBrandProfileAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBrandProfileAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBrandProfileAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the attributes of one brand profile, atomically.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +157,261 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBrandProfileAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBrandProfileAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBrandProfileAttributes"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateBrandProfileAttributesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The attributes belong to one profile, so an identifier that names no stored
+        // profile is this operation's `ResourceNotFoundException`. Everything below
+        // addresses the profile by the id this resolves to — a `BrandProfileIdOrArn`
+        // may be either spelling, and only one of them is the stored key.
+        let Some(brand_profile_id) = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .map(str::to_string)
+        else {
+            return Err(
+                CreateBrandProfileAttributesErrorModeled::ResourceNotFoundException(
+                    crate::state::brand_profile_not_found(&input.brand_profile_id),
+                )
+                .into(),
+            );
+        };
+
+        // How much media the store already holds, read before the profile is borrowed
+        // for writing: the ceiling it is compared against is a ceiling on the whole
+        // store, not on one profile.
+        let media_held = store.attribute_media_bytes();
+        let Some(profile) = store.brand_profiles.get_mut(&brand_profile_id) else {
+            // The id came from `resolve_brand_profile_id` under this same lock, so
+            // the profile is still stored; a store that lost it between the two reads
+            // has failed on the server's side rather than on the request's.
+            return Err(
+                CreateBrandProfileAttributesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "The brand profile this request addresses is no longer \
+                                  available."
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `clientToken` is `@idempotencyToken`: a repeat of a request already served
+        // reports the attributes that request created instead of creating a second
+        // set. A request naming an attribute this token did not create is not a
+        // repeat of it, and takes the ordinary path below.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed: Option<Vec<ReportedAttribute>> = input
+                .attributes
+                .iter()
+                .map(|requested| {
+                    profile
+                        .attributes
+                        .get(&requested.attribute_name)
+                        .filter(|held| held.client_token.as_deref() == Some(token))
+                        .map(|held| ReportedAttribute {
+                            name: held.name.clone(),
+                            attribute_type: held.attribute_type.clone(),
+                            holds_media: held.media.is_some(),
+                        })
+                })
+                .collect();
+            if let Some(created) = replayed {
+                return Ok(output_for(ctx, &brand_profile_id, created));
+            }
+        }
+
+        // NOTHING is written until every entry has been checked: this operation is
+        // documented as atomic — "either all of the attributes are created, or none
+        // of them are" — so a request that fails on its last entry leaves the profile
+        // exactly as it was.
+        let mut pending: Vec<crate::state::BrandProfileAttribute> =
+            Vec::with_capacity(input.attributes.len());
+        let mut pending_media_bytes: usize = 0;
+        for (index, requested) in input.attributes.iter().enumerate() {
+            let carries_media = crate::state::carries_media(&requested.attribute_type);
+            // Which member carries an attribute's content follows from its type:
+            // `attributeValue` "applies to attributes of type TEXT. For attributes of
+            // type IMAGE or DOCUMENT, provide the media through the attachment body
+            // instead" — so an entry offering the other type's member asks for
+            // something the attribute cannot hold.
+            if carries_media && requested.attribute_value.is_some() {
+                return Err(member_not_applicable(
+                    index,
+                    "attributeValue",
+                    &requested.attribute_type,
+                    "attachmentBody",
+                ));
+            }
+            if !carries_media && requested.attachment_body.is_some() {
+                return Err(member_not_applicable(
+                    index,
+                    "attachmentBody",
+                    &requested.attribute_type,
+                    "attributeValue",
+                ));
+            }
+            // `attributeName` "is unique within a brand profile", so a name the
+            // profile already holds — and a name this one request asks for twice —
+            // conflicts with the state the profile would have to be in for both
+            // attributes to exist under it.
+            if profile.attributes.contains_key(&requested.attribute_name)
+                || pending
+                    .iter()
+                    .any(|held| held.name == requested.attribute_name)
+            {
+                return Err(CreateBrandProfileAttributesErrorModeled::ConflictException(
+                    crate::state::brand_profile_attribute_exists_conflict(
+                        &requested.attribute_name,
+                    ),
+                )
+                .into());
+            }
+            let media = requested
+                .attachment_body
+                .clone()
+                .map(crate::state::BrandProfileAttributeMedia::new);
+            pending_media_bytes += media.as_ref().map_or(0, |media| media.bytes.len());
+            pending.push(crate::state::BrandProfileAttribute {
+                name: requested.attribute_name.clone(),
+                attribute_type: requested.attribute_type.clone(),
+                value: requested.attribute_value.clone(),
+                description: requested.description.clone(),
+                category: requested.category.clone(),
+                media,
+                client_token: input.client_token.clone(),
+                created_at: now,
+                updated_at: now,
+            });
+        }
+
+        // Both stores are bounded: past either ceiling a further create is refused
+        // with this operation's `ServiceQuotaExceededException` rather than growing
+        // the emulator's heap. Checked AFTER the idempotency lookup, so a repeat of a
+        // request already served still answers from the store at the ceiling.
+        if profile.attributes.len() + pending.len() > crate::state::MAX_BRAND_PROFILE_ATTRIBUTES {
+            return Err(
+                CreateBrandProfileAttributesErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of attributes for a brand profile ({}) would be exceeded.",
+                            crate::state::MAX_BRAND_PROFILE_ATTRIBUTES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if media_held + pending_media_bytes > crate::state::MAX_ATTRIBUTE_MEDIA_BYTES {
+            return Err(
+                CreateBrandProfileAttributesErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum amount of attribute media ({} bytes) would be exceeded.",
+                            crate::state::MAX_ATTRIBUTE_MEDIA_BYTES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Insert, then report from the records now in the store, in the order the
+        // request listed them.
+        let created: Vec<ReportedAttribute> = pending
+            .into_iter()
+            .map(|attribute| {
+                let reported = ReportedAttribute {
+                    name: attribute.name.clone(),
+                    attribute_type: attribute.attribute_type.clone(),
+                    holds_media: attribute.media.is_some(),
+                };
+                profile.attributes.insert(attribute.name.clone(), attribute);
+                reported
+            })
+            .collect();
+        Ok(output_for(ctx, &brand_profile_id, created))
     }
+}
+
+/// One created attribute, as much of it as the output reports.
+struct ReportedAttribute {
+    name: String,
+    attribute_type: String,
+    /// Whether the stored attribute holds media, which is what decides whether there
+    /// is anything for a `mediaDownloadUrl` to address.
+    holds_media: bool,
+}
+
+/// Every output member of the attributes `created`, read back off the records the
+/// store now holds.
+///
+/// `mediaDownloadUrl` addresses the media an attribute HOLDS: `MediaDownloadUrl` is
+/// "present only for attributes of type IMAGE or DOCUMENT", and of those only one
+/// media has actually been supplied for has anything to download — an attribute
+/// created with no attachment body reports no URL rather than one leading to nothing.
+fn output_for(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    brand_profile_id: &str,
+    created: Vec<ReportedAttribute>,
+) -> CreateBrandProfileAttributesOutput {
+    CreateBrandProfileAttributesOutput {
+        attributes: created
+            .into_iter()
+            .map(|attribute| BrandProfileAttributeOutput {
+                media_download_url: (crate::state::carries_media(&attribute.attribute_type)
+                    && attribute.holds_media)
+                    .then(|| {
+                        crate::state::attribute_media_download_url(
+                            ctx,
+                            brand_profile_id,
+                            &attribute.name,
+                        )
+                    }),
+                attribute_name: attribute.name,
+                attribute_type: attribute.attribute_type,
+            })
+            .collect(),
+    }
+}
+
+/// `ValidationException` for an entry of `attributes` that carries content its own
+/// `attributeType` does not take: `index` is that entry's 0-based position in the list,
+/// `member` the member at fault and `instead` the one that type takes.
+///
+/// The member is reported at its path WITHIN the request — the element and then the
+/// member — so a caller sending ten attributes is told which of them to change, in the
+/// same path vocabulary and the same wording this service's constraint refusals use: a
+/// list element contributes a ONE-based `<index>.member` segment, as the framework's own
+/// constraint reports spell it.
+fn member_not_applicable(
+    index: usize,
+    member: &str,
+    attribute_type: &str,
+    instead: &str,
+) -> CreateBrandProfileAttributesError {
+    let path = format!("attributes.{}.member.{member}", index + 1);
+    let requirement =
+        format!("Member must not be specified for an attribute of type {attribute_type}; supply {instead} instead");
+    CreateBrandProfileAttributesErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+             {requirement}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            path,
+            message: requirement,
+        }]),
+    })
+    .into()
 }
