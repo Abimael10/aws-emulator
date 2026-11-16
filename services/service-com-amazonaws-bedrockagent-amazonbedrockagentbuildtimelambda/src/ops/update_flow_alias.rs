@@ -261,6 +261,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An alias's `name` is the flow's to hold once, exactly as it is at
+        // create: this operation takes a required `name`, so a rename onto a name
+        // ANOTHER alias of the same flow holds would leave two of them under it.
+        // That is the modelled `ConflictException`, worded with the name asked for
+        // and the id of the alias holding it, and nothing is written — while
+        // re-asserting the name this alias already carries is no conflict,
+        // because an alias is not its own obstacle.
+        if let Some(holder) = state
+            .flow_alias_named_other_than(flow_id, &input.name, alias_id)
+            .map(|alias| alias.alias_id.clone())
+        {
+            return Err(UpdateFlowAliasErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::flow_alias_name_conflict_message(
+                        Self::NAME,
+                        &input.name,
+                        &holder,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(record) = state.flow_alias_of_mut(flow_id, alias_id) else {
             return Err(UpdateFlowAliasErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

@@ -31,6 +31,8 @@ mod document_delete_retires_the_document;
 mod enum_value_set_order;
 #[path = "all/flow_alias_deployment.rs"]
 mod flow_alias_deployment;
+#[path = "all/flow_alias_name_uniqueness.rs"]
+mod flow_alias_name_uniqueness;
 #[path = "all/flow_alias_updates.rs"]
 mod flow_alias_updates;
 #[path = "all/flow_definition_validation.rs"]
@@ -39,6 +41,8 @@ mod flow_definition_validation;
 mod flow_deletion_cascade;
 #[path = "all/flow_draft_updates.rs"]
 mod flow_draft_updates;
+#[path = "all/flow_in_use_guards.rs"]
+mod flow_in_use_guards;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
 #[path = "all/flow_preparation.rs"]

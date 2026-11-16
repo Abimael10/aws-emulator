@@ -11,8 +11,11 @@
 //! The table below spans what the rule generalises over: how many numbered
 //! versions the deleted flow had been cut into, how many aliases had been
 //! created on it, which `FlowIdentifier` form the request names it by, and the
-//! value of `skipResourceInUseCheck` — none of which changes the outcome, since
-//! the delete's response carries only the deleted flow's id.
+//! value of `skipResourceInUseCheck` — none of which changes what an ACCEPTED
+//! delete answers, since the delete's response carries only the deleted flow's
+//! id. A flow an alias still references is accepted only once the request asks
+//! for the in-use check to be skipped; the refusal it earns with the check in
+//! force is its own table, in `tests/all/flow_in_use_guards.rs`.
 //!
 //! Every assertion here goes through the router, so it exercises the real wire
 //! path (route matching, model constraint validation, serialization) rather than
@@ -412,16 +415,16 @@ const ROWS: &[Row] = &[
         skip_in_use_check: Some(true),
     },
     Row {
-        case: "two versions and two aliases, named by ARN",
+        case: "two versions and two aliases, named by ARN, the in-use check skipped",
         versions: 2,
         aliases: 2,
         by_arn: true,
-        skip_in_use_check: None,
+        skip_in_use_check: Some(true),
     },
     Row {
-        case: "three versions and one alias, the in-use check requested",
+        case: "three versions and no alias, the in-use check requested",
         versions: 3,
-        aliases: 1,
+        aliases: 0,
         by_arn: false,
         skip_in_use_check: Some(false),
     },
@@ -665,7 +668,10 @@ async fn a_flow_created_after_a_delete_is_a_new_flow() {
         .flow_with_children(case, "recreated-flow", 2, 1)
         .await;
     let first_id = first.string(&["id"]);
-    let deleted = emulator.delete_flow(&first_id, None).await;
+    // The flow carries an alias, so the delete asks for the in-use check to be
+    // skipped: what this test is about is the id the delete freed, not the
+    // pre-condition.
+    let deleted = emulator.delete_flow(&first_id, Some(true)).await;
     assert_eq!(
         deleted.status, 200,
         "case {case}: expected DeleteFlow -> 200, got {deleted:?}"

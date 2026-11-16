@@ -217,6 +217,19 @@ pub fn flow_in_use_by_alias_conflict_message(operation: &str, alias_id: &str) ->
     )
 }
 
+/// The `ConflictException` message a create or an update answers when the alias
+/// name it asks for is one an alias of the same flow already holds.
+///
+/// Two variable parts beside the operation the caller invoked: `name`, the name
+/// the request asked for, and `alias_id`, the alias in state that already holds
+/// it — the one thing that tells the caller which alias it collided with.
+pub fn flow_alias_name_conflict_message(operation: &str, name: &str, alias_id: &str) -> String {
+    format!(
+        "Couldn't perform {operation} operation. The name {name} already exists for id \
+         {alias_id}. Retry your request with a different name."
+    )
+}
+
 /// A `ListFlowAliases` resume cursor: how many of one flow's aliases the listing
 /// has already reported, in the order
 /// [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::page_of_flow_aliases`]
@@ -302,6 +315,55 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .count()
     }
 
+    /// The alias of `flow_id` that holds `name`, or `None` when no alias of this
+    /// flow carries it.
+    ///
+    /// An alias's NAME is the caller's to choose and the flow's to hold once: a
+    /// name is unique among the aliases of ONE flow, so the search is over that
+    /// flow's aliases alone and two flows may each have an alias of the same
+    /// name. When several already shared a name the earliest-created one is
+    /// reported, so a refusal naming it names the same alias however the store
+    /// happens to be iterated.
+    pub fn flow_alias_named(&self, flow_id: &str, name: &str) -> Option<&FlowAliasRecord> {
+        self.flow_aliases
+            .values()
+            .filter(|record| record.flow_id == flow_id && record.name == name)
+            .min_by_key(|record| record.sort_key())
+    }
+
+    /// The same, for a rename: the OTHER alias of this flow that holds `name`,
+    /// which is what stops an update from leaving two aliases of one flow under
+    /// a single name. An alias is never its own obstacle, so re-asserting the
+    /// name it already carries is no conflict.
+    pub fn flow_alias_named_other_than(
+        &self,
+        flow_id: &str,
+        name: &str,
+        alias_id: &str,
+    ) -> Option<&FlowAliasRecord> {
+        self.flow_aliases
+            .values()
+            .filter(|record| {
+                record.flow_id == flow_id && record.name == name && record.alias_id != alias_id
+            })
+            .min_by_key(|record| record.sort_key())
+    }
+
+    /// The alias that still references `flow_id`, or `None` when the flow has
+    /// none.
+    ///
+    /// What USES a flow is an alias created on it, whichever version of it the
+    /// alias routes to: the alias is how a caller reaches the flow, so every one
+    /// of them is a live reference. When the flow has several the
+    /// earliest-created one is reported, so a refusal naming it names the same
+    /// alias however the store happens to be iterated.
+    pub fn flow_alias_referencing_flow(&self, flow_id: &str) -> Option<&FlowAliasRecord> {
+        self.flow_aliases
+            .values()
+            .filter(|record| record.flow_id == flow_id)
+            .min_by_key(|record| record.sort_key())
+    }
+
     /// Whether `flow_id` holds the version the modelled
     /// `FlowAliasRoutingConfigurationListItem$flowVersion` token names.
     ///
@@ -380,6 +442,27 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             page.iter().map(|record| record.to_summary()).collect(),
             next_token,
         )
+    }
+
+    /// Forget the alias `alias_id` names on `flow_id`, and the index that let a
+    /// repeated create replay it; `None` when the flow holds no alias under that
+    /// id, which is the one thing that makes a delete of it a missing resource.
+    ///
+    /// Only the alias goes: the flow it pointed at and the version it routed to
+    /// are resources of their own, which an alias never owned.
+    pub fn remove_flow_alias(
+        &mut self,
+        flow_id: &str,
+        alias_id: &str,
+    ) -> Option<FlowAliasRecord> {
+        let record = self
+            .flow_aliases
+            .remove(&(flow_id.to_string(), alias_id.to_string()))?;
+        self.flow_alias_client_tokens
+            .retain(|(aliased_flow_id, _), aliased| {
+                aliased_flow_id != flow_id || aliased != alias_id
+            });
+        Some(record)
     }
 
     /// Forget every alias of `flow_id`, and the index that let a repeated create

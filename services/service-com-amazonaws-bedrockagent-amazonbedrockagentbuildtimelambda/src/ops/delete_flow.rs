@@ -3,7 +3,10 @@
 //! @op DeleteFlow
 //!
 //! Removes the stored flow and the versions cut from it, so a following
-//! `GetFlow` answers the modelled `ResourceNotFoundException`.
+//! `GetFlow` answers the modelled `ResourceNotFoundException` — unless an alias
+//! still references the flow and the request left the in-use check in force, in
+//! which case the delete is refused with the modelled `ConflictException` and
+//! nothing is removed.
 //!
 //! ## Shape of an operation
 //!
@@ -182,11 +185,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleted, so there is no transient status for a reader to observe and
         // nothing for the clock to owe. The versions cut from the flow go with
         // it — a version is identified by the flow it belongs to.
-        //
-        // `skipResourceInUseCheck` governs deleting a flow an alias still points
-        // at; no operation in this slice can create such a reference, so no flow
-        // is ever in use and the flag changes nothing yet.
+        let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        if !state.flows.contains_key(&flow_id) {
+            return Err(DeleteFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+
+        // `skipResourceInUseCheck` is documented "By default, this value is
+        // false and deletion is stopped if the resource is in use. If you set it
+        // to true, the resource will be deleted even if the resource is in use."
+        // What uses a flow is an alias created on it — the way a caller reaches
+        // the flow, whichever of its versions the alias routes to — so the check
+        // is that reference: while one holds, the delete is refused with the
+        // modelled `ConflictException` naming the alias the caller has to deal
+        // with first, and nothing is removed.
+        if !input.skip_resource_in_use_check {
+            if let Some(alias_id) = state
+                .flow_alias_referencing_flow(&flow_id)
+                .map(|alias| alias.alias_id.clone())
+            {
+                return Err(DeleteFlowErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::flow_in_use_by_alias_conflict_message(
+                            Self::NAME,
+                            &alias_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
         let Some(record) = state.remove_flow(&flow_id) else {
             return Err(DeleteFlowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

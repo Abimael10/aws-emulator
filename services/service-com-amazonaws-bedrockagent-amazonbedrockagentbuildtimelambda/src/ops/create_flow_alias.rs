@@ -267,17 +267,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than adding another record, and `ServiceQuotaExceededException`
         // is the modelled refusal for exactly that. Checked AFTER the idempotency
         // replay above, so a retry of an accepted create is still served.
-        //
-        // No name check: the modelled `Name` carries no uniqueness constraint
-        // (only its pattern), and an alias's identity is the minted
-        // `flowAliasId` its ARN carries — so two aliases of one flow may share a
-        // name and the modelled `ConflictException` is not owed here.
         if state.flow_alias_count(&flow_id) >= crate::state::FLOW_ALIAS_QUOTA {
             return Err(CreateFlowAliasErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
                         "this flow already holds the maximum of {} aliases",
                         crate::state::FLOW_ALIAS_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An alias's `name` is the caller's to choose and the flow's to hold
+        // once: the alias's identity is the minted `flowAliasId`, but the name is
+        // what callers address a deployment by, so no two aliases of one flow may
+        // carry the same one. A create under a name an alias of this flow already
+        // holds is the modelled `ConflictException`, worded with the name asked
+        // for and the id of the alias holding it, and nothing is minted — so the
+        // flow still holds exactly one alias under that name. Checked after the
+        // idempotency replay above, so a retry of an accepted create still
+        // reports the alias it created rather than colliding with itself.
+        if let Some(holder) = state
+            .flow_alias_named(&flow_id, &input.name)
+            .map(|alias| alias.alias_id.clone())
+        {
+            return Err(CreateFlowAliasErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::flow_alias_name_conflict_message(
+                        Self::NAME,
+                        &input.name,
+                        &holder,
                     )),
                 },
             )
