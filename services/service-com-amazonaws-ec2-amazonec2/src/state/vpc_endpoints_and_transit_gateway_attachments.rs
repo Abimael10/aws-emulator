@@ -2470,6 +2470,32 @@ pub const INVALID_VPC_ENDPOINT_ID_NOT_FOUND: &str = "InvalidVpcEndpointId.NotFou
 /// `InvalidVpcEndpointId.Malformed` (HTTP 400).
 pub const INVALID_VPC_ENDPOINT_ID_MALFORMED: &str = "InvalidVpcEndpointId.Malformed";
 
+/// How a report of a `VpcEndpointId` this account holds no endpoint for NAMES the resource:
+/// the shape's own name as three title-cased words, the way AWS words the sentence
+/// [`id_not_found_message`] builds — "The Vpc Endpoint Id '…' does not exist" — rather than
+/// in the prose ("VPC endpoint ID") an operation might reach for.
+///
+/// The ONE spelling of that name, beside [`VPC_ENDPOINT_SERVICE_ID_KIND`] for the endpoint
+/// SERVICE's own id, so every operation that resolves a `VpcEndpointId` words an unknown one
+/// identically.
+pub const VPC_ENDPOINT_ID_KIND: &str = "Vpc Endpoint Id";
+
+/// Refuse a well-formed VPC endpoint id this account holds no endpoint for: HTTP 400
+/// [`INVALID_VPC_ENDPOINT_ID_NOT_FOUND`].
+///
+/// The resource is named the way AWS names it in this refusal ([`VPC_ENDPOINT_ID_KIND`]),
+/// with the id taken from the REQUEST. The ONE place this refusal is built, so every
+/// operation that resolves a `VpcEndpointId` as the SUBJECT of the call answers an unknown
+/// one identically; the BULK delete reports its own cause under
+/// [`INVALID_VPC_ENDPOINT_NOT_FOUND`] instead and does not come here.
+pub fn invalid_vpc_endpoint_id_not_found<E>(vpc_endpoint_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+        VPC_ENDPOINT_ID_KIND,
+        vpc_endpoint_id,
+    )
+}
+
 /// `InvalidVpcEndpoint.NotFound`: the code the BULK delete of VPC endpoints reports an id it
 /// resolves no endpoint for with, PER ITEM in `Unsuccessful`.
 ///

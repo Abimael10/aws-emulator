@@ -267,13 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             // The sentence is this resource's own — "The Vpc Endpoint Id '…' does not exist",
             // the wording AWS answers a describe naming an endpoint that does not exist with
-            // — built from the id the REQUEST named. That spelling of the resource noun is
-            // why this one does not go through [`crate::state::id_not_found`].
-            return Err(crate::scaffolded::Scaffolded::service_error(
-                state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
-                400,
-                format!("The Vpc Endpoint Id '{unknown}' does not exist"),
-            ));
+            // — built from the id the REQUEST named, by the one writer of that refusal
+            // ([`crate::state::invalid_vpc_endpoint_id_not_found`]).
+            return Err(state::invalid_vpc_endpoint_id_not_found(unknown));
         }
 
         // "The default is to describe all your VPC endpoints": `VpcEndpointIds` narrows the

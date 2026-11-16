@@ -265,11 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|endpoint_id| !store.vpc_endpoints.contains_key(**endpoint_id))
         {
-            return Err(state::id_not_found(
-                state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
-                "VPC endpoint ID",
-                unknown,
-            ));
+            // The sentence every reader of a `VpcEndpointId` in this crate answers an
+            // unresolvable one with, built from the id the REQUEST named
+            // ([`crate::state::invalid_vpc_endpoint_id_not_found`]).
+            return Err(state::invalid_vpc_endpoint_id_not_found(unknown));
         }
 
         // Every association of the account by default; `VpcEndpointIds` narrows the store to

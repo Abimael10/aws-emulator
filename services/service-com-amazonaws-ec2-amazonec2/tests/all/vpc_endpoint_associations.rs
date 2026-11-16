@@ -958,7 +958,7 @@ async fn the_endpoint_ids_narrow_the_report_to_the_associations_of_those_endpoin
             "case {case:?}: expected InvalidVpcEndpointId.NotFound, got {body}"
         );
         assert!(
-            error_message(&body).contains(&format!("The VPC endpoint ID '{unknown}' does not exist")),
+            error_message(&body).contains(&format!("The Vpc Endpoint Id '{unknown}' does not exist")),
             "case {case:?}: the refusal must name the id, got {body}"
         );
     }

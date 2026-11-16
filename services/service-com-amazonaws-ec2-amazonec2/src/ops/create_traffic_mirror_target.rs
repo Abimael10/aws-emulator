@@ -145,13 +145,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            id_not_found, idempotent_parameter_mismatch, invalid_id_message,
+            idempotent_parameter_mismatch, invalid_id_message,
             invalid_network_interface_id_malformed, invalid_network_interface_id_not_found,
-            invalid_parameter_combination, load_balancer_arn_is_well_formed,
-            network_interface_id_is_well_formed, require_service_state,
-            tags_from_specifications, traffic_mirror_target_limit_exceeded,
-            vpc_endpoint_id_is_well_formed, TrafficMirrorTargetRoom,
-            INVALID_VPC_ENDPOINT_ID_MALFORMED, INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+            invalid_parameter_combination, invalid_vpc_endpoint_id_not_found,
+            load_balancer_arn_is_well_formed, network_interface_id_is_well_formed,
+            require_service_state, tags_from_specifications,
+            traffic_mirror_target_limit_exceeded, vpc_endpoint_id_is_well_formed,
+            TrafficMirrorTargetRoom, INVALID_VPC_ENDPOINT_ID_MALFORMED,
             MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
             TRAFFIC_MIRROR_TARGET_TAGGABLE_RESOURCE,
             TRAFFIC_MIRROR_TARGET_TYPE_GATEWAY_LOAD_BALANCER_ENDPOINT,
@@ -301,11 +301,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(gateway_load_balancer_endpoint_id)
             else {
                 // The sentence this service answers a named endpoint it cannot resolve with,
-                // as `DescribeVpcEndpoints` words it: the shape's noun spelt `Vpc Endpoint
-                // Id`, carrying the id the REQUEST named.
-                return Err(id_not_found(
-                    INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
-                    "Vpc Endpoint Id",
+                // as every reader of a `VpcEndpointId` words it: the shape's noun spelt `Vpc
+                // Endpoint Id`, carrying the id the REQUEST named
+                // ([`invalid_vpc_endpoint_id_not_found`]).
+                return Err(invalid_vpc_endpoint_id_not_found(
                     gateway_load_balancer_endpoint_id,
                 ));
             };

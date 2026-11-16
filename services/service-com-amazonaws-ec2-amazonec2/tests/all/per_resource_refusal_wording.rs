@@ -13,7 +13,8 @@
 //! * a class whose sentence names the resource in ITS OWN words keeps those words, whichever
 //!   operation answers it: the transit gateway family's `<Resource> <id> was deleted or does
 //!   not exist.` for the attachments the transit gateway owns as resources, the endpoint
-//!   service's `VpcEndpointService Id`, and the network interface's `interface ID`;
+//!   service's `VpcEndpointService Id`, the VPC endpoint's own `Vpc Endpoint Id`, and the
+//!   network interface's `interface ID`;
 //! * where EC2 answers ONE refusal class with two sentences, each operation keeps the one its
 //!   own validator words: a client VPN attachment — the Client VPN endpoint's resource, not the
 //!   transit gateway's — keeps the service's shared `<kind> ID '<id>'` template, and so do the
@@ -48,8 +49,8 @@ use service_com_amazonaws_ec2_amazonec2::state::{
     INVALID_ADDRESS_NOT_FOUND, INVALID_AMI_ID_MALFORMED, INVALID_HOST_CONFIGURATION,
     INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED, INVALID_NETWORK_INTERFACE_ID_MALFORMED,
     INVALID_REQUEST, INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-    INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND, INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
-    availability_zones_in_region,
+    INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND, INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+    INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND, availability_zones_in_region,
 };
 
 use super::ec2_query::{call, emulator, error_code, error_message};
@@ -223,6 +224,78 @@ fn unknown_endpoint_service_rows() -> Vec<Row> {
             withheld: None,
         })
         .collect()
+}
+
+/// Class 3b: a VPC ENDPOINT id this account holds no endpoint for — the endpoint's own id,
+/// not its service's — through every operation that resolves one.
+///
+/// The sentence names the resource in AWS's own words, the shape's name as three title-cased
+/// words (`Vpc Endpoint Id`), and interpolates only the id, single-quoted, from the member of
+/// the request that carried it. One wording for the class, so which operation asked and which
+/// member named the id change nothing; `DeleteVpcEndpoints` is not here because a bulk delete
+/// reports an unresolvable id per item under its own code and sentence.
+fn unknown_vpc_endpoint_rows() -> Vec<Row> {
+    // The SNS topic a connection notification watches an endpoint through: a member that
+    // operation reads before it resolves the endpoint id, so the row reaches this refusal.
+    let topic = format!(
+        "arn:aws:sns:{REGION}:{account}:endpoint-events",
+        account = engine::emulator_account_id()
+    );
+    // Every operation that resolves a `VpcEndpointId` as the subject of the call, with the
+    // member it names the id by and whatever else the request must carry to reach the lookup —
+    // a list member for the two describes, a scalar for the rest, and the Gateway Load Balancer
+    // endpoint of a traffic mirror target, which is the same id under another member's name.
+    let callers: Vec<(&'static str, &'static str, Params)> = vec![
+        ("DescribeVpcEndpoints", "VpcEndpointId.1", Vec::new()),
+        (
+            "DescribeVpcEndpointAssociations",
+            "VpcEndpointId.1",
+            Vec::new(),
+        ),
+        (
+            "ModifyVpcEndpoint",
+            "VpcEndpointId",
+            vec![p("ResetPolicy", "true")],
+        ),
+        (
+            "CreateVpcEndpointConnectionNotification",
+            "VpcEndpointId",
+            vec![
+                p("ConnectionNotificationArn", &topic),
+                p("ConnectionEvents.1", "Accept"),
+            ],
+        ),
+        (
+            "CreateTrafficMirrorTarget",
+            "GatewayLoadBalancerEndpointId",
+            Vec::new(),
+        ),
+    ];
+    // Both published id lengths — 17 and 8 lowercase hexadecimal digits — and, within the long
+    // form, the all-zero id a client reaches for as a placeholder, a mixed-digit one and an
+    // all-`f` one: WELL FORMED ids, so each is this refusal rather than the malformed one.
+    let ids = [
+        "vpce-00000000000000000",
+        "vpce-0a1b2c3d4e5f60718",
+        "vpce-fffffffffffffffff",
+        "vpce-0a1b2c3d",
+    ];
+    let mut rows = Vec::new();
+    for (action, member, extra) in callers {
+        for id in ids {
+            let mut params = vec![p(member, id)];
+            params.extend(extra.iter().cloned());
+            rows.push(Row {
+                case: format!("{action} naming the unheld endpoint {id} in {member}"),
+                action,
+                params,
+                code: INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+                message: format!("The Vpc Endpoint Id '{id}' does not exist"),
+                withheld: None,
+            });
+        }
+    }
+    rows
 }
 
 /// Class 4: an Elastic IP address this account holds no allocation for — one sentence for that
@@ -481,6 +554,7 @@ fn rows() -> Vec<Row> {
     rows.extend(unknown_attachment_rows());
     rows.extend(malformed_attachment_rows());
     rows.extend(unknown_endpoint_service_rows());
+    rows.extend(unknown_vpc_endpoint_rows());
     rows.extend(unknown_address_rows());
     rows.extend(both_host_dimensions_rows());
     rows.extend(malformed_interface_rows());

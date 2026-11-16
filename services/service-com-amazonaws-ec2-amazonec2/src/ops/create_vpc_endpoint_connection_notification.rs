@@ -238,11 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(vpc_endpoint_id) = input.vpc_endpoint_id.as_deref() {
             if !store.vpc_endpoints.contains_key(vpc_endpoint_id) {
-                return Err(state::id_not_found(
-                    state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
-                    "VpcEndpoint Id",
-                    vpc_endpoint_id,
-                ));
+                return Err(state::invalid_vpc_endpoint_id_not_found(vpc_endpoint_id));
             }
         }
 
