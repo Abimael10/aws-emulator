@@ -39,9 +39,9 @@ use crate::emulator::{Warehouses, REGION};
 /// The `source`, `detail-type` and bus the Data API's statement events travel on,
 /// spelled out here rather than imported from the service crate, so a wrong
 /// constant in the implementation cannot make this suite pass.
-const EVENT_SOURCE: &str = "aws.redshift-data";
-const DETAIL_TYPE: &str = "Redshift Data Statement Status Change";
-const DEFAULT_BUS: &str = "default";
+pub(crate) const EVENT_SOURCE: &str = "aws.redshift-data";
+pub(crate) const DETAIL_TYPE: &str = "Redshift Data Statement Status Change";
+pub(crate) const DEFAULT_BUS: &str = "default";
 
 /// The warehouse every row that names a cluster runs on, and the database both
 /// warehouses are created with.
@@ -62,10 +62,10 @@ const TERMINAL_STATUSES: [&str; 3] = ["FINISHED", "FAILED", "ABORTED"];
 /// Generous beside the engine's own execution bound, which is what decides when a
 /// statement stops: a poll here gives up because the emulator never produced what
 /// it waited for, and never because the machine running the test was busy.
-const POLL_BUDGET: Duration = Duration::from_secs(180);
+pub(crate) const POLL_BUDGET: Duration = Duration::from_secs(180);
 
 /// How long to wait between two polls.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Which kind of warehouse a row's statement runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,7 +218,7 @@ fn submit_request(row: &Row) -> Value {
 /// EventBridge makes a target's send as its own service principal and "relies on
 /// resource-based policies" for a queue, so a queue that granted it nothing
 /// receives nothing.
-async fn given_queue(emulator: &Warehouses, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(emulator: &Warehouses, name: &str) -> (String, String) {
     let created = emulator
         .sqs_ok("CreateQueue", &json!({"QueueName": name}))
         .await;
@@ -255,9 +255,19 @@ async fn given_queue(emulator: &Warehouses, name: &str) -> (String, String) {
     (url, arn)
 }
 
-/// An ENABLED rule on the default bus carrying `pattern`, with `queue_arn` as its
-/// one target.
-async fn given_rule(emulator: &Warehouses, name: &str, pattern: &Value, queue_arn: &str) {
+/// An ENABLED rule on the default bus carrying `pattern`, with `target_arns` as
+/// its targets, in the order given.
+pub(crate) async fn given_rule(
+    emulator: &Warehouses,
+    name: &str,
+    pattern: &Value,
+    target_arns: &[&str],
+) {
+    let targets: Vec<Value> = target_arns
+        .iter()
+        .enumerate()
+        .map(|(slot, arn)| json!({"Id": format!("target-{slot}"), "Arn": arn}))
+        .collect();
     emulator
         .events_ok(
             "PutRule",
@@ -275,7 +285,7 @@ async fn given_rule(emulator: &Warehouses, name: &str, pattern: &Value, queue_ar
             &json!({
                 "Rule": name,
                 "EventBusName": DEFAULT_BUS,
-                "Targets": [{"Id": "statement-events", "Arn": queue_arn}],
+                "Targets": targets,
             }),
         )
         .await;
@@ -287,12 +297,12 @@ async fn given_rule(emulator: &Warehouses, name: &str, pattern: &Value, queue_ar
 }
 
 /// The rule every statement event of this service matches.
-fn statement_event_pattern() -> Value {
+pub(crate) fn statement_event_pattern() -> Value {
     json!({"source": [EVENT_SOURCE], "detail-type": [DETAIL_TYPE]})
 }
 
 /// Every envelope now waiting on the queue at `url`.
-async fn drain(emulator: &Warehouses, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(emulator: &Warehouses, url: &str) -> Vec<Value> {
     let received = emulator
         .sqs_ok(
             "ReceiveMessage",
@@ -313,7 +323,7 @@ async fn drain(emulator: &Warehouses, url: &str) -> Vec<Value> {
 
 /// Collect envelopes off the queue at `url` until `wanted` have arrived or
 /// [`POLL_BUDGET`] passes.
-async fn collect(emulator: &Warehouses, url: &str, wanted: usize) -> Vec<Value> {
+pub(crate) async fn collect(emulator: &Warehouses, url: &str, wanted: usize) -> Vec<Value> {
     let started = Instant::now();
     let mut arrived: Vec<Value> = Vec::new();
     while arrived.len() < wanted && started.elapsed() < POLL_BUDGET {
@@ -327,7 +337,7 @@ async fn collect(emulator: &Warehouses, url: &str, wanted: usize) -> Vec<Value> 
 
 /// Poll `id` until it reports a terminal status, and answer the record that
 /// reported it.
-async fn wait_for_terminal(emulator: &Warehouses, case: &str, id: &str) -> Value {
+pub(crate) async fn wait_for_terminal(emulator: &Warehouses, case: &str, id: &str) -> Value {
     let started = Instant::now();
     loop {
         let described = emulator
@@ -468,14 +478,14 @@ async fn a_with_event_submission_is_announced_and_delivered_to_its_sqs_target() 
         &emulator,
         "statement-status-changes",
         &statement_event_pattern(),
-        &matching_arn,
+        &[matching_arn.as_str()],
     )
     .await;
     given_rule(
         &emulator,
         "another-services-events",
         &json!({"source": ["aws.ecs"], "detail-type": ["ECS Task State Change"]}),
-        &other_arn,
+        &[other_arn.as_str()],
     )
     .await;
 
@@ -580,7 +590,7 @@ async fn cancelling_a_with_event_statement_announces_that_it_was_aborted() {
         &emulator,
         "statement-status-changes",
         &statement_event_pattern(),
-        &queue_arn,
+        &[queue_arn.as_str()],
     )
     .await;
 

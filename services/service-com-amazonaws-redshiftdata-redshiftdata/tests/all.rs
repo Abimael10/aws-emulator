@@ -65,6 +65,9 @@ mod session_parameters;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/statement_event_target_wiring.rs"]
+mod statement_event_target_wiring;
+
 #[path = "all/statement_lifecycle.rs"]
 mod statement_lifecycle;
 
