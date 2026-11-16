@@ -84,6 +84,16 @@ const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 /// One emulator: Backup, DynamoDB, EventBridge and SQS mounted on ONE shared engine, each
 /// claiming only requests scoped to its own signing name.
 fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same four services on one engine, with the engine handle KEPT.
+///
+/// `pub(crate)` for the sibling suite covering what a REFUSED restore publishes
+/// (`restore_refusal_publishes_no_restore_event.rs`), which has to see what that call
+/// stored; [`emulator`] delegates here, so the services mounted are one list rather than
+/// two that can drift apart.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -99,9 +109,9 @@ fn emulator() -> MultiServiceRouter {
         service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(&engine)),
     );
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// Create the DynamoDB table a case backs up, and answer the ARN DynamoDB gives it: the

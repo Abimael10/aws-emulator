@@ -103,6 +103,8 @@ mod restore_job_listing_pages;
 mod restore_job_state_change_events;
 #[path = "all/restore_metadata_validation.rs"]
 mod restore_metadata_validation;
+#[path = "all/restore_refusal_publishes_no_restore_event.rs"]
+mod restore_refusal_publishes_no_restore_event;
 #[path = "all/restore_testing_plan.rs"]
 mod restore_testing_plan;
 #[path = "all/scheduled_runs_preview.rs"]
