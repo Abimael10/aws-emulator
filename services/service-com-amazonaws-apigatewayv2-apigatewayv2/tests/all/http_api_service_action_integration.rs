@@ -31,7 +31,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_form::form_encode;
 
-/// The Region every request below is signed for.
+/// The Region every request below is signed for, unless a suite reaching this estate
+/// through another endpoint names one of its own ([`Emulator::at_endpoint`]).
 const REGION: &str = "us-east-1";
 
 /// The access-key id standing for the account's own published credential: neither the token
@@ -40,16 +41,16 @@ const REGION: &str = "us-east-1";
 const ACCOUNT_KEY: &str = "AKIDEMULATOR";
 
 /// The role an integration below names, and the inline policy this suite writes on it.
-const ROLE_NAME: &str = "apigateway-publishes-events";
+pub(crate) const ROLE_NAME: &str = "apigateway-publishes-events";
 const INLINE_POLICY: &str = "inline";
 
 /// The actions a statement on that role names.
-const PUT_EVENTS_ACTION: &str = "events:PutEvents";
+pub(crate) const PUT_EVENTS_ACTION: &str = "events:PutEvents";
 const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 
 /// The custom bus an integration publishes onto, and the rule that carries this suite's
 /// control queue on it.
-const BUS: &str = "orders-bus";
+pub(crate) const BUS: &str = "orders-bus";
 const RULE: &str = "matching";
 const NEAR_MISS_RULE: &str = "near-miss";
 const TARGET_ID: &str = "t1";
@@ -77,26 +78,40 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 /// REFUSED: that service's own answer, passed through — EventBridge's `AccessDeniedException`
 /// is its modelled 400 (`smithy_query(query="shape", shape="AccessDeniedException")` on the
 /// EventBridge model).
-const ACTION_REFUSED: u16 = 400;
+pub(crate) const ACTION_REFUSED: u16 = 400;
 
 /// The error that service's own document names for a publication the policies in force do
 /// not permit.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The session name API Gateway opens an integration role's session under, which is what the
 /// relayed refusal names as the principal.
-const SESSION_NAME: &str = "BackplaneAssumeRoleSession";
+pub(crate) const SESSION_NAME: &str = "BackplaneAssumeRoleSession";
 
 /// This service, EventBridge, Amazon SQS, IAM and the token service over ONE shared engine,
 /// as `core/router/src/lib.rs` mounts them: the action an integration performs is dispatched
 /// back into this same router, so the bus it publishes onto is the bus this suite put a rule
 /// on.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The Region every call below is signed for, and the Region in the hosts of the other
+    /// services this estate holds.
+    region: String,
+    /// The endpoint the CONTROL-PLANE client is configured with: the `Host` its calls carry.
+    /// A value this service ANNOUNCES follows the endpoint the request came in on, so which
+    /// address an api is published at is a function of this.
+    control_endpoint: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
+        Self::at_endpoint(&format!("apigateway.{REGION}.amazonaws.com"), REGION)
+    }
+
+    /// The same estate reached by a client configured with `control_endpoint` and signing for
+    /// `region` — the emulator's own loopback endpoint for a client that resolves nothing
+    /// else, or one of AWS's own service hosts for a client that does ([`new`](Self::new)).
+    pub(crate) fn at_endpoint(control_endpoint: &str, region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -124,15 +139,20 @@ impl Emulator {
                 engine,
             ),
         );
-        Self { router }
+        Self {
+            router,
+            region: region.to_string(),
+            control_endpoint: control_endpoint.to_string(),
+        }
     }
 
     /// A SigV4 `Authorization` whose credential scope names `service`, which is what routes
     /// the request. The signature is never checked here.
-    fn authorization(service: &str) -> String {
+    fn authorization(&self, service: &str) -> String {
         format!(
-            "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{REGION}/{service}/\
-             aws4_request, SignedHeaders=host, Signature=not-verified"
+            "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{}/{service}/\
+             aws4_request, SignedHeaders=host, Signature=not-verified",
+            self.region
         )
     }
 
@@ -150,13 +170,16 @@ impl Emulator {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+            .header(
+                "host",
+                format!("{signing_name}.{}.amazonaws.com", self.region),
+            )
             .header(
                 "content-type",
                 format!("application/x-amz-json-{json_version}"),
             )
             .header("x-amz-target", format!("{target_prefix}.{operation}"))
-            .header("authorization", Self::authorization(signing_name))
+            .header("authorization", self.authorization(signing_name))
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
@@ -176,7 +199,7 @@ impl Emulator {
     }
 
     /// One EventBridge call that must be served (`awsJson1_1`, `AWSEvents.<Operation>`).
-    async fn events(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn events(&self, case: &str, operation: &str, body: &Value) -> Value {
         self.rpc(case, "events", "AWSEvents", "1.1", operation, body)
             .await
     }
@@ -200,7 +223,7 @@ impl Emulator {
             .method("POST")
             .uri("https://iam.amazonaws.com/")
             .header("content-type", "application/x-www-form-urlencoded")
-            .header("authorization", Self::authorization("iam"))
+            .header("authorization", self.authorization("iam"))
             .body(bytes::Bytes::from(body))
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
@@ -214,18 +237,23 @@ impl Emulator {
 
     /// One control-plane call against this service (`restJson1` under `/v2`), as its status
     /// and parsed body.
-    async fn control(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn control(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let payload = match &body {
             Some(value) => bytes::Bytes::from(value.to_string()),
             None => bytes::Bytes::new(),
         };
-        let host = format!("apigateway.{REGION}.amazonaws.com");
+        let host = self.control_endpoint.clone();
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://{host}{uri}"))
             .header("host", host)
             .header("content-type", "application/json")
-            .header("authorization", Self::authorization("apigateway"))
+            .header("authorization", self.authorization("apigateway"))
             .body(payload)
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
@@ -241,8 +269,14 @@ impl Emulator {
     }
 
     /// An api with one integration, one route over it and the `$default` stage with
-    /// auto-deploy on; answers `(ApiId, the host its ApiEndpoint names)`.
-    async fn api(&self, case: &str, integration: Value, route_key: &str) -> (String, String) {
+    /// auto-deploy on; answers `(ApiId, the address its ApiEndpoint announces)` — the value a
+    /// client builds its invoke URL from, which [`invoke`](Self::invoke) takes as it stands.
+    pub(crate) async fn api(
+        &self,
+        case: &str,
+        integration: Value,
+        route_key: &str,
+    ) -> (String, String) {
         let (status, api) = self
             .control(
                 "POST",
@@ -255,12 +289,7 @@ impl Emulator {
             "case {case:?}: CreateApi answered {status} {api}"
         );
         let api_id = api["apiId"].as_str().unwrap_or_default().to_string();
-        let host = api["apiEndpoint"]
-            .as_str()
-            .unwrap_or_default()
-            .split_once("://")
-            .map(|(_scheme, rest)| rest.to_string())
-            .unwrap_or_default();
+        let announced = api["apiEndpoint"].as_str().unwrap_or_default().to_string();
         let (status, created) = self
             .control(
                 "POST",
@@ -302,20 +331,21 @@ impl Emulator {
             status, 201,
             "case {case:?}: CreateStage answered {status} {stage}"
         );
-        (api_id, host)
+        (api_id, announced)
     }
 
     /// One client request to a route of the deployed stage, carrying `body` — the invoke the
-    /// integration is performed for. No credential: the route's `AuthorizationType` is the
+    /// integration is performed for. `endpoint` is the address the api ANNOUNCED and `path`
+    /// what the client appends to it. No credential: the route's `AuthorizationType` is the
     /// default `NONE`.
-    async fn invoke(
+    pub(crate) async fn invoke(
         &self,
-        host: &str,
+        endpoint: &str,
         path: &str,
         headers: &[(&str, &str)],
         body: &str,
     ) -> (u16, Value) {
-        let (status, _media_type, parsed) = self.answered(host, path, headers, body).await;
+        let (status, _media_type, parsed) = self.answered(endpoint, path, headers, body).await;
         (status, parsed)
     }
 
@@ -323,15 +353,17 @@ impl Emulator {
     /// the half of the answer that says which wire form the document is stated in.
     async fn answered(
         &self,
-        host: &str,
+        endpoint: &str,
         path: &str,
         headers: &[(&str, &str)],
         body: &str,
     ) -> (u16, String, Value) {
+        let (authority, base_path) =
+            crate::http_api_published_invoke_address::announced_parts(endpoint);
         let mut builder = http::Request::builder()
             .method("POST")
-            .uri(format!("https://{host}{path}"))
-            .header("host", host)
+            .uri(format!("https://{authority}{base_path}{path}"))
+            .header("host", authority.as_str())
             .header("content-type", "application/json");
         for (name, value) in headers {
             builder = builder.header(*name, *value);
@@ -360,7 +392,7 @@ impl Emulator {
     /// The role an integration's `CredentialsArn` names, trusted by API Gateway and carrying
     /// `statements` as its inline identity policy — written with IAM's own operations, so the
     /// role a session is minted of is the record `iam:CreateRole` wrote. Answers its ARN.
-    async fn role(&self, case: &str, statements: Option<Value>) -> String {
+    pub(crate) async fn role(&self, case: &str, statements: Option<Value>) -> String {
         let trust = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -438,7 +470,12 @@ impl Emulator {
     /// The custom bus, a rule on it matching exactly `(source, detail_type)` with its own
     /// queue, and a NEAR-MISS rule differing from it only in the letter case of the detail
     /// type, with a queue of its own. Answers `(matching queue url, near-miss queue url)`.
-    async fn bus_with_rules(&self, case: &str, source: &str, detail_type: &str) -> (String, String) {
+    pub(crate) async fn bus_with_rules(
+        &self,
+        case: &str,
+        source: &str,
+        detail_type: &str,
+    ) -> (String, String) {
         self.events(case, "CreateEventBus", &json!({ "Name": BUS }))
             .await;
         let (matching_url, matching_arn) = self.queue(case, "matching-queue").await;
@@ -509,7 +546,7 @@ impl Emulator {
     }
 
     /// Every message waiting on the queue at `url`, as its parsed body, taken off it.
-    async fn drained(&self, case: &str, url: &str) -> Vec<Value> {
+    pub(crate) async fn drained(&self, case: &str, url: &str) -> Vec<Value> {
         self.received(case, url)
             .await
             .iter()
@@ -548,7 +585,7 @@ fn role_arn() -> String {
 
 /// The integration an api below carries: the first-class subtype `subtype`, performed under
 /// `credentials_arn`, with `request_parameters` mapping the action's parameters.
-fn subtype_integration(
+pub(crate) fn subtype_integration(
     subtype: &str,
     credentials_arn: Option<&str>,
     request_parameters: Value,
@@ -567,7 +604,7 @@ fn subtype_integration(
 
 /// A statement granting `action` on every resource, which is what an integration's role
 /// needs to perform the action the subtype names.
-fn grant(action: &str) -> Value {
+pub(crate) fn grant(action: &str) -> Value {
     json!([{ "Effect": "Allow", "Action": action, "Resource": "*" }])
 }
 
@@ -705,7 +742,7 @@ async fn a_subtype_route_publishes_the_event_its_request_parameters_map() {
         let emulator = Emulator::new();
         let role = emulator.role(case, Some(grant(PUT_EVENTS_ACTION))).await;
         let (matching, near_miss) = emulator.bus_with_rules(case, row.source, row.detail_type).await;
-        let host = emulator
+        let endpoint = emulator
             .api(
                 case,
                 subtype_integration("EventBridge-PutEvents", Some(&role), (row.parameters)()),
@@ -714,7 +751,7 @@ async fn a_subtype_route_publishes_the_event_its_request_parameters_map() {
             .await
             .1;
         let (status, media_type, answered) = emulator
-            .answered(&host, row.path, row.headers, row.body)
+            .answered(&endpoint, row.path, row.headers, row.body)
             .await;
         assert_eq!(
             status, 200,
@@ -806,7 +843,7 @@ async fn a_subtype_route_performs_the_action_as_the_role_its_credentials_arn_nam
         let (matching, _near_miss) = emulator
             .bus_with_rules(case, "app.orders", "OrderPlaced")
             .await;
-        let (_api_id, host) = emulator
+        let (_api_id, endpoint) = emulator
             .api(
                 case,
                 subtype_integration(
@@ -823,7 +860,7 @@ async fn a_subtype_route_performs_the_action_as_the_role_its_credentials_arn_nam
             )
             .await;
         let (status, answered) = emulator
-            .invoke(&host, "/orders", &[], r#"{"id":"o-1"}"#)
+            .invoke(&endpoint, "/orders", &[], r#"{"id":"o-1"}"#)
             .await;
         let expected_status = if *performed { 200 } else { ACTION_REFUSED };
         assert_eq!(
@@ -905,7 +942,7 @@ async fn the_action_a_subtype_route_performs_is_the_one_its_subtype_names() {
         let emulator = Emulator::new();
         let role = emulator.role(case, Some(grant(SEND_MESSAGE_ACTION))).await;
         let (url, _arn) = emulator.queue(case, "sent-to").await;
-        let host = emulator
+        let endpoint = emulator
             .api(
                 case,
                 subtype_integration(subtype, Some(&role), parameters(&url)),
@@ -914,7 +951,7 @@ async fn the_action_a_subtype_route_performs_is_the_one_its_subtype_names() {
             .await
             .1;
         let (status, answered) = emulator
-            .invoke(&host, "/orders", &[], r#"{"note":"placed"}"#)
+            .invoke(&endpoint, "/orders", &[], r#"{"note":"placed"}"#)
             .await;
         let expected_status = if expected.is_some() {
             200
@@ -1028,7 +1065,7 @@ async fn a_subtype_route_answers_the_document_the_serving_service_answered() {
             Queue::Standard => emulator.queue(case, "sent-to").await.0,
             Queue::Fifo => emulator.fifo_queue(case, "sent-to.fifo").await,
         };
-        let host = emulator
+        let endpoint = emulator
             .api(
                 case,
                 subtype_integration("SQS-SendMessage", Some(&role), (row.parameters)(&url)),
@@ -1037,7 +1074,7 @@ async fn a_subtype_route_answers_the_document_the_serving_service_answered() {
             .await
             .1;
         let (status, media_type, answered) =
-            emulator.answered(&host, "/send", &[], row.body).await;
+            emulator.answered(&endpoint, "/send", &[], row.body).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the action's own answer, got {status} {answered}"
@@ -1159,7 +1196,7 @@ async fn a_request_that_cannot_satisfy_a_required_mapping_is_refused() {
         let emulator = Emulator::new();
         let role = emulator.role(case, Some(grant(SEND_MESSAGE_ACTION))).await;
         let (url, _arn) = emulator.queue(case, "sent-to").await;
-        let host = emulator
+        let endpoint = emulator
             .api(
                 case,
                 subtype_integration("SQS-SendMessage", Some(&role), (row.parameters)(&url)),
@@ -1167,7 +1204,7 @@ async fn a_request_that_cannot_satisfy_a_required_mapping_is_refused() {
             )
             .await
             .1;
-        let (status, answered) = emulator.invoke(&host, "/send", &[], row.body).await;
+        let (status, answered) = emulator.invoke(&endpoint, "/send", &[], row.body).await;
         let expected_status = if row.queued.is_some() {
             200
         } else {

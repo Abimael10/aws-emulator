@@ -131,6 +131,8 @@ mod http_api_payload_quota;
 mod http_api_published_endpoint_authorized_cors;
 #[path = "all/http_api_published_endpoint_reporters.rs"]
 mod http_api_published_endpoint_reporters;
+#[path = "all/http_api_published_endpoint_service_action.rs"]
+mod http_api_published_endpoint_service_action;
 #[path = "all/http_api_published_invoke_address.rs"]
 mod http_api_published_invoke_address;
 #[path = "all/http_api_request_authorizer.rs"]

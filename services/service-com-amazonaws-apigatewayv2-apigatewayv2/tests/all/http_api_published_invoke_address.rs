@@ -111,7 +111,7 @@ fn rows() -> Vec<Row> {
 
 /// The announced endpoint split into the authority a client dials and the path it carries
 /// ahead of the stage — empty for an endpoint that is a bare host.
-fn announced_parts(announced: &str) -> (String, String) {
+pub(crate) fn announced_parts(announced: &str) -> (String, String) {
     let without_scheme = announced
         .split_once("://")
         .map_or(announced, |(_scheme, rest)| rest);
@@ -124,13 +124,33 @@ fn announced_parts(announced: &str) -> (String, String) {
     }
 }
 
+/// The authority and base path the api of `api_id` must be ANNOUNCED on, for a control-plane
+/// request that reached `endpoint` and was signed for `region`.
+///
+/// Which address that is follows the client the request came from: a client that resolves
+/// nothing but the emulator's own endpoint (`reaches_only_the_emulator`) is announced that
+/// endpoint with the api behind the reserved data-plane path, and a client that resolves AWS's
+/// own hostnames is announced the api's own documented `execute-api` host. The one reading of
+/// the rule, shared with the sibling suite that drives a first-class service action through
+/// the announced address, so the two cannot drift apart.
+pub(crate) fn expected_announced_parts(
+    reaches_only_the_emulator: bool,
+    endpoint: &str,
+    region: &str,
+    api_id: &str,
+) -> (String, String) {
+    if reaches_only_the_emulator {
+        (endpoint.to_string(), format!("/_aws/execute-api/{api_id}"))
+    } else {
+        (
+            format!("{api_id}.execute-api.{region}.amazonaws.com"),
+            String::new(),
+        )
+    }
+}
+
 /// Assert `announced` is the address this emulator serves the api at, and answer the
 /// authority and base path a client builds its invoke URL from.
-///
-/// Which address that is follows the client the control-plane request came from: a client
-/// that resolves nothing but the emulator's own endpoint is announced that endpoint with the
-/// api behind the reserved data-plane path, and a client that resolves AWS's own hostnames
-/// is announced the api's own documented `execute-api` host.
 fn assert_announced(row: &Row, reporter: &str, api_id: &str, announced: &str) -> (String, String) {
     let scheme = "https://";
     assert!(
@@ -140,14 +160,8 @@ fn assert_announced(row: &Row, reporter: &str, api_id: &str, announced: &str) ->
         row.case
     );
     let (authority, base_path) = announced_parts(announced);
-    let (expected_authority, expected_base_path) = if row.reaches_only_the_emulator {
-        (row.host.to_string(), format!("/_aws/execute-api/{api_id}"))
-    } else {
-        (
-            format!("{api_id}.execute-api.{}.amazonaws.com", row.region),
-            String::new(),
-        )
-    };
+    let (expected_authority, expected_base_path) =
+        expected_announced_parts(row.reaches_only_the_emulator, row.host, row.region, api_id);
     assert_eq!(
         authority, expected_authority,
         "case {:?}: {reporter} must announce the api on {expected_authority}, got \
