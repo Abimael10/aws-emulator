@@ -403,9 +403,11 @@ pub(super) fn applicable_tags(propagated: &[(String, String)]) -> Vec<(String, S
 ///
 /// The three records CloudFormation keeps about a resource it provisioned
 /// ([`is_stack_provenance_tag`]) TRAVEL, so the owning service's own read of the handle a
-/// stack publishes reports them; every OTHER reserved key is a caller's to have supplied and
-/// is dropped here rather than sent to a call that would refuse the resource outright,
-/// because a deployment must not fail over tags a template merely spelled.
+/// stack publishes reports them. Every OTHER reserved key is filtered out here as well,
+/// though no declaration reaches this point carrying one: a declaration claiming a key of
+/// that namespace fails the resource before any of this
+/// ([`super::stack_tags::declared_resource_tag_refusal`]), so what this filter keeps out is a
+/// key that got into the propagated set by some other route.
 ///
 /// The ONE reading of that split for the per-type providers beside this algorithm, so a later
 /// change to it cannot be applied to some of them and not the rest. A provider whose owning
@@ -2258,6 +2260,35 @@ pub async fn reconcile(
                     outcome.resources.push(resource);
                     continue;
                 }
+                // A changed declaration may no more claim a key in the reserved namespace
+                // than the one that created the resource could: the change fails carrying the
+                // same sentence and the owning service is not asked to apply it, for the
+                // reason the create's own gate records
+                // ([`super::stack_tags::declared_resource_tag_refusal`]).
+                if let Some(reason) =
+                    super::stack_tags::declared_resource_tag_refusal(&deployed_properties)
+                {
+                    failed.push((resource.logical_id.clone(), super::failed_action::UPDATE));
+                    outcome.transitions.push(
+                        ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_FAILED,
+                            Some(reason.to_string()),
+                        )
+                        .applying(&declared_properties),
+                    );
+                    Box::pin(roll_back_failed_resource(
+                        ctx,
+                        region,
+                        stack,
+                        &mut resource,
+                        existing,
+                        &mut outcome,
+                    ))
+                    .await;
+                    outcome.resources.push(resource);
+                    continue;
+                }
                 let applied = match owner_for(&resource.resource_type) {
                     Some(provisioner) => {
                         // A change that hands an IAM ROLE to this service is applied only if
@@ -2740,6 +2771,23 @@ pub async fn reconcile(
                 &resource,
                 reporting.failed,
                 reason,
+            ));
+            outcome.resources.push(resource);
+            continue;
+        }
+        // A tag key inside the namespace AWS reserves for its own tags is not one a
+        // DECLARATION may claim either: the resource fails carrying the sentence this service
+        // answers a caller-supplied reserved key with, and nothing is asked of the service
+        // that owns the type — so no resource of it is created anywhere
+        // ([`super::stack_tags::declared_resource_tag_refusal`], which admits the three keys
+        // CloudFormation records itself).
+        if let Some(reason) = super::stack_tags::declared_resource_tag_refusal(&deployed_properties)
+        {
+            failed.push((resource.logical_id.clone(), reporting.action));
+            outcome.transitions.push(ResourceTransition::failed(
+                &resource,
+                reporting.failed,
+                reason.to_string(),
             ));
             outcome.resources.push(resource);
             continue;

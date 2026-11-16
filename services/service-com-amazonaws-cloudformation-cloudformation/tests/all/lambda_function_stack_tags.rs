@@ -10,15 +10,18 @@
 //! `aws:` namespace AWS keeps for itself, and that is the point: the namespace binds a
 //! CALLER, while the service provisioning the resource is what SETS such a tag, so they
 //! reach the owning service's own tag store and `lambda:ListTags` on the ARN the stack
-//! published answers with the whole set. A key in that namespace the TEMPLATE merely spells
-//! is a caller's and does not travel, and the deployment still completes.
+//! published answers with the whole set. A key in that namespace the TEMPLATE spells that is
+//! NOT one of those three is a caller claiming the namespace, which fails the resource rather
+//! than travelling — that rule and its own rows live in
+//! `crate::resource_reserved_tag_keys`, so this suite's rows are the ones a deployment
+//! COMPLETES.
 //!
 //! The rows differ along what the rule generalises over: how many stack-level tags there are
 //! (none, one, several), how many functions one stack declares (so the `logical-id` tag
 //! differs per resource while the other two do not), whether the function declares `Tags` of
 //! its own, whether one of those keys COLLIDES with a stack tag or with one of
-//! CloudFormation's own three, the FORM a declared tag value takes (text, a number, a
-//! boolean), and a declared key in the reserved namespace that is NOT CloudFormation's.
+//! CloudFormation's own three, and the FORM a declared tag value takes (text, a number, a
+//! boolean).
 //!
 //! Every expected value is computed from what the row declares plus the stack id
 //! `DescribeStacks` reports — never read back out of the tag answer being checked. The tags
@@ -269,30 +272,6 @@ async fn a_provisioned_function_carries_the_stacks_tags_and_the_cloudformation_o
                     ("retention-days", "7"),
                     ("encrypted", "true"),
                 ],
-            }],
-        },
-        Case {
-            // A declared key in the reserved namespace that is NOT one of CloudFormation's
-            // three is a caller's to have written, and AWS Lambda refuses a caller that
-            // namespace — so it does not travel, and the deployment still completes.
-            case: "a declared key in the reserved namespace that is not CloudFormation's own",
-            stack_name: "reserved-declared-stack",
-            template: &format!(
-                r#"{{"Resources":{{{ROLE},
-                     "Claimed":{{"Type":"AWS::Lambda::Function","Properties":{{
-                        "Runtime":"python3.12","Handler":"index.handler",
-                        "Role":{{"Fn::GetAtt":["HandlerRole","Arn"]}},
-                        "Code":{{"ZipFile":"def handler(event, context):\n    return {{}}\n"}},
-                        "Tags":[{{"Key":"aws:servicecatalog:provisioningPrincipalArn",
-                                  "Value":"someone"}},
-                                {{"Key":"stage","Value":"prod"}}]}}}}}},
-                   "Outputs":{{"ClaimedArn":{{"Value":{{"Fn::GetAtt":["Claimed","Arn"]}}}}}}}}"#
-            ),
-            stack_tags: &[("team", "platform")],
-            functions: &[Declared {
-                logical_id: "Claimed",
-                output_key: "ClaimedArn",
-                stored: &[("stage", "prod")],
             }],
         },
     ];

@@ -492,6 +492,10 @@ mod required_resource_properties;
 mod reserved_stack_tag_keys;
 #[path = "all/resource_deletion_policies.rs"]
 mod resource_deletion_policies;
+// The reserved `aws:` tag-key namespace in a RESOURCE's own `Tags`: a declaration claiming a
+// key of it fails that resource and the stack rolls back.
+#[path = "all/resource_reserved_tag_keys.rs"]
+mod resource_reserved_tag_keys;
 #[path = "all/resource_scan_discovery.rs"]
 mod resource_scan_discovery;
 #[path = "all/resource_scan_inventory.rs"]

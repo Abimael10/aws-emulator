@@ -13,10 +13,12 @@
 //!
 //! The namespace itself is defined here ([`RESERVED_TAG_KEY_PREFIX`],
 //! [`is_reserved_tag_key`]) for the parts of this crate that read tag keys against it: this
-//! refusal, and the provisioning arms that keep service-owned keys out of the tag lists
-//! another service's API is called with. `super::provisioner` carries a private copy of the
-//! same two items that this module cannot take over, because that file is far longer than a
-//! file a change may touch; a change that splits it should delegate it to here.
+//! refusal, the one a RESOURCE's own declared `Tags` are held to
+//! ([`declared_resource_tag_refusal`]), and the provisioning arms that keep service-owned keys
+//! out of the tag lists another service's API is called with. `super::provisioner` carries a
+//! private copy of the same two items that this module cannot take over, because that file is
+//! far longer than a file a change may touch; a change that splits it should delegate it to
+//! here.
 
 /// The tag-key prefix `Tag$Key` documents as the one the tags Amazon Web Services owns
 /// carry, and therefore the one no caller's key may open with.
@@ -137,6 +139,80 @@ pub fn validate_optional_tags(tags: Option<&[crate::ops::types::Tag]>) -> Result
 /// is the answer wherever a `Tags` list reaches this service.
 pub const RESERVED_TAG_KEY: &str = "aws: prefixed tag key names are not allowed for external use.";
 
+/// The property a resource TYPE publishes its OWN tag set under: the one a declaration states
+/// the tags OF THE RESOURCE IT DECLARES in.
+///
+/// Source: the property each type's provider arm reads a declaration's tags from, through
+/// [`super::provisioner::tags_of`]. `Tags` is the name nearly every type spells; the six below
+/// are the types of this crate that spell it otherwise — a hosted zone's and a health check's
+/// in Amazon Route 53 and a vault's and a plan's in AWS Backup
+/// (`super::provisioner::platform_services`, whose `BACKUP_VAULT_TAGS_PROPERTY` and
+/// `BACKUP_PLAN_TAGS_PROPERTY` name the last two), and a user pool's and an identity pool's in
+/// Amazon Cognito (`super::provisioning::cognito_user_pool`'s `USER_POOL_TAGS` and
+/// `super::provisioning::cognito_identity_pool`'s `IDENTITY_POOL_TAGS`). Each is spelled here
+/// rather than imported because every one of them is private to the module that reads it, and
+/// raising four modules' visibility to share six strings is wider than this rule needs.
+///
+/// Two forms of declared tag are deliberately OUT OF SCOPE here, because neither is the
+/// declared resource's own tag set:
+///
+/// * a tag set NESTED in a sub-property, which states the tags of a resource the OWNING service
+///   makes out of the declaration rather than of the resource the declaration is — an
+///   `AWS::EC2::LaunchTemplate`'s `TagSpecifications[].Tags`
+///   (`super::provisioner::compute_fleet`) and an `AWS::Backup::BackupPlan` rule's
+///   `RecoveryPointTags`. Each is read by its own arm, which is where such a set would be
+///   judged;
+/// * a property whose tag keys are MATCHED rather than set — an `AWS::Rbin::Rule`'s
+///   `ResourceTags` and `ExcludeResourceTags`, which select the resources a retention rule
+///   applies to, and an `AWS::Cognito::IdentityPool`'s `PrincipalTags`, which maps a tag key
+///   onto a claim. A reserved key there names a tag AWS ITSELF set, which is exactly what such
+///   a declaration may legitimately select on.
+const DECLARED_TAG_PROPERTIES: &[&str] = &[
+    "Tags",
+    "HostedZoneTags",
+    "HealthCheckTags",
+    "BackupVaultTags",
+    "BackupPlanTags",
+    "UserPoolTags",
+    "IdentityPoolTags",
+];
+
+/// `Some(RESERVED_TAG_KEY)` where the property document `properties` of ONE declared resource
+/// states a tag key in the reserved namespace that is not a key CloudFormation itself sets.
+///
+/// A key under the reserved prefix is a tag the SERVICE owns, and a resource's own `Tags` are
+/// as much a caller's statement as a stack's are: so a declaration claiming one is refused
+/// with the very sentence this service answers a caller-supplied reserved key with
+/// ([`RESERVED_TAG_KEY`]), and the resource it declares is not created anywhere.
+///
+/// The exception is the three records CloudFormation keeps on every resource it provisions
+/// ([`super::provisioning::is_stack_provenance_tag`]): those ARE in the reserved namespace and
+/// CloudFormation is the one that sets them, so a declaration spelling one does not displace
+/// them and does not fail the resource — it is overwritten with CloudFormation's own value
+/// where that type's owning service takes them at all ([`super::provisioning::storable_tags`]).
+///
+/// Both spellings of a tag property are read, because the reading is
+/// [`super::provisioner::tags_of`]'s: a type publishing its tag set as the MAP of key to value
+/// is judged exactly as one publishing the `[{Key, Value}]` list is. Which properties are read
+/// at all, and which declared tag sets are out of scope, is
+/// [`DECLARED_TAG_PROPERTIES`]'s own statement.
+pub(crate) fn declared_resource_tag_refusal(properties: &::serde_json::Value) -> Option<&'static str> {
+    let claims_a_reserved_key = DECLARED_TAG_PROPERTIES.iter().any(|property| {
+        let Some(declared) = properties.get(*property) else {
+            return false;
+        };
+        // Offered under the name the shared reader looks for, which is how the arms of a type
+        // that spells its tag property otherwise reach that same reader.
+        let offered = ::serde_json::json!({ "Tags": declared });
+        super::provisioner::tags_of(&offered, &[])
+            .iter()
+            .any(|(key, _)| {
+                is_reserved_tag_key(key) && !super::provisioning::is_stack_provenance_tag(key)
+            })
+    });
+    claims_a_reserved_key.then_some(RESERVED_TAG_KEY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +268,131 @@ mod tests {
                 refused,
                 Err(RESERVED_TAG_KEY.to_string()),
                 "case {key:?}: expected the reserved-namespace refusal, got {refused:?}"
+            );
+        }
+    }
+
+    /// RULE: a RESOURCE's own declared tag set is held to the same namespace — in either
+    /// spelling of the property, under every property name a type publishes its tags as, and
+    /// with the three keys CloudFormation itself sets as the one exception.
+    ///
+    /// The rows span EVERY property name [`DECLARED_TAG_PROPERTIES`] carries (five of them
+    /// names the report did not cite), the two spellings of a tag set, where the offending key
+    /// sits, how it is cased, the three keys CloudFormation records itself, keys that only
+    /// resemble the prefix, and the two forms that catalogue states are out of scope — a tag
+    /// set nested in a sub-property, and a property whose keys are matched rather than set.
+    #[test]
+    fn a_declared_resource_tag_key_is_held_to_the_same_namespace() {
+        use ::serde_json::json;
+
+        let cases: &[(&str, ::serde_json::Value, bool)] = &[
+            (
+                "the Map spelling claiming a reserved key",
+                json!({"Tags": {"aws:hostile": "y"}}),
+                true,
+            ),
+            (
+                "the list spelling claiming a reserved key",
+                json!({"Tags": [{"Key": "aws:hostile", "Value": "y"}]}),
+                true,
+            ),
+            (
+                "the bare prefix as the whole key",
+                json!({"Tags": {"aws:": "y"}}),
+                true,
+            ),
+            (
+                "the prefix in upper case, which claims the same namespace",
+                json!({"Tags": [{"Key": "AWS:hostile", "Value": "y"}]}),
+                true,
+            ),
+            (
+                "a reserved key after an ordinary one",
+                json!({"Tags": [{"Key": "team", "Value": "p"},
+                                {"Key": "aws:hostile", "Value": "y"}]}),
+                true,
+            ),
+            (
+                "a hosted zone's own tag property, which the type spells otherwise",
+                json!({"HostedZoneTags": [{"Key": "aws:hostile", "Value": "y"}]}),
+                true,
+            ),
+            (
+                "a health check's own tag property",
+                json!({"HealthCheckTags": [{"Key": "aws:hostile", "Value": "y"}]}),
+                true,
+            ),
+            (
+                "a backup plan's own tag property",
+                json!({"BackupPlanTags": {"aws:hostile": "y"}}),
+                true,
+            ),
+            (
+                "a user pool's own tag property, which Amazon Cognito spells as a map",
+                json!({"UserPoolTags": {"aws:hostile": "y"}}),
+                true,
+            ),
+            (
+                "an identity pool's own tag property",
+                json!({"IdentityPoolTags": {"aws:hostile": "y"}}),
+                true,
+            ),
+            (
+                "a tag set nested in a sub-property, which states another resource's tags",
+                json!({"LaunchTemplateData": {"TagSpecifications": [
+                    {"ResourceType": "instance",
+                     "Tags": [{"Key": "aws:hostile", "Value": "y"}]}]}}),
+                false,
+            ),
+            (
+                "a property whose tag keys are matched rather than set",
+                json!({"ResourceTags": [{"Key": "aws:cloudformation:stack-name",
+                                        "Value": "some-stack"}],
+                       "ExcludeResourceTags": [{"Key": "aws:hostile", "Value": "y"}]}),
+                false,
+            ),
+            (
+                "a principal-tag mapping, whose keys name claims rather than tags to set",
+                json!({"PrincipalTags": {"aws:hostile": "custom:tenant"}}),
+                false,
+            ),
+            (
+                "a backup vault's own tag property, in the Map spelling",
+                json!({"BackupVaultTags": {"aws:hostile": "y"}}),
+                true,
+            ),
+            (
+                "one of the three keys CloudFormation records itself",
+                json!({"Tags": [{"Key": "aws:cloudformation:logical-id", "Value": "Forged"}]}),
+                false,
+            ),
+            (
+                "every one of the three beside an ordinary key",
+                json!({"Tags": {"aws:cloudformation:stack-name": "s",
+                                "aws:cloudformation:stack-id": "i",
+                                "aws:cloudformation:logical-id": "l",
+                                "team": "platform"}}),
+                false,
+            ),
+            (
+                "keys that only resemble the prefix",
+                json!({"Tags": {"aws": "y", "team-aws:mine": "y", "aw:s": "y"}}),
+                false,
+            ),
+            ("no tag property at all", json!({"Name": "n"}), false),
+            ("no property document at all", ::serde_json::Value::Null, false),
+            (
+                "a tag property that is neither a map nor a list",
+                json!({"Tags": "aws:hostile"}),
+                false,
+            ),
+        ];
+        for (case, properties, refused) in cases {
+            let judged = declared_resource_tag_refusal(properties);
+            assert_eq!(
+                judged,
+                refused.then_some(RESERVED_TAG_KEY),
+                "case {case:?}: expected refused={refused}, got {judged:?}"
             );
         }
     }
