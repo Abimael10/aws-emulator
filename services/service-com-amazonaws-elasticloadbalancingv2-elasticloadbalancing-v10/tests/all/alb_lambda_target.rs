@@ -167,7 +167,11 @@ fn package() -> Vec<u8> {
 /// mounts them: the function the load balancer forwards to is run by that Lambda, and the
 /// handler's own SDK call is dispatched back into this same router, so the queue it reports
 /// to is the queue this suite reads.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because `all/alb_lambda_target_invoke_grant.rs` drives the same three services
+/// over one engine: ONE builder for that mounting, so the two suites cannot drift on what is
+/// mounted behind a load balancer with a Lambda target.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);

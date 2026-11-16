@@ -329,6 +329,23 @@ pub(crate) async fn reported(
     url: &str,
     budget: Duration,
 ) -> Vec<String> {
+    reports(router, case, url, budget, 1).await
+}
+
+/// The ONE reading of the side channel every suite of this crate shares: every message it
+/// holds, deleted as it is read so the next row starts from an empty queue, once `expected` of
+/// them have arrived and one more look finds none — else every message the budget allowed.
+///
+/// A row that must have invoked NOTHING expects none of them, and the first look settles it
+/// with no waiting: the handler reports before it returns and the load balancer answers after
+/// the invocation, so the queue's contents are already final when a row's answer is in hand.
+pub(crate) async fn reports(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    budget: Duration,
+    expected: usize,
+) -> Vec<String> {
     let mut seen = Vec::new();
     let deadline = Instant::now() + budget;
     loop {
@@ -357,13 +374,28 @@ pub(crate) async fn reported(
                 "case {case:?}: expected DeleteMessage to answer 200, got {status} {deleted}"
             );
         }
-        if !seen.is_empty() && batch.is_empty() {
+        if seen.len() >= expected && batch.is_empty() {
             return seen;
         }
         if Instant::now() >= deadline {
             return seen;
         }
         tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// Place the instant Lambda owes every function its move out of `Pending` at, so a suite can
+/// invoke a freshly created function without sleeping for that span.
+///
+/// `pub(crate)` because every suite of this crate that drives a Lambda target needs it: ONE
+/// reading of that span, so they cannot drift on it.
+pub(crate) fn activate_functions(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine
+        .state::<service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState>();
+    let mut store = state.lock();
+    let past = SystemTime::now() - Duration::from_secs(1);
+    for record in store.functions.values_mut() {
+        record.active_due = past;
     }
 }
 
@@ -534,15 +566,7 @@ async fn the_published_address_answers_a_lambda_target_and_generates_its_own_502
         .to_string();
     // The activation span Lambda owes the function, placed rather than slept for — the same
     // reading every suite that invokes a freshly created function uses.
-    {
-        let state = engine
-            .state::<service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState>();
-        let mut store = state.lock();
-        let past = SystemTime::now() - Duration::from_secs(1);
-        for record in store.functions.values_mut() {
-            record.active_due = past;
-        }
-    }
+    activate_functions(&engine);
 
     // The load balancer and the address it publishes, the `lambda` target group, the
     // registration of the function, the grant that admits the invocation, and the HTTP:80

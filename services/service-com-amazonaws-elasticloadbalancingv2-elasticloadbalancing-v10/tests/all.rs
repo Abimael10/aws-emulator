@@ -23,6 +23,8 @@ mod alb_https_listener_tls;
 mod alb_lambda_target;
 #[path = "all/alb_lambda_target_access_log.rs"]
 mod alb_lambda_target_access_log;
+#[path = "all/alb_lambda_target_invoke_grant.rs"]
+mod alb_lambda_target_invoke_grant;
 #[path = "all/alb_lambda_target_published_address.rs"]
 mod alb_lambda_target_published_address;
 #[path = "all/attribute_collections.rs"]
