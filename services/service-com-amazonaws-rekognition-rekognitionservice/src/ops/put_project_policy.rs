@@ -9,8 +9,8 @@
 //!
 //! A project policy is a resource policy whose statements grant copying a MODEL VERSION of
 //! the project the policy is attached to, so a document is acceptable only when it is a
-//! policy and every resource it names is a model version that project holds; either way of
-//! failing that is the modelled `MalformedPolicyDocumentException`. The rule, the two
+//! policy and every resource it names is the ARN of a model version of that project; either
+//! way of failing that is the modelled `MalformedPolicyDocumentException`. The rule, the two
 //! wordings and the stored record all live in [`crate::state::project_policies`], so
 //! `ListProjectPolicies` and the operations that take a document later agree with this one.
 //!
@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The document has to be a policy, and every resource its statements name has to be
-        // a model version this project holds; both failures are the modelled
+        // the ARN of a model version of this project; both failures are the modelled
         // `MalformedPolicyDocumentException`, worded apart on the wire.
         crate::state::project_policies::validate_document_for(&input.policy_document, project)
             .map_err(|defect| match defect {
@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::modeled_error::malformed_policy_document(),
                     )
                 }
-                crate::state::project_policies::DocumentDefect::ResourceDoesNotExist => {
+                crate::state::project_policies::DocumentDefect::NotAProjectVersion => {
                     PutProjectPolicyErrorModeled::MalformedPolicyDocumentException(
                         crate::state::modeled_error::invalid_policy_resource(),
                     )

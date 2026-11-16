@@ -385,8 +385,10 @@ pub struct Project {
     ///
     /// A project created now manages none: a version is recorded by the operations that
     /// create one (`CreateProjectVersion`, `CopyProjectVersion`), each of which is an
-    /// unimplemented 501 until it is written. What reads this map is the resource check a
-    /// project policy's document is held to — see [`project_policies`].
+    /// unimplemented 501 until it is written, and read back by the operations that describe
+    /// one. A project policy's document is NOT held to it: what a policy grants on is a
+    /// version ARN of the project, which may name a version created after the policy — see
+    /// [`project_policies`].
     pub versions: BTreeMap<String, ProjectVersion>,
     /// The project policies attached to this project, keyed by their `PolicyName` — the
     /// project's identity for a policy, since "you can attach multiple project policies to
@@ -448,14 +450,6 @@ impl Project {
             versions: BTreeMap::new(),
             policies: BTreeMap::new(),
         }
-    }
-
-    /// Whether `arn` names a model version this project holds, in either form of the ARN
-    /// (see [`arn_names`]).
-    pub fn has_version_arn(&self, arn: &str) -> bool {
-        self.versions
-            .values()
-            .any(|version| arn_names(&version.arn, arn))
     }
 
     /// This project as the modelled `ProjectDescription`.

@@ -13,8 +13,15 @@
 //!
 //! * the document has to BE a policy — parseable JSON whose `Statement` is a statement, or
 //!   a list of statements, each naming the resources it grants on ([`policy_resources`]);
-//! * every resource it names has to resolve to a model version the named project holds
+//! * every resource it names has to be the ARN of a model version OF that project
 //!   ([`validate_document_for`]).
+//!
+//! What is asked of a named resource is its FORM, not its existence: a resource policy grants
+//! on a resource by ARN, and the version a grant is written for may be created after the
+//! policy that grants on it (a recorded `PutProjectPolicy` of a document naming a
+//! version-shaped ARN is accepted by a project holding no version at all), so
+//! [`names_version_of`] holds a resource to being a model version ARN of the project the
+//! policy is attached to and no more.
 //!
 //! Either refusal is the modelled `MalformedPolicyDocumentException` ("The format of the
 //! project policy document that you supplied to `PutProjectPolicy` is incorrect",
@@ -25,7 +32,7 @@
 //!
 //! Nothing here interprets the policy: no statement of it is ever evaluated, and the
 //! document is stored and reported back exactly as it was supplied. What IS computed is
-//! which resources it names and whether they exist.
+//! which resources it names and whether each of them names a model version of the project.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -143,9 +150,9 @@ pub enum DocumentDefect {
     /// The document is not a policy: it does not parse as JSON, or what it parses to is
     /// not a statement naming the resources it grants on.
     NotAPolicy,
-    /// The document is a policy, but a resource it names is not a model version of the
-    /// project the policy is being attached to.
-    ResourceDoesNotExist,
+    /// The document is a policy, but a resource it names is not the ARN of a model version
+    /// of the project the policy is being attached to.
+    NotAProjectVersion,
 }
 
 /// The resources `document`'s statements name, or [`DocumentDefect::NotAPolicy`] when the
@@ -189,17 +196,60 @@ pub fn policy_resources(document: &str) -> Result<Vec<String>, DocumentDefect> {
 }
 
 /// Hold `document` to what makes a project policy acceptable for `project`: it has to be a
-/// policy, and every resource it names has to be a model version `project` holds, because a
-/// project policy grants copying a model version OF the project it is attached to.
+/// policy, and every resource it names has to be the ARN of a model version OF `project`,
+/// because a project policy grants copying a model version of the project it is attached to.
 pub fn validate_document_for(document: &str, project: &Project) -> Result<(), DocumentDefect> {
     let resources = policy_resources(document)?;
     if resources
         .iter()
-        .any(|resource| !project.has_version_arn(resource))
+        .any(|resource| !names_version_of(project, resource))
     {
-        return Err(DocumentDefect::ResourceDoesNotExist);
+        return Err(DocumentDefect::NotAProjectVersion);
     }
     Ok(())
+}
+
+/// Whether `resource` is the ARN of a model version of `project`.
+///
+/// A version's ARN is the project's own ARN with the segment the service assigned the project
+/// replaced by `version/<VersionName>/<assigned>` — `ProjectVersionArn`'s pattern,
+/// `project\/[a-zA-Z0-9_.\-]{1,255}\/version\/[a-zA-Z0-9_.\-]{1,255}\/[0-9]+$`
+/// (`smithy_query(query="operation",operation="CreateProjectVersion")`) — so what is asked of
+/// a resource is: its partition, service, region, account and project name are this
+/// project's, its version name is one that pattern admits, and its last segment is the
+/// numeric one the service assigns a version. Either form of the ARN names the resource, as
+/// everywhere else in this store (see [`super::arn_names`]).
+///
+/// Whether the project HOLDS that version is not part of it; see this module's docs.
+pub fn names_version_of(project: &Project, resource: &str) -> bool {
+    // The project's ARN without the segment the service assigned it: the prefix every one of
+    // its model versions carries.
+    let Some((project_path, _assigned)) = super::arn_identity(&project.arn).rsplit_once('/')
+    else {
+        return false;
+    };
+    let Some(version_path) =
+        super::arn_identity(resource).strip_prefix(&format!("{project_path}/version/"))
+    else {
+        return false;
+    };
+    let Some((version_name, assigned)) = version_path.rsplit_once('/') else {
+        return false;
+    };
+    is_version_name(version_name) && is_assigned_segment(assigned)
+}
+
+/// Whether `name` is a `VersionName` the ARN pattern admits: `[a-zA-Z0-9_.\-]{1,255}`.
+fn is_version_name(name: &str) -> bool {
+    (1..=255).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// Whether `segment` is the one the service assigns a version it creates: `[0-9]+`.
+fn is_assigned_segment(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Whether `revision_id` is the revision a write is allowed to replace `policies`' entry

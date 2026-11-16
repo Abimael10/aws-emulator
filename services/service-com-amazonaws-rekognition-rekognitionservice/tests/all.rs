@@ -37,6 +37,8 @@ mod label_detection;
 mod photographic_enrolment;
 #[path = "all/project_policies.rs"]
 mod project_policies;
+#[path = "all/project_policy_deletion.rs"]
+mod project_policy_deletion;
 #[path = "all/projects.rs"]
 mod projects;
 #[path = "all/protective_equipment.rs"]

@@ -249,6 +249,37 @@ pub fn invalid_policy_revision_id() -> InvalidPolicyRevisionIdException {
     InvalidPolicyRevisionIdException::with_message(INVALID_POLICY_REVISION_ID_MESSAGE)
 }
 
+/// The fixed text an operation given a `PolicyName` the named project has no policy under is
+/// refused with: the two request values between three pieces of fixed text. A policy is
+/// identified by its name WITHIN a project, so the refusal names both halves of that identity
+/// — the name asked for and the project it was looked for in — and takes each from the
+/// request and the store rather than from any one exchange.
+pub fn project_policy_not_found(
+    policy_name: &str,
+    project_name: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException::with_message(format!(
+        "The specified policy {policy_name} does not exist for project {project_name}."
+    ))
+}
+
+/// The fixed text a DELETE that does not name the policy's current revision is refused with.
+///
+/// `DeleteProjectPolicy` words this class as what the caller has to do about it — re-read the
+/// policy's latest revision and try again — rather than as the shape's own sentence
+/// ([`INVALID_POLICY_REVISION_ID_MESSAGE`], which is how a WRITE of a policy words it), so the
+/// two refusals of the same modelled exception keep the wording of the operation that answers
+/// them. The policy's name comes from the request; the revision the policy actually carries is
+/// not disclosed, which is why the caller is told to go and read it.
+pub fn project_policy_revision_is_not_latest(
+    policy_name: &str,
+) -> InvalidPolicyRevisionIdException {
+    InvalidPolicyRevisionIdException::with_message(format!(
+        "The policy cannot be deleted. Please enter the latest policy revision ID associated \
+         with the policy {policy_name} and try again."
+    ))
+}
+
 /// A `PolicyName` the project already has a policy under, on a write that did not name a
 /// revision to replace: attaching under a name that is taken is a collision, and updating
 /// the policy that holds the name is what naming its revision asks for.

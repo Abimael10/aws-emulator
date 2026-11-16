@@ -6,32 +6,34 @@
 //!
 //! THE RULE UNDER TEST: `PutProjectPolicy` accepts a `PolicyDocument` only when the
 //! document IS a policy — parseable JSON whose `Statement` names the resources it grants on
-//! — and every resource it names is a model version of the project the policy is being
-//! attached to; it then records the policy under its name, assigns it a fresh hexadecimal
-//! `PolicyRevisionId` and answers with it, and a later write of that policy is accepted only
-//! when it names the revision the policy currently carries. A document that is not a policy
-//! and a document naming a resource that is not an existing model version are both refused
-//! with the modelled 400 `MalformedPolicyDocumentException`, each with its own fixed wording,
-//! and a refused call attaches nothing. `ListProjectPolicies` reports exactly the records the
-//! project holds, one `MaxResults`-sized page at a time.
+//! — and every resource it names is the ARN of a model version of the project the policy is
+//! being attached to; it then records the policy under its name, assigns it a fresh
+//! hexadecimal `PolicyRevisionId` and answers with it, and a later write of that policy is
+//! accepted only when it names the revision the policy currently carries. A document that is
+//! not a policy and a document naming a resource that is not a model version ARN of that
+//! project are both refused with the modelled 400 `MalformedPolicyDocumentException`, each
+//! with its own fixed wording, and a refused call attaches nothing. `ListProjectPolicies`
+//! reports exactly the records the project holds, one `MaxResults`-sized page at a time.
 //!
 //! Each test asserts that rule over a TABLE whose rows differ along what it generalises
 //! over: how a document fails to be a policy (a parse failure, a non-object, a missing or
-//! mis-typed `Statement`, a statement naming no resource), what an unacceptable resource is
-//! (the project itself, another project's version, a version of this project that does not
-//! exist, a wildcard, one bad entry among good ones), what an acceptable document looks like
-//! (one statement or several, one resource or a list of them, the shortest and longest
-//! `PolicyName`), and the page size (both published `ListProjectPoliciesPageSize` bounds and
-//! one past each). The malformed-JSON and bare-project-ARN rows are the two the issue's
-//! recorded exchange carries; the rest are the same rule at other inputs.
+//! mis-typed `Statement`, a statement naming no resource), how a resource fails to be a model
+//! version ARN of this project (the project itself, another project's version, another
+//! account's, a wildcard, a version ARN missing its assigned segment, one bad entry among
+//! good ones), what an acceptable document looks like (one statement or several, one resource
+//! or a list of them, a version the project holds and one it does not hold yet, the shortest
+//! and longest `PolicyName`), and the page size (both published `ListProjectPoliciesPageSize`
+//! bounds and one past each). The malformed-JSON and bare-project-ARN rows are the two the
+//! issue's recorded exchange carries; the rest are the same rule at other inputs.
 //!
 //! Every assertion goes over HTTP and reads only the status, the wire error code and the
-//! JSON body. The one thing the test writes directly into this service's store is a MODEL
-//! VERSION of a project: a version is recorded by `CreateProjectVersion` / `CopyProjectVersion`,
-//! each of which is still an unimplemented 501 (their own stub issues), so until one of them
-//! is written there is no other way to have the resource a project policy grants on exist —
-//! and with no version in the store, every syntactically valid document names a resource
-//! that does not exist, which is exactly how AWS answers such a document.
+//! JSON body. The one thing some tests write directly into this service's store is a MODEL
+//! VERSION of a project: a version is recorded by `CreateProjectVersion` /
+//! `CopyProjectVersion`, each of which is still an unimplemented 501 (their own stub issues),
+//! so that is the only way to have a resource a policy grants on really exist. Whether it
+//! exists is NOT what the document rule asks — a grant may be written for a version created
+//! later, which is how AWS answers such a document — so a row may equally name a
+//! version-shaped ARN of a version the store does not hold.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -47,7 +49,7 @@ use crate::face_collections::{call, label_less, Reply};
 
 /// The region every call of this suite signs with, and therefore the region of every ARN
 /// the service mints for it.
-const REGION: &str = "us-east-1";
+pub const REGION: &str = "us-east-1";
 
 /// `MaxResults` is `ListProjectPoliciesPageSize`, `range 1..5` on `ListProjectPolicies`
 /// (`smithy_query(query="operation",operation="ListProjectPolicies")`).
@@ -70,7 +72,7 @@ const INVALID_POLICY_RESOURCE_MESSAGE: &str =
 
 /// The emulator with this one service mounted, plus the engine it was mounted on, so a
 /// test can record the model version a project policy grants on (see this module's docs).
-fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still routes by the SigV4
@@ -81,7 +83,7 @@ fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Create a project over the wire and answer the ARN the service minted for it.
-async fn create_project(router: &MultiServiceRouter, project_name: &str) -> String {
+pub async fn create_project(router: &MultiServiceRouter, project_name: &str) -> String {
     let reply = call(router, "CreateProject", json!({ "ProjectName": project_name })).await;
     assert_eq!(
         reply.status, 200,
@@ -99,7 +101,7 @@ async fn create_project(router: &MultiServiceRouter, project_name: &str) -> Stri
 /// The operations that create a model version are unimplemented 501s, so this writes the
 /// record they would write; everything the rule under test does with it then happens over
 /// the wire.
-fn record_model_version(
+pub fn record_model_version(
     engine: &Arc<engine::InMemoryEngine>,
     project_name: &str,
     version_name: &str,
@@ -128,7 +130,7 @@ fn unrecorded_version_arn(project_name: &str, version_name: &str) -> String {
 /// A project policy document granting `rekognition:CopyProjectVersion` on `resources`:
 /// one statement, with `Resource` written as a bare string when it names one resource and
 /// as a list when it names several — both forms IAM's JSON policy grammar admits.
-fn policy_document(resources: &[&str]) -> String {
+pub fn policy_document(resources: &[&str]) -> String {
     let resource = if let [only] = resources {
         json!(only)
     } else {
@@ -149,7 +151,7 @@ fn policy_document(resources: &[&str]) -> String {
 
 /// `PutProjectPolicy` for `policy_name` on `project_arn`, naming `revision_id` when the
 /// write asks to replace a revision.
-async fn put_policy(
+pub async fn put_policy(
     router: &MultiServiceRouter,
     project_arn: &str,
     policy_name: &str,
@@ -169,7 +171,7 @@ async fn put_policy(
 
 /// Every project policy `project_arn` holds, walked page by page through
 /// `ListProjectPolicies` with `max_results` (the default page when it is `None`).
-async fn list_policies(
+pub async fn list_policies(
     router: &MultiServiceRouter,
     project_arn: &str,
     max_results: Option<i64>,
@@ -200,7 +202,7 @@ async fn list_policies(
 
 /// The policy named `policy_name` as `ListProjectPolicies` reports it, if the project holds
 /// it.
-async fn listed_policy(
+pub async fn listed_policy(
     router: &MultiServiceRouter,
     project_arn: &str,
     policy_name: &str,
@@ -211,7 +213,7 @@ async fn listed_policy(
         .find(|policy| member(policy, "PolicyName").as_deref() == Some(policy_name))
 }
 
-fn member(policy: &Value, name: &str) -> Option<String> {
+pub fn member(policy: &Value, name: &str) -> Option<String> {
     policy.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
@@ -319,7 +321,7 @@ async fn a_document_that_is_not_a_policy_is_refused_as_malformed() {
 }
 
 #[tokio::test]
-async fn a_document_naming_a_resource_that_is_not_a_model_version_is_refused() {
+async fn a_document_naming_a_resource_that_is_not_a_model_version_arn_is_refused() {
     let (router, engine) = harness_with_engine();
     let project_arn = create_project(&router, "invalid-resource-project").await;
     let version_arn = record_model_version(&engine, "invalid-resource-project", "version-one");
@@ -330,9 +332,15 @@ async fn a_document_naming_a_resource_that_is_not_a_model_version_is_refused() {
     let other_version_arn = record_model_version(&engine, "other-project", "version-one");
 
     let collection_arn = state::collection_arn(REGION, "a-collection");
-    let unrecorded = unrecorded_version_arn("invalid-resource-project", "never-created");
+    // The project's ARN without the segment the service assigned it: the prefix its model
+    // versions carry, which the rows below write ARNs off that are not versions of it.
+    let project_path = project_arn
+        .rsplit_once('/')
+        .expect("a ProjectArn ends in its assigned segment")
+        .0
+        .to_string();
 
-    // Each row names a resource that is not a model version of this project, differing in
+    // Each row names a resource that is not a model version ARN of this project, differing in
     // what it names instead.
     for (case, resources) in [
         // The row the recorded exchange carries: the project's own ARN, not a version's.
@@ -342,8 +350,22 @@ async fn a_document_naming_a_resource_that_is_not_a_model_version_is_refused() {
             vec![label_less(&project_arn)],
         ),
         (
-            "a version-shaped ARN of a version that does not exist",
-            vec![unrecorded.clone()],
+            "a version ARN with no assigned segment",
+            vec![format!("{project_path}/version/version-one")],
+        ),
+        (
+            "a version ARN whose assigned segment is not numeric",
+            vec![format!("{project_path}/version/version-one/latest")],
+        ),
+        (
+            "a version ARN with an empty version name",
+            vec![format!("{project_path}/version//1700000000000")],
+        ),
+        (
+            "a version ARN carrying a further path segment",
+            vec![format!(
+                "{project_path}/version/version-one/alias/1700000000000"
+            )],
         ),
         (
             "another project's model version",
@@ -357,8 +379,8 @@ async fn a_document_naming_a_resource_that_is_not_a_model_version_is_refused() {
             vec![version_arn.replace(engine::emulator_account_id(), "123456789012")],
         ),
         (
-            "one unknown version beside an existing one",
-            vec![version_arn.clone(), unrecorded.clone()],
+            "one resource that is not a version ARN beside one that is",
+            vec![version_arn.clone(), project_arn.clone()],
         ),
     ] {
         let borrowed: Vec<&str> = resources.iter().map(String::as_str).collect();
@@ -439,6 +461,16 @@ async fn an_accepted_policy_is_recorded_and_reported_back() {
             "the longest policy name",
             long_name.clone(),
             policy_document(&[second.as_str()]),
+        ),
+        (
+            // A grant may be written for a version created after the policy, so the resource
+            // has to be a model version ARN of this project and not a version it already
+            // holds.
+            "a model version the project does not hold yet",
+            "copy-future-version".to_string(),
+            policy_document(&[
+                unrecorded_version_arn("accepted-policy-project", "version-later").as_str()
+            ]),
         ),
     ];
 
@@ -653,8 +685,9 @@ async fn a_policy_is_rewritten_only_by_naming_its_current_revision() {
         upper.body
     );
 
-    // A policy whose document no longer resolves cannot be written even with the right
-    // revision: the document rule holds for a rewrite exactly as for an attach.
+    // A policy whose document names a resource that is not a model version of this project
+    // cannot be written even with the right revision: the document rule holds for a rewrite
+    // exactly as for an attach.
     let revision = upper
         .string("PolicyRevisionId")
         .expect("the rewrite answers a revision");
@@ -662,12 +695,12 @@ async fn a_policy_is_rewritten_only_by_naming_its_current_revision() {
         &router,
         &project_arn,
         "revisioned",
-        &policy_document(&[unrecorded_version_arn("revision-project", "never-created").as_str()]),
+        &policy_document(&[project_arn.as_str()]),
         Some(&revision),
     )
     .await;
     assert_document_refused(
-        "a rewrite naming a resource that does not exist",
+        "a rewrite naming the project instead of one of its versions",
         &refused,
         INVALID_POLICY_RESOURCE_MESSAGE,
     );
