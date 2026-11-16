@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataLakeNamespaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataLakeNamespaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataLakeNamespaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation REPORTS the data lake namespaces the shared store
+//! ([`crate::state`]) holds for one instance, a page at a time, so every entry is a record
+//! `CreateDataLakeNamespace` persisted and `GetDataLakeNamespace` reports identically.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataLakeNamespaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataLakeNamespacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataLakeNamespaces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDataLakeNamespacesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data lake store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` carries `@range(1..20)` and `@default(10)`, both applied before this
+        // handler runs, so the value is already in range here. A value outside the modelled
+        // range is therefore unreachable — and is refused as the modelled
+        // `ValidationException` rather than quietly read as a page of zero (a page of zero
+        // carrying a token would make a client paging in a loop spin forever), so the
+        // invariant is stated where it is relied on.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(size))
+            .ok_or_else(|| {
+                ListDataLakeNamespacesError::from(
+                    ListDataLakeNamespacesErrorModeled::ValidationException(ValidationException {
+                        message: Some(format!(
+                            "maxResults must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}, got {}",
+                            input.max_results
+                        )),
+                    }),
+                )
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this read performs: the instance transitions the clock already
+        // owed at `now`, which were due whether or not anybody read anything.
+        store.materialize_due_transitions(now);
+
+        // Same gateway rule as every instance-scoped call: an `instanceId` naming no
+        // instance of this account is refused by the authorization step, before this
+        // instance's data lake is read at all — which is why this operation models
+        // `AccessDeniedException` and no `ResourceNotFoundException`.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(ListDataLakeNamespacesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Where this page resumes, read AFTER the authorization step so an unknown instance
+        // is answered as the authorization failure it is rather than as a bad token. The
+        // token is an encoded boundary rather than a confidential one: what it has to pass
+        // is [`decode_page_token`], so a value this listing did not issue for THIS
+        // instance is a bad request rather than a silently truncated or restarted page.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => Some(
+                decode_page_token(token, &input.instance_id).ok_or_else(|| {
+                    ListDataLakeNamespacesError::from(
+                        ListDataLakeNamespacesErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    crate::state::UNISSUED_PAGE_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        ),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+
+        // The store holds one instance's namespaces contiguously and in name order, so a
+        // page walks that order from where the previous one stopped. Only CREATED
+        // namespaces are stored, which is what this operation documents: an instance's
+        // pre-defined namespaces are not reported.
+        // An instance whose data lake holds no custom namespace is reported as an EMPTY
+        // list, deliberately: `DataLakeNamespaceList` carries `@length(min: 1)`, which
+        // describes a page that reports something, and a listing has to be able to say
+        // that there is nothing to report. The alternative — refusing a read because the
+        // store is empty — is not a behaviour any listing has.
+        let mut namespaces = Vec::new();
+        let mut next_token = None;
+        for record in store.instance_namespaces(&input.instance_id) {
+            if resume_at
+                .as_deref()
+                .is_some_and(|resume| record.name.as_str() < resume)
+            {
+                continue;
+            }
+            if namespaces.len() >= page_size {
+                // One more namespace follows this page than fits in it: the token names
+                // that namespace, so the next page resumes exactly where this one stopped.
+                // The boundary is a NAME rather than a store position, so the rest of the
+                // listing is still reported when the namespace it names is deleted in
+                // between.
+                next_token = Some(encode_page_token(&input.instance_id, &record.name));
+                break;
+            }
+            namespaces.push(record.to_wire());
+        }
+
+        Ok(ListDataLakeNamespacesOutput {
+            namespaces,
+            next_token,
+        })
     }
+}
+
+/// The published bounds of `DataLakeNamespaceMaxResults` (`@range(min: 1, max: 20)`),
+/// which is what one page of this listing holds.
+const MIN_PAGE_SIZE: usize = 1;
+const MAX_PAGE_SIZE: usize = 20;
+
+/// The stamp every token this operation issues carries: this service, the token format
+/// version, and the list it is a boundary for. A token stamped for another of this
+/// service's listings therefore names no boundary here.
+const PAGE_STAMP: &str = "scn:1:namespace:";
+
+/// The page token naming the namespace a resumed page starts at, for the instance whose
+/// listing it was cut from.
+///
+/// The payload is the namespace NAME and not a store position: a name is still a
+/// meaningful boundary in the listing's order when the namespace the previous page stopped
+/// on has since been deleted, which is what keeps a resumed page from dropping the
+/// namespaces behind it. `DataLakeNamespaceNextToken` is modelled as an opaque string of
+/// length 1..65535 and nothing else, so the token is the stamped payload hex-encoded: it
+/// carries no store key a client could address the store with, and is under 200 characters
+/// — well inside the modelled bound. The encoding is a reversible envelope and not an
+/// authenticator; what a value presented back has to pass is [`decode_page_token`], where
+/// carrying the instance and a name of the modelled form is what lets a value this listing
+/// did not issue — or one issued for another instance's data lake — be refused instead of
+/// honoured as a boundary for THIS listing. A boundary a caller does assemble for its own
+/// instance names a namespace of that same instance, which is a position it can already
+/// reach by paging.
+///
+/// `:` separates the two fields because neither can contain one: an `instanceId` is a
+/// hyphenated hex UUID and `DataLakeNamespaceName` is `^[a-z0-9_]+$`.
+fn encode_page_token(instance_id: &str, name: &str) -> String {
+    ::hex::encode(format!("{PAGE_STAMP}{instance_id}:{name}").as_bytes())
+}
+
+/// The namespace name a token names, or `None` when `token` is not one this operation
+/// issued for this instance — which the caller is told as a `ValidationException`, never
+/// as a silently truncated or restarted page.
+fn decode_page_token(token: &str, instance_id: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let mut fields = decoded.strip_prefix(PAGE_STAMP)?.split(':');
+    let token_instance = fields.next()?;
+    let token_name = fields.next()?;
+    // Every boundary this operation pages on is a namespace name of the instance the page
+    // was cut from, so anything else is a boundary this service could not have issued for
+    // this listing.
+    (fields.next().is_none()
+        && token_instance == instance_id
+        && crate::state::is_modelled_namespace_name(token_name))
+    .then(|| token_name.to_string())
 }

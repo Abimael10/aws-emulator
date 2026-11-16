@@ -354,6 +354,17 @@ pub fn instance_authorization_failure_message(instance_id: &str) -> String {
 /// cannot drift into several sentences for one refusal.
 pub const NAMESPACE_NOT_FOUND_MESSAGE: &str = "Namespace not found.";
 
+/// How a paginated read of this service refuses a `nextToken` it did not issue.
+///
+/// A continuation token carries the position it names INSIDE it, so a value a caller built
+/// (or one another listing issued) names a position this listing never offered. The APIs
+/// document a refusal for such a value, never a page, and the modelled
+/// `ValidationException` (HTTP 400) is the channel every paginated operation here has for
+/// it. Stated once, here, so the listings cannot drift into several sentences for one
+/// refusal. No recording pins this sentence, so it is the emulator's own wording and
+/// carries nothing from the request.
+pub const UNISSUED_PAGE_TOKEN_MESSAGE: &str = "nextToken is not a pagination token this service issued";
+
 /// The namespace-name prefixes AWS Supply Chain keeps for itself.
 ///
 /// SOURCE: the `name` member of `CreateDataLakeNamespaceRequest`, which documents
@@ -1167,14 +1178,27 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
         self.namespaces.get(&namespace_key(instance_id, name))
     }
 
+    /// Every stored namespace of `instance_id`, in `name` order: the contiguous span of
+    /// the key space that instance's namespaces occupy ([`namespace_key`] puts the
+    /// instance first). That order is the one `ListDataLakeNamespaces` pages through, and
+    /// it holds only namespaces a caller created — the data lake's pre-defined namespaces
+    /// ([`PREDEFINED_NAMESPACES`]) are never stored, which is exactly what that listing
+    /// documents.
+    pub fn instance_namespaces<'a>(
+        &'a self,
+        instance_id: &'a str,
+    ) -> impl Iterator<Item = &'a DataLakeNamespaceRecord> + 'a {
+        self.namespaces
+            .range(namespace_key(instance_id, "")..)
+            .take_while(move |((instance, _), _)| instance == instance_id)
+            .map(|(_, record)| record)
+    }
+
     /// How many namespaces `instance_id`'s data lake holds — one range scan over the keys
     /// that instance's namespaces occupy, which is what
     /// [`MAX_NAMESPACES_PER_INSTANCE`] caps.
     pub fn namespace_count(&self, instance_id: &str) -> usize {
-        self.namespaces
-            .range(namespace_key(instance_id, "")..)
-            .take_while(|((stored, _), _)| stored == instance_id)
-            .count()
+        self.instance_namespaces(instance_id).count()
     }
 
     /// Whether a further namespace create for `instance_id` would push its data lake
@@ -1372,6 +1396,22 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
 /// through.
 fn new_uuid_v4() -> String {
     ::emulator_telemetry::SessionId::random().as_str().to_string()
+}
+
+/// Whether `name` has the shape the model gives `DataLakeNamespaceName`: length 1..50 and
+/// `^[a-z0-9_]+$`.
+///
+/// Stated once, here, so the handler that validates a resume key and anything else that
+/// has to recognise a namespace name cannot drift from the modelled constraint. The
+/// modelled constraints already refuse a bad `name` MEMBER before a handler runs; this is
+/// for a name that arrives inside an opaque value instead, where no member carries it.
+pub fn is_modelled_namespace_name(name: &str) -> bool {
+    const MAX_NAMESPACE_NAME_LENGTH: usize = 50;
+    !name.is_empty()
+        && name.len() <= MAX_NAMESPACE_NAME_LENGTH
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// Whether `value` is an `instanceId` of the model's `UUID` shape: length 36 and

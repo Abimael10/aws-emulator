@@ -27,6 +27,8 @@ mod data_lake_dataset_listing;
 mod data_lake_dataset_refusal_wording;
 #[path = "all/data_lake_datasets.rs"]
 mod data_lake_datasets;
+#[path = "all/data_lake_namespace_listing.rs"]
+mod data_lake_namespace_listing;
 #[path = "all/data_lake_namespaces.rs"]
 mod data_lake_namespaces;
 #[path = "all/flow_executions.rs"]
