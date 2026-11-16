@@ -76,17 +76,20 @@ const CONNECTION_FUNCTION_NOT_FOUND_SENTENCE: &str =
 /// The payload is the `FunctionBlob` itself rather than a document, so it is read as bytes:
 /// code that is not valid UTF-8 (a blob may be anything) has to come back unchanged, which
 /// reading it as a string would not show.
-struct CodeAnswer {
-    status: u16,
-    etag: String,
+pub(crate) struct CodeAnswer {
+    pub(crate) status: u16,
+    pub(crate) etag: String,
     content_type: String,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 /// `GET /2020-05-31/connection-function/{Identifier}`, read as raw bytes, naming `stage`
 /// when it is `Some` and leaving the optional query parameter out entirely when it is
 /// `None`.
-async fn get_connection_function(
+///
+/// `pub(crate)` so the suite that UPDATES a connection function reads the code it stored
+/// back through this one call path rather than a second copy of it.
+pub(crate) async fn get_connection_function(
     router: &MultiServiceRouter,
     identifier: &str,
     stage: Option<&str>,

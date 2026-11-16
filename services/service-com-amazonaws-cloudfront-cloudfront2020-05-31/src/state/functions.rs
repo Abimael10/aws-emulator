@@ -453,10 +453,14 @@ fn associated_function_arns(config: &DistributionConfig) -> impl Iterator<Item =
 /// Every key value store ARN the configuration `config` associates.
 ///
 /// A function carries its stores in a LIST wrapper (`KeyValueStoreAssociations`), so one
-/// configuration contributes zero or more ARNs. The walk is stated once here because both
-/// directions need it: the check that every associated store EXISTS, and the check that a
-/// store is still associated by something before it may be deleted.
-fn associated_key_value_store_arns(config: &FunctionConfig) -> impl Iterator<Item = &str> + '_ {
+/// configuration contributes zero or more ARNs. The walk is stated once here because every
+/// direction needs it: the check that every associated store EXISTS, the check that a store
+/// is still associated by something before it may be deleted, and the same existence check
+/// over a CONNECTION function's configuration — the same `FunctionConfig` shape — which is
+/// why the sibling module reaches it too.
+pub(super) fn associated_key_value_store_arns(
+    config: &FunctionConfig,
+) -> impl Iterator<Item = &str> + '_ {
     config
         .key_value_store_associations
         .as_ref()

@@ -33,7 +33,7 @@ use crate::ops::types::{
 
 use super::{
     ComAmazonawsCloudfrontCloudfront20200531State, TagSet, MAX_FUNCTIONS,
-    MAX_FUNCTION_CODE_BYTES, PROPAGATION_DELAY,
+    MAX_FUNCTION_CODE_BYTES, MAX_KEY_VALUE_STORE_ASSOCIATIONS, PROPAGATION_DELAY,
 };
 
 /// `ConnectionFunctionSummary$Status` for the stage a publish has just written.
@@ -316,6 +316,76 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         let summary = published.to_summary(&function.name, &function.id, &function.arn);
         function.live = Some(published);
         Some(summary)
+    }
+
+    /// The reason `config` describes no connection function this service can hold, or `None`
+    /// when it describes one.
+    ///
+    /// ONE check for every payload that carries a connection function's `FunctionConfig` — a
+    /// create and an update both store a whole configuration, so both refuse the same
+    /// configurations:
+    ///
+    /// * a list wrapper whose `Quantity` disagrees with its `Items`
+    ///   ([`super::function_config_quantity_mismatch`]);
+    /// * more key value store associations than one function may carry
+    ///   ([`MAX_KEY_VALUE_STORE_ASSOCIATIONS`]), which is checked BEFORE the stores are
+    ///   looked up so a request naming more is refused before anything is scanned;
+    /// * an association naming a key value store this service does not hold — the ARN is
+    ///   compared against the STORED ARN of a key value store
+    ///   ([`Self::key_value_store_by_arn`]), never taken on trust from the request.
+    ///
+    /// The caller reports the reason as the `InvalidArgument` its operation models for an
+    /// argument the service cannot use.
+    pub fn connection_function_config_unusable(&self, config: &FunctionConfig) -> Option<String> {
+        if let Some(message) = super::function_config_quantity_mismatch(config) {
+            return Some(message);
+        }
+
+        let associated = super::functions::associated_key_value_store_arns(config).count();
+        if associated > MAX_KEY_VALUE_STORE_ASSOCIATIONS {
+            return Some(format!(
+                "the configuration associates {associated} key value stores with the connection \
+                 function but at most {MAX_KEY_VALUE_STORE_ASSOCIATIONS} may be associated"
+            ));
+        }
+        for arn in super::functions::associated_key_value_store_arns(config) {
+            if self.key_value_store_by_arn(arn).is_none() {
+                return Some(format!("the key value store {arn} does not exist"));
+            }
+        }
+
+        None
+    }
+
+    /// Replace the code and the configuration of the `DEVELOPMENT` stage of the connection
+    /// function `id` names, and report the record as it now stands — or `None` when this
+    /// store holds no connection function under that id, checked BEFORE the mint so a
+    /// version token is never spent on a resource that is not there.
+    ///
+    /// An update carries no name and no stage: the connection function's identity (the id,
+    /// the ARN minted for it, the name it was created under and the tags it carries) and its
+    /// `LIVE` stage are left exactly as they stand, because `LIVE` holds what a
+    /// `PublishConnectionFunction` COPIED into it — an edit of the editable stage is not a
+    /// publish. The stage's `LastModifiedTime` moves to `now`, its `CreatedTime` does not,
+    /// and a FRESH version token is minted, so the version this caller just replaced no
+    /// longer satisfies an `If-Match`.
+    pub fn apply_connection_function_update(
+        &mut self,
+        id: &str,
+        config: FunctionConfig,
+        code: Vec<u8>,
+        now: SystemTime,
+    ) -> Option<&StoredConnectionFunction> {
+        if !self.connection_functions.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.connection_functions.get_mut(id)?;
+        stored.development.config = config;
+        stored.development.code = code;
+        stored.development.last_modified_time = now;
+        stored.development.etag = etag;
+        Some(stored)
     }
 
     /// Apply the publish transition the clock owes every stored connection function at

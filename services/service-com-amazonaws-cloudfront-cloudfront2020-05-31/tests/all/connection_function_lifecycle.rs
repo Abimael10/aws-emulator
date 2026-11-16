@@ -151,7 +151,10 @@ impl Create {
     }
 
     /// The `ConnectionFunctionConfig` element this create carries.
-    fn config_xml(&self) -> String {
+    ///
+    /// `pub(crate)` so the suite that UPDATES a connection function sends the same
+    /// configuration document this one creates with, rather than a second copy of it.
+    pub(crate) fn config_xml(&self) -> String {
         let mut out = format!(
             "<ConnectionFunctionConfig><Comment>{}</Comment><Runtime>{}</Runtime>",
             escape(&self.comment),

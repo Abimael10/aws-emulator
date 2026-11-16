@@ -201,50 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every CloudFront list travels in a wrapper stating its own length, and a
-        // configuration whose `Quantity` disagrees with its `Items` describes no function
-        // at all. The ONE rule for a `FunctionConfig`, shared with `CreateFunction`.
-        if let Some(message) =
-            crate::state::function_config_quantity_mismatch(&input.connection_function_config)
+        // A configuration this service cannot hold — a list wrapper whose `Quantity`
+        // disagrees with its `Items`, more key value store associations than one function
+        // may carry, or an association naming a key value store this service does not hold —
+        // describes no connection function at all. The ONE rule for a connection function's
+        // `FunctionConfig`, shared with `UpdateConnectionFunction`, which stores a whole
+        // configuration too.
+        if let Some(reason) =
+            store.connection_function_config_unusable(&input.connection_function_config)
         {
-            return Err(invalid_argument(message).into());
-        }
-
-        // An association names a key value store by the ARN that store's own create minted,
-        // so a connection function can only be associated with a store this service HOLDS:
-        // the check is against the stored ARN, never against the request alone. The list is
-        // bounded FIRST — CloudFront's published quota for "Key value stores per function"
-        // is one ([`crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS`]), the model puts no
-        // length on the list, and the lookup below walks the stored stores — so a request
-        // naming more describes no function this service runs and is refused before any
-        // scanning is done.
-        let associations = input
-            .connection_function_config
-            .key_value_store_associations
-            .as_ref()
-            .map_or(&[][..], |associations| {
-                associations.items.as_deref().unwrap_or_default()
-            });
-        if associations.len() > crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS {
-            return Err(invalid_argument(format!(
-                "the configuration associates {} key value stores with the connection \
-                 function but at most {} may be associated",
-                associations.len(),
-                crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS
-            ))
-            .into());
-        }
-        for association in associations {
-            if store
-                .key_value_store_by_arn(&association.key_value_store_arn)
-                .is_none()
-            {
-                return Err(invalid_argument(format!(
-                    "the key value store {} does not exist",
-                    association.key_value_store_arn
-                ))
-                .into());
-            }
+            return Err(invalid_argument(reason).into());
         }
 
         // "The entity already exists. You must provide a unique entity": a name identifies

@@ -35,5 +35,11 @@
 //! That stranded pair was dropped with the prose around it, the sorted one left where it is,
 //! for the same reason as the five runs before it.
 //!
+//! A SEVENTH run had grown back in both places at once: the header itself held a dozen
+//! re-typed copies of its paragraphs, and below the last declaration stood another run of them
+//! with three landings' own declaration pairs scattered through it. The header was written back
+//! as ONE block, each of those pairs was moved into the place its name sorts to, and the prose
+//! was dropped, for the same reason as the six runs before it.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

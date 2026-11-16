@@ -60,6 +60,8 @@ mod connection_function_not_found_message;
 mod connection_function_publish;
 #[path = "all/connection_function_test_run.rs"]
 mod connection_function_test_run;
+#[path = "all/connection_function_update.rs"]
+mod connection_function_update;
 #[path = "all/connection_group_by_routing_endpoint.rs"]
 mod connection_group_by_routing_endpoint;
 #[path = "all/connection_group_delete.rs"]
