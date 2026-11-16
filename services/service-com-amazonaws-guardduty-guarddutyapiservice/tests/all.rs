@@ -65,6 +65,8 @@ mod detector_sub_resource_creates;
 mod detector_sub_resource_deletes;
 #[path = "all/detector_update_without_configuration.rs"]
 mod detector_update_without_configuration;
+#[path = "all/entity_set_delete_observability.rs"]
+mod entity_set_delete_observability;
 #[path = "all/entity_set_delete_retention.rs"]
 mod entity_set_delete_retention;
 #[path = "all/entity_set_id_refusal_classes.rs"]

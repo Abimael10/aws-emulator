@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrustedEntitySet
-//! IMPLEMENTED: deletes the trusted entity set the request names from
-//! [`crate::state`] — the detector no longer HAS it, so `GetTrustedEntitySet` and a
-//! second `DeleteTrustedEntitySet` refuse its id with the entity-set families'
-//! absence refusal and `ListTrustedEntitySets` stops naming it. The detector's
+//! IMPLEMENTED: starts the deletion of the trusted entity set the request names in
+//! [`crate::state`] — the detector no longer HAS it, so a second
+//! `DeleteTrustedEntitySet` refuses its id with the entity-set families' absence
+//! refusal and `ListTrustedEntitySets` stops naming it, while `GetTrustedEntitySet`
+//! keeps reporting the set on its own id with the `DELETE_PENDING` status the
+//! deletion moved it to, which the clock settles to `DELETED`. The detector's
 //! single trusted-entity-set slot is freed, so a later create succeeds. An id outside
 //! the alphabet the member is constrained to never reaches that lookup: it is refused
 //! with the constraint-violation template
@@ -203,13 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Deletes the trusted entity set that is associated with the specified
-        // trustedEntitySetId" (this operation's own documentation): once the delete
-        // is served the detector no longer HAS the set, so nothing addresses it
-        // afterwards — neither `GetTrustedEntitySet`, which refuses its id, nor
-        // `ListTrustedEntitySets`, which stops naming it, nor a replayed
-        // `ClientToken`, which mints a new set instead. The record is kept only as
-        // the tombstone that makes the id unresolvable, bounded by the same
-        // retention every deleted entity set is.
+        // trustedEntitySetId" (this operation's own documentation): the deletion is
+        // ASYNCHRONOUS, so what the call does is accept it — the set moves to
+        // `DELETE_PENDING` and the clock owes it `DELETED`
+        // ([`crate::state::EntitySetRecord::begin_delete`]). The detector no longer
+        // HAS it from this instant: `ListTrustedEntitySets` stops naming it, the
+        // detector's single slot is free, a replayed `ClientToken` mints a new set
+        // instead of handing this one back, no write may move it and a second delete
+        // has nothing left to delete. Its record is RETAINED, bounded by the
+        // retention every deleted entity set shares, so `GetTrustedEntitySet` can
+        // report how far the deletion has got.
         let deleted = detector
             .delete_trusted_entity_set(&input.trusted_entity_set_id, now)
             .unwrap_or(false);

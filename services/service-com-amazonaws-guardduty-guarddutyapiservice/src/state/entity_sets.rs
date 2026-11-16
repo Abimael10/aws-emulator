@@ -51,6 +51,20 @@ pub const ENTITY_SET_DELETED: &str = "DELETED";
 /// settled one.
 pub const ENTITY_SET_TRANSITION_MILLIS: i64 = 500;
 
+/// How long a set whose deletion has SETTLED on [`ENTITY_SET_DELETED`] stays
+/// readable, before the service stops holding it and its id is refused the way one
+/// no create ever minted is.
+///
+/// A delete starts an asynchronous deletion, so the id it names keeps answering while
+/// the deletion runs and reports it through the status enum; once the set is really
+/// gone there is nothing left to report on that id. AWS documents no span for either
+/// half, so this one is CHOSEN, and chosen to be observable from both sides:
+/// comfortably longer than [`ENTITY_SET_TRANSITION_MILLIS`], so a caller polling the
+/// read sees the settled [`ENTITY_SET_DELETED`] rather than stepping straight from
+/// `DELETE_PENDING` to a refusal, and short enough that a caller polling for the
+/// refusal does not wait long for it.
+pub const ENTITY_SET_DELETED_RETENTION_MILLIS: i64 = 10_000;
+
 /// How many DELETED entity sets one of a detector's entity-set maps retains so a
 /// read can still report [`ENTITY_SET_DELETE_PENDING`] / [`ENTITY_SET_DELETED`].
 ///
@@ -326,6 +340,33 @@ impl EntitySetRecord {
     /// only ever moves on to [`ENTITY_SET_DELETED`].
     pub fn is_deleting(&self) -> bool {
         self.deleted_at_millis.is_some()
+    }
+
+    /// When the service stops holding this record, if a delete has been accepted for
+    /// it: [`ENTITY_SET_DELETED_RETENTION_MILLIS`] after the deletion settles on
+    /// [`ENTITY_SET_DELETED`], which is itself owed
+    /// [`ENTITY_SET_TRANSITION_MILLIS`] after the delete was accepted.
+    ///
+    /// It is derived from [`Self::deleted_at_millis`], the instant the deletion was
+    /// ACCEPTED and the one thing nothing moves afterwards, so the instant the record
+    /// stops being reportable cannot drift from the deletion that started it.
+    pub fn removal_due_millis(&self) -> Option<i64> {
+        self.deleted_at_millis.map(|accepted| {
+            accepted
+                .saturating_add(ENTITY_SET_TRANSITION_MILLIS)
+                .saturating_add(ENTITY_SET_DELETED_RETENTION_MILLIS)
+        })
+    }
+
+    /// Is this record still one a read REPORTS at `now`?
+    ///
+    /// Every live set is, and so is one whose deletion is still running or inside its
+    /// retention window ([`Self::removal_due_millis`]); past that instant the service
+    /// no longer holds the set, so its id resolves to nothing. It is answered from the
+    /// CLOCK and WITHOUT writing, so every reader of the store agrees about which
+    /// records are gone whether or not one of them has swept the map.
+    pub fn is_reportable(&self, now: i64) -> bool {
+        self.removal_due_millis().is_none_or(|due| now < due)
     }
 
     /// Accept this entity set's deletion: [`ENTITY_SET_DELETE_PENDING`] now, with

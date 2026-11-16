@@ -296,15 +296,18 @@ macro_rules! tagged_resource_tags_of {
                 .$get(id)
                 .filter(|s| deleted.resolves(s.is_deleting()))
                 .map(|s| & $($mutability)? s.tags),
+            // An entity set past its deletion's retention window is one the service
+            // no longer holds ([`EntitySetRecord::is_reportable`]), so neither half
+            // of the tagging surface resolves it: its own read does not either.
             TaggedSubResource::TrustedEntitySet => detector
                 .trusted_entity_sets
                 .$get(id)
-                .filter(|s| deleted.resolves(s.is_deleting()))
+                .filter(|s| deleted.resolves(s.is_deleting()) && s.is_reportable(now_millis()))
                 .map(|s| & $($mutability)? s.tags),
             TaggedSubResource::ThreatEntitySet => detector
                 .threat_entity_sets
                 .$get(id)
-                .filter(|s| deleted.resolves(s.is_deleting()))
+                .filter(|s| deleted.resolves(s.is_deleting()) && s.is_reportable(now_millis()))
                 .map(|s| & $($mutability)? s.tags),
             TaggedSubResource::PublishingDestination => detector
                 .publishing_destinations

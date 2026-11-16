@@ -2,7 +2,9 @@
 
 //! @op GetTrustedEntitySet
 //! IMPLEMENTED: reports the trusted entity set `CreateTrustedEntitySet` stored under the
-//! detector, materialising only the status change the CLOCK already made due. An id outside
+//! detector, materialising only the status change the CLOCK already made due — including a
+//! set whose delete has been accepted, which keeps answering on its own id with the
+//! `DELETE_PENDING` / `DELETED` status the deletion moved it to. An id outside
 //! the alphabet the member is constrained to is refused with the constraint-violation
 //! template ([`crate::scaffolded::entity_set_id_constraint_rejection`]); an id of the right
 //! form that names no set is refused with the family's own absence sentence under the
@@ -184,15 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
+        // A set whose delete has been accepted is STILL REPORTED here: the deletion
+        // is asynchronous, so the id keeps answering with the status it moved the
+        // set to ([`crate::state::ENTITY_SET_DELETE_PENDING`], which the clock
+        // settles to [`crate::state::ENTITY_SET_DELETED`]) until the service stops
+        // holding the record ([`crate::state::EntitySetRecord::is_reportable`]) — the
+        // same rule `GetIPSet` and `GetThreatIntelSet` follow for a deleted uploaded
+        // list. Leaving the detector's collection is not the same as being
+        // unreadable: `ListTrustedEntitySets` stops naming it and no write may move
+        // it, while its own read reports where the deletion has got to.
         let Some(set) = detector
             .trusted_entity_sets
             .get_mut(&input.trusted_entity_set_id)
-            .filter(|set| !set.is_deleting())
+            .filter(|set| set.is_reportable(now))
         else {
-            // An entity-set id this detector does not hold — one no create minted,
-            // one minted under another detector, and one a delete has taken out of
-            // the detector's holdings — is one absence, reported the way BOTH
-            // entity-set families report it
+            // An entity-set id this detector holds no reportable record for — one no
+            // create minted, one minted under another detector, and one whose
+            // deletion has run out its retention — is one absence, reported the
+            // way BOTH entity-set families report it
             // ([`crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE`]): HTTP 404 under
             // the `ResourceNotFoundException` class, with one fixed sentence that
             // names neither the member nor the value.
