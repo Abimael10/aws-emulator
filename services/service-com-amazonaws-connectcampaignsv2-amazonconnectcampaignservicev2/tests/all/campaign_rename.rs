@@ -26,7 +26,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignState, CAMPAIGN_NOT_FOUND_MESSAGE,
+    campaign_id_not_found_message, CampaignState,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -451,8 +451,8 @@ async fn an_unheld_campaign_id_is_not_found() {
         );
         assert_eq!(
             error_message(&body),
-            CAMPAIGN_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected the shared not-found wording, got {:?}",
+            campaign_id_not_found_message(absent),
+            "case {case:?}: expected the rename's not-found wording naming the id, got {:?}",
             error_message(&body)
         );
     }

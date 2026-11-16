@@ -10,12 +10,12 @@
 //! shape, its history or the region the request was signed for.
 //!
 //! What this API version DOES with that answer is its own: the registry outcome is
-//! answered with the modelled `ResourceNotFoundException` (HTTP 404) carrying this
-//! service's one fixed sentence for the class, where the first ConnectCampaigns API
-//! version answers the same outcome with its modelled `ValidationException` (HTTP 400) —
-//! the same sentence, the refusal each version's own model and recorded wire name. Pinning
-//! that sentence here and in that version's own suite is what keeps the two from drifting
-//! apart on the one text they share.
+//! answered with the modelled `ResourceNotFoundException` (HTTP 404) carrying the sentence
+//! THIS operation's wire states — the instance id reported unresolved, naming the id asked
+//! about — where the first ConnectCampaigns API version answers the same outcome with its
+//! modelled `ValidationException` (HTTP 400) and its own sentence: the refusal each
+//! version's own model and recorded wire name. Pinning that sentence here and in that
+//! version's own suite is what keeps the two from drifting apart.
 //!
 //! Asserted over a TABLE whose rows differ along what the gate generalises over — the form
 //! of the `connectInstanceId` (an `InstanceId`, len 1..256, pattern
@@ -27,12 +27,13 @@ use serde_json::{json, Value};
 
 use super::common::{call, error_code, router, Harness};
 
-/// The sentence an operation that only REQUIRES a usable Connect instance answers an id
-/// the account's registry does not hold with. Written out here rather than read back out
-/// of the implementation, so this suite pins the wording itself; it carries nothing from
-/// the request, so there is no place to fill.
-const NOT_USABLE_WORDING: &str =
-    "Connect Instance does not exist or is not enabled to use Campaigns.";
+/// The sentence `StartInstanceOnboardingJob` answers an id the account's registry does
+/// not hold with. Written out here rather than read back out of the implementation, so
+/// this suite pins the wording itself: the fixed text, with the id the request named
+/// filled in.
+fn not_found_wording(instance: &str) -> String {
+    format!("ConnectInstanceId not found {instance}.")
+}
 
 /// One row of the table: the instance id the account is given, the region the request is
 /// signed for, and the region the instance is registered in — which the gate does not
@@ -183,9 +184,9 @@ async fn an_instance_the_registry_does_not_hold_is_refused() {
             );
             assert_eq!(
                 refused.get("message").and_then(Value::as_str),
-                Some(NOT_USABLE_WORDING),
-                "case {:?} (ever held: {ever_held}): expected the fixed sentence of this \
-                 refusal class, got {refused}",
+                Some(not_found_wording(&case.instance).as_str()),
+                "case {:?} (ever held: {ever_held}): expected the sentence this operation \
+                 states for an unresolved instance id, got {refused}",
                 case.name
             );
 

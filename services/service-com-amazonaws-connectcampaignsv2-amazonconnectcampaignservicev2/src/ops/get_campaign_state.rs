@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.campaign(&region, &input.id) else {
             return Err(GetCampaignStateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                    message: crate::state::campaign_absent_message(&input.id),
                     x_amz_error_type: None,
                 },
             )

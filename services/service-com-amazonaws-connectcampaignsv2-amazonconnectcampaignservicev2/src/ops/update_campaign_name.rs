@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::RenameRejected::NotFound) => {
                 Err(UpdateCampaignNameErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                        message: crate::state::campaign_id_not_found_message(&input.id),
                         x_amz_error_type: None,
                     },
                 )

@@ -262,7 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 return Err(StartInstanceOnboardingJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                        // The instance id itself is reported unresolved, naming it:
+                        // the sentence this service's onboarding plane states (see
+                        // `crate::state::instance_id_not_found_message`).
+                        message: crate::state::instance_id_not_found_message(
+                            &input.connect_instance_id,
+                        ),
                         x_amz_error_type: None,
                     },
                 )

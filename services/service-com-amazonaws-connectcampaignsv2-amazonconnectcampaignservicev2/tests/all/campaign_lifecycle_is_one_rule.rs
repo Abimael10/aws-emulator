@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
-use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::CAMPAIGN_NOT_FOUND_MESSAGE;
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::campaign_absent_message;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::common::{call, campaign_state, create_campaign, drive_lifecycle, error_code, router};
@@ -266,8 +266,8 @@ async fn all_four_actions_refuse_an_unknown_id_alike() {
             );
             assert_eq!(
                 body["message"].as_str(),
-                Some(CAMPAIGN_NOT_FOUND_MESSAGE),
-                "case {case:?}: expected {CAMPAIGN_NOT_FOUND_MESSAGE:?}, got {:?}",
+                Some(campaign_absent_message(&id).as_str()),
+                "case {case:?}: expected the lifecycle plane's absent-campaign sentence, got {:?}",
                 body["message"]
             );
         }
@@ -325,8 +325,8 @@ async fn all_four_actions_resolve_the_id_in_the_requests_region() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(CAMPAIGN_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected {CAMPAIGN_NOT_FOUND_MESSAGE:?}, got {:?}",
+            Some(campaign_absent_message(&id).as_str()),
+            "case {case:?}: expected the lifecycle plane's absent-campaign sentence, got {:?}",
             body["message"]
         );
 

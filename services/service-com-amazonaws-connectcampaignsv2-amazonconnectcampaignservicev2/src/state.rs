@@ -1853,33 +1853,53 @@ pub fn campaign_invalid_state_message(id: &str, state: CampaignState) -> String 
     format!("Campaign: {id} is in invalid state: {}", state.as_upper())
 }
 
-/// What this service answers when a well-formed campaign id names no campaign.
+/// What a well-formed campaign id that names no campaign is refused with, where the
+/// operation that was called states the lookup WITHOUT the id it was asked about.
 ///
-/// A FIXED service string — it does not embed the requested id, which is what the
-/// recorded `DescribeCampaign` 404 carries — so every campaign-id lookup that
-/// resolves to nothing reads the same and the response is deterministic. The one
-/// not-found text the campaign-id operations share, so two of them cannot disagree.
-/// (`PutOutboundRequestBatch` keeps its own recorded wording, which does name the
-/// campaign: that operation's message is composed from the request.)
+/// This service words that one refusal in three sentences, and which of them an
+/// operation answers is a fact of that operation's own wire rather than of the store:
+/// the lookup sentence without the id (this one), the same lookup sentence NAMING the id
+/// ([`campaign_id_not_found_message`]), and the data/lifecycle plane's own sentence about
+/// the campaign ([`campaign_absent_message`]). The three live here together so an
+/// operation picks one rather than spelling its own, and so the set of them is one thing
+/// to read.
+///
+/// A FIXED service string: it carries nothing from the request, so every refusal of this
+/// kind reads the same and the response is deterministic.
 pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
 
-/// What `DeleteCampaign` answers when the id it was asked to delete names no
-/// campaign: the same `CampaignId not found` sentence as the lookups above, NAMING the
-/// id, and ended with a period.
+/// The same lookup sentence as [`CAMPAIGN_NOT_FOUND_MESSAGE`], NAMING the campaign id
+/// the request addressed and ended with a period.
 ///
-/// Composed from the request: a caller deleting many campaigns at once learns from the
-/// refusal WHICH id was missing, which is the whole purpose of the id in this message.
-/// The id-less [`CAMPAIGN_NOT_FOUND_MESSAGE`] stays what the reading operations answer,
-/// as their own recorded refusals carry it — the two paths genuinely differ.
-pub fn delete_campaign_not_found_message(id: &str) -> String {
+/// Composed from the request: a caller that addressed the wrong id learns WHICH id was
+/// missing, which is the whole purpose of the id in this message. The one text every
+/// operation whose wire states it shares — the rename, the configuration changes that
+/// state it, and the deletion of the campaign itself — so two of them cannot disagree.
+pub fn campaign_id_not_found_message(id: &str) -> String {
     format!("CampaignId not found {id}.")
 }
 
-/// What this service answers when a request FILTERS by a Connect instance that is not
-/// onboarded to Campaigns in the region it was signed for, at HTTP 400 under the
-/// modelled `ValidationException`: the filtered instance is resolved before anything is
-/// listed, so an instance with no campaigns and one that is no campaign target at all
-/// are not answered alike.
+/// What the operations that ACT on a campaign — its lifecycle transitions, the state it
+/// is at and the outbound requests submitted against it — answer when the id names no
+/// campaign: the campaign is reported absent rather than the id reported unresolved.
+///
+/// Composed from the request, so the refusal names the campaign the caller asked about.
+/// The one text that plane shares, so two of its operations cannot disagree about a
+/// request they both refuse.
+pub fn campaign_absent_message(id: &str) -> String {
+    format!("Campaign: {id} doesn't exist")
+}
+
+/// What this service answers when a request addresses a Connect instance that is not
+/// onboarded to Campaigns in the region it was signed for: the instance is reported as
+/// not onboarded, which is what a caller has to change before the call means anything.
+///
+/// Two operations' wire states it: the campaign LISTING, whose instance filter is
+/// resolved before anything is listed (so an instance with no campaigns and one that is
+/// no campaign target at all are not answered alike, at HTTP 400 under the modelled
+/// `ValidationException`), and the removal of an instance's CONFIGURATION, which has
+/// nothing to remove for such an instance (at HTTP 404 under the modelled
+/// `ResourceNotFoundException`).
 ///
 /// A FIXED service string: it names no instance and carries nothing from the request,
 /// so every refusal of this kind reads the same.
@@ -2028,20 +2048,35 @@ pub const CAMPAIGN_DELETION_POLICY_DELETE_ALL: &str = "DELETE_ALL";
 /// reading, since a caller that did not ask for the campaigns to go keeps them.
 pub const CAMPAIGN_DELETION_POLICY_RETAIN_ALL: &str = "RETAIN_ALL";
 
-/// What this service answers when the resource a request addresses IS the Campaigns
-/// configuration of a Connect instance the request's region holds none for: there is
-/// no instance configuration to report, nor any to configure.
+/// What `StartInstanceOnboardingJob` answers when the account's Amazon Connect registry
+/// holds no instance under the id a request names: the instance id itself is reported
+/// unresolved, naming it.
+///
+/// Composed from the request, so the refusal names the instance the caller asked about, as
+/// the recorded response of this class does. The one operation whose wire states this
+/// sentence today — the onboarding start; the removal of an instance's CONFIGURATION
+/// reports the instance as not onboarded ([`INSTANCE_NOT_ONBOARDED_MESSAGE`]) and the
+/// operations that merely need a usable instance report its usability
+/// ([`INSTANCE_NOT_FOUND_MESSAGE`]) — so a second operation whose wire shows this sentence
+/// states it from here rather than spelling its own.
+pub fn instance_id_not_found_message(connect_instance_id: &str) -> String {
+    format!("ConnectInstanceId not found {connect_instance_id}.")
+}
+
+/// What this service answers when the resource a request addresses depends on the
+/// Campaigns configuration of a Connect instance the request's region holds none for:
+/// there is no instance configuration to report, to configure, or to hang the addressed
+/// resource off.
 ///
 /// Composed from the request, so the refusal names the instance the caller asked
 /// about, as the recorded responses of this class do. The one text shared by every
-/// operation whose own resource is that configuration — the two on
-/// `/v2/connect-instance/{id}/config`, and the two on the instance's
-/// communication-limits, which are a member of that same stored configuration (see
-/// [`StoredInstanceOnboarding::communication_limits`]) — so two of them cannot
-/// disagree about an instance this service holds no configuration for. An operation
-/// that addresses some OTHER resource and only requires the instance to be usable by
-/// Campaigns refuses with [`INSTANCE_NOT_FOUND_MESSAGE`] instead, which is the text
-/// recorded for that class.
+/// operation whose wire states it — the two on `/v2/connect-instance/{id}/config`, the
+/// two on the instance's communication-limits, which are a member of that same stored
+/// configuration (see [`StoredInstanceOnboarding::communication_limits`]), and the two
+/// that write an instance's integrations — so two of them cannot disagree about an
+/// instance this service holds no configuration for. The operations whose wire states
+/// the instance's USABILITY instead answer [`INSTANCE_NOT_FOUND_MESSAGE`], which is the
+/// text recorded for those.
 pub fn instance_config_not_found_message(connect_instance_id: &str) -> String {
     format!("ConnectInstanceConfig not found {connect_instance_id}.")
 }
@@ -2237,11 +2272,10 @@ pub fn service_linked_role_arn() -> String {
 /// A FIXED service string — it names no instance and carries nothing from the request,
 /// which is what the recorded responses of this class carry — so every refusal of this
 /// kind reads the same and the response is deterministic. The one text shared by the
-/// operations that merely require a usable instance (starting an onboarding job,
-/// creating a campaign, and the instance-integration operations), so two of them
-/// cannot disagree about a request they both refuse. The operations that address the
-/// instance's configuration itself answer
-/// [`instance_config_not_found_message`] instead.
+/// operations whose wire states the instance's usability (starting an onboarding job,
+/// creating a campaign, and listing an instance's integrations), so two of them cannot
+/// disagree about a request they both refuse. The operations whose wire states the
+/// instance's CONFIGURATION answer [`instance_config_not_found_message`] instead.
 ///
 /// The sentence itself is the shared gate's
 /// ([`::service_common::connect_instance_registry::INSTANCE_NOT_USABLE_MESSAGE`]), stated
@@ -2573,9 +2607,10 @@ pub struct LastChannelSubtype;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleRejected {
     /// The region holds no campaign under that id, so there is no lifecycle to move.
-    /// The caller answers this with the modelled `ResourceNotFoundException`
+    /// Carries the id judged, so [`Self::message`] can name the campaign the request
+    /// addressed. The caller answers this with the modelled `ResourceNotFoundException`
     /// (HTTP 404).
-    NotFound,
+    NotFound { id: String },
     /// The campaign is at `state` at the instant the call was judged and the action
     /// asked for is not legal from there (see [`CampaignState::after`]). Carries the
     /// id judged, so [`Self::message`] can name the campaign the request did. The
@@ -2588,7 +2623,10 @@ impl LifecycleRejected {
     /// The sentence this refusal is reported with.
     pub fn message(&self) -> String {
         match self {
-            Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+            // The lifecycle plane reports the campaign absent, naming it: see
+            // [`campaign_absent_message`] for the three sentences this service words a
+            // campaign-id lookup with and which plane states which.
+            Self::NotFound { id } => campaign_absent_message(id),
             Self::IllegalAction { id, state } => campaign_invalid_state_message(id, *state),
         }
     }
@@ -2598,14 +2636,22 @@ impl LifecycleRejected {
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::configurable_campaign`]
 /// reports it. Nothing is written in either case.
 ///
-/// [`Self::message`] carries the sentence the refusal is worded with, so every
-/// campaign-configuration operation refuses alike while each maps the rejection to the
-/// error variant its own model declares.
+/// [`Self::message`] carries the sentence a STATE refusal is worded with, so every
+/// campaign-configuration operation reports an unconfigurable campaign alike while each
+/// maps the rejection to the error variant its own model declares. The NOT-FOUND sentence
+/// is the calling operation's and not this enum's: AWS words that refusal per operation —
+/// six of these operations name the id ([`campaign_id_not_found_message`]) and the rest
+/// state the id-less lookup ([`CAMPAIGN_NOT_FOUND_MESSAGE`]) — and which one an operation
+/// states is a fact of its own wire, which the store cannot know. So each handler states
+/// its own on this arm, picking one of the sentences `crate::state` holds rather than
+/// spelling it, and [`Self::message`] answers the id-less one for the operations whose wire
+/// states that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationRejected {
     /// The region holds no campaign under that id, so there is no configuration to
     /// change. The caller answers this with the modelled `ResourceNotFoundException`
-    /// (HTTP 404).
+    /// (HTTP 404), worded with the sentence ITS own wire states (see the type's own
+    /// documentation above).
     NotFound,
     /// The campaign is at `state` at the instant the call was judged and that state
     /// takes no further configuration change (see
@@ -2616,7 +2662,10 @@ pub enum ConfigurationRejected {
 }
 
 impl ConfigurationRejected {
-    /// The sentence this refusal is reported with.
+    /// The sentence this refusal is reported with: the state clause for a campaign that
+    /// takes no further change, and the id-less lookup sentence for an absent campaign —
+    /// which is what the operations whose wire states that one answer, the rest stating
+    /// their own (see the type's own documentation).
     pub fn message(self) -> String {
         match self {
             Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
@@ -2667,15 +2716,16 @@ impl IntegrationPutRefused {
 ///
 /// [`Self::message`] carries the sentence the refusal is worded with, so both batch
 /// operations refuse alike while each maps the rejection to the error variant its own
-/// model declares, keeps its own per-request failure catalog and words its own
-/// not-found refusal — which is the one part of this the two do not share (see
-/// [`CAMPAIGN_NOT_FOUND_MESSAGE`]).
+/// model declares and keeps its own per-request failure catalog. A campaign the region
+/// does not hold is reported absent by the sentence the plane that ACTS on a campaign
+/// states ([`campaign_absent_message`]), which both batch operations answer with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialRejected {
     /// The region holds no campaign under that id, so there is no buffer to take the
-    /// batch into. The caller answers this with the modelled
+    /// batch into. Carries the id judged, so [`Self::message`] can name the campaign the
+    /// request addressed. The caller answers this with the modelled
     /// `ResourceNotFoundException` (HTTP 404).
-    NotFound,
+    NotFound { id: String },
     /// The campaign is at `state` at the instant the call was judged and that state
     /// takes no outbound requests (see [`CampaignState::takes_outbound_requests`]).
     /// Carries the id judged, so [`Self::message`] can name the campaign. The caller
@@ -2688,7 +2738,7 @@ impl DialRejected {
     /// The sentence this refusal is reported with.
     pub fn message(&self) -> String {
         match self {
-            Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+            Self::NotFound { id } => campaign_absent_message(id),
             Self::NotDialable { id, state } => campaign_invalid_state_message(id, *state),
         }
     }
@@ -2973,7 +3023,9 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         now: SystemTime,
     ) -> Result<CampaignState, LifecycleRejected> {
         let Some(stored) = self.campaign_mut(campaign.region, campaign.id) else {
-            return Err(LifecycleRejected::NotFound);
+            return Err(LifecycleRejected::NotFound {
+                id: campaign.id.to_string(),
+            });
         };
         let current = stored.state_at(now);
         let Some(next) = current.after(action) else {
@@ -3052,7 +3104,9 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         now: SystemTime,
     ) -> Result<&StoredCampaign, DialRejected> {
         let Some(stored) = self.campaign(campaign.region, campaign.id) else {
-            return Err(DialRejected::NotFound);
+            return Err(DialRejected::NotFound {
+                id: campaign.id.to_string(),
+            });
         };
         let current = stored.state_at(now);
         if !current.takes_outbound_requests() {

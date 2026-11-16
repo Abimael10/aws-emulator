@@ -177,10 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.lock().remove_campaign(&region, &input.id).is_none() {
             return Err(DeleteCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // This operation's refusal NAMES the id it was asked to delete, so
-                    // a caller deleting many campaigns at once learns which one was
-                    // missing; the reading operations keep their own id-less wording.
-                    message: crate::state::delete_campaign_not_found_message(&input.id),
+                    // The lookup sentence that names the id: the three sentences this
+                    // service words a campaign-id lookup with live together in
+                    // `crate::state`, where which plane states which is stated once.
+                    message: crate::state::campaign_id_not_found_message(&input.id),
                     x_amz_error_type: None,
                 },
             )

@@ -45,10 +45,12 @@ const REGION: &str = "us-west-2";
 /// encryption is enabled — so a case about the TYPE is not refused for a missing key.
 const KMS_KEY_ARN: &str = "arn:aws:kms:us-west-2:000000000000:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
-/// The most of a caller's value a refusal echoes, pinned to the ceiling the emulator's
-/// refusals share (`MAX_ECHOED_VALUE` in `aws_smithy_schema_server::constraints`), so a
-/// huge member cannot be amplified into a huge response.
-const MAX_ECHOED_VALUE: usize = 256;
+/// A length past the ceiling the emulator's refusals echo a value at (`MAX_ECHOED_VALUE`
+/// in `aws_smithy_schema_server::constraints`, 256 bytes), so the row built from it is
+/// one a refusal could only state by echoing a bounded prefix — and an ENUM refusal of
+/// this service states no value at all (see [`expected_message`]), which is what that row
+/// pins.
+const LONGER_THAN_ANY_ECHO: usize = 300;
 
 /// Which resource an operation's path names, and so what a case's target id has to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,22 +135,17 @@ fn message_of(response: &Value) -> &str {
 }
 
 /// The whole sentence a value outside `allowed` at `member` is refused with: the
-/// validation envelope, carrying the one clause for that member, the value as sent and
-/// the value set it failed.
-///
-/// A value past [`MAX_ECHOED_VALUE`] is echoed as a prefix of that many bytes followed
-/// by the value's own length, which is how every refusal in this emulator shows an
-/// over-long value.
-fn expected_message(member: &str, allowed: &[&str], value: &str) -> String {
-    let echoed = if value.len() <= MAX_ECHOED_VALUE {
-        value.to_string()
-    } else {
-        format!("{}... [{} bytes]", &value[..MAX_ECHOED_VALUE], value.len())
-    };
+/// validation envelope, carrying the one clause for that member and the value set it
+/// failed, in ASCENDING order over that set and with NO value echoed back — the two
+/// renderings this service's own wire shows for an enumerated type (see
+/// `src/service/validation.rs`), which hold for every enum member of every operation.
+fn expected_message(member: &str, allowed: &[&str]) -> String {
+    let mut stated: Vec<&str> = allowed.to_vec();
+    stated.sort_unstable();
     format!(
-        "1 validation error detected: Value '{echoed}' at '{member}' failed to satisfy \
+        "1 validation error detected: Value at '{member}' failed to satisfy \
          constraint: Member must satisfy enum value set: [{}]",
-        allowed.join(", ")
+        stated.join(", ")
     )
 }
 
@@ -232,8 +229,9 @@ async fn drive(
 /// The rows differ along what the rule generalises over: a value no catalog of this
 /// service holds, the case of a declared value, a prefix of one, a suffix on one, a
 /// declared value sent twice, a value declared by a different enum of this service
-/// (`DayOfWeek`'s `MONDAY`, which none of these catalogs holds), and a value far past
-/// the length a refusal echoes.
+/// (`DayOfWeek`'s `MONDAY`, which none of these catalogs holds), and a value far longer
+/// than the ceiling the emulator's refusals echo a value at ([`LONGER_THAN_ANY_ECHO`]) —
+/// which an enum refusal of this service states nothing of either way.
 fn off_catalog(allowed: &[&str]) -> Vec<(&'static str, String)> {
     let first = allowed[0];
     vec![
@@ -243,7 +241,10 @@ fn off_catalog(allowed: &[&str]) -> Vec<(&'static str, String)> {
         ("a declared value with a suffix", format!("{first}_AND_MORE")),
         ("a declared value sent twice", format!("{first},{first}")),
         ("a value declared by another enum of this service", "MONDAY".to_string()),
-        ("a value longer than a refusal echoes", "x".repeat(300)),
+        (
+            "a value longer than any refusal echoes",
+            "x".repeat(LONGER_THAN_ANY_ECHO),
+        ),
     ]
 }
 
@@ -287,7 +288,7 @@ async fn a_value_outside_its_catalog_is_refused_with_one_sentence() {
                 );
                 assert_eq!(
                     message_of(&body),
-                    expected_message(member.member, member.declared, &value),
+                    expected_message(member.member, member.declared),
                     "case {case:?}: the refusal was worded {:?}",
                     message_of(&body)
                 );
@@ -424,7 +425,7 @@ async fn every_value_a_catalog_holds_is_served() {
 /// holds that backstop to the rule for all five members at once: a value its catalog
 /// holds is nothing to refuse, a member the request left out is nothing to weigh, and
 /// anything else is the one validation-envelope sentence naming the member and its
-/// value set, with an over-long value echoed as a bounded prefix.
+/// value set, stating no value.
 #[test]
 fn the_shared_check_refuses_exactly_what_a_catalog_leaves_out() {
     for member in ENUM_MEMBERS {
@@ -449,7 +450,7 @@ fn the_shared_check_refuses_exactly_what_a_catalog_leaves_out() {
             let refusal = enum_value_violation(member.member, member.allowed, Some(&value));
             assert_eq!(
                 refusal.as_deref(),
-                Some(expected_message(member.member, member.allowed, &value).as_str()),
+                Some(expected_message(member.member, member.allowed).as_str()),
                 "case {case:?}: the refusal was worded {refusal:?}"
             );
         }

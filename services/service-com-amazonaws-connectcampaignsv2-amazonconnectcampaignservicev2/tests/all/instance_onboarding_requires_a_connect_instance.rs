@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, INSTANCE_NOT_FOUND_MESSAGE,
-    ONBOARDING_JOB_DURATION, ONBOARDING_STATUS_IN_PROGRESS,
+    instance_id_not_found_message,
+    ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, ONBOARDING_JOB_DURATION,
+    ONBOARDING_STATUS_IN_PROGRESS,
 };
 
 use super::common::{call, error_code, router_with_engine, Harness};
@@ -119,9 +120,8 @@ async fn create_campaign(
 }
 
 /// Assert `(status, body)` is the modelled 404 for an instance the account does not
-/// hold: the service's FIXED text for an instance that is not usable by Campaigns,
-/// which carries nothing from the request, so it reads the same whatever id was asked
-/// about.
+/// hold: the sentence this operation's wire states, which reports the instance id
+/// unresolved and names the id asked about.
 fn assert_instance_not_found(case: &str, what: &str, status: u16, body: &Value, instance: &str) {
     assert_eq!(
         status, 404,
@@ -134,9 +134,9 @@ fn assert_instance_not_found(case: &str, what: &str, status: u16, body: &Value, 
     );
     assert_eq!(
         body.get("message").and_then(Value::as_str),
-        Some(INSTANCE_NOT_FOUND_MESSAGE),
-        "case {case:?}: expected the service's fixed text for an instance not usable by \
-         Campaigns from {what}, got {body}"
+        Some(instance_id_not_found_message(instance).as_str()),
+        "case {case:?}: expected the sentence {what} states for an unresolved instance id, \
+         got {body}"
     );
 }
 

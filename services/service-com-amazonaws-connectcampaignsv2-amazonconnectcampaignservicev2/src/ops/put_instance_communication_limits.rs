@@ -240,14 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         if !stored {
             // Instance-wide limits are configuration of the instance, so an instance
-            // with no finished onboarding job has nothing to configure — the same 404
-            // its config read answers, decided by the same predicate.
+            // with no finished onboarding job has nothing to configure. The sentence is
+            // the one this service's wire states for an instance that is no Campaigns
+            // instance — the usability text, which the limits read answers too, so the
+            // two cannot disagree.
             return Err(
                 PutInstanceCommunicationLimitsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::instance_config_not_found_message(
-                            &input.connect_instance_id,
-                        ),
+                        message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
                         x_amz_error_type: None,
                     },
                 )

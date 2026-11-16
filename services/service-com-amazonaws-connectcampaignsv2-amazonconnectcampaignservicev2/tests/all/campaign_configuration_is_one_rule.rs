@@ -16,10 +16,13 @@
 //! * a campaign in any state that still takes the change is served, and the call moves
 //!   no lifecycle;
 //! * an id the request's region holds no campaign under is HTTP 404
-//!   `ResourceNotFoundException` with the same sentence from every one of them.
+//!   `ResourceNotFoundException` with the sentence that operation's own wire states — the
+//!   lookup sentence, naming the id or not, as `campaign_not_found_message.rs` tables it.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::CAMPAIGN_NOT_FOUND_MESSAGE;
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
+    campaign_id_not_found_message, CAMPAIGN_NOT_FOUND_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::common::{
@@ -35,6 +38,9 @@ struct Configure {
     method: &'static str,
     suffix: String,
     body: Value,
+    /// Whether this operation's not-found sentence NAMES the id it was asked about, as
+    /// its own wire states it (`campaign_not_found_message.rs` holds the whole table).
+    names_the_id: bool,
 }
 
 /// Every operation that changes a campaign's configuration — the ones whose model
@@ -45,11 +51,16 @@ struct Configure {
 /// `COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES` / `COMMUNICATION_TIME_CONFIG_TYPE_VALUES`
 /// in this crate's `ops::types` render them).
 fn configuration_operations() -> Vec<Configure> {
-    let row = |operation: &'static str, method: &'static str, suffix: &str, body: Value| Configure {
+    let row = |operation: &'static str,
+               method: &'static str,
+               suffix: &str,
+               body: Value,
+               names_the_id: bool| Configure {
         operation,
         method,
         suffix: suffix.to_string(),
         body,
+        names_the_id,
     };
     vec![
         row(
@@ -60,6 +71,7 @@ fn configuration_operations() -> Vec<Configure> {
                 "customerProfilesSegmentArn":
                     "arn:aws:profile:us-east-1:000000000000:segment/one-rule"
             }}),
+            true,
         ),
         row(
             "UpdateCampaignSchedule",
@@ -68,6 +80,7 @@ fn configuration_operations() -> Vec<Configure> {
             // A window that is still open, so a served call leaves the campaign's
             // clock-derived state exactly where it was.
             json!({"schedule": {"startTime": instant(60.0), "endTime": instant(7_200.0)}}),
+            false,
         ),
         row(
             "UpdateCampaignFlowAssociation",
@@ -77,14 +90,22 @@ fn configuration_operations() -> Vec<Configure> {
                 "connectCampaignFlowArn":
                     "arn:aws:connect:us-east-1:000000000000:instance/i-1/flow/f-1"
             }),
+            true,
         ),
         row(
             "UpdateCampaignEntryLimits",
             "POST",
             "/entry-limits",
             json!({"entryLimitsConfig": {"maxEntryCount": 4, "minEntryInterval": "PT45M"}}),
+            true,
         ),
-        row("DeleteCampaignEntryLimits", "DELETE", "/entry-limits", Value::Null),
+        row(
+            "DeleteCampaignEntryLimits",
+            "DELETE",
+            "/entry-limits",
+            Value::Null,
+            true,
+        ),
         row(
             "UpdateCampaignCommunicationLimits",
             "POST",
@@ -94,12 +115,14 @@ fn configuration_operations() -> Vec<Configure> {
                     {"maxCountPerRecipient": 3, "frequency": 2, "unit": "DAY"}
                 ]
             }}}),
+            true,
         ),
         row(
             "DeleteCampaignCommunicationLimits",
             "DELETE",
             "/communication-limits?config=ALL_CHANNEL_SUBTYPES",
             Value::Null,
+            true,
         ),
         row(
             "UpdateCampaignCommunicationTime",
@@ -111,12 +134,14 @@ fn configuration_operations() -> Vec<Configure> {
                     "dailyHours": {"TUESDAY": [{"startTime": "T08:00", "endTime": "T18:00"}]}
                 }}
             }}),
+            false,
         ),
         row(
             "DeleteCampaignCommunicationTime",
             "DELETE",
             "/communication-time?config=TELEPHONY",
             Value::Null,
+            false,
         ),
     ]
 }
@@ -381,10 +406,15 @@ async fn every_configuration_operation_refuses_an_unknown_id_alike() {
                 "case {case:?}: expected ResourceNotFoundException, got {}",
                 error_code(&body)
             );
+            let expected = if op.names_the_id {
+                campaign_id_not_found_message(id)
+            } else {
+                CAMPAIGN_NOT_FOUND_MESSAGE.to_string()
+            };
             assert_eq!(
                 body["message"].as_str(),
-                Some(CAMPAIGN_NOT_FOUND_MESSAGE),
-                "case {case:?}: expected {CAMPAIGN_NOT_FOUND_MESSAGE:?}, got {:?}",
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {:?}",
                 body["message"]
             );
         }

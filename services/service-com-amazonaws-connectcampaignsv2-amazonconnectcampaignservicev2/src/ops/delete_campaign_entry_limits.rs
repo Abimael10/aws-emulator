@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::ConfigurationRejected::NotFound => {
                         DeleteCampaignEntryLimitsErrorModeled::ResourceNotFoundException(
                             ResourceNotFoundException {
-                                message: rejected.message(),
+                                message: crate::state::campaign_id_not_found_message(&input.id),
                                 x_amz_error_type: None,
                             },
                         )

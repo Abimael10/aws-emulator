@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops::types::EncryptionConfig;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
+    instance_config_not_found_message, instance_id_not_found_message,
     ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, INSTANCE_NOT_FOUND_MESSAGE,
     ONBOARDING_JOB_DURATION,
 };
@@ -57,6 +58,11 @@ const SECOND_FUNCTION: &str = "arn:aws:lambda:us-east-1:000000000000:function:re
 /// One request: its HTTP method, its path, and its body (`Value::Null` for a request
 /// that carries none).
 type Request = (&'static str, String, Value);
+
+/// One row of the class table: the operation, the request to drive while the account
+/// holds the instance, the one to drive once it does not, and the sentence that
+/// operation's own wire states for an instance it cannot use.
+type ClassRow = (&'static str, Request, Request, fn(&str) -> String);
 
 /// A `lambda` `IntegrationConfig` for `function_arn` (`LambdaIntegrationConfig$functionArn`,
 /// from `smithy_query(query="shape", shape="IntegrationConfig")`).
@@ -86,12 +92,15 @@ fn campaign_body(instance: &str, name: &str) -> Value {
 
 /// Every operation of this refusal class, each with TWO requests for `instance`: one to
 /// drive while the account's registry holds the instance, which must be served, and one
-/// to drive once it does not, which must be refused. Both name resources the fixture
-/// really set up, so the registry is the only difference between the two phases.
+/// to drive once it does not, which must be refused, plus the sentence that operation's
+/// own wire states for an instance it cannot use. Both requests name resources the
+/// fixture really set up, so the registry is the only difference between the two phases.
 ///
-/// The class is the one [`INSTANCE_NOT_FOUND_MESSAGE`] describes: starting an onboarding
-/// job, creating a campaign, and the instance-integration operations.
-fn class_operations(instance: &str) -> Vec<(&'static str, Request, Request)> {
+/// The class is every operation that needs a USABLE instance: starting an onboarding
+/// job, creating a campaign, and the instance-integration operations. The status and the
+/// code are the class's; which sentence each one states is a fact of its own wire, and
+/// `instance_refusal_messages.rs` tables all of them.
+fn class_operations(instance: &str) -> Vec<ClassRow> {
     let onboarding = format!("/v2/connect-instance/{instance}/onboarding");
     let integrations = format!("/v2/connect-instance/{instance}/integrations");
     let onboarding_body = json!({"encryptionConfig": {"enabled": false}});
@@ -100,6 +109,7 @@ fn class_operations(instance: &str) -> Vec<(&'static str, Request, Request)> {
             "StartInstanceOnboardingJob",
             ("PUT", onboarding.clone(), onboarding_body.clone()),
             ("PUT", onboarding, onboarding_body),
+            instance_id_not_found_message,
         ),
         (
             "CreateCampaign",
@@ -113,6 +123,7 @@ fn class_operations(instance: &str) -> Vec<(&'static str, Request, Request)> {
                 "/v2/campaigns".to_string(),
                 campaign_body(instance, "once-the-account-does-not"),
             ),
+            usability_sentence,
         ),
         (
             "PutConnectInstanceIntegration",
@@ -126,6 +137,7 @@ fn class_operations(instance: &str) -> Vec<(&'static str, Request, Request)> {
                 integrations.clone(),
                 json!({"integrationConfig": lambda_config(SECOND_FUNCTION)}),
             ),
+            instance_config_not_found_message,
         ),
         (
             "DeleteConnectInstanceIntegration",
@@ -139,13 +151,21 @@ fn class_operations(instance: &str) -> Vec<(&'static str, Request, Request)> {
                 format!("{integrations}/delete"),
                 json!({"integrationIdentifier": lambda_identifier(SECOND_FUNCTION)}),
             ),
+            instance_config_not_found_message,
         ),
         (
             "ListConnectInstanceIntegrations",
             ("GET", integrations.clone(), Value::Null),
             ("GET", integrations, Value::Null),
+            usability_sentence,
         ),
     ]
+}
+
+/// The fixed sentence about an instance that is not usable by Campaigns, as a row's
+/// sentence function.
+fn usability_sentence(_instance: &str) -> String {
+    INSTANCE_NOT_FOUND_MESSAGE.to_string()
 }
 
 /// Drive one [`Request`] of `region`'s endpoint.
@@ -203,9 +223,9 @@ fn refusal(body: &Value, status: u16) -> (u16, String, String) {
 }
 
 /// Assert `(status, body)` is the modelled 404 for an instance that is not usable by
-/// Campaigns: the service's FIXED text for that class, which carries nothing from the
-/// request.
-fn assert_instance_not_found(case: &str, status: u16, body: &Value) {
+/// Campaigns, worded with `expected` — the sentence the answering operation's own wire
+/// states.
+fn assert_instance_not_found(case: &str, status: u16, body: &Value, expected: &str) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected HTTP 404 for an instance the account does not hold, \
@@ -218,9 +238,9 @@ fn assert_instance_not_found(case: &str, status: u16, body: &Value) {
     );
     assert_eq!(
         body.get("message").and_then(Value::as_str),
-        Some(INSTANCE_NOT_FOUND_MESSAGE),
-        "case {case:?}: expected the service's fixed text for an instance not usable by \
-         Campaigns, got {body}"
+        Some(expected),
+        "case {case:?}: expected the sentence this operation states for an instance not \
+         usable by Campaigns, got {body}"
     );
 }
 
@@ -241,9 +261,9 @@ async fn campaign_names(router: &Harness, region: &str, case: &str) -> Vec<Strin
 
 #[tokio::test]
 async fn every_operation_needing_a_usable_instance_is_refused_once_the_registry_loses_it() {
-    let mut refusals: Vec<(&str, (u16, String, String))> = Vec::new();
+    let mut refusals: Vec<(&str, (u16, String))> = Vec::new();
 
-    for (operation, served, refused) in class_operations(INSTANCE) {
+    for (operation, served, refused, sentence) in class_operations(INSTANCE) {
         let (router, _engine) = router_with_engine();
         prepare(&router, REGION, INSTANCE).await;
 
@@ -264,12 +284,14 @@ async fn every_operation_needing_a_usable_instance_is_refused_once_the_registry_
         );
 
         let (status, body) = send(&router, REGION, &refused).await;
-        assert_instance_not_found(operation, status, &body);
-        refusals.push((operation, refusal(&body, status)));
+        assert_instance_not_found(operation, status, &body, &sentence(INSTANCE));
+        let (status, code, _) = refusal(&body, status);
+        refusals.push((operation, (status, code)));
     }
 
-    // The class is ONE refusal: every operation of it answers the same status, code and
-    // text, so two of them cannot disagree about a request they both refuse.
+    // The class is ONE refusal in status and code: every operation of it answers the
+    // same 404 and the same modelled error, so two of them cannot disagree about
+    // WHETHER a request they both refuse is a missing resource.
     let (first_operation, first) = refusals
         .first()
         .cloned()
@@ -317,7 +339,12 @@ async fn a_refused_create_mints_nothing_and_a_refused_put_stores_nothing() {
         &campaign_body(INSTANCE, "never-minted"),
     )
     .await;
-    assert_instance_not_found("CreateCampaign stores nothing", status, &body);
+    assert_instance_not_found(
+        "CreateCampaign stores nothing",
+        status,
+        &body,
+        INSTANCE_NOT_FOUND_MESSAGE,
+    );
     assert!(
         body.get("id").is_none() && body.get("arn").is_none(),
         "case \"CreateCampaign stores nothing\": a refused create mints no id or ARN, got {body}"
@@ -333,7 +360,12 @@ async fn a_refused_create_mints_nothing_and_a_refused_put_stores_nothing() {
         )}),
     )
     .await;
-    assert_instance_not_found("PutConnectInstanceIntegration stores nothing", status, &body);
+    assert_instance_not_found(
+        "PutConnectInstanceIntegration stores nothing",
+        status,
+        &body,
+        &instance_config_not_found_message(INSTANCE),
+    );
 
     // Putting the instance back into the registry makes it usable again — the gate
     // reads the registry's current contents rather than latching — and what it holds is
@@ -382,7 +414,7 @@ async fn an_onboarding_record_alone_does_not_make_an_instance_usable() {
     // whether the instance exists, so every operation of the class refuses it.
     let instance = "onboarded-but-never-registered";
 
-    for (operation, _served, refused) in class_operations(instance) {
+    for (operation, _served, refused, sentence) in class_operations(instance) {
         let (router, engine) = router_with_engine();
         let state =
             engine.state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>();
@@ -408,7 +440,7 @@ async fn an_onboarding_record_alone_does_not_make_an_instance_usable() {
         }
 
         let (status, body) = send(&router, REGION, &refused).await;
-        assert_instance_not_found(operation, status, &body);
+        assert_instance_not_found(operation, status, &body, &sentence(instance));
     }
 }
 
@@ -476,7 +508,7 @@ async fn the_gate_follows_the_registry_for_every_id_form_and_region() {
                 &campaign_body(&instance, "target-once-deregistered"),
             )
             .await;
-            assert_instance_not_found(&case, status, &body);
+            assert_instance_not_found(&case, status, &body, INSTANCE_NOT_FOUND_MESSAGE);
 
             // Put back, and it is a target again.
             router.register_connect_instance(region, &instance);

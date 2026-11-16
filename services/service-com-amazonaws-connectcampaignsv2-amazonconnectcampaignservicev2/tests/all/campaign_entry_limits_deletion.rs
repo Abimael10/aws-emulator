@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignState, CAMPAIGN_NOT_FOUND_MESSAGE,
+    campaign_id_not_found_message, CampaignState,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -343,8 +343,8 @@ async fn an_unknown_campaign_is_not_found_and_loses_no_entry_limits() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(CAMPAIGN_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the fixed not-found text, got {}",
+            Some(campaign_id_not_found_message(&id).as_str()),
+            "case {case:?}: expected this operation's not-found text naming the id, got {}",
             body["message"]
         );
 

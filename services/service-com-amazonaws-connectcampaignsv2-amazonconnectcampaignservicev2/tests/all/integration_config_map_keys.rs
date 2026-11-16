@@ -63,17 +63,24 @@ fn profiles_config(keys: &[&str]) -> Value {
 /// The whole message a map at `member` is refused with when `offenders` are not values
 /// `allowed` holds: the validation envelope, carrying one clause per offending key,
 /// ordered by key.
+///
+/// Each clause names the member path — which carries the offending KEY — and the value
+/// set, in ascending order over that set, and states no value: the two renderings this
+/// service's wire shows for an enumerated type, which hold wherever one is weighed (see
+/// `src/service/validation.rs`).
 fn expected_message(member: &str, allowed: &[&str], offenders: &[&str]) -> String {
     let mut ordered: Vec<&str> = offenders.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
+    let mut stated: Vec<&str> = allowed.to_vec();
+    stated.sort_unstable();
     let clauses: Vec<String> = ordered
         .iter()
         .map(|key| {
             format!(
-                "Value '{key}' at '{member}.{key}.member' failed to satisfy constraint: \
+                "Value at '{member}.{key}.member' failed to satisfy constraint: \
                  Member must satisfy enum value set: [{}]",
-                allowed.join(", ")
+                stated.join(", ")
             )
         })
         .collect();

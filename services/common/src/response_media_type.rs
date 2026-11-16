@@ -50,14 +50,16 @@
 //!   [`ResponseMediaType::announce`] through `Service::override_operation`,
 //!   `Service::override_routing_error` and `Service::override_framework_error`.
 //!
-//! The first of those three is the one that needs plumbing rather than a one-line call: the
-//! refusal tail is rendered INSIDE the centralized walk, so reaching it means serving that
-//! walk and re-announcing what it answered. That plumbing is therefore stated here once, as
+//! Two of those three need plumbing rather than a one-line call. The refusal tail is
+//! rendered INSIDE the centralized walk, so reaching it means serving that walk and
+//! re-announcing what it answered; that plumbing is stated here once, as
 //! [`ResponseMediaTypeOperation`] (the wrapper a service hands back from
 //! `Service::override_operation`, re-announcing either every response of the walk or only
 //! the ones an [`AnnouncedResponses`] predicate accepts) and [`routes`] (the condition under
-//! which it claims a request); the other two seams are handed the rendered response and need
-//! nothing but the call.
+//! which it claims a request). A transport failure arrives with no request to resolve an
+//! envelope from and cannot be re-rendered from the borrowed error, so that seam's whole
+//! body is stated here too, as [`reannounced_framework_error`]. The routing failure is
+//! handed the rendered response and needs nothing but the call.
 //!
 //! One response no author seam reaches: the authentication refusal, which the router renders
 //! through `definition().refusal_response(..)` before the service is asked anything
@@ -76,11 +78,13 @@
 //! front door, the same `1.1` framing over an `awsJson1_0` model; the last of them is the
 //! two-announcer case, so it states which responses that front door produced rather than
 //! re-announcing all of them — and by
-//! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice` and
+//! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice`,
+//! `service-com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2` and
 //! `service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2`, whose models declare
 //! `restJson1` and whose recorded wires announce the awsJson `1.1` media type on every
 //! reply, so each states its own pair (`application/json` → `1.1`) and takes the
-//! mechanism, including [`ResponseMediaTypeOperation`], from here. Each of them states
+//! mechanism, including [`ResponseMediaTypeOperation`] and
+//! [`reannounced_framework_error`], from here. Each of them states
 //! only its own pair (`RESPONSE_MEDIA_TYPE`).
 //!
 //! STILL TO MIGRATE onto this module: `service-com-amazonaws-amp-amazonprometheusservice`
@@ -94,8 +98,10 @@
 //! should state the rule again.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Service,
+    protocol_error_response, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext,
+    PreDispatchProtocol, Service,
 };
 
 /// The response header carrying the media type.
@@ -167,6 +173,47 @@ pub fn routes(definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> bool
         .ok()
         .and_then(|key| definition.routing_table().get(key))
         .is_some()
+}
+
+/// `error` rendered in the JSON pre-dispatch envelope and re-announced across `pair`, or
+/// `None` for an error that cannot be rebuilt — the whole `Service::override_framework_error`
+/// body for a service on a JSON protocol (`restJson1` or the awsJson family) whose wire
+/// announces a media type of its own.
+///
+/// That seam is handed the transport-level failure ALONE, with no request to resolve an
+/// envelope from, and `ProtocolError` is neither `Clone` nor reconstructable in general. So
+/// the framework's own renderer is reached by rebuilding the one variant the router ever
+/// raises here — `Malformed`, from the `aws-chunked` decode it runs before naming an
+/// operation — and rendering it in the JSON envelope, whose media type is the one the
+/// service's protocol trait implies ([`ResponseMediaType::implied`]) and which carries the
+/// `x-amzn-errortype` header both JSON families answer an error with. `ProtocolError` is an
+/// open enum this crate does not own, so every other variant declines to `None`, keeping the
+/// framework's own rendering of an error that cannot be rebuilt rather than losing what it
+/// said.
+///
+/// THE HOME for that rebuild-and-render: it is the one of the three framework-rendered seams
+/// that needs more than a call to [`ResponseMediaType::announce`], and a second spelling of
+/// it per crate is how one service comes to render a transport failure differently from
+/// another. `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice` and
+/// `service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2` each carried the same block
+/// privately, written before this module had one, and are migrated onto this function.
+pub fn reannounced_framework_error(
+    pair: ResponseMediaType,
+    error: &ProtocolError,
+) -> Option<RtResponse> {
+    match error {
+        ProtocolError::Malformed(message) => {
+            let rebuilt = ProtocolError::Malformed(message.clone());
+            Some(pair.announce(protocol_error_response(
+                PreDispatchProtocol::Json {
+                    content_type: pair.implied(),
+                    errortype_header: true,
+                },
+                rebuilt,
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// Serves the modelled operation the service's routing table names for the request, exactly

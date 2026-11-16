@@ -175,6 +175,22 @@ pub async fn call(
     path: &str,
     body: &Value,
 ) -> (u16, Value) {
+    let (status, _headers, parsed) = call_with_headers(router, region, method, path, body).await;
+    (status, parsed)
+}
+
+/// [`call`], handing back the response HEADERS as well — for a case about what the
+/// response ANNOUNCES rather than what it says (its media type, say).
+///
+/// The one place this crate's suites read a response header, so the plumbing stays
+/// single-homed in [`call`]'s own body.
+pub async fn call_with_headers(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
     let payload = if body.is_null() {
         bytes::Bytes::new()
     } else {
@@ -189,13 +205,14 @@ pub async fn call(
         .expect("a well-formed test request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, headers, parsed)
 }
 
 /// The error code a failure response carries (restJson1 puts it in `__type`).

@@ -265,9 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DeleteConnectInstanceConfigErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: crate::state::instance_config_not_found_message(
-                                &input.connect_instance_id,
-                            ),
+                            // The instance holds no finished onboarding, so the sentence
+                            // is the one this service states about an instance that is
+                            // not onboarded (`crate::state::INSTANCE_NOT_ONBOARDED_MESSAGE`).
+                            message: crate::state::INSTANCE_NOT_ONBOARDED_MESSAGE.to_string(),
                             x_amz_error_type: None,
                         },
                     )

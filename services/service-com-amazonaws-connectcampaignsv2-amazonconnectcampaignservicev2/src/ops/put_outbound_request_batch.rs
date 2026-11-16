@@ -231,9 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store's own decision, shared with `PutProfileOutboundRequestBatch` (see
         // `crate::state::...::dialable_campaign`), so the two batch operations cannot
         // disagree about which campaign dials. What is this operation's own is the
-        // mapping below to the error variants its model declares — and the not-found
-        // wording, which this operation keeps as its recorded responses carry it,
-        // naming the campaign the caller asked for.
+        // mapping below to the error variants its model declares; the not-found
+        // sentence is the one the plane that ACTS on a campaign states
+        // (`crate::state::campaign_absent_message`), naming the campaign the caller
+        // asked for.
         let configured = match store.dialable_campaign(
             crate::state::CampaignRef {
                 region: &region,
@@ -245,10 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(campaign) => campaign.channel_subtypes(),
             Err(rejected) => {
                 return Err(match &rejected {
-                    crate::state::DialRejected::NotFound => {
+                    crate::state::DialRejected::NotFound { .. } => {
                         PutOutboundRequestBatchErrorModeled::ResourceNotFoundException(
                             ResourceNotFoundException {
-                                message: format!("Campaign: {} doesn't exist", input.id),
+                                message: rejected.message(),
                                 x_amz_error_type: None,
                             },
                         )

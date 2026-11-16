@@ -129,6 +129,8 @@ mod profile_outbound_requests;
 mod profile_request_event_trigger_context;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/response_media_type.rs"]
+mod response_media_type;
 #[path = "all/schedule_timestamp_precision.rs"]
 mod schedule_timestamp_precision;
 #[path = "all/shared_connect_instance_gate.rs"]

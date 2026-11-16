@@ -14,15 +14,14 @@
 //! * a campaign that IS `Running` at the instant of the call takes the batch, however
 //!   it got there;
 //! * an id the request's region holds no campaign under is HTTP 404
-//!   `ResourceNotFoundException` from either operation — the one part of this the two
-//!   deliberately word differently, since the dial batch's recorded refusal names the
-//!   campaign asked for.
+//!   `ResourceNotFoundException` from either operation, with the one sentence the plane
+//!   that ACTS on a campaign states about an absent one, naming the campaign asked for.
 
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, CAMPAIGN_NOT_FOUND_MESSAGE,
+    campaign_absent_message, ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -98,7 +97,7 @@ const BATCH_OPERATIONS: &[Batch] = &[
         suffix: "/outbound-requests",
         member: "outboundRequests",
         request: dial_request,
-        not_found_message: dial_not_found_message,
+        not_found_message: batch_not_found_message,
         pending: pending_dial,
     },
     Batch {
@@ -106,21 +105,16 @@ const BATCH_OPERATIONS: &[Batch] = &[
         suffix: "/profile-outbound-requests",
         member: "profileOutboundRequests",
         request: profile_request,
-        not_found_message: profile_not_found_message,
+        not_found_message: batch_not_found_message,
         pending: pending_profile,
     },
 ];
 
-/// The not-found sentence the dial batch answers with, which names the campaign the
-/// caller asked for.
-fn dial_not_found_message(id: &str) -> String {
-    format!("Campaign: {id} doesn't exist")
-}
-
-/// The not-found sentence the profile batch answers with: the fixed text every other
-/// campaign-id operation of this service shares.
-fn profile_not_found_message(_id: &str) -> String {
-    CAMPAIGN_NOT_FOUND_MESSAGE.to_string()
+/// The not-found sentence both batch operations answer with, which names the campaign
+/// the caller asked for: the one the plane that ACTS on a campaign states, so neither
+/// batch can word it differently from the lifecycle calls beside it.
+fn batch_not_found_message(id: &str) -> String {
+    campaign_absent_message(id)
 }
 
 /// Submit a one-request batch of `op`'s shape to `id` under `client_token`.

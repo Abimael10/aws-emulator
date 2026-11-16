@@ -5,24 +5,26 @@
 //!
 //! Every case drives real HTTP through the router the production entrypoint serves, so
 //! each assertion exercises the restJson1 wire protocol, the modelled constraints and
-//! the handlers together. The rule under test: a 404 `ResourceNotFoundException` names
-//! the RESOURCE the request addresses, and every operation addressing that resource
-//! answers the one text for it —
+//! the handlers together. The rule under test: a 404 `ResourceNotFoundException` carries
+//! the sentence the ANSWERING operation's own wire states, composed from the request and
+//! never from the store, and every operation that states one sentence states exactly it —
 //!
-//! * the operations whose own resource IS the instance's Campaigns configuration (the
-//!   two on `/v2/connect-instance/{id}/config` and the two on its
-//!   `/communication-limits`, which are a member of that same configuration) report
-//!   that configuration as not found, naming the instance asked about;
-//! * the operations that address some OTHER resource and only require the instance to
-//!   be usable by Campaigns (`CreateCampaign`, the three instance-integration
-//!   operations, `StartInstanceOnboardingJob`) answer the service's FIXED sentence
-//!   about the instance, which carries nothing from the request;
+//! * the operations whose wire reports the instance's Campaigns CONFIGURATION as not
+//!   found name the instance asked about (the config READ, and the two that write an
+//!   instance's integrations);
+//! * the operations whose wire reports the instance's USABILITY by Campaigns answer the
+//!   service's fixed sentence about it, which carries nothing from the request
+//!   (`CreateCampaign`, the integration LISTING, and the two on the instance's
+//!   communication limits);
+//! * the removal of the configuration reports the instance as NOT ONBOARDED, the fixed
+//!   sentence its own wire states;
 //! * the two whose own resource is the onboarding JOB report that record as not
 //!   existing, naming the AWS account the call was made in beside the instance asked
 //!   about — an onboarding record belongs to one account's instance, so that is how a
 //!   caller tells "never onboarded in THIS account" from a cross-account mistake;
 //!
-//! so two operations of one class cannot disagree about a request they both refuse.
+//! so two operations that state one sentence cannot disagree about a request they both
+//! refuse.
 //!
 //! The rows differ along what the rule generalises over: the operation (every
 //! instance-scoped one, across all three classes), the form of the instance id (its
@@ -36,7 +38,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
     instance_config_not_found_message, onboarding_job_not_found_message,
-    INSTANCE_NOT_FOUND_MESSAGE,
+    INSTANCE_NOT_FOUND_MESSAGE, INSTANCE_NOT_ONBOARDED_MESSAGE,
 };
 
 use super::common::{call, error_code, onboard_instance, router, Harness};
@@ -49,19 +51,21 @@ const REGION: &str = "us-east-1";
 /// none.
 const OTHER_REGION: &str = "eu-west-1";
 
-/// Which resource a request addresses, and so which text its 404 carries.
+/// Which sentence an operation's own wire states, and so which text its 404 carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Refusal {
-    /// The instance's Campaigns configuration itself.
+    /// The instance's Campaigns configuration reported as not found, naming it.
     Config,
-    /// Another resource, for which the instance only has to be usable by Campaigns.
+    /// The instance reported as not usable by Campaigns.
     Instance,
-    /// The instance's onboarding job.
+    /// The instance reported as not onboarded.
+    NotOnboarded,
+    /// The instance's onboarding job reported as not existing.
     Job,
 }
 
 impl Refusal {
-    /// The message this class answers for `instance`, spelled out HERE rather than
+    /// The message this sentence states for `instance`, spelled out HERE rather than
     /// taken from the crate, so the assertion pins the wording and not merely the fact
     /// that every handler calls the same helper.
     fn message(self, instance: &str) -> String {
@@ -70,6 +74,7 @@ impl Refusal {
             Refusal::Instance => {
                 "Connect Instance does not exist or is not enabled to use Campaigns.".to_string()
             }
+            Refusal::NotOnboarded => "Instance is not onboarded".to_string(),
             Refusal::Job => format!(
                 "Instance onboarding record does not exist for aws account id {} and \
                  instance id {instance}",
@@ -123,14 +128,14 @@ fn instance_scoped_operations(instance: &str) -> Vec<Op> {
             method: "DELETE",
             path: format!("{instance_path}/config"),
             body: Value::Null,
-            refusal: Refusal::Config,
+            refusal: Refusal::NotOnboarded,
         },
         Op {
             name: "GetInstanceCommunicationLimits",
             method: "GET",
             path: format!("{instance_path}/communication-limits"),
             body: Value::Null,
-            refusal: Refusal::Config,
+            refusal: Refusal::Instance,
         },
         Op {
             name: "PutInstanceCommunicationLimits",
@@ -141,7 +146,7 @@ fn instance_scoped_operations(instance: &str) -> Vec<Op> {
                     {"maxCountPerRecipient": 3, "frequency": 1, "unit": "DAY"},
                 ],
             }}}),
-            refusal: Refusal::Config,
+            refusal: Refusal::Instance,
         },
         Op {
             name: "ListConnectInstanceIntegrations",
@@ -157,7 +162,7 @@ fn instance_scoped_operations(instance: &str) -> Vec<Op> {
             body: json!({"integrationConfig": {"lambda": {
                 "functionArn": "arn:aws:lambda:us-east-1:000000000000:function:refusal-probe",
             }}}),
-            refusal: Refusal::Instance,
+            refusal: Refusal::Config,
         },
         Op {
             name: "DeleteConnectInstanceIntegration",
@@ -166,7 +171,7 @@ fn instance_scoped_operations(instance: &str) -> Vec<Op> {
             body: json!({"integrationIdentifier": {"lambda": {
                 "functionArn": "arn:aws:lambda:us-east-1:000000000000:function:refusal-probe",
             }}}),
-            refusal: Refusal::Instance,
+            refusal: Refusal::Config,
         },
         Op {
             name: "CreateCampaign",
@@ -392,6 +397,11 @@ async fn the_shared_texts_are_the_ones_the_handlers_compose() {
         INSTANCE_NOT_FOUND_MESSAGE,
         Refusal::Instance.message("any-instance"),
         "the instance text drifted from what the wire carries"
+    );
+    assert_eq!(
+        INSTANCE_NOT_ONBOARDED_MESSAGE,
+        Refusal::NotOnboarded.message("any-instance"),
+        "the not-onboarded text drifted from what the wire carries"
     );
 }
 

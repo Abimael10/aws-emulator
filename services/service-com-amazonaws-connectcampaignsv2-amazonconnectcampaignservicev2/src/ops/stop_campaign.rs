@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(rejected) => Err(match &rejected {
                 // This region holds no campaign under that id: there is no lifecycle
                 // to move, and nothing was written.
-                crate::state::LifecycleRejected::NotFound => {
+                crate::state::LifecycleRejected::NotFound { .. } => {
                     StopCampaignErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
                             message: rejected.message(),

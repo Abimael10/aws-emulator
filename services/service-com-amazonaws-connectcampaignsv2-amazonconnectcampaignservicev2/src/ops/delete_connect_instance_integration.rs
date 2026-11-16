@@ -250,7 +250,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DeleteConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                            message: crate::state::instance_config_not_found_message(
+                                &input.connect_instance_id,
+                            ),
                             x_amz_error_type: None,
                         },
                     )
@@ -291,7 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                        message: crate::state::instance_config_not_found_message(
+                            &input.connect_instance_id,
+                        ),
                         x_amz_error_type: None,
                     },
                 )

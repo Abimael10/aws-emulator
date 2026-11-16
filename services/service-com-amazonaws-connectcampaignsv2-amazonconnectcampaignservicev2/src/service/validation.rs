@@ -21,6 +21,9 @@
 //!   [`unanchored`] for the handler-side clauses and the suites that pin them);
 //! * the Amazon Connect instance id is never echoed: the member that carries one is named,
 //!   its value is not ([`carries_connect_instance_id`]);
+//! * a value outside an ENUMERATED type's set is refused by naming the member and the set
+//!   alone, with the set stated in ascending order and the rejected value not echoed
+//!   ([`enum_value_set`]);
 //! * a violation of a constraint on an ELEMENT of a list of scalars is reported against the
 //!   LIST member, quoting the list and nesting the element shape's whole constraint set,
 //!   which the shared renderer reads off this service's own input schemas
@@ -31,7 +34,9 @@
 
 use ::aws_smithy_schema::Schema;
 use ::service_common::validation::{list_of_element, rendered_list};
-use ::smithy_server_runtime::{Refusal, Refused, Violation};
+use ::service_common::validation_message::in_sorted_enum_order;
+use ::smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
+use ::std::collections::HashSet;
 
 /// A `@pattern` as a refusal of this service quotes it: the expression body, without the
 /// anchors the model writes around it.
@@ -173,6 +178,38 @@ pub fn in_json_document(message: &str) -> String {
     format!("{{ \"message\": \"{message}\" }}")
 }
 
+/// How this service states a value outside an ENUMERATED type's set: `violation` with that
+/// type's values in ascending order.
+///
+/// Two things are this API's own about such a clause, and both hold for every enumerated
+/// member of every operation rather than for a table of them:
+///
+/// * the set is stated in ASCENDING order over the values themselves
+///   ([`in_sorted_enum_order`], the fleet's one home for that order), not in the order this
+///   service's model happens to declare them in, so one type reads the same whatever order a
+///   model revision lists it in;
+/// * the rejected value is NOT echoed — the clause names the member and the set the value
+///   had to come from and nothing else — which is what [`withholds_value_at`] collects the
+///   member paths of.
+fn enum_value_set(violation: &Violation) -> Violation {
+    in_sorted_enum_order(violation)
+}
+
+/// The member paths whose clause states no value at all: every member a refusal weighed
+/// against an ENUMERATED type's set (see [`enum_value_set`]), beside the ones that carry an
+/// Amazon Connect instance id ([`carries_connect_instance_id`]).
+///
+/// A set of PATHS because that is what the shared renderer asks about, built from the
+/// violations by the CONSTRAINT each one broke: a member is weighed against one type, so the
+/// two readings cannot disagree about a path.
+fn withholds_value_at(violations: &[Violation]) -> HashSet<&str> {
+    violations
+        .iter()
+        .filter(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)))
+        .map(|violation| violation.path.as_str())
+        .collect()
+}
+
 /// How this service states `refusal`, or `None` to keep the framework's own wording.
 ///
 /// Only a refusal of the request's VALUES is reworded; an authentication refusal says
@@ -181,13 +218,18 @@ pub fn refusal(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
+    // Each clause's enumerated set is re-ordered BEFORE the envelope is rendered, and the
+    // members stated without a value are collected off the same violations, so one walk
+    // decides both halves of what an enum clause reads like.
+    let restated: Vec<Violation> = violations.iter().map(enum_value_set).collect();
+    let withheld = withholds_value_at(&restated);
     let stated =
         ::service_common::validation_message::aws_validation_refusal_over_elements_quoting_withholding(
-            refusal,
+            &Refusal::Invalid(restated.clone()),
             &input_schemas(),
             unanchored,
             |collection| quoted_collection(collection, violations),
-            carries_connect_instance_id,
+            |path| withheld.contains(path) || carries_connect_instance_id(path),
         )?;
     if belongs_to_outbound_batch(violations) {
         return Some(Refused {

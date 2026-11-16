@@ -282,34 +282,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
         // `aws-chunked` body. The entry's protocol-correct rendering is kept word for
-        // word; only the media type is re-announced (see the module header).
-        //
-        // The error is borrowed and `ProtocolError` is neither `Clone` nor
-        // reconstructable in general, so the default renderer is reached by rebuilding
-        // the one variant the router ever raises here — `Malformed`, from the
-        // `aws-chunked` decode it runs before naming an operation. `ProtocolError` is
-        // an open enum this crate does not own, so the remaining arm declines to
-        // `None`, keeping the framework's own rendering of an error this service cannot
-        // rebuild rather than losing what that error said.
-        match error {
-            aws_smithy_schema_server::ProtocolError::Malformed(message) => {
-                let rebuilt = aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
-                // Rendered through the framework's own renderer for this service's
-                // protocol envelope rather than through the entry: this seam is handed
-                // the error alone, and the entry's renderer resolves the envelope from
-                // the REQUEST it is given. The model declares restJson1, and the media
-                // type this service announces is re-stamped on the rendering anyway.
-                Some(RESPONSE_MEDIA_TYPE.announce(
-                    smithy_server_runtime::protocol_error_response(
-                        smithy_server_runtime::PreDispatchProtocol::Json {
-                            content_type: REST_JSON_MEDIA_TYPE,
-                            errortype_header: true,
-                        },
-                        rebuilt,
-                    ),
-                ))
-            }
-            _ => None,
-        }
+        // word; only the media type is re-announced (see the module header). The whole
+        // body is the shared rule's: that seam is handed the error ALONE, with no
+        // request to resolve an envelope from, and the rebuild-and-render that answer
+        // takes lives once in
+        // [`service_common::response_media_type::reannounced_framework_error`].
+        service_common::response_media_type::reannounced_framework_error(
+            RESPONSE_MEDIA_TYPE,
+            error,
+        )
     }
 }
