@@ -19,20 +19,32 @@
 //! * that model's `ModelDataUrl` is read out of this emulator's own Amazon S3 and the fitted
 //!   parameters are read back out of the `model.tar.gz` a training or AutoML run wrote
 //!   ([`super::model_from_archive`]), so the model served is the model trained;
+//! * an artifact holding a SERIALIZED GRADIENT-BOOSTED model instead — what SageMaker's own
+//!   boosting algorithm and the framework containers that wrap it upload — is read for the
+//!   booster's own parameters ([`super::boosted_model`]) and the prediction is computed from
+//!   them, so a model trained elsewhere and deployed here is served from what its artifact
+//!   really carries;
 //! * the payload is read as the caller's own records and the prediction is COMPUTED from
 //!   those parameters, one prediction per record in the order the payload carried them —
 //!   rendered as one comma-separated record for a `text/csv` answer and as the `predictions`
 //!   list of scores for a JSON one.
 //!
-//! Nothing here runs a container image. An artifact this emulator's own runs did not produce
-//! holds no parameters to compute from, so there is nothing to serve for it and the caller
-//! gets the operation's modelled failure for an invocation the model did not answer — never a
-//! synthesised body. The same goes for a variant whose model carries no artifact at all, and
-//! for a payload holding no record the model can be applied to.
+//! Nothing here runs a container image, and nothing is derived from an artifact's identity or
+//! from the request: an artifact holding no model either of those readings can take parameters
+//! out of is served by nothing at all, and neither is a variant whose model carries no
+//! artifact, a URI naming no object, an object Amazon S3 would not answer or a payload holding
+//! no record the model can be applied to. Each of those gets the operation's modelled failure
+//! for an invocation the model did not answer — never a synthesised body.
 
 use super::*;
 
 use crate::ops::types::ContainerDefinition;
+
+/// The most entries of a model archive that are examined for a serialized model: a container's
+/// artifact carries its model file beside what else it needs (the feature names, the
+/// configuration it was trained under), so the archive is walked rather than one name assumed —
+/// bounded, because the archive is a caller's own object.
+pub const MAX_ARTIFACT_ENTRIES: usize = 64;
 
 /// The most records one invocation's payload may carry. An EMULATOR ceiling, not an AWS
 /// limit: the predictions are held in memory, so the answer is bounded however large the
@@ -77,9 +89,9 @@ pub enum ServingRefusal {
     NoModelArtifact { model_name: String },
     /// The artifact could not be read out of Amazon S3.
     ArtifactUnreadable { uri: String },
-    /// The artifact holds no model this emulator can compute an inference from — it was not
-    /// produced by a run of this emulator's own, and nothing here runs the container image
-    /// that would know how to read it.
+    /// The artifact was read and holds no model whose parameters an inference can be computed
+    /// from: it carries no model this emulator's own runs wrote and no serialized booster
+    /// either, and nothing here runs the container image that would know how to read it.
     ArtifactNotServable { uri: String },
     /// The payload holds no record the model can be applied to.
     PayloadNotRecords,
@@ -105,8 +117,8 @@ impl ServingRefusal {
             Self::ArtifactNotServable { uri } => format!(
                 "The model artifacts at {uri} hold no model this emulator can compute an \
                  inference from: a SageMaker model runs as a container image, which this \
-                 emulator does not run, so only an artifact written by its own training runs \
-                 can be served."
+                 emulator does not run, so the artifact has to carry the model's own \
+                 parameters."
             ),
             Self::PayloadNotRecords => format!(
                 "The request payload holds no record to predict from: a record is a row of \
@@ -181,32 +193,153 @@ fn container_artifact_url(container: &ContainerDefinition) -> Option<String> {
         .cloned()
 }
 
-/// Load the fitted model behind `variant`, reading its artifact out of this emulator's own
-/// Amazon S3.
+/// What serves an invocation behind a variant: the model the artifact the variant's model
+/// names holds.
+#[derive(Debug, Clone)]
+pub enum ServedModel {
+    /// The parameters a training or AutoML run of this emulator FITTED and wrote into the
+    /// artifact, read back out of it ([`super::model_from_archive`]).
+    Fitted(LinearModel),
+    /// The serialized GRADIENT-BOOSTED model the artifact carries, read for the booster's own
+    /// parameters ([`super::boosted_model`]).
+    Boosted(BoostedModel),
+}
+
+impl ServedModel {
+    /// What this model answers for one record's features.
+    #[must_use]
+    pub fn predict(&self, features: &[f64]) -> f64 {
+        match self {
+            Self::Fitted(model) => model.predict(features),
+            Self::Boosted(model) => model.predict(features),
+        }
+    }
+
+    /// How many feature values a record has to carry for this model to be applied to it, for a
+    /// model that was FITTED on a particular width — and `None` for one that routes a value it
+    /// has no feature for and a feature the record does not carry, which a boosted model does
+    /// (a missing value takes the node's own default direction).
+    #[must_use]
+    pub fn fitted_width(&self) -> Option<usize> {
+        match self {
+            Self::Fitted(model) => Some(model.weights.len()),
+            Self::Boosted(_) => None,
+        }
+    }
+}
+
+/// Load the model behind `variant`, reading its artifact out of this emulator's own Amazon S3.
+///
+/// `None` is a fault of this process rather than of the request — the decode could not be
+/// performed at all — which a handler answers as such; every answer ABOUT the artifact is a
+/// `Result` of its own.
 pub async fn load_served_model(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     variant: &ServingVariant,
-) -> Result<LinearModel, ServingRefusal> {
+) -> Option<Result<ServedModel, ServingRefusal>> {
     let Some(uri) = variant.model_data_url.as_deref() else {
-        return Err(ServingRefusal::NoModelArtifact {
+        return Some(Err(ServingRefusal::NoModelArtifact {
             model_name: variant.model_name.clone(),
-        });
+        }));
     };
     let Some(location) = S3Location::parse(uri) else {
-        return Err(ServingRefusal::ArtifactUnreadable {
+        return Some(Err(ServingRefusal::ArtifactUnreadable {
             uri: uri.to_string(),
-        });
+        }));
     };
     let client = s3_client(ctx, region);
     let Ok(bytes) = read_object(&client, &location, MAX_OBJECT_BYTES).await else {
-        return Err(ServingRefusal::ArtifactUnreadable {
+        return Some(Err(ServingRefusal::ArtifactUnreadable {
             uri: location.uri(),
-        });
+        }));
     };
-    model_from_archive(&bytes).ok_or(ServingRefusal::ArtifactNotServable {
+    // Decoding an artifact is synchronous, CPU-bound work over a caller's own object, so it
+    // goes to the blocking pool and the worker serving this request is released while it runs —
+    // the same seam a training run's fit uses. The work itself is bounded (see
+    // [`MAX_ARTIFACT_ENTRIES`] and the ceilings in [`super::boosted_model`] and
+    // [`super::binary_json`]), so the pool is never occupied for long.
+    let decoded = ::tokio::task::spawn_blocking(move || model_from_artifact(&bytes))
+        .await
+        .ok()?;
+    Some(decoded.ok_or(ServingRefusal::ArtifactNotServable {
         uri: location.uri(),
-    })
+    }))
+}
+
+/// [`serve_inference`] on the blocking pool: applying a model to a payload's records is
+/// synchronous, CPU-bound work bounded by the model's own ceilings and by
+/// [`MAX_PAYLOAD_RECORDS`], so the worker serving the request is released while it runs.
+///
+/// `None` is a fault of this process rather than of the request — the work could not be
+/// performed at all — which a handler answers as such.
+pub async fn serve_inference_off_worker(
+    model: &ServedModel,
+    body: &[u8],
+    accept: Option<&str>,
+) -> Option<Result<ServedInference, ServingRefusal>> {
+    let model = model.clone();
+    let body = body.to_vec();
+    let accept = accept.map(str::to_string);
+    ::tokio::task::spawn_blocking(move || serve_inference(&model, &body, accept.as_deref()))
+        .await
+        .ok()
+}
+
+/// The model the artifact `bytes` carry, and `None` for an artifact holding none.
+///
+/// The one reading of a deployed artifact, so every caller of a model's artifact — an
+/// invocation, and any other work that applies a deployed model to records — takes the same
+/// parameters out of the same bytes:
+///
+/// * the model a training or AutoML run of this emulator wrote, read back out of the archive it
+///   wrote it into;
+/// * otherwise, a serialized gradient-boosted model, looked for in each entry of the archive —
+///   a container's artifact carries its model file beside whatever else it needs — and then in
+///   the bytes themselves, for an artifact that is the model file alone.
+#[must_use]
+pub fn model_from_artifact(bytes: &[u8]) -> Option<ServedModel> {
+    if let Some(fitted) = model_from_archive(bytes) {
+        return Some(ServedModel::Fitted(fitted));
+    }
+    if let Some(boosted) = archive_entries(bytes)
+        .into_iter()
+        .find_map(|entry| boosted_model_from_bytes(&entry))
+    {
+        return Some(ServedModel::Boosted(boosted));
+    }
+    boosted_model_from_bytes(bytes).map(ServedModel::Boosted)
+}
+
+/// The bytes of each entry a compressed archive holds, bounded by [`MAX_ARTIFACT_ENTRIES`]
+/// entries and by [`super::MAX_INFLATED_ARCHIVE_BYTES`] over the whole inflated stream — the
+/// archive is a caller's own object, so the decompressed side is bounded as explicitly as the
+/// download was.
+///
+/// Empty for bytes that are not such an archive, which is not an error here: an artifact may be
+/// the model file itself.
+fn archive_entries(bytes: &[u8]) -> Vec<Vec<u8>> {
+    use ::std::io::Read;
+
+    let decoder = ::flate2::read::GzDecoder::new(bytes).take(MAX_INFLATED_ARCHIVE_BYTES);
+    let mut archive = ::tar::Archive::new(decoder);
+    let Ok(entries) = archive.entries() else {
+        return Vec::new();
+    };
+    let mut read = Vec::new();
+    for entry in entries.take(MAX_ARTIFACT_ENTRIES) {
+        let Ok(entry) = entry else { continue };
+        let mut body = Vec::new();
+        if entry
+            .take(MAX_INFLATED_ARCHIVE_BYTES)
+            .read_to_end(&mut body)
+            .is_ok()
+            && !body.is_empty()
+        {
+            read.push(body);
+        }
+    }
+    read
 }
 
 /// What an endpoint answers one invocation with: the rendered body and the media type it is
@@ -220,7 +353,7 @@ pub struct ServedInference {
 /// Apply `model` to the records `body` carries and render the predictions in the media type
 /// `accept` asks for.
 pub fn serve_inference(
-    model: &LinearModel,
+    model: &ServedModel,
     body: &[u8],
     accept: Option<&str>,
 ) -> Result<ServedInference, ServingRefusal> {
@@ -231,9 +364,13 @@ pub fn serve_inference(
     if rows.len() > MAX_PAYLOAD_RECORDS {
         return Err(ServingRefusal::PayloadTooManyRecords { records: rows.len() });
     }
-    let expected = model.weights.len();
-    if let Some(found) = rows.iter().find(|row| row.len() != expected).map(Vec::len) {
-        return Err(ServingRefusal::FeatureCountMismatch { expected, found });
+    // A model FITTED on a particular set of feature columns cannot be applied to a record of
+    // another width; one read out of an artifact was fitted here on none, so every record's
+    // width is one it applies to.
+    if let Some(expected) = model.fitted_width() {
+        if let Some(found) = rows.iter().find(|row| row.len() != expected).map(Vec::len) {
+            return Err(ServingRefusal::FeatureCountMismatch { expected, found });
+        }
     }
     let predictions: Vec<f64> = rows.iter().map(|row| model.predict(row)).collect();
     let as_json = accept.is_some_and(|accept| accept.contains(JSON_MEDIA_TYPE));

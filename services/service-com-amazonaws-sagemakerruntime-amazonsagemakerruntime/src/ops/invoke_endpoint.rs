@@ -12,8 +12,9 @@
 //! a `SessionId` naming no stateful session — then, once that addressing has resolved,
 //! a `Body` past the maximum the model declares for it — and finally SERVES the inference
 //! from the model deployed behind the variant the call routes to
-//! (`sagemaker::state::model_serving`), answering the modelled 424 `ModelError` naming the
-//! condition when there is nothing to compute from.
+//! (`sagemaker::state::model_serving`), capturing the exchange where the deployment's
+//! `DataCaptureConfig` asks for it (`sagemaker::state::data_capture`) and answering the
+//! modelled 424 `ModelError` naming the condition when there is nothing to compute from.
 //! Every call is logged in [`crate::state`]. This is the ONLY file to touch for this
 //! operation.
 //!
@@ -28,24 +29,30 @@
 //!
 //! ## What answers the inference
 //!
-//! A SageMaker model is a CONTAINER IMAGE of customer code, which a generated emulator
-//! cannot run. What this emulator CAN serve is a model it fitted itself: a training job or
-//! an AutoML job run here writes its fitted parameters into the `model.tar.gz` under the
-//! job's output location, `CreateModel` deploys that artifact as a container's
-//! `ModelDataUrl`, and this operation reads the parameters back out of it and computes the
-//! prediction for the payload the caller sent. So the body answered is a MEASUREMENT over
-//! the caller's own request, from a model trained on the caller's own data.
+//! A SageMaker model is a CONTAINER IMAGE of customer code, which a generated emulator cannot
+//! run. What answers an invocation here is the model the deployed artifact holds, read out of
+//! this emulator's own Amazon S3 (`sagemaker::state::model_serving`): the parameters a training
+//! or AutoML run of this emulator fitted and wrote into the `model.tar.gz` under the job's
+//! output location, and for an artifact in any other format — a container image's own model
+//! file — the scorer this emulator hosts in that image's place, whose parameters are read out
+//! of the artifact's content. Either way the body answered is COMPUTED from the caller's own
+//! payload and the artifact the caller deployed.
 //!
-//! Where there is nothing to compute from — a variant whose model names no artifact, an
-//! artifact that cannot be read, one this emulator's own runs did not produce, or a payload
-//! holding no record the model applies to — nothing computed a prediction, and the answer
-//! is the modelled error for an invocation the model did not serve rather than a
-//! synthesised `Body`. Of the six errors the operation models, `ModelError` (424) is the
-//! one that says exactly that: the model behind the endpoint did not return an inference.
-//! The retryable ones would be false — `ModelNotReadyException` (429) and
-//! `ServiceUnavailable` (503) both promise that waiting and retrying helps, and nothing
-//! here ever becomes ready — and `ValidationError` (400) would blame a request that is
-//! valid.
+//! What gets the modelled failure instead is an invocation with no model artifact to compute
+//! from at all — a variant whose model names none, a URI naming no object, an object Amazon S3
+//! would not answer — or a payload holding no record the model applies to. Of the six errors
+//! the operation models, `ModelError` (424) is the one that says the model behind the endpoint
+//! did not return an inference. The retryable ones would be false — `ModelNotReadyException`
+//! (429) and `ServiceUnavailable` (503) both promise that waiting and retrying helps — and
+//! `ValidationError` (400) would blame a request that is valid.
+//!
+//! ## What is captured
+//!
+//! An endpoint whose deployment carries a `DataCaptureConfig` also records the exchange it
+//! served under that configuration's `DestinationS3Uri`
+//! (`sagemaker::state::data_capture`). It is a by-product of serving and best effort: a
+//! destination the deployment's execution role may not write leaves the inference answered
+//! exactly as it is and no capture object behind it.
 //!
 //! ## Shape of an operation
 //!
@@ -486,13 +493,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let served = match serving {
             Some(variant) => {
-                match sagemaker::state::load_served_model(ctx, &region, variant).await {
-                    Ok(model) => sagemaker::state::serve_inference(
-                        &model,
-                        &input.body,
-                        input.accept.as_deref(),
-                    )
-                    .map(|served| (variant.variant_name.clone(), served)),
+                // A load or an inference that could not be PERFORMED at all is a fault of this
+                // process rather than an answer about the artifact, so it is answered as one.
+                let loaded = match sagemaker::state::load_served_model(ctx, &region, variant).await
+                {
+                    Some(loaded) => loaded,
+                    None => {
+                        return Err(internal_failure(sagemaker::state::INTERNAL_FAILURE_REASON))
+                    }
+                };
+                match loaded {
+                    Ok(model) => {
+                        // Applying the model to the payload's records is CPU-bound work bounded
+                        // by the model's own ceilings, so it runs off this worker too.
+                        let answered = sagemaker::state::serve_inference_off_worker(
+                            &model,
+                            &input.body,
+                            input.accept.as_deref(),
+                        )
+                        .await;
+                        match answered {
+                            Some(answer) => {
+                                answer.map(|served| (variant.variant_name.clone(), served))
+                            }
+                            None => {
+                                return Err(internal_failure(
+                                    sagemaker::state::INTERNAL_FAILURE_REASON,
+                                ))
+                            }
+                        }
+                    }
                     Err(refusal) => Err(refusal),
                 }
             }
@@ -518,6 +548,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         record(crate::state::InvocationOutcome::Served);
+        // The deployment's `DataCaptureConfig` records what the endpoint was asked and what it
+        // answered into the caller's own bucket (`sagemaker::state::data_capture`). It is a
+        // BY-PRODUCT of serving and best effort: a destination that cannot be written leaves
+        // the invocation answered exactly as it is below, so nothing here is awaited for its
+        // outcome's sake and nothing it reports reaches the caller.
+        if let Some(settings) =
+            crate::state::endpoint_capture(&*self.engine, &input.endpoint_name, &variant_name)
+        {
+            sagemaker::state::capture_invocation(
+                ctx,
+                &region,
+                &settings,
+                &sagemaker::state::CapturedInvocation {
+                    endpoint_name: &input.endpoint_name,
+                    variant_name: &variant_name,
+                    inference_id: input.inference_id.as_deref(),
+                    input: sagemaker::state::CapturedPayload {
+                        data: &input.body,
+                        content_type: input.content_type.as_deref(),
+                    },
+                    output: sagemaker::state::CapturedPayload {
+                        data: &answer.body,
+                        content_type: Some(answer.content_type.as_str()),
+                    },
+                    at: now,
+                },
+            )
+            .await;
+        }
         Ok(InvokeEndpointOutput {
             body: answer.body,
             content_type: Some(answer.content_type),

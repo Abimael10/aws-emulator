@@ -19337,6 +19337,7 @@ dependencies = [
  "aws-smithy-types",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "csv",
  "flate2",
  "hex",

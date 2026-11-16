@@ -25,6 +25,11 @@
 //! control plane to train and deploy, and the SageMaker runtime to invoke. Neither crate's
 //! own test target can see both sides of it.
 //!
+//! The harness below (the emulator, the request builders, the role and the poll-until-settled
+//! reading) is SHARED with [`crate::sagemaker_endpoint_captures_invocations_to_s3`], the suite
+//! that asks what an endpoint captures of what it served, so the two cannot drift apart in how
+//! they stand the flow up.
+//!
 //! The rows differ along what RULE ONE generalises over: the media type and the shape of the
 //! payload (comma-separated records, a JSON list of records, a JSON `instances` list), how
 //! many records one invocation carries (one, several), how many feature columns the model was
@@ -43,19 +48,19 @@ use crate::query_wire::form_encode;
 const REGION: &str = "us-east-1";
 
 /// The account the emulator serves.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The bucket the training data and the model artifact live in.
-const BUCKET: &str = "sagemaker-serving-run";
+pub(crate) const BUCKET: &str = "sagemaker-serving-run";
 
 /// The role the training run reads and writes under.
-const ROLE: &str = "sagemaker-serving-role";
+pub(crate) const ROLE: &str = "sagemaker-serving-role";
 
 /// How long a resource is polled for the status it has to reach before a case fails, and how
 /// often. What the poll waits for is the CONDITION, re-read in a loop, so a loaded host does
 /// not fail a case the clock would have served.
-const SETTLE_BUDGET: Duration = Duration::from_secs(90);
-const SETTLE_POLL: Duration = Duration::from_millis(50);
+pub(crate) const SETTLE_BUDGET: Duration = Duration::from_secs(90);
+pub(crate) const SETTLE_POLL: Duration = Duration::from_millis(50);
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name` — the routing
 /// key the router claims a request by. Neither the key id nor the signature is a credential:
@@ -68,7 +73,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// The four services the flow spans, on ONE engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's concern, not any of these services'.
@@ -91,23 +96,23 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One HTTP exchange: the status, the response headers and the raw body.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Vec<u8>,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Answer {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
     /// One response header's value, or the empty string when the answer carried none.
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -116,7 +121,7 @@ impl Answer {
     }
 
     /// The wire error shape the answer names, as a client resolves it.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let named = match self.headers.get("x-amzn-errortype") {
             Some(value) => value.to_str().unwrap_or_default().to_string(),
             None => self
@@ -129,7 +134,7 @@ impl Answer {
         named.split(':').next().unwrap_or_default().to_string()
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let rendered = self.json();
         rendered
             .get("message")
@@ -141,7 +146,7 @@ impl Answer {
 }
 
 /// One request to the service `signing_name` serves.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     signing_name: &str,
     method: &str,
@@ -171,7 +176,7 @@ async fn send(
 }
 
 /// One SageMaker control-plane call (`awsJson1_1`).
-async fn control(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn control(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let answer = send(
         router,
         "sagemaker",
@@ -188,7 +193,7 @@ async fn control(router: &MultiServiceRouter, operation: &str, body: &Value) -> 
 }
 
 /// One SageMaker control-plane call that must be served.
-async fn control_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn control_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, answered) = control(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -198,7 +203,7 @@ async fn control_ok(router: &MultiServiceRouter, operation: &str, body: &Value) 
 }
 
 /// `POST /endpoints/{endpoint}/invocations`, the one route `InvokeEndpoint` is bound to.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &MultiServiceRouter,
     endpoint: &str,
     headers: &[(&str, &str)],
@@ -216,7 +221,7 @@ async fn invoke(
 }
 
 /// `PUT /<bucket>` — `CreateBucket`.
-async fn given_bucket(router: &MultiServiceRouter) {
+pub(crate) async fn given_bucket(router: &MultiServiceRouter) {
     let answer = send(router, "s3", "PUT", &format!("/{BUCKET}"), &[], Vec::new()).await;
     assert_eq!(
         answer.status,
@@ -228,7 +233,7 @@ async fn given_bucket(router: &MultiServiceRouter) {
 }
 
 /// `PUT /<bucket>/<key>` — `PutObject`.
-async fn given_object(router: &MultiServiceRouter, key: &str, body: &str) {
+pub(crate) async fn given_object(router: &MultiServiceRouter, key: &str, body: &str) {
     let answer = send(
         router,
         "s3",
@@ -248,7 +253,7 @@ async fn given_object(router: &MultiServiceRouter, key: &str, body: &str) {
 }
 
 /// One IAM action (`awsQuery`).
-async fn iam(router: &MultiServiceRouter, action: &str, parameters: &[(&str, &str)]) {
+pub(crate) async fn iam(router: &MultiServiceRouter, action: &str, parameters: &[(&str, &str)]) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in parameters {
         body.push('&');
@@ -276,7 +281,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, parameters: &[(&str, &st
 
 /// Hold the execution role in this account's IAM: it trusts the SageMaker service principal
 /// and may read the training data and write the artifact.
-async fn given_role(router: &MultiServiceRouter) -> String {
+pub(crate) async fn given_role(router: &MultiServiceRouter) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -340,7 +345,7 @@ fn training_data(rows: usize, features: usize) -> String {
 }
 
 /// Poll `reader` until the resource's `member` reaches `wanted`, answering the read that did.
-async fn settled(
+pub(crate) async fn settled(
     router: &MultiServiceRouter,
     case: &str,
     reader: &str,
@@ -366,7 +371,7 @@ async fn settled(
 /// An ECR-shaped container image path in this account's registry. The emulator pulls no
 /// image; the path is the reference the control plane records, as every other image reference
 /// in these services is.
-fn image() -> String {
+pub(crate) fn image() -> String {
     format!("{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/serving:1")
 }
 

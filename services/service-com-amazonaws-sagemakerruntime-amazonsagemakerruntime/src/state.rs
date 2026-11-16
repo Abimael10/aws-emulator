@@ -424,6 +424,24 @@ pub fn serving_variants<Eng: Send + Sync + 'static>(
     sagemaker::state::endpoint_serving_variants(&store, endpoint_name)
 }
 
+/// What the endpoint `endpoint_name`'s deployment asks to be CAPTURED of an invocation the
+/// variant `variant_name` served, read out of the SageMaker CONTROL PLANE's own stores.
+///
+/// The endpoint, its configuration and the model behind the variant are all the control
+/// plane's resources, so the reading of them lives there
+/// (`sagemaker::state::endpoint_capture_settings`) and this is only the lock around it. The
+/// settings are taken out owned, because the capture write that follows them is an Amazon S3
+/// call and no store guard is held across it.
+pub fn endpoint_capture<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    endpoint_name: &str,
+    variant_name: &str,
+) -> Option<sagemaker::state::CaptureSettings> {
+    let control_plane = sagemaker::state::service_state(engine)?;
+    let store = control_plane.lock();
+    sagemaker::state::endpoint_capture_settings(&store, endpoint_name, variant_name)
+}
+
 /// Per-service state for com-amazonaws-sagemakerruntime-amazonsagemakerruntime. A handler reaches it through [`service_state`].
 ///
 /// It holds no endpoint: an endpoint is the control plane's resource and is resolved

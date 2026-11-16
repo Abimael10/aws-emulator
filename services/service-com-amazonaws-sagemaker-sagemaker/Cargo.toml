@@ -56,6 +56,10 @@ base64 = "0.22"
 # Reads the comma-separated records a training channel carries; a library computing over data
 # in this process, with no native or build-time code.
 csv = "1.3"
+# The calendar reading of an instant, for the hour folder an endpoint's data-capture object is
+# laid out under (`state::data_capture`): the date components come from the maintained calendar
+# rather than from arithmetic over epoch seconds here.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # The `model.tar.gz` a finished training run writes under `OutputDataConfig.S3OutputPath`:
 # the archive format `ModelArtifacts` documents, written with the maintained tar writer and
 # gzip codec rather than laid out here.

@@ -20,7 +20,7 @@
 
 use serde_json::Value;
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    fit, fit_epochs, serve_inference, LinearModel, Record, CSV_MEDIA_TYPE, JSON_MEDIA_TYPE,
+    fit, fit_epochs, serve_inference, Record, ServedModel, CSV_MEDIA_TYPE, JSON_MEDIA_TYPE,
 };
 
 /// How many feature columns the fitted model takes.
@@ -28,7 +28,7 @@ const FEATURES: usize = 3;
 
 /// A model fitted on records whose target is a linear function of their features, so every
 /// prediction below is a measurement of a real fit rather than a constant.
-fn fitted() -> LinearModel {
+fn fitted() -> ServedModel {
     let records: Vec<Record> = (0..40)
         .map(|row| {
             let features: Vec<f64> = (0..FEATURES)
@@ -41,7 +41,7 @@ fn fitted() -> LinearModel {
         })
         .collect();
     let epochs = fit_epochs(records.len(), FEATURES);
-    fit(&records, epochs)
+    ServedModel::Fitted(fit(&records, epochs))
 }
 
 /// The record at `index` of a payload: `FEATURES` values offset by the index, so no two

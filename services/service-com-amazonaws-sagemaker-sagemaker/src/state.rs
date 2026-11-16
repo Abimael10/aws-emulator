@@ -72,6 +72,21 @@ pub use auto_ml_run::*;
 pub mod model_serving;
 pub use model_serving::*;
 
+/// The DATA CAPTURE an endpoint performs on the invocations it serves: what its deployment
+/// asks to be recorded, and the object the record is written as. See `state/data_capture.rs`.
+pub mod data_capture;
+pub use data_capture::*;
+
+/// The GRADIENT-BOOSTED model a deployed artifact holds, and the inference it computes. See
+/// `state/boosted_model.rs`.
+pub mod boosted_model;
+pub use boosted_model::*;
+
+/// The BINARY form of a JSON document, decoded into the same document its text form parses to:
+/// the other encoding a serialized model artifact carries. See `state/binary_json.rs`.
+pub mod binary_json;
+pub use binary_json::*;
+
 use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
     AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,

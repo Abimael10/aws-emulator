@@ -379,6 +379,8 @@ mod cloudformation_grants_acmpca_permissions;
 mod cloudformation_half_made_resource_is_not_left_behind;
 #[path = "all/cloudformation_http_api_cors_lambda_default_route.rs"]
 mod cloudformation_http_api_cors_lambda_default_route;
+#[path = "all/cloudformation_http_api_lambda_invoke_permission.rs"]
+mod cloudformation_http_api_lambda_invoke_permission;
 #[path = "all/cloudformation_imports_an_existing_queue.rs"]
 mod cloudformation_imports_an_existing_queue;
 #[path = "all/cloudformation_kms_encrypted_sns_sqs_pipeline.rs"]
@@ -1211,6 +1213,8 @@ mod s3files_create_file_system_bucket;
 mod sagemaker_agentic_rft_job_runtime_handoff;
 #[path = "all/sagemaker_create_admission.rs"]
 mod sagemaker_create_admission;
+#[path = "all/sagemaker_endpoint_captures_invocations_to_s3.rs"]
+mod sagemaker_endpoint_captures_invocations_to_s3;
 #[path = "all/sagemaker_endpoint_serves_a_trained_model.rs"]
 mod sagemaker_endpoint_serves_a_trained_model;
 #[path = "all/sagemaker_execution_role_admission.rs"]
