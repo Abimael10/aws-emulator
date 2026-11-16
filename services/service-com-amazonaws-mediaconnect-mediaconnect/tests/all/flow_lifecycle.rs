@@ -108,6 +108,67 @@ impl Emulator {
         (Self { router, engine }, callback)
     }
 
+    /// As [`Emulator::new`], with EventBridge and SQS mounted beside this service on the
+    /// SAME engine.
+    ///
+    /// A flow status change is published onto the account's default event bus and EventBridge
+    /// delivers it to the targets of the rules that match, so the suite covering it needs the
+    /// bus and the queue one of its rules targets answering beside this service, over the very
+    /// callback the handlers publish through.
+    pub(crate) fn with_event_bus() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_mediaconnect_mediaconnect::EmulatedService::new(engine.clone()),
+        );
+        router.register_service(
+            service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(engine.clone()),
+        );
+        router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+            engine.clone(),
+        ));
+        Self { router, engine }
+    }
+
+    /// One `awsJson` RPC call against a service mounted BESIDE this one, the way a client
+    /// makes it: `POST /` with `X-Amz-Target: <target_prefix>.<operation>` and a credential
+    /// scoped to `signing_name`, which is what the router picks the service from.
+    pub(crate) async fn rpc(
+        &self,
+        signing_name: &str,
+        target_prefix: &str,
+        json_version: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLEEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
+             SignedHeaders=host, Signature=deadbeef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+            .header(
+                "content-type",
+                format!("application/x-amz-json-{json_version}"),
+            )
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("build request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
     /// Put `count` flows straight into the store, the way CreateFlow stores one.
     ///
     /// The store ceiling is a bound on what is STORED, so the suite that asserts it

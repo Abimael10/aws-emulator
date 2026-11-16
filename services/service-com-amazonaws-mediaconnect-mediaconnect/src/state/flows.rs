@@ -1090,18 +1090,29 @@ pub struct StoredFlow {
 }
 
 impl StoredFlow {
-    /// Materialise the status change the clock already made due, if it is due at `now`.
+    /// Materialise the status change the clock already made due, if it is due at `now`, and
+    /// answer the MOVE it made — `None` when nothing was due.
     ///
     /// This is the only write a reporting operation (DescribeFlow, ListFlows) performs:
-    /// the change was owed at `due_at` whether or not anybody called.
-    pub fn settle(&mut self, now: SystemTime) {
-        if let Some(pending) = self.pending.take() {
-            if now >= pending.due_at {
-                self.status = pending.status;
-            } else {
-                self.pending = Some(pending);
-            }
+    /// the change was owed at `due_at` whether or not anybody called. The move is answered
+    /// rather than merely applied because a flow status change is an event this service
+    /// publishes (see [`crate::state::flow_events`]), and the caller that materialises a
+    /// move is the one place that can tell it happened.
+    pub fn settle(&mut self, now: SystemTime) -> Option<FlowStatusChange> {
+        let pending = self.pending.take()?;
+        if now < pending.due_at {
+            self.pending = Some(pending);
+            return None;
         }
+        let previous_status = ::std::mem::replace(&mut self.status, pending.status);
+        Some(FlowStatusChange::new(
+            &self.flow_arn,
+            &previous_status,
+            &self.status,
+            // The instant the move was DUE, not the instant it was materialised: the event
+            // reports when the flow moved.
+            pending.due_at,
+        ))
     }
 
     /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed.

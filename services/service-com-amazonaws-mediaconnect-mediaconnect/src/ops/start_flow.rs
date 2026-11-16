@@ -3,7 +3,8 @@
 //! @op StartFlow
 //!
 //! Starts the stored flow: the status it moves to is persisted in [`crate::state`], so a
-//! following DescribeFlow reports it.
+//! following DescribeFlow reports it, and every status it moves into is published onto the
+//! account's default EventBridge bus (see [`crate::state::flow_events`]).
 //!
 //! ## Shape of an operation
 //!
@@ -148,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartFlowErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -159,61 +159,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle_due_transitions(now);
+        // The guard is taken and RELEASED inside this block, so no lock is held across the
+        // publication below and the in-process call it makes.
+        let (flow_arn, reported_status) = {
+            let mut store = state.lock();
+            store.settle_due_transitions(now);
 
-        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
-            return Err(StartFlowErrorModeled::NotFoundException(NotFoundException {
-                message: crate::state::flow_not_found_message(&input.flow_arn),
-            })
-            .into());
+            let Some(flow) = store.flows.get(&input.flow_arn) else {
+                return Err(StartFlowErrorModeled::NotFoundException(NotFoundException {
+                    message: crate::state::flow_not_found_message(&input.flow_arn),
+                })
+                .into());
+            };
+            let flow_arn = flow.flow_arn.clone();
+            let current_status = flow.status.clone();
+
+            // A flow that is already running, or already on its way there, keeps the status
+            // it has: a repeat of the start answers the same thing rather than restarting
+            // the transition the first one began, so the instant the clock owes `ACTIVE` at
+            // does not move.
+            let already_started = current_status == crate::state::STATUS_ACTIVE
+                || current_status == crate::state::STATUS_STARTING;
+
+            if already_started {
+                (flow_arn, current_status)
+            } else {
+                // A start moves the flow out of the stopped status, so that status is where
+                // it begins: `STANDBY` is the status of a stopped flow, and it is the only
+                // one a start that is not already a repeat can be accepted from. A flow in
+                // any other status is either between two statuses — the clock owes it a
+                // DIFFERENT one, which is what a stop accepted a moment ago leaves behind —
+                // or not in a status a start applies to at all, and accepting the call there
+                // would discard the change the service already told a caller it had
+                // accepted. That is a semantic error, which is what `BadRequestException` is
+                // "thrown if the request contains", worded through the one place this crate
+                // states a flow status precondition; the flow, and the transition the clock
+                // owes it, are left exactly as they were.
+                if current_status != crate::state::STATUS_STANDBY {
+                    return Err(StartFlowErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: crate::state::state_precondition_message(
+                                "Flow",
+                                crate::state::STATUS_STANDBY,
+                                "START",
+                            ),
+                        },
+                    )
+                    .into());
+                }
+
+                // Starting a flow is not instantaneous: it reports `STARTING` and the clock
+                // owes `ACTIVE` one transition span later, so a caller that reads the flow
+                // straight afterwards still sees the start in flight. Both statuses are
+                // moves the flow makes, so both are recorded for publication — this one
+                // here, and the one the clock owes by a settle, wherever it is materialised.
+                store.begin_flow_transition(
+                    &flow_arn,
+                    crate::state::STATUS_STARTING,
+                    crate::state::STATUS_ACTIVE,
+                    now,
+                );
+                (flow_arn, crate::state::STATUS_STARTING.to_string())
+            }
         };
 
-        // A flow that is already running, or already on its way there, keeps the status it
-        // has: a repeat of the start answers the same thing rather than restarting the
-        // transition the first one began, so the instant the clock owes `ACTIVE` at does not
-        // move.
-        let already_started = flow.status == crate::state::STATUS_ACTIVE
-            || flow.status == crate::state::STATUS_STARTING;
-
-        if !already_started {
-            // A start moves the flow out of the stopped status, so that status is where it
-            // begins: `STANDBY` is the status of a stopped flow, and it is the only one a
-            // start that is not already a repeat can be accepted from. A flow in any other
-            // status is either between two statuses — the clock owes it a DIFFERENT one,
-            // which is what a stop accepted a moment ago leaves behind — or not in a status
-            // a start applies to at all, and accepting the call there would discard the
-            // change the service already told a caller it had accepted. That is a semantic
-            // error, which is what `BadRequestException` is "thrown if the request
-            // contains", worded through the one place this crate states a flow status
-            // precondition; the flow, and the transition the clock owes it, are left
-            // exactly as they were.
-            if flow.status != crate::state::STATUS_STANDBY {
-                return Err(StartFlowErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: crate::state::state_precondition_message(
-                            "Flow",
-                            crate::state::STATUS_STANDBY,
-                            "START",
-                        ),
-                    },
-                )
-                .into());
-            }
-
-            // Starting a flow is not instantaneous: it reports `STARTING` and the clock owes
-            // `ACTIVE` one transition span later, so a caller that reads the flow straight
-            // afterwards still sees the start in flight.
-            flow.begin_transition(
-                crate::state::STATUS_STARTING,
-                crate::state::STATUS_ACTIVE,
-                now,
-            );
-        }
+        // The move this call made is published onto the account's default event bus, and the
+        // move the clock still owes this flow is handed to the store's clock pump — so a
+        // client that reacts to the flow through EventBridge alone, making no further
+        // MediaConnect call, observes it reaching `ACTIVE` too.
+        crate::state::publish_flow_status_changes(ctx, &*self.engine).await;
 
         Ok(StartFlowOutput {
-            flow_arn: Some(flow.flow_arn.clone()),
-            status: Some(flow.status.clone()),
+            flow_arn: Some(flow_arn),
+            status: Some(reported_status),
         })
     }
 }

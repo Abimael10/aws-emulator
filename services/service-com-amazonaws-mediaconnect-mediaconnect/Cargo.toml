@@ -16,7 +16,11 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = [
+    # `time`: the store's flow clock pump waits for the instant a flow's status change falls
+    # due before it materialises and publishes it (`src/state/flow_events.rs`).
+    "time",
+] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -30,6 +34,15 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL,
 # which is what the endpoint the EC2 call above is made at is built from.
 service-common = { path = "../common" }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): MediaConnect publishes a `MediaConnect Flow Status Change`
+# event onto the account's default event bus as a flow moves between statuses
+# (`src/state/flow_events.rs`). Only the generated client is needed — the emulator supplies
+# the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-eventbridge = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -49,6 +62,15 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # IAM's protocol is form-encoded, so that suite builds its `CreateRole` body with the one
 # `application/x-www-form-urlencoded` serializer rather than a hand-rolled encoder.
 form_urlencoded = "1"
+# EventBridge and SQS are mounted beside this service on one engine in the integration
+# tests, because a flow status change is published onto the default event bus and a rule on
+# that bus delivers it to an SQS queue: without them mounted there is nothing for the
+# publication to reach.
+# DEV-ONLY: this crate depends on no other service's crate outside its tests.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# `time` for the integration cases that wait for a flow's owed status change to fall due.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

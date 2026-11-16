@@ -269,3 +269,5 @@ mod update_bridge_declared_output_bound;
 mod flow_source_report_preconditions;
 #[path = "all/vpc_interface_role_assumption.rs"]
 mod vpc_interface_role_assumption;
+#[path = "all/flow_status_change_events.rs"]
+mod flow_status_change_events;

@@ -160,7 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteFlowErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -171,66 +170,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // The status change the clock already owes this flow is materialised before the
-        // flow is read, exactly as the reporting operations do it: a flow whose `STOPPING`
-        // became `STANDBY` while nobody was looking is a stopped flow, so it is deletable.
-        store.settle_due_transitions(now);
+        // The guard is taken and RELEASED inside this block, so no lock is held across the
+        // publication below and the in-process call it makes.
+        let flow_arn = {
+            let mut store = state.lock();
+            // The status change the clock already owes this flow is materialised before the
+            // flow is read, exactly as the reporting operations do it: a flow whose
+            // `STOPPING` became `STANDBY` while nobody was looking is a stopped flow, so it
+            // is deletable.
+            store.settle_due_transitions(now);
 
-        let Some(flow) = store.flows.get(&input.flow_arn) else {
-            return Err(DeleteFlowErrorModeled::NotFoundException(NotFoundException {
-                message: crate::state::flow_not_found_message(&input.flow_arn),
-            })
-            .into());
+            let Some(flow) = store.flows.get(&input.flow_arn) else {
+                return Err(DeleteFlowErrorModeled::NotFoundException(NotFoundException {
+                    message: crate::state::flow_not_found_message(&input.flow_arn),
+                })
+                .into());
+            };
+
+            // "Deletes a flow. Before you can delete a flow, you must stop the flow": the
+            // precondition is the flow's STATUS, and the status of a stopped flow is
+            // `STANDBY`. A flow in any other status — running, or still moving between
+            // statuses — is a semantic error, which is what `BadRequestException` is "thrown
+            // if the request contains", and the flow is left exactly as it was.
+            if flow.status != crate::state::STATUS_STANDBY {
+                return Err(DeleteFlowErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::state_precondition_message(
+                            "Flow",
+                            crate::state::STATUS_STANDBY,
+                            "DELETE",
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // The ARN this call answers with is the STORED flow's own, so it is read off the
+            // record before anything is written — and so is the status it is moving OUT of,
+            // which the event this delete publishes reports as the previous one.
+            let flow_arn = flow.flow_arn.clone();
+            let deleted_from_status = flow.status.clone();
+
+            // A bridge's flow source names this flow in a REQUIRED member, resolved against
+            // this store by every path that writes such a source, so a reference that
+            // outlived the flow could not be dropped off the bridge and no later call could
+            // restate it. The delete is refused while one exists, as it is for the other
+            // required reference this store resolves
+            // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`),
+            // and the flow is left exactly as it was.
+            if let Some(detail) = store.flow_bridge_source_rejection(&flow_arn) {
+                return Err(DeleteFlowErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::bad_request_message(&detail),
+                    },
+                )
+                .into());
+            }
+
+            store.flows.remove(&input.flow_arn);
+            // `DELETING` is a status this service reports the flow MOVING INTO, so it is a
+            // flow status change like any other and is recorded for publication — from the
+            // status the flow held when the delete was accepted. Nothing is owed after it:
+            // the record goes with this call, so there is no later status to report.
+            store.record_flow_status_change(crate::state::FlowStatusChange::new(
+                &flow_arn,
+                &deleted_from_status,
+                crate::state::STATUS_DELETING,
+                now,
+            ));
+            // The flow goes, and its sources and outputs go with it, so every record of this
+            // store that NAMED one of them stops naming it: the references go with the
+            // resources they pointed at, through the one repair every operation that takes a
+            // flow, a flow output or a flow source out of the store performs. A bridge one of
+            // this flow's sources was fed by held a flow output for that source — the
+            // service's own record of a flow taking the bridge as its source — so those
+            // outputs go with the flow too, through the one place this crate decides which
+            // flow outputs a bridge holds.
+            store.clear_unresolvable_flow_references(now);
+            store.sync_bridge_flow_outputs();
+            flow_arn
         };
 
-        // "Deletes a flow. Before you can delete a flow, you must stop the flow": the
-        // precondition is the flow's STATUS, and the status of a stopped flow is
-        // `STANDBY`. A flow in any other status — running, or still moving between
-        // statuses — is a semantic error, which is what `BadRequestException` is "thrown
-        // if the request contains", and the flow is left exactly as it was.
-        if flow.status != crate::state::STATUS_STANDBY {
-            return Err(DeleteFlowErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: crate::state::state_precondition_message(
-                        "Flow",
-                        crate::state::STATUS_STANDBY,
-                        "DELETE",
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // The ARN this call answers with is the STORED flow's own, so it is read off the
-        // record before anything is written.
-        let flow_arn = flow.flow_arn.clone();
-
-        // A bridge's flow source names this flow in a REQUIRED member, resolved against this
-        // store by every path that writes such a source, so a reference that outlived the
-        // flow could not be dropped off the bridge and no later call could restate it. The
-        // delete is refused while one exists, as it is for the other required reference this
-        // store resolves (`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`),
-        // and the flow is left exactly as it was.
-        if let Some(detail) = store.flow_bridge_source_rejection(&flow_arn) {
-            return Err(DeleteFlowErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: crate::state::bad_request_message(&detail),
-                },
-            )
-            .into());
-        }
-
-        store.flows.remove(&input.flow_arn);
-        // The flow goes, and its sources and outputs go with it, so every record of this
-        // store that NAMED one of them stops naming it: the references go with the resources
-        // they pointed at, through the one repair every operation that takes a flow, a flow
-        // output or a flow source out of the store performs. A bridge one of this flow's
-        // sources was fed by held a flow output for that source — the service's own record of
-        // a flow taking the bridge as its source — so those outputs go with the flow too,
-        // through the one place this crate decides which flow outputs a bridge holds.
-        store.clear_unresolvable_flow_references(now);
-        store.sync_bridge_flow_outputs();
+        // The move this call made is published onto the account's default event bus, so a
+        // client that reacts to the flow through EventBridge observes it going away.
+        crate::state::publish_flow_status_changes(ctx, &*self.engine).await;
 
         Ok(DeleteFlowOutput {
             flow_arn: Some(flow_arn),

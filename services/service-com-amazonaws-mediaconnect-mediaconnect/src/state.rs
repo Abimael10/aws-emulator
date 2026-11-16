@@ -10,7 +10,7 @@
 //! operation addresses a flow by name and the model puts no uniqueness rule on
 //! `Flow.Name`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -63,6 +63,7 @@ use crate::ops::types::{
 };
 mod arns;
 mod cidr_blocks;
+mod flow_events;
 mod offerings;
 mod router_filters;
 mod routers;
@@ -72,6 +73,7 @@ mod source_report_preconditions;
 mod vpc_interface_role;
 mod vpc_placement;
 pub use cidr_blocks::*;
+pub use flow_events::*;
 pub use flows::*;
 pub use source_report_preconditions::*;
 pub use vpc_interface_role::*;
@@ -1929,6 +1931,24 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// Monotonic counter minting the unique fragment of every flow / source / output /
     /// entitlement ARN and of the addresses and ports the service assigns.
     pub next_arn_suffix: u64,
+    /// The flow status changes recorded but not yet published to EventBridge (see
+    /// [`flow_events`]).
+    ///
+    /// A queue rather than a flag on the flow record, because a change outlives the status
+    /// that produced it: the flow may move again — or a delete may take it out of the store
+    /// — between the move and the publication, which is made with no guard held. It is
+    /// bounded ([`MAX_PENDING_FLOW_EVENTS`], oldest dropped first) because every transition
+    /// appends to it, and each entry names the Region whose bus it belongs on.
+    pub pending_flow_events: VecDeque<FlowStatusChange>,
+    /// Whether this store's flow CLOCK PUMP is running ([`drive_flow_clock`]), so at most
+    /// one does.
+    pub flow_clock_pump_running: bool,
+    /// Which claim on that pump is the live one: a pump releases its own claim and never a
+    /// later pump's.
+    pub flow_clock_pump_generation: u64,
+    /// The running pump's task handle, kept so the pump it replaces is aborted rather than
+    /// merely forgotten.
+    pub flow_clock_pump: Option<::tokio::task::JoinHandle<()>>,
 }
 
 /// A mutable handle on the tag state of ONE global resource, as
@@ -2090,8 +2110,18 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// of every router input, router output and router network interface whose deletion has
     /// come due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
+        // A flow whose settle MOVED its status made a transition, which is an event this
+        // service publishes (see [`flow_events`]): the moves are gathered here and recorded
+        // below, once the flow map is no longer borrowed, so one move is recorded exactly
+        // once whichever call — or the clock pump — materialised it.
+        let mut flow_changes: Vec<FlowStatusChange> = Vec::new();
         for flow in self.flows.values_mut() {
-            flow.settle(now);
+            if let Some(moved) = flow.settle(now) {
+                flow_changes.push(moved);
+            }
+        }
+        for change in flow_changes {
+            self.record_flow_status_change(change);
         }
         for gateway in self.gateways.values_mut() {
             gateway.settle(now);
