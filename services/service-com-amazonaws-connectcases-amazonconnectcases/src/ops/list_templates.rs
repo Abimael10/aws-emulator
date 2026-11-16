@@ -122,20 +122,22 @@ impl From<ListTemplatesErrorModeled> for ListTemplatesError {
     }
 }
 
-/// The condensed summary the listing reports for one stored template: the
-/// members `TemplateSummary` declares, each read off the stored record rather
-/// than off the request that asked for it.
+/// The condensed summary the listing reports for one stored template: every
+/// member a summary carries, each read off the stored record rather than off the
+/// request that asked for it.
+///
+/// The template's identity reaches the wire twice, as `templateId`/`templateArn`
+/// and as the `id`/`arn` names a summary also reports it by; both pairs are
+/// projected from the fields below, so they cannot disagree (see
+/// [`TemplateSummary`]). The tag-propagation list is the stored one whatever it
+/// holds, and an empty one is reported as `[]` rather than left out.
 fn summary(template: &crate::state::Template) -> TemplateSummary {
     TemplateSummary {
         template_id: template.template_id.clone(),
         template_arn: template.template_arn.clone(),
         name: template.name.clone(),
         status: template.status.clone(),
-        tag_propagation_configurations: if template.tag_propagation_configurations.is_empty() {
-            None
-        } else {
-            Some(template.tag_propagation_configurations.clone())
-        },
+        tag_propagation_configurations: template.tag_propagation_configurations.clone(),
     }
 }
 

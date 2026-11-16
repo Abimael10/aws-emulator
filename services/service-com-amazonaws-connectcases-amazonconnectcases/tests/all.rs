@@ -57,5 +57,7 @@ mod system_fields;
 mod template_deletion;
 #[path = "all/template_listing.rs"]
 mod template_listing;
+#[path = "all/template_summary_wire_form.rs"]
+mod template_summary_wire_form;
 #[path = "all/template_update.rs"]
 mod template_update;

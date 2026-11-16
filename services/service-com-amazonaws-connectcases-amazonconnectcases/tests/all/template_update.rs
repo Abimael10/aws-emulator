@@ -216,7 +216,9 @@ async fn update_template_writes_only_the_members_its_request_carries() {
         status: "Active".to_string(),
         required_fields: Some(required(&[&first])),
         layout_configuration: None,
-        tag_propagation_configurations: None,
+        // A read reports the tag-propagation list whatever it holds, so a
+        // template that propagates no tags carries it as an empty list.
+        tag_propagation_configurations: Some(json!([])),
     };
     let mut rows: Vec<UpdateRow> = Vec::new();
 
@@ -342,7 +344,7 @@ async fn update_template_writes_only_the_members_its_request_carries() {
         json!({ "tagPropagationConfigurations": propagation }),
         expected.clone(),
     ));
-    expected.tag_propagation_configurations = None;
+    expected.tag_propagation_configurations = Some(json!([]));
     rows.push((
         "tagPropagationConfigurations of no entries".to_string(),
         json!({ "tagPropagationConfigurations": [] }),

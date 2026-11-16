@@ -223,11 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Case rules are a resource of their own; `CreateCaseRule` is still a
             // stub, so no template can carry one and none is reported.
             rules: None,
-            tag_propagation_configurations: if template.tag_propagation_configurations.is_empty() {
-                None
-            } else {
-                Some(template.tag_propagation_configurations.clone())
-            },
+            // The stored list whatever it holds: the service reports the member
+            // on every read of a template, as `[]` for one that propagates no
+            // tags, so a caller that iterates it never has to tell an empty
+            // list from an absent one.
+            tag_propagation_configurations: Some(template.tag_propagation_configurations.clone()),
         })
     }
 }

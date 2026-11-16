@@ -27,13 +27,167 @@ pub struct ListTemplatesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcases#TemplateSummary")]
+/// One template's condensed summary, as a template listing reports it.
+///
+/// Its schema, serializer and deserializer are written out below instead of
+/// derived from the model. `#[smithy_macros::smithy(shape = ...)]` admits
+/// EXACTLY the member list the on-disk model declares, and the wire form of a
+/// template summary carries two members that model does not: `id`, the
+/// template's own identifier, and `arn`, its Amazon Resource Name — the names
+/// under which a summary reports a template's identity alongside the modelled
+/// `templateId`/`templateArn`. Both are projected from the SAME stored fields as
+/// the modelled pair (see [`TemplateSummary::serialize_members`]), so all four
+/// cannot disagree.
+///
+/// The modelled members keep the names, order and indices
+/// `smithy_query(query="shape", shape="TemplateSummary")` gives them, and the
+/// two members the model does not declare are appended last with their shape ids
+/// in a namespace of their own, so neither claims to be modelled nor collides
+/// with a member the model may declare later.
+///
+/// `tag_propagation_configurations` is the template's own list rather than an
+/// `Option`: the service reports the member on every summary, as `[]` for a
+/// template that propagates no tags.
 #[derive(Debug, Clone, Default)]
 pub struct TemplateSummary {
     pub template_id: String,
     pub template_arn: String,
     pub name: String,
     pub status: String,
-    pub tag_propagation_configurations: Option<Vec<TagPropagationConfiguration>>,
+    pub tag_propagation_configurations: Vec<TagPropagationConfiguration>,
 }
 
+/// One member schema of [`TemplateSummary`], named and indexed as the model
+/// orders it.
+macro_rules! template_summary_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.connectcases#TemplateSummary$", $name),
+                TemplateSummary::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+/// One member schema of [`TemplateSummary`] the on-disk model does not declare:
+/// the same shape as a modelled member, with its shape id in the namespace
+/// recorded-only members live in.
+macro_rules! template_summary_recorded_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.connectcases.recorded#TemplateSummary$", $name),
+                TemplateSummary::RECORDED_NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl TemplateSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.connectcases#TemplateSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.connectcases";
+    /// The namespace of a member the wire carries but the on-disk model does not
+    /// declare.
+    const RECORDED_NAMESPACE: &'static str = "com.amazonaws.connectcases.recorded";
+
+    pub const M_TEMPLATE_ID: ::aws_smithy_schema::Schema =
+        template_summary_member!("templateId", String, 0);
+    pub const M_TEMPLATE_ARN: ::aws_smithy_schema::Schema =
+        template_summary_member!("templateArn", String, 1);
+    pub const M_NAME: ::aws_smithy_schema::Schema = template_summary_member!("name", String, 2);
+    pub const M_STATUS: ::aws_smithy_schema::Schema = template_summary_member!("status", String, 3);
+    pub const M_TAG_PROPAGATION_CONFIGURATIONS: ::aws_smithy_schema::Schema =
+        template_summary_member!("tagPropagationConfigurations", List, 4);
+    /// The template's identifier, under the name a summary reports it by beside
+    /// `templateId`.
+    pub const M_ID: ::aws_smithy_schema::Schema = template_summary_recorded_member!("id", String, 5);
+    /// The template's ARN, under the name a summary reports it by beside
+    /// `templateArn`.
+    pub const M_ARN: ::aws_smithy_schema::Schema =
+        template_summary_recorded_member!("arn", String, 6);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "TemplateSummary"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_TEMPLATE_ID,
+            &Self::M_TEMPLATE_ARN,
+            &Self::M_NAME,
+            &Self::M_STATUS,
+            &Self::M_TAG_PROPAGATION_CONFIGURATIONS,
+            &Self::M_ID,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static TEMPLATE_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &TemplateSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for TemplateSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_TEMPLATE_ID, self.template_id.as_str())?;
+        s.write_string(&Self::M_TEMPLATE_ARN, self.template_arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        // Written whatever the template holds: a template that propagates no
+        // tags reports the member as an empty list, never leaves it out.
+        s.write_list(&Self::M_TAG_PROPAGATION_CONFIGURATIONS, &|list| {
+            for configuration in self.tag_propagation_configurations.iter() {
+                list.write_struct(&TagPropagationConfiguration::SCHEMA, configuration)?;
+            }
+            Ok(())
+        })?;
+        // The identity members the model does not declare, each projected from
+        // the stored field its modelled counterpart is written from, so a
+        // summary cannot report one identity under one name and another under
+        // the other.
+        s.write_string(&Self::M_ID, self.template_id.as_str())?;
+        s.write_string(&Self::M_ARN, self.template_arn.as_str())?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for TemplateSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.template_id = d.read_string(&Self::M_TEMPLATE_ID)?,
+                Some(1) => out.template_arn = d.read_string(&Self::M_TEMPLATE_ARN)?,
+                Some(2) => out.name = d.read_string(&Self::M_NAME)?,
+                Some(3) => out.status = d.read_string(&Self::M_STATUS)?,
+                Some(4) => {
+                    let mut configurations = Vec::new();
+                    d.read_list(&Self::M_TAG_PROPAGATION_CONFIGURATIONS, &mut |element| {
+                        configurations.push(<TagPropagationConfiguration as
+                            ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                            element,
+                        )?);
+                        Ok(())
+                    })?;
+                    out.tag_propagation_configurations = configurations;
+                }
+                // `id` and `arn` carry the identity `templateId`/`templateArn`
+                // already carry, so a read takes it from the modelled pair and
+                // these two add nothing.
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
