@@ -83,6 +83,8 @@ mod resource_tag_removal;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/version_build_failure_read_path.rs"]
+mod version_build_failure_read_path;
 #[path = "all/version_state_time_bucket_key.rs"]
 mod version_state_time_bucket_key;
 #[path = "all/version_state_time_bucket.rs"]
