@@ -21,6 +21,8 @@ mod batch_firewall_rule_deletions;
 mod batch_firewall_rule_updates;
 #[path = "all/batch_firewall_rules.rs"]
 mod batch_firewall_rules;
+#[path = "all/coded_refusal_identity.rs"]
+mod coded_refusal_identity;
 #[path = "all/endpoint_subnet_references.rs"]
 mod endpoint_subnet_references;
 #[path = "all/endpoint_vpc_and_addresses.rs"]
