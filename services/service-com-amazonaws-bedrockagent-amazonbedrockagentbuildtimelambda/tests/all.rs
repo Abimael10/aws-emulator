@@ -27,6 +27,8 @@ mod data_source_preconditions;
 mod delete_removes_the_resource;
 #[path = "all/document_delete_retires_the_document.rs"]
 mod document_delete_retires_the_document;
+#[path = "all/document_delete_unindexes_the_document.rs"]
+mod document_delete_unindexes_the_document;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
 #[path = "all/flow_alias_deployment.rs"]
