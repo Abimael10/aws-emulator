@@ -33,30 +33,30 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The `source` and `detail-type` Amazon ECR announces a finished image scan under, spelled
 /// out here rather than imported from the service crate, so a wrong constant in the
 /// implementation cannot make this suite pass.
-const SOURCE: &str = "aws.ecr";
+pub(crate) const SOURCE: &str = "aws.ecr";
 const IMAGE_SCAN: &str = "ECR Image Scan";
 
 /// The bus an AWS service's own events go to.
-const DEFAULT_BUS: &str = "default";
+pub(crate) const DEFAULT_BUS: &str = "default";
 
 /// Amazon ECR's `X-Amz-Target` prefix, from that service's own model.
-const ECR_TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
+pub(crate) const ECR_TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
 
 /// How long the suite waits for an announcement to arrive before giving up. A GENEROUS
 /// ceiling, not an expectation: nothing here asserts on how long anything took.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One poll of a queue inside [`DELIVERY_DEADLINE`].
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The whole emulator over one engine, exactly as `core/router/src/lib.rs` assembles it for
 /// the binary.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     router.set_request_authentication(false);
@@ -66,7 +66,7 @@ fn router() -> MultiServiceRouter {
 /// A SigV4 `Authorization` whose credential scope names `service`, which is what routes the
 /// request. The signature is never checked: the router above runs with request
 /// authentication off.
-fn authorization(service: &str) -> String {
+pub(crate) fn authorization(service: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{service}/aws4_request, \
          SignedHeaders=host, Signature=0000"
@@ -112,17 +112,32 @@ async fn rpc(
 }
 
 /// One EventBridge call (`awsJson1_1`, `AWSEvents.<Operation>`).
-async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn events(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     rpc(router, case, "events", "AWSEvents", "1.1", operation, body).await
 }
 
 /// One Amazon SQS call (`awsJson1_0`, `AmazonSQS.<Operation>`).
-async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     rpc(router, case, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 
 /// One Amazon ECR call (`awsJson1_1`).
-async fn ecr(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ecr(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     rpc(
         router,
         case,
@@ -136,7 +151,7 @@ async fn ecr(router: &MultiServiceRouter, case: &str, operation: &str, body: &Va
 }
 
 /// A string member of a response, or a panic naming the case and what came back.
-fn member(case: &str, body: &Value, pointer: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, pointer: &str) -> String {
     body.pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected {pointer} in {body}"))
@@ -147,7 +162,7 @@ fn member(case: &str, body: &Value, pointer: &str) -> String {
 /// `sqs:SendMessage` as its own service principal and "relies on resource-based policies"
 /// for a queue (`PutTargets`), so a queue that has granted it nothing receives nothing —
 /// answering its url and the ARN a rule names it by.
-async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
     let created = sqs(router, case, "CreateQueue", &json!({"QueueName": name})).await;
     let url = member(case, &created, "/QueueUrl");
     let attributes = sqs(
@@ -201,7 +216,12 @@ async fn rule(router: &MultiServiceRouter, case: &str, name: &str, repository: &
 }
 
 /// Give `rule_name` the queue `queue_arn` as its one target.
-async fn target(router: &MultiServiceRouter, case: &str, rule_name: &str, queue_arn: &str) {
+pub(crate) async fn target(
+    router: &MultiServiceRouter,
+    case: &str,
+    rule_name: &str,
+    queue_arn: &str,
+) {
     let targeted = events(
         router,
         case,
@@ -276,27 +296,21 @@ fn announcement<'a>(case: &str, arrived: &'a [Value], digest: &str) -> &'a Value
         })
 }
 
-/// Push a manifest whose bytes are the row's own into `repository` under `tag`, and answer
-/// the digest the registry stored it under.
-async fn push(
+/// Push a manifest whose bytes are the row's own into `repository`, under `tag` when one is
+/// named, and answer the digest the registry stored it under. An untagged push names none.
+pub(crate) async fn push(
     router: &MultiServiceRouter,
     case: &str,
     repository: &str,
     marker: &str,
-    tag: &str,
+    tag: Option<&str>,
 ) -> String {
     let manifest = json!({"schemaVersion": 2, "marker": marker}).to_string();
-    let pushed = ecr(
-        router,
-        case,
-        "PutImage",
-        &json!({
-            "repositoryName": repository,
-            "imageManifest": manifest,
-            "imageTag": tag,
-        }),
-    )
-    .await;
+    let mut body = json!({"repositoryName": repository, "imageManifest": manifest});
+    if let Some(tag) = tag {
+        body["imageTag"] = json!(tag);
+    }
+    let pushed = ecr(router, case, "PutImage", &body).await;
     member(case, &pushed, "/image/imageId/imageDigest")
 }
 
@@ -345,7 +359,7 @@ async fn a_scan_on_push_reaches_the_matching_rules_queue_target() {
 
     // The first push: both rules on the scanned repository match its finished scan, and
     // only the probe has a target to deliver to.
-    let first_digest = push(&router, case, scanned, "first", "v1").await;
+    let first_digest = push(&router, case, scanned, "first", Some("v1")).await;
     let probed = collect_until(&router, case, &probe_url, &first_digest).await;
     announcement(case, &probed, &first_digest);
 
@@ -366,7 +380,7 @@ async fn a_scan_on_push_reaches_the_matching_rules_queue_target() {
     // The positive control on that same rule: it is given the queue as its target, and the
     // next push's finished scan arrives there.
     target(&router, case, "ecr-scan-late", &late_arn).await;
-    let digest = push(&router, case, scanned, "second", "v2").await;
+    let digest = push(&router, case, scanned, "second", Some("v2")).await;
 
     let arrived = collect_until(&router, case, &late_url, &digest).await;
     assert!(
