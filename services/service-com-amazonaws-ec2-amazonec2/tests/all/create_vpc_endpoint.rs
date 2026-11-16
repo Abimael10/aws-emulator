@@ -466,6 +466,10 @@ async fn the_endpoint_carries_the_security_groups_asked_for_or_the_vpcs_default(
             param("VpcId", &built.vpc_id),
             param("ServiceName", "com.amazonaws.us-east-1.logs"),
             param("VpcEndpointType", "Interface"),
+            // This table is about the endpoint's GROUPS, and it creates two endpoints to one
+            // service in one VPC: the private hosted zone of a service belongs to at most one
+            // endpoint per VPC, so neither row asks for it.
+            param("PrivateDnsEnabled", "false"),
         ];
         params.extend(indexed("SubnetId", &[built.subnets[0].as_str()]));
         if let Some(group_id) = named {
@@ -967,6 +971,10 @@ async fn a_subnet_configuration_places_the_interface_on_the_address_it_names() {
             param("VpcId", &built.vpc_id),
             param("ServiceName", "com.amazonaws.us-east-1.logs"),
             param("VpcEndpointType", "Interface"),
+            // This table is about the ADDRESS an interface takes, and it creates two endpoints
+            // to one service in one VPC: the private hosted zone of a service belongs to at
+            // most one endpoint per VPC, so neither row asks for it.
+            param("PrivateDnsEnabled", "false"),
             param("SubnetConfiguration.1.SubnetId", &built.subnets[0]),
             param("SubnetConfiguration.1.Ipv4", address),
         ];

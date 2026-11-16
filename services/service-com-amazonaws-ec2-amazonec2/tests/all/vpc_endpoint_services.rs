@@ -169,46 +169,68 @@ fn next_token(case: &str, body: &str) -> Option<String> {
 struct CatalogueCase {
     /// The service's label under the Region.
     label: &'static str,
+    /// The HOST form of that label — its dotted components in reverse order, since an endpoint
+    /// service name is the reverse-domain spelling of the host the service answers on
+    /// (`com.amazonaws.<region>.ecr.dkr` is reached at `dkr.ecr.<region>.amazonaws.com`).
+    /// Written out here, independently of the code that derives it.
+    dns_host: &'static str,
     /// The `ServiceType` members it must report, in order.
     types: &'static [&'static str],
     /// Whether it must report a private DNS name — an interface endpoint's private hosted
-    /// zone answers on the service's default public name, and a gateway endpoint has none.
+    /// zone answers on the service's default public name, a gateway endpoint has none, and a
+    /// service that publishes no such name has none either.
     private_dns: bool,
+    /// Whether an endpoint to it takes an endpoint policy
+    /// (`ServiceDetail$VpcEndpointPolicySupported`).
+    policy: bool,
 }
 
 /// The rows: the two services the blocked recordings name, and four the issue did not cite —
 /// an interface service with a dotted label, a plain interface service, the one service
-/// reachable through either kind of endpoint, and a gateway-only service.
+/// reachable through either kind of endpoint, and a gateway-only service. The AWS IoT Core
+/// data-plane service is the one that supports neither an endpoint policy nor private DNS.
 const CATALOGUE_CASES: [CatalogueCase; 6] = [
     CatalogueCase {
         label: "appstream.streaming",
+        dns_host: "streaming.appstream",
         types: &["Interface"],
         private_dns: true,
+        policy: true,
     },
     CatalogueCase {
         label: "iot.data",
+        dns_host: "data.iot",
         types: &["Interface"],
-        private_dns: true,
+        private_dns: false,
+        policy: false,
     },
     CatalogueCase {
         label: "ecr.dkr",
+        dns_host: "dkr.ecr",
         types: &["Interface"],
         private_dns: true,
+        policy: true,
     },
     CatalogueCase {
         label: "logs",
+        dns_host: "logs",
         types: &["Interface"],
         private_dns: true,
+        policy: true,
     },
     CatalogueCase {
         label: "s3",
+        dns_host: "s3",
         types: &["Gateway", "Interface"],
         private_dns: true,
+        policy: true,
     },
     CatalogueCase {
         label: "dynamodb",
+        dns_host: "dynamodb",
         types: &["Gateway"],
         private_dns: false,
+        policy: true,
     },
 ];
 
@@ -293,13 +315,14 @@ async fn each_catalogued_service_is_reported_for_the_region_asked_about() {
             );
             // "The DNS names for the service": an interface endpoint's own names sit under
             // the service's base name below `vpce.amazonaws.com`; a gateway endpoint mints
-            // none and is reached through the service's public name.
+            // none and is reached through the service's public name. Both sit under the host
+            // form of the service's label.
             let mut expected_dns: Vec<String> = Vec::new();
             if row.types.contains(&"Interface") {
-                expected_dns.push(format!("{}.{region}.vpce.amazonaws.com", row.label));
+                expected_dns.push(format!("{}.{region}.vpce.amazonaws.com", row.dns_host));
             }
             if row.types.contains(&"Gateway") {
-                expected_dns.push(format!("{}.{region}.amazonaws.com", row.label));
+                expected_dns.push(format!("{}.{region}.amazonaws.com", row.dns_host));
             }
             expected_dns.sort();
             let mut base_dns_names = service.base_dns_names.clone();
@@ -311,7 +334,7 @@ async fn each_catalogued_service_is_reported_for_the_region_asked_about() {
             );
             let expected_private = row
                 .private_dns
-                .then(|| format!("{}.{region}.amazonaws.com", row.label));
+                .then(|| format!("{}.{region}.amazonaws.com", row.dns_host));
             assert_eq!(
                 service.private_dns_name, expected_private,
                 "case {case:?}: expected the private DNS name {expected_private:?}, got {:?}",
@@ -331,8 +354,8 @@ async fn each_catalogued_service_is_reported_for_the_region_asked_about() {
             );
             assert_eq!(
                 service.policy_supported.as_deref(),
-                Some("true"),
-                "case {case:?}: an endpoint to a service of the catalogue takes a policy, got \
+                Some(if row.policy { "true" } else { "false" }),
+                "case {case:?}: expected the service's own endpoint-policy support, got \
                  {:?}",
                 service.policy_supported
             );

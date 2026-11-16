@@ -162,17 +162,15 @@ pub(crate) fn expected_entry(row: &EntryCase) -> ReportedEntry {
         cidr_block: (!row.ipv6).then(|| row.reported_cidr.to_string()),
         ipv6_cidr_block: row.ipv6.then(|| row.reported_cidr.to_string()),
         egress: row.egress.to_string(),
-        // A reported entry carries BOTH the port range and the ICMP type and code; the one
-        // the rule's protocol has no use for comes back empty rather than absent.
-        port_range: Some(
-            row.port_range
-                .map_or((None, None), |(from, to)| {
-                    (Some(from.to_string()), Some(to.to_string()))
-                }),
-        ),
-        icmp_type_code: Some(row.icmp_type_code.map_or((None, None), |(icmp_type, code)| {
+        // A reported entry carries only the members the RULE has: the port range of a rule
+        // written with one, the ICMP type and code of a rule written with one, and neither for
+        // a rule whose protocol has no ports and no ICMP numbers.
+        port_range: row.port_range.map(|(from, to)| {
+            (Some(from.to_string()), Some(to.to_string()))
+        }),
+        icmp_type_code: row.icmp_type_code.map(|(icmp_type, code)| {
             (Some(icmp_type.to_string()), Some(code.to_string()))
-        })),
+        }),
     }
 }
 
@@ -186,8 +184,9 @@ fn catch_all_entry(egress: bool) -> ReportedEntry {
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         ipv6_cidr_block: None,
         egress: egress.to_string(),
-        port_range: Some((None, None)),
-        icmp_type_code: Some((None, None)),
+        // Every protocol, so no ports and no ICMP numbers: neither member is reported.
+        port_range: None,
+        icmp_type_code: None,
     }
 }
 

@@ -4,18 +4,19 @@
 //! zone an interface endpoint to it associates — driven over `ec2Query` (README.md /
 //! OPERATIONS.md "Wire protocol").
 //!
-//! The rule under test: every endpoint service Amazon Web Services publishes an INTERFACE for
-//! has a default public DNS name — "the default public DNS name for the service for the
-//! Region (for example, kinesis.us-east-1.amazonaws.com)"
+//! The rule under test: an endpoint service Amazon Web Services publishes an INTERFACE for has
+//! a default public DNS name when the service publishes one — "the default public DNS name for
+//! the service for the Region (for example, kinesis.us-east-1.amazonaws.com)"
 //! (`smithy_query(query="doc",shape="CreateVpcEndpointRequest",member="PrivateDnsEnabled")`)
-//! — and the DOMAIN that name sits under follows the FAMILY the service's name belongs to:
-//! `com.amazonaws.<region>.<label>` answers on `<label>.<region>.amazonaws.com`, and the two
-//! families published under the `aws.api` / `api.aws` labels on `<label>.<region>.api.aws`.
+//! — and that name is the service's own NAME read as the reverse-domain spelling it is:
+//! `com.amazonaws.<region>.<label>` answers on `<host>.<region>.amazonaws.com`, and the two
+//! families published under the `aws.api` / `api.aws` labels on `<host>.<region>.api.aws`,
+//! where `<host>` is the label's dotted components in reverse order.
 //! So `DescribeVpcEndpointServices` reports that name (and `verified` beside it) for any of
 //! them, and `CreateVpcEndpoint` associates the private hosted zone it is the record set of
 //! rather than refusing the request; `PrivateDnsEnabled` is refused only for a service that
-//! really has no such name, which is one of the account's OWN service configurations created
-//! without a `PrivateDnsName`.
+//! really has no such name — one of the account's OWN service configurations created without a
+//! `PrivateDnsName`, or a published service that supports no private DNS.
 //!
 //! The rows span what the rule generalises over: each published name family, a label the
 //! blocked recordings did not cite, a dotted label, a gateway-only service (which has no
@@ -90,7 +91,7 @@ const ROWS: [Row; 6] = [
     Row {
         case: "a dotted label under com.amazonaws",
         service_name: "com.amazonaws.us-east-1.ecr.dkr",
-        private_dns_name: Some("ecr.dkr.us-east-1.amazonaws.com"),
+        private_dns_name: Some("dkr.ecr.us-east-1.amazonaws.com"),
     },
     Row {
         case: "a service reachable through either kind of endpoint",
@@ -288,14 +289,14 @@ async fn private_dns_is_refused_for_a_service_that_has_no_private_dns_name() {
     );
     assert_eq!(
         error_code(&body),
-        ec2::state::INVALID_PARAMETER_VALUE,
-        "case {case:?}: expected InvalidParameterValue, got {body}"
+        ec2::state::INVALID_PARAMETER,
+        "case {case:?}: expected InvalidParameter, got {body}"
     );
     assert_eq!(
         error_message(&body),
         format!(
-            "Private DNS can't be enabled because the service {service_name} has no private DNS \
-             name"
+            "Private DNS can't be enabled because the service {service_name} does not provide \
+             a private DNS name."
         ),
         "case {case:?}: the refusal must name the service at fault, got {body}"
     );

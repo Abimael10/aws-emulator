@@ -20,7 +20,7 @@ use ec2::ops::types::NETWORK_PROTOCOL_ENUM_VALUES;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, elements, error_code};
+use super::ec2_query::{call, element, elements, error_code, error_message};
 
 /// The Region every call here is signed for. A check's configuration is a fact of the check
 /// rather than of the Region.
@@ -158,7 +158,7 @@ async fn a_member_of_the_same_name_on_another_input_is_untouched() {
              with body {body}"
         );
         assert!(
-            body.contains(&format!("({sent})")),
+            error_message(&body).contains(sent),
             "case {sent:?}: the refusal must name the value as sent, got {body}"
         );
     }

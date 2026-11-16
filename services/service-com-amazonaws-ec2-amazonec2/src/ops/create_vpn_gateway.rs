@@ -149,22 +149,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = state::request_region(ctx.parts());
 
         // "The Availability Zone for the virtual private gateway" (`AvailabilityZone`): a
-        // zone the Region does not have names no place to create one, and the naming rule
-        // for those zones lives in one place, `availability_zones_in_region`. A request
-        // that names none gets a gateway that reports none — "This field may be empty or
-        // not returned" (`VpnGateway$AvailabilityZone`).
-        let availability_zone = match input.availability_zone.as_deref() {
+        // zone the Region cannot host one in names no place to create one, and the naming
+        // rule for those zones lives in one place, `availability_zones_in_region`. A request
+        // that names none — or names an EMPTY value, which names no zone either — gets a
+        // gateway that reports none: "This field may be empty or not returned"
+        // (`VpnGateway$AvailabilityZone`).
+        let availability_zone = match input
+            .availability_zone
+            .as_deref()
+            .filter(|zone_name| !zone_name.is_empty())
+        {
             None => None,
             Some(zone_name) => {
-                // The Region's zone set and the one place a zone a Region does not have is
-                // refused, shared with every other handler that lets a request name a zone.
+                // The Region's zone set and the shared lookup every other handler that lets a
+                // request name a zone uses; only the REFUSAL is this operation's, because what
+                // it publishes is the set of zones a virtual private gateway may be created
+                // in — the fixed sentence of this class, with the requested zone and that set
+                // as its variable parts, so a caller can recover by picking one of them.
                 let zones = state::availability_zones_in_region(&region);
-                let zone = state::availability_zone_of_region(
+                let zone = state::availability_zone_refused_with(
                     &zones,
-                    &region,
-                    "availabilityZone",
                     zone_name,
                     |zone| zone.zone_name.as_str(),
+                    || {
+                        state::invalid_parameter_value(format!(
+                            "Value ({echoed}) for parameter availabilityZone is invalid. \
+                             VpnConnection gateways can currently only be created in the \
+                             following availability zones: {offered}.",
+                            echoed = state::echoed_resource_id(zone_name),
+                            // The zone NAMES the Region offers, comma-separated, which is how
+                            // this sentence enumerates them.
+                            offered = state::zone_names(&zones).join(","),
+                        ))
+                    },
                 )?;
                 Some(zone.zone_name.clone())
             }

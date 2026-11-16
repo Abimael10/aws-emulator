@@ -758,11 +758,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // private hosted zone's record set holds.
         let service_private_dns_name = state::endpoint_service_private_dns_name(&store, &service_name);
         if private_dns_enabled && !private_dns_held {
+            // The zone's whole content is the record set for the name the SERVICE publishes, so
+            // a service that publishes none has no zone to associate — the same question, in
+            // the same wording, the create asks before honouring the member.
+            let Some(private_dns_domain) = service_private_dns_name.as_deref() else {
+                return Err(state::private_dns_unsupported_service(&service_name));
+            };
             let attributes = store
                 .vpc_attributes_of(&vpc_id)
                 .ok_or_else(|| state::invalid_vpc_id_not_found(&vpc_id))?;
             if !(attributes.enable_dns_support && attributes.enable_dns_hostnames) {
                 return Err(state::private_dns_unsupported_vpc(&vpc_id));
+            }
+            // And the zone answers ONE domain inside the VPC: it belongs to at most one
+            // endpoint per VPC per service, so turning it on for a second one is refused
+            // ([`crate::state::vpc_has_private_dns_endpoint_for_service`], asked excluding the
+            // endpoint this request is about).
+            if state::vpc_has_private_dns_endpoint_for_service(
+                &store,
+                &vpc_id,
+                &service_name,
+                Some(endpoint_id),
+            ) {
+                return Err(state::private_dns_conflicting_domain(
+                    private_dns_domain,
+                    &vpc_id,
+                ));
             }
         }
 

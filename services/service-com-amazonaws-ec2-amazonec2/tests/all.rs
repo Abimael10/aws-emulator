@@ -18,6 +18,8 @@
 // published bounds on the date a request may name, and what both ends refuse. Declared FIRST
 // for the reason the note above gives: the sorted neighbourhood and the tail of this file are
 // where every new ec2 suite inserts its lines.
+#[path = "all/create_vpn_gateway_availability_zone.rs"]
+mod create_vpn_gateway_availability_zone;
 #[path = "all/image_deprecation.rs"]
 mod image_deprecation;
 // The NAME an Amazon Web Services-managed prefix list is published under — the Region's scope
@@ -63,6 +65,8 @@ mod capacity_manager_monitored_tag_key_repeats;
 mod instance_metric_publication;
 #[path = "all/lookup_role_policy_changes.rs"]
 mod lookup_role_policy_changes;
+#[path = "all/network_acl_entry_rule_members.rs"]
+mod network_acl_entry_rule_members;
 #[path = "all/volume_create_notifications.rs"]
 mod volume_create_notifications;
 // The OPTIONAL members a read of an AMI and a read of an instance carry: every Amazon EBS
@@ -341,6 +345,8 @@ mod vpc_encryption_controls;
 // table created for one VPC with the local route it comes with, one route per destination
 // against a target of that VPC, and a subnet associated with one table of its own VPC — each
 // read back through its own describe. Declared beside `prefix_lists` for the reason the note
+#[path = "all/vpc_endpoint_private_dns_domains.rs"]
+mod vpc_endpoint_private_dns_domains;
 #[path = "all/vpc_internet_path.rs"]
 mod vpc_internet_path;
 // The create side of the route table slice: the one table `CreateRouteTable` stores for the

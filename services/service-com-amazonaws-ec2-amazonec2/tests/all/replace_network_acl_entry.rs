@@ -180,14 +180,15 @@ fn expected_entry(rule: &Rule) -> ReportedEntry {
         cidr_block: (!rule.ipv6).then(|| rule.reported_cidr.to_string()),
         ipv6_cidr_block: rule.ipv6.then(|| rule.reported_cidr.to_string()),
         egress: rule.egress.to_string(),
-        // A reported entry carries BOTH the port range and the ICMP type and code; the one
-        // the rule's protocol has no use for comes back empty rather than absent.
-        port_range: Some(rule.port_range.map_or((None, None), |(from, to)| {
+        // A reported entry carries only the members the RULE has: the port range of a rule
+        // written with one, the ICMP type and code of a rule written with one, and neither for
+        // a rule whose protocol has no ports and no ICMP numbers.
+        port_range: rule.port_range.map(|(from, to)| {
             (Some(from.to_string()), Some(to.to_string()))
-        })),
-        icmp_type_code: Some(rule.icmp_type_code.map_or((None, None), |(icmp_type, code)| {
+        }),
+        icmp_type_code: rule.icmp_type_code.map(|(icmp_type, code)| {
             (Some(icmp_type.to_string()), Some(code.to_string()))
-        })),
+        }),
     }
 }
 

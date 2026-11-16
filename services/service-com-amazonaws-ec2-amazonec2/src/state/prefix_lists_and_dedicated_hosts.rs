@@ -2094,13 +2094,33 @@ pub const SERVICE_DNS_SUFFIX: &str = "amazonaws.com";
 /// workspace builds such a host under (`<label>.<region>.api.aws`).
 pub const API_SERVICE_DNS_SUFFIX: &str = "api.aws";
 
+/// The DNS HOST FORM of an endpoint service's label: its dotted components in REVERSE order.
+///
+/// An endpoint service name is the reverse-domain spelling of the host the service answers
+/// on — `com.amazonaws.<region>.ecr.dkr` names the service a consumer reaches at
+/// `dkr.ecr.<region>.amazonaws.com` (Amazon ECR User Guide, "Amazon ECR interface VPC
+/// endpoints": the Docker endpoint's private DNS name is `dkr.ecr.<region>.amazonaws.com`),
+/// the same way `com.amazonaws.<region>.qldb.session` names the one at
+/// `session.qldb.<region>.amazonaws.com` — so the LAST component of the label is the leftmost
+/// label of the host. A label of one component is its own host form, which is why a plain
+/// service's name reads the same either way.
+///
+/// The ONE place that is applied, so a service's base endpoint DNS name, its default public
+/// name and the names an endpoint to it answers on are all built from one spelling.
+pub fn endpoint_service_dns_label(label: &str) -> String {
+    let mut parts: Vec<&str> = label.split('.').collect();
+    parts.reverse();
+    parts.join(".")
+}
+
 /// The DNS suffix the default public name of a service of the catalogue sits under, which is
 /// decided by the FAMILY its endpoint service name belongs to — the prefix that name opens
 /// with ([`AWS_ENDPOINT_SERVICE_PREFIX`], [`AWS_API_ENDPOINT_SERVICE_PREFIX`],
 /// [`API_AWS_ENDPOINT_SERVICE_PREFIX`]).
 ///
-/// Every such service HAS a default public name: it is the name a consumer resolves without
-/// an endpoint, and the one an interface endpoint's private hosted zone answers on
+/// A service that publishes such a name ([`endpoint_service_offering`]) publishes it under the
+/// domain its name family names: it is the name a consumer resolves without an endpoint, and
+/// the one an interface endpoint's private hosted zone answers on
 /// ([`endpoint_service_private_dns_name`]), so which domain it sits under is the only
 /// question — and the name family answers it.
 fn public_dns_suffix(prefix: &str) -> &'static str {
@@ -2182,6 +2202,68 @@ pub fn private_dns_unsupported_vpc<E>(vpc_id: &str) -> Scaffolded<E> {
         format!(
             "Enabling private DNS requires both enableDnsSupport and enableDnsHostnames VPC \
              attributes set to true for {vpc_id}"
+        ),
+    )
+}
+
+/// Refuse `PrivateDnsEnabled` for a service that publishes no default public DNS name: HTTP
+/// 400 [`INVALID_PARAMETER`], naming the service at fault.
+///
+/// "The private hosted zone contains a record set for the default public DNS name for the
+/// service for the Region" (`CreateVpcEndpointRequest$PrivateDnsEnabled`): that record set is
+/// the whole content of the zone, so a service with no such name has no zone to associate and
+/// the member cannot be honoured — the same class as [`private_dns_unsupported_vpc`], where
+/// what the value cannot be honoured against is the state of a resource the request names.
+pub fn private_dns_unsupported_service<E>(service_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!(
+            "Private DNS can't be enabled because the service {service_name} does not provide \
+             a private DNS name."
+        ),
+    )
+}
+
+/// Whether the VPC `vpc_id` ALREADY has an endpoint that associates the private hosted zone of
+/// the service `service_name`, other than the endpoint `excluding` names.
+///
+/// "The private hosted zone contains a record set for the default public DNS name for the
+/// service for the Region" (`CreateVpcEndpointRequest$PrivateDnsEnabled`): that zone answers
+/// one domain inside the VPC, so two endpoints of one VPC claiming it for one service would be
+/// a configuration nothing could resolve unambiguously — at most one endpoint per VPC per
+/// service has private DNS on. `excluding` is the endpoint the request is ABOUT, so a modify
+/// that leaves its own setting on is not refused by the endpoint it is modifying.
+///
+/// The ONE definition of that question, so the create and the modify cannot disagree about
+/// whether the domain is already taken.
+pub fn vpc_has_private_dns_endpoint_for_service(
+    store: &ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+    service_name: &str,
+    excluding: Option<&str>,
+) -> bool {
+    store.vpc_endpoints.iter().any(|(endpoint_id, endpoint)| {
+        excluding.is_none_or(|held| held != endpoint_id.as_str())
+            && endpoint.private_dns_enabled == Some(true)
+            && endpoint.vpc_id.as_deref() == Some(vpc_id)
+            && endpoint.service_name.as_deref() == Some(service_name)
+    })
+}
+
+/// Refuse a request that would give a second endpoint of one VPC the private hosted zone of one
+/// service: HTTP 400 [`INVALID_PARAMETER`], naming the DOMAIN that zone answers — the service's
+/// own default public DNS name — and the VPC it is already answered in.
+///
+/// The same class as [`private_dns_unsupported_vpc`]: the value is one `PrivateDnsEnabled`
+/// takes, and what it cannot be honoured against is the state of the VPC the request names.
+pub fn private_dns_conflicting_domain<E>(private_dns_name: &str, vpc_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!(
+            "private-dns-enabled cannot be set because there is already a conflicting DNS \
+             domain for {private_dns_name} in the VPC {vpc_id}"
         ),
     )
 }
@@ -2301,6 +2383,52 @@ pub(super) const GATEWAY_ONLY: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY];
 /// A service reachable through either, reported in the order the `ServiceType` enum declares
 /// its members.
 pub(super) const GATEWAY_AND_INTERFACE: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY, VPC_ENDPOINT_TYPE_INTERFACE];
+
+/// What an endpoint service of the catalogue offers an endpoint to it BEYOND being reachable:
+/// whether such an endpoint takes a policy, and whether the service publishes a default public
+/// DNS name a private hosted zone can answer on.
+///
+/// Both are facts of the SERVICE rather than of PrivateLink — "indicates whether the service
+/// supports endpoint policies" (`ServiceDetail$VpcEndpointPolicySupported`), and the private
+/// name is "the default public DNS name for the service for the Region"
+/// (`CreateVpcEndpointRequest$PrivateDnsEnabled`), which a service may simply not publish — so
+/// a service that offers neither is reported as offering neither, and `PrivateDnsEnabled` for
+/// it is refused rather than recorded as an association that would resolve nothing.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EndpointServiceOffering {
+    /// Whether an endpoint to the service takes an endpoint policy.
+    pub(super) policy: bool,
+    /// Whether the service publishes a default public DNS name.
+    pub(super) private_dns: bool,
+}
+
+/// What a published service offers unless the catalogue says otherwise: an endpoint policy and
+/// a default public DNS name, which is what the PrivateLink guide describes for the services it
+/// lists.
+pub(super) const OFFERS_POLICY_AND_PRIVATE_DNS: EndpointServiceOffering =
+    EndpointServiceOffering { policy: true, private_dns: true };
+
+/// The published services whose offering is NOT [`OFFERS_POLICY_AND_PRIVATE_DNS`], by the label
+/// they sit under in a Region ([`AwsEndpointService::label`]).
+///
+/// The AWS IoT Core DATA-plane service is one: a recorded `DescribeVpcEndpointServices` reports
+/// it with no private DNS name and no endpoint-policy support, which is why a narrowing policy
+/// cannot be written for it and why an endpoint to it is reached through the endpoint's own DNS
+/// names rather than through the service's public hostname. A label this table does not name
+/// keeps the default, so this is the one place a service's offering differs from it.
+pub(super) const ENDPOINT_SERVICE_OFFERINGS: &[(&str, EndpointServiceOffering)] = &[(
+    "iot.data",
+    EndpointServiceOffering { policy: false, private_dns: false },
+)];
+
+/// What the service under `label` offers ([`ENDPOINT_SERVICE_OFFERINGS`]), or the default every
+/// other published service carries.
+pub(super) fn endpoint_service_offering(label: &str) -> EndpointServiceOffering {
+    ENDPOINT_SERVICE_OFFERINGS
+        .iter()
+        .find(|(named, _)| *named == label)
+        .map_or(OFFERS_POLICY_AND_PRIVATE_DNS, |(_, offering)| *offering)
+}
 
 /// The endpoint services Amazon Web Services offers in every Region.
 ///
@@ -2613,12 +2741,16 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
         let service_name = format!("{prefix}{region}.{}", service.label);
         // The DOMAIN this service's default public DNS name sits under follows the family
         // its name belongs to ([`public_dns_suffix`]): `com.amazonaws.<region>.<label>`
-        // answers on `<label>.<region>.amazonaws.com`, and the two families named under the
-        // `aws.api` / `api.aws` labels on `<label>.<region>.api.aws`. Every published
-        // service has such a name — it is what a consumer resolves without an endpoint —
-        // so the private hosted zone an interface endpoint to any of them associates has a
-        // record set to hold.
+        // answers on `<host>.<region>.amazonaws.com`, and the two families named under the
+        // `aws.api` / `api.aws` labels on `<host>.<region>.api.aws` — where `<host>` is the
+        // label in its host form ([`endpoint_service_dns_label`]), a service NAME being the
+        // reverse-domain spelling of the host it answers on.
         let public_dns_suffix = public_dns_suffix(prefix);
+        let dns_label = endpoint_service_dns_label(service.label);
+        // What this service offers beyond being reachable: a published service that offers no
+        // endpoint policy or no default public DNS name is reported as offering neither
+        // ([`endpoint_service_offering`]).
+        let offering = endpoint_service_offering(service.label);
         let interface = service.types.contains(&VPC_ENDPOINT_TYPE_INTERFACE);
         let gateway = service.types.contains(&VPC_ENDPOINT_TYPE_GATEWAY);
         // "The DNS names for the service": the base name an endpoint's own names sit
@@ -2629,14 +2761,12 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
         let mut base_endpoint_dns_names = Vec::new();
         if interface {
             base_endpoint_dns_names.push(format!(
-                "{label}.{region}.{ENDPOINT_DNS_SUFFIX}",
-                label = service.label,
+                "{dns_label}.{region}.{ENDPOINT_DNS_SUFFIX}"
             ));
         }
         if gateway {
             base_endpoint_dns_names.push(format!(
-                "{label}.{region}.{public_dns_suffix}",
-                label = service.label,
+                "{dns_label}.{region}.{public_dns_suffix}"
             ));
         }
         EndpointServiceRecord {
@@ -2660,19 +2790,22 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
             // which is the name a private hosted zone resolves inside the VPC — so only an
             // interface endpoint has one, a private hosted zone being an interface
             // endpoint's option.
-            private_dns_name: interface
-                .then(|| format!("{label}.{region}.{public_dns_suffix}", label = service.label)),
+            private_dns_name: (interface && offering.private_dns)
+                .then(|| format!("{dns_label}.{region}.{public_dns_suffix}")),
             // "(Interface and gateway endpoints) A policy to attach to the endpoint that
             // controls access to the service" (`CreateVpcEndpointRequest$PolicyDocument`):
-            // both kinds of endpoint to a service of this catalog take one.
-            vpc_endpoint_policy_supported: true,
+            // both kinds of endpoint to a service of this catalog take one, unless the service
+            // itself supports no endpoint policy.
+            vpc_endpoint_policy_supported: offering.policy,
             // Nothing has to accept a connection to a service Amazon Web Services offers,
             // and it does not manage the endpoints consumers create to it: the endpoint a
             // caller creates is the caller's.
             acceptance_required: false,
             manages_vpc_endpoints: false,
             payer_responsibility: Some(PAYER_RESPONSIBILITY_SERVICE_OWNER.to_string()),
-            private_dns_name_verification_state: interface
+            // There is a name to verify only where the service publishes one, so this follows
+            // the member above rather than the endpoint type on its own.
+            private_dns_name_verification_state: (interface && offering.private_dns)
                 .then(|| DNS_NAME_STATE_VERIFIED.to_string()),
             // "The supported IP address types" (`ServiceDetail$SupportedIpAddressTypes`) is
             // about what the SERVICE answers on. An interface endpoint service answers on

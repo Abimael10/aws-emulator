@@ -15,8 +15,8 @@
 use super::{
     ALL_IPV4_ADDRESSES, ALL_IP_PROTOCOLS, CidrProblem, ComAmazonawsEc2Amazonec2State,
     DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, MAX_ICMP_TYPE, MAX_PORT, MAX_PROTOCOL_NUMBER,
-    RULE_ACTION_DENY, canonical_ipv4_cidr, canonical_ipv6_cidr, invalid_parameter_combination,
-    invalid_parameter_value, missing_parameter,
+    RULE_ACTION_DENY, canonical_ipv4_cidr, canonical_ipv6_cidr, echoed_resource_id,
+    invalid_parameter_combination, invalid_parameter_value, missing_parameter,
 };
 use crate::ops::types::{IcmpTypeCode, NetworkAclEntry, PortRange};
 use crate::scaffolded::Scaffolded;
@@ -125,12 +125,12 @@ pub fn network_acl_entry_report_order(entry: &NetworkAclEntry) -> (bool, i32) {
 /// rule number that name the entry, and every member that says what it matches and what it
 /// does with it.
 ///
-/// The two members a reader fills in ([`reported_network_acl_entry`] gives an entry whose
-/// protocol has no ICMP numbers or no ports an EMPTY pair rather than none at all) are
-/// compared through their REPORTED value, so an entry a request describes and the entry a
-/// store holds are judged on one shape and a request that named neither is still the same
-/// rule. Read from each side rather than by projecting a copy of it, so a comparison
-/// allocates nothing; the projection stays the one place a STORED entry's shape is decided.
+/// The two members a rule may leave out ([`reported_network_acl_entry`] reports neither for a
+/// rule that carries neither) are compared through the PAIR of numbers each holds, so an
+/// entry a request describes and the entry a store holds are judged on one shape and a
+/// request that named neither is still the same rule. Read from each side rather than by
+/// projecting a copy of it, so a comparison allocates nothing; the projection stays the one
+/// place a STORED entry's shape is decided.
 ///
 /// The ONE definition of "this rule is already there", for the writers that have to tell an
 /// entry already exactly as asked for from a DIFFERENT rule occupying the same number.
@@ -205,18 +205,25 @@ pub fn network_acl_entry_limit_exceeded<E>(message: impl Into<String>) -> Scaffo
 
 /// `entry` as a reader reports it.
 ///
-/// A reported entry carries BOTH "the ICMP type and code" (`NetworkAclEntry$IcmpTypeCode`)
-/// and "the range of ports the rule applies to" (`$PortRange`): a rule whose protocol has no
-/// ICMP numbers or no ports carries them EMPTY rather than not at all, which is how an ACL's
-/// `entrySet` comes back on the wire.
+/// A reported entry carries exactly the members the RULE has: "the ICMP type and code"
+/// (`NetworkAclEntry$IcmpTypeCode`) only for a rule written with one — the protocols that need
+/// it — and "the range of ports the rule applies to" (`$PortRange`) only for a rule written
+/// with one, which is "required if specifying protocol 6 (TCP) or 17 (UDP)"
+/// (`CreateNetworkAclEntryRequest$PortRange`). A rule over every protocol has neither ports
+/// nor ICMP numbers, so it reports neither member rather than an empty one: an empty port
+/// range on an all-traffic rule would read as a port restriction the rule does not carry.
 ///
 /// The ONE place that is applied, so every writer of a stored entry
 /// ([`created_network_acl_entries`], [`super::default_network_acl_entries`],
 /// [`ComAmazonawsEc2Amazonec2State::insert_network_acl_entry`]) stores the same shape and no
 /// two readers report one entry differently.
 pub fn reported_network_acl_entry(mut entry: NetworkAclEntry) -> NetworkAclEntry {
-    entry.icmp_type_code.get_or_insert_with(IcmpTypeCode::default);
-    entry.port_range.get_or_insert_with(PortRange::default);
+    entry.icmp_type_code = entry
+        .icmp_type_code
+        .filter(|icmp| icmp.r#type.is_some() || icmp.code.is_some());
+    entry.port_range = entry
+        .port_range
+        .filter(|range| range.from.is_some() || range.to.is_some());
     entry
 }
 
@@ -316,12 +323,15 @@ pub fn validated_network_acl_entry<E>(
     } else {
         match protocol.parse::<i32>() {
             Ok(number) if (0..=MAX_PROTOCOL_NUMBER).contains(&number) => Some(number),
+            // A value that is not a protocol number is not a protocol EC2 knows, whether it
+            // is a protocol NAME a security group rule may carry, a number outside the single
+            // byte a protocol number occupies, or anything else: that is one class, and it is
+            // refused with the sentence EC2 words every unknown IP protocol with — the fixed
+            // text, with the value from the REQUEST as its only variable part.
             _ => {
                 return Err(invalid_parameter_value(format!(
-                    "Value ({protocol}) for parameter protocol is invalid. The protocol \
-                     number must be between 0 and {max}, or {all} for all protocols",
-                    max = MAX_PROTOCOL_NUMBER,
-                    all = ALL_IP_PROTOCOLS,
+                    "Invalid value '{echoed}' for IP protocol. Unknown protocol.",
+                    echoed = echoed_resource_id(protocol),
                 )))
             }
         }

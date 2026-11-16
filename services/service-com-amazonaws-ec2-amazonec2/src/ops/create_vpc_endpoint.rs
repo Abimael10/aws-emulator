@@ -542,13 +542,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && input
                 .private_dns_enabled
                 .unwrap_or(service_private_dns_name.is_some());
-        if private_dns_enabled {
-            if service_private_dns_name.is_none() {
-                return Err(state::invalid_parameter_value(format!(
-                    "Private DNS can't be enabled because the service {service_name} has no \
-                     private DNS name"
-                )));
-            }
+        let private_dns_domain = match (private_dns_enabled, service_private_dns_name.as_deref()) {
+            (false, _) => None,
+            // A service that publishes no such name has nothing to turn on, through the one
+            // wording this crate refuses that with.
+            (true, None) => return Err(state::private_dns_unsupported_service(service_name)),
+            (true, Some(domain)) => Some(domain),
+        };
+        if private_dns_domain.is_some() {
             let attributes = store
                 .vpc_attributes_of(&input.vpc_id)
                 .ok_or_else(|| state::invalid_vpc_id_not_found(&input.vpc_id))?;
@@ -761,6 +762,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The private hosted zone this endpoint would associate answers ONE domain inside the
+        // VPC, so it belongs to at most one endpoint per VPC per service: a request that is not
+        // the replay answered above, and that would claim a domain another endpoint of this VPC
+        // already holds for this service, is refused rather than served into a configuration
+        // nothing could resolve ([`crate::state::vpc_has_private_dns_endpoint_for_service`], the
+        // one definition of that question, which the modify asks too). Asked after the members
+        // of the request itself have been read, so a request that is also malformed is refused
+        // for that first.
+        if let Some(private_dns_domain) = private_dns_domain {
+            if state::vpc_has_private_dns_endpoint_for_service(
+                &store,
+                &input.vpc_id,
+                service_name,
+                None,
+            ) {
+                return Err(state::private_dns_conflicting_domain(
+                    private_dns_domain,
+                    &input.vpc_id,
+                ));
+            }
+        }
+
         // A count ceiling first, then the byte budget: a record count on its own admits
         // gigabytes, because each record holds strings the caller chose the length of. The
         // endpoint network interfaces are counted against their own store's ceiling as each
@@ -865,9 +888,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // terminal one for an endpoint that stands up nothing, the non-terminal one for an
         // endpoint whose network interfaces are still being provisioned
         // ([`created_state`]) — and "Indicates whether the endpoint is being managed by its
-        // service" (`RequesterManaged`) is false for one a caller created. Only the members
-        // the endpoint's own TYPE has are set, so a gateway endpoint does not report an
-        // address type it has none of.
+        // service" (`RequesterManaged`) is false for one a caller created. Every ID LIST the
+        // endpoint has is reported as a list — the ids the request named for it, empty where it
+        // named none — while a member that is not a list is set only for a type that has one,
+        // so a gateway endpoint does not report an address type it has none of.
         let created_state = created_state(gateway);
         let endpoint = VpcEndpoint {
             vpc_endpoint_type: Some(endpoint_type.clone()),
@@ -877,23 +901,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_document: policy_document.clone(),
             // "(Gateway endpoint) The IDs of the route tables associated with the
             // endpoint": the tables the request named, each of which the endpoint's own
-            // route is added to below.
-            route_table_ids: gateway.then(|| requested_route_tables.clone()),
-            subnet_ids: (!gateway).then(|| {
+            // route is added to below. Reported as a LIST whichever type the endpoint is,
+            // EMPTY for a type that is reached through endpoint network interfaces rather
+            // than through a route and so names no table.
+            route_table_ids: Some(requested_route_tables.clone()),
+            subnet_ids: Some(
                 placements
                     .iter()
                     .map(|placement| placement.subnet_id.clone())
-                    .collect()
-            }),
-            groups: interface.then(|| {
+                    .collect(),
+            ),
+            groups: Some(
                 groups
                     .iter()
                     .map(|group| SecurityGroupIdentifier {
                         group_id: group.group_id.clone(),
                         group_name: group.group_name.clone(),
                     })
-                    .collect()
-            }),
+                    .collect(),
+            ),
             ip_address_type: (!gateway).then(|| ip_address_type.to_string()),
             dns_options: (!gateway).then(|| DnsOptions {
                 dns_record_ip_type: Some(dns_record_ip_type.clone()),
@@ -901,7 +927,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             private_dns_enabled: interface.then_some(private_dns_enabled),
             requester_managed: Some(false),
-            network_interface_ids: (!gateway).then(|| network_interface_ids.clone()),
+            network_interface_ids: Some(network_interface_ids.clone()),
             creation_timestamp: Some(state::system_time_to_date_time(SystemTime::now())),
             tags: Some(tags.clone()),
             owner_id: Some(::engine::emulator_account_id().to_string()),
@@ -1094,6 +1120,10 @@ pub(crate) struct EndpointPlacement {
 /// endpoint's own id, the service name's labels, and the zones of the stored subnets — never
 /// a value read off a clock or a random source.
 ///
+/// `service` is the service's LABEL as its name carries it; the host those names sit under is
+/// that label's host form ([`crate::state::endpoint_service_dns_label`]), since an endpoint
+/// service name is the reverse-domain spelling of the host the service answers on.
+///
 /// `private_dns` is that public name and the zone that answers it, which is the name the
 /// SERVICE publishes ([`crate::state::endpoint_service_private_dns_name`], the one
 /// `DescribeVpcEndpointServices` reports) rather than one rebuilt here, so the zone's record
@@ -1107,6 +1137,7 @@ pub(crate) fn dns_entries(
     private_dns: Option<(&str, &str)>,
 ) -> Vec<DnsEntry> {
     let suffix = crate::state::ENDPOINT_DNS_SUFFIX;
+    let service = crate::state::endpoint_service_dns_label(service);
     let mut entries: Vec<DnsEntry> = Vec::with_capacity(placements.len() + 2);
     if let Some((private_dns_name, private_hosted_zone_id)) = private_dns {
         entries.push(DnsEntry {

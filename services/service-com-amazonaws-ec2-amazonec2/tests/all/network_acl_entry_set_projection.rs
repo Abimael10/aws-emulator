@@ -8,9 +8,10 @@
 //!
 //! The rule under test: a network ACL's reported `entrySet` is that ACL's whole stored rule
 //! table, projected ONE way — the egress rules first, then the ingress rules, each by
-//! ascending rule number — and every reported entry carries both "the ICMP type and code"
-//! (`NetworkAclEntry$IcmpTypeCode`) and "the range of ports the rule applies to"
-//! (`$PortRange`), EMPTY for the one the rule's protocol has no use for, beside the rule
+//! ascending rule number — and every reported entry carries exactly the members its RULE has:
+//! "the ICMP type and code" (`NetworkAclEntry$IcmpTypeCode`) for a rule written with one and
+//! "the range of ports the rule applies to" (`$PortRange`) for a rule written with one, and
+//! NEITHER for a rule whose protocol has no ports and no ICMP numbers, beside the rule
 //! number, protocol, action, direction and range the rule was written with.
 //!
 //! So the list `CreateNetworkAcl` answers, the list `DescribeNetworkAcls` answers for that
@@ -49,7 +50,8 @@ const REGION: &str = "us-east-1";
 
 /// One entry of a reported network ACL, with every member of the modelled `NetworkAclEntry`
 /// told apart from an ABSENT one: `None` is a member the response left out, and
-/// `Some((None, None))` one it wrote as a present-but-empty element.
+/// `Some((None, None))` one it wrote as a present-but-empty element — which is what this suite
+/// pins the readers against writing for a rule that has no such member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportedEntry {
     rule_number: String,
@@ -212,7 +214,7 @@ impl Rule {
     }
 
     /// The entry this rule must be reported as: its own members, with the port range and the
-    /// ICMP type and code both PRESENT — empty for the one its protocol has no use for.
+    /// ICMP type and code reported only where the rule carries one.
     fn reported(&self) -> ReportedEntry {
         ReportedEntry {
             rule_number: self.rule_number.to_string(),
@@ -221,19 +223,19 @@ impl Rule {
             cidr_block: self.cidr_block.clone(),
             ipv6_cidr_block: self.ipv6_cidr_block.clone(),
             egress: self.egress.to_string(),
-            port_range: Some(self.port_range.map_or((None, None), |(from, to)| {
+            port_range: self.port_range.map(|(from, to)| {
                 (Some(from.to_string()), Some(to.to_string()))
-            })),
-            icmp_type_code: Some(self.icmp_type_code.map_or((None, None), |(icmp, code)| {
+            }),
+            icmp_type_code: self.icmp_type_code.map(|(icmp, code)| {
                 (Some(icmp.to_string()), Some(code.to_string()))
-            })),
+            }),
         }
     }
 }
 
 /// One rule-32767 entry every network ACL ends with, in the direction `egress` names: the
-/// catch-all deny over every protocol and every IPv4 address, carrying both the port range
-/// and the ICMP type and code as present-but-empty members.
+/// catch-all deny over every protocol and every IPv4 address, which has no ports and no ICMP
+/// numbers and so reports neither member.
 fn catch_all(egress: bool) -> ReportedEntry {
     every_protocol_entry(DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, egress, RULE_ACTION_DENY)
 }
@@ -258,8 +260,8 @@ fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> Re
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         ipv6_cidr_block: None,
         egress: egress.to_string(),
-        port_range: Some((None, None)),
-        icmp_type_code: Some((None, None)),
+        port_range: None,
+        icmp_type_code: None,
     }
 }
 
@@ -400,7 +402,7 @@ async fn assert_every_reader(
 /// Every reader projects the entries a network ACL is CREATED with the same way: the two
 /// rules of a VPC's own default ACL in each direction, and the catch-all deny in each
 /// direction for an ACL a caller created — egress first, each by ascending rule number, each
-/// carrying the port range and the ICMP type and code as present-but-empty members.
+/// over every protocol and so carrying neither a port range nor an ICMP type and code.
 #[tokio::test]
 async fn every_reader_projects_the_entries_an_acl_is_created_with_the_same_way() {
     let (router, _engine) = super::ec2_query::emulator();

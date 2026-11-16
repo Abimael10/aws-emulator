@@ -901,8 +901,23 @@ async fn a_request_that_cannot_be_served_is_refused_with_the_code_for_its_cause(
     let gateway_id = create_gateway_endpoint("the refusal table", &router, &built.vpc_id).await;
     // An interface endpoint served through no subnet yet, so a call that adds two subnets of
     // ONE zone is judged on those two alone rather than on a zone the endpoint already fills.
-    let unplaced_id =
-        create_interface_endpoint("the refusal table", &router, &built.vpc_id, &[]).await;
+    // It asks for NO private hosted zone: that zone belongs to at most one endpoint per VPC
+    // per service, and the endpoint above already associates it for this service.
+    let unplaced_id = {
+        let body = ok(
+            "the refusal table",
+            &router,
+            "CreateVpcEndpoint",
+            &[
+                param("VpcId", &built.vpc_id),
+                param("ServiceName", INTERFACE_SERVICE),
+                param("VpcEndpointType", "Interface"),
+                param("PrivateDnsEnabled", "false"),
+            ],
+        )
+        .await;
+        member("the refusal table", &body, "vpcEndpointId")
+    };
     let before = describe_endpoint("the refusal table", &router, &endpoint_id).await;
 
     /// A VPC endpoint id of the right shape that no endpoint of the account has.

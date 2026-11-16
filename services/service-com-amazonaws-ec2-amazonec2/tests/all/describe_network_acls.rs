@@ -246,10 +246,10 @@ fn default_entries() -> Vec<ReportedEntry> {
                 cidr_block: Some("0.0.0.0/0".to_string()),
                 ipv6_cidr_block: None,
                 egress: egress.to_string(),
-                // A reported entry carries both members; an entry whose protocol has no ICMP
-                // numbers and no ports carries them EMPTY rather than not at all.
-                port_range: Some((String::new(), String::new())),
-                icmp_type_code: Some((String::new(), String::new())),
+                // A reported entry carries only the members its RULE has; an entry over every
+                // protocol has no ICMP numbers and no ports, so it carries neither.
+                port_range: None,
+                icmp_type_code: None,
             })
         })
         .collect()
