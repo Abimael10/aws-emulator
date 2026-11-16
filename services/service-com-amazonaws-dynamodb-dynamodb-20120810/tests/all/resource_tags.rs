@@ -217,7 +217,7 @@ fn longest_value() -> String {
 async fn tagging_merges_the_batch_into_the_stored_set_and_reports_it_back() {
     let router = emulator();
 
-    let cases: [MergeCase; 7] = [
+    let cases: [MergeCase; 6] = [
         MergeCase {
             name: "a first tag on an untagged table",
             created: &[],
@@ -254,12 +254,9 @@ async fn tagging_merges_the_batch_into_the_stored_set_and_reports_it_back() {
             batch: &[("Env", "prod"), ("ENV", "dev")],
             expected: &[("ENV", "dev"), ("Env", "prod"), ("env", "staging")],
         },
-        MergeCase {
-            name: "an empty batch changes nothing",
-            created: &[("env", "staging")],
-            batch: &[],
-            expected: &[("env", "staging")],
-        },
+        // A batch with NO entries is not a merge of nothing: a tag write states the tags
+        // it applies in that list, so an empty one states no write and is refused as
+        // input (`tests/all/tagging_input_refusals.rs`).
     ];
 
     for (index, case) in cases.iter().enumerate() {
@@ -351,20 +348,16 @@ struct UntagCase {
 }
 
 /// One untag case: the keys `UntagResource` names, and the set that must remain. The
-/// rows span the counts the rule generalises over — none, one, several, every key — and
-/// keys the resource does not carry.
+/// rows span the counts the rule generalises over — one, several, every key — and keys the
+/// resource does not carry. A removal that names NO key states no removal and is refused
+/// as input, which `tests/all/tagging_input_refusals.rs` drives.
 #[tokio::test]
 async fn untagging_removes_exactly_the_keys_named_and_is_idempotent() {
     let router = emulator();
 
     const STORED: &[(&str, &str)] = &[("env", "prod"), ("owner", "platform"), ("tier", "gold")];
 
-    let cases: [UntagCase; 5] = [
-        UntagCase {
-            name: "no keys named leaves the set alone",
-            removed: &[],
-            remaining: STORED,
-        },
+    let cases: [UntagCase; 4] = [
         UntagCase {
             name: "one key goes and the others stay",
             removed: &["owner"],

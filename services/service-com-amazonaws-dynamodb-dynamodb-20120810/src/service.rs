@@ -373,6 +373,64 @@ fn states_absent_member_as_clause(operation: &str) -> bool {
         .is_ok()
 }
 
+/// The operations whose own request code reads the members of an ARN-ADDRESSED TAGGING
+/// call — the whole tagging surface — so the refusal of one of those members is the
+/// sentence THAT check states and not the validating walk's clause about it.
+///
+/// Two members, each with its own check:
+///
+/// * `ResourceArn`, the surface's whole selector, resolved by the service's table-ARN check
+///   ([`crate::state::resolve_resource_arn`]) rather than by the bounds the model declares
+///   on the member. Whatever is wrong with the value, the refusal states the ARN rule it
+///   broke: the class sentence ([`crate::state::INVALID_TABLE_ARN`]) alone when the request
+///   carries no value to name, and otherwise the sentence that check words for the value
+///   (`crate::state::invalid_resource_arn_message`) — observed for all three operations,
+///   both for a request that supplies no value and for one whose value is outside the
+///   member's declared `@length` bound;
+/// * the required TAG LIST a write or a removal states its entries in
+///   ([`REQUIRED_TAG_LISTS`]).
+///
+/// A violation the walk reports against either member is therefore RESTATED here instead of
+/// being stated as that walk's clause: the walk refuses the request before the handler runs,
+/// so this seam is the only place the service's own checks can answer for it.
+///
+/// The resource-POLICY surface shares the `ResourceArn` member and not the vocabulary: it
+/// addresses "a table or stream" (the `PutResourcePolicy` doc) and words its own refusals of
+/// a value that is neither (`tests/all/resource_policy_arn_scope_refusals.rs`), so it keeps
+/// the walk's clause.
+///
+/// Sorted, which [`checks_its_own_members`] relies on for `binary_search` and
+/// `self_checked_member_operations_are_sorted` pins.
+const SELF_CHECKED_MEMBER_OPERATIONS: &[&str] =
+    &["ListTagsOfResource", "TagResource", "UntagResource"];
+
+/// Whether `operation` reads those members through its own checks.
+fn checks_its_own_members(operation: &str) -> bool {
+    SELF_CHECKED_MEMBER_OPERATIONS
+        .binary_search(&operation)
+        .is_ok()
+}
+
+/// The REQUIRED TAG LISTS of that same surface, each as the member path the validating walk
+/// reports it under and the entry its own sentence names
+/// (`crate::state::no_tag_entries_message`).
+///
+/// A tag write and a tag removal state the entries they ask for in such a list, so the
+/// service reads the list itself: a request that states NO entry of it asks for nothing and
+/// is refused by that check — observed to be the same sentence whether the request carried
+/// an EMPTY list or no list at all, which is why the absence is restated here rather than
+/// left to the walk's `Member must not be null` clause. The empty half is the handler's,
+/// because a list the request did carry reaches it
+/// (`crate::state::check_tag_entries_stated`).
+///
+/// Read only for the operations above, so the `Tags` member another operation carries as an
+/// OPTIONAL list (`CreateTable`, where stating none of them is a table with no tags) cannot
+/// reach it.
+const REQUIRED_TAG_LISTS: &[(&str, &str)] = &[
+    ("tagKeys", crate::state::TAG_KEY_LIST_ENTRY),
+    ("tags", crate::state::TAG_LIST_ENTRY),
+];
+
 /// The enum value sets this service STATES in an order of its own, each written in the
 /// order it states them.
 ///
@@ -558,6 +616,10 @@ tokio::task_local! {
     /// back the same way.
     static SERVED_NULL_CLAUSE: bool;
 
+    /// Whether that operation reads an ARN-addressed tagging call's members through its own
+    /// checks ([`SELF_CHECKED_MEMBER_OPERATIONS`]), set and read back the same way.
+    static SERVED_MEMBER_CHECK: bool;
+
     /// The clauses this service's OWN reading of the request found
     /// ([`request_constraints`]), set around the same run and read back by
     /// [`validation_envelope`] so they are counted in the one envelope beside the
@@ -589,6 +651,16 @@ fn served_states_clause_bare() -> bool {
 /// answer every operation this list does not name gives.
 fn served_states_absent_member_as_clause() -> bool {
     SERVED_NULL_CLAUSE.try_with(|clause| *clause).unwrap_or(false)
+}
+
+/// Whether the operation this task is serving reads an ARN-addressed tagging call's members
+/// through its own checks. Absent altogether is a refusal raised outside an operation's run,
+/// where there is no served operation to read that off — and the walk's clause is what such
+/// a refusal states.
+fn served_checks_its_own_members() -> bool {
+    SERVED_MEMBER_CHECK
+        .try_with(|checked| *checked)
+        .unwrap_or(false)
 }
 
 /// The clauses this service's own reading of the request it is serving found. None at all
@@ -656,9 +728,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                         states_service_checked_clause_bare(operation),
                         SERVED_NULL_CLAUSE.scope(
                             states_absent_member_as_clause(operation),
-                            SERVED_SERVICE_CHECKED_CLAUSES.scope(
-                                request_constraints::service_checked_clauses(operation, req),
-                                op.run(svc, req, ctx),
+                            SERVED_MEMBER_CHECK.scope(
+                                checks_its_own_members(operation),
+                                SERVED_SERVICE_CHECKED_CLAUSES.scope(
+                                    request_constraints::service_checked_clauses(operation, req),
+                                    op.run(svc, req, ctx),
+                                ),
                             ),
                         ),
                     ),
@@ -875,6 +950,25 @@ fn masking_violation(violations: &[Violation]) -> Option<&Violation> {
 ///
 /// `None` declines the whole refusal — see [`requirement`].
 fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    // The tagging surface's `ResourceArn` is resolved by the service's own table-ARN check,
+    // so a violation the walk reports against that member is restated as the ARN rule it
+    // broke ([`ARN_CHECKED_OPERATIONS`]): the sentence that check words for the value, or
+    // the class sentence alone when there is no value to name. It comes first, and states
+    // nothing of any other member, because the member it is about is the whole selector the
+    // request addresses a resource by.
+    if served_checks_its_own_members() {
+        if let Some(value) = resource_arn_violation(violations) {
+            return Some(match value {
+                Some(value) => crate::state::invalid_resource_arn_message(value),
+                None => crate::state::INVALID_TABLE_ARN.to_string(),
+            });
+        }
+        // The same surface reads its required tag LIST itself, so a request that states no
+        // entry of it is refused by that check too ([`REQUIRED_TAG_LISTS`]).
+        if let Some(entry) = absent_required_tag_list(violations) {
+            return Some(crate::state::no_tag_entries_message(entry));
+        }
+    }
     if let Some(absent) = missing_service_required_member(violations) {
         if !served_states_absent_member_as_clause() {
             return Some(crate::state::missing_parameter_message(&absent));
@@ -1004,6 +1098,30 @@ fn missing_service_required_member(violations: &[Violation]) -> Option<String> {
                 && SERVICE_REQUIRED_MEMBERS.contains(&violation.path.as_str())
         })
         .map(|violation| wire_member_path(&violation.path))
+}
+
+/// The entry the sentence names for the required tag list this refusal found absent
+/// ([`REQUIRED_TAG_LISTS`]), or `None` when the refusal is about anything else.
+fn absent_required_tag_list(violations: &[Violation]) -> Option<&'static str> {
+    violations.iter().find_map(|violation| {
+        REQUIRED_TAG_LISTS
+            .iter()
+            .find(|(member, _)| *member == violation.path.as_str())
+            .map(|(_, entry)| *entry)
+    })
+}
+
+/// Whether this refusal found a violation of the ARN-addressed selector
+/// ([`crate::state::RESOURCE_ARN_MEMBER_PATH`]), and the value the member held — `None`
+/// inside the `Some` for a member the request carried no value for.
+///
+/// One request can break several members' rules; the one reported is this member, because
+/// the check that reads it is what resolves the resource the request addresses.
+fn resource_arn_violation(violations: &[Violation]) -> Option<&Option<String>> {
+    violations
+        .iter()
+        .find(|violation| violation.path == crate::state::RESOURCE_ARN_MEMBER_PATH)
+        .map(|violation| &violation.value)
 }
 
 /// The service key `::emulator_server::service_from_target` reads out of a
@@ -1191,10 +1309,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clause_form, stated_enum_order, states_absent_member_as_clause,
+        checks_its_own_members, clause_form, stated_enum_order, states_absent_member_as_clause,
         states_service_checked_clause_bare, ClauseForm, BARE_CLAUSE_OPERATIONS,
-        ITEM_REQUEST_FORM_OPERATIONS, PUBLISHED_ENUM_ORDERS, VALIDATOR_NULL_CLAUSE_OPERATIONS,
-        VALIDATOR_PATH_FORM_OPERATIONS,
+        ITEM_REQUEST_FORM_OPERATIONS, PUBLISHED_ENUM_ORDERS, SELF_CHECKED_MEMBER_OPERATIONS,
+        VALIDATOR_NULL_CLAUSE_OPERATIONS, VALIDATOR_PATH_FORM_OPERATIONS,
     };
 
     /// The admissible sets as the walk hands them over.
@@ -1296,6 +1414,37 @@ mod tests {
         for operation in VALIDATOR_NULL_CLAUSE_OPERATIONS {
             assert!(
                 states_absent_member_as_clause(operation),
+                "case {operation:?}: expected the walk's clause, got the service's sentence"
+            );
+        }
+    }
+
+    #[test]
+    fn self_checked_member_operations_are_sorted() {
+        let mut sorted = SELF_CHECKED_MEMBER_OPERATIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            SELF_CHECKED_MEMBER_OPERATIONS,
+            sorted.as_slice(),
+            "case the self-checked list: expected it sorted for `binary_search`, got \
+             {SELF_CHECKED_MEMBER_OPERATIONS:?}"
+        );
+        for operation in SELF_CHECKED_MEMBER_OPERATIONS {
+            assert!(
+                checks_its_own_members(operation),
+                "case {operation:?}: expected the service's own sentence, got the walk's clause"
+            );
+        }
+        // The surface that shares the ARN member and not the vocabulary, and the operation
+        // that carries the same `Tags` list as an OPTIONAL member.
+        for operation in [
+            "PutResourcePolicy",
+            "GetResourcePolicy",
+            "DeleteResourcePolicy",
+            "CreateTable",
+        ] {
+            assert!(
+                !checks_its_own_members(operation),
                 "case {operation:?}: expected the walk's clause, got the service's sentence"
             );
         }

@@ -199,6 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
+        // A tag write states its tags in a list, so a list with no entries states no
+        // write: it is refused as INPUT, before the resource it addressed is looked up,
+        // whichever resource that would have been
+        // ([`crate::state::check_tag_entries_stated`]).
+        crate::state::check_tag_entries_stated(crate::state::TAG_LIST_ENTRY, input.tags.len())
+            .map_err(lift)?;
+
         // The request's tag list is caller-sized, so it is bounded BEFORE anything
         // walks it: a table may carry at most `MAX_TAGS_PER_TABLE` tags, so a list
         // longer than that cannot be stored whatever it holds.

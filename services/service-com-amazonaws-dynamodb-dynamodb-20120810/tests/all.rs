@@ -345,6 +345,8 @@ mod transact_write_expression_parse_defects;
 mod table_throughput_mode_and_warm_capacity;
 #[path = "all/tag_read_propagation.rs"]
 mod tag_read_propagation;
+#[path = "all/tagging_input_refusals.rs"]
+mod tagging_input_refusals;
 #[path = "all/time_to_live.rs"]
 mod time_to_live;
 #[path = "all/transactional_consumed_capacity_metrics.rs"]

@@ -196,6 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
+        // A tag removal states the keys it removes in a list, so a list with no entries
+        // states no removal: it is refused as INPUT, before the resource it addressed is
+        // looked up, whichever resource that would have been
+        // ([`crate::state::check_tag_entries_stated`]).
+        crate::state::check_tag_entries_stated(
+            crate::state::TAG_KEY_LIST_ENTRY,
+            input.tag_keys.len(),
+        )
+        .map_err(lift)?;
+
         // The key list is caller-sized, so it is bounded BEFORE anything walks it: a
         // table carries at most `MAX_TAGS_PER_TABLE` tags, so a request naming more
         // keys than that names keys no resource can hold.

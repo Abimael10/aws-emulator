@@ -186,6 +186,11 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
     // planes, and each request carries every OTHER required member so the absent one is
     // the only fault. The path is the lowerCamel one the validating walk reports, which
     // is what a client reads out of the message.
+    //
+    // The tagging surface's members are NOT among them: that surface reads its `ResourceArn`
+    // and its required tag list itself, and states the sentence each of those checks words —
+    // for a member the request carries no value for as much as for one it does
+    // (`tests/all/tagging_input_refusals.rs`).
     let rows: Vec<(&str, &str, Value, &str)> = vec![
         (
             "a stream destination with no stream ARN",
@@ -228,24 +233,6 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
             "DescribeBackup",
             json!({}),
             "backupArn",
-        ),
-        (
-            "a tag listing with no resource ARN",
-            "ListTagsOfResource",
-            json!({}),
-            "resourceArn",
-        ),
-        (
-            "a tag write with no tags",
-            "TagResource",
-            json!({"ResourceArn": table_arn.clone()}),
-            "tags",
-        ),
-        (
-            "a tag removal with no tag keys",
-            "UntagResource",
-            json!({"ResourceArn": table_arn.clone()}),
-            "tagKeys",
         ),
         (
             "a policy attach with no document",

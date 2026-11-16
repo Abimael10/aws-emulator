@@ -3074,21 +3074,43 @@ pub fn resource_arn_not_found(resource_arn: &str) -> RequestError {
 ///   member it was sent in, because the value IS an ARN and the rule it broke is which
 ///   resource it names.
 pub fn invalid_resource_arn(resource_arn: &str) -> RequestError {
+    RequestError::Validation(invalid_resource_arn_message(resource_arn))
+}
+
+/// The MESSAGE of that refusal, for the one caller that states it outside a handler: the
+/// member's own bounds are declared by the model, so the validating walk can reach the
+/// value before any handler does, and `src/service.rs` restates the refusal from here
+/// rather than letting the walk's clause stand (see its `SELF_CHECKED_MEMBER_OPERATIONS`).
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
     if resource_arn.starts_with(ARN_PREFIX) {
-        RequestError::Validation(format!(
-            "Invalid TableArn: Invalid ResourceArn provided as input {resource_arn}"
-        ))
+        format!("{INVALID_TABLE_ARN}: Invalid ResourceArn provided as input {resource_arn}")
     } else {
-        RequestError::Validation(format!(
+        format!(
             "One or more parameter values were invalid: ARNs must start with '{ARN_PREFIX}': \
              {resource_arn}"
-        ))
+        )
     }
 }
 
 /// What every ARN begins with, which is the first thing an ARN-addressed member is held
 /// to ([`invalid_resource_arn`]).
 pub const ARN_PREFIX: &str = "arn:";
+
+/// The CLASS sentence a `ResourceArn` the TAGGING surface cannot read as a table ARN of
+/// this endpoint is refused by, and the WHOLE message when there is no value to name.
+///
+/// The refusal states the failure in two parts: this sentence, which is the rule that was
+/// broken, and — when the request carried a value — the detail clause naming it
+/// ([`invalid_resource_arn`]). A request that carries NO value for the member leaves
+/// nothing to detail, so the class sentence is the whole message: fixed text, no member
+/// path, nothing echoed. `src/service.rs` is where the member's absence reaches it, because
+/// the walk is what finds a member missing.
+pub const INVALID_TABLE_ARN: &str = "Invalid TableArn";
+
+/// The member path the validating walk reports an ARN-ADDRESSED operation's selector
+/// under: the lowerCamel spelling of `ResourceArn`, which is the path a clause about that
+/// member names it by.
+pub const RESOURCE_ARN_MEMBER_PATH: &str = "resourceArn";
 
 /// The `ValidationException` message for a request whose tag list repeats a key.
 ///

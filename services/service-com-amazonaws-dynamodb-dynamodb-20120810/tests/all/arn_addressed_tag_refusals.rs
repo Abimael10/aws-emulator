@@ -494,7 +494,8 @@ async fn a_tag_list_that_repeats_a_key_is_refused_wherever_a_tag_list_is_accepte
 
     // The rows span where the repeat falls, how many times a key repeats, whether the
     // repeated values agree, the key's case and its length, and the lists that are
-    // NOT repeats (distinct keys, keys differing only in case, one tag, none at all).
+    // NOT repeats (distinct keys, keys differing only in case, one tag, and none at all —
+    // which a tag WRITE refuses as an empty list and a create accepts as no tags).
     let cases: [TagListCase; 11] = [
         TagListCase {
             name: "no tags at all",
@@ -602,6 +603,30 @@ async fn a_tag_list_that_repeats_a_key_is_refused_wherever_a_tag_list_is_accepte
                     "case {:?} on TagResource: the refusal names the repeated key, got {}",
                     case.name,
                     message(&body)
+                );
+                let listed = listed_tags(&router, REGION, &arn).await;
+                assert!(
+                    listed.is_empty(),
+                    "case {:?} on TagResource: a refused write stores nothing, got {listed:?}",
+                    case.name
+                );
+            }
+            // A tag WRITE states the tags it applies in that list, so a list with no
+            // entries states no write and is refused as input — while `CreateTable` takes
+            // the same `TagList` as an OPTIONAL member below, where stating none of them is
+            // a table with no tags. `tests/all/tagging_input_refusals.rs` drives that rule
+            // over both operations of the tagging surface.
+            None if case.tags.is_empty() => {
+                assert_eq!(
+                    (status, error_code(&body).as_str(), message(&body).as_str()),
+                    (
+                        400,
+                        "ValidationException",
+                        "Atleast one Tag needs to be provided as Input."
+                    ),
+                    "case {:?} on TagResource: expected the empty-list refusal, got {status} \
+                     with {body}",
+                    case.name
                 );
                 let listed = listed_tags(&router, REGION, &arn).await;
                 assert!(
