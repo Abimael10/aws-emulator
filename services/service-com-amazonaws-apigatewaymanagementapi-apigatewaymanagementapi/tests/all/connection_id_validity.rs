@@ -32,27 +32,19 @@
 //! The router, request builder and response readers live in `crate::support`.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use engine::InMemoryEngine;
 
 use service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi as mgmt;
 
+// The refusal shapes, the operation table, the registration instant and the path spelling come
+// from the crate's shared harness, so no two suites can disagree about them.
 use crate::support::{
-    call, call_with_headers, error_code, error_message, ids_api_gateway_does_not_mint, minted,
-    rendered, register, ALL_A_MARKED_ID, HOST, MINTED_IDS,
+    call, call_with_headers, connected_at, error_code, error_message,
+    ids_api_gateway_does_not_mint, minted, operations, path, register, rendered, ALL_A_MARKED_ID,
+    GONE_STATUS, GONE_TYPE, HOST, INVALID_MESSAGE, INVALID_STATUS, INVALID_TYPE, MINTED_IDS,
+    NO_MESSAGE,
 };
-
-/// The status and code API Gateway refuses a `ConnectionId` that could never have been
-/// issued with, and the fixed text of its message.
-const INVALID_STATUS: u16 = 400;
-const INVALID_TYPE: &str = "BadRequestException";
-const INVALID_MESSAGE: &str = "Invalid connectionId: ";
-
-/// The modelled refusal for an id this service ISSUED whose connection it no longer holds
-/// (`@httpError(410)`).
-const GONE_STATUS: u16 = 410;
-const GONE_TYPE: &str = "GoneException";
 
 /// `ConnectionId` forms that ARE of the shape API Gateway issues: standard base64 of
 /// `mgmt::state::CONNECTION_ID_BYTES` bytes carrying the format marker its encoding stamps.
@@ -110,21 +102,6 @@ const MALFORMED_IDS: [(&str, &str, &str); 9] = [
 /// spelled out, so the length is readable.
 fn very_long_id() -> String {
     "A".repeat(200)
-}
-
-/// The three operations, by the method each is reached with, and the payload each sends.
-fn operations() -> Vec<(&'static str, Vec<u8>)> {
-    vec![
-        ("GET", Vec::new()),
-        ("POST", b"payload".to_vec()),
-        ("DELETE", Vec::new()),
-    ]
-}
-
-/// A registration instant in the past, so an instant the service writes later is strictly
-/// greater.
-fn connected_at() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
 
 /// The two shared catalogs are the forms they claim to be: every id
@@ -235,7 +212,7 @@ async fn a_well_formed_id_that_names_no_open_connection_is_gone() {
             );
             assert_eq!(
                 error_message(&body),
-                "<no message>",
+                NO_MESSAGE,
                 "case {case:?}: GoneException is memberless, so it carries no message, \
                  got {}",
                 rendered(&body)
@@ -303,9 +280,4 @@ async fn a_minted_id_is_served_while_its_connection_is_open_and_gone_once_it_clo
             );
         }
     }
-}
-
-/// The modelled request path for `connection_id`.
-fn path(connection_id: &str) -> String {
-    format!("/@connections/{connection_id}")
 }

@@ -10,7 +10,7 @@
 //! then drift.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -267,4 +267,55 @@ pub fn register_identity(
 /// whatever the case called itself.
 pub fn minted(label: &str) -> String {
     mgmt::state::connection_id_for(label.as_bytes())
+}
+
+/// The refusal a `ConnectionId` that API Gateway's connection-id encoding could never have
+/// produced earns: the status, the shape a restJson1 client resolves from `x-amzn-errortype`,
+/// and the FIXED text of its message, which the submitted value follows.
+///
+/// Named here, once, because every suite that drives one of the three operations asserts the
+/// same two refusals and a second copy of either would let one suite accept what another
+/// refuses.
+pub const INVALID_STATUS: u16 = 400;
+pub const INVALID_TYPE: &str = "BadRequestException";
+pub const INVALID_MESSAGE: &str = "Invalid connectionId: ";
+
+/// The modelled refusal for an id of that encoding which the registry does not hold
+/// (`GoneException`, `@httpError(410)`, no members), and what [`error_message`] answers for
+/// such a body, which carries no `message` member at all.
+pub const GONE_STATUS: u16 = 410;
+pub const GONE_TYPE: &str = "GoneException";
+pub const NO_MESSAGE: &str = "<no message>";
+
+/// The three operations this service models, by the method each is reached with and the
+/// payload each sends — only `PostToConnection` carries a body.
+pub fn operations() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("GET", Vec::new()),
+        ("POST", b"fan-out".to_vec()),
+        ("DELETE", Vec::new()),
+    ]
+}
+
+/// A registration instant in the past, so an instant the service writes later is strictly
+/// greater.
+pub fn connected_at() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// The modelled request path for `connection_id`, spelled as a client sends it.
+pub fn path(connection_id: &str) -> String {
+    format!("/@connections/{}", as_path_segment(connection_id))
+}
+
+/// `connection_id` as a path SEGMENT carries it: the base64 alphabet's `+` and `/` and the
+/// padding `=` are percent-encoded, which is how a client sends a token holding them.
+///
+/// One encoder for every suite, so no two of them can send the same token differently.
+pub fn as_path_segment(connection_id: &str) -> String {
+    connection_id
+        .replace('%', "%25")
+        .replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
 }

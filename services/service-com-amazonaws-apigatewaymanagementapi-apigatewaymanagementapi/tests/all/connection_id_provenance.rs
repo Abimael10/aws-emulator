@@ -35,61 +35,18 @@
 //! The router, request builder and response readers live in `crate::support`.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use engine::InMemoryEngine;
 
 use service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi as mgmt;
 
+// The refusal shapes, the operation table, the registration instant and the path spelling come
+// from the crate's shared harness, so no two suites can disagree about them.
 use crate::support::{
-    call_with_headers, error_code, error_message, minted, rendered, register, ALL_A_MARKED_ID,
-    HOST, MINTED_IDS, RECORDED_ID,
+    call_with_headers, connected_at, error_code, error_message, minted, operations, path, register,
+    rendered, ALL_A_MARKED_ID, GONE_STATUS, GONE_TYPE, HOST, INVALID_MESSAGE, INVALID_STATUS,
+    INVALID_TYPE, MINTED_IDS, NO_MESSAGE, RECORDED_ID,
 };
-
-/// The refusal for a value API Gateway's encoding could not have produced: the status, the
-/// shape and the fixed text of its message.
-const INVALID_STATUS: u16 = 400;
-const INVALID_TYPE: &str = "BadRequestException";
-const INVALID_MESSAGE: &str = "Invalid connectionId: ";
-
-/// The modelled refusal for an id of that encoding the registry does not hold
-/// (`GoneException`, `@httpError(410)`, memberless).
-const GONE_STATUS: u16 = 410;
-const GONE_TYPE: &str = "GoneException";
-
-/// What `crate::support::error_message` answers for a body with no `message` member, which
-/// is every body of the memberless `GoneException`.
-const NO_MESSAGE: &str = "<no message>";
-
-/// The three operations, by the method each is reached with, and the payload each sends.
-fn operations() -> Vec<(&'static str, Vec<u8>)> {
-    vec![
-        ("GET", Vec::new()),
-        ("POST", b"fan-out".to_vec()),
-        ("DELETE", Vec::new()),
-    ]
-}
-
-/// A registration instant in the past, so an instant the service writes later is strictly
-/// greater.
-fn connected_at() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-}
-
-/// The modelled request path for `connection_id`.
-fn path(connection_id: &str) -> String {
-    format!("/@connections/{}", as_path_segment(connection_id))
-}
-
-/// `connection_id` as a path SEGMENT carries it: the base64 alphabet's `+` and `/` and the
-/// padding `=` are percent-encoded, which is how a client sends a token holding them.
-fn as_path_segment(connection_id: &str) -> String {
-    connection_id
-        .replace('%', "%25")
-        .replace('+', "%2B")
-        .replace('/', "%2F")
-        .replace('=', "%3D")
-}
 
 /// A token of 11 bytes whose format marker is `marker`, as a `ConnectionId` travels: the
 /// bytes carry `label` so each case addresses a value of its own.

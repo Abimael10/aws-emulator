@@ -15,6 +15,8 @@
 mod connection_endpoint_scope;
 #[path = "all/connection_error_envelope.rs"]
 mod connection_error_envelope;
+#[path = "all/connection_id_mint_log.rs"]
+mod connection_id_mint_log;
 #[path = "all/connection_id_provenance.rs"]
 mod connection_id_provenance;
 #[path = "all/connection_id_validity.rs"]
