@@ -142,7 +142,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from inside the critical section, so it is the instant at which this
         // call holds the store.
         let (mut store, now) = crate::state::lock_and_settle(&state);
-        let Some(tunnel_id) = store.tunnel_id_for_arn(&region, &input.resource_arn) else {
+        // The ARN is read as an ADDRESS, so any spelling of the tunnel's ARN
+        // resolves to it, and the tags are removed under the one spelling this
+        // service stores them by rather than under the caller's.
+        let Some(addressed) = store.tunnel_for_arn(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The tunnel the ARN names, named the way every other
@@ -173,8 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removing a tag the tunnel reported IS an update of the tunnel and is
         // stamped on the record. A request that names only keys the tunnel does
         // not carry changes nothing, and so stamps nothing.
-        if store.remove_tags(&input.resource_arn, input.tag_keys.iter().map(String::as_str)) {
-            store.stamp_tunnel_updated(&region, &tunnel_id, now);
+        if store.remove_tags(
+            &addressed.tunnel_arn,
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            store.stamp_tunnel_updated(&region, &addressed.tunnel_id, now);
         }
         drop(store);
 

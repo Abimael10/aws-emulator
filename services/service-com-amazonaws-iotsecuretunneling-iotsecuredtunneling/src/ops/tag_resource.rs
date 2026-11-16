@@ -157,8 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from inside the critical section, so it is the instant at which this
         // call holds the store.
         let (mut store, now) = crate::state::lock_and_settle(&state);
-        // An ARN that names no stored tunnel has nothing to tag.
-        let Some(tunnel_id) = store.tunnel_id_for_arn(&region, &input.resource_arn) else {
+        // An ARN that names no stored tunnel has nothing to tag. The ARN is
+        // read as an ADDRESS, so any spelling of the tunnel's ARN resolves to
+        // it, and the tags are written under the one spelling this service
+        // stores them by rather than under the caller's.
+        let Some(addressed) = store.tunnel_for_arn(&region, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The tunnel the ARN names, named the way every other
@@ -191,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's `LimitExceededException` reports, so this
         // handler wraps the helper's message in that modelled error, the same one
         // `OpenTunnel` answers for this limit and for the tunnel count.
-        if let Some(message) = store.tag_limit_refusal(&input.resource_arn, &input.tags) {
+        if let Some(message) = store.tag_limit_refusal(&addressed.tunnel_arn, &input.tags) {
             return Err(TagResourceErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(message),
@@ -206,8 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stamped on the record. A request that only re-writes the key/value
         // pairs the tunnel already carries changes nothing, and so stamps
         // nothing.
-        if store.put_tags(&input.resource_arn, &input.tags) {
-            store.stamp_tunnel_updated(&region, &tunnel_id, now);
+        if store.put_tags(&addressed.tunnel_arn, &input.tags) {
+            store.stamp_tunnel_updated(&region, &addressed.tunnel_id, now);
         }
         drop(store);
 

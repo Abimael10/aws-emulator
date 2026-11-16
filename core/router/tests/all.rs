@@ -4,14 +4,9 @@
 // end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
 // `tests/all/`, sorted by name, and no other line.
 //
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the one
-// place its name sorts to. The list holds those pairs and nothing else — no prose between
-// them, no blank line, and nothing at all after the last one — so two branches landing at once
-// insert two lines in two places and have nothing here to duplicate, re-word or mistype. What
-// a suite covers, and why it drives the assembled router rather than one service crate,
-// belongs in that suite's OWN module header, where it is read beside the test it explains; a
-// note about THIS file belongs in `all/appended_notes.rs` and its siblings, which keep what
-// earlier landings had appended here and are declared below like any other file.
+// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
+// place its name sorts to. That list holds those pairs and nothing else: no prose between
+// them, no blank line, and nothing at all after the last one.
 //
 // This header is ONE block, for the same reason: re-typed copies of it are what had grown in
 // the tail of the list and in the header itself, and the suites
@@ -36,23 +31,10 @@
 // `all/every_suite_file_is_declared.rs` pin every rule above, for this root and for every
 // service crate's own `tests/all.rs`, so check there rather than leaving a note here.
 //
-// Put a new suite at `tests/all/<name>.rs` and insert ONE pair into the list below, in the
-// place its name sorts to. That list holds those pairs and nothing else: no prose between
-// them, no blank line, and nothing at all after the last one. Two branches landing at once
-// then insert two lines in two places and have no prose to duplicate, re-word or mistype,
-// which is what had gone wrong here — this header and the tail of the list had each grown
-// hundreds of re-typed copies of these paragraphs, and no suite of this target ran.
-//
-// What a suite covers, and why it drives the assembled router rather than one service crate,
-// belongs in that suite's OWN module header, where it is read beside the test it explains. A
-// note about THIS file belongs in `all/appended_header_notes.rs`, `all/appended_notes.rs`,
-// `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which keep what earlier landings
-// had appended here and are declared below like any other file.
-//
-// The suite headers this root compiles wrap a paragraph without the indentation
-// `clippy::doc_lazy_continuation` asks of a doc list item, so that lint is allowed for the
-// whole target. An inner attribute is legal only ahead of the first item, so it stands at the
-// end of this header rather than in the list.
+// The lint allowed below is for the suite files this root compiles: a module header that wraps
+// a paragraph without the indentation `clippy::doc_lazy_continuation` asks of a doc list item
+// is a note rather than a build failure. An inner attribute is legal only ahead of the first
+// item, so it stands with this header.
 #![allow(clippy::doc_lazy_continuation)]
 #[path = "all/agent_registry_discovery_routes_probe.rs"]
 mod agent_registry_discovery_routes_probe;

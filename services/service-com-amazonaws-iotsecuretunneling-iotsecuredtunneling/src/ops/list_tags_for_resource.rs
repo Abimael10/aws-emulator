@@ -145,10 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inside the critical section, so a lifetime that ran out while this
         // request waited for the lock has run out by the time it reads.
         let (store, _) = crate::state::lock_and_settle(&state);
-        if store
-            .tunnel_id_for_arn(&region, &input.resource_arn)
-            .is_none()
-        {
+        // The ARN is read as an ADDRESS, so any spelling of the tunnel's ARN
+        // resolves to it, and the tags are read under the one spelling this
+        // service stores them by rather than under the caller's.
+        let Some(addressed) = store.tunnel_for_arn(&region, &input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The tunnel the ARN names, named the way every other
@@ -159,13 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
         // This output reports an untagged resource by leaving the member out,
         // the form this crate's tests pin for it. The tag member of a reported
         // `Tunnel` is the one that always carries its set, empty list and all,
         // so the two readers of the one tag store differ only in how each
         // reports "none".
-        let tags = store.tag_list(&input.resource_arn);
+        let tags = store.tag_list(&addressed.tunnel_arn);
         drop(store);
 
         Ok(ListTagsForResourceOutput { tags })

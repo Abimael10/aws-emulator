@@ -338,6 +338,19 @@ impl StoredTunnel {
     }
 }
 
+/// The tunnel a caller-supplied resource ARN resolved to: the record's own
+/// `tunnelId`, and the `tunnelArn` this service stores and keys its tags by.
+///
+/// Both come from the stored record rather than from the request, so an
+/// ARN-addressed operation works on the resource the address names however the
+/// caller spelled it. See
+/// [`ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::tunnel_for_arn`].
+#[derive(Debug, Clone)]
+pub struct AddressedTunnel {
+    pub tunnel_id: String,
+    pub tunnel_arn: String,
+}
+
 /// Per-service state for com-amazonaws-iotsecuretunneling-iotsecuredtunneling. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
@@ -358,6 +371,11 @@ pub struct ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
     /// `(region, tunnelArn)` -> `tunnelId`, so an ARN-addressed operation
     /// resolves an ARN only to a tunnel of the Region it is serving.
+    ///
+    /// The ARN here is the one spelling this service mints
+    /// ([`tunnel_arn`]), so a caller-supplied ARN is looked up through
+    /// [`canonical_tunnel_arn`] rather than as submitted: see
+    /// [`Self::tunnel_for_arn`].
     pub arn_index: BTreeMap<(String, String), String>,
     /// The soonest instant at which some OPEN tunnel's lifetime runs out, so the
     /// expiry sweep is a single comparison on the overwhelmingly common call
@@ -508,13 +526,29 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
         });
     }
 
-    /// The id of the tunnel `arn` names, if `region`'s endpoint holds one.
+    /// The tunnel the caller-supplied resource ARN `arn` addresses, if
+    /// `region`'s endpoint holds one.
     ///
-    /// An ARN names the Region of the resource it addresses, so an ARN minted in
-    /// another Region resolves to nothing here, exactly as the tunnel it names is
-    /// unreachable through this endpoint.
-    pub fn tunnel_id_for_arn(&self, region: &str, arn: &str) -> Option<String> {
-        self.arn_index.get(&tunnel_key(region, arn)).cloned()
+    /// A resource ARN addresses a resource through its FIELDS, not by being the
+    /// byte string a service happened to mint, so the lookup is made on the
+    /// canonical spelling of the resource those fields name
+    /// ([`canonical_tunnel_arn`]) and every spelling AWS writes of one tunnel's
+    /// ARN resolves to that tunnel. An ARN names the Region, the account and the
+    /// partition of the resource it addresses, so one naming another of those
+    /// resolves to nothing here, exactly as the resource it names is unreachable
+    /// through this endpoint.
+    ///
+    /// The answer carries the record's own `tunnelArn` beside its id, because
+    /// that one spelling — not the string the caller wrote — is what this
+    /// service keys a tunnel's tags by.
+    pub fn tunnel_for_arn(&self, region: &str, arn: &str) -> Option<AddressedTunnel> {
+        let canonical = canonical_tunnel_arn(arn)?;
+        let tunnel_id = self.arn_index.get(&tunnel_key(region, &canonical))?;
+        let tunnel = self.tunnel(region, tunnel_id)?;
+        Some(AddressedTunnel {
+            tunnel_id: tunnel.tunnel_id.clone(),
+            tunnel_arn: tunnel.tunnel_arn.clone(),
+        })
     }
 
     /// The message refusing a request that would take the resource `arn` names
@@ -792,6 +826,32 @@ pub fn tunnel_id_from_arn(arn: &str) -> Option<&str> {
     }
     let tunnel_id = ::service_common::arn::resource_id_of_type(arn, TUNNEL_ARN_RESOURCE_TYPE)?;
     is_modelled_tunnel_id(tunnel_id).then_some(tunnel_id)
+}
+
+/// The ONE spelling of the tunnel ARN the caller-supplied `arn` addresses, or
+/// `None` when `arn` addresses no tunnel resource ([`tunnel_id_from_arn`]).
+///
+/// An ARN is an ADDRESS made of fields, not a byte string a service minted: AWS
+/// writes the resource field in both of the `<type>/<id>` and `<type>:<id>`
+/// forms, so two ARNs differing only in that separator name one and the same
+/// resource and have to resolve alike. Normalising the separator here is what
+/// lets a resolution compare addresses rather than spellings, with exactly one
+/// place that knows which spelling is canonical — the slash form
+/// [`tunnel_arn`] mints.
+///
+/// Every OTHER field is part of the address and is carried over as the caller
+/// wrote it, so a request naming another partition, Region or account still
+/// addresses another resource and is resolved against that one.
+pub fn canonical_tunnel_arn(arn: &str) -> Option<String> {
+    let parsed = ::service_common::arn::parse_of(arn, TUNNEL_ARN_SERVICE)?;
+    let tunnel_id = tunnel_id_from_arn(arn)?;
+    Some(format!(
+        "arn:{partition}:{vendor}:{region}:{account}:{TUNNEL_ARN_RESOURCE_TYPE}/{tunnel_id}",
+        partition = parsed.partition,
+        vendor = parsed.vendor,
+        region = parsed.region,
+        account = parsed.account,
+    ))
 }
 
 /// The message every `ResourceNotFoundException` of this service carries.

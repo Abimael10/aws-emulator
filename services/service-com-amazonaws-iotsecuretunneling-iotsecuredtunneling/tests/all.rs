@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_identifier_lifting.rs"]
 mod arn_identifier_lifting;
+#[path = "all/arn_spelling_addresses_one_resource.rs"]
+mod arn_spelling_addresses_one_resource;
 #[path = "all/clock_read_inside_the_store_lock.rs"]
 mod clock_read_inside_the_store_lock;
 #[path = "all/close_tunnel_idempotence.rs"]
