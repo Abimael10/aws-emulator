@@ -78,6 +78,8 @@ mod list_target_account_configurations;
 mod list_target_resource_types;
 #[path = "all/modelled_map_key_bounds.rs"]
 mod modelled_map_key_bounds;
+#[path = "all/published_action_catalog.rs"]
+mod published_action_catalog;
 #[path = "all/published_catalog_entries.rs"]
 mod published_catalog_entries;
 #[path = "all/published_catalog_text.rs"]

@@ -202,17 +202,12 @@ fn ids(case: &str, listed: &[Value]) -> Vec<String> {
 
 /// The published resource types this crate's action table records no action for.
 ///
-/// The published type listing is its own catalog, and `ACTION_CATALOG` records an action
-/// only where the reference named in the module docs states one, so these five are published
-/// while no catalogued action targets them. Named here so the cross-table check below stays
-/// an assertion rather than an exception.
-const UNTARGETED_PUBLISHED_TYPES: &[&str] = &[
-    "aws:directconnect:virtual-interface",
-    "aws:dsql:cluster",
-    "aws:ec2:vpc-endpoint",
-    "aws:kinesis:stream",
-    "aws:memorydb:multi-region-cluster",
-];
+/// The published type listing is its own catalog, so a type it enumerates is published
+/// whether or not a catalogued action targets one. The published action catalog now records
+/// an action for every type the listing enumerates, so this list is empty. Named here so the
+/// cross-table check below stays an assertion rather than an exception: a type that stops
+/// being targeted is a deliberate row here.
+const UNTARGETED_PUBLISHED_TYPES: &[&str] = &[];
 
 /// The resource types a catalogued action targets that the published type LISTING does not
 /// enumerate.

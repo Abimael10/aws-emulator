@@ -272,7 +272,8 @@ fn action_text() -> Vec<ActionText> {
         },
         ActionText {
             id: "aws:ec2:send-spot-instance-interruptions",
-            description: "Interrupt the specified Spot Instances.",
+            description: "Interrupts a set of Spot Instances after sending an interruption \
+                          notice.",
             parameters: &[(
                 "durationBeforeInterruption",
                 "The length of time before the interruption notice is sent, in ISO 8601 format.",
@@ -280,7 +281,7 @@ fn action_text() -> Vec<ActionText> {
         },
         ActionText {
             id: "aws:fis:wait",
-            description: "Wait for the specified duration.",
+            description: "Waits for the specified duration.",
             parameters: &[("duration", "The duration of the action, in ISO 8601 format.")],
         },
     ]

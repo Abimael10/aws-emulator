@@ -196,9 +196,17 @@ pub const FIS_ACTION_ID_CONDITION_KEY: &str = "ec2:FisActionId";
 ///
 /// Three conventions the rows follow, all taken from the reference itself:
 ///
-/// * a row's `description` is the text the reference PUBLISHES for that action rather than
-///   a paraphrase of it, which names the resources the action acts on as "the specified
-///   …" — the value a client that reads or snapshots `Action$description` sees;
+/// * a row's `description` is the string the catalog PUBLISHES for that action id rather
+///   than a restatement of it in this emulator's own words: it is the action's own summary,
+///   reported character for character, punctuation included (`aws:ebs:pause-volume-io`
+///   publishes no closing period, `aws:directconnect:virtual-interface-disconnect` publishes
+///   a noun phrase rather than a sentence), and it is the value a client that renders or
+///   snapshots `Action$description` sees. The published strings follow no one pattern — some
+///   are imperative (`aws:ec2:reboot-instances`, `aws:ec2:stop-instances`,
+///   `aws:ec2:terminate-instances`, `aws:ssm:start-automation-execution` and
+///   `aws:arc:start-zonal-autoshift` are published that way, which is why they read
+///   differently from their neighbours), others open with the verb in the third person — so a
+///   row carries the string published for ITS id and never one shaped after a sibling row's;
 /// * an action FIS performs through another service's agent carries that service's own
 ///   call as its permission — the `aws:ecs:task-*` actions run through SSM on the task, so
 ///   `ssm:SendCommand` is what their execution role needs, and the `aws:eks:*` actions
@@ -258,9 +266,41 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[&["cloudwatch:DescribeAlarms"]],
     },
     ActionCatalogEntry {
+        id: "aws:directconnect:virtual-interface-disconnect",
+        description: "Direct Connect Failover Test.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "VirtualInterfaces",
+            resource_type: "aws:directconnect:virtual-interface",
+        }],
+        permissions: &[&["directconnect:StartBgpFailoverTest"]],
+    },
+    ActionCatalogEntry {
+        id: "aws:dsql:cluster-connection-failure",
+        description: "Simulates connection failures to a DSQL cluster for the specified \
+                      duration.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Clusters",
+            resource_type: "aws:dsql:cluster",
+        }],
+        // The reference states no single API call for this action, so this row records no
+        // permission rather than one it would guess (see
+        // [`ActionCatalogEntry::permissions`]).
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:dynamodb:global-table-pause-replication",
-        description: "Pause replication of the specified DynamoDB global tables in this \
-                      Region.",
+        description: "Disrupts DynamoDB Global Table regional connectivity by pausing \
+                      replication and blocking table operations in the affected region.",
         parameters: &[ActionCatalogParameter {
             name: "duration",
             description: "The duration of the action, in ISO 8601 format.",
@@ -274,7 +314,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ebs:pause-volume-io",
-        description: "Pause I/O operations on the specified EBS volumes.",
+        description: "Pauses IO for a set of EBS volumes",
         parameters: &[ActionCatalogParameter {
             name: "duration",
             description: "The duration of the action, in ISO 8601 format.",
@@ -287,9 +327,32 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[&["ec2:PauseVolumeIO"]],
     },
     ActionCatalogEntry {
+        id: "aws:ebs:volume-io-latency",
+        description: "Sets latency to EBS volume I/O operations.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "latencyMilliseconds",
+                description: "The latency added to each I/O operation, in milliseconds.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Volumes",
+            resource_type: "aws:ec2:ebs-volume",
+        }],
+        // See `aws:dsql:cluster-connection-failure`: the reference states no single API call
+        // for this action either.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:ec2:api-error",
-        description: "Cause EC2 API requests made with the specified IAM roles to fail with \
-                      the specified error.",
+        description: "Injects the specified error into the EC2 API requests made with a set of \
+                      IAM roles.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -320,8 +383,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ec2:api-insufficient-instance-capacity-error",
-        description: "Cause EC2 RunInstances requests made with the specified IAM roles to fail \
-                      with an insufficient instance capacity error.",
+        description: "Injects insufficient instance capacity errors into the EC2 RunInstances \
+                      requests made with a set of IAM roles.",
         parameters: &[
             ActionCatalogParameter {
                 name: "availabilityZoneIdentifiers",
@@ -347,8 +410,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ec2:asg-insufficient-instance-capacity-error",
-        description: "Cause instance launches in the specified Auto Scaling groups to fail with \
-                      an insufficient instance capacity error.",
+        description: "Injects insufficient instance capacity errors into the instance launches \
+                      of a set of Auto Scaling groups.",
         parameters: &[
             ActionCatalogParameter {
                 name: "availabilityZoneIdentifiers",
@@ -384,7 +447,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ec2:send-spot-instance-interruptions",
-        description: "Interrupt the specified Spot Instances.",
+        description: "Interrupts a set of Spot Instances after sending an interruption notice.",
         parameters: &[ActionCatalogParameter {
             name: "durationBeforeInterruption",
             description: "The length of time before the interruption notice is sent, in ISO 8601 \
@@ -432,7 +495,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:drain-container-instances",
-        description: "Drain the container instances of the specified Amazon ECS clusters.",
+        description: "Drains a percentage of the container instances of a set of Amazon ECS \
+                      clusters.",
         parameters: &[
             ActionCatalogParameter {
                 name: "drainagePercentage",
@@ -453,7 +517,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:stop-task",
-        description: "Stop the specified Amazon ECS tasks.",
+        description: "Stops a set of Amazon ECS tasks.",
         parameters: &[],
         targets: &[ActionCatalogTarget {
             name: "Tasks",
@@ -463,7 +527,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-cpu-stress",
-        description: "Generate CPU load on the specified Amazon ECS tasks.",
+        description: "Runs CPU stress on a set of Amazon ECS tasks.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -495,7 +559,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-io-stress",
-        description: "Generate I/O load on the specified Amazon ECS tasks.",
+        description: "Runs I/O stress on a set of Amazon ECS tasks.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -527,7 +591,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-kill-process",
-        description: "Kill the specified process in the specified Amazon ECS tasks.",
+        description: "Kills a process on a set of Amazon ECS tasks.",
         parameters: &[
             ActionCatalogParameter {
                 name: "installDependencies",
@@ -554,8 +618,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-blackhole-port",
-        description: "Drop traffic to or from the specified port in the specified Amazon ECS \
-                      tasks.",
+        description: "Drops traffic on a port of a set of Amazon ECS tasks.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -592,7 +655,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-latency",
-        description: "Add latency to the traffic of the specified Amazon ECS tasks.",
+        description: "Adds latency and jitter to the network traffic of a set of Amazon ECS \
+                      tasks.",
         parameters: &[
             ActionCatalogParameter {
                 name: "delayMilliseconds",
@@ -629,7 +693,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-packet-loss",
-        description: "Drop a percentage of the packets of the specified Amazon ECS tasks.",
+        description: "Drops a percentage of the network packets of a set of Amazon ECS tasks.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -661,8 +725,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:inject-kubernetes-custom-resource",
-        description: "Apply the specified Kubernetes custom resource to the specified Amazon EKS \
-                      cluster.",
+        description: "Applies a Kubernetes custom resource to an Amazon EKS cluster.",
         parameters: &[
             ActionCatalogParameter {
                 name: "kubernetesApiVersion",
@@ -699,7 +762,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-cpu-stress",
-        description: "Generate CPU load on the specified Amazon EKS pods.",
+        description: "Runs CPU stress on a set of Kubernetes pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -730,7 +793,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-delete",
-        description: "Delete the specified Amazon EKS pods.",
+        description: "Deletes a set of Kubernetes pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "gracePeriodSeconds",
@@ -751,7 +814,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-io-stress",
-        description: "Generate I/O load on the specified Amazon EKS pods.",
+        description: "Runs I/O stress on a set of Kubernetes pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -782,7 +845,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-memory-stress",
-        description: "Generate memory load on the specified Amazon EKS pods.",
+        description: "Runs memory stress on a set of Kubernetes pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -813,8 +876,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-network-blackhole-port",
-        description: "Drop traffic to or from the specified port in the specified Amazon EKS \
-                      pods.",
+        description: "Drops traffic on a port of a set of Kubernetes pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -850,7 +912,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-network-latency",
-        description: "Add latency to the traffic of the specified Amazon EKS pods.",
+        description: "Adds latency and jitter to the network traffic of a set of Kubernetes \
+                      pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "delayMilliseconds",
@@ -886,7 +949,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-network-packet-loss",
-        description: "Drop a percentage of the packets of the specified Amazon EKS pods.",
+        description: "Drops a percentage of the network packets of a set of Kubernetes pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -917,7 +980,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:terminate-nodegroup-instances",
-        description: "Terminate instances in the specified Amazon EKS node groups.",
+        description: "Terminates a percentage of the instances of a set of Amazon EKS node \
+                      groups.",
         parameters: &[ActionCatalogParameter {
             name: "instanceTerminationPercentage",
             description: "The percentage of instances to terminate.",
@@ -931,7 +995,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:elasticache:replicationgroup-interrupt-az-power",
-        description: "Interrupt power in one Availability Zone of the specified ElastiCache \
+        description: "Interrupts power in one Availability Zone of a set of ElastiCache \
                       replication groups.",
         parameters: &[ActionCatalogParameter {
             name: "duration",
@@ -946,8 +1010,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-internal-error",
-        description: "Cause API requests made with the specified IAM roles to fail with an \
-                      internal error.",
+        description: "Injects internal errors into the API requests made with a set of IAM \
+                      roles.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -978,7 +1042,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-throttle-error",
-        description: "Cause API requests made with the specified IAM roles to be throttled.",
+        description: "Injects throttling errors into the API requests made with a set of IAM \
+                      roles.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1009,8 +1074,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-unavailable-error",
-        description: "Cause API requests made with the specified IAM roles to fail with an \
-                      unavailable error.",
+        description: "Injects unavailable errors into the API requests made with a set of IAM \
+                      roles.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1041,7 +1106,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:fis:wait",
-        description: "Wait for the specified duration.",
+        description: "Waits for the specified duration.",
         parameters: &[ActionCatalogParameter {
             name: "duration",
             description: "The duration of the action, in ISO 8601 format.",
@@ -1053,8 +1118,40 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[],
     },
     ActionCatalogEntry {
+        id: "aws:kinesis:stream-expired-iterator-exception",
+        description: "Injects ExpiredIteratorException into the read requests of a Kinesis data \
+                      stream.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Streams",
+            resource_type: "aws:kinesis:stream",
+        }],
+        // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
+        id: "aws:kinesis:stream-provisioned-throughput-exception",
+        description: "Injects ProvisionedThroughputExceededException into the requests of a \
+                      Kinesis data stream.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Streams",
+            resource_type: "aws:kinesis:stream",
+        }],
+        // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:lambda:invocation-add-delay",
-        description: "Add delay to the invocations of the specified Lambda functions.",
+        description: "Adds delay to the invocations of a set of Lambda functions.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1088,8 +1185,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:lambda:invocation-error",
-        description: "Cause the invocations of the specified Lambda functions to return an \
-                      error.",
+        description: "Returns an error from the invocations of a set of Lambda functions.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1116,8 +1212,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:lambda:invocation-http-integration-response",
-        description: "Cause the invocations of the specified Lambda functions to return the \
-                      specified HTTP integration response.",
+        description: "Returns the specified HTTP integration response from the invocations of a \
+                      set of Lambda functions.",
         parameters: &[
             ActionCatalogParameter {
                 name: "contentTypeHeader",
@@ -1153,8 +1249,23 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[],
     },
     ActionCatalogEntry {
+        id: "aws:memorydb:multi-region-cluster-pause-replication",
+        description: "Pauses replication for a MemoryDB multi-region cluster.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Clusters",
+            resource_type: "aws:memorydb:multi-region-cluster",
+        }],
+        // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:network:disrupt-connectivity",
-        description: "Disrupt network connectivity for the specified subnets.",
+        description: "Disrupts network connectivity for a set of subnets.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1174,9 +1285,24 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[&["ec2:CreateNetworkAcl"]],
     },
     ActionCatalogEntry {
+        id: "aws:network:disrupt-vpc-endpoint",
+        description: "Disrupts connectivity to a VPC endpoint.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "VpcEndpoints",
+            resource_type: "aws:ec2:vpc-endpoint",
+        }],
+        // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:network:route-table-disrupt-connectivity",
-        description: "Disrupt connectivity to the specified service for the subnets the \
-                      specified route tables serve.",
+        description: "Disrupts connectivity to a service for the subnets a set of route tables \
+                      serve.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1199,9 +1325,31 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[],
     },
     ActionCatalogEntry {
+        id: "aws:network:route-table-disrupt-cross-region-connectivity",
+        description: "Disrupts traffic between the subnets a set of route tables serve and \
+                      another Region.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "region",
+                description: "The Region whose traffic is disrupted.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "RouteTables",
+            resource_type: "aws:ec2:route-table",
+        }],
+        // See `aws:network:route-table-disrupt-connectivity` for why no permission is recorded.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:network:transit-gateway-disrupt-cross-region-connectivity",
-        description: "Disrupt traffic between the specified transit gateways and the specified \
-                      Region.",
+        description: "Disrupts traffic between a set of transit gateways and another Region.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1223,7 +1371,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:rds:failover-db-cluster",
-        description: "Fail over the specified Amazon Aurora DB clusters.",
+        description: "Fails over a set of Amazon Aurora DB clusters.",
         parameters: &[],
         targets: &[ActionCatalogTarget {
             name: "Clusters",
@@ -1233,7 +1381,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:rds:reboot-db-instances",
-        description: "Reboot the specified Amazon RDS DB instances.",
+        description: "Reboots a set of Amazon RDS DB instances.",
         parameters: &[ActionCatalogParameter {
             name: "forceFailover",
             description: "Whether to force a failover of a Multi-AZ DB instance.",
@@ -1247,7 +1395,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:s3:bucket-pause-replication",
-        description: "Pause replication from the specified S3 buckets.",
+        description: "Pauses replication from a set of S3 buckets.",
         parameters: &[ActionCatalogParameter {
             name: "duration",
             description: "The duration of the action, in ISO 8601 format.",
@@ -1261,7 +1409,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ssm:send-command",
-        description: "Run the specified SSM document on the specified instances.",
+        description: "Runs an SSM document on a set of instances.",
         parameters: &[
             ActionCatalogParameter {
                 name: "documentArn",
@@ -1431,9 +1579,9 @@ impl TargetResourceTypeCatalogEntry {
 /// contract here is invented for a type documented without one.
 ///
 /// The published LISTING is its own catalog, independent of [`ACTION_CATALOG`] in both
-/// directions: it carries types no catalogued action targets (`aws:kinesis:stream` is one),
-/// and a published action can target a type the listing does not carry, which is why what
-/// makes a type TARGETABLE is this table or the action table
+/// directions: a published action can target a type the listing does not carry
+/// (`aws:ec2:route-table` is one), and the listing can carry a type no catalogued action
+/// targets, which is why what makes a type TARGETABLE is this table or the action table
 /// ([`action_catalog_targets_resource_type`]) rather than this table alone.
 ///
 /// ORDER: the order the published listing enumerates the types in, which is the order

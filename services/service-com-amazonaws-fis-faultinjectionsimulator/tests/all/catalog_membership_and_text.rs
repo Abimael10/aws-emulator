@@ -124,20 +124,20 @@ const PUBLISHED_ACTION_TEXT: &[(&str, &str)] = &[
     ),
     (
         "aws:ebs:pause-volume-io",
-        "Pause I/O operations on the specified EBS volumes.",
+        "Pauses IO for a set of EBS volumes",
     ),
     (
         "aws:ecs:task-network-latency",
-        "Add latency to the traffic of the specified Amazon ECS tasks.",
+        "Adds latency and jitter to the network traffic of a set of Amazon ECS tasks.",
     ),
-    ("aws:fis:wait", "Wait for the specified duration."),
+    ("aws:fis:wait", "Waits for the specified duration."),
     (
         "aws:rds:failover-db-cluster",
-        "Fail over the specified Amazon Aurora DB clusters.",
+        "Fails over a set of Amazon Aurora DB clusters.",
     ),
     (
         "aws:s3:bucket-pause-replication",
-        "Pause replication from the specified S3 buckets.",
+        "Pauses replication from a set of S3 buckets.",
     ),
 ];
 

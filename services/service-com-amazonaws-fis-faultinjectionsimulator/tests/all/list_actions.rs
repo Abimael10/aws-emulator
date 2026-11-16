@@ -240,20 +240,26 @@ fn ids(case: &str, listed: &[Value]) -> Vec<String> {
 /// The action ids this suite expects the list to publish, by the reference named in the
 /// module docs.
 ///
-/// They span fourteen AWS services and every family of fault the reference documents:
+/// They span eighteen AWS services and every family of fault the catalog publishes:
 /// instance lifecycle (`aws:ec2:stop-instances`, `aws:ec2:terminate-instances`), API faults
-/// (`aws:ec2:api-error`, the `aws:fis:inject-api-*` family), container faults (the
-/// `aws:ecs:task-*` and `aws:eks:pod-*` families), storage and database faults
-/// (`aws:ebs:pause-volume-io`, `aws:rds:failover-db-cluster`,
-/// `aws:s3:bucket-pause-replication`), networking (`aws:network:*`), zonal recovery
+/// (`aws:ec2:api-error`, the `aws:fis:inject-api-*` and `aws:kinesis:stream-*` families),
+/// container faults (the `aws:ecs:task-*` and `aws:eks:pod-*` families), storage and
+/// database faults (`aws:ebs:pause-volume-io`, `aws:ebs:volume-io-latency`,
+/// `aws:dsql:cluster-connection-failure`, `aws:rds:failover-db-cluster`,
+/// `aws:s3:bucket-pause-replication`), replication
+/// (`aws:memorydb:multi-region-cluster-pause-replication`), networking (`aws:network:*`,
+/// `aws:directconnect:virtual-interface-disconnect`), zonal recovery
 /// (`aws:arc:start-zonal-autoshift`), observability (`aws:cloudwatch:assert-alarm-state`),
 /// orchestration (`aws:ssm:*`) and the parameterised no-op (`aws:fis:wait`).
 fn expected_ids() -> BTreeSet<String> {
     [
         "aws:arc:start-zonal-autoshift",
         "aws:cloudwatch:assert-alarm-state",
+        "aws:directconnect:virtual-interface-disconnect",
+        "aws:dsql:cluster-connection-failure",
         "aws:dynamodb:global-table-pause-replication",
         "aws:ebs:pause-volume-io",
+        "aws:ebs:volume-io-latency",
         "aws:ec2:api-error",
         "aws:ec2:api-insufficient-instance-capacity-error",
         "aws:ec2:asg-insufficient-instance-capacity-error",
@@ -283,11 +289,16 @@ fn expected_ids() -> BTreeSet<String> {
         "aws:fis:inject-api-throttle-error",
         "aws:fis:inject-api-unavailable-error",
         "aws:fis:wait",
+        "aws:kinesis:stream-expired-iterator-exception",
+        "aws:kinesis:stream-provisioned-throughput-exception",
         "aws:lambda:invocation-add-delay",
         "aws:lambda:invocation-error",
         "aws:lambda:invocation-http-integration-response",
+        "aws:memorydb:multi-region-cluster-pause-replication",
         "aws:network:disrupt-connectivity",
+        "aws:network:disrupt-vpc-endpoint",
         "aws:network:route-table-disrupt-connectivity",
+        "aws:network:route-table-disrupt-cross-region-connectivity",
         "aws:network:transit-gateway-disrupt-cross-region-connectivity",
         "aws:rds:failover-db-cluster",
         "aws:rds:reboot-db-instances",
