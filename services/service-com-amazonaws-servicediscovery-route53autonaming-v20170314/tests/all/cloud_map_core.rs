@@ -159,6 +159,56 @@ pub(crate) async fn service(router: &MultiServiceRouter, namespace_id: &str, nam
         .to_string()
 }
 
+/// Every entry a paginated listing serves for one request body, paging it to exhaustion: the
+/// `operation` is the listing to call and `member` the output member holding its page, so one
+/// pager serves every listing this service models instead of one copy per suite.
+///
+/// The `NextToken` each page hands back is fed to the next request, and the walk is bounded
+/// so a listing that failed to terminate is reported rather than looping.
+pub(crate) async fn all_page_entries(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    member: &str,
+    body: Value,
+) -> Vec<Value> {
+    let mut request = body;
+    let mut entries = Vec::new();
+    let mut served = 0usize;
+    loop {
+        let listed = ok(router, operation, request.clone()).await;
+        let page = listed[member]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: {operation} answers a list, got {listed}"))
+            .clone();
+        entries.extend(page);
+        served += 1;
+        assert!(
+            served <= 64,
+            "case {case:?}: paging {operation} must terminate, got {served} pages"
+        );
+        match listed["NextToken"].as_str() {
+            Some(token) => request["NextToken"] = json!(token),
+            None => return entries,
+        }
+    }
+}
+
+/// The resource ids one set of listing entries names, each read from the entry's `Id` member.
+pub(crate) fn entry_ids(case: &str, entries: &[Value]) -> BTreeSet<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            entry["Id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: every entry names its resource, got {entry}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
 /// The `InstanceId`s `DiscoverInstances` answers with for the given request body.
 pub(crate) async fn discovered(router: &MultiServiceRouter, body: Value) -> BTreeSet<String> {
     let found = ok(router, "DiscoverInstances", body).await;

@@ -48,7 +48,14 @@ struct Expected {
 
 /// Create a namespace with `create` and return its id, resolved through the
 /// `CREATE_NAMESPACE` operation the call files.
-async fn create_namespace(router: &MultiServiceRouter, create: &str, body: Value) -> String {
+///
+/// `pub(crate)` so a sibling suite that needs namespaces of every type shares this one
+/// create-then-resolve round trip rather than carrying a copy of it.
+pub(crate) async fn create_namespace(
+    router: &MultiServiceRouter,
+    create: &str,
+    body: Value,
+) -> String {
     let created = ok(router, create, body).await;
     let operation_id = created["OperationId"]
         .as_str()

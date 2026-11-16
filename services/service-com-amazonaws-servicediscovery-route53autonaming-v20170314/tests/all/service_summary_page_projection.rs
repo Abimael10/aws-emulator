@@ -24,33 +24,8 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::cloud_map_core::{dns_namespace, emulator, namespace, ok};
+use super::cloud_map_core::{all_page_entries, dns_namespace, emulator, entry_ids, namespace, ok};
 use super::service_listing::namespace_arn;
-
-/// Every `ServiceSummary` `ListServices` serves for one request body, paging the listing
-/// to exhaustion so a page cut by `MaxResults` is exercised as well as a whole one.
-async fn all_summaries(router: &MultiServiceRouter, case: &str, body: Value) -> Vec<Value> {
-    let mut request = body;
-    let mut summaries = Vec::new();
-    let mut served = 0usize;
-    loop {
-        let listed = ok(router, "ListServices", request.clone()).await;
-        let page = listed["Services"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: ListServices answers a list, got {listed}"))
-            .clone();
-        summaries.extend(page);
-        served += 1;
-        assert!(
-            served <= 64,
-            "case {case:?}: paging must terminate, got {served} pages"
-        );
-        match listed["NextToken"].as_str() {
-            Some(token) => request["NextToken"] = json!(token),
-            None => return summaries,
-        }
-    }
-}
 
 /// Create a service, optionally with a `DnsConfig`, and return its id.
 async fn service_with(
@@ -68,21 +43,6 @@ async fn service_with(
         .as_str()
         .unwrap_or_else(|| panic!("CreateService returns the service it stored, got {created}"))
         .to_string()
-}
-
-/// The service ids one set of summaries names.
-fn summary_ids(case: &str, summaries: &[Value]) -> BTreeSet<String> {
-    summaries
-        .iter()
-        .map(|summary| {
-            summary["Id"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("case {case:?}: every summary names its service, got {summary}")
-                })
-                .to_string()
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -192,10 +152,11 @@ async fn every_listed_summary_reports_the_ownership_and_record_members_of_its_se
             if let Some(max) = max_results {
                 body["MaxResults"] = json!(max);
             }
-            let summaries = all_summaries(&router, &case, body).await;
+            let summaries =
+                all_page_entries(&router, &case, "ListServices", "Services", body).await;
 
             assert_eq!(
-                summary_ids(&case, &summaries),
+                entry_ids(&case, &summaries),
                 listed_services,
                 "case {case:?}: expected the listing to serve {listed_services:?}, got \
                  {summaries:?}"

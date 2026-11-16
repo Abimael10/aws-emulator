@@ -47,6 +47,8 @@ mod list_operations;
 mod namespace_listing;
 #[path = "all/namespace_properties.rs"]
 mod namespace_properties;
+#[path = "all/namespace_summary_page_projection.rs"]
+mod namespace_summary_page_projection;
 #[path = "all/operation_id_form.rs"]
 mod operation_id_form;
 #[path = "all/public_dns_namespace.rs"]
