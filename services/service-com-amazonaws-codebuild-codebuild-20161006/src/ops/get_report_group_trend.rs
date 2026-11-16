@@ -150,9 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// smallest, the largest and the mean of them. A report group this account does not
     /// hold has no trend, so that call is refused with the modelled not-found error.
     ///
-    /// Purely reporting: a report run is minted by a build whose buildspec declares one,
-    /// never by this call, so nothing in the store changes and a later caller sees
-    /// exactly what this one saw.
+    /// Purely reporting about the GROUP: a report run is minted by a build whose buildspec
+    /// declared one, never by this call, so the only write it makes is the run the clock
+    /// already owed a started build — the same settle every reader of a build makes — after
+    /// which a later caller sees exactly what this one saw.
     async fn handle(
         &self,
         input: Self::Input,
@@ -166,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "GetReportGroupTrend (this engine carries no CodeBuild state)",
             ));
         };
-        let _ = ctx;
 
         // `reportGroupArn` is typed `NonEmptyString`, so any non-empty text reaches this
         // handler. A value that is not a report group ARN of this service addresses no
@@ -203,6 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler runs, and the conversion cannot narrow a value a request could send.
         let analysed_at_most =
             usize::try_from(input.num_of_reports.unwrap_or(DEFAULT_NUM_OF_REPORTS)).unwrap_or(0);
+
+        // The runs the clock owes a started build are produced BEFORE this read analyses
+        // anything: a build that declared a report produces that report when its own run
+        // happens, which is owed at its due instant whether or not anybody called, and it is
+        // performed from here because it reaches the account's object store
+        // (`crate::state::build_run::settle_due_builds`).
+        crate::state::settle_due_builds(
+            ctx.callback(),
+            &*self.engine,
+            &state,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .await;
 
         let guard = state.lock();
         // The ARN is the group's whole identity, so a group this account does not hold —

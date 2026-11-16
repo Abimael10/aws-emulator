@@ -33,6 +33,8 @@ mod build_image;
 mod build_log_delivery;
 #[path = "all/build_log_location.rs"]
 mod build_log_location;
+#[path = "all/build_report_ingestion.rs"]
+mod build_report_ingestion;
 #[path = "all/buildspec_execution.rs"]
 mod buildspec_execution;
 #[path = "all/buildspec_file_tree.rs"]

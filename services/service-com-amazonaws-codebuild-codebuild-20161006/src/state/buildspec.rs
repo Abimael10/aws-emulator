@@ -21,7 +21,9 @@
 //! as a successful one does. That transfer is the object store's half of the run and is
 //! performed by [`super::build_run`], which calls [`run_commands`] and then
 //! [`finish_build`] with what the transfer answered: this module decides nothing about
-//! where an artifact went.
+//! where an artifact went. Nor does it decide what the build's `reports` sections came to:
+//! this reading only states which files each of them declared and in what format, and
+//! [`super::build_reports`] reads the runs out of those files.
 //!
 //! The buildspec is YAML, read through the one bounded parse this crate reads a
 //! buildspec with ([`super::batchspec::buildspec_document`]), and its command lines are
@@ -42,6 +44,7 @@ use std::collections::BTreeMap;
 
 use super::batchspec::{buildspec_document, mapping_get, scalar_string, UnreadableBuildspec};
 use super::build_image::{image_files, BUILD_IMAGE_VARIABLE};
+use super::build_reports::ReportDeclaration;
 use super::build_shell::BuildShell;
 use super::runtime_versions::{install_runtimes, RuntimeInstallFailure};
 use super::{finished_phase, open_phase};
@@ -167,6 +170,11 @@ const DISCARD_PATHS_KEY: &str = "discard-paths";
 /// See [`ARTIFACTS_KEY`]: the artifacts "identified by an artifact identifier" each of the
 /// build's secondary destinations takes its files from.
 const SECONDARY_ARTIFACTS_KEY: &str = "secondary-artifacts";
+/// The buildspec's `reports` key, whose sections each declare "the report group name or
+/// ARN" one of the build's reports belongs to.
+const REPORTS_KEY: &str = "reports";
+/// See [`REPORTS_KEY`]: "the format of the report file" a report's declared files are in.
+const FILE_FORMAT_KEY: &str = "file-format";
 /// The buildspec's `cache` key, whose `paths` are "the locations … that CodeBuild uses to
 /// upload and download the cache".
 const CACHE_KEY: &str = "cache";
@@ -207,6 +215,9 @@ pub struct Buildspec {
     /// The `cache/paths` the buildspec declares, which is what a build carries over into
     /// the next build of the same project.
     pub cache_paths: Vec<String>,
+    /// The `reports` sections the buildspec declares, by the report group each one names —
+    /// which is what makes a build mint a report run per group ([`super::build_reports`]).
+    pub reports: BTreeMap<String, ReportDeclaration>,
 }
 
 /// One phase of a buildspec: the `BuildPhaseType` it is reported as, the command lines
@@ -276,6 +287,26 @@ pub fn read_buildspec(buildspec: &str) -> Result<Buildspec, UnreadableBuildspec>
                 read.secondary_artifacts
                     .insert(identifier.to_string(), read_artifacts(declared));
             }
+        }
+    }
+    // Each `reports` section declares WHICH files of the working tree hold that group's
+    // results and the format they are in; which files those are is the same selection an
+    // `artifacts` section declares, so it is read the same way.
+    if let Some(reports) = mapping_get(root, REPORTS_KEY).and_then(::yaml_rust2::Yaml::as_hash) {
+        for (group, declared) in reports {
+            let Some(group) = scalar_string(group) else {
+                continue;
+            };
+            let Some(declared) = declared.as_hash() else {
+                continue;
+            };
+            read.reports.insert(
+                group,
+                ReportDeclaration {
+                    files: read_artifacts(declared),
+                    file_format: mapping_get(declared, FILE_FORMAT_KEY).and_then(scalar_string),
+                },
+            );
         }
     }
     if let Some(cache) = mapping_get(root, CACHE_KEY).and_then(::yaml_rust2::Yaml::as_hash) {

@@ -20,7 +20,7 @@
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
 //! `BatchGetReportGroups`, `BatchGetReports`, `GetReportGroupTrend`, `ListProjects`,
-//! `ListSharedProjects`, `ListReportGroups`,
+//! `ListSharedProjects`, `ListReportGroups`, `ListReportsForReportGroup`,
 //! `ListBuildsForProject`, `ListBuildBatches`, `ListBuildBatchesForProject`,
 //! `ListSandboxes`, `ListSandboxesForProject`,
 //! `ListSourceCredentials`) only read them.
@@ -29,6 +29,10 @@
 //! policy attached to one project or report group, written by
 //! `PutResourcePolicy` and read back by `GetResourcePolicy`, and a project
 //! carrying one is what `ListSharedProjects` reports as shared.
+//!
+//! A [`Report`] is the one record no operation writes: a report run is produced by a BUILD,
+//! when the run the clock owed it has read the result files its buildspec's `reports` section
+//! declared ([`build_reports`]).
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -58,6 +62,9 @@ mod build_cache;
 mod build_image;
 /// WHERE one build's output went: the log group and stream it reports.
 mod build_logs;
+/// The REPORTS a build produces: the report runs its buildspec declared, read from the
+/// result files its own commands wrote.
+mod build_reports;
 /// Running the builds the clock owes a run, where the object store can be reached.
 mod build_run;
 /// The variables a build's environment is given whose value another service holds — a
@@ -95,6 +102,7 @@ pub use batchspec::*;
 pub use build_cache::*;
 pub use build_image::*;
 pub use build_logs::*;
+pub use build_reports::*;
 pub use build_run::*;
 pub use build_secrets::*;
 pub use build_source::*;
@@ -918,11 +926,11 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// so two reports of one group cannot collide. See [`report_arn`] for the form and
     /// [`report_ids_from_arn`] for its inverse.
     ///
-    /// A report is produced by a build whose buildspec declares one, so no operation
-    /// mints a report directly: nothing this emulator runs executes a buildspec, so an
-    /// account holds the reports written here and the report readers answer from them.
-    /// Bounded by the report groups and builds a report belongs to, which carry the
-    /// ceilings ([`MAX_REPORT_GROUPS`], [`MAX_BUILDS`]), so it needs none of its own.
+    /// A report run is produced by a BUILD whose buildspec declares one: the run is minted
+    /// when that build's own commands have written the result files its `reports` section
+    /// declared ([`build_reports`]), so no operation mints a report directly and the report
+    /// readers answer from what the builds of this account produced. Bounded at that growth
+    /// site by [`MAX_REPORTS`].
     pub reports: BTreeMap<String, Report>,
     /// Resource-based policies, keyed by the ARN of the project or report group
     /// each one is attached to.
@@ -2206,12 +2214,14 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         claimed
     }
 
-    /// Record what one claimed run answered ([`StoredBuild::record_run`]), and the instant
-    /// the cache it saved was written at, which is what a later build restores against the
-    /// project's last cache reset.
+    /// Record what one claimed run answered ([`StoredBuild::record_run`]), the report runs it
+    /// produced ([`build_reports::record_build_reports`]), and the instant the cache it saved
+    /// was written at, which is what a later build restores against the project's last cache
+    /// reset.
     pub fn record_build_run(
         &mut self,
         claimed: &build_run::ClaimedRun,
+        region: &str,
         recorded: build_run::RecordedRun,
     ) {
         if let Some(stored) = self.builds.get_mut(&claimed.id) {
@@ -2221,6 +2231,9 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 &recorded.secondary_artifacts,
             );
         }
+        // The reports the build produced go in with it: they are what its own commands
+        // wrote, read in the format its buildspec declared.
+        build_reports::record_build_reports(self, claimed, region, &recorded.reports);
         if let Some(saved) = recorded.cache_saved_millis {
             if let Some(project) = self.projects.get_mut(&claimed.project_name) {
                 project.cache_saved_millis = Some(saved);

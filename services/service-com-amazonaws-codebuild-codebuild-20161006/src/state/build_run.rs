@@ -23,7 +23,9 @@
 //!    build environment carries ([`super::build_tools`]), whose calls those commands really
 //!    make;
 //! 4. what the commands produced is put where the build's artifacts say
-//!    ([`super::artifact_upload`]), and the declared cache paths are saved;
+//!    ([`super::artifact_upload`]), the report runs its `reports` sections declared are read
+//!    from the result files those commands wrote ([`super::build_reports`]), and the declared
+//!    cache paths are saved;
 //! 5. the build records what every step answered ([`super::finish_build`]).
 //!
 //! # Why a reporting operation drives it
@@ -94,7 +96,7 @@ pub async fn settle_due_builds<Eng: Send + Sync + 'static>(
     let claimed = state.lock().claim_due_build_runs(now_millis());
     for run in claimed {
         let recorded = perform(callback, engine, region, &run).await;
-        state.lock().record_build_run(&run, recorded);
+        state.lock().record_build_run(&run, region, recorded);
     }
 }
 
@@ -112,6 +114,9 @@ pub struct RecordedRun {
     pub secondary_artifacts: Vec<(String, BuildArtifacts)>,
     /// The instant this build's cache was saved at — `None` when it saved none.
     pub cache_saved_millis: Option<i64>,
+    /// The report runs this build produced, one per report group its buildspec declared —
+    /// empty for a build that declared none, or one that never ran its commands.
+    pub reports: Vec<super::ReportRun>,
 }
 
 /// What the provisioning phase reports for a build whose command session could not be
@@ -277,6 +282,9 @@ async fn perform<Eng: Send + Sync + 'static>(
                 artifacts: None,
                 secondary_artifacts: Vec::new(),
                 cache_saved_millis: None,
+                // Nothing of this build ran, so it produced no result file to read a report
+                // run from.
+                reports: Vec::new(),
             };
         }
     }
@@ -321,6 +329,7 @@ async fn perform<Eng: Send + Sync + 'static>(
                 artifacts: None,
                 secondary_artifacts: Vec::new(),
                 cache_saved_millis: None,
+                reports: Vec::new(),
             };
         }
     };
@@ -332,6 +341,15 @@ async fn perform<Eng: Send + Sync + 'static>(
     records.extend(agent_lines(&run.phases));
     deliver_log(callback, region, &claimed.build, &records).await;
 
+    // The report runs the buildspec declared are read from the result files the commands
+    // wrote, which is part of the build's own finishing work: a build a phase failure ABORTED
+    // does that work too, so a test report is produced for the build whose tests failed it
+    // exactly as for one that passed. A build that never got a specification declared no
+    // report at all.
+    let reports = run.spec.as_ref().map_or_else(Vec::new, |spec| {
+        super::report_runs(&spec.reports, &run.produced)
+    });
+
     // Nothing is put anywhere for a build that never reached its own finishing work.
     if !run.reached_output {
         return RecordedRun {
@@ -339,6 +357,7 @@ async fn perform<Eng: Send + Sync + 'static>(
             artifacts: None,
             secondary_artifacts: Vec::new(),
             cache_saved_millis: None,
+            reports,
         };
     }
     let spec = run.spec.clone();
@@ -425,5 +444,6 @@ async fn perform<Eng: Send + Sync + 'static>(
         artifacts: uploaded,
         secondary_artifacts,
         cache_saved_millis: cached.then_some(claimed.due_millis),
+        reports,
     }
 }

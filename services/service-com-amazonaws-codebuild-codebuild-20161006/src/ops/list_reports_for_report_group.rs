@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReportsForReportGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReportsForReportGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReportsForReportGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the ARNs of the report runs one report group holds: this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,23 +144,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_REPORTS_FOR_REPORT_GROUP_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the ARNs of the report group's runs, newest first unless the request asks for
+    /// the other order, one page at a time.
+    ///
+    /// A report run is minted by a BUILD whose buildspec declared it, so the runs the clock
+    /// owes are produced before this read reports anything — the same settle every reader of
+    /// a build makes, and the only write this read performs. A report group this account
+    /// does not hold has no runs to list, so the call is refused with the modelled not-found
+    /// error rather than answered with an empty page.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReportsForReportGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReportsForReportGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReportsForReportGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListReportsForReportGroup (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        // The ARN's own FIELDS are read first, and in order, exactly as
+        // `crate::ops::get_report_group_trend` reads them: a region field that cannot be a
+        // Region is the first one at fault, so it is what the refusal names, and the
+        // resource behind it is never read.
+        if let Some(message) = crate::state::arn_region_violation(&input.report_group_arn) {
+            return Err(ListReportsForReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // `reportGroupArn` targets a plain `String`, so any text reaches this handler. A
+        // value that is not a report group ARN of this service addresses no report group at
+        // all — there is no account, region or store in which it could name one — so the
+        // call is refused with the operation's own input error rather than reported as a
+        // group that merely is not held, which is what the not-found error below means.
+        if crate::state::report_group_name_from_arn(&input.report_group_arn).is_none() {
+            return Err(ListReportsForReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_REPORT_GROUP_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The runs the clock owes are produced BEFORE this read reports anything: a build
+        // reads its source and writes its output through the account's object store, so it
+        // is run from here, where that store can be reached
+        // (`crate::state::build_run::settle_due_builds`).
+        crate::state::settle_due_builds(
+            ctx.callback(),
+            &*self.engine,
+            &state,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .await;
+
+        let guard = state.lock();
+        // The ARN is the group's whole identity, so a group this account does not hold —
+        // including one an ARN of another partition, region, account or resource type names
+        // — has no runs to report.
+        if guard.report_group_by_arn(&input.report_group_arn).is_none() {
+            drop(guard);
+            return Err(
+                ListReportsForReportGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The sentence a reporting read of a report group's contents states,
+                        // which quotes the ARN it was asked about — the same refusal
+                        // `GetReportGroupTrend` states for the same question.
+                        message: Some(crate::state::provided_report_group_absent_message(
+                            &input.report_group_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "A ReportFilter object used to filter the returned reports": a request that filters
+        // on a status lists only the runs that are in it.
+        let status_asked_about = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.status.as_deref());
+        // The group's runs, newest first — the order `Report$created` ("the date and time
+        // this report run occurred") puts them in. `sortOrder` is "whether the results are
+        // returned in ascending or descending order" of that same instant, and the model
+        // documents no default: this service's other listings read anything but an explicit
+        // `ASCENDING` as descending (`crate::ops::list_builds`), so a request stating no
+        // order reads the most recent run first.
+        let mut arns: Vec<String> = guard
+            .reports_of_report_group(&input.report_group_arn)
+            .into_iter()
+            .filter(|report| {
+                status_asked_about.is_none_or(|status| report.status.as_deref() == Some(status))
+            })
+            .filter_map(|report| report.arn.clone())
+            .collect();
+        // Dropped before the page is cut: nothing below reads the store.
+        drop(guard);
+        if input.sort_order.as_deref() == Some(SORT_ORDER_ASCENDING) {
+            arns.reverse();
+        }
+
+        let Some((page, next_token)) =
+            crate::state::page_limited(&arns, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListReportsForReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListReportsForReportGroupOutput {
+            // Always serialized, `[]` when the group holds no run: the `@length(min: 1)` on
+            // `ReportArns` bounds what a list may carry rather than whether the answer
+            // states its result, and a paginator must read a list either way.
+            reports: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The `SortOrderType` value that lists a report group's runs oldest first; the other,
+/// `DESCENDING`, is the order the runs already come out in.
+const SORT_ORDER_ASCENDING: &str = "ASCENDING";
+

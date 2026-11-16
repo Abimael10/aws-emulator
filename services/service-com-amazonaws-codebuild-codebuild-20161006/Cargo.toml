@@ -82,6 +82,12 @@ aws-sdk-ecr = { version = "1", default-features = false }
 # codecs, both pure Rust.
 tar = "0.4"
 flate2 = "1"
+# `roxmltree`: the test-result and code-coverage files a build's `reports` sections declare
+# are XML documents the build's own commands wrote (JUnit, NUnit, TestNG, Visual Studio,
+# JaCoCo, Cobertura, Clover), and roxmltree is the pure-Rust, read-only XML reader this
+# workspace already reads caller-supplied XML with. A DATA-FORMAT PARSER, not an execution
+# substrate: no `unsafe`, no C and no build script, and it resolves no external entity.
+roxmltree = "0.20"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

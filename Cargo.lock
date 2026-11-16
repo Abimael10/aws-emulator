@@ -11797,6 +11797,7 @@ dependencies = [
  "hex",
  "http",
  "md-5 0.10.6",
+ "roxmltree",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
