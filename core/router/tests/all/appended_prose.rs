@@ -30,5 +30,10 @@
 //! duplicate was left at that one place, and the prose was dropped, for the same reason as the
 //! four runs before it.
 //!
+//! A SIXTH run had grown back below that root's last declaration while this repair was under
+//! review, again carrying a second declaration of a suite the sorted list already declared.
+//! That stranded pair was dropped with the prose around it, the sorted one left where it is,
+//! for the same reason as the five runs before it.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

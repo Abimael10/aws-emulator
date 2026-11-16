@@ -8,5 +8,14 @@
 //! suite of this target. They said nothing that root's header does not, and the guard suites
 //! beside this one check the rules they restated, so they are gone rather than kept.
 //!
+//! A later run of the same copies had grown INSIDE that root's header, above its first item,
+//! where no guard suite looks: seven re-typed or truncated repetitions of its opening
+//! paragraphs, each restating a rule the suites beside this one already check. The header was
+//! reduced to one copy of each paragraph and they are gone rather than kept, for the same
+//! reason as the run before them.
+//!
+//! A second such run grew back inside that header while the first repair was being reviewed,
+//! and was reduced the same way.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

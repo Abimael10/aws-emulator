@@ -63,6 +63,8 @@ mod effective_lifecycle_policy;
 mod encryption_indexes_and_tagging;
 #[path = "all/encryption_policy_precondition.rs"]
 mod encryption_policy_precondition;
+#[path = "all/endpoint_policy_order.rs"]
+mod endpoint_policy_order;
 #[path = "all/index_create_retry_precedence.rs"]
 mod index_create_retry_precedence;
 #[path = "all/index_delete.rs"]

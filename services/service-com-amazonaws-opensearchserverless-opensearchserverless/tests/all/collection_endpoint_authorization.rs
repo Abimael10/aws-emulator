@@ -47,7 +47,7 @@ const SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 /// and an access key through IAM's own API and signs the data-plane request with it, which
 /// is what makes the principal the data plane resolves a record `iam:CreateAccessKey`
 /// really wrote.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -123,7 +123,7 @@ fn xml_text(xml: &str, tag: &str) -> String {
 
 /// An IAM user and a long-term access key of its own: the principal a data access policy
 /// names, and the access key id a request of that principal signs with.
-async fn iam_user(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn iam_user(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let (status, created) = iam(router, "CreateUser", &[("UserName", name)]).await;
     assert_eq!(status, 200, "case CreateUser({name}): got {status} {created}");
     let arn = xml_text(&created, "Arn");
@@ -141,7 +141,7 @@ async fn iam_user(router: &MultiServiceRouter, name: &str) -> (String, String) {
 }
 
 /// Create a security policy of `kind`, asserting it was accepted.
-async fn create_security_policy(
+pub(crate) async fn create_security_policy(
     router: &MultiServiceRouter,
     kind: &str,
     name: &str,
@@ -160,7 +160,7 @@ async fn create_security_policy(
 }
 
 /// Create a `data` access policy, asserting it was accepted.
-async fn create_access_policy(router: &MultiServiceRouter, name: &str, policy: &Value) {
+pub(crate) async fn create_access_policy(router: &MultiServiceRouter, name: &str, policy: &Value) {
     let (status, code, answer) = call(
         router,
         "CreateAccessPolicy",
@@ -175,7 +175,7 @@ async fn create_access_policy(router: &MultiServiceRouter, name: &str, policy: &
 
 /// A `network` security policy document naming `resources`, with public access — the shape
 /// AWS's "Network access for Amazon OpenSearch Serverless" documents.
-fn network_policy(resources: &[&str]) -> Value {
+pub(crate) fn network_policy(resources: &[&str]) -> Value {
     json!({
         "Rules": [{ "ResourceType": "collection", "Resource": resources }],
         "AllowFromPublic": true,
@@ -185,7 +185,7 @@ fn network_policy(resources: &[&str]) -> Value {
 /// A `data` access policy document granting `permissions` on `resources` of `resource_type`
 /// to `principals` — the shape AWS's "Data access control for Amazon OpenSearch Serverless"
 /// documents.
-fn data_policy(
+pub(crate) fn data_policy(
     resource_type: &str,
     resources: &[&str],
     permissions: &[&str],
@@ -202,7 +202,7 @@ fn data_policy(
 }
 
 /// Create a collection and poll until it reports ACTIVE, answering its `CollectionDetail`.
-async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
+pub(crate) async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, code, created) = call(
         router,
         "CreateCollection",
@@ -234,7 +234,7 @@ async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
 }
 
 /// The host a published endpoint names, which is what a client of it sends as `Host`.
-fn endpoint_host(detail: &Value) -> String {
+pub(crate) fn endpoint_host(detail: &Value) -> String {
     let endpoint = text(detail, "collectionEndpoint");
     let after_scheme = endpoint.strip_prefix("https://").unwrap_or(&endpoint);
     after_scheme
@@ -247,7 +247,7 @@ fn endpoint_host(detail: &Value) -> String {
 /// One OpenSearch REST request to a collection endpoint, as `opensearch-py` sends it:
 /// addressed to the published host, signed for the `aoss` signing name presenting `akid`,
 /// and carrying NO `x-amz-target`, because the REST API has no RPC target.
-async fn rest(
+pub(crate) async fn rest(
     router: &MultiServiceRouter,
     host: &str,
     akid: &str,
@@ -279,7 +279,7 @@ async fn rest(
 
 /// A `knn_vector` index body of `dimension` values — the body the recorded `indices.create`
 /// of a knowledge base's vector index carries.
-fn knn_index_body(dimension: usize) -> Value {
+pub(crate) fn knn_index_body(dimension: usize) -> Value {
     json!({
         "settings": { "index": { "knn": true } },
         "mappings": {
@@ -292,7 +292,7 @@ fn knn_index_body(dimension: usize) -> Value {
 
 /// The access key id a request of the account's own published credential presents: one no
 /// IAM record names, which is the position an account root credential is in.
-const AMBIENT_ACCESS_KEY_ID: &str = "AKIDAMBIENT";
+pub(crate) const AMBIENT_ACCESS_KEY_ID: &str = "AKIDAMBIENT";
 
 /// RULE: a collection's endpoints are reachable only through a `network` security policy
 /// whose rules name that collection; a request to a collection no such policy covers is
