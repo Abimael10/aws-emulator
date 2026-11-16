@@ -17,14 +17,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::ops::types::REGISTRY_ALIAS_STATUS_VALUES;
-// The universal prefix every ECR Public registry URI carries (`Registry$registryUri`: "a
-// universal prefix and the registry alias") and the status the registry's alias carries:
-// one source for each, shared with the handler rather than restated here.
-use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
-    GALLERY_HOST, REGISTRY_ALIAS_STATUS_ACTIVE,
-};
+// The status the registry's alias carries: one source, shared with the handler rather than
+// restated here.
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::REGISTRY_ALIAS_STATUS_ACTIVE;
 
-use crate::repository_image_lifecycle::{ok, refused, service, text, ARN_PREFIX, REGISTRY_ID};
+use crate::repository_image_lifecycle::{
+    announced_endpoint, ok, refused, service, text, ARN_PREFIX, REGISTRY_ID,
+};
 
 #[test]
 fn the_alias_status_this_service_reports_is_one_the_model_declares() {
@@ -195,13 +194,15 @@ fn assert_registry_record(record: &Value, case: &str) -> String {
         panic!("case {case:?}: expected a primary alias, the one shown in a pull URL, {record}")
     });
 
-    // `registryUri` is the universal prefix plus the alias shown in a `docker pull`
-    // command — the primary alias — and carries neither a region nor an account.
+    // `registryUri` is the prefix a client prepends to a repository name and points a
+    // login at, so it is an ADDRESS: the endpoint this emulator serves the registry at,
+    // scoped by the alias shown in a `docker pull` command — the primary alias — and
+    // carrying neither a region nor an account.
     let registry_uri = text(record, &["registryUri"], case);
     assert_eq!(
         registry_uri,
-        format!("{GALLERY_HOST}/{primary}"),
-        "case {case:?}: expected the gallery host scoped by the primary alias, \
+        format!("{}/{primary}", announced_endpoint()),
+        "case {case:?}: expected the served endpoint scoped by the primary alias, \
          got {registry_uri:?}"
     );
 

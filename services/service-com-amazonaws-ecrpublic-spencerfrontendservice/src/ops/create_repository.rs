@@ -3,9 +3,10 @@
 //! @op CreateRepository
 //!
 //! Inserts a repository into the public registry held in [`crate::state`] and reports
-//! what was inserted. The ARN, the URI and `createdAt` are all stored, so the
-//! `Repository` a later `DescribeRepositories` reports is the same object, not a
-//! recomputed one.
+//! what was inserted. The ARN and `createdAt` are stored, so the `Repository` a later
+//! `DescribeRepositories` reports is the same object, not a recomputed one; its URI is an
+//! address rather than a label, so it is published on the endpoint the answer is served at
+//! ([`crate::state::registry_address`]).
 //!
 //! ## Shape of an operation
 //!
@@ -259,7 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.repository_name.clone(),
             arn: store.repository_arn(&input.repository_name),
             registry_id: store.registry_id.clone(),
-            uri: store.repository_uri(&input.repository_name),
             // The tier the repository is hosted in. This operation takes no tier member —
             // a repository is created in a registry, and the registry decides the tier —
             // so a repository of this registry carries the tier that registry hosts
@@ -281,8 +281,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what `crate::service` serves at the `logoUrl` that record carries.
             logo: record.logo,
         };
+        // The repository's URI is the one ADDRESS in the answer, so it is published on the
+        // endpoint this caller reached the emulator at rather than stored with the record:
+        // a client that pushes to the URI it was handed has to arrive back here.
+        let registry_uri = store.registry_uri(&crate::state::announced_gallery_endpoint(ctx));
         let output = CreateRepositoryOutput {
-            repository: Some(repository.as_repository()),
+            repository: Some(repository.as_repository(&registry_uri)),
             catalog_data: Some(repository.catalog_data.clone()),
         };
         store

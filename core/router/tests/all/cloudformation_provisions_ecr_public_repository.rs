@@ -422,6 +422,24 @@ fn a_cloudformation_stack_creates_and_deletes_the_ecr_public_repositories_it_dec
                 serde_json::json!(["ARM 64"]),
                 "expected the template's Architectures on the repository, got {catalog}"
             );
+            // The provisioned repository's own pullable URI is the registry's URI followed by
+            // the repository's name — an ADDRESS, so it is read from the registry this read
+            // was answered by rather than written out as a host here.
+            let (_, registries) = ecr_public(
+                &router,
+                &runtime,
+                "DescribeRegistries",
+                serde_json::json!({}),
+            );
+            let registry_uri = registries["registries"][0]["registryUri"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                !registry_uri.is_empty() && !registry_uri.starts_with("public.ecr.aws"),
+                "expected a registry URI on an address this emulator answers on, got \
+                 {registries}"
+            );
             let (_, tags) = ecr_public(
                 &router,
                 &runtime,
@@ -430,7 +448,7 @@ fn a_cloudformation_stack_creates_and_deletes_the_ecr_public_repositories_it_dec
             );
             assert_eq!(
                 tags["repositories"][0]["repositoryUri"].as_str(),
-                Some("public.ecr.aws/emulator/cfn-catalog-repo"),
+                Some(format!("{registry_uri}/cfn-catalog-repo").as_str()),
                 "expected the provisioned repository's own pullable URI, got {tags}"
             );
 

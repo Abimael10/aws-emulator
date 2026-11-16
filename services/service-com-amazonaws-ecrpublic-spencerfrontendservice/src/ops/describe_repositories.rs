@@ -217,11 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Absent `repositoryNames` means every repository; present, it means exactly the
         // named subset, and a name that is not stored is not found. Either way the walk
         // is in `repositoryName` order, which is what makes the page token resumable.
+        // Every reported repository is published under the registry URI this caller reached
+        // the emulator at: the URI is the push/pull ADDRESS, so a client that enumerates
+        // repositories and then pulls from each one reaches this registry.
+        let registry_uri = store.registry_uri(&crate::state::announced_gallery_endpoint(ctx));
         let selected: Vec<(String, Repository)> = match input.repository_names.as_ref() {
             None => store
                 .repositories
                 .iter()
-                .map(|(name, repository)| (name.clone(), repository.as_repository()))
+                .map(|(name, repository)| (name.clone(), repository.as_repository(&registry_uri)))
                 .collect(),
             Some(names) => {
                 let mut selected = ::std::collections::BTreeMap::new();
@@ -240,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .into(),
                         );
                     };
-                    selected.insert(name.clone(), repository.as_repository());
+                    selected.insert(name.clone(), repository.as_repository(&registry_uri));
                 }
                 selected.into_iter().collect()
             }

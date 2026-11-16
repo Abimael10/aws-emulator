@@ -4,13 +4,20 @@
 //! holds the images.
 //!
 //! A compute service starting a container has to FETCH the image its definition names, and a
-//! reference whose host is the public gallery ([`GALLERY_HOST`]) addresses THIS registry:
+//! reference whose host addresses this gallery addresses THIS registry:
 //! `Repository$repositoryUri` is "the URI for the repository", built from "a universal prefix
 //! and the registry alias" followed by the repository name, and a container runtime appends
 //! the tag or the digest it wants to that URI. So the reference reads as `<alias>`,
 //! `<repository>` and either a tag or a digest ([`parse_gallery_reference`]), and whether the
 //! gallery serves it is decided HERE, against the repositories and tags this registry holds,
 //! rather than by whoever is starting the container.
+//!
+//! TWO hosts address this gallery, and both have to be read, because a client composes a
+//! reference on whichever of them it was given: the host AWS serves the public gallery at
+//! ([`GALLERY_HOST`]), which is what a reference written by hand names, and an address this
+//! emulator itself answers on ([`registry_address::names_this_emulator`]), which is what a
+//! `repositoryUri` this registry PUBLISHED carries — so the reference a client builds from the
+//! URI the API handed it resolves to the very repository that URI names.
 //!
 //! Only this registry's own alias is answered: an alias this registry was not assigned names
 //! some other public registry ([`ComAmazonawsEcrpublicSpencerfrontendserviceState::is_this_registry`]
@@ -62,13 +69,14 @@ const DIGEST_SEPARATOR: &str = "@";
 /// reference — one in a private registry, in another registry altogether, or a bare name a
 /// container runtime resolves against some other public registry.
 ///
-/// The form is the `repositoryUri` this registry publishes with a tag or a digest appended:
-/// `public.ecr.aws/<registry alias>/<repository>[:<tag>|@<digest>]`. A reference naming no tag
-/// and no digest asks for [`DEFAULT_IMAGE_TAG`].
+/// The form is a `repositoryUri` of this registry with a tag or a digest appended:
+/// `<gallery host>/<registry alias>/<repository>[:<tag>|@<digest>]`, where the host is either
+/// the one AWS publishes the gallery at or an address this emulator answers on (see the module
+/// docs). A reference naming no tag and no digest asks for [`DEFAULT_IMAGE_TAG`].
 #[must_use]
 pub fn parse_gallery_reference(image: &str) -> Option<GalleryReference> {
     let (host, rest) = image.trim().split_once('/')?;
-    if !host.eq_ignore_ascii_case(GALLERY_HOST) {
+    if !addresses_this_gallery(host) {
         return None;
     }
     let (registry_alias, path) = rest.split_once('/')?;
@@ -100,6 +108,15 @@ pub fn parse_gallery_reference(image: &str) -> Option<GalleryReference> {
         image_tag: Some(image_tag),
         image_digest: None,
     })
+}
+
+/// Whether the host of a container reference addresses THIS gallery: the host AWS publishes
+/// the public gallery at, or an address this emulator answers on (see the module docs).
+///
+/// A host name carries whatever case the writer used, so the gallery host is compared without
+/// regard to it.
+fn addresses_this_gallery(host: &str) -> bool {
+    host.eq_ignore_ascii_case(GALLERY_HOST) || registry_address::names_this_emulator(host)
 }
 
 /// Why this gallery did not serve a pull.
@@ -177,14 +194,29 @@ mod tests {
         }
     }
 
-    /// RULE: a reference is read as this gallery's only when its host is the gallery host,
-    /// and the alias, repository and tag or digest are read out of the reference itself.
+    /// RULE: a reference is read as this gallery's only when its host addresses this gallery —
+    /// the host AWS publishes it at, or an address this emulator answers on — and the alias,
+    /// repository and tag or digest are read out of the reference itself.
     #[test]
     fn a_gallery_reference_is_read_out_of_the_path() {
         let rows = [
             Row {
                 image: "public.ecr.aws/alias/app:1.2",
                 expected: Some(names("alias", "app", Some("1.2"), None)),
+            },
+            Row {
+                // The address a `repositoryUri` this registry published carries: a client that
+                // appends a tag to the URI it was handed names this registry by it.
+                image: "127.0.0.1:9297/alias/app:1.2",
+                expected: Some(names("alias", "app", Some("1.2"), None)),
+            },
+            Row {
+                image: "emulator.invalid/alias/team/app@sha256:abc",
+                expected: Some(names("alias", "team/app", None, Some("sha256:abc"))),
+            },
+            Row {
+                image: "localhost:39355/alias/app",
+                expected: Some(names("alias", "app", Some(DEFAULT_IMAGE_TAG), None)),
             },
             Row {
                 // A reference naming no tag asks for the tag a container runtime appends.
@@ -211,6 +243,12 @@ mod tests {
             },
             Row {
                 image: "quay.io/alias/app:1",
+                expected: None,
+            },
+            Row {
+                // A registry an operator runs on a routable address of their own is no
+                // gallery of this emulator's.
+                image: "10.1.2.3:5000/alias/app:1",
                 expected: None,
             },
             Row {

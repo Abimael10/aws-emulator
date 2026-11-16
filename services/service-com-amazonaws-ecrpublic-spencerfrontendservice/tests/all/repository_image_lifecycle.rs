@@ -17,7 +17,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::API_REGION;
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
+    API_REGION, DEFAULT_REGISTRY_ALIAS,
+};
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -31,9 +33,22 @@ pub(crate) const REGISTRY_ID: &str = "000000000000";
 /// The ARN prefix of every repository in this partition-wide (region-less) registry.
 pub(crate) const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
 
-/// The universal gallery prefix plus this registry's alias: the leading segments of
-/// every `repositoryUri`.
-const URI_PREFIX: &str = "public.ecr.aws/emulator/";
+/// The `host[:port]` this emulator is SERVED at, which is what every URI this registry
+/// publishes is built on: a repository's and the registry's own URI are the addresses a
+/// container client dials, so they name the endpoint the emulator answers on rather than
+/// the real gallery host. No call in this target arrives on a socket, so that endpoint is
+/// the authority of the unserved base (`smithy_server_runtime::UNSERVED_URL_BASE`).
+pub(crate) fn announced_endpoint() -> &'static str {
+    let base = smithy_server_runtime::UNSERVED_URL_BASE;
+    base.split_once("://").map_or(base, |(_scheme, authority)| authority)
+}
+
+/// The leading segments of every `repositoryUri`: the endpoint this emulator is served at
+/// and this registry's alias (`state::DEFAULT_REGISTRY_ALIAS`), which is the registry's own
+/// URI with the trailing separator.
+pub(crate) fn uri_prefix() -> String {
+    format!("{}/{DEFAULT_REGISTRY_ALIAS}/", announced_endpoint())
+}
 
 /// A router with just this service mounted on a fresh engine.
 ///
@@ -223,8 +238,8 @@ async fn create_repository_inserts_a_repository_every_valid_name_form_can_be_rea
         );
         assert_eq!(
             uri,
-            format!("{URI_PREFIX}{name}"),
-            "case {case:?}: expected the repository URI to be gallery-host/alias/name, \
+            format!("{}{name}", uri_prefix()),
+            "case {case:?}: expected the repository URI to be served-endpoint/alias/name, \
              got {uri:?}"
         );
         assert_eq!(

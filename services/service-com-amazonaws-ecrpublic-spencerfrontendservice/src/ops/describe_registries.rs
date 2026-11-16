@@ -184,7 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // registry resumes after it and yields an empty page with no further token.
         let (registry_id, registry) = {
             let store = state.lock();
-            (store.registry_id.clone(), registry_of(&store))
+            (
+                store.registry_id.clone(),
+                registry_of(&store, &crate::state::announced_gallery_endpoint(ctx)),
+            )
         };
 
         // The registry id is the only key a page of this listing can end on, so a token
@@ -209,7 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This registry as the modelled `Registry` shape.
+/// This registry as the modelled `Registry` shape, published on the endpoint this answer
+/// is served at (`gallery_endpoint`).
 ///
 /// `verified` is "whether the account is a verified Amazon Web Services Marketplace
 /// vendor" (`Registry$verified`) — a standing outside this API, which no operation of
@@ -218,11 +222,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `repositoryUri`, so it is both the primary and the default alias
 /// (`RegistryAlias$primaryRegistryAlias` is "displayed in … the repository URL",
 /// `RegistryAlias$defaultRegistryAlias` is the one assigned to the registry itself).
-fn registry_of(store: &crate::state::ComAmazonawsEcrpublicSpencerfrontendserviceState) -> Registry {
+///
+/// `registryUri` is the registry-wide prefix a client prepends to a repository name and
+/// points a login at, so it is an ADDRESS: it names the endpoint this emulator serves the
+/// registry at, scoped by that alias (`crate::state::registry_address`).
+fn registry_of(
+    store: &crate::state::ComAmazonawsEcrpublicSpencerfrontendserviceState,
+    gallery_endpoint: &str,
+) -> Registry {
     Registry {
         registry_id: store.registry_id.clone(),
         registry_arn: store.registry_arn(),
-        registry_uri: store.registry_uri(),
+        registry_uri: store.registry_uri(gallery_endpoint),
         verified: false,
         aliases: vec![RegistryAlias {
             name: store.registry_alias.clone(),

@@ -216,10 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The echoed repository carries the same URI a create or a read of it reports: the
+        // registry URI this caller reached the emulator at, followed by the name.
+        let registry_uri = store.registry_uri(&crate::state::announced_gallery_endpoint(ctx));
         let removed = store
             .repositories
             .remove(&input.repository_name)
-            .map(|repository| repository.as_repository());
+            .map(|repository| repository.as_repository(&registry_uri));
         drop(store);
 
         Ok(DeleteRepositoryOutput {

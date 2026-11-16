@@ -47,6 +47,8 @@ mod logo_blob_constraints;
 mod pagination_filter_exclusion;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/published_gallery_address.rs"]
+mod published_gallery_address;
 #[path = "all/put_image_layer_resolution.rs"]
 mod put_image_layer_resolution;
 #[path = "all/region_gate.rs"]
