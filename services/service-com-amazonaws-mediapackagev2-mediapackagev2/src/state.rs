@@ -1613,9 +1613,18 @@ impl HarvestJobRecord {
 
     /// Whether this job has reached a status it can no longer leave.
     pub fn is_terminal(&self) -> bool {
-        self.status == HARVEST_JOB_CANCELLED
-            || self.status == HARVEST_JOB_FAILED
-            || self.status == HARVEST_JOB_COMPLETED
+        self.status == HARVEST_JOB_CANCELLED || self.work_has_ended()
+    }
+
+    /// Whether this job's WORK has ended — a status cancelling cannot reach, because the
+    /// harvest itself decided it rather than a caller
+    /// ([`HARVEST_JOB_COMPLETED`], [`HARVEST_JOB_FAILED`]).
+    ///
+    /// The narrower half of [`HarvestJobRecord::is_terminal`], which also holds for the
+    /// status a cancellation PRODUCES: a rule about what a cancellation may still do asks
+    /// this one, so the state a cancellation writes never makes cancelling refuse itself.
+    pub fn work_has_ended(&self) -> bool {
+        self.status == HARVEST_JOB_FAILED || self.status == HARVEST_JOB_COMPLETED
     }
 
     /// When the clock owes this job its exit from `IN_PROGRESS`.

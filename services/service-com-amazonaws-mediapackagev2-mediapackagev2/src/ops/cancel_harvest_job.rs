@@ -243,12 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cancelled is the SAME request as the one that cancelled it, so the job is
         // already in the status the call asks for and the answer is the success the first
         // call gave — nothing is committed, so neither the entity tag nor `ModifiedAt`
-        // moves. Only a status cancelling cannot REACH is a refusal, which is the next
-        // rule.
-        if job.status == crate::state::HARVEST_JOB_CANCELLED {
-            return Ok(CancelHarvestJobOutput {});
-        }
-        if job.is_terminal() {
+        // moves. Only a job whose WORK has ended is a refusal: those are the statuses
+        // cancelling cannot reach, which is why this gate asks the narrow predicate
+        // (`work_has_ended`) rather than the shared terminal one — the latter also holds
+        // for the status this very operation writes.
+        if job.work_has_ended() {
             return Err(CancelHarvestJobErrorModeled::ValidationException(
                 crate::state::validation_failed(
                     "harvestJobName",
@@ -257,6 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
+        }
+        if job.status == crate::state::HARVEST_JOB_CANCELLED {
+            return Ok(CancelHarvestJobOutput {});
         }
 
         job.status = crate::state::HARVEST_JOB_CANCELLED.to_string();
