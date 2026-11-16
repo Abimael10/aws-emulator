@@ -12,9 +12,9 @@
 //! directories, so a well-formed id no directory of the account holds is reported as an
 //! INVALID VALUE of that filter — `EntityDoesNotExistException`, HTTP 400, whose `Message`
 //! names the ids the filter could not resolve, unquoted, under the plural spelling of the
-//! member they arrived in, separated the way AWS separates the values of one member it
-//! quotes back, and closing with the call's own request id. It is not the sentence an
-//! operation whose SUBJECT is one directory states for the same id.
+//! member they arrived in, separated by a bare comma, and closing with the call's own
+//! request id. It is not the sentence an operation whose SUBJECT is one directory states
+//! for the same id.
 //!
 //! It is asserted over a TABLE spanning what the report varies along — how many ids the
 //! filter could not resolve (one, two, three), where they sit among resolvable ones, and a
@@ -114,7 +114,7 @@ async fn an_unresolvable_filter_reports_its_own_values() {
             message,
             format!(
                 "Invalid directory ID(s): {ids}.{REQUEST_ID_SEPARATOR}{request_id}",
-                ids = named.join(", ")
+                ids = named.join(",")
             ),
             "case {case:?}: expected the invalid-value sentence naming the filter's own \
              unresolved ids, got {message:?}"

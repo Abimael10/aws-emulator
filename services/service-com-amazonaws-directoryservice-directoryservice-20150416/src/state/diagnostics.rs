@@ -50,16 +50,21 @@ pub fn empty_filter_list(member: &str, element: &str) -> String {
 
 /// The same report for an operation whose filter is a LIST of directory ids
 /// (`DescribeDirectories$DirectoryIds`): every id the store could not resolve, in the
-/// order the filter is scanned, separated the way AWS separates the values of one member
-/// it quotes back — a comma and a space — under the plural spelling of the member the ids
-/// arrived in. [`refusal`] appends the request id, once.
+/// order the filter is scanned, under the plural spelling of the member the ids arrived
+/// in. [`refusal`] appends the request id, once.
+///
+/// The ids are rendered as one value list, separated by a BARE comma and nothing else, so
+/// splitting the list on that comma gives back exactly the ids the request sent — a
+/// separator carrying a space would hand every id after the first back with a leading
+/// space it was not sent with. The single-id form is the same sentence with no separator
+/// in it.
 ///
 /// The order is the filter's rather than a sorted one, so the nth name answers the nth id
 /// the request sent that the store could not resolve.
 pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
     format!(
         "Invalid directory ID(s): {ids}.",
-        ids = directory_ids.join(", ")
+        ids = directory_ids.join(",")
     )
 }
 

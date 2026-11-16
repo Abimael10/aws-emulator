@@ -593,7 +593,7 @@ async fn a_deleted_id_filters_to_an_empty_page_while_an_unknown_one_is_refused()
         assert_eq!(
             message,
             with_request_id(
-                &format!("Invalid directory ID(s): {}.", named.join(", ")),
+                &format!("Invalid directory ID(s): {}.", named.join(",")),
                 &request_id
             ),
             "case {row:?}: expected only the ids this account never had to be named, got \
