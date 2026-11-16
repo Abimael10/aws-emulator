@@ -264,7 +264,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be opened leaves the API UNCREATED rather than publishing an endpoint nothing
         // serves.
         let (graphql_authority, realtime_authority) =
-            match crate::service::graphql_api::open_for_api(&self.engine, &api_id).await {
+            match crate::service::graphql_api::open_for_api(
+                &self.engine,
+                &api_id,
+                &region,
+                ctx.callback().clone(),
+            )
+            .await
+            {
                 Ok(authorities) => authorities,
                 Err(reason) => {
                     state.lock().graphql_data_plane.forget_api(&api_id);
@@ -369,6 +376,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .graphql_apis
             .get(&api_id)
             .map(crate::state::GraphqlApiRecord::to_graphql_api);
+        let logs_configured = graphql_api
+            .as_ref()
+            .is_some_and(|api| api.log_config.is_some());
+        drop(guard);
+
+        // An API that configures logging HAS its log group: `logConfig` names "The service
+        // role that AppSync assumes to publish to CloudWatch logs in your account", so the
+        // group this API's records go to is provisioned with the API rather than only when
+        // the first request is logged ([`crate::service::graphql_api::field_logs`]). Taken
+        // with this service's own store released, so the destination's guard is the only one
+        // held.
+        if logs_configured {
+            crate::service::graphql_api::field_logs::provisioned(
+                &*self.engine,
+                &region,
+                &api_id,
+            );
+        }
 
         Ok(CreateGraphqlApiOutput { graphql_api })
     }

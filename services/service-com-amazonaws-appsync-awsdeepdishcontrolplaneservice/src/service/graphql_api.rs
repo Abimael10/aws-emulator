@@ -39,11 +39,14 @@
 
 use ::std::sync::Arc;
 
+use ::smithy_server_runtime::EmbeddedEmulator;
+
 use crate::ops::types::AdditionalAuthenticationProvider;
 use crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState as ServiceStore;
 
 pub mod caller;
 pub mod execution;
+pub mod field_logs;
 pub mod mapping_template;
 pub mod metrics;
 pub mod query;
@@ -65,6 +68,14 @@ pub struct PlaneContext {
     /// its own and the WAFv2 evaluation in front of the API spans two stores — WAF's own
     /// records and the CloudWatch series it reports through ([`query`]).
     pub engine: Arc<::engine::InMemoryEngine>,
+    /// The Region the API was created in, which is where what it logs about a request is
+    /// written ([`field_logs`]).
+    pub region: String,
+    /// The in-process transport into this same emulator — the handle the operation that
+    /// created the API was given (`OperationContext::callback`) — kept because a request on
+    /// this plane has no context of its own and what the API LOGS about one is written into
+    /// this emulator's CloudWatch Logs ([`field_logs`]).
+    pub callback: EmbeddedEmulator,
 }
 
 // By hand, because a store handle has no rendering of its own: what is diagnosable about a
@@ -94,6 +105,8 @@ impl ::std::fmt::Debug for PlaneContext {
 pub async fn open_for_api<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     api_id: &str,
+    region: &str,
+    callback: EmbeddedEmulator,
 ) -> Result<(String, String), String> {
     // The engine as the shared one, kept as a handle rather than borrowed: the sockets
     // outlive this call, and what answers on them reads the WAFv2 records through it.
@@ -112,6 +125,8 @@ pub async fn open_for_api<Eng: Send + Sync + 'static>(
             api_id,
         ),
         engine: Arc::clone(&shared),
+        region: region.to_string(),
+        callback,
     };
     // The core's own TLS server, for a client that dialled `https://` or `wss://`. A core
     // that cannot prepare it leaves this `None`, and such a client is then dropped at the

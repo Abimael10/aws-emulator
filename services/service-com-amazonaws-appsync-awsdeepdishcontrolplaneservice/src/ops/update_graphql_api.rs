@@ -277,8 +277,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answer from the STORED record, so this body is the one `GetGraphqlApi` and
         // `ListGraphqlApis` answer with afterwards — minus the API's `dns` records,
         // which this reply does not carry (`crate::state::GraphqlApiRecord::to_updated_graphql_api`).
+        let graphql_api = record.to_updated_graphql_api();
+        let logs_configured = graphql_api.log_config.is_some();
+        drop(guard);
+
+        // An update that configures logging provisions the API's log group, as the create
+        // does ([`crate::service::graphql_api::field_logs`]), so an API whose logging was
+        // turned on afterwards has the group its records go to as well. Taken with this
+        // service's own store released, so the destination's guard is the only one held.
+        if logs_configured {
+            crate::service::graphql_api::field_logs::provisioned(
+                &*self.engine,
+                &crate::state::request_region(ctx),
+                &input.api_id,
+            );
+        }
+
         Ok(UpdateGraphqlApiOutput {
-            graphql_api: Some(record.to_updated_graphql_api()),
+            graphql_api: Some(graphql_api),
         })
     }
 }

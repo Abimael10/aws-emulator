@@ -37,18 +37,12 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::event_api::LOOPBACK_HOST;
-use crate::event_api_data_plane::{appsync, loopback_port};
+use crate::event_api_data_plane::appsync;
 
 /// The region every control-plane call in this suite is signed for.
 const REGION: &str = "us-west-2";
-
-/// How long a case waits for one answer before giving up: generous for a loaded test
-/// machine, and bounded so a case that will never be answered fails instead of hanging.
-const ANSWER_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How long a case waits for the clock to perform a schema creation, and how often it looks
 /// again — the span is the service's own (`state::SCHEMA_CREATION_SPAN`), and the deadline is
@@ -975,6 +969,10 @@ async fn post_raw(
 /// The same, answering `None` for a request nothing served at all — a connection refused or
 /// severed, or an answer that is no HTTP response. The seam for a case that asserts an
 /// address no longer serves this API.
+///
+/// The socket client itself is the crate's one reading of how a client reaches a published
+/// address ([`crate::graphql_api_mapping_template_resolvers::try_post_answer`]); this keeps
+/// only what this suite's cases read off the answer.
 async fn try_post_raw(
     case: &str,
     api: &GraphqlApi,
@@ -983,34 +981,14 @@ async fn try_post_raw(
     body: &Value,
     fields: &[(&str, &str)],
 ) -> Option<(u16, Value)> {
-    let mut stream = tokio::time::timeout(
-        ANSWER_DEADLINE,
-        TcpStream::connect(("127.0.0.1", loopback_port(case, &api.graphql))),
+    let (status, _, document) = crate::graphql_api_mapping_template_resolvers::try_post_answer(
+        case,
+        &api.graphql,
+        path,
+        method,
+        body,
+        fields,
     )
-    .await
-    .ok()?
-    .ok()?;
-    let payload = body.to_string();
-    let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\n\
-         content-length: {}\r\nconnection: close\r\n",
-        api.graphql,
-        payload.len()
-    );
-    for (field, value) in fields {
-        request.push_str(&format!("{field}: {value}\r\n"));
-    }
-    request.push_str("\r\n");
-    request.push_str(&payload);
-    stream.write_all(request.as_bytes()).await.ok()?;
-    let mut answered = Vec::new();
-    tokio::time::timeout(ANSWER_DEADLINE, stream.read_to_end(&mut answered))
-        .await
-        .ok()?
-        .ok()?;
-    let text = String::from_utf8_lossy(&answered).to_string();
-    let (head, payload) = text.split_once("\r\n\r\n")?;
-    let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
-    let document = serde_json::from_str(payload).unwrap_or(Value::Null);
+    .await?;
     Some((status, document))
 }

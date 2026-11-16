@@ -60,6 +60,9 @@ pub struct GraphqlDataPlane {
     apis: BTreeMap<String, ApiSocket>,
     /// Drives [`Self::mint_connection_id`]: how many connections this plane has accepted.
     connection_seed: u64,
+    /// Drives [`Self::mint_request_id`]: how many requests this plane's GraphQL endpoints
+    /// have answered.
+    request_seed: u64,
 }
 
 // By hand, because a `ResourceListener` is a live socket and carries no `Debug` of its own:
@@ -90,6 +93,7 @@ impl std::fmt::Debug for GraphqlDataPlane {
             .debug_struct("GraphqlDataPlane")
             .field("apis", &apis)
             .field("connection_seed", &self.connection_seed)
+            .field("request_seed", &self.request_seed)
             .finish()
     }
 }
@@ -134,6 +138,19 @@ impl GraphqlDataPlane {
     pub fn mint_connection_id(&mut self) -> String {
         self.connection_seed = self.connection_seed.wrapping_add(1);
         uuid_from(CONNECTION_ID_MIX_DOMAIN, self.connection_seed)
+    }
+
+    /// Mint the next REQUEST id: a UUID, which is the shape AppSync identifies one request
+    /// to a GraphQL API by — the value its answer carries in `x-amzn-RequestId` and the one
+    /// every record the API logs about that request is stamped with.
+    ///
+    /// Minted from this plane's own counter through the service's one UUID rendering
+    /// ([`uuid_from`]), under a domain of its own, so no request id can coincide with a
+    /// connection id minted from the same counter value and nothing a client sends chooses
+    /// it.
+    pub fn mint_request_id(&mut self) -> String {
+        self.request_seed = self.request_seed.wrapping_add(1);
+        uuid_from(REQUEST_ID_MIX_DOMAIN, self.request_seed)
     }
 
     /// Record that `connection_id` is open on `api_id`, with `frames` as the queue a
@@ -242,3 +259,7 @@ impl GraphqlDataPlane {
 /// What a GraphQL API connection id's bytes are mixed with, so one can never coincide with
 /// an id the Event API plane minted from the same counter value.
 const CONNECTION_ID_MIX_DOMAIN: u64 = 0x4170_7053_796E_6303;
+
+/// What a GraphQL API REQUEST id's bytes are mixed with, for the same reason: a request id
+/// and a connection id are drawn from parts of the sequence far apart from each other.
+const REQUEST_ID_MIX_DOMAIN: u64 = 0x4170_7053_796E_6304;

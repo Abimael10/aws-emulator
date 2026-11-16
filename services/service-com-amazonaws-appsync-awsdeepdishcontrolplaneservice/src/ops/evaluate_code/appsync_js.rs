@@ -471,6 +471,9 @@ fn evaluate_in(
             None,
         );
     }
+    if let Err(error) = install_runtime_globals(ctx) {
+        return (Outcome::Stopped(error), None);
+    }
     // Held BEFORE any of the caller's code is compiled, so the invoker this run reads its
     // answer through is this module's own however the code rebinds the global object.
     let invoker = match ctx.eval::<Function<'_>, _>(INVOKER_SOURCE).catch(ctx) {
@@ -705,6 +708,44 @@ fn install_host(ctx: &Ctx<'_>, collected: &Arc<Mutex<Collected>>) -> Result<(), 
         .set("__appsyncAutoId", Func::from(auto_id))
         .map_err(|error| format!("the sandbox id mint could not be installed: {error}"))
 }
+
+/// Bind the APPSYNC_JS runtime's own names in the GLOBAL scope: `util` and `runtime`.
+///
+/// Code written for this runtime reaches them BOTH ways — through the import of the utilities
+/// module ("`import { util } from '@aws-appsync/utils'`") and as bare names, because the
+/// runtime binds them for the code it runs — so a handler that calls `util.error(...)` with
+/// no import of its own is code this runtime runs rather than code that fails on an undefined
+/// name.
+///
+/// They are the SAME objects the module exports ([`UTILS_MODULE_SOURCE`], declared here under
+/// the module's own name so a later `import` of it resolves to this one instance): one
+/// definition of each helper, so the two ways of reaching them cannot drift apart. Installed
+/// before any of the caller's code is compiled, so code that rebinds a global only changes
+/// what IT sees.
+fn install_runtime_globals(ctx: &Ctx<'_>) -> Result<(), String> {
+    let declared = Module::declare(ctx.clone(), UTILS_MODULE, UTILS_MODULE_SOURCE)
+        .map_err(|error| format!("the sandbox utilities did not compile: {error}"))?;
+    let (module, settled) = declared
+        .eval()
+        .map_err(|error| format!("the sandbox utilities did not load: {error}"))?;
+    settled
+        .finish::<()>()
+        .map_err(|error| format!("the sandbox utilities did not load: {error}"))?;
+    let globals = ctx.globals();
+    for name in RUNTIME_GLOBALS {
+        let exported: Value<'_> = module
+            .get(*name)
+            .map_err(|error| format!("the sandbox {name} is not available: {error}"))?;
+        globals
+            .set(*name, exported)
+            .map_err(|error| format!("the sandbox {name} could not be installed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The names the runtime binds for the code it runs, which are the names
+/// [`UTILS_MODULE_SOURCE`] exports.
+const RUNTIME_GLOBALS: &[&str] = &["util", "runtime"];
 
 /// A fresh identifier for `util.autoId`, in the UUID form AppSync's own ids take.
 ///

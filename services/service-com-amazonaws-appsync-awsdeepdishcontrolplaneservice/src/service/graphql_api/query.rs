@@ -29,11 +29,22 @@
 //! (`Origin` / `Sec-Fetch-Site`) check — and the request is read under one deadline and one
 //! body ceiling, both the core's, so a slow or oversized client cannot hold a connection
 //! permit open.
+//!
+//! Every answer this endpoint writes — the result, and each refusal above — carries the
+//! REQUEST ID of the request it answers in [`REQUEST_ID_FIELD`], minted per request by the
+//! API's own data plane (`crate::state::GraphqlDataPlane::mint_request_id`). It is the value
+//! a client correlates its answer with what the API LOGGED about producing it by, because
+//! every record an API with a `logConfig` writes carries that same id
+//! ([`super::field_logs`]). A request the API itself answered is also a request it LOGS;
+//! three are not, because AppSync produced no answer of its own for them: one the WEB ACL
+//! decided at the edge, one this endpoint never read (shed for want of a permit, past the
+//! body ceiling, or past the read deadline), and one refused by the transport-safety rules
+//! before any of it was dispatched.
 
 use ::std::future::Future;
 use ::std::pin::Pin;
 use ::std::sync::Arc;
-use ::std::time::Duration;
+use ::std::time::{Duration, Instant, SystemTime};
 
 use ::bytes::Bytes;
 use ::emulator_server::{listener_caps, ListenerConn, NativeHandler, TlsUpgrader};
@@ -43,8 +54,12 @@ use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::execution::{self, GraphqlRequest};
-use super::{caller, PlaneContext};
+use super::{caller, field_logs, PlaneContext};
 use crate::service::event_api::{self, PresentedAuth};
+
+/// The response field every answer this endpoint writes carries the request's own id in, as
+/// AppSync names it.
+pub const REQUEST_ID_FIELD: &str = "x-amzn-requestid";
 
 /// The path the GraphQL endpoint serves its API at — the path `uris`'s `GRAPHQL` entry
 /// carries, which is the same `/graphql` the real-time endpoint is addressed at: the two are
@@ -109,13 +124,20 @@ async fn serve_connection(context: PlaneContext, in_flight: Arc<Semaphore>, conn
         let context = context.clone();
         let in_flight = Arc::clone(&in_flight);
         async move {
+            // The id of THIS request, minted by the API's own data plane before anything of
+            // the request is read, so every answer below — including one this endpoint
+            // refuses and a contained panic — names the request it is of.
+            let request_id = context.state.lock().graphql_data_plane.mint_request_id();
             // Every request's whole answer is driven through the core's panic containment,
             // because this socket is served by this module rather than by the front door's
             // router: there is no middleware layer to carry it.
             let facts = ::emulator_server::RequestFacts::from_request(&request);
-            Ok::<_, ::std::convert::Infallible>(
-                contained(facts, answer(context, in_flight, request)).await,
+            let answered = contained(
+                facts,
+                answer(context, in_flight, request, request_id.clone()),
             )
+            .await;
+            Ok::<_, ::std::convert::Infallible>(stamped(answered, &request_id))
         }
     });
     if let Err(error) = ::hyper::server::conn::http1::Builder::new()
@@ -165,11 +187,28 @@ where
     ::http::Response::from_parts(parts, Full::new(bytes))
 }
 
+/// `answered` with the request's own id written on it — the one field every answer of this
+/// endpoint carries, whatever produced it.
+///
+/// A minted id is a UUID, so it is always a value a response field can carry; an answer that
+/// somehow carries one already keeps it rather than being stamped twice.
+fn stamped(
+    mut answered: ::http::Response<Full<Bytes>>,
+    request_id: &str,
+) -> ::http::Response<Full<Bytes>> {
+    let name = ::http::HeaderName::from_static(REQUEST_ID_FIELD);
+    if let Ok(value) = ::http::HeaderValue::from_str(request_id) {
+        answered.headers_mut().entry(name).or_insert(value);
+    }
+    answered
+}
+
 /// Answer one request to the GraphQL endpoint.
 async fn answer(
     context: PlaneContext,
     in_flight: Arc<Semaphore>,
     request: ::http::Request<::hyper::body::Incoming>,
+    request_id: String,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
     if let Some(refused) = refused_before_dispatch(&parts) {
@@ -188,7 +227,7 @@ async fn answer(
         let Ok(collected) = limited.collect().await else {
             return error_response(413, BAD_REQUEST_ERROR_TYPE, BODY_TOO_LARGE);
         };
-        served_request(&context, &parts, &collected.to_bytes()).await
+        served_request(&context, &parts, &collected.to_bytes(), &request_id).await
     })
     .await;
     served.unwrap_or_else(|_| error_response(408, BAD_REQUEST_ERROR_TYPE, REQUEST_TIMED_OUT))
@@ -200,12 +239,35 @@ async fn served_request(
     context: &PlaneContext,
     parts: &::http::request::Parts,
     body: &[u8],
+    request_id: &str,
 ) -> ::http::Response<Full<Bytes>> {
+    // When this request began and the clock its latency is measured on: both are what the
+    // API's own records of it state ([`field_logs`]).
+    let started = SystemTime::now();
+    let clock = Instant::now();
     if parts.uri.path() != GRAPHQL_PATH {
-        return error_response(404, NOT_FOUND_ERROR_TYPE, NO_SUCH_ROUTE);
+        return refusal_logged(
+            context,
+            request_id,
+            started,
+            clock,
+            404,
+            NOT_FOUND_ERROR_TYPE,
+            NO_SUCH_ROUTE,
+        )
+        .await;
     }
     if parts.method != ::http::Method::POST {
-        return error_response(405, BAD_REQUEST_ERROR_TYPE, A_QUERY_IS_A_POST);
+        return refusal_logged(
+            context,
+            request_id,
+            started,
+            clock,
+            405,
+            BAD_REQUEST_ERROR_TYPE,
+            A_QUERY_IS_A_POST,
+        )
+        .await;
     }
     // The API's own ARN, which is what a web ACL is associated with and what says the API
     // still exists at all.
@@ -226,15 +288,21 @@ async fn served_request(
         return refused;
     }
     let auth = PresentedAuth::from_fields(&parts.headers);
-    {
+    let authorized = {
         let store = context.state.lock();
-        if !super::authorized(&store, &context.api_id, &auth) {
-            return error_response(
-                401,
-                event_api::UNAUTHORIZED_ERROR_TYPE,
-                event_api::UNAUTHORIZED_MESSAGE,
-            );
-        }
+        super::authorized(&store, &context.api_id, &auth)
+    };
+    if !authorized {
+        return refusal_logged(
+            context,
+            request_id,
+            started,
+            clock,
+            401,
+            event_api::UNAUTHORIZED_ERROR_TYPE,
+            event_api::UNAUTHORIZED_MESSAGE,
+        )
+        .await;
     }
     // WHO the call speaks for, resolved once: it is both what a resolver reads as
     // `$context.identity` and what the API's fields are authorized for ([`caller`]). A call
@@ -245,10 +313,28 @@ async fn served_request(
         .as_ref()
         .map_or(Json::Null, |caller| caller.identity.clone());
     let Ok(document) = ::serde_json::from_slice::<Json>(body) else {
-        return error_response(400, BAD_REQUEST_ERROR_TYPE, BODY_IS_A_DOCUMENT);
+        return refusal_logged(
+            context,
+            request_id,
+            started,
+            clock,
+            400,
+            BAD_REQUEST_ERROR_TYPE,
+            BODY_IS_A_DOCUMENT,
+        )
+        .await;
     };
     let Some(query) = document.get(QUERY_MEMBER).and_then(Json::as_str) else {
-        return error_response(400, BAD_REQUEST_ERROR_TYPE, BODY_CARRIES_A_QUERY);
+        return refusal_logged(
+            context,
+            request_id,
+            started,
+            clock,
+            400,
+            BAD_REQUEST_ERROR_TYPE,
+            BODY_CARRIES_A_QUERY,
+        )
+        .await;
     };
     let request = GraphqlRequest {
         query: query.to_string(),
@@ -279,7 +365,47 @@ async fn served_request(
     }
     request.unauthorized = judged.refused;
     let answered = execution::execute(context, &request).await;
+    field_logs::delivered(
+        context,
+        &field_logs::Served {
+            request_id,
+            status: 200,
+            started,
+            latency: clock.elapsed(),
+            answer: Some(&answered),
+        },
+    )
+    .await;
     json_response(200, &answered.document())
+}
+
+/// One refusal the API's own logs report: the answer, and the record the API logs about
+/// having refused the request.
+///
+/// A request the API itself refused is one it SERVED — the status it was answered with is
+/// what a request-level record states — so it is logged like any other, with no execution to
+/// report because none ran.
+async fn refusal_logged(
+    context: &PlaneContext,
+    request_id: &str,
+    started: SystemTime,
+    clock: Instant,
+    status: u16,
+    error_type: &str,
+    message: &str,
+) -> ::http::Response<Full<Bytes>> {
+    field_logs::delivered(
+        context,
+        &field_logs::Served {
+            request_id,
+            status,
+            started,
+            latency: clock.elapsed(),
+            answer: None,
+        },
+    )
+    .await;
+    error_response(status, error_type, message)
 }
 
 /// What IAM decided about the FIELDS one call selects.

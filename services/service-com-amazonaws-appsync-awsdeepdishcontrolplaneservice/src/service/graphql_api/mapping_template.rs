@@ -1646,7 +1646,11 @@ fn split(args: &[Vec<Json>]) -> (&[Json], &[Vec<Json>]) {
 /// `Err` for a value past [`MAX_VALUE_BYTES`] or nested past [`MAX_VALUE_DEPTH`] — the two
 /// memory bounds of an evaluation. The walk stops at the first byte past the ceiling, so
 /// weighing a refused value costs no more than weighing an admitted one.
-fn weigh(value: &Json, depth: usize) -> Result<usize, String> {
+///
+/// Reached by the field-log trace of an execution too ([`super::execution`]), which bounds
+/// what one request RETAINS of the values its fields were resolved with: one service weighs a
+/// held value one way.
+pub(crate) fn weigh(value: &Json, depth: usize) -> Result<usize, String> {
     if depth > MAX_VALUE_DEPTH {
         return Err(format!("{TOO_DEEP_A_VALUE} {MAX_VALUE_DEPTH}."));
     }

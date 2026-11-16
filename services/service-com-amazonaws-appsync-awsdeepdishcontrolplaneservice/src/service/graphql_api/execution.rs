@@ -22,18 +22,24 @@
 //!    — for a `PIPELINE` resolver — the functions it invokes, in order. A field that carries
 //!    no resolver takes its value from the object its parent resolved to, which is what a
 //!    GraphQL object's own member is.
-//! 3. The CODE is RUN, by the same engine embedded in this process that `EvaluateCode`
-//!    evaluates a resolver with ([`crate::ops::evaluate_code::appsync_js`]): the `request`
-//!    function over the field's `ctx`, then the `response` function over the result the data
-//!    source produced. Every bound that module declares holds here — a wall clock, a step
-//!    budget, memory and stack ceilings and an answer ceiling — and each run gets a fresh
-//!    engine, so nothing of one field's run is reachable from the next.
+//! 3. The DEFINITION is RUN. A resolver defined by `code` is run by the same engine embedded
+//!    in this process that `EvaluateCode` evaluates a resolver with
+//!    ([`crate::ops::evaluate_code::appsync_js`]): the `request` function over the field's
+//!    `ctx`, then the `response` function over the result the data source produced. Every
+//!    bound that module declares holds here — a wall clock, a step budget, memory and stack
+//!    ceilings and an answer ceiling — and each run gets a fresh engine, so nothing of one
+//!    field's run is reachable from the next. A resolver defined by MAPPING TEMPLATES is run
+//!    the same way round by the template runtime ([`super::mapping_template`]): the request
+//!    template renders the configuration the data source is called with, and the response
+//!    template renders the value the field takes.
 //! 4. The sub-selections of each resolved value are PROJECTED onto it, as a GraphQL result
 //!    carries exactly the fields the request selected.
 //!
 //! A field whose code raised, and one this emulator cannot resolve at all, is reported as an
 //! error of that field's own path with the value `null`, which is how a GraphQL result
 //! states a field that did not resolve.
+
+use ::std::time::Duration;
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
 
@@ -74,6 +80,59 @@ pub struct Answer {
     /// One entry per field that did not resolve, and the request-level faults that stopped
     /// the execution before any field ran.
     pub errors: Vec<Json>,
+    /// What resolving each field came to, for the API's own field logging
+    /// ([`super::field_logs`]): empty for an API that captures no field-level logs, which is
+    /// what the execution is told before it starts.
+    pub traces: Vec<FieldTrace>,
+}
+
+/// What resolving ONE field came to, as the API's field-level logging reports it: where the
+/// field sits, what resolved it, how long that took, and the request and response each step
+/// of the resolution GENERATED.
+///
+/// Collected only for an API whose `logConfig` captures field-level logs — the `fieldLogLevel`
+/// rule ([`super::field_logs`]) — so an API that logs none pays nothing for it.
+#[derive(Debug, Clone)]
+pub struct FieldTrace {
+    /// Where in the result the field sits, as a GraphQL error's own `path` names it.
+    pub path: Vec<Json>,
+    /// The type the field belongs to.
+    pub parent_type: String,
+    /// The field's own name, which is its response key's name before any alias.
+    pub field_name: String,
+    /// The name of the type the field resolves to, as the API's schema declares it, or the
+    /// empty name when it declares none.
+    pub return_type: String,
+    /// The ARN of the resolver attached to the field, or `None` for a field that carries
+    /// none.
+    pub resolver_arn: Option<String>,
+    /// How long after the execution started this field began resolving.
+    pub start_offset: Duration,
+    /// How long resolving it took.
+    pub duration: Duration,
+    /// The sentence the field did not resolve with, or `None` for one that resolved.
+    pub error: Option<String>,
+    /// The `ctx` the field was resolved with — the arguments, the source and the field's
+    /// `info` — which is the CONTEXT a verbose field log carries.
+    pub context: Json,
+    /// One entry per step that resolved the field, in the order they ran: the request each
+    /// step's own `request` function generated and the response its `response` function
+    /// returned.
+    pub steps: Vec<GeneratedStep>,
+}
+
+/// The request and response ONE step of a resolution generated: "the generated
+/// request/response functions that got resolved" for the field (`LogConfig$fieldLogLevel`).
+#[derive(Debug, Clone)]
+pub struct GeneratedStep {
+    /// What the step is called: the field for a UNIT resolver, the function's name for a
+    /// step of a pipeline.
+    pub name: String,
+    /// The request the step's `request` function generated, or `None` when it did not
+    /// return one.
+    pub request: Option<Json>,
+    /// What the step's `response` function returned, or `None` when it did not return.
+    pub response: Option<Json>,
 }
 
 impl Answer {
@@ -82,6 +141,7 @@ impl Answer {
         Self {
             data: None,
             errors: vec![json!({"message": message})],
+            traces: Vec::new(),
         }
     }
 
@@ -118,6 +178,33 @@ const MAX_RESOLVER_RUNS: usize = 64;
 
 /// How many fields one selection set may select, for the same reason.
 const MAX_SELECTED_FIELDS: usize = 64;
+
+/// How many FIELDS one request's own field-log trace keeps, how many steps of one field it
+/// keeps, and how many bytes of their verbose halves — the field's context and the request and
+/// response its steps generated — it RETAINS in all.
+///
+/// Emulator resource guards, for the reason every other bound here is one: the number of
+/// fields a request resolves is what the document and the values its resolvers return choose,
+/// and a trace holds request-derived values, so what the collection may hold is bounded in
+/// host code rather than by the request. A request that resolves more fields than the first
+/// bound keeps traces the ones it kept; one that would retain more than the byte bound keeps
+/// each field's trace with the verbose halves left out, exactly as `excludeVerboseContent`
+/// leaves them out, so the field is still reported.
+const MAX_FIELD_TRACES: usize = 64;
+const MAX_TRACED_STEPS: usize = 16;
+const MAX_TRACE_BYTES: usize = 256 * 1024;
+
+/// How many errors one result REPORTS, and how many bytes of argument one document's
+/// variables may be substituted into.
+///
+/// Emulator resource guards of the same kind: a field is resolved once per value a resolver's
+/// answer projects it over, so the number of errors a result can carry is not bounded by the
+/// fields the document selects; and a variable's value is substituted into every argument
+/// that references it, so what the selected arguments hold is not bounded by the document's
+/// own size. A result past the first bound carries that many errors and one entry saying so;
+/// a document past the second is refused before anything is resolved.
+const MAX_FIELD_ERRORS: usize = 256;
+const MAX_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 
 /// How many fields one request's whole document may expand to, every level and every
 /// fragment splice together.
@@ -187,6 +274,11 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         request,
         runs: 0,
         errors: Vec::new(),
+        started: ::std::time::Instant::now(),
+        traced: super::field_logs::captures_field_logs(&context.state.lock(), &context.api_id),
+        traces: Vec::new(),
+        trace_bytes: MAX_TRACE_BYTES,
+        steps: Vec::new(),
         appended: Vec::new(),
         template_deadline: ::std::time::Instant::now() + MAX_TEMPLATE_RUNTIME,
     };
@@ -196,6 +288,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     Answer {
         data: Some(data),
         errors: execution.errors,
+        traces: execution.traces,
     }
 }
 
@@ -251,6 +344,7 @@ fn read_operation(request: &GraphqlRequest) -> Result<(OperationKind, Vec<Select
         document: &document,
         variables: &request.variables,
         remaining: MAX_SELECTED_NODES,
+        held: MAX_ARGUMENT_BYTES,
         spreading: Vec::new(),
     };
     let fields = expansion.selection_set(operation.selection_set.as_ref(), 0)?;
@@ -266,6 +360,19 @@ struct Execution<'a> {
     runs: usize,
     /// The errors of the fields that did not resolve, in the order they were resolved.
     errors: Vec<Json>,
+    /// When this execution began, which every field's own offset is measured from.
+    started: ::std::time::Instant,
+    /// Whether the API captures field-level logs at all: a field's trace is collected only
+    /// then, so an API that logs none pays nothing for the collection.
+    traced: bool,
+    /// What resolving each field came to, in the order the fields were resolved.
+    traces: Vec<FieldTrace>,
+    /// How many more bytes of the verbose halves of those traces this request may retain,
+    /// which [`MAX_TRACE_BYTES`] starts at.
+    trace_bytes: usize,
+    /// The steps of the field being resolved RIGHT NOW, which each step appends its
+    /// generated request and its response to and the field's own trace then takes.
+    steps: Vec<GeneratedStep>,
     /// The errors the mapping templates of the field being resolved APPENDED
     /// (`$util.appendError`, which "does not interrupt the evaluation"), drained onto
     /// [`Self::errors`] under that field's own path once it is resolved.
@@ -316,8 +423,7 @@ impl Execution<'_> {
         depth: usize,
     ) -> Json {
         if depth >= MAX_SELECTION_DEPTH {
-            self.errors
-                .push(field_error(path, &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}.")));
+            self.fault(field_error(path, &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}.")));
             return Json::Null;
         }
         // A field the authorization in front of the API refused this caller resolves to
@@ -331,35 +437,69 @@ impl Execution<'_> {
                 refused_type == type_name && *refused_field == field.name
             })
         {
-            self.errors
-                .push(unauthorized_field(path, type_name, &field.name));
+            self.fault(unauthorized_field(path, type_name, &field.name));
             return Json::Null;
         }
         let plan = self.plan(type_name, &field.name);
-        let value = match plan {
+        let resolver_arn = plan.as_ref().and_then(|plan| plan.arn.clone());
+        // Where this field sits in the execution, so its trace reports the offset and the
+        // span the API's field logging states them as.
+        let start_offset = self.started.elapsed();
+        self.steps.clear();
+        self.appended.clear();
+        let resolved: Result<Json, Failure> = match plan {
             // A field the API attaches no resolver to is the member of the object its
             // parent resolved to, which is what a GraphQL object's own field is.
-            None => source.get(&field.name).cloned().unwrap_or(Json::Null),
+            None => Ok(source.get(&field.name).cloned().unwrap_or(Json::Null)),
             Some(plan) => {
                 if self.runs >= MAX_RESOLVER_RUNS {
-                    self.errors
-                        .push(field_error(path, &format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}.")));
+                    self.fault(field_error(
+                        path,
+                        &format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}."),
+                    ));
                     return Json::Null;
                 }
                 self.runs = self.runs.saturating_add(1);
-                let outcome = self.run(&plan, type_name, source, field).await;
-                // Whatever the run came to, the errors its templates appended are reported
-                // under this field's path: that is what appending one is for.
-                for appended in ::std::mem::take(&mut self.appended) {
-                    self.errors.push(appended.document(path));
-                }
-                match outcome {
-                    Ok(value) => value,
-                    Err(failure) => {
-                        self.errors.push(failure.document(path));
-                        return Json::Null;
-                    }
-                }
+                self.run(&plan, type_name, source, field).await
+            }
+        };
+        if self.traced && self.traces.len() < MAX_FIELD_TRACES {
+            let duration = self.started.elapsed().saturating_sub(start_offset);
+            let return_type = self.field_type_name(type_name, &field.name);
+            let steps = ::std::mem::take(&mut self.steps);
+            // What this entry RETAINS is the verbose half of it — the field's own context and
+            // the request and response its steps generated — and a request may retain only so
+            // much of that ([`MAX_TRACE_BYTES`]). Past that, the field is still traced, with
+            // the verbose sections left out exactly as `excludeVerboseContent` leaves them
+            // out, so a request cannot choose how much of it one trace holds.
+            let context = logged_context(type_name, field);
+            let (context, steps) = match self.affordable(&context, &steps) {
+                true => (context, steps),
+                false => (Json::Null, Vec::new()),
+            };
+            self.traces.push(FieldTrace {
+                path: path.to_vec(),
+                parent_type: type_name.to_string(),
+                field_name: field.name.clone(),
+                return_type,
+                resolver_arn,
+                start_offset,
+                duration,
+                error: resolved.as_ref().err().map(Failure::message),
+                context,
+                steps,
+            });
+        }
+        // Whatever the run came to, the errors its templates appended are reported
+        // under this field's path: that is what appending one is for.
+        for appended in ::std::mem::take(&mut self.appended) {
+            self.fault(appended.document(path));
+        }
+        let value = match resolved {
+            Ok(value) => value,
+            Err(failure) => {
+                self.fault(failure.document(path));
+                return Json::Null;
             }
         };
         if field.selections.is_empty() {
@@ -391,8 +531,7 @@ impl Execution<'_> {
     ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Json> + Send + 'f>> {
         Box::pin(async move {
             if depth >= MAX_SELECTION_DEPTH {
-                self.errors
-                    .push(field_error(path, &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}.")));
+                self.fault(field_error(path, &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}.")));
                 return Json::Null;
             }
             match value {
@@ -440,6 +579,7 @@ impl Execution<'_> {
         let api = store.graphql_apis.get(&self.context.api_id)?;
         let resolver = api.resolver(type_name, field_name)?;
         Some(ResolverPlan {
+            arn: Some(resolver.arn.clone()),
             code: resolver.code.clone(),
             templates: Templates::of(
                 resolver.request_mapping_template.as_deref(),
@@ -571,7 +711,7 @@ impl Execution<'_> {
     }
 
     /// Run ONE step — a UNIT resolver, or one function of a pipeline — against its own data
-    /// source, and answer what its `response` function returned.
+    /// source, and answer what its definition made of the result.
     async fn run_step(
         &mut self,
         step: &PipelineStep,
@@ -592,6 +732,7 @@ impl Execution<'_> {
                 None => Err(NO_DEFINITION.to_string().into()),
             };
         };
+        let recorded = self.recorded_step(&step.name);
         let requested = returned(
             code,
             REQUEST_FUNCTION,
@@ -599,14 +740,17 @@ impl Execution<'_> {
             stash,
         )
         .await?;
+        self.record_request(recorded, &requested);
         let result = self.data_source_result(step, &requested)?;
-        Ok(returned(
+        let answered = returned(
             code,
             RESPONSE_FUNCTION,
             &step_context(base, stash, &result, Some(previous)),
             stash,
         )
-        .await?)
+        .await?;
+        self.record_response(recorded, &answered);
+        Ok(answered)
     }
 
     /// Run ONE step that is defined by MAPPING TEMPLATES: evaluate the request template to
@@ -630,6 +774,7 @@ impl Execution<'_> {
         stash: &mut Json,
         previous: &Json,
     ) -> Result<Json, Failure> {
+        let recorded = self.recorded_step(&step.name);
         let requested = match &templates.request {
             Some(template) => {
                 let context = step_context(base, stash, &Json::Null, Some(previous));
@@ -638,14 +783,95 @@ impl Execution<'_> {
             }
             None => Json::Null,
         };
+        self.record_request(recorded, &requested);
         let result = self.data_source_result(step, &requested)?;
-        match &templates.response {
+        let answered = match &templates.response {
             Some(template) => {
                 let context = step_context(base, stash, &result, Some(previous));
                 let rendered = self.rendered(template, &context, stash).await?;
-                read_rendered(&rendered, RESPONSE_TEMPLATE)
+                read_rendered(&rendered, RESPONSE_TEMPLATE)?
             }
-            None => Ok(result),
+            None => result,
+        };
+        self.record_response(recorded, &answered);
+        Ok(answered)
+    }
+
+    /// Open this step's own entry in the field's trace, which the API's field logging reports
+    /// as the request and the response the step GENERATED, and answer where that entry sits.
+    /// Opened BEFORE the step's request half runs, so a step that raises is still reported as
+    /// one that ran. `None` for an API that captures no field-level logs, which is what makes
+    /// the collection cost nothing there.
+    fn recorded_step(&mut self, name: &str) -> Option<usize> {
+        if !self.traced || self.steps.len() >= MAX_TRACED_STEPS {
+            return None;
+        }
+        self.steps.push(GeneratedStep {
+            name: name.to_string(),
+            request: None,
+            response: None,
+        });
+        Some(self.steps.len().saturating_sub(1))
+    }
+
+    /// Report one error of this execution, under what one result may REPORT.
+    ///
+    /// The one place an error of a field is reported, so every kind of them — a bound a field
+    /// met, a field the caller may not reach, what a definition raised and what it appended —
+    /// is counted the same way. A result that would carry more than [`MAX_FIELD_ERRORS`]
+    /// carries that many and ONE further entry saying so, because the number of values a
+    /// resolver's answer projects a field over is the request's to choose and an error carries
+    /// the path and the sentence of each.
+    fn fault(&mut self, error: Json) {
+        if self.errors.len() < MAX_FIELD_ERRORS {
+            self.errors.push(error);
+            return;
+        }
+        if self.errors.len() == MAX_FIELD_ERRORS {
+            self.errors
+                .push(json!({"message": format!("{TOO_MANY_ERRORS} {MAX_FIELD_ERRORS}.")}));
+        }
+    }
+
+    /// Whether what one field's trace would RETAIN fits in what this request may retain,
+    /// spending it if so.
+    /// Weighed through the mapping-template runtime's own reading of what a value occupies
+    /// (`mapping_template::weigh`), so one service weighs a held value one way; a value it
+    /// refuses outright is one this request does not retain either.
+    fn affordable(&mut self, context: &Json, steps: &[GeneratedStep]) -> bool {
+        let mut weight = match mapping_template::weigh(context, 0) {
+            Ok(weight) => weight,
+            Err(_) => return false,
+        };
+        for step in steps {
+            for generated in [step.request.as_ref(), step.response.as_ref()] {
+                let Some(generated) = generated else {
+                    continue;
+                };
+                match mapping_template::weigh(generated, 0) {
+                    Ok(step_weight) => weight = weight.saturating_add(step_weight),
+                    Err(_) => return false,
+                }
+            }
+        }
+        if weight > self.trace_bytes {
+            return false;
+        }
+        self.trace_bytes -= weight;
+        true
+    }
+
+    /// Record the request one step generated, where its entry was opened.
+    fn record_request(&mut self, at: Option<usize>, requested: &Json) {
+        if let Some(entry) = at.and_then(|at| self.steps.get_mut(at)) {
+            entry.request = Some(requested.clone());
+        }
+    }
+
+    /// Record what one step's response half answered, where its entry was opened.
+    fn record_response(&mut self, at: Option<usize>, answered: &Json) {
+        if let Some(entry) = at.and_then(|at| self.steps.get_mut(at)) {
+            entry.response = Some(answered.clone());
         }
     }
 
@@ -742,6 +968,8 @@ impl Execution<'_> {
 /// names, copied out of the store.
 #[derive(Debug, Clone)]
 struct ResolverPlan {
+    /// The ARN of the stored resolver, which is what the field's own logs name it by.
+    arn: Option<String>,
     /// The APPSYNC_JS `code` the resolver is defined by, or `None` for one defined another
     /// way.
     code: Option<String>,
@@ -812,6 +1040,15 @@ impl Failure {
                 raised.message = format!("{name}: {}", raised.message);
                 Self::Raised(raised)
             }
+        }
+    }
+
+    /// The sentence this failure states, which is what the API's field logging reports as
+    /// the error of the field that did not resolve.
+    fn message(&self) -> String {
+        match self {
+            Self::Message(message) => message.clone(),
+            Self::Raised(raised) => raised.message.clone(),
         }
     }
 }
@@ -899,6 +1136,24 @@ struct FieldContext {
     request: Json,
     info: Json,
     identity: Json,
+}
+
+/// The CONTEXT a verbose field log carries for one field: the arguments the selection carries
+/// and which field of which type is being resolved.
+///
+/// Deliberately NOT the `ctx` a resolver reads. What a log record keeps is read by whoever can
+/// read the log group and is held for the whole request, so it carries neither the request's
+/// own fields (where a caller presents its authorization material) nor the request's variables
+/// or the parent's resolved value (which one request would otherwise retain once per field it
+/// resolves).
+fn logged_context(type_name: &str, field: &SelectedField) -> Json {
+    json!({
+        "arguments": Json::Object(field.arguments.clone()),
+        "info": {
+            "fieldName": field.name,
+            "parentTypeName": type_name,
+        },
+    })
 }
 
 /// The `ctx` one step is run with: what the field carries, the stash as the steps before it
@@ -1098,15 +1353,20 @@ pub struct SelectedField {
 /// The budget is what makes the expansion safe. A selection set's own width
 /// ([`MAX_SELECTED_FIELDS`]) and the depth it may nest to ([`MAX_SELECTION_DEPTH`]) bound
 /// each LEVEL, and their product does not bound the total — a chain of fragments each
-/// spreading the next multiplies one level's width by the next's — so the number of fields
-/// the whole document expands to is counted down from [`MAX_SELECTED_NODES`] across every
-/// level and every splice. A document that asks for more is refused before the expansion is
-/// built, so one request cannot choose how much memory reading it costs.
+/// spreading the next multiplies one level's width by the next's — so the number of NODES the
+/// whole document expands to is counted down from [`MAX_SELECTED_NODES`] across every level
+/// and every splice: every field read and every fragment spliced spends one, so a document
+/// whose fragments select no field at all is bounded too. A document that asks for more is
+/// refused before the expansion is built, so one request cannot choose how much work or
+/// memory reading it costs.
 struct Expansion<'a> {
     document: &'a ::apollo_parser::cst::Document,
     variables: &'a JsonMap<String, Json>,
     /// How many more fields this document may expand to, all levels together.
     remaining: usize,
+    /// How many more bytes of substituted ARGUMENT this document may hold, which
+    /// [`MAX_ARGUMENT_BYTES`] starts at ([`read_arguments`] states why it is counted).
+    held: usize,
     /// The fragments being spliced right now, innermost last: a spread that re-enters one is
     /// refused rather than expanded, so a cyclic fragment is reported instead of fanning
     /// out until a bound stops it.
@@ -1146,7 +1406,8 @@ impl Expansion<'_> {
                     // Spent BEFORE the field is read, so the sub-selection below is read
                     // under what is left rather than past it.
                     self.spend()?;
-                    let arguments = read_arguments(selected.arguments(), self.variables);
+                    let arguments =
+                        read_arguments(selected.arguments(), self.variables, &mut self.held)?;
                     let selections =
                         self.selection_set(selected.selection_set().as_ref(), depth + 1)?;
                     fields.push(SelectedField {
@@ -1161,11 +1422,16 @@ impl Expansion<'_> {
                 // a field resolves to is the resolver attached to it, not the document's
                 // guess at the object's type.
                 cst::Selection::InlineFragment(inline) => {
+                    // Spent for the SPLICE as well as for the fields it produces: a spread
+                    // that selects no field at all is still work this document asked for, so
+                    // it is counted against the same budget.
+                    self.spend()?;
                     let spliced = self.selection_set(inline.selection_set().as_ref(), depth + 1)?;
                     fields.extend(spliced);
                     self.within_width(fields.len())?;
                 }
                 cst::Selection::FragmentSpread(spread) => {
+                    self.spend()?;
                     let Some(name) = spread
                         .fragment_name()
                         .and_then(|fragment| fragment.name())
@@ -1190,8 +1456,8 @@ impl Expansion<'_> {
         Ok(fields)
     }
 
-    /// Spend one field of this document's budget, or refuse the document for asking for more
-    /// than [`MAX_SELECTED_NODES`] fields in all.
+    /// Spend one node of this document's budget, or refuse the document for asking for more
+    /// than [`MAX_SELECTED_NODES`] nodes in all.
     fn spend(&mut self) -> Result<(), String> {
         if self.remaining == 0 {
             return Err(format!("{TOO_MANY_NODES} {MAX_SELECTED_NODES}."));
@@ -1232,13 +1498,20 @@ fn fragment_definition(
 
 /// The arguments one selected field carries, as the document writes them and with the
 /// request's own variables substituted for every variable it references.
+///
+/// `held` is what the whole document may hold in its substituted arguments, counted down
+/// across every field it selects: a variable's value is substituted by COPY into each
+/// argument that references it, so what the expansion retains is not bounded by the size of
+/// the document. `Err` once that is spent, so a document that would expand its own body into
+/// more than this is refused before anything is resolved.
 fn read_arguments(
     arguments: Option<::apollo_parser::cst::Arguments>,
     variables: &JsonMap<String, Json>,
-) -> JsonMap<String, Json> {
+    held: &mut usize,
+) -> Result<JsonMap<String, Json>, String> {
     let mut read = JsonMap::new();
     let Some(arguments) = arguments else {
-        return read;
+        return Ok(read);
     };
     for argument in arguments.arguments() {
         let Some(name) = argument.name().map(|name| name.text().to_string()) else {
@@ -1247,48 +1520,59 @@ fn read_arguments(
         let Some(value) = argument.value() else {
             continue;
         };
-        read.insert(name, read_value(&value, variables, 0));
+        read.insert(name, read_value(&value, variables, 0, held)?);
     }
-    read
+    Ok(read)
 }
 
 /// One GraphQL value as the document writes it, in the JSON a resolver reads it as.
 ///
 /// A variable takes the value the request's `variables` gives it, and one the request does
 /// not carry is `null` — "if a variable is not provided, it is considered to have no value".
+/// Every value this produces is charged against `held` ([`read_arguments`] states why),
+/// weighed through the mapping-template runtime's own reading of what a value occupies, so
+/// one service weighs a held value one way.
 fn read_value(
     value: &::apollo_parser::cst::Value,
     variables: &JsonMap<String, Json>,
     depth: usize,
-) -> Json {
+    held: &mut usize,
+) -> Result<Json, String> {
     use ::apollo_parser::cst::{CstNode, Value};
     if depth >= MAX_SELECTION_DEPTH {
-        return Json::Null;
+        return Ok(Json::Null);
     }
-    match value {
+    let read = match value {
         Value::Variable(variable) => variable
             .name()
             .and_then(|name| variables.get(name.text().as_str()).cloned())
             .unwrap_or(Json::Null),
         Value::StringValue(text) => Json::String(String::from(text.clone())),
-        Value::ListValue(list) => Json::Array(
-            list.values()
-                .map(|element| read_value(&element, variables, depth.saturating_add(1)))
-                .collect(),
-        ),
-        Value::ObjectValue(object) => Json::Object(
-            object
-                .object_fields()
-                .filter_map(|member| {
-                    let name = member.name()?.text().to_string();
-                    let value = member.value()?;
-                    Some((
-                        name,
-                        read_value(&value, variables, depth.saturating_add(1)),
-                    ))
-                })
-                .collect(),
-        ),
+        Value::ListValue(list) => {
+            let mut elements: Vec<Json> = Vec::new();
+            for element in list.values() {
+                elements.push(read_value(
+                    &element,
+                    variables,
+                    depth.saturating_add(1),
+                    held,
+                )?);
+            }
+            return Ok(Json::Array(elements));
+        }
+        Value::ObjectValue(object) => {
+            let mut members = JsonMap::new();
+            for member in object.object_fields() {
+                let (Some(name), Some(value)) = (member.name(), member.value()) else {
+                    continue;
+                };
+                members.insert(
+                    name.text().to_string(),
+                    read_value(&value, variables, depth.saturating_add(1), held)?,
+                );
+            }
+            return Ok(Json::Object(members));
+        }
         // An enum value is a name, which is how a resolver reads one; every remaining form
         // is a JSON literal already — an integer, a float, a boolean or `null` — so it is
         // read as the document wrote it.
@@ -1300,7 +1584,16 @@ fn read_value(
             let text = other.syntax().text().to_string();
             ::serde_json::from_str(text.trim()).unwrap_or(Json::Null)
         }
+    };
+    // A list and an object are charged through their own elements above, so only the values
+    // that are read whole are weighed here — which is where a substituted variable lands.
+    let weight = mapping_template::weigh(&read, 0)
+        .map_err(|_| format!("{TOO_MUCH_ARGUMENT} {MAX_ARGUMENT_BYTES} bytes."))?;
+    if weight > *held {
+        return Err(format!("{TOO_MUCH_ARGUMENT} {MAX_ARGUMENT_BYTES} bytes."));
     }
+    *held -= weight;
+    Ok(read)
 }
 
 /// How an operation the document does not hold is stated.
@@ -1324,6 +1617,8 @@ const TOO_MANY_FIELDS: &str = "A selection set carries at most";
 const TOO_MANY_NODES: &str = "One request selects at most";
 const CYCLIC_FRAGMENT: &str = "This document spreads a fragment into itself:";
 const TOO_MANY_RUNS: &str = "One request runs at most";
+const TOO_MANY_ERRORS: &str = "This request's result reports at most";
+const TOO_MUCH_ARGUMENT: &str = "One request's selected arguments hold at most";
 const NO_DEFINITION: &str = "This field's resolver carries no definition to run.";
 const TEMPLATES_TOOK_TOO_LONG: &str =
     "This request's mapping templates ran for longer than this endpoint evaluates them in:";

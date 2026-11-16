@@ -111,8 +111,12 @@ mod graphql_api_announced_endpoints;
 mod graphql_api_create_rules;
 #[path = "all/graphql_api_environment_variables_authorization.rs"]
 mod graphql_api_environment_variables_authorization;
+#[path = "all/graphql_api_field_logging.rs"]
+mod graphql_api_field_logging;
 #[path = "all/graphql_api_lifecycle.rs"]
 mod graphql_api_lifecycle;
+#[path = "all/graphql_api_mapping_template_resolvers.rs"]
+mod graphql_api_mapping_template_resolvers;
 #[path = "all/graphql_api_query_endpoint.rs"]
 mod graphql_api_query_endpoint;
 #[path = "all/graphql_api_realtime_endpoint.rs"]
