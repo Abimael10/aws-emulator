@@ -155,13 +155,17 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         // once that call's span has passed: the transition was due at this
         // instant whether or not anybody called.
         for stored in &mut self.integrations {
-            let in_progress = stored.integration.status.as_deref().is_some_and(|status| {
-                status == INTEGRATION_STATUS_CREATING || status == INTEGRATION_STATUS_MODIFYING
-            });
-            if in_progress && now >= stored.active_at {
+            if stored.operation_in_progress() && now >= stored.active_at {
                 stored.integration.status = Some(INTEGRATION_STATUS_ACTIVE.to_string());
             }
         }
+        // And an integration a delete reported as `deleting` is GONE once that
+        // delete's span has passed, which is what makes the delete observable:
+        // the record stays readable in the status the delete put it in until
+        // then, and that removal was due at this instant whether or not anybody
+        // called.
+        self.integrations
+            .retain(|stored| stored.removed_at.is_none_or(|due| now < due));
         // An event is readable for the published retention window and no
         // longer, so one that happened further back than that was due to leave
         // the log at this instant whether or not anybody called.
@@ -788,24 +792,6 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     pub fn integration_named(&self, integration_name: &str) -> Option<&StoredIntegration> {
         self.integrations.iter().find(|stored| {
             stored.integration.integration_name.as_deref() == Some(integration_name)
-        })
-    }
-
-    /// The stored integration that already replicates `source_arn` into
-    /// `target_arn`, if any.
-    ///
-    /// An integration is the replication of ONE source into ONE data warehouse,
-    /// so the (source, target) PAIR is its identity beside its name: a second
-    /// integration over the same pair would be the same replication twice, and
-    /// is refused however it is named.
-    pub fn integration_for_pair(
-        &self,
-        source_arn: &str,
-        target_arn: &str,
-    ) -> Option<&StoredIntegration> {
-        self.integrations.iter().find(|stored| {
-            stored.integration.source_arn.as_deref() == Some(source_arn)
-                && stored.integration.target_arn.as_deref() == Some(target_arn)
         })
     }
 

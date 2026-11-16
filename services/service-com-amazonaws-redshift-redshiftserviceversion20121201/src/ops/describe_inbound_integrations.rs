@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeInboundIntegrationsErrorModeled::IntegrationNotFoundFault(
                             IntegrationNotFoundFault {
-                                message: Some(st::integration_not_found_message(requested)),
+                                message: Some(st::INTEGRATION_NOT_FOUND.to_string()),
                             },
                         )
                         .into(),
@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeInboundIntegrationsErrorModeled::InvalidNamespaceFault(
                             InvalidNamespaceFault {
-                                message: Some(st::integration_namespace_not_found_message(target)),
+                                message: Some(st::INTEGRATION_NAMESPACE_NOT_FOUND.to_string()),
                             },
                         )
                         .into(),

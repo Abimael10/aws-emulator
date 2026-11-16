@@ -119,7 +119,8 @@ enum Expected {
     /// with that source kind's access sentence, and nothing recorded.
     Refused(state::zero_etl_source::SourceKind),
     /// The source passed the check, so the create is refused for its target
-    /// instead — 404 `IntegrationTargetNotFoundFault`.
+    /// instead — 400 `InvalidParameterValue` with the data-warehouse-access
+    /// sentence, which is a DIFFERENT sentence from any source kind's.
     Admitted,
 }
 
@@ -159,13 +160,23 @@ async fn assert_row(emulator: &Emulator, row: &Row) {
         }
         Expected::Admitted => {
             assert_eq!(
-                (answer.status, answer.error_code().as_deref()),
-                (404, Some("IntegrationTargetNotFoundFault")),
+                (
+                    answer.status,
+                    answer.error_code().as_deref(),
+                    answer.text("Message").as_deref()
+                ),
+                (
+                    400,
+                    Some("InvalidParameterValue"),
+                    Some(crate::zero_etl_integration_targets::DATA_WAREHOUSE_ACCESS_MESSAGE)
+                ),
                 "case {}: a source the owner did not deny must reach the target decision; \
-                 expected 404 IntegrationTargetNotFoundFault, got {} / {:?} with body {}",
+                 expected 400 InvalidParameterValue with the data-warehouse-access sentence, \
+                 got {} / {:?} / {:?} with body {}",
                 row.case,
                 answer.status,
                 answer.error_code(),
+                answer.text("Message"),
                 answer.body
             );
         }

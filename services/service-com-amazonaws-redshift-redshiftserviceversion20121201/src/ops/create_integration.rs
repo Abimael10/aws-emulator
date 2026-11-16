@@ -8,9 +8,17 @@
 //! recorded, against the control plane that owns the namespace the `TargetArn`
 //! names — this service's own store for a provisioned cluster's namespace, and
 //! Amazon Redshift Serverless for one of its namespaces
-//! (`crate::state::serverless::resolve_zero_etl_target`) — and classified three
-//! ways: a namespace that exists nowhere answers `IntegrationTargetNotFoundFault`
-//! (404), a serverless namespace whose data warehouse is not active yet answers
+//! (`crate::state::serverless::resolve_zero_etl_target`) — and the data warehouse
+//! it names then has to AUTHORIZE the integration through its own resource policy
+//! (`crate::state::zero_etl_authorization`). A warehouse the caller cannot reach
+//! — a namespace that exists nowhere, or one whose resource policy grants neither
+//! the caller the inbound-integration create nor Amazon Redshift the inbound
+//! authorization for this source, a warehouse with no policy at all included — is
+//! refused 400 `InvalidParameterValue` with the one data-warehouse-access sentence
+//! (`crate::state::ZERO_ETL_DATA_WAREHOUSE_ACCESS`), which says nothing about
+//! which of those held. A warehouse that authorizes the integration while it is
+//! not ready for it answers the transient refusal instead: a serverless namespace
+//! whose data warehouse is not active yet answers
 //! `IntegrationConflictOperationFault` (400) and a provisioned cluster that is
 //! not available answers this operation's own `InvalidClusterStateFault` (400),
 //! so a refused create leaves no integration behind. The SOURCE is a resource
@@ -21,9 +29,9 @@
 //! this service cannot honour the parameters of, refused 400
 //! `InvalidParameterValue` with that source kind's access sentence, while an
 //! owner that cannot be asked at all leaves the question undecided and the ARN is
-//! stored exactly as the request carried it. A second create over
-//! one (`SourceArn`, `TargetArn`) pair, or under one `IntegrationName`, is
-//! refused with `IntegrationAlreadyExistsFault`.
+//! stored exactly as the request carried it. A second create under one
+//! `IntegrationName` of the account is refused with
+//! `IntegrationAlreadyExistsFault`.
 //! The integration becomes `active` a `crate::state::PROVISIONING_SPAN` after
 //! this call.
 //!
@@ -286,10 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // plane — the modelled `TargetArn` pattern admits a `redshift` and a
         // `redshift-serverless` namespace ARN alike — so the ARN is resolved
         // against the control plane that owns the namespace it names, and the
-        // outcome is classified three ways: a namespace that does not exist is
-        // no target at all (404, permanent), one that exists while its data
-        // warehouse is not active cannot take the data yet (400, transient), and
-        // one whose warehouse is active takes the integration.
+        // outcome is classified two ways: a namespace that does not exist is a
+        // data warehouse the caller cannot reach (400 `InvalidParameterValue`,
+        // worded exactly as a warehouse that grants it nothing, because which of
+        // the two held is what a caller may not be told), and one that exists
+        // while its data warehouse is not active cannot take the data yet (400,
+        // transient) — the LATTER only once the warehouse has been shown to
+        // authorize the integration at all, since a caller a warehouse grants
+        // nothing has no reason to wait for it.
         //
         // The SERVERLESS arm is a question for the control plane that owns those
         // namespaces, so it is asked FIRST, with no lock held.
@@ -297,39 +309,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .await;
         match &serverless_target {
             Some(st::serverless::WarehouseTarget::Absent) => {
-                return Err(
-                    CreateIntegrationErrorModeled::IntegrationTargetNotFoundFault(
-                        IntegrationTargetNotFoundFault {
-                            message: Some(st::integration_target_not_found_message(
-                                &input.target_arn,
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            Some(st::serverless::WarehouseTarget::NotActive) => {
-                return Err(
-                    CreateIntegrationErrorModeled::IntegrationConflictOperationFault(
-                        IntegrationConflictOperationFault {
-                            message: Some(st::INTEGRATION_TARGET_NOT_ACTIVE.to_string()),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::ZERO_ETL_DATA_WAREHOUSE_ACCESS,
+                ));
             }
             Some(st::serverless::WarehouseTarget::Unresolvable(reason)) => {
-                // Visible at default verbosity: a create admitted because the
-                // control plane that owns the target could not be asked reads
-                // exactly like one admitted against a warehouse known to be
-                // active, so the degraded path says so rather than passing
-                // quietly — and nothing is assumed from silence.
+                // Visible at default verbosity: the control plane that owns the
+                // target could not be asked, so nothing is KNOWN about the
+                // namespace and nothing is assumed from silence — the create is
+                // not refused on the strength of a peer that never answered, and
+                // it goes on to the authorization decision below, which refuses
+                // it unless this account's own store holds a resource policy
+                // granting it. The degraded path says so rather than passing
+                // quietly, because a target resolved this way reads exactly like
+                // one known to be there.
                 ::tracing::warn!(
                     reason = %reason,
                     "the zero-ETL integration target could not be resolved"
                 );
             }
-            Some(st::serverless::WarehouseTarget::Active) | None => {}
+            Some(
+                st::serverless::WarehouseTarget::Active
+                | st::serverless::WarehouseTarget::NotActive,
+            )
+            | None => {}
         }
 
         // The clock is read once the target has been resolved, so the span the
@@ -341,34 +344,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(started);
 
-        // Identity before capacity: a request that would create nothing keeps
-        // the more specific fault even when the store is at its bound. An
-        // integration is identified by the (source, target) PAIR it replicates
-        // as well as by its name, so a second integration over one pair is
-        // refused however it is named.
-        if store
-            .integration_for_pair(&input.source_arn, &input.target_arn)
-            .is_some()
-        {
-            return Err(
-                CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
-                    IntegrationAlreadyExistsFault {
-                        message: Some(st::integration_pair_exists_message(
-                            &input.source_arn,
-                            &input.target_arn,
+        // ... and the PROVISIONED arm of the same target rule is this store's
+        // own: the namespace holding a cluster's data. A namespace no cluster of
+        // this account holds is a data warehouse the caller cannot reach, so the
+        // EXISTENCE half is answered here, with the same sentence the serverless
+        // arm answers it with; whether the cluster is available enough to take the
+        // data is the readiness half, answered below the authorization decision.
+        let provisioned_target = if serverless_target.is_none() {
+            let Some(target) = store.cluster_with_namespace_arn(&input.target_arn) else {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::ZERO_ETL_DATA_WAREHOUSE_ACCESS,
+                ));
+            };
+            Some((
+                target.cluster.cluster_status.clone(),
+                target.cluster.cluster_identifier.clone(),
+            ))
+        } else {
+            None
+        };
+
+        // The target data warehouse is what AUTHORIZES the integration, through
+        // the resource policy attached to it: it names the principal that may
+        // create an inbound integration into the warehouse and the source Amazon
+        // Redshift may then admit the flow from, so a warehouse that grants the
+        // caller neither — or carries no policy at all — authorizes nothing and
+        // the create is refused with the same sentence a warehouse that does not
+        // exist earns (`st::zero_etl_authorization`). Decided BEFORE the
+        // warehouse's readiness, in BOTH arms, because a caller a warehouse grants
+        // nothing has no reason to wait for it to come up — and learning that the
+        // warehouse is there but not ready is exactly what the one access sentence
+        // withholds.
+        if !st::zero_etl_authorization::integration_is_authorized(
+            store.resource_policy(&input.target_arn),
+            &input.target_arn,
+            &input.source_arn,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::ZERO_ETL_DATA_WAREHOUSE_ACCESS,
+            ));
+        }
+
+        // The warehouse grants the integration; whether it can take the data YET
+        // is the transient half of the target rule, which each control plane words
+        // with its own fault — the model gives this operation its own cluster-state
+        // fault for a provisioned cluster that is not available.
+        if let Some((cluster_status, cluster_identifier)) = provisioned_target {
+            if cluster_status.as_deref() != Some(st::STATUS_AVAILABLE) {
+                return Err(CreateIntegrationErrorModeled::InvalidClusterStateFault(
+                    InvalidClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {} is not in the available state.",
+                            cluster_identifier.unwrap_or_default()
                         )),
+                    },
+                )
+                .into());
+            }
+        }
+        if serverless_target == Some(st::serverless::WarehouseTarget::NotActive) {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationConflictOperationFault(
+                    IntegrationConflictOperationFault {
+                        message: Some(st::INTEGRATION_TARGET_NOT_ACTIVE.to_string()),
                     },
                 )
                 .into(),
             );
         }
+
+        // Identity before capacity: a request that would create nothing keeps
+        // the more specific fault even when the store is at its bound. An
+        // integration is addressed by its NAME within the account, so that name
+        // is what it is unique on and what the refusal states.
         if store.integration_named(&input.integration_name).is_some() {
             return Err(
                 CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
                     IntegrationAlreadyExistsFault {
-                        message: Some(format!(
-                            "Cannot create the integration because an integration with the name {} already exists.",
-                            input.integration_name
+                        message: Some(st::integration_name_exists_message(
+                            &input.integration_name,
+                            ::engine::emulator_account_id(),
                         )),
                     },
                 )
@@ -387,41 +442,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // ... and the PROVISIONED arm of the same target rule is this store's
-        // own: the namespace holding a cluster's data. A cluster that is not
-        // available cannot take the data an integration would replicate into
-        // it, and the model gives this operation its own cluster-state fault
-        // for exactly that condition.
-        if serverless_target.is_none() {
-            let Some(target) = store.cluster_with_namespace_arn(&input.target_arn) else {
-                return Err(
-                    CreateIntegrationErrorModeled::IntegrationTargetNotFoundFault(
-                        IntegrationTargetNotFoundFault {
-                            message: Some(st::integration_target_not_found_message(
-                                &input.target_arn,
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            };
-            if target.cluster.cluster_status.as_deref() != Some(st::STATUS_AVAILABLE) {
-                return Err(CreateIntegrationErrorModeled::InvalidClusterStateFault(
-                    InvalidClusterStateFault {
-                        message: Some(format!(
-                            "Cluster {} is not in the available state.",
-                            target
-                                .cluster
-                                .cluster_identifier
-                                .clone()
-                                .unwrap_or_default()
-                        )),
-                    },
-                )
-                .into());
-            }
         }
 
         // The record every later `DescribeIntegrations` reports verbatim: the
@@ -446,8 +466,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.integrations.push(st::StoredIntegration {
             integration: integration.clone(),
             active_at: started + st::PROVISIONING_SPAN,
+            removed_at: None,
         });
 
         Ok(integration)
     }
 }
+

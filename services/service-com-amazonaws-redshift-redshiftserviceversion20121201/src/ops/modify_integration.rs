@@ -200,11 +200,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = store.integration_position(&input.integration_arn) else {
             return Err(ModifyIntegrationErrorModeled::IntegrationNotFoundFault(
                 IntegrationNotFoundFault {
-                    message: Some(st::integration_not_found_message(&input.integration_arn)),
+                    message: Some(st::INTEGRATION_NOT_FOUND.to_string()),
                 },
             )
             .into());
         };
+        // An integration takes ONE conditional operation at a time, so one a
+        // delete has already been accepted against takes no modify: the change is
+        // refused and the deletion stays on course, rather than a modify
+        // resurrecting an integration on its way out.
+        if store.integrations[position].deletion_accepted() {
+            return Err(
+                ModifyIntegrationErrorModeled::IntegrationConflictOperationFault(
+                    IntegrationConflictOperationFault {
+                        message: Some(st::INTEGRATION_CONFLICT_OPERATION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
         // The NAME is what an account's integrations are unique on, so a rename
         // onto a name another integration carries is refused and changes
         // nothing.

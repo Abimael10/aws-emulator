@@ -2,11 +2,16 @@
 
 //! @op DeleteIntegration
 //!
-//! Removes the zero-ETL integration its ARN names from this account and reports
-//! the removed integration back in the `deleting` status — the status it is in
-//! as the call returns. The record leaves the store, which is what makes the
-//! deletion observable: every later read of that ARN reports it absent. An ARN
-//! that names no integration answers `IntegrationNotFoundFault`.
+//! Marks the zero-ETL integration its ARN names for removal and reports it back
+//! in the `deleting` status — the status it is in as the call returns. The record
+//! STAYS in the store in that status until the delete's own span has passed
+//! (`crate::state::PROVISIONING_SPAN`), so a caller that reads straight after this
+//! call still sees the integration it deleted, and every read after the span
+//! reports it absent. An integration whose own CREATE has not settled yet takes
+//! no delete: the call is refused `IntegrationConflictOperationFault` (400) and
+//! the integration keeps the status it was in, and so is a second delete of one
+//! already on its way out. An ARN that names no integration answers
+//! `IntegrationNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,33 +189,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        store.settle(::service_common::clock::now(&*self.engine));
+        let started = ::service_common::clock::now(&*self.engine);
+        store.settle(started);
 
         let Some(position) = store.integration_position(&input.integration_arn) else {
             return Err(DeleteIntegrationErrorModeled::IntegrationNotFoundFault(
                 IntegrationNotFoundFault {
-                    message: Some(st::integration_not_found_message(&input.integration_arn)),
+                    message: Some(st::INTEGRATION_NOT_FOUND.to_string()),
                 },
             )
             .into());
         };
-        // The record leaves the store, which is what makes the deletion
-        // observable; what this call REPORTS is that record in the status the
-        // deletion put it in.
-        let removed = store.integrations.remove(position);
+        // An integration whose own CREATE has not settled is one its target data
+        // warehouse has not finished taking, so there is nothing there to delete:
+        // the delete is refused and the integration stays describable in the
+        // status it was already in, which is what stops a client destroying an
+        // integration mid-create. A second delete of an integration already on
+        // its way out is a conflict of another kind, worded as the model words
+        // it.
+        let stored = &store.integrations[position];
+        if stored.being_created() {
+            return Err(
+                DeleteIntegrationErrorModeled::IntegrationConflictOperationFault(
+                    IntegrationConflictOperationFault {
+                        message: Some(st::INTEGRATION_DELETE_TARGET_NOT_ACTIVE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if stored.deletion_accepted() {
+            return Err(
+                DeleteIntegrationErrorModeled::IntegrationConflictOperationFault(
+                    IntegrationConflictOperationFault {
+                        message: Some(st::INTEGRATION_CONFLICT_OPERATION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The deletion is UNDER WAY when this returns, which is the status this
+        // call reports: the record stays in the store, and every read of that ARN
+        // keeps reporting it in `deleting` until the delete's own span has passed
+        // and the clock takes it out (`settle`). That is what makes the delete's
+        // effect observable rather than instantaneous.
+        let stored = &mut store.integrations[position];
+        stored.integration.status = Some(st::INTEGRATION_STATUS_DELETING.to_string());
+        stored.removed_at = Some(started + st::PROVISIONING_SPAN);
+        let deleting = stored.integration.clone();
 
         Ok(DeleteIntegrationOutput {
-            integration_arn: removed.integration.integration_arn,
-            integration_name: removed.integration.integration_name,
-            source_arn: removed.integration.source_arn,
-            target_arn: removed.integration.target_arn,
-            status: Some(st::INTEGRATION_STATUS_DELETING.to_string()),
-            errors: removed.integration.errors,
-            create_time: removed.integration.create_time,
-            description: removed.integration.description,
-            kms_key_id: removed.integration.kms_key_id,
-            additional_encryption_context: removed.integration.additional_encryption_context,
-            tags: removed.integration.tags,
+            integration_arn: deleting.integration_arn,
+            integration_name: deleting.integration_name,
+            source_arn: deleting.source_arn,
+            target_arn: deleting.target_arn,
+            status: deleting.status,
+            errors: deleting.errors,
+            create_time: deleting.create_time,
+            description: deleting.description,
+            kms_key_id: deleting.kms_key_id,
+            additional_encryption_context: deleting.additional_encryption_context,
+            tags: deleting.tags,
         })
     }
 }

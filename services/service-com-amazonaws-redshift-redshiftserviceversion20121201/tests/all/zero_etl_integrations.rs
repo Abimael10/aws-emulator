@@ -63,6 +63,16 @@ async fn seeded() -> (Emulator, String) {
     // stands still, which is what keeps a record a later row means to read in
     // its transient state in it.
     emulator.advance_clock(state::PROVISIONING_SPAN);
+    // The data warehouse is what AUTHORIZES an integration into it, so the target
+    // every row names carries the resource policy that grants it: these rows are
+    // about the integration record, not about the grant (see
+    // [`crate::zero_etl_integration_authorization`]).
+    crate::zero_etl_integration_targets::authorize_target(
+        &emulator,
+        "seed the target's resource policy",
+        &namespace,
+    )
+    .await;
     (emulator, namespace)
 }
 
@@ -378,8 +388,10 @@ async fn an_integration_is_recorded_against_the_namespace_it_replicates_into() {
         collision.error_code()
     );
 
-    // A DELETE reports the record in the status the deletion put it in, and takes
-    // it out of every later report.
+    // A DELETE reports the record in the status the deletion put it in, and the
+    // record stays readable in that status until the delete's own span has passed
+    // — so the delete's effect is observable rather than instantaneous.
+    emulator.advance_clock(state::PROVISIONING_SPAN);
     let deleted = call(
         &emulator,
         "DeleteIntegration",
@@ -393,6 +405,24 @@ async fn an_integration_is_recorded_against_the_namespace_it_replicates_into() {
         deleted.status,
         deleted.body
     );
+    let during_delete = call(
+        &emulator,
+        "DescribeIntegrations",
+        &[("IntegrationArn".to_string(), arns[0].clone())],
+    )
+    .await;
+    assert_eq!(
+        (
+            during_delete.status,
+            during_delete.text("Status").as_deref()
+        ),
+        (200, Some(state::INTEGRATION_STATUS_DELETING)),
+        "case read an integration being deleted: expected 200 and the deleting status, got {} \
+         with body {}",
+        during_delete.status,
+        during_delete.body
+    );
+    emulator.advance_clock(state::PROVISIONING_SPAN);
     let after_delete = emulator.call("DescribeIntegrations", &[]).await;
     assert_eq!(
         all_text(&after_delete.body, "IntegrationArn"),
@@ -428,13 +458,16 @@ async fn an_arn_that_names_no_integration_is_refused_by_every_operation() {
         );
         assert_eq!(
             answer.text("Message").as_deref(),
-            Some(state::integration_not_found_message(UNKNOWN_ARN).as_str()),
-            "case {action} with an unknown ARN: expected the message to name it, got {:?}",
+            // Written out literally, so a change to the wording fails this case
+            // rather than following the handler.
+            Some("The requested integration doesn't exist."),
+            "case {action} with an unknown ARN: expected the fixed not-found sentence, got {:?}",
             answer.text("Message")
         );
     }
 
-    // A TARGET that names no namespace this account holds is no target at all.
+    // A TARGET that names no namespace this account holds is a data warehouse
+    // the caller cannot reach.
     let unknown_namespace = "arn:aws:redshift:us-west-2:000000000000:namespace/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     let refused = call(
         &emulator,
@@ -451,11 +484,19 @@ async fn an_arn_that_names_no_integration_is_refused_by_every_operation() {
     .await;
     assert_eq!(
         (refused.status, refused.error_code().as_deref()),
-        (404, Some("IntegrationTargetNotFoundFault")),
-        "case an unknown target: expected 404 IntegrationTargetNotFoundFault, got {} / {:?} with body {}",
+        (400, Some("InvalidParameterValue")),
+        "case an unknown target: expected 400 InvalidParameterValue, got {} / {:?} with body {}",
         refused.status,
         refused.error_code(),
         refused.body
+    );
+    assert_eq!(
+        refused.text("Message").as_deref(),
+        // The sibling suite's literal copy of the sentence, pinned there rather
+        // than read back from the handler's own constant.
+        Some(crate::zero_etl_integration_targets::DATA_WAREHOUSE_ACCESS_MESSAGE),
+        "case an unknown target: expected the data-warehouse-access sentence, got {:?}",
+        refused.text("Message")
     );
     let inbound = call(
         &emulator,
@@ -471,7 +512,8 @@ async fn an_arn_that_names_no_integration_is_refused_by_every_operation() {
         inbound.error_code()
     );
 
-    // A cluster that is not available cannot take an integration yet.
+    // A cluster that is not available cannot take an integration yet — once its
+    // namespace authorizes the integration at all, which is decided first.
     let coming_up = emulator.create_minimal("integration-coming-up").await;
     assert_eq!(
         coming_up.status, 200,
@@ -481,6 +523,12 @@ async fn an_arn_that_names_no_integration_is_refused_by_every_operation() {
     let creating_namespace = coming_up
         .text("ClusterNamespaceArn")
         .expect("the creating cluster reports its namespace ARN");
+    crate::zero_etl_integration_targets::authorize_target(
+        &emulator,
+        "authorize the coming-up cluster's namespace",
+        &creating_namespace,
+    )
+    .await;
     let too_early = call(
         &emulator,
         "CreateIntegration",

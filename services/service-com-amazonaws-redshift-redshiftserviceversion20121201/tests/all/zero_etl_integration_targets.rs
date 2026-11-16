@@ -11,13 +11,20 @@
 //! @pattern `^arn:aws[a-z\-]*:redshift(-serverless)?:[a-z0-9\-]+:[0-9]{12}:(namespace\/|namespace:)[a-z0-9\-]+$`)
 //! — so the ARN is resolved against the control plane that owns the namespace it
 //! names and the outcome is classified three ways: a namespace that exists
-//! nowhere is the permanent not-found class (404
-//! `IntegrationTargetNotFoundFault`), a namespace that EXISTS while its data
-//! warehouse is not active is the transient conflict class (400
-//! `IntegrationConflictOperationFault`), and a namespace whose warehouse is
-//! active takes the integration (200, `Status` `creating`).** A refused create
-//! records nothing, and a second integration over one (`SourceArn`, `TargetArn`)
-//! pair is refused with `IntegrationAlreadyExistsFault`.
+//! nowhere is a data warehouse the caller cannot reach (400
+//! `InvalidParameterValue`, the one data-warehouse-access sentence), a namespace
+//! that EXISTS while its data warehouse is not active is the transient conflict
+//! class (400 `IntegrationConflictOperationFault`), and a namespace whose
+//! warehouse is active takes the integration (200, `Status` `creating`).** A
+//! refused create records nothing, and a second create under one
+//! `IntegrationName` of the account is refused with
+//! `IntegrationAlreadyExistsFault`.
+//!
+//! Every target a row expects to get past the authorization decision carries the
+//! resource policy that authorizes an integration into it
+//! ([`zero_etl_target_policy`]), because a data warehouse that grants the caller
+//! nothing is refused before its readiness is judged — WHICH grant a policy has
+//! to state is the subject of [`crate::zero_etl_integration_authorization`].
 //!
 //! Every case drives a real HTTP request through the same `MultiServiceRouter`
 //! the production router builds, with the Redshift Serverless control plane
@@ -54,11 +61,24 @@ pub(crate) const NOT_ACTIVE_MESSAGE: &str = "Unable to perform create operation 
                                   warehouse is not active. Wait until the data warehouse is \
                                   active and try again.";
 
+/// The ONE sentence Amazon Redshift words a data warehouse the caller cannot
+/// reach with — it does not exist, or its resource policy grants the caller
+/// nothing — reproduced here independently of the handler for the same reason.
+///
+/// `pub(crate)` so the sibling suites pin the same sentence rather than keeping
+/// another copy of it.
+pub(crate) const DATA_WAREHOUSE_ACCESS_MESSAGE: &str =
+    "You don't have access to zero-ETL integrations because the Amazon Redshift data \
+     warehouse doesn't exist or you don't have the required permissions. Check the \
+     resource policy of the data warehouse and make sure your user or role is specified \
+     as an authorized principal.";
+
 /// What a `TargetArn` resolves to, as the three refusal/acceptance classes the
 /// rule names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolution {
-    /// 404 `IntegrationTargetNotFoundFault`: no namespace of either control plane.
+    /// 400 `InvalidParameterValue`: no namespace of either control plane, so the
+    /// data warehouse cannot be reached.
     Absent,
     /// 400 `IntegrationConflictOperationFault`: the namespace is there, the
     /// warehouse on it is not active.
@@ -103,6 +123,59 @@ async fn create_integration(
         ],
     )
     .await
+}
+
+/// The resource policy a target data warehouse carries to AUTHORIZE a zero-ETL
+/// integration into it: the documented pair of grants — this account may create
+/// an inbound integration into the warehouse, and Amazon Redshift may admit the
+/// inbound flow on its behalf.
+///
+/// Unconditional, so it authorizes an integration from any source of the account:
+/// which SOURCE a policy narrows the grants to is the subject of the
+/// [`crate::zero_etl_integration_authorization`] suite, not of these tables.
+///
+/// `pub(crate)` so every suite whose rows need an authorized target attaches the
+/// same document rather than another copy of it.
+pub(crate) fn zero_etl_target_policy() -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": { "AWS": format!("arn:aws:iam::{}:root", engine::emulator_account_id()) },
+                "Action": "redshift:CreateInboundIntegration",
+            },
+            {
+                "Effect": "Allow",
+                "Principal": { "Service": "redshift.amazonaws.com" },
+                "Action": "redshift:AuthorizeInboundIntegration",
+            },
+        ],
+    })
+    .to_string()
+}
+
+/// Attach [`zero_etl_target_policy`] to the data warehouse `target` names, so a
+/// create into it is authorized.
+///
+/// A resource policy is attached to the ARN the request names, so a target
+/// addressed by SEVERAL of the forms the modelled pattern admits is authorized
+/// under each of them.
+pub(crate) async fn authorize_target(emulator: &Emulator, case: &str, target: &str) {
+    let answer = call(
+        emulator,
+        "PutResourcePolicy",
+        &[
+            ("ResourceArn".to_string(), target.to_string()),
+            ("Policy".to_string(), zero_etl_target_policy()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: attaching the target's resource policy expected 200, got {} with body {}",
+        answer.status, answer.body
+    );
 }
 
 /// Create a serverless namespace through the control plane that owns it, and
@@ -193,8 +266,8 @@ async fn assert_row(emulator: &Emulator, row: &Row) {
         Resolution::Absent => {
             assert_eq!(
                 (answer.status, answer.error_code().as_deref()),
-                (404, Some("IntegrationTargetNotFoundFault")),
-                "case {}: expected 404 IntegrationTargetNotFoundFault, got {} / {:?} with body {}",
+                (400, Some("InvalidParameterValue")),
+                "case {}: expected 400 InvalidParameterValue, got {} / {:?} with body {}",
                 row.case,
                 answer.status,
                 answer.error_code(),
@@ -202,8 +275,8 @@ async fn assert_row(emulator: &Emulator, row: &Row) {
             );
             assert_eq!(
                 answer.text("Message").as_deref(),
-                Some(format!("Integration target not found: {}", row.target).as_str()),
-                "case {}: expected the not-found message to name the ARN the request carried, got {:?}",
+                Some(DATA_WAREHOUSE_ACCESS_MESSAGE),
+                "case {}: expected the data-warehouse-access sentence, got {:?}",
                 row.case,
                 answer.text("Message")
             );
@@ -262,6 +335,13 @@ async fn a_target_namespace_resolves_against_the_control_plane_that_owns_it() {
         live_by_id.contains(&live_id),
         "case seed: expected the minted ARN to carry the namespace id, got {live_by_id} and {live_id}"
     );
+    // Each target a row expects to get PAST the authorization decision carries
+    // the resource policy that authorizes the integration, under every ARN form
+    // the rows address it by — what a row asserts here is the RESOLUTION class,
+    // not the grant.
+    for target in [&live_by_id, &live_colon, &live_by_name, &bare_arn] {
+        authorize_target(&emulator, "seed the target's resource policy", target).await;
+    }
 
     // PHASE 1: the warehouse is not active, so every form of a namespace that
     // EXISTS is the transient conflict class and every form of one that does not
@@ -425,11 +505,17 @@ async fn a_target_namespace_resolves_against_the_control_plane_that_owns_it() {
 }
 
 #[tokio::test]
-async fn one_source_and_target_pair_is_one_integration() {
+async fn an_integration_name_is_unique_within_the_account() {
     let emulator = Emulator::with_serverless();
     let (namespace_arn, _id) = create_namespace(&emulator, "zetl-pair").await;
     create_workgroup(&emulator, "zetl-pair-wg", "zetl-pair").await;
     await_workgroup(&emulator, "zetl-pair-wg").await;
+    let (other_namespace_arn, _other_id) = create_namespace(&emulator, "zetl-pair-two").await;
+    create_workgroup(&emulator, "zetl-pair-two-wg", "zetl-pair-two").await;
+    await_workgroup(&emulator, "zetl-pair-two-wg").await;
+    for target in [&namespace_arn, &other_namespace_arn] {
+        authorize_target(&emulator, "seed the target's resource policy", target).await;
+    }
 
     let created = create_integration(&emulator, "zetlPairFirst", SOURCE, &namespace_arn).await;
     assert_eq!(
@@ -438,13 +524,34 @@ async fn one_source_and_target_pair_is_one_integration() {
         created.status, created.body
     );
 
-    // The PAIR is what an integration is: a second one over the same source and
-    // the same target is refused however it is named.
-    for (case, name) in [
-        ("the same pair under another name", "zetlPairSecond"),
-        ("the same pair under the same name", "zetlPairFirst"),
+    // The NAME is what an account's integrations are unique on, so a second
+    // create under a name the account already holds is refused whatever it
+    // replicates — the same pair, another source, or another target.
+    //
+    // The sentence is written out LITERALLY here, with only the requested name
+    // and the account id interpolated, so a change to its wording fails this case
+    // rather than following the handler.
+    let taken = "zetlPairFirst";
+    let expected_message = format!(
+        "A zero-ETL integration named {taken} already exists in account {}. Integration names \
+         must be unique within an account. Specify a different name for your integration, or \
+         delete the existing integration.",
+        engine::emulator_account_id()
+    );
+    for (case, source, target) in [
+        ("the taken name over the same pair", SOURCE, &namespace_arn),
+        (
+            "the taken name over another source",
+            "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
+            &namespace_arn,
+        ),
+        (
+            "the taken name over another target",
+            SOURCE,
+            &other_namespace_arn,
+        ),
     ] {
-        let duplicate = create_integration(&emulator, name, SOURCE, &namespace_arn).await;
+        let duplicate = create_integration(&emulator, taken, source, target).await;
         assert_eq!(
             (duplicate.status, duplicate.error_code().as_deref()),
             (400, Some("IntegrationAlreadyExistsFault")),
@@ -455,40 +562,35 @@ async fn one_source_and_target_pair_is_one_integration() {
         );
         assert_eq!(
             duplicate.text("Message").as_deref(),
-            Some(
-                format!(
-                    "An integration from source {SOURCE} to target {namespace_arn} already exists. \
-                     Only one integration is allowed."
-                )
-                .as_str()
-            ),
-            "case {case}: expected the message to name the source and the target, got {:?}",
+            Some(expected_message.as_str()),
+            "case {case}: expected the name-uniqueness sentence naming the name and the \
+             account, got {:?}",
             duplicate.text("Message")
         );
     }
 
-    // Another source into the same target is another integration, so the pair
-    // rule is about the pair and not about the target alone.
-    let other_source = create_integration(
+    // And a FREE name is accepted over the very pair the taken name was refused
+    // over, so the rule is about the name and nothing else.
+    let other_name = create_integration(
         &emulator,
-        "zetlPairOtherSource",
-        "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
+        "zetlPairOtherName",
+        SOURCE,
         &namespace_arn,
     )
     .await;
     assert_eq!(
-        other_source.status, 200,
-        "case another source into the same target: expected 200, got {} with body {}",
-        other_source.status, other_source.body
+        other_name.status, 200,
+        "case a free name over the same pair: expected 200, got {} with body {}",
+        other_name.status, other_name.body
     );
     let listed = emulator.call("DescribeIntegrations", &[]).await;
     assert_eq!(
         all_text(&listed.body, "IntegrationName"),
         vec![
             "zetlPairFirst".to_string(),
-            "zetlPairOtherSource".to_string()
+            "zetlPairOtherName".to_string()
         ],
-        "case read the pair cases back: expected the two accepted integrations, got body {}",
+        "case read the name cases back: expected the two accepted integrations, got body {}",
         listed.body
     );
 }

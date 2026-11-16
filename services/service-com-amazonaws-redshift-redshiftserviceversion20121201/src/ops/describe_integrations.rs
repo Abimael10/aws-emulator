@@ -175,20 +175,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // The only write a read makes: the `creating` / `modifying` ->
-        // `active` transitions the clock already owes.
+        // `active` transitions, and the removal of an integration a delete
+        // marked, that the clock already owes.
         store.settle(::service_common::clock::now(&*self.engine));
 
         // The integrations this request reports: the ONE the ARN names, or every
         // one the account holds when it names none. ONE lookup decides both, so
         // the refusal and the selection can never disagree — an ARN that names
-        // nothing is a refusal, not an empty report.
+        // nothing is a refusal, not an empty report. An integration a delete put
+        // in `deleting` is still one the account holds, so it is still reported:
+        // that is what makes the delete's own effect observable.
         let selected: Vec<&CreateIntegrationOutput> = match input.integration_arn.as_deref() {
             Some(requested) => match store.integration(requested) {
                 Some(stored) => vec![&stored.integration],
                 None => {
                     return Err(DescribeIntegrationsErrorModeled::IntegrationNotFoundFault(
                         IntegrationNotFoundFault {
-                            message: Some(st::integration_not_found_message(requested)),
+                            message: Some(st::INTEGRATION_NOT_FOUND.to_string()),
                         },
                     )
                     .into())

@@ -18,7 +18,8 @@
 //! cannot see: the sibling `zero_etl_integration_sources` suite names a target
 //! that exists nowhere in every row, so a reordering that let the target's class
 //! answer first would still pass there while turning the source verdict into a
-//! transient conflict (`IntegrationConflictOperationFault`) or a not-found —
+//! transient conflict (`IntegrationConflictOperationFault`) or a data-warehouse
+//! access refusal —
 //! refusals that tell a client to retry a call that can never succeed, instead of
 //! naming the table and the policies the operator has to fix.
 //!
@@ -39,7 +40,8 @@ use crate::zero_etl_integration_sources::{
     create_bucket, create_integration, create_table, table_arn,
 };
 use crate::zero_etl_integration_targets::{
-    await_workgroup, create_namespace, create_workgroup, NOT_ACTIVE_MESSAGE,
+    authorize_target, await_workgroup, create_namespace, create_workgroup,
+    DATA_WAREHOUSE_ACCESS_MESSAGE, NOT_ACTIVE_MESSAGE,
 };
 
 /// How Amazon Redshift words a zero-ETL source table it cannot reach — it is not
@@ -67,7 +69,8 @@ const SOURCE_BUCKET_MESSAGE: &str =
 enum Decision {
     /// The SOURCE decided: 400 `InvalidParameterValue` with that kind's sentence.
     SourceAbsent(&'static str),
-    /// The source passed, so the TARGET decided: it exists nowhere (404).
+    /// The source passed, so the TARGET decided: it exists nowhere, so the data
+    /// warehouse cannot be reached (400).
     TargetAbsent,
     /// The source passed, so the TARGET decided: it exists, not active (400).
     TargetNotActive,
@@ -109,13 +112,23 @@ async fn assert_row(emulator: &Emulator, row: &Row) {
         }
         Decision::TargetAbsent => {
             assert_eq!(
-                (answer.status, answer.error_code().as_deref()),
-                (404, Some("IntegrationTargetNotFoundFault")),
+                (
+                    answer.status,
+                    answer.error_code().as_deref(),
+                    answer.text("Message").as_deref()
+                ),
+                (
+                    400,
+                    Some("InvalidParameterValue"),
+                    Some(DATA_WAREHOUSE_ACCESS_MESSAGE)
+                ),
                 "case {}: a source its owner holds leaves the answer to the target, so expected \
-                 404 IntegrationTargetNotFoundFault; got {} / {:?} with body {}",
+                 400 InvalidParameterValue with the data-warehouse-access sentence; got {} / \
+                 {:?} / {:?} with body {}",
                 row.case,
                 answer.status,
                 answer.error_code(),
+                answer.text("Message"),
                 answer.body
             );
         }
@@ -187,6 +200,12 @@ async fn an_absent_source_decides_whatever_the_target_would_have_answered() {
     let (live_target, _live_id) = create_namespace(&emulator, "zetl-ord-live").await;
     create_workgroup(&emulator, "zetl-ord-live-wg", "zetl-ord-live").await;
     await_workgroup(&emulator, "zetl-ord-live-wg").await;
+    // Both targets that EXIST carry the resource policy that authorizes an
+    // integration into them, so the class each one answers with is its own
+    // readiness rather than a missing grant.
+    for target in [&bare_target, &live_target] {
+        authorize_target(&emulator, "seed the target's resource policy", target).await;
+    }
 
     let absent_table = table_arn("zetl-ord-never-created");
     let absent_bucket = "arn:aws:s3:::zetl-ord-never-created".to_string();

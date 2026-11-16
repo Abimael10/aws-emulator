@@ -83,6 +83,10 @@ pub mod serverless;
 /// against the service that owns the table or bucket it names.
 pub mod zero_etl_source;
 
+/// Whether the data warehouse a `CreateIntegration` replicates into AUTHORIZES
+/// that integration, decided from the resource policy attached to it.
+pub mod zero_etl_authorization;
+
 /// The IAM Identity Center instance an application registration creates its
 /// managed application in, resolved against the service that owns the account's
 /// instances, and the denial a registration naming another instance carries.
@@ -3726,22 +3730,43 @@ pub fn integration_arn(integration_name: &str, region: &str) -> String {
 
 /// What every operation on an integration answers when the ARN it resolves
 /// names none.
-pub fn integration_not_found_message(integration_arn: &str) -> String {
-    format!("Integration not found: {integration_arn}")
-}
-
-/// How Amazon Redshift states that the (source, target) pair a create names is
-/// already replicating.
 ///
-/// An integration replicates ONE source into ONE data warehouse, so the pair is
-/// what an integration is unique on and what the sentence names. Fixed text bar
-/// the two ARNs, which are the request's own `SourceArn` and `TargetArn`.
-pub fn integration_pair_exists_message(source_arn: &str, target_arn: &str) -> String {
+/// Entirely fixed text, and it names NEITHER the ARN the request carried nor
+/// anything else about it: the refusal is the one sentence Amazon Redshift states
+/// for an `IntegrationArn` that resolves to no integration, on every operation
+/// that resolves one (`DeleteIntegration`, `DescribeIntegrations`,
+/// `DescribeInboundIntegrations` and `ModifyIntegration`).
+pub const INTEGRATION_NOT_FOUND: &str = "The requested integration doesn't exist.";
+
+/// What `CreateIntegration` answers when the `IntegrationName` it carries is one
+/// an integration of this account already has.
+///
+/// An integration is addressed by its NAME within the account, so the name is what
+/// an account's integrations are unique on and what the sentence names, together
+/// with the account the uniqueness holds in; the remediation it gives is
+/// accordingly to rename or to drop the integration that holds the name. Fixed
+/// text bar the requested name and the caller's own account identifier.
+pub fn integration_name_exists_message(integration_name: &str, account_id: &str) -> String {
     format!(
-        "An integration from source {source_arn} to target {target_arn} already exists. \
-         Only one integration is allowed."
+        "A zero-ETL integration named {integration_name} already exists in account \
+         {account_id}. Integration names must be unique within an account. Specify a \
+         different name for your integration, or delete the existing integration."
     )
 }
+
+/// What a zero-ETL request is refused with when the data warehouse its `TargetArn`
+/// names cannot be reached: it is not a data warehouse of this account at all, or
+/// it is one whose own resource policy grants the caller nothing
+/// ([`zero_etl_authorization`]).
+///
+/// Entirely fixed text, and deliberately ONE sentence for both conditions: which
+/// of them held is exactly what a caller that may not read the data warehouse must
+/// not be told, so the remediation points at the resource policy instead.
+pub const ZERO_ETL_DATA_WAREHOUSE_ACCESS: &str =
+    "You don't have access to zero-ETL integrations because the Amazon Redshift data \
+     warehouse doesn't exist or you don't have the required permissions. Check the \
+     resource policy of the data warehouse and make sure your user or role is specified \
+     as an authorized principal.";
 
 /// What `CreateIntegration` answers when the data warehouse its `TargetArn`
 /// names exists but is not active yet.
@@ -3754,17 +3779,36 @@ pub const INTEGRATION_TARGET_NOT_ACTIVE: &str = "Unable to perform create operat
      specified zero-ETL integration because its target Redshift data warehouse is not active. \
      Wait until the data warehouse is active and try again.";
 
-/// What `CreateIntegration` answers when its `TargetArn` names no data warehouse
-/// at all — a permanent condition, naming the ARN the request carried.
-pub fn integration_target_not_found_message(target_arn: &str) -> String {
-    format!("Integration target not found: {target_arn}")
-}
+/// What `DeleteIntegration` answers when the integration its ARN names is still
+/// under the conditional operation that created or changed it, so its target data
+/// warehouse has not finished taking it.
+///
+/// The same sentence [`INTEGRATION_TARGET_NOT_ACTIVE`] states for a create, worded
+/// for the operation that is refused: entirely fixed text, and transient — the
+/// client is told to wait and try again rather than to change anything.
+pub const INTEGRATION_DELETE_TARGET_NOT_ACTIVE: &str = "Unable to perform delete operation on \
+     the specified zero-ETL integration because its target Redshift data warehouse is not \
+     active. Wait until the data warehouse is active and try again.";
+
+/// What an operation against one integration answers when ANOTHER operation
+/// against it is still in flight — a second delete of an integration already being
+/// deleted, or a modify of one.
+///
+/// The sentence the model itself states for the condition
+/// (`smithy_query(query="shape", shape="IntegrationConflictOperationFault")`), so
+/// the refusal says what the modelled fault means and nothing is invented beside
+/// it.
+pub const INTEGRATION_CONFLICT_OPERATION: &str =
+    "A conflicting conditional operation is currently in progress against this resource. \
+     This typically occurs when there are multiple requests being made to the same \
+     resource at the same time, and these requests conflict with each other.";
 
 /// Why a `TargetArn` that names no namespace of either control plane is refused
 /// by an operation that FILTERS on it rather than creating against it.
-pub fn integration_namespace_not_found_message(target_arn: &str) -> String {
-    format!("Namespace not found: {target_arn}")
-}
+///
+/// Entirely fixed text, and it names no ARN: the refusal is the one sentence
+/// Amazon Redshift states for a namespace that does not resolve.
+pub const INTEGRATION_NAMESPACE_NOT_FOUND: &str = "The requested namespace doesn't exist.";
 
 /// A zero-ETL integration as this service stores it: the modelled projection
 /// `DescribeIntegrations` reports, plus when the status transition the last call
@@ -3778,9 +3822,41 @@ pub struct StoredIntegration {
     /// [`INTEGRATION_STATUS_MODIFYING`] -> [`INTEGRATION_STATUS_ACTIVE`]
     /// transition falls due. See [`PROVISIONING_SPAN`].
     pub active_at: Instant,
+    /// When the integration a `DeleteIntegration` accepted is GONE, for one a
+    /// delete marked [`INTEGRATION_STATUS_DELETING`] — `None` while no delete has
+    /// been accepted. A delete is a transition like any other, so the record stays
+    /// readable in the status the delete put it in until that instant, which is
+    /// what makes the delete's own effect observable. See [`PROVISIONING_SPAN`].
+    pub removed_at: Option<Instant>,
 }
 
 impl StoredIntegration {
+    /// Whether a conditional operation is still in flight against this
+    /// integration: the create or the modify that put it in a transient status
+    /// has not settled yet.
+    ///
+    /// What the clock owes a transition for ([`INTEGRATION_STATUS_ACTIVE`]),
+    /// which is why the state machine is read from the integration's own status
+    /// rather than from each caller's idea of it.
+    pub fn operation_in_progress(&self) -> bool {
+        self.integration.status.as_deref().is_some_and(|status| {
+            status == INTEGRATION_STATUS_CREATING || status == INTEGRATION_STATUS_MODIFYING
+        })
+    }
+
+    /// Whether this integration is still being CREATED — the one transient
+    /// status in which its target data warehouse has not finished taking it, so
+    /// there is nothing there to delete yet.
+    pub fn being_created(&self) -> bool {
+        self.integration.status.as_deref() == Some(INTEGRATION_STATUS_CREATING)
+    }
+
+    /// Whether a `DeleteIntegration` has already been accepted against this
+    /// integration, so it is on its way out and takes no further operation.
+    pub fn deletion_accepted(&self) -> bool {
+        self.removed_at.is_some()
+    }
+
     /// The INBOUND projection of this integration: what
     /// `DescribeInboundIntegrations` reports for it, which is the same
     /// integration seen from the target that receives the data.

@@ -209,6 +209,8 @@ mod storage_summary;
 mod table_restore;
 #[path = "all/usage_limits.rs"]
 mod usage_limits;
+#[path = "all/zero_etl_integration_authorization.rs"]
+mod zero_etl_integration_authorization;
 #[path = "all/zero_etl_integration_sources.rs"]
 mod zero_etl_integration_sources;
 #[path = "all/zero_etl_integration_targets.rs"]
