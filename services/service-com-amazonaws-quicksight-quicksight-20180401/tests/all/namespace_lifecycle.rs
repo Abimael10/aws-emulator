@@ -299,7 +299,9 @@ async fn create_namespace_persists_it_and_describe_reports_it() {
         );
 
         // A second create of the same name in the same account is a conflict, whatever
-        // it submits.
+        // it submits: the refusal states the status the namespace holding the name is
+        // in — `CREATED` here, since the transition above has been brought forward — and
+        // names the requested namespace and the account.
         let (status, body) = create_namespace(&harness, row.account, row.body()).await;
         assert_eq!(
             status, 409,
@@ -308,8 +310,13 @@ async fn create_namespace_persists_it_and_describe_reports_it() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!("The namespace {namespace} already exists.")),
-            "case {case:?}: the conflict must name the namespace: {body}"
+            json!(format!(
+                "Cannot create a namespace when status is CREATED. Failed to create \
+                 namespace {namespace} for account {}. ",
+                row.account
+            )),
+            "case {case:?}: the conflict must name the status, the namespace and the \
+             account: {body}"
         );
         assert_eq!(
             body["__type"],
@@ -435,8 +442,12 @@ async fn every_account_already_has_the_default_namespace() {
         );
         assert_eq!(
             body["Message"],
-            json!("The namespace default already exists."),
-            "case {case:?}: the conflict must name the namespace: {body}"
+            json!(format!(
+                "Cannot create a namespace when status is CREATED. Failed to create \
+                 namespace default for account {account}. "
+            )),
+            "case {case:?}: the conflict must name the status, the namespace and the \
+             account: {body}"
         );
         assert_eq!(
             body["__type"],

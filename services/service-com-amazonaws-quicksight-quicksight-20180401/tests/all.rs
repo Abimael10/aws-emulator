@@ -37,6 +37,8 @@ mod identity_type_refusal;
 mod list_refresh_schedules;
 #[path = "all/mutation_response_status.rs"]
 mod mutation_response_status;
+#[path = "all/namespace_conflict_message.rs"]
+mod namespace_conflict_message;
 #[path = "all/namespace_lifecycle.rs"]
 mod namespace_lifecycle;
 #[path = "all/refresh_schedule_lifecycle.rs"]

@@ -214,11 +214,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A namespace is unique within the account, and every account already has the
         // namespace the model's `Namespace` members call the default one, so neither can
         // be created a second time: a name already in use conflicts with the namespace
-        // holding it.
-        if store.namespace_exists(&input.aws_account_id, &input.namespace, now) {
+        // holding it. What forbids the create is the status that namespace is in, so the
+        // refusal reports the status the stored record carries at this instant — the one
+        // `DescribeNamespace` reports too — rather than a fixed word.
+        if let Some(status) = store.namespace_status(&input.aws_account_id, &input.namespace, now) {
             return Err(CreateNamespaceErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!("The namespace {} already exists.", input.namespace)),
+                    message: Some(crate::state::namespace_exists_message(
+                        status,
+                        &input.namespace,
+                        &input.aws_account_id,
+                    )),
                     request_id: Some(request_id),
                 },
             )

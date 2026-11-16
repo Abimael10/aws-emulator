@@ -34,7 +34,14 @@ const REGION: &str = "us-west-2";
 
 /// `DeleteNamespace`: `DELETE /accounts/{AwsAccountId}/namespaces/{Namespace}`.
 /// Source: smithy_query(query="operation", operation="DeleteNamespace").
-async fn delete_namespace(harness: &Harness, account: &str, namespace: &str) -> (u16, Value) {
+///
+/// `pub(crate)` so a sibling suite that needs a namespace on its way out drives the
+/// delete the same way this one does, rather than shaping the request a second time.
+pub(crate) async fn delete_namespace(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+) -> (u16, Value) {
     harness
         .call(
             "DELETE",

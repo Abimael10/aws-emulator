@@ -5,11 +5,13 @@
 //! QuickSight identifies the resource a refusal is about the way the service itself
 //! does, and every handler that refuses the same error class renders the same
 //! template, so the wording a client reads does not depend on which operation it
-//! called. Two templates cover the resources this crate holds:
+//! called. These templates cover the resources this crate holds:
 //!
 //! * a resource addressed by an ARN (a folder, a data source, a data set, a theme)
 //!   is named by that ARN — `"<Kind> <arn> already exists"` for a conflict and
 //!   `"<Kind> <arn> is not found"` for a miss, neither ending in a period;
+//! * a namespace, whose create is refused by the status the namespace already holding
+//!   the name is in, is named together with that status and the account it belongs to;
 //! * a group or a user, which QuickSight's identity path serves, is named by its name
 //!   together with the account it belongs to, and a refusal the account's own
 //!   configuration causes is named by that account too — each of them closed by the
@@ -147,6 +149,20 @@ pub fn group_exists_message(group_name: &str, aws_account_id: &str) -> String {
     format!(
         "Group {group_name} already exists. {}",
         identity_scope_fields(aws_account_id, &[("groupName", group_name)])
+    )
+}
+
+/// The conflict `CreateNamespace` reports for a `Namespace` the account already holds.
+///
+/// What forbids the create is the status the namespace holding that name is in, so the
+/// sentence states that status — whichever `NamespaceStatus` the existing namespace
+/// reports as of this call, not a constant — and the clause after it names the create
+/// that failed: the requested name and the account it was requested in, both as the
+/// request carried them. The message ends in a period and a space.
+pub fn namespace_exists_message(status: &str, namespace: &str, aws_account_id: &str) -> String {
+    format!(
+        "Cannot create a namespace when status is {status}. Failed to create namespace \
+         {namespace} for account {aws_account_id}. "
     )
 }
 
