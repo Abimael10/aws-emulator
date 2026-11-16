@@ -31,5 +31,10 @@
 //! is gone rather than kept, and the pair stands where its name sorts to, for the same reason as
 //! the runs before it.
 //!
+//! A FIFTH run came the way the third had: two branches that had each reduced the header were
+//! merged, and the merge kept all three reductions one after another, so two lines of the block
+//! stood three times over and the target's own guard suite reported them. It was reduced to one
+//! copy of each paragraph again, which is the rule `all_rs_carries_one_header_block.rs` reads.
+//!
 //! The module stays declared because it is a file under `tests/all/`, which this crate's
 //! build script requires a declaration for.

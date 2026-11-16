@@ -31,6 +31,8 @@ mod action_type_definitions;
 mod action_type_provider_entitlement;
 #[path = "all/action_type_wire_form.rs"]
 mod action_type_wire_form;
+#[path = "all/active_execution_ceiling.rs"]
+mod active_execution_ceiling;
 #[path = "all/approval_result_messages.rs"]
 mod approval_result_messages;
 #[path = "all/approval_reviewer.rs"]

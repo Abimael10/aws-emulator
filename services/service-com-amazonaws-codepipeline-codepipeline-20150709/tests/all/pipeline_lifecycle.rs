@@ -976,7 +976,10 @@ async fn start_pipeline_execution_mints_stored_ids_and_honours_its_idempotency_t
 
 /// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, the modelled
 /// `PipelineExecutionId` pattern, checked without pulling in a regex engine.
-fn is_execution_id(candidate: &str) -> bool {
+///
+/// `pub(crate)` so the suite that pins the active-execution ceiling reads the ids it is
+/// handed against the same pattern rather than growing a second copy of this.
+pub(crate) fn is_execution_id(candidate: &str) -> bool {
     let groups: Vec<&str> = candidate.split('-').collect();
     groups.len() == 5
         && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
