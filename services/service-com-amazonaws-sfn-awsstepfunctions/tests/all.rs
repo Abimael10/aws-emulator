@@ -328,6 +328,12 @@ mod unserved_request_refusals;
 mod update_state_machine_alias_effects;
 #[path = "all/vended_log_delivery_clock.rs"]
 mod vended_log_delivery_clock;
+// `vended_log_destination_grants` pins which GRANTS on a log destination are access to it:
+// a control-plane call stating a logging configuration is served for every role whose
+// documents allow it the delivery actions on the destination, and refused only where they
+// allow it none.
+#[path = "all/vended_log_destination_grants.rs"]
+mod vended_log_destination_grants;
 #[path = "all/vended_log_event_members.rs"]
 mod vended_log_event_members;
 #[path = "all/zz_scratch.rs"]
