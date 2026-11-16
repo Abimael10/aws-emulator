@@ -131,6 +131,8 @@ mod kinesis_target_delivery;
 mod kinesis_target_shard_affinity;
 #[path = "all/kinesis_target_stream_consumption.rs"]
 mod kinesis_target_stream_consumption;
+#[path = "all/lambda_target_async_destination_records.rs"]
+mod lambda_target_async_destination_records;
 #[path = "all/lambda_target_handler_failure_is_not_a_delivery_failure.rs"]
 mod lambda_target_handler_failure_is_not_a_delivery_failure;
 #[path = "all/lambda_target_handler_records_the_invoking_rule.rs"]
