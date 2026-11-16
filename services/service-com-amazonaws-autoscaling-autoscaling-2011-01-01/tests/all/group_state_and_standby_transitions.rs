@@ -115,7 +115,10 @@ async fn create_group(
 }
 
 /// What `DescribeAutoScalingGroups` answers for one group.
-async fn describe(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite over `EnterStandby`'s instance set reads a group through
+/// this one reader rather than a second copy of it.
+pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = query(
         router,
         "DescribeAutoScalingGroups",
@@ -131,7 +134,10 @@ async fn describe(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Look again until the group reports exactly `wanted` instances in `state`, or
 /// [`DEADLINE`] passes. Answers the instance ids it last read, in document order.
-async fn instances_in_state(
+///
+/// `pub(crate)` for the same reason as [`describe`]: one poll-until-the-condition helper for
+/// every suite here that waits on a lifecycle state.
+pub(crate) async fn instances_in_state(
     router: &MultiServiceRouter,
     name: &str,
     state: &str,

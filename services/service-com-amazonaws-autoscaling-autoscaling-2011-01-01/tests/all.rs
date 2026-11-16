@@ -37,6 +37,8 @@ mod describe_load_balancer_target_groups;
 mod describe_policies_page_size;
 #[path = "all/describe_tags.rs"]
 mod describe_tags;
+#[path = "all/enter_standby_instance_set.rs"]
+mod enter_standby_instance_set;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/group_configuration_refusals.rs"]
