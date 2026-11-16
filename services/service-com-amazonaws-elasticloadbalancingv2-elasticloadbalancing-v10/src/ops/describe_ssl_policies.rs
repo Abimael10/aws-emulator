@@ -254,6 +254,18 @@ pub fn policy_ssl_protocols(name: &str) -> Option<&'static [&'static str]> {
         .map(|entry| entry.ssl_protocols)
 }
 
+/// Whether the published catalogue carries a cipher of this name at all — the cross-check
+/// that what another reading of this service SPELLS for a cipher (the `ssl_cipher` a load
+/// balancer's access-log record carries for a connection,
+/// [`crate::service::listener_socket`]) is spelled the way `Cipher$Name` spells it here, and
+/// not in a second convention a reader could not look up.
+#[must_use]
+pub fn publishes_cipher(name: &str) -> bool {
+    POLICY_CATALOGUE
+        .iter()
+        .any(|entry| entry.ciphers.contains(&name))
+}
+
 impl PolicyEntry {
     /// This entry as the modelled `SslPolicy`.
     fn to_shape(&self) -> SslPolicy {

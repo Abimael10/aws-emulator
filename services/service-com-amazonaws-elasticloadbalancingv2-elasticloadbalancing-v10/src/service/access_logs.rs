@@ -205,6 +205,21 @@ pub(super) struct AnsweredRequest {
     pub(super) redirect_url: Option<String>,
     /// The failure class a load-balancer-generated answer carries ([`reason`]).
     pub(super) error_reason: Option<String>,
+    /// What the TLS connection the request arrived over negotiated, for a request that
+    /// arrived over one: the protocol version (`ssl_protocol`) and the cipher suite
+    /// (`ssl_cipher`), each spelled as the published security-policy catalogue spells it,
+    /// the name the `ClientHello` asked for (`domain_name`) and the ARN of the certificate
+    /// presented for that name (`chosen_cert_arn`).
+    ///
+    /// Observed where the handshake was run, which is the load balancer's own socket
+    /// ([`super::listener_socket`]). Each is absent for a request that arrived in the clear,
+    /// and the two name fields for a client that asked for no name — which is what Elastic
+    /// Load Balancing writes for a listener that terminates no TLS and for a client that
+    /// sends no server name.
+    pub(super) ssl_protocol: Option<String>,
+    pub(super) ssl_cipher: Option<String>,
+    pub(super) domain_name: Option<String>,
+    pub(super) chosen_certificate_arn: Option<String>,
     /// The priority of the rule that matched, and 0 where no rule did — which is the value
     /// Elastic Load Balancing writes for a request its default actions answered.
     pub(super) matched_rule_priority: i32,
@@ -237,6 +252,10 @@ impl Default for AnsweredRequest {
             actions: Vec::new(),
             redirect_url: None,
             error_reason: None,
+            ssl_protocol: None,
+            ssl_cipher: None,
+            domain_name: None,
+            chosen_certificate_arn: None,
             matched_rule_priority: 0,
         }
     }
@@ -277,18 +296,24 @@ impl AnsweredRequest {
             self.sent_bytes.to_string(),
             quoted(&self.request_line()),
             quoted(self.user_agent.as_deref().unwrap_or(ABSENT)),
-            // The cipher and protocol a TLS connection negotiated are the SOCKET's, which
-            // this plane does not observe: it serves the same request however it arrived.
-            ABSENT.to_string(),
-            ABSENT.to_string(),
+            // The cipher and protocol a TLS connection negotiated, observed where the
+            // handshake was run and carried here with the request
+            // ([`super::listener_socket`]); the absent marker for a request that arrived in
+            // the clear, which negotiated neither.
+            self.ssl_cipher
+                .clone()
+                .unwrap_or_else(|| ABSENT.to_string()),
+            self.ssl_protocol
+                .clone()
+                .unwrap_or_else(|| ABSENT.to_string()),
             self.target_group_arn
                 .clone()
                 .unwrap_or_else(|| ABSENT.to_string()),
             quoted(self.trace_id.as_deref().unwrap_or(ABSENT)),
-            // The name a TLS client asked for, and the certificate that was presented for
-            // it, are the socket's too.
-            quoted(ABSENT),
-            quoted(ABSENT),
+            // The name the TLS client asked for, and the certificate the listener presented
+            // for it — the same connection's, from the same observation.
+            quoted(self.domain_name.as_deref().unwrap_or(ABSENT)),
+            quoted(self.chosen_certificate_arn.as_deref().unwrap_or(ABSENT)),
             self.matched_rule_priority.to_string(),
             timestamp(self.received_at),
             quoted(&self.actions.join(",")),

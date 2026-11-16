@@ -25,3 +25,36 @@ Replay detail: 'Error: Check timed out after 60.0s'. Expected: at least one gzip
 
 ## Steps to Reproduce
 1. Clone the repo and run the behavioral suite. 2. Replay elbv2__s3.log-edge-producers-alb-https-access-log-records-negotiated-tls-and-sni. 3. Directly: create an ALB with an HTTPS listener, enable access_logs.s3.enabled with a granted bucket and prefix, issue an HTTPS request with SNI, then list the prefix.
+
+## Resolution
+
+Partly implemented, partly blocked on the core listener API.
+
+* FIXED — the access-log record of a request an HTTPS listener served now carries the facts of
+  the CONNECTION that request arrived over: the protocol version and the cipher suite the
+  handshake negotiated (`ssl_protocol`, `ssl_cipher`, spelled as `SslPolicy$SslProtocols` and
+  `Cipher$Name` spell them in the catalogue `DescribeSSLPolicies` publishes), the name the
+  `ClientHello` asked for (`domain_name`) and the ARN of the certificate presented for that
+  name (`chosen_cert_arn`). Each of the four was written as the absent marker before, for
+  every request, because the handshake is terminated on the load balancer's own socket and
+  the plane that answers the request never saw it; the socket now states what it observed on
+  the leg it hands the plane, and the plane takes those values off the request so neither a
+  listener's rules nor a target sees a header of the emulator's own. A request that arrived
+  in the clear still carries the absent marker in all four, which is what Elastic Load
+  Balancing writes for a listener that terminates no TLS. Pinned end to end over a real TLS
+  connection to the published address in
+  `tests/all/alb_https_access_log_tls.rs`.
+* BLOCKED (vendor) — the recorded check dials the load balancer's `DNSName` on the PORT its
+  listener declares (443) and is refused, so it never reaches the record above. A load
+  balancer can only answer there once a resource listener can be opened on a requested port:
+  the core owns the socket, the interface and the port (`vendor/server/src/listeners.rs`,
+  `bind_std`/`bind_tokio` and `tcp_plaintext`, which takes no requested port — an OS-assigned
+  port or the first free port of `EMULATOR_LISTENER_PORT_RANGE`), and
+  `vendor/engine/src/lib.rs` states that a service never binds a socket or chooses a port
+  itself. Needed there: a listener API that accepts a requested port, or a per-resource
+  loopback address the service can then open the declared ports on — with which
+  `crate::state::open_load_balancer_endpoint` would open one listener per `Listener$Port` and
+  publish `DNSName` as the bare host the model documents. This is the same core gap recorded
+  under Cause 1 of
+  `issues/things-that-now-work/20261110T220525Z-elbv2-5-net-new-data-plane-causes-dnsname.md`.
+

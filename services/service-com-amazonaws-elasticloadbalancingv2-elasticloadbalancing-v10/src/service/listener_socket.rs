@@ -127,11 +127,19 @@ fn in_flight() -> Arc<Semaphore> {
 /// [`crate::service::data_plane::FORWARDED_HOST_HEADER`], which this leg SETS so a client's
 /// own value cannot travel as one), and the two framing headers describe a body this leg
 /// re-frames itself.
-const HEADERS_NOT_FORWARDED: [&str; 4] = [
+///
+/// The four TLS headers are here too: the facts of the connection are what this leg
+/// OBSERVES and states ([`crate::service::data_plane::TLS_HEADERS`]), so a client's own
+/// value under one of those names never travels as an observation of its own handshake.
+const HEADERS_NOT_FORWARDED: &[&str] = &[
     "host",
     "content-length",
     "transfer-encoding",
     crate::service::data_plane::FORWARDED_HOST_HEADER,
+    crate::service::data_plane::TLS_PROTOCOL_HEADER,
+    crate::service::data_plane::TLS_CIPHER_HEADER,
+    crate::service::data_plane::TLS_SERVER_NAME_HEADER,
+    crate::service::data_plane::TLS_CERTIFICATE_ARN_HEADER,
 ];
 
 /// Serves ONE load balancer's socket: it terminates TLS under that load balancer's own
@@ -199,9 +207,30 @@ struct Accepted {
     load_balancer_name: String,
     conn: ListenerConn,
     listener_port: Option<i32>,
+    /// What the handshake on this connection negotiated, for a connection that ran one.
+    negotiated: NegotiatedTls,
     /// The framing of each request on this connection, as the CLIENT wrote it
     /// ([`crate::service::request_head`]).
     framings: Arc<crate::service::request_head::Framings>,
+}
+
+/// What the TLS handshake on one connection negotiated — the facts of the CONNECTION, which
+/// only the end that ran the handshake observes, and which the load balancer's own
+/// access-log record carries for the request it carried ([`super::access_logs`]).
+///
+/// Every field is absent for a connection in the clear, and the two name fields for a client
+/// that asked for no server name. Cloned per request on the connection, as the handles
+/// around it are.
+#[derive(Clone, Debug, Default)]
+struct NegotiatedTls {
+    /// The protocol version, spelled as the published `SslProtocols` catalogue spells it.
+    protocol: Option<&'static str>,
+    /// The cipher suite, spelled as the published `Cipher$Name` catalogue spells it.
+    cipher: Option<&'static str>,
+    /// The name the `ClientHello` asked for (RFC 6066 §3).
+    server_name: Option<String>,
+    /// The ARN of the certificate presented for that name.
+    certificate_arn: Option<String>,
 }
 
 /// What one request's FRAMING is judged against: the framings the client wrote on this
@@ -255,6 +284,7 @@ impl ListenerSocket {
             load_balancer_name,
             conn,
             listener_port,
+            negotiated,
             framings,
         } = accepted;
         let io = ::hyper_util::rt::TokioIo::new(conn);
@@ -263,6 +293,7 @@ impl ListenerSocket {
         let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
             let callback = callback.clone();
             let load_balancer_name = load_balancer_name.clone();
+            let negotiated = negotiated.clone();
             // What this request was framed with, the store, and the load balancer it reached,
             // so each request of the connection is judged by the mode that load balancer is
             // at WHEN it arrives: a client that modifies the attribute between two requests
@@ -283,7 +314,14 @@ impl ListenerSocket {
                 Ok::<_, ::std::convert::Infallible>(
                     ::emulator_server::contain_panics(
                         facts,
-                        answer(callback, framing, load_balancer_name, listener_port, request),
+                        answer(
+                            callback,
+                            framing,
+                            load_balancer_name,
+                            listener_port,
+                            negotiated,
+                            request,
+                        ),
                     )
                     .await,
                 )
@@ -334,16 +372,29 @@ impl ListenerSocket {
                 load_balancer_name: plan.load_balancer_name,
                 conn: Box::new(sniffed),
                 listener_port: plan.listener_port,
+                // A connection in the clear negotiated nothing: there is no protocol, no
+                // cipher, no server name and no certificate to report for it.
+                negotiated: NegotiatedTls::default(),
                 framings,
             });
         }
-        let conn = match tls_server_config(&plan.certificates, plan.ssl_policy.as_deref()) {
+        let presented: Vec<Arc<CertificateKeyMaterial>> = plan
+            .certificates
+            .iter()
+            .map(|(_arn, material)| Arc::clone(material))
+            .collect();
+        let (conn, negotiated) = match tls_server_config(&presented, plan.ssl_policy.as_deref()) {
             // The account's own certificates, as the listener names them.
             Some(config) => {
                 let acceptor = ::tokio_rustls::TlsAcceptor::from(config);
                 match ::tokio::time::timeout(handshake_deadline(), acceptor.accept(prefixed)).await
                 {
-                    Ok(Ok(stream)) => Box::new(stream) as ListenerConn,
+                    Ok(Ok(stream)) => {
+                        // What the handshake just agreed, read off the connection that ran
+                        // it: this is the only place it can be observed.
+                        let negotiated = negotiated_tls(&stream, &plan.certificates);
+                        (Box::new(stream) as ListenerConn, negotiated)
+                    }
                     Ok(Err(error)) => {
                         ::tracing::debug!(
                             %error,
@@ -356,6 +407,8 @@ impl ListenerSocket {
             }
             // No key material for any certificate this listener names: the connection is
             // served by the core's own TLS server, under the emulator's own certificate.
+            // That handshake is the core's, so this service observed none of it and reports
+            // nothing about it.
             None => {
                 let upgrader = self.upgrader.clone()?;
                 match ::tokio::time::timeout(
@@ -364,7 +417,7 @@ impl ListenerSocket {
                 )
                 .await
                 {
-                    Ok(Ok((upgraded, _negotiated))) => upgraded,
+                    Ok(Ok((upgraded, _negotiated))) => (upgraded, NegotiatedTls::default()),
                     Ok(Err(error)) => {
                         ::tracing::debug!(
                             %error,
@@ -385,6 +438,7 @@ impl ListenerSocket {
             load_balancer_name: plan.load_balancer_name,
             conn: Box::new(sniffed),
             listener_port: plan.listener_port,
+            negotiated,
             framings,
         })
     }
@@ -442,19 +496,148 @@ impl ListenerSocket {
         })
     }
 
-    /// The key material of each certificate in `certificate_arns`, in that order — the
-    /// listener's default certificate first, then its certificate list — skipping every
-    /// certificate no material is held for.
-    fn material_of(&self, certificate_arns: &[String]) -> Vec<Arc<CertificateKeyMaterial>> {
+    /// The key material of each certificate in `certificate_arns`, beside the ARN it is held
+    /// under, in that order — the listener's default certificate first, then its certificate
+    /// list — skipping every certificate no material is held for and every one whose material
+    /// does not load as a key a handshake can be run with.
+    ///
+    /// The ARN travels with the material because the certificate a handshake PRESENTS is one
+    /// of these, and the access-log record of the request it carries names it
+    /// (`chosen_cert_arn`). The unloadable ones are dropped here so this list is exactly what
+    /// the selection holds ([`::service_common::acm_certificate_termination`]), and the ARN
+    /// this module reports for a handshake is the ARN of the certificate that selection
+    /// chose.
+    fn material_of(&self, certificate_arns: &[String]) -> Vec<(String, Arc<CertificateKeyMaterial>)> {
         let Some(directory) = self.key_material.as_ref() else {
             return Vec::new();
         };
         let directory = directory.lock();
         certificate_arns
             .iter()
-            .filter_map(|arn| directory.material(arn))
+            .filter_map(|arn| {
+                let material = directory.material(arn)?;
+                ::service_common::acm_certificate_termination::certified_key(&material)
+                    .is_some()
+                    .then(|| (arn.clone(), material))
+            })
             .collect()
     }
+}
+
+/// What the handshake `stream` completed negotiated, and which of `certificates` it
+/// presented.
+///
+/// The protocol version and the cipher suite are spelled as the published security-policy
+/// catalogue spells them ([`protocol_name`], [`cipher_name`]), so what a record carries for a
+/// connection and what `DescribeSSLPolicies` publishes for the policy it ran under are the
+/// same strings. The certificate is resolved by the same rule the handshake chose it with
+/// ([`chosen_certificate`]).
+fn negotiated_tls<IO>(
+    stream: &::tokio_rustls::server::TlsStream<IO>,
+    certificates: &[(String, Arc<CertificateKeyMaterial>)],
+) -> NegotiatedTls
+where
+    IO: ::tokio::io::AsyncRead + ::tokio::io::AsyncWrite + Unpin,
+{
+    let (_io, connection) = stream.get_ref();
+    let server_name = connection.server_name().map(str::to_string);
+    NegotiatedTls {
+        protocol: connection.protocol_version().and_then(protocol_name),
+        cipher: connection
+            .negotiated_cipher_suite()
+            .and_then(|suite| cipher_name(suite.suite())),
+        certificate_arn: chosen_certificate(certificates, server_name.as_deref()),
+        server_name,
+    }
+}
+
+/// The `SslProtocol` spelling of one negotiated protocol version, and `None` for a version
+/// the published catalogue names none of — nothing is reported for a version this service
+/// cannot name.
+fn protocol_name(version: ::rustls::ProtocolVersion) -> Option<&'static str> {
+    match version {
+        ::rustls::ProtocolVersion::TLSv1_2 => Some(TLS_1_2),
+        ::rustls::ProtocolVersion::TLSv1_3 => Some(TLS_1_3),
+        _ => None,
+    }
+}
+
+/// The `Cipher$Name` spelling of one negotiated cipher suite, and `None` for a suite this
+/// table does not name.
+fn cipher_name(suite: ::rustls::CipherSuite) -> Option<&'static str> {
+    NEGOTIATED_CIPHER_NAMES
+        .iter()
+        .find(|(negotiated, _name)| *negotiated == suite)
+        .map(|(_negotiated, name)| *name)
+}
+
+/// How the published cipher catalogue spells each suite this emulator's TLS implementation
+/// can negotiate.
+///
+/// `Cipher$Name` is "the name of the cipher", and the catalogue
+/// `DescribeSSLPolicies` publishes ([`crate::ops::describe_ssl_policies`]) spells a TLS 1.3
+/// suite by its registered name (`TLS_AES_128_GCM_SHA256`) and a TLS 1.2 suite by its
+/// OpenSSL name (`ECDHE-RSA-AES128-GCM-SHA256`) — so that is the spelling a record of a
+/// connection carries, and the one a reader can look up in that catalogue.
+const NEGOTIATED_CIPHER_NAMES: &[(::rustls::CipherSuite, &str)] = &[
+    (
+        ::rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+        "TLS_AES_128_GCM_SHA256",
+    ),
+    (
+        ::rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+        "TLS_AES_256_GCM_SHA384",
+    ),
+    (
+        ::rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        "TLS_CHACHA20_POLY1305_SHA256",
+    ),
+    (
+        ::rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+    ),
+    (
+        ::rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+    ),
+    (
+        ::rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        "ECDHE-RSA-AES128-GCM-SHA256",
+    ),
+    (
+        ::rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        "ECDHE-RSA-AES256-GCM-SHA384",
+    ),
+    (
+        ::rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        "ECDHE-ECDSA-CHACHA20-POLY1305",
+    ),
+    (
+        ::rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        "ECDHE-RSA-CHACHA20-POLY1305",
+    ),
+];
+
+/// Which of `certificates` a handshake asking for `server_name` was presented: the first
+/// whose own names cover that name, and the listener's DEFAULT certificate — the first entry
+/// — for a client that asked for a name none of them covers or for no name at all.
+///
+/// The same selection the handshake itself ran
+/// ([`::service_common::acm_certificate_termination`]), over the same list in the same
+/// order, so the ARN reported is the ARN of the certificate the client was really presented.
+fn chosen_certificate(
+    certificates: &[(String, Arc<CertificateKeyMaterial>)],
+    server_name: Option<&str>,
+) -> Option<String> {
+    if let Some(asked_for) = server_name {
+        if let Some((arn, _material)) = certificates
+            .iter()
+            .find(|(_arn, material)| material.covers(asked_for))
+        {
+            return Some(arn.clone());
+        }
+    }
+    certificates.first().map(|(arn, _material)| arn.clone())
 }
 
 /// What a connection of one kind is served with ([`ListenerSocket::plan`]).
@@ -464,10 +647,10 @@ struct ConnectionPlan {
     /// The security policy the addressed listener was configured with, and `None` for a
     /// listener that names none — which negotiates under the default policy.
     ssl_policy: Option<String>,
-    /// The certificates the addressed listener presents, default certificate first. Empty
-    /// for a connection in the clear, and for a TLS listener this emulator holds no key
-    /// material for.
-    certificates: Vec<Arc<CertificateKeyMaterial>>,
+    /// The certificates the addressed listener presents, default certificate first, each
+    /// beside the ARN it is held under. Empty for a connection in the clear, and for a TLS
+    /// listener this emulator holds no presentable key material for.
+    certificates: Vec<(String, Arc<CertificateKeyMaterial>)>,
 }
 
 /// The TLS server configuration a listener presenting `certificates` under the security
@@ -568,6 +751,7 @@ async fn answer(
     framing: Framing,
     load_balancer_name: String,
     listener_port: Option<i32>,
+    negotiated: NegotiatedTls,
     request: ::http::Request<::hyper::body::Incoming>,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
@@ -597,6 +781,7 @@ async fn answer(
             collected.to_bytes(),
             &load_balancer_name,
             listener_port,
+            &negotiated,
         ) else {
             return generated(BAD_REQUEST, MALFORMED_REQUEST_TARGET);
         };
@@ -653,6 +838,7 @@ fn forwarded(
     body: Bytes,
     load_balancer_name: &str,
     listener_port: Option<i32>,
+    negotiated: &NegotiatedTls,
 ) -> Option<RtRequest> {
     let request_path = parts.uri.path();
     if carries_a_dot_segment(request_path) {
@@ -686,6 +872,31 @@ fn forwarded(
         .filter(|dialled| !dialled.is_empty())
     {
         builder = builder.header(crate::service::data_plane::FORWARDED_HOST_HEADER, dialled);
+    }
+    // What the handshake this connection ran negotiated, which only this end observed
+    // ([`crate::service::data_plane::TLS_HEADERS`]): stated for a connection that ran one,
+    // and for nothing else.
+    for (name, value) in [
+        (
+            crate::service::data_plane::TLS_PROTOCOL_HEADER,
+            negotiated.protocol.map(str::to_string),
+        ),
+        (
+            crate::service::data_plane::TLS_CIPHER_HEADER,
+            negotiated.cipher.map(str::to_string),
+        ),
+        (
+            crate::service::data_plane::TLS_SERVER_NAME_HEADER,
+            negotiated.server_name.clone(),
+        ),
+        (
+            crate::service::data_plane::TLS_CERTIFICATE_ARN_HEADER,
+            negotiated.certificate_arn.clone(),
+        ),
+    ] {
+        if let Some(value) = value {
+            builder = builder.header(name, value);
+        }
     }
     for (name, value) in parts.headers.iter() {
         if HEADERS_NOT_FORWARDED.contains(&name.as_str()) {
@@ -873,7 +1084,7 @@ mod tests {
                 .body(())
                 .expect("the case's own request");
             let (parts, ()) = request.into_parts();
-            let forwarded = forwarded(parts, Bytes::new(), "my-alb", *port)
+            let forwarded = forwarded(parts, Bytes::new(), "my-alb", *port, &NegotiatedTls::default())
                 .unwrap_or_else(|| panic!("case {requested:?}: the request must forward"));
             assert_eq!(
                 forwarded.uri().to_string(),
@@ -938,12 +1149,166 @@ mod tests {
                 .body(())
                 .expect("the case's own request");
             let (parts, ()) = request.into_parts();
-            let rendered = forwarded(parts, Bytes::new(), "my-alb", Some(80));
+            let rendered = forwarded(
+                parts,
+                Bytes::new(),
+                "my-alb",
+                Some(80),
+                &NegotiatedTls::default(),
+            );
             assert_eq!(
                 rendered.is_some(),
                 *forwards,
                 "case {requested:?}: expected it to forward {forwards}, got {:?}",
                 rendered.map(|request| request.uri().to_string())
+            );
+        }
+    }
+
+    /// RULE: the facts of the CONNECTION travel on the leg as this end observed them, and a
+    /// value a client wrote under one of those names never does.
+    #[test]
+    fn the_leg_states_what_the_handshake_negotiated_and_nothing_a_client_wrote() {
+        // The rows span what the observation generalises over: a connection that negotiated
+        // everything (protocol, cipher, a server name and a certificate), one whose client
+        // asked for no name, and a connection in the clear, which negotiated nothing.
+        let cases: &[(&str, NegotiatedTls, [Option<&str>; 4])] = &[
+            (
+                "a client that asked for a name",
+                NegotiatedTls {
+                    protocol: Some(TLS_1_3),
+                    cipher: Some("TLS_AES_128_GCM_SHA256"),
+                    server_name: Some("api.example.com".to_string()),
+                    certificate_arn: Some("arn:aws:acm:us-west-2:111122223333:certificate/c1"
+                        .to_string()),
+                },
+                [
+                    Some(TLS_1_3),
+                    Some("TLS_AES_128_GCM_SHA256"),
+                    Some("api.example.com"),
+                    Some("arn:aws:acm:us-west-2:111122223333:certificate/c1"),
+                ],
+            ),
+            (
+                "a client that asked for no name",
+                NegotiatedTls {
+                    protocol: Some(TLS_1_2),
+                    cipher: Some("ECDHE-RSA-AES128-GCM-SHA256"),
+                    server_name: None,
+                    certificate_arn: Some("arn:aws:acm:us-west-2:111122223333:certificate/c2"
+                        .to_string()),
+                },
+                [
+                    Some(TLS_1_2),
+                    Some("ECDHE-RSA-AES128-GCM-SHA256"),
+                    None,
+                    Some("arn:aws:acm:us-west-2:111122223333:certificate/c2"),
+                ],
+            ),
+            (
+                "a connection in the clear",
+                NegotiatedTls::default(),
+                [None, None, None, None],
+            ),
+        ];
+        for (case, negotiated, expected) in cases {
+            // Every one of those names, forged by the client: none of them may travel.
+            let mut builder = ::http::Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("host", "127.0.0.1:52811");
+            for name in crate::service::data_plane::TLS_HEADERS {
+                builder = builder.header(name, "forged-by-the-client");
+            }
+            let (parts, ()) = builder.body(()).expect("the case's own request").into_parts();
+            let forwarded = forwarded(parts, Bytes::new(), "my-alb", Some(443), negotiated)
+                .unwrap_or_else(|| panic!("case {case:?}: the request must forward"));
+            for (name, expected) in crate::service::data_plane::TLS_HEADERS
+                .iter()
+                .zip(expected.iter())
+            {
+                let carried = forwarded.headers().get(*name).map(ToString::to_string);
+                assert_eq!(
+                    carried.as_deref(),
+                    *expected,
+                    "case {case:?}: expected {name} to carry {expected:?}, got {carried:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: every protocol version and cipher suite this emulator's TLS implementation can
+    /// negotiate has a name to report, and that name is the one the published security-policy
+    /// catalogue spells it with.
+    #[test]
+    fn every_negotiable_protocol_and_cipher_has_the_published_name() {
+        let versions: &[(::rustls::ProtocolVersion, Option<&str>)] = &[
+            (::rustls::ProtocolVersion::TLSv1_2, Some(TLS_1_2)),
+            (::rustls::ProtocolVersion::TLSv1_3, Some(TLS_1_3)),
+            // A version no listener of this emulator completes a handshake under is named
+            // by no published policy, so nothing is reported for it.
+            (::rustls::ProtocolVersion::TLSv1_0, None),
+            (::rustls::ProtocolVersion::SSLv3, None),
+        ];
+        for (version, expected) in versions {
+            let named = protocol_name(*version);
+            assert_eq!(
+                named, *expected,
+                "case {version:?}: expected {expected:?}, got {named:?}"
+            );
+        }
+        // Every suite the provider this tree terminates handshakes with can negotiate: each
+        // has a name, and each name is one `DescribeSSLPolicies` publishes — except the two
+        // TLS 1.2 ChaCha20 suites, which no predefined policy of this service offers and
+        // which are therefore named by the same OpenSSL convention without appearing in it.
+        let unpublished = [
+            "ECDHE-ECDSA-CHACHA20-POLY1305",
+            "ECDHE-RSA-CHACHA20-POLY1305",
+        ];
+        for suite in ::rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES {
+            let suite = suite.suite();
+            let named = cipher_name(suite);
+            let Some(named) = named else {
+                panic!("case {suite:?}: expected a name for a suite this emulator negotiates");
+            };
+            assert!(
+                crate::ops::describe_ssl_policies::publishes_cipher(named)
+                    || unpublished.contains(&named),
+                "case {suite:?}: expected {named} to be spelled as the published catalogue \
+                 spells a cipher"
+            );
+        }
+    }
+
+    /// RULE: the certificate reported for a handshake is the one the selection presented —
+    /// the first entry whose own names cover the name asked for, and the listener's default
+    /// certificate for a name none of them covers or for no name at all.
+    #[test]
+    fn the_reported_certificate_is_the_one_the_selection_presents() {
+        let held: Vec<(String, Arc<CertificateKeyMaterial>)> = vec![
+            ("arn:default".to_string(), material(&["default.example.com"])),
+            ("arn:listed".to_string(), material(&["listed.example.net"])),
+            ("arn:wildcard".to_string(), material(&["*.apps.example.org"])),
+        ];
+        // The rows span what the selection generalises over: the default certificate's own
+        // name, a certificate-list entry's name, a label under a wildcard entry, a name no
+        // entry covers, no name at all, and a listener presenting nothing.
+        type Presented = [(String, Arc<CertificateKeyMaterial>)];
+        let nothing: &Presented = &[];
+        let cases: &[(&str, Option<&str>, &Presented, Option<&str>)] = &[
+            ("the default certificate's name", Some("default.example.com"), &held, Some("arn:default")),
+            ("a certificate-list entry", Some("listed.example.net"), &held, Some("arn:listed")),
+            ("a label under a wildcard", Some("api.apps.example.org"), &held, Some("arn:wildcard")),
+            ("a name no entry covers", Some("other.example.com"), &held, Some("arn:default")),
+            ("no name at all", None, &held, Some("arn:default")),
+            ("a listener presenting nothing", Some("default.example.com"), nothing, None),
+        ];
+        for (case, asked_for, certificates, expected) in cases {
+            let chosen = chosen_certificate(certificates, *asked_for);
+            assert_eq!(
+                chosen.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {chosen:?}"
             );
         }
     }

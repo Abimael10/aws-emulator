@@ -288,6 +288,32 @@ const SIGV4_SCHEME: &str = "AWS4-HMAC-SHA256";
 /// client's own value never travels with the request it forwards.
 pub(super) const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
 
+/// The headers the facts of the TLS CONNECTION a request arrived over travel in.
+///
+/// An HTTPS listener terminates the handshake on the load balancer's own socket, so the
+/// protocol version and cipher suite that handshake negotiated, the name the `ClientHello`
+/// asked for and the certificate presented for that name are observed THERE
+/// ([`super::listener_socket`]) — they are facts of the connection, which this plane does
+/// not hold, and the load balancer's own access-log record carries every one of them
+/// ([`super::access_logs`]).
+///
+/// The socket SETS them and drops whatever the client sent under those names, so nothing a
+/// client wrote travels as an observation of its own connection; and this plane TAKES them
+/// off the request ([`ConnectionTls::taken_from`]), so neither a listener's rules nor a
+/// target ever sees a header of this emulator's own.
+pub(super) const TLS_PROTOCOL_HEADER: &str = "x-emulator-elbv2-tls-protocol";
+pub(super) const TLS_CIPHER_HEADER: &str = "x-emulator-elbv2-tls-cipher";
+pub(super) const TLS_SERVER_NAME_HEADER: &str = "x-emulator-elbv2-tls-server-name";
+pub(super) const TLS_CERTIFICATE_ARN_HEADER: &str = "x-emulator-elbv2-tls-certificate-arn";
+
+/// Every header above, for the leg that sets them and the read that takes them off.
+pub(super) const TLS_HEADERS: [&str; 4] = [
+    TLS_PROTOCOL_HEADER,
+    TLS_CIPHER_HEADER,
+    TLS_SERVER_NAME_HEADER,
+    TLS_CERTIFICATE_ARN_HEADER,
+];
+
 /// The five placeholders a `redirect` action's components may be written with, from
 /// `RedirectActionConfig`: "You can reuse URI components using the following reserved
 /// keywords: #{protocol}, #{host}, #{port}, #{path} (the leading "/" is not included) and
@@ -617,6 +643,49 @@ pub(super) struct DataPlaneRequest {
     pub(super) headers: Vec<(String, String)>,
     /// The port the client addressed, when it named one.
     pub(super) port: Option<i32>,
+    /// What the TLS connection this request arrived over negotiated, for one that arrived
+    /// over TLS at all ([`ConnectionTls`]).
+    pub(super) tls: ConnectionTls,
+}
+
+/// What the TLS handshake that carried a request negotiated, as the socket that ran it
+/// observed it ([`TLS_PROTOCOL_HEADER`]).
+///
+/// Every field is `None` for a request that arrived in the clear, and the two name fields
+/// for a client that asked for no server name: nothing of a connection this emulator did not
+/// observe is recorded.
+#[derive(Debug, Default)]
+pub(super) struct ConnectionTls {
+    /// The protocol version, spelled as the published `SslProtocols` catalogue spells it.
+    pub(super) ssl_protocol: Option<String>,
+    /// The cipher suite, spelled as the published `Cipher$Name` catalogue spells it.
+    pub(super) ssl_cipher: Option<String>,
+    /// The name the `ClientHello` asked for (RFC 6066 §3).
+    pub(super) server_name: Option<String>,
+    /// The ARN of the certificate the listener presented for that name.
+    pub(super) certificate_arn: Option<String>,
+}
+
+impl ConnectionTls {
+    /// Read the facts of the connection off `headers` and REMOVE them, so what the rules
+    /// and the targets see is the request as the client sent it.
+    fn taken_from(headers: &mut Vec<(String, String)>) -> Self {
+        let read = |name: &str| -> Option<String> {
+            headers
+                .iter()
+                .find(|(held, _)| held == name)
+                .map(|(_, value)| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let observed = Self {
+            ssl_protocol: read(TLS_PROTOCOL_HEADER),
+            ssl_cipher: read(TLS_CIPHER_HEADER),
+            server_name: read(TLS_SERVER_NAME_HEADER),
+            certificate_arn: read(TLS_CERTIFICATE_ARN_HEADER),
+        };
+        headers.retain(|(held, _)| !TLS_HEADERS.contains(&held.as_str()));
+        observed
+    }
 }
 
 impl DataPlaneRequest {
@@ -640,17 +709,20 @@ impl DataPlaneRequest {
             .get(FORWARDED_HOST_HEADER)
             .filter(|host| !host.trim().is_empty())
             .or(addressed);
+        let mut headers: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+            .collect();
+        let tls = ConnectionTls::taken_from(&mut headers);
         Self {
             method: req.method().to_string(),
             path: path.to_string(),
             query: uri.query().unwrap_or_default().to_string(),
             host: client_host.map(host_only).unwrap_or_default().to_string(),
-            headers: req
-                .headers()
-                .iter()
-                .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
-                .collect(),
+            headers,
             port: addressed_port(addressed),
+            tls,
         }
     }
 
@@ -1094,6 +1166,10 @@ async fn deliver_access_log(
         actions: served.observed.actions.clone(),
         redirect_url: served.location.clone(),
         error_reason: served.observed.error_reason.clone(),
+        ssl_protocol: request.tls.ssl_protocol.clone(),
+        ssl_cipher: request.tls.ssl_cipher.clone(),
+        domain_name: request.tls.server_name.clone(),
+        chosen_certificate_arn: request.tls.certificate_arn.clone(),
         matched_rule_priority,
     };
     super::access_logs::deliver(ctx, &destination, &answered).await;

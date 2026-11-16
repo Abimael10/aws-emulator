@@ -17,6 +17,8 @@ mod alb_data_plane;
 mod alb_desync_mitigation_and_forwarded_for;
 #[path = "all/alb_drop_invalid_header_fields.rs"]
 mod alb_drop_invalid_header_fields;
+#[path = "all/alb_https_access_log_tls.rs"]
+mod alb_https_access_log_tls;
 #[path = "all/alb_https_listener_tls.rs"]
 mod alb_https_listener_tls;
 #[path = "all/alb_lambda_target.rs"]

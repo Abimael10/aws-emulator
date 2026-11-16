@@ -49,14 +49,14 @@ use crate::provisioning_loop::{action, call, p, REGION};
 
 /// The body the listener's default action answers with, so the answer is this listener's
 /// own rather than anything a client sent.
-const SERVED_BODY: &str = "tls-ok";
+pub(crate) const SERVED_BODY: &str = "tls-ok";
 
 /// The status that action answers with.
 const SERVED_STATUS: &str = "200";
 
 /// How long a case gives one dial and one exchange. A generous bound on work that is all in
 /// this process; a case that cannot finish inside it has found a defect, not a slow machine.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A router carrying this service and Certificate Manager over ONE shared engine, exactly
 /// as the assembled router mounts them: the certificate a listener presents is a resource
@@ -78,14 +78,14 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// One certificate a case brings: the PEM material a client imports, and the DER of the
 /// leaf, which is what the presented certificate is compared against.
-struct Minted {
-    certificate_pem: String,
-    private_key_pem: String,
-    der: Vec<u8>,
+pub(crate) struct Minted {
+    pub(crate) certificate_pem: String,
+    pub(crate) private_key_pem: String,
+    pub(crate) der: Vec<u8>,
 }
 
 /// Mint a real self-signed leaf covering `names`, with `rcgen`.
-fn mint(names: &[&str]) -> Minted {
+pub(crate) fn mint(names: &[&str]) -> Minted {
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let owned: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
     let mut params = rcgen::CertificateParams::new(owned).expect("certificate parameters");
@@ -105,7 +105,7 @@ fn mint(names: &[&str]) -> Minted {
 
 /// Import one minted certificate through Certificate Manager's own `ImportCertificate`, and
 /// answer the ARN it was stored under.
-async fn import(router: &MultiServiceRouter, case: &str, minted: &Minted) -> String {
+pub(crate) async fn import(router: &MultiServiceRouter, case: &str, minted: &Minted) -> String {
     let body = serde_json::json!({
         "Certificate": aws_smithy_types::base64::encode(minted.certificate_pem.as_bytes()),
         "PrivateKey": aws_smithy_types::base64::encode(minted.private_key_pem.as_bytes()),
@@ -141,7 +141,7 @@ async fn import(router: &MultiServiceRouter, case: &str, minted: &Minted) -> Str
 }
 
 /// Create an Application Load Balancer and answer its ARN and the address it published.
-async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", name));
     form.push(p("Subnets.member.1", "subnet-11111111"));
@@ -164,7 +164,7 @@ async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> (Strin
 /// Create one listener whose default action is the fixed response above, on `protocol` and
 /// `port`, naming `certificate_arn` as its default certificate and `ssl_policy` as its
 /// security policy when it has them.
-async fn create_listener(
+pub(crate) async fn create_listener(
     router: &MultiServiceRouter,
     lb_arn: &str,
     protocol: &str,
@@ -208,7 +208,7 @@ async fn create_listener(
 
 /// Add one certificate to a listener's certificate list, through the operation that owns
 /// that list.
-async fn add_listener_certificate(
+pub(crate) async fn add_listener_certificate(
     router: &MultiServiceRouter,
     listener_arn: &str,
     certificate_arn: &str,
@@ -226,7 +226,7 @@ async fn add_listener_certificate(
 
 /// Place the instant the load balancer's move to `active` is owed at in the past, so a case
 /// serves traffic without sleeping for the span the clock owes.
-fn make_active(engine: &Arc<engine::InMemoryEngine>, lb_arn: &str) {
+pub(crate) fn make_active(engine: &Arc<engine::InMemoryEngine>, lb_arn: &str) {
     let state = engine.state::<ElbState>();
     let mut store = state.lock();
     if let Some(record) = store.load_balancers.get_mut(lb_arn) {
@@ -242,7 +242,7 @@ fn is_reachable_authority(published: &str) -> bool {
 }
 
 /// The port of a published address, which is the port a case dials on loopback.
-fn published_port(published: &str) -> u16 {
+pub(crate) fn published_port(published: &str) -> u16 {
     published
         .parse::<std::net::SocketAddr>()
         .unwrap_or_else(|error| panic!("the published address {published} is no address: {error}"))
@@ -254,7 +254,7 @@ fn published_port(published: &str) -> u16 {
 /// The core binds its listeners on loopback (`EMULATOR_BIND_ADDRESS`, `127.0.0.1` by
 /// default), so the dial below is to this machine — and the assertion above is what pins it
 /// there: only the PORT is taken from the published authority.
-async fn dial(published: &str) -> tokio::net::TcpStream {
+pub(crate) async fn dial(published: &str) -> tokio::net::TcpStream {
     let port = published_port(published);
     tokio::time::timeout(
         EXCHANGE_TIMEOUT,
@@ -273,7 +273,7 @@ async fn dial(published: &str) -> tokio::net::TcpStream {
 /// afterwards, byte for byte: what is under test is WHICH certificate the listener
 /// presents, and a client that refused an unexpected one would report a handshake failure
 /// instead of naming the certificate it got.
-fn client_config() -> Arc<rustls::ClientConfig> {
+pub(crate) fn client_config() -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     Arc::new(
         rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))

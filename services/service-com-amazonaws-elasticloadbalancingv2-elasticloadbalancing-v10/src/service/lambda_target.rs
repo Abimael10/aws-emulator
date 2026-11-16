@@ -763,6 +763,7 @@ mod tests {
                 "my-alb-1.us-west-2.elb.amazonaws.com".to_string(),
             )],
             port: Some(80),
+            ..DataPlaneRequest::default()
         }
     }
 
