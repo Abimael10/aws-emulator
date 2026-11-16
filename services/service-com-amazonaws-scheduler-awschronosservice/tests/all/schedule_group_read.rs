@@ -3,23 +3,17 @@
 //! End-to-end wire tests for reading a schedule group back: `GetScheduleGroup`.
 //!
 //! The rule under test: `GetScheduleGroup` reports the persisted group a name
-//! addresses — its ARN, name, `ScheduleGroupState` and the two timestamps —
-//! including the implicit `default` group every account has without creating it,
-//! and answers `ResourceNotFoundException` for a name no group has. These cases
+//! addresses — its ARN, name, `ScheduleGroupState` and the instants a call
+//! actually made on it — including the implicit `default` group every account
+//! has without creating it, which no call created and which therefore reports
+//! neither timestamp, and answers `ResourceNotFoundException` for a name no
+//! group has. These cases
 //! vary the name over the whole modelled `ScheduleGroupName` class and the
 //! request over several regions; the recorded case is one row.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::wire_harness::{account_id, call, call_in, error_code, scheduler_router, REGION};
-
-/// Seconds since the epoch, the unit restJson1 renders a `timestamp` member in.
-fn now_epoch_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the test clock is after the epoch")
-        .as_secs_f64()
-}
+use crate::wire_harness::{
+    account_id, call, call_in, error_code, now_epoch_seconds, scheduler_router, REGION,
+};
 
 /// A timestamp member of a `GetScheduleGroup` response, as epoch seconds.
 fn timestamp(body: &serde_json::Value, member: &str) -> f64 {
@@ -197,10 +191,15 @@ async fn the_implicit_default_group_is_readable_without_being_created() {
             Some("ACTIVE"),
             "region {region}: expected State ACTIVE, got {got}"
         );
-        let creation = timestamp(&got, "CreationDate");
-        assert!(
-            creation > 0.0 && creation <= now_epoch_seconds() + 1.0,
-            "region {region}: CreationDate {creation} must be a past instant"
+        // No call created or changed it, so it has neither instant to report
+        // and both optional members are omitted.
+        assert_eq!(
+            (
+                got.get("CreationDate"),
+                got.get("LastModificationDate")
+            ),
+            (None, None),
+            "region {region}: the built-in group reports neither date, got {got}"
         );
 
         // And it is the same record on every later read.

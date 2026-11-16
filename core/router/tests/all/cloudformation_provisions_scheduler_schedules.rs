@@ -1283,7 +1283,20 @@ async fn a_declared_group_is_enumerated_by_list_schedule_groups() {
                     Some(expected_arn.as_str()),
                     "case {case:?}: expected the enumerated ARN {expected_arn:?}, got {summary}"
                 );
+                // Both timestamps report an instant a REQUEST made on the group: a group
+                // the stack's create call minted carries each of them, while the group the
+                // service provisions with the account was created by no call and reports
+                // neither, so the keys are absent from its summary.
                 for dated in ["CreationDate", "LastModificationDate"] {
+                    if group == DEFAULT_GROUP {
+                        assert_eq!(
+                            summary.get(dated),
+                            None,
+                            "case {case:?}: no call created the {DEFAULT_GROUP:?} group, so it \
+                             reports no {dated}, got {summary}"
+                        );
+                        continue;
+                    }
                     let reported = summary.get(dated).and_then(Value::as_f64);
                     assert!(
                         reported.is_some_and(|seconds| seconds > 0.0),

@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Tagging is a modification of the schedule group, so the group's
             // last-modification reading moves only when the stored tag set
             // really changed.
-            group.last_modification_date = now;
+            group.last_modification_date = Some(now);
         }
 
         Ok(TagResourceOutput {})

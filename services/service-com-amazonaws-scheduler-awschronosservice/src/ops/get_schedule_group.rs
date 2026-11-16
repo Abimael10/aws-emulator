@@ -176,10 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(record.arn),
             name: Some(record.name),
             state: Some(record.state),
-            creation_date: Some(crate::state::to_wire_timestamp(record.creation_date)),
-            last_modification_date: Some(crate::state::to_wire_timestamp(
-                record.last_modification_date,
-            )),
+            // Both dates are optional, and only a group a call created or
+            // changed has them: the group the service provisions with the
+            // account reports neither, so the serializer omits the keys.
+            creation_date: record.creation_date.map(crate::state::to_wire_timestamp),
+            last_modification_date: record
+                .last_modification_date
+                .map(crate::state::to_wire_timestamp),
         })
     }
 }

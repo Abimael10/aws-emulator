@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if group.remove_tags(input.tag_keys.iter().map(String::as_str)) {
                 // Untagging modifies the group, so its last-modification reading
                 // moves only when a tag really went away.
-                group.last_modification_date = now;
+                group.last_modification_date = Some(now);
             }
         }
 

@@ -129,6 +129,16 @@ pub fn encode_label(value: &str) -> String {
     encoded
 }
 
+/// The test clock as seconds since the epoch — the unit restJson1 renders a
+/// `timestamp` member in, so a suite can bracket a server-set date with its own
+/// readings taken around the call that set it.
+pub fn now_epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the test clock is after the epoch")
+        .as_secs_f64()
+}
+
 /// The ARN `CreateScheduleGroup` mints for `name` in `region`.
 pub fn group_arn(region: &str, name: &str) -> String {
     format!(

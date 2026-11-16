@@ -180,14 +180,23 @@ pub fn names_system_tag<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> bool {
 }
 
 /// A `ScheduleGroup` as this emulator persists it.
+///
+/// A group's two instants are the ones a REQUEST made: `creation_date` is when
+/// a create call minted the group and `last_modification_date` when a call last
+/// changed it. The group the service provisions with the account was minted by
+/// no call, so it holds neither, and a reader reports only the instants the
+/// record actually holds — both modelled members are optional.
 #[derive(Debug, Clone)]
 pub struct ScheduleGroupRecord {
     pub name: String,
     pub arn: String,
     /// `ScheduleGroupState`: `ACTIVE` | `DELETING`.
     pub state: String,
-    pub creation_date: SystemTime,
-    pub last_modification_date: SystemTime,
+    /// When a create call minted this group; `None` for a group no call minted.
+    pub creation_date: Option<SystemTime>,
+    /// When a call last changed this group; `None` for a group no call has
+    /// created or changed.
+    pub last_modification_date: Option<SystemTime>,
     /// Carried for `TagResource`/`UntagResource`/`ListTagsForResource`.
     pub tags: Vec<Tag>,
     /// When this group's removal becomes due, set by `DeleteScheduleGroup`.
@@ -283,14 +292,6 @@ pub struct ComAmazonawsSchedulerAwschronosserviceState {
     /// Schedules by `(group name, schedule name)` — the pair that identifies a
     /// schedule, and an ordering `ListSchedules` pages through.
     pub schedules: BTreeMap<(String, String), ScheduleRecord>,
-    /// When this account's scheduler state came into being, which is the
-    /// `CreationDate` the implicit `default` group reports.
-    ///
-    /// The default group is created with the account, so no request mints it and
-    /// nothing can read its creation date off a client call. Fixing it here, when
-    /// the store is first reached, keeps it STABLE across reads — a read of the
-    /// default group never writes.
-    pub origin: SystemTime,
     /// The clock that invokes this account's schedules as their expressions make
     /// them due, and what it has already performed ([`invocation`]).
     pub invocations: Invocations,
@@ -301,7 +302,6 @@ impl Default for ComAmazonawsSchedulerAwschronosserviceState {
         Self {
             groups: BTreeMap::new(),
             schedules: BTreeMap::new(),
-            origin: SystemTime::now(),
             invocations: Invocations::default(),
         }
     }
@@ -345,10 +345,10 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
     /// The group `name` addresses, or `None` when no such group exists.
     ///
     /// Every account has the `default` group without having created it, so it is
-    /// answered from [`Self::origin`] rather than from a stored row — the same
-    /// membership rule [`Self::group_exists`] applies, as one record a reader can
-    /// serialize. `region` is the request's region, which the ARN of a group no
-    /// create call minted carries.
+    /// synthesised rather than read from a stored row — the same membership rule
+    /// [`Self::group_exists`] applies, as one record a reader can serialize.
+    /// `region` is the request's region, which the ARN of a group no create call
+    /// minted carries, and no call minted it, so it carries neither instant.
     pub fn group_record(&self, region: &str, name: &str) -> Option<ScheduleGroupRecord> {
         if let Some(record) = self.groups.get(name) {
             return Some(record.clone());
@@ -358,8 +358,8 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
                 name: DEFAULT_SCHEDULE_GROUP.to_string(),
                 arn: schedule_group_arn(region, DEFAULT_SCHEDULE_GROUP),
                 state: SCHEDULE_GROUP_STATE_ACTIVE.to_string(),
-                creation_date: self.origin,
-                last_modification_date: self.origin,
+                creation_date: None,
+                last_modification_date: None,
                 tags: Vec::new(),
                 // The built-in group is never deleted: `DeleteScheduleGroup` on
                 // the reserved name is refused, so no removal is ever due.
@@ -415,11 +415,10 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
     /// Only a caller that already resolved `name` through [`Self::group_name_for_arn`]
     /// reaches this, so the group exists — and every group a create call minted
     /// already has a row, so the one row this can add is the `default` group's.
-    /// Its dates come from [`Self::origin`], the same reading
-    /// [`Self::group_record`] reports for it, so storing its tags never moves the
-    /// creation date a reader sees.
+    /// That row holds no creation instant, the same as the record
+    /// [`Self::group_record`] synthesises for it: materialising a row to hold
+    /// tags is not a create call, so it mints no date a reader would see.
     pub fn group_for_write(&mut self, name: &str, region: &str) -> &mut ScheduleGroupRecord {
-        let origin = self.origin;
         self.groups
             .entry(name.to_string())
             .or_insert_with(|| ScheduleGroupRecord {
@@ -428,8 +427,8 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
                 // The built-in group AWS creates with the account is ACTIVE; this
                 // row only starts holding its tags.
                 state: SCHEDULE_GROUP_STATE_ACTIVE.to_string(),
-                creation_date: origin,
-                last_modification_date: origin,
+                creation_date: None,
+                last_modification_date: None,
                 tags: Vec::new(),
                 // Nothing has deleted this group: the built-in one cannot be
                 // deleted at all, and any other name already has its row.

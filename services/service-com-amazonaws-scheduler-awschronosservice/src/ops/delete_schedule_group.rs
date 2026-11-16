@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that due.
         if group.deletion_due.is_none() {
             group.state = crate::state::SCHEDULE_GROUP_STATE_DELETING.to_string();
-            group.last_modification_date = now;
+            group.last_modification_date = Some(now);
             group.deletion_due = Some(now + crate::state::GROUP_DELETION_DELAY);
         }
 

@@ -77,8 +77,13 @@ fn listed_names(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// The group the service provisions with the account, which no call created.
+const BUILT_IN_GROUP: &str = "default";
+
 /// Assert one summary is built from the stored record: the modelled ARN for its
-/// name in `region`, an `ACTIVE` `ScheduleGroupState`, and server-set dates.
+/// name in `region`, an `ACTIVE` `ScheduleGroupState`, and the two optional
+/// timestamps exactly when a call made them — a group a create call minted
+/// carries both, the account's built-in group carries neither.
 fn assert_summary_shape(case: &str, summary: &serde_json::Value, region: &str) {
     let name = summary
         .get("Name")
@@ -98,6 +103,18 @@ fn assert_summary_shape(case: &str, summary: &serde_json::Value, region: &str) {
         Some("ACTIVE"),
         "case {case:?}: expected State ACTIVE, got {summary}"
     );
+    if name == BUILT_IN_GROUP {
+        assert_eq!(
+            (
+                summary.get("CreationDate"),
+                summary.get("LastModificationDate")
+            ),
+            (None, None),
+            "case {case:?}: no call created or changed the built-in group, so neither \
+             date is reported, got {summary}"
+        );
+        return;
+    }
     let creation = summary
         .get("CreationDate")
         .and_then(serde_json::Value::as_f64)
@@ -349,13 +366,23 @@ async fn the_implicit_default_groups_arn_follows_the_signed_region() {
         assert_summary_shape(region, summary, region);
     }
 
-    // And the date it reports is the account's, stable across reads and
-    // Regions — not a fresh clock reading per call.
+    // And its ARN is the only thing that follows the Region: the rest of the
+    // summary — including the two dates no call ever made for it — is the same
+    // record read from either Region.
     let (_, first) = call_in(&router, "GET", "/schedule-groups", "us-east-1", None).await;
     let (_, second) = call_in(&router, "GET", "/schedule-groups", "eu-west-2", None).await;
-    assert_eq!(
-        summaries(&first)[0].get("CreationDate"),
-        summaries(&second)[0].get("CreationDate"),
-        "case \"default group CreationDate\": expected one stable date, got {first} and {second}"
-    );
+    for (region, body) in [("us-east-1", &first), ("eu-west-2", &second)] {
+        let summary = &summaries(body)[0];
+        let mut without_arn = summary.clone();
+        without_arn
+            .as_object_mut()
+            .expect("a summary is a JSON object")
+            .remove("Arn");
+        assert_eq!(
+            without_arn,
+            serde_json::json!({ "Name": "default", "State": "ACTIVE" }),
+            "case {region:?}: the built-in group reports its name and state only, \
+             got {summary}"
+        );
+    }
 }
