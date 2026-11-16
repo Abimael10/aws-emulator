@@ -860,6 +860,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Monotonic counter feeding
     /// [`next_ssh_public_key_id`](Self::next_ssh_public_key_id).
     pub ssh_public_key_id_seq: u64,
+    /// Monotonic counter feeding
+    /// [`next_service_specific_credential_id`](Self::next_service_specific_credential_id).
+    pub service_specific_credential_id_seq: u64,
     /// Monotonic counter feeding [`hold_password`](Self::hold_password), so every
     /// password the account holds a verifier for carries its own salt.
     pub password_salt_seq: u64,
@@ -974,6 +977,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             server_certificate_id_seq: 0,
             signing_certificate_id_seq: 0,
             ssh_public_key_id_seq: 0,
+            service_specific_credential_id_seq: 0,
             password_salt_seq: 0,
             global_endpoint_token_version: None,
         }

@@ -37,6 +37,7 @@ pub mod policy_statement_grammar;
 pub mod reported_entities;
 pub mod reported_services;
 pub mod role_templates;
+pub mod service_specific_credential_mint;
 pub mod simulated_decisions;
 pub mod ssh_public_keys;
 pub mod statement_positions;
@@ -64,6 +65,7 @@ pub use policy_statement_grammar::*;
 pub use reported_entities::*;
 pub use reported_services::*;
 pub use role_templates::*;
+pub use service_specific_credential_mint::*;
 pub use ssh_public_keys::*;
 pub use statement_positions::*;
 pub use trust_policy::*;
@@ -858,32 +860,6 @@ pub fn credential_expiration(
 ) -> ::aws_smithy_types::DateTime {
     let age = i64::from(credential_age_days).saturating_mul(SECONDS_PER_DAY);
     ::aws_smithy_types::DateTime::from_secs(created.secs().saturating_add(age))
-}
-
-/// A fresh service-specific credential: the id to report it under, and its secret.
-///
-/// A service-specific credential authenticates its IAM user to ONE other Amazon Web
-/// Services service — CodeCommit over HTTPS Git, Amazon Keyspaces over CQL — and
-/// never to this emulator over SigV4, so the pair must not stay in the emulator's
-/// credential store. Nothing in a service may construct an id or a secret itself,
-/// though, so both are minted by the one component that generates them, the
-/// credential store, and the record is then removed from it again — the shape
-/// `service-com-amazonaws-mwaa-amazonmwaa`'s `mint_airflow_token` uses for the same
-/// reason. The id that comes back is 20 characters from the base32 alphabet, inside
-/// `serviceSpecificCredentialId`'s len 20..128 and `^[\w]+$`.
-///
-/// `None` when the store minted no secret, which leaves the caller to refuse rather
-/// than report a credential it made up.
-pub fn mint_service_specific_credential(
-    store: &::emulator_server::CredentialStore,
-) -> Option<(String, String)> {
-    let minted = store.create(&::emulator_server::aws_credentials::AWS_ACCESS_KEY);
-    let secret = minted
-        .secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY)
-        .map(str::to_string);
-    // The pair is not a credential of this emulator; see above.
-    let _ = store.delete(&minted.id);
-    secret.map(|secret| (minted.id, secret))
 }
 
 /// One inline policy embedded in an IAM entity.

@@ -315,10 +315,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The new password "is Amazon Web Services generated and cryptographically
         // strong. It cannot be configured by the user", so it comes from the one
         // component that generates credential material, exactly as the create takes
-        // it; the id minted alongside it is dropped, because a reset keeps the
-        // credential the account already holds and replaces only its secret.
-        let Some((_, password)) =
-            crate::state::mint_service_specific_credential(ctx.credential_store())
+        // it. No identifier is minted here: a reset keeps the credential the account
+        // already holds and replaces only its secret.
+        let Some(password) =
+            crate::state::mint_service_specific_credential_secret(ctx.credential_store())
         else {
             // No secret was minted, and this operation will not invent one; it models
             // no server fault, so the honest answer is "this emulator did not serve

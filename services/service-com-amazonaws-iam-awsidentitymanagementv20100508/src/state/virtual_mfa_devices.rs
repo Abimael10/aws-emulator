@@ -180,9 +180,9 @@ pub fn virtual_mfa_device_arn(path: &str, virtual_mfa_device_name: &str) -> Stri
 ///
 /// Nothing in a service may construct a secret itself, so the material is minted by the
 /// one component that generates them, the emulator's credential store, and the record is
-/// then removed from it again — the shape [`mint_service_specific_credential`] uses for
-/// the same reason: a virtual MFA device's seed authenticates its holder to IAM through a
-/// time-based one-time password, never to this emulator over SigV4, so the pair must not
+/// then removed from it again — the shape [`mint_service_specific_credential_secret`] uses
+/// for the same reason: a virtual MFA device's seed authenticates its holder to IAM through
+/// a time-based one-time password, never to this emulator over SigV4, so the pair must not
 /// stay in the credential store.
 ///
 /// `None` when the store minted no material, which leaves the caller to refuse rather than

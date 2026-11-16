@@ -35,3 +35,8 @@ Cause 2: expected CreateServiceSpecificCredentialResult/ServiceSpecificCredentia
 1. Boot the emulator from this checkout.
 2. Replay iam-list-access-keys-lifecycle#task#3: CreateAccessKey for a user and read AccessKey/AccessKeyId - it begins 'EMULATOR', not 'AKIA'. #task#4 ListAccessKeys echoes it.
 3. Replay iam-service-specific-credential-lifecycle#task#3: CreateServiceSpecificCredential - ServiceSpecificCredentialId begins 'EMULATOR', not 'ACCA'.
+
+## Resolution
+Cause 2 is FIXED: the account mints a ServiceSpecificCredentialId from its own counter and the ACCA prefix published for that resource type, as it already does for user, group, role, instance-profile, policy, certificate and SSH-key ids, while the secret half still comes from the emulator's credential store. The iam-service-specific-credential-lifecycle fixture replays clean.
+
+Cause 1 is DECLINED, and the AccessKeyId prefix remains divergent: an IAM access key id is not minted by this service. It is the id of a credential the emulator's credential store creates, because that id is what verifies a signed request and what DeleteAccessKey revokes, and its prefix is fixed in the read-only core (vendor/server/src/aws_credentials.rs), which states the choice deliberately so a secret scanner never mistakes an emulator key for an AWS key. CredentialKind is sealed, so no service crate can mint a prefixed key that still verifies; a constructed id would hand the caller a credential the emulator refuses. The same core minting path is still tracked by open issue 20261028T040721Z-cognito-identity-cognito-idp-iam-getcredentialsforidentity-vends-an on the STS/Cognito temporary-credential side.

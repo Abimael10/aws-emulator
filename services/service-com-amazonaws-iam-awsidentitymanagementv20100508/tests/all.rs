@@ -105,6 +105,8 @@ mod error_envelope_request_id;
 mod error_request_id_across_operations;
 #[path = "all/fixed_refusal_wording.rs"]
 mod fixed_refusal_wording;
+#[path = "all/generated_identifier_prefixes.rs"]
+mod generated_identifier_prefixes;
 #[path = "all/group_attached_policies.rs"]
 mod group_attached_policies;
 #[path = "all/group_attached_policy_listing.rs"]
