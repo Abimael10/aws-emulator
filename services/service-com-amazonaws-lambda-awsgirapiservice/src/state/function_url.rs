@@ -541,9 +541,112 @@ pub fn function_url_marker_cursor(key: &PageTokenKey, marker: &str) -> Option<St
     super::marker_cursor(key, marker)
 }
 
+/// The time-zone designator a function URL's own instants carry: the UTC DESIGNATOR `Z`.
+///
+/// `FunctionUrlConfig$CreationTime` and `$LastModifiedTime` are each documented "in
+/// ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)" linking the W3C NOTE-datetime profile
+/// (`smithy_query(query="doc", shape="FunctionUrlConfig", member="CreationTime")`), and the
+/// `TZD` of that profile is either this designator or an offset written `+hh:mm` — a
+/// colon-less four-digit offset is not one of its forms. So the instants of THIS resource
+/// are rendered in the designator form, and a strict ISO-8601 reader parses every one of
+/// them.
+///
+/// It is the function URL's instants that are rendered this way and not every instant of
+/// this service: `FunctionConfiguration$LastModified` and its siblings are recorded by AWS
+/// in the NUMERIC offset form their own documentation gives an example of, which is what
+/// `super::UTC_DESIGNATOR` spells and what `super::iso8601` renders.
+pub const FUNCTION_URL_UTC_DESIGNATOR: &str = "Z";
+
+/// `at` as the ISO-8601 instant a function URL's `CreationTime` and `LastModifiedTime`
+/// describe, with the designator [`FUNCTION_URL_UTC_DESIGNATOR`] spells.
+///
+/// The ONE rendering behind every function-URL answer: the two write paths
+/// (`CreateFunctionUrlConfig`, `UpdateFunctionUrlConfig`) store what this renders and every
+/// read projects the stored text, so the single-configuration reads and the list projection
+/// cannot disagree about the form.
+///
+/// The instant itself is rendered by the one renderer this service has
+/// (`super::designated_iso8601`, which states the truncation and the fixed width every
+/// instant member of this service is reported at); all this adds is WHICH designator these
+/// members carry.
+#[must_use]
+pub fn function_url_iso8601(at: ::std::time::SystemTime) -> String {
+    super::designated_iso8601(at, FUNCTION_URL_UTC_DESIGNATOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A function URL's instant renders in the designator form the member's own profile
+    /// admits, at a fixed width, and the text orders as the instants do.
+    ///
+    /// The rows span what the rendering generalises over: the epoch itself, a subsecond
+    /// field of every magnitude (none, milliseconds, and a sub-millisecond remainder that
+    /// is truncated away), and instants far apart.
+    #[test]
+    fn a_function_urls_instant_carries_the_utc_designator_at_a_fixed_width() {
+        let epoch = ::std::time::SystemTime::UNIX_EPOCH;
+        let rows: &[(&str, ::std::time::Duration)] = &[
+            ("the epoch", ::std::time::Duration::from_secs(0)),
+            ("a whole second", ::std::time::Duration::from_secs(1_767_225_600)),
+            (
+                "a millisecond field",
+                ::std::time::Duration::new(1_767_225_600, 333_000_000),
+            ),
+            (
+                "a microsecond remainder, truncated away",
+                ::std::time::Duration::new(1_767_225_600, 333_444_000),
+            ),
+            (
+                "a nanosecond remainder, truncated away",
+                ::std::time::Duration::new(1_767_225_600, 333_999_999),
+            ),
+            (
+                "a later instant",
+                ::std::time::Duration::new(1_800_000_000, 1_000),
+            ),
+        ];
+        let mut rendered: Vec<(&str, String)> = Vec::new();
+        for (case, since_epoch) in rows {
+            let text = function_url_iso8601(epoch + *since_epoch);
+            assert!(
+                text.ends_with(FUNCTION_URL_UTC_DESIGNATOR) && text.contains('T'),
+                "case {case:?}: expected an ISO-8601 instant carrying the \
+                 {FUNCTION_URL_UTC_DESIGNATOR:?} designator, got {text:?}"
+            );
+            assert_eq!(
+                text.len(),
+                "2026-01-01T00:00:00.000Z".len(),
+                "case {case:?}: expected the fixed width of a three-digit subsecond field, \
+                 got {text:?}"
+            );
+            let parsed = ::aws_smithy_types::DateTime::from_str(
+                &text,
+                ::aws_smithy_types::date_time::Format::DateTime,
+            );
+            assert!(
+                parsed.is_ok(),
+                "case {case:?}: a strict ISO-8601 reader must parse {text:?}, got {parsed:?}"
+            );
+            rendered.push((case, text));
+        }
+        // The millisecond truncation is what makes the text order the instant order: a
+        // sub-millisecond remainder renders as the millisecond instant below it, never
+        // above it.
+        for window in rendered.windows(2) {
+            let (before, after) = (&window[0], &window[1]);
+            assert!(
+                before.1 <= after.1,
+                "case {:?} then {:?}: the text must order as the instants do, got {:?} then \
+                 {:?}",
+                before.0,
+                after.0,
+                before.1,
+                after.1
+            );
+        }
+    }
 
     /// A page marker round-trips under the key that minted it, and no value another store
     /// minted or a caller assembled names a position at all.

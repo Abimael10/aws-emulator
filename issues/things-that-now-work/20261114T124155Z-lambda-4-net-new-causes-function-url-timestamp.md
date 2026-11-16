@@ -12,11 +12,35 @@ Issue-Key: lambda|ListFunctionUrlConfigs|2xx->2xx|$.FunctionUrlConfigs[*].Creati
 Issue-Key: lambda|ListFunctionUrlConfigs|2xx->2xx|$.FunctionUrlConfigs[*].LastModifiedTime
 Issue-Key: lambda|GetFunctionCodeSigningConfig|2xx->2xx|$
 Issue-Related: 20261103T165236Z-lambda-createfunction-skips-package-and-code-signing-validation.md
+Issue-Related: 20261116T141500Z-lambda-createfunction-accepts-an-execution-role-lambda-cannot-assume.md
 Issue-Commit: 34779bb431f14dc6a8db9e00edffcb539add901f
 
 # lambda: 4 net-new causes — function-URL timestamp format, empty code-signing read, missing role-trust refusal
 
 > _Note: this issue was identified against the code base at commit `34779bb431f14dc6a8db9e00edffcb539add901f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Resolution (2026-11-16)
+
+Causes 2, 3 and 4 are FIXED, and Cause 1 is SPLIT OUT into its own open record —
+`issues/things-that-do-not-work/20261116T141500Z-lambda-createfunction-accepts-an-execution-role-lambda-cannot-assume.md`
+— so the refusal it asks for stays tracked rather than being closed with this record. That
+record carries Cause 1 verbatim, the one-line reading that fixes it, and the 28 in-crate test
+expectations plus the cross-service suite that the reversal reaches; the same cluster is also
+Cause 1 of `20261116T024510Z-lambda-3-net-new-causes-in-request-validation.md`.
+
+* Causes 2 and 3 — a function URL's `CreationTime` and `LastModifiedTime` now carry the W3C
+  NOTE-datetime designator the members' own documentation links, from one renderer the two
+  write paths stamp the record with and every read projects
+  (`state::function_url::function_url_iso8601`); every other instant member of this service
+  keeps the numeric-offset form AWS's own documented example spells. Pinned by
+  `tests/all/function_url_instant_form.rs`. The instant ITSELF is a per-run value, so the
+  replay still differs on it.
+* Cause 4 — `GetFunctionCodeSigningConfig` now names the function it reports on in every 200,
+  with the attached configuration's ARN beside it when the function holds one, instead of
+  answering an empty body. Pinned by `tests/all/function_code_signing_config_read.rs`. The
+  recorded value of `FunctionName` at the four reads of a function holding NO association is
+  the recording environment's own (masked in the fixture), so the replay still differs on it.
+
 
 ## Operation
 CreateFunction

@@ -206,9 +206,9 @@ async fn associate(case: &str, router: &MultiServiceRouter, reference: &str, con
 /// addresses: the ARN it holds, or `None` when it holds none.
 ///
 /// The function existing is what the call reports on, so every answer is a 200; and what the
-/// body carries is the association as a WHOLE — the configuration's ARN and the function
-/// holding it for a function that holds one, and nothing at all for a function that holds
-/// none, never an empty or otherwise non-conforming value standing in for "none".
+/// body carries is the FUNCTION it reports on either way, with the configuration's ARN beside
+/// it for a function that holds one and no such member for a function that holds none, never
+/// an empty or otherwise non-conforming value standing in for "none".
 async fn reported(
     case: &str,
     router: &MultiServiceRouter,
@@ -237,11 +237,9 @@ async fn reported(
         "case {case:?}: a CodeSigningConfigArn that is present must be a string, got {}",
         answer.text()
     );
-    assert_eq!(
-        answer.has("FunctionName"),
-        arn.is_some(),
-        "case {case:?}: the body reports the association as a whole — the function holding \
-         it exactly when there is a configuration to report — got {}",
+    assert!(
+        answer.string("FunctionName").is_some(),
+        "case {case:?}: the body names the FUNCTION this read reports on either way, got {}",
         answer.text()
     );
     arn
@@ -694,12 +692,13 @@ async fn a_function_holding_no_config_reports_none_however_it_came_to_hold_none(
             answer.text()
         );
         // It is a REPORT of the function, not a refusal: the status is the operation's own
-        // 200, and a function holding no association reports neither member of the
-        // association rather than one of them.
+        // 200, and the body names the function it reports on whether or not there is a
+        // configuration to report beside it.
         assert_eq!(
-            (answer.status, answer.has("FunctionName")),
-            (200, false),
-            "case {function:?}: expected a 200 reporting no association at all, got {} {}",
+            (answer.status, answer.string("FunctionName")),
+            (200, Some(function.to_string())),
+            "case {function:?}: expected a 200 naming the function and no configuration, got \
+             {} {}",
             answer.status,
             answer.text()
         );

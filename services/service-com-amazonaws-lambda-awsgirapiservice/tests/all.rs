@@ -229,6 +229,8 @@ mod execution_role_resolution;
 mod function_aliases;
 #[path = "all/function_code_signing_association.rs"]
 mod function_code_signing_association;
+#[path = "all/function_code_signing_config_read.rs"]
+mod function_code_signing_config_read;
 #[path = "all/function_code_signing_dissociation.rs"]
 mod function_code_signing_dissociation;
 #[path = "all/function_code_signing_removal.rs"]
@@ -281,6 +283,8 @@ mod function_url_data_plane;
 mod function_url_deletion;
 #[path = "all/function_url_error_class.rs"]
 mod function_url_error_class;
+#[path = "all/function_url_instant_form.rs"]
+mod function_url_instant_form;
 #[path = "all/function_url_listing.rs"]
 mod function_url_listing;
 #[path = "all/function_url_published_address.rs"]

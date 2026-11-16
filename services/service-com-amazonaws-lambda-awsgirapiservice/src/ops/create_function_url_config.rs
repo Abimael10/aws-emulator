@@ -310,10 +310,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // of the configuration reports), and that is a different claim from "the
             // caller set this".
             invoke_mode: input.invoke_mode.clone(),
-            creation_time: crate::state::iso8601(now),
+            // In the designator form a function URL's own instants carry, which is a
+            // different rendering from the function configuration's `LastModified`
+            // (`crate::state::function_url::function_url_iso8601`).
+            creation_time: crate::state::function_url::function_url_iso8601(now),
             // Nothing has changed the configuration yet, so the last change to it is its
             // creation.
-            last_modified_time: crate::state::iso8601(now),
+            last_modified_time: crate::state::function_url::function_url_iso8601(now),
         };
 
         let output = CreateFunctionUrlConfigOutput {

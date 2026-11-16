@@ -4231,11 +4231,16 @@ pub fn layer_version_without_policy_message(layer_version_arn: &str) -> String {
 /// ("in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)"), whose `TZD` is that designator. So
 /// one rendering serves them all, and a caller parsing any of them with the offset form
 /// reads every one of them.
+///
+/// A function URL's own instants are the one exception, and a recorded one: see
+/// [`function_url::FUNCTION_URL_UTC_DESIGNATOR`].
 pub const UTC_DESIGNATOR: &str = "+0000";
 
-/// `at` as the ISO-8601 instant the model's `LastModified` member describes
-/// ("in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)"), with the designator
-/// [`UTC_DESIGNATOR`] spells.
+/// `at` as an ISO-8601 instant ("in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)") whose
+/// time-zone designator is `designator` — the ONE rendering of an instant this service
+/// has, so the two designators it reports an instant under
+/// ([`UTC_DESIGNATOR`], [`function_url::FUNCTION_URL_UTC_DESIGNATOR`]) cannot differ in
+/// anything else.
 ///
 /// The subsecond field is TRUNCATED to whole milliseconds and rendered at a fixed three
 /// digits, so two instants this service reports always compare the same way as strings
@@ -4243,19 +4248,25 @@ pub const UTC_DESIGNATOR: &str = "+0000";
 /// string, so the order is not strict, but it is never reversed. The `DateTime`
 /// formatter trims trailing zeros instead, which makes one rendering a PREFIX of another
 /// (`…:43.848` against `…:43.848766`) and so reverses their order under a string
-/// comparison, and a caller reading `LastModified` of one resource twice, or of two
+/// comparison, and a caller reading such a member of one resource twice, or of two
 /// resources, has only the string to order them by.
-#[must_use]
-pub fn iso8601(at: SystemTime) -> String {
+fn designated_iso8601(at: SystemTime, designator: &str) -> String {
     let instant = ::aws_smithy_types::DateTime::from(at);
     let seconds = ::aws_smithy_types::DateTime::from_secs(instant.secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default();
     let millis = instant.subsec_nanos() / 1_000_000;
     format!(
-        "{}.{millis:03}{UTC_DESIGNATOR}",
+        "{}.{millis:03}{designator}",
         seconds.trim_end_matches('Z')
     )
+}
+
+/// `at` as the ISO-8601 instant the model's `LastModified` member describes, with the
+/// designator [`UTC_DESIGNATOR`] spells ([`designated_iso8601`] renders it).
+#[must_use]
+pub fn iso8601(at: SystemTime) -> String {
+    designated_iso8601(at, UTC_DESIGNATOR)
 }
 
 /// The base64-encoded SHA-256 of `bytes`, which is what the model's `CodeSha256`

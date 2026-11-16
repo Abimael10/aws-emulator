@@ -473,10 +473,10 @@ async fn a_function_url_is_created_from_the_request_and_read_back() {
         );
         let creation_time = created.string("CreationTime").unwrap_or_default();
         assert!(
-            creation_time.contains('T') && creation_time.ends_with("+0000"),
-            "case {label:?}: CreationTime must be an ISO-8601 instant with the numeric UTC \
-             offset this service renders (the form the model's own instant example, \
-             `2018-11-27T15:10:45.123+0000`, spells), got {creation_time:?}"
+            creation_time.contains('T') && creation_time.ends_with('Z'),
+            "case {label:?}: CreationTime must be an ISO-8601 instant carrying the UTC \
+             designator of the W3C profile the member's own documentation links (see \
+             `tests/all/function_url_instant_form.rs`), got {creation_time:?}"
         );
 
         // Read the configuration back: a URL that was answered but never persisted

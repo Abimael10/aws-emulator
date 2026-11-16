@@ -20,6 +20,10 @@
 //!    (`smithy_query(query="doc", shape="LayerVersionsListItem", member="CreatedDate")`),
 //!    and every other instant member is documented by the same phrase ("in ISO-8601
 //!    format (YYYY-MM-DDThh:mm:ss.sTZD)"). The rows span the operations that mint one.
+//!    The instants of a FUNCTION URL are the one exception, and carry the `Z` designator
+//!    of the W3C profile their documentation links instead — that member set is
+//!    `tests/all/function_url_instant_form.rs`'s, which is why no row here is one of
+//!    them.
 //! 3. `NextMarker` is "The pagination token that's included if more results are
 //!    available": a token the listing MINTS for the position a truncated page ended on,
 //!    so it is none of the identifiers this API addresses a resource by, it is present
@@ -541,8 +545,8 @@ async fn every_reported_instant_carries_the_numeric_utc_offset() {
         &configuration.member("LastModified"),
     );
 
-    // A function URL: `CreationTime` on the create, both instants on the read, the
-    // listing and the update.
+    // A function URL: its two instants carry the OTHER designator, and are asserted in
+    // `tests/all/function_url_instant_form.rs` rather than here.
     create_alias(&router, "instant-probe", "live").await;
     let created = create_url_config(
         &router,
@@ -551,30 +555,13 @@ async fn every_reported_instant_carries_the_numeric_utc_offset() {
         &json!({ "AuthType": "NONE" }),
     )
     .await;
-    assert_offset_instant(
-        "CreateFunctionUrlConfig",
-        "CreationTime",
-        &created.member("CreationTime"),
+    assert_eq!(
+        created.status,
+        201,
+        "CreateFunctionUrlConfig must succeed, got {} {}",
+        created.status,
+        created.text()
     );
-    let read = get_url_config(&router, "instant-probe", None).await;
-    for member in ["CreationTime", "LastModifiedTime"] {
-        assert_offset_instant("GetFunctionUrlConfig", member, &read.member(member));
-    }
-    let updated = update_url_config(
-        &router,
-        "instant-probe",
-        None,
-        &json!({ "AuthType": "AWS_IAM" }),
-    )
-    .await;
-    for member in ["CreationTime", "LastModifiedTime"] {
-        assert_offset_instant("UpdateFunctionUrlConfig", member, &updated.member(member));
-    }
-    let listed = list_url_configs(&router, "instant-probe", "").await;
-    let entry = listed_entry(&listed, &qualified_arn("instant-probe", VERSION_LATEST));
-    for member in ["CreationTime", "LastModifiedTime"] {
-        assert_offset_instant("ListFunctionUrlConfigs", member, &entry[member]);
-    }
 
     // A layer version: `CreatedDate`, the member whose documentation spells the form.
     let layer = call(

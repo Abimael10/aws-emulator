@@ -246,8 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(invoke_mode) = input.invoke_mode.clone() {
             config.invoke_mode = Some(invoke_mode);
         }
-        // "When the function URL configuration was last updated": that is this call.
-        config.last_modified_time = crate::state::iso8601(now);
+        // "When the function URL configuration was last updated": that is this call, in
+        // the form a function URL's own instants carry
+        // (`crate::state::function_url::function_url_iso8601`).
+        config.last_modified_time = crate::state::function_url::function_url_iso8601(now);
 
         // Answered by reading the stored configuration back, so a later
         // `GetFunctionUrlConfig` reports exactly what this call persisted — the same URL

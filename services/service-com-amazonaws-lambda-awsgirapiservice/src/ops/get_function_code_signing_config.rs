@@ -8,8 +8,8 @@
 //! [`crate::state::FunctionRecord::code_signing_config_arn`].
 //!
 //! The function existing is what this call reports on, so a function holding no
-//! association is reported rather than refused: the response is the same 200 with
-//! `CodeSigningConfigArn` absent from the body (see
+//! association is reported rather than refused: the response is the same 200 naming the
+//! function, with `CodeSigningConfigArn` absent from the body (see
 //! [`super::types::GetFunctionCodeSigningConfigOutput`]).
 //!
 //! ## Shape of an operation
@@ -215,17 +215,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
 
         // The function exists, so this is a report of what it holds rather than a
-        // refusal — and what it holds is ONE association, reported as a whole: a function
-        // associated with a configuration is reported by that configuration's ARN and the
-        // function holding it, and a function associated with none is reported by an empty
-        // body rather than by a name with no configuration beside it (see
+        // refusal — and what it reports is the function it resolved, named on every answer,
+        // with the ONE association the function holds beside it when it holds one. A
+        // function associated with none is reported by its name alone, rather than by an
+        // ARN its own pattern admits no stand-in for (see
         // [`GetFunctionCodeSigningConfigOutput`]).
-        let association = record.code_signing_config_arn.clone();
         Ok(GetFunctionCodeSigningConfigOutput {
-            function_name: association
-                .as_ref()
-                .map(|_| record.config.name.clone()),
-            code_signing_config_arn: association,
+            // `FunctionName` is "The name or ARN of the Lambda function" this call reports
+            // on, resolved from the request, so it is reported on every answer — the
+            // function's own name, which is what the two recorded reads of an associated
+            // function carry. The association is reported beside it only when the function
+            // holds one.
+            function_name: record.config.name.clone(),
+            code_signing_config_arn: record.code_signing_config_arn.clone(),
         })
     }
 }
