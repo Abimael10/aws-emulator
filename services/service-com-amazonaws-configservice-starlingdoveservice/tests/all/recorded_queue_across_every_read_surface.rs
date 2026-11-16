@@ -13,7 +13,10 @@
 //!    answers the recorded keys of a batch and leaves a key it holds no item for out of
 //!    both of its lists, `SelectResourceConfig` answers a row per recorded resource the
 //!    query matches, and a well-formed key the account never recorded is refused
-//!    `ResourceNotDiscoveredException`.
+//!    `ResourceNotDiscoveredException`. The items a resource's history holds are its whole
+//!    sequence, oldest to newest: its discovery, each state it changed into, and its
+//!    deletion last — which is the order `Forward` reports, and the reverse of the order
+//!    this read reports by default.
 //! 2. A recorder that is RECORDING records whatever turned it on: the recorder its linked
 //!    service creates is recording from the instant it was created — the caller can make
 //!    no start call for it (`UnmodifiableEntityException`: "Service-linked configuration
@@ -34,16 +37,20 @@ use crate::config_recorded_resource_compliance::{Emulator, ACCOUNT_ID, REGION};
 /// The resource type Config records an Amazon SQS queue under, an entry of
 /// `com.amazonaws.configservice#ResourceType` from
 /// `smithy_query(query="shape", shape="ResourceType")`.
-const QUEUE_RESOURCE_TYPE: &str = "AWS::SQS::Queue";
+pub(crate) const QUEUE_RESOURCE_TYPE: &str = "AWS::SQS::Queue";
 
 /// `ConfigurationItemStatus` values, from
 /// `smithy_query(query="shape", shape="ConfigurationItemStatus")` (whose values are `OK`,
 /// `ResourceDiscovered`, `ResourceNotRecorded`, `ResourceDeleted` and
 /// `ResourceDeletedNotRecorded`): the status of the item that first discovered a resource,
 /// and the status of the final item recording that it is gone.
-const RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
+pub(crate) const RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
 /// See [`RESOURCE_DISCOVERED`].
-const RESOURCE_DELETED: &str = "ResourceDeleted";
+pub(crate) const RESOURCE_DELETED: &str = "ResourceDeleted";
+/// See [`RESOURCE_DISCOVERED`]: the status of an item recording a configuration that has
+/// been updated since the resource was discovered ("OK – The resource configuration has been
+/// updated").
+pub(crate) const CONFIGURATION_UPDATED: &str = "OK";
 
 /// The error a configuration-item read answers for a resource key the account has
 /// recorded no configuration item for.
@@ -105,7 +112,7 @@ async fn history(case: &str, emulator: &Emulator, queue_url: &str) -> Vec<Value>
 ///
 /// What is waited for is the pass the recorder owes, never a span: the assertion that
 /// fails at the deadline names the items the read did report.
-async fn await_history<P>(
+pub(crate) async fn await_history<P>(
     case: &str,
     emulator: &Emulator,
     queue_url: &str,
@@ -129,8 +136,55 @@ where
     }
 }
 
+/// The configuration items `GetResourceConfigHistory` reports for `queue_url` OLDEST first,
+/// which is the order a `chronologicalOrder` of `Forward` asks for
+/// (`GetResourceConfigHistoryRequest$chronologicalOrder`: "By default, the results are listed
+/// in reverse chronological order").
+pub(crate) async fn history_oldest_first(
+    case: &str,
+    emulator: &Emulator,
+    queue_url: &str,
+) -> Vec<Value> {
+    let (status, body) = emulator
+        .call(
+            "config",
+            "StarlingDoveService",
+            "1.1",
+            "GetResourceConfigHistory",
+            &json!({
+                "resourceType": QUEUE_RESOURCE_TYPE,
+                "resourceId": queue_url,
+                "chronologicalOrder": "Forward",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: GetResourceConfigHistory must answer 200, got {status} with {body}"
+    );
+    body["configurationItems"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The instant each item was captured at, as the epoch-seconds number the wire carries it as
+/// — the only form a client holds a capture instant in.
+pub(crate) fn captured_at(case: &str, items: &[Value]) -> Vec<f64> {
+    items
+        .iter()
+        .map(|item| {
+            item["configurationItemCaptureTime"]
+                .as_f64()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected an item capture time, got {item}")
+                })
+        })
+        .collect()
+}
+
 /// The `configurationItemStatus` of each item, newest first.
-fn statuses(items: &[Value]) -> Vec<String> {
+pub(crate) fn statuses(items: &[Value]) -> Vec<String> {
     items
         .iter()
         .map(|item| {
@@ -144,7 +198,7 @@ fn statuses(items: &[Value]) -> Vec<String> {
 
 /// The recorded `configuration` document of `item`, decoded from the JSON string that
 /// member carries.
-fn configuration(case: &str, item: &Value) -> Value {
+pub(crate) fn configuration(case: &str, item: &Value) -> Value {
     let encoded = item["configuration"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a recorded configuration, got {item}"));
@@ -162,7 +216,12 @@ fn recorded_value(item: &Value, attribute: &str) -> Option<String> {
 }
 
 /// Create a queue through Amazon SQS' own API and answer its url.
-async fn create_queue(case: &str, emulator: &Emulator, name: &str, attributes: &Value) -> String {
+pub(crate) async fn create_queue(
+    case: &str,
+    emulator: &Emulator,
+    name: &str,
+    attributes: &Value,
+) -> String {
     let mut request = json!({ "QueueName": name });
     if !attributes.is_null() {
         request["Attributes"] = attributes.clone();
@@ -176,7 +235,12 @@ async fn create_queue(case: &str, emulator: &Emulator, name: &str, attributes: &
 
 /// The attribute Amazon SQS reports for `queue_url`, as the live value a recorded item is
 /// compared against.
-async fn live_attribute(case: &str, emulator: &Emulator, queue_url: &str, attribute: &str) -> Value {
+pub(crate) async fn live_attribute(
+    case: &str,
+    emulator: &Emulator,
+    queue_url: &str,
+    attribute: &str,
+) -> Value {
     let live = emulator
         .sqs(
             "GetQueueAttributes",
@@ -229,7 +293,7 @@ fn batched_ids(case: &str, body: &Value) -> Vec<String> {
 /// They differ along what the rule generalises over — how many attributes the queue
 /// carries, whether it is a FIFO queue (which carries the attributes only a FIFO queue
 /// has) and which attribute a change moves.
-const QUEUES: [(&str, &str, &str, &str); 4] = [
+pub(crate) const QUEUES: [(&str, &str, &str, &str); 4] = [
     ("a queue created with no attributes", "surfaces-plain", "VisibilityTimeout", "37"),
     (
         "a queue created with one attribute",
@@ -247,7 +311,7 @@ const QUEUES: [(&str, &str, &str, &str); 4] = [
 ];
 
 /// The attributes each row's queue is CREATED with, for the row named by `name`.
-fn created_with(name: &str) -> Value {
+pub(crate) fn created_with(name: &str) -> Value {
     match name {
         "surfaces-delayed" => json!({ "DelaySeconds": "3" }),
         "surfaces-configured" => json!({
@@ -444,6 +508,65 @@ async fn every_configuration_item_read_reports_the_queue_the_recorder_discovered
             Vec::<String>::new(),
             "case {case:?}: a resource whose deletion is recorded has no current item to \
              report, got {batched}"
+        );
+
+        // The history then holds the resource's WHOLE sequence oldest to newest: its
+        // discovery, each state it changed into, and its deletion last.
+        let oldest_first = history_oldest_first(case, &emulator, &queue_url).await;
+        let sequence = statuses(&oldest_first);
+        assert_eq!(
+            sequence.first().map(String::as_str),
+            Some(RESOURCE_DISCOVERED),
+            "case {case:?}: the resource's history begins with its discovery, got {sequence:?}"
+        );
+        assert_eq!(
+            sequence.last().map(String::as_str),
+            Some(RESOURCE_DELETED),
+            "case {case:?}: the resource's history ends with its deletion, got {sequence:?}"
+        );
+        assert!(
+            sequence[1..sequence.len() - 1]
+                .iter()
+                .all(|status| status == CONFIGURATION_UPDATED),
+            "case {case:?}: every item between those two records a configuration that was \
+             updated, got {sequence:?}"
+        );
+        let mut newest_first = sequence.clone();
+        newest_first.reverse();
+        assert_eq!(
+            statuses(&deleted), newest_first,
+            "case {case:?}: the default order reports that same sequence newest first, got {:?}",
+            statuses(&deleted)
+        );
+        let captured = captured_at(case, &oldest_first);
+        assert!(
+            captured.windows(2).all(|pair| pair[0] <= pair[1]),
+            "case {case:?}: the items come in the order they were captured, got {captured:?}"
+        );
+
+        // And the deletion item still identifies the queue and keeps the state it was last
+        // in: a resource's history outlives the resource.
+        let final_item = &oldest_first[sequence.len() - 1];
+        assert_eq!(
+            final_item["resourceId"],
+            json!(queue_url),
+            "case {case:?}: the deletion item names the queue's own url, got {final_item}"
+        );
+        assert_eq!(
+            final_item["resourceName"],
+            json!(name),
+            "case {case:?}: the deletion item names the queue's custom name, got {final_item}"
+        );
+        assert_eq!(
+            final_item["arn"], queue_arn,
+            "case {case:?}: the deletion item keeps the ARN Amazon SQS reported, got \
+             {final_item}"
+        );
+        assert_eq!(
+            configuration(case, final_item)[attribute],
+            json!(updated),
+            "case {case:?}: the deletion item keeps the configuration last recorded for the \
+             queue, got {final_item}"
         );
     }
 }

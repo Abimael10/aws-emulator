@@ -71,6 +71,11 @@ mod error_message_rules;
 mod list_configuration_recorders;
 #[path = "all/pending_aggregation_requests.rs"]
 mod pending_aggregation_requests;
+// Declared HERE, where `queue_*` sorts in the list above, rather than appended at the tail:
+// every suite that lands appends there, so a declaration added there conflicts with the next
+// one that lands.
+#[path = "all/queue_configuration_echo_and_deletion.rs"]
+mod queue_configuration_echo_and_deletion;
 #[path = "all/resource_evaluations.rs"]
 mod resource_evaluations;
 #[path = "all/state_roundtrip.rs"]
