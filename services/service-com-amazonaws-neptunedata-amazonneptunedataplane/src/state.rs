@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-neptunedata-amazonneptunedataplane service.
 //!
-//! Five kinds of record live here, and every implemented operation computes its answer
+//! The records below live here, and every implemented operation computes its answer
 //! from them:
 //!
 //! * [`FastResetRecord`] — the fast-reset token the engine is willing to accept, and what
@@ -20,6 +20,11 @@
 //! * [`PropertyGraph`] — the graph's own data: the nodes and relationships the
 //!   openCypher endpoints read and write (see [`open_cypher`]). `ExecuteFastReset`
 //!   empties it, because that is what a database reset leaves behind.
+//! * [`StatisticsRecord`] — the DFE statistics the property-graph statistics endpoints
+//!   report (see [`statistics`]): the generation mode `ManagePropertygraphStatistics` set
+//!   and the latest run it performed, counted from [`PropertyGraph`] itself.
+//!   `DeletePropertygraphStatistics` removes the record, so `GetPropertygraphStatistics`
+//!   has nothing to answer from and refuses.
 //!
 //! `ExecuteGremlinExplainQuery` is what admits a query record: it reads the submitted
 //! traversal and plans it (see [`gremlin_plan`]), which is work the engine really did, so
@@ -60,12 +65,14 @@ mod ml;
 mod open_cypher;
 mod parse_refusal;
 mod property_graph;
+mod statistics;
 
 pub use gremlin_plan::*;
 pub use ml::*;
 pub use open_cypher::*;
 pub use parse_refusal::*;
 pub use property_graph::*;
+pub use statistics::*;
 
 /// `GetEngineStatusOutput$status` for an instance that is not experiencing problems:
 /// the member's own documentation says "Set to `healthy` if the instance is not
@@ -615,6 +622,12 @@ pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     pub graph: PropertyGraph,
     /// The Neptune ML resources this engine holds, which the ML endpoints read and write.
     pub ml: MlRegistry,
+    /// The DFE statistics this engine holds for the property graph, which the
+    /// property-graph statistics endpoints read and write. `None` while the engine keeps
+    /// no statistics state for that data — before any management call has started one, and
+    /// again once a delete has removed it — which is what makes a read of statistics that
+    /// are not available a refusal rather than an answer.
+    pub propertygraph_statistics: Option<StatisticsRecord>,
 }
 
 impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
@@ -642,6 +655,57 @@ impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
             .take(limit)
             .map(|job| job.load_id.clone())
             .collect()
+    }
+
+    /// Apply `mode` to the property-graph statistics, and report the id of the generation
+    /// run a `refresh` performed — `None` for a mode that only sets how statistics are
+    /// generated, which is what makes the payload "only returned for refresh mode".
+    ///
+    /// A management call is what starts the statistics state of this data: a record the
+    /// engine keeps none for is created here, carrying the mode this call set. A `refresh`
+    /// counts the graph's characteristic sets as of `now` and records the run, so what a
+    /// later read reports follows from what the graph held when the run happened.
+    pub fn manage_propertygraph_statistics(
+        &mut self,
+        mode: StatisticsMode,
+        now: SystemTime,
+    ) -> Option<String> {
+        match mode {
+            StatisticsMode::DisableAutoCompute => {
+                self.propertygraph_statistics_record().auto_compute = false;
+                None
+            }
+            StatisticsMode::EnableAutoCompute => {
+                self.propertygraph_statistics_record().auto_compute = true;
+                None
+            }
+            StatisticsMode::Refresh => {
+                // The run reads the graph before the record is borrowed to write it, so one
+                // call reads the graph once and writes the statistics once.
+                let signatures = characteristic_sets(&self.graph);
+                Some(
+                    self.propertygraph_statistics_record()
+                        .record_generation(signatures, now),
+                )
+            }
+        }
+    }
+
+    /// The property-graph statistics record to write, started here when the engine keeps
+    /// none yet: a management call is what the statistics state of this data begins with.
+    fn propertygraph_statistics_record(&mut self) -> &mut StatisticsRecord {
+        self.propertygraph_statistics
+            .get_or_insert_with(StatisticsRecord::default)
+    }
+
+    /// Delete the property-graph statistics, and report whether there were any to delete.
+    ///
+    /// `false` means the engine kept no statistics state for this data, which is what tells
+    /// the delete there was nothing to delete. What is removed is the whole statistics state
+    /// the endpoints report, so a read after it has nothing to answer from until the next
+    /// management call starts a record again.
+    pub fn delete_propertygraph_statistics(&mut self) -> bool {
+        self.propertygraph_statistics.take().is_some()
     }
 
     /// Perform the fast reset `token` authorises, and report whether it did.
@@ -811,10 +875,21 @@ pub fn invalid_fast_reset_token() -> InvalidParameterException {
 /// The `IllegalArgumentException` payload for an `action` this service does not support,
 /// naming the value that was wrong and the values the member accepts.
 pub fn unsupported_action(action: &str, accepted: &[&str]) -> IllegalArgumentException {
+    unsupported_member_value("action", action, accepted)
+}
+
+/// The `IllegalArgumentException` payload for a request member carrying a value this
+/// service does not support, naming the member, the value that was wrong and the values the
+/// member accepts, so the caller can fix the request from the message alone.
+pub fn unsupported_member_value(
+    member: &str,
+    value: &str,
+    accepted: &[&str],
+) -> IllegalArgumentException {
     IllegalArgumentException {
         detailed_message: format!(
-            "Supplied action {} is invalid. Accepted actions: {}",
-            echoed(action),
+            "Supplied {member} {} is invalid. Accepted {member}s: {}",
+            echoed(value),
             accepted.join(", ")
         ),
         request_id: new_request_id(),

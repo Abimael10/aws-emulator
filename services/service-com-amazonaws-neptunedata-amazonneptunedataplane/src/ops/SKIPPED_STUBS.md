@@ -18,11 +18,13 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: DeletePropertygraphStatistics — unsupported shape construct: operation 'DeletePropertygraphStatistics' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: DeleteSparqlStatistics — unsupported shape construct: operation 'DeleteSparqlStatistics' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: GetPropertygraphStatistics — unsupported shape construct: operation 'GetPropertygraphStatistics' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetSparqlStatistics — unsupported shape construct: operation 'GetSparqlStatistics' has a Unit/absent input, which the generator does not emit yet
 
 Hand-authored since: `GetEngineStatus` was declined here for the same reason (a
 Unit/absent input) and is now hand-written in `ops/get_engine_status.rs`, which
-declares its own input type and schema. Use it as the pattern for the four above.
+declares its own input type and schema. `GetPropertygraphStatistics` and
+`DeletePropertygraphStatistics` were declined for that reason too and are now
+hand-written in `ops/get_propertygraph_statistics.rs` and
+`ops/delete_propertygraph_statistics.rs`. Use any of them as the pattern for the
+two above.
