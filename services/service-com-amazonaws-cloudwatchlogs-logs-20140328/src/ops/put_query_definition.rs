@@ -200,7 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(record) = store.query_definitions.get_mut(&query_definition_id) else {
                 return Err(PutQueryDefinitionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::query_definition_not_found_message()),
+                        // The id is this call's UPDATE SELECTOR, so the refusal is the one
+                        // that also says what leaving the member out would have meant.
+                        message: Some(crate::state::query_definition_update_not_found_message()),
                     },
                 )
                 .into());

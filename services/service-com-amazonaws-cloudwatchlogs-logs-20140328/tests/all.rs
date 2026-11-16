@@ -157,6 +157,8 @@ mod index_policy_puts;
 mod index_policy_removal;
 #[path = "all/ingestion_window.rs"]
 mod ingestion_window;
+#[path = "all/insights_created_field_projection.rs"]
+mod insights_created_field_projection;
 #[path = "all/insights_queries.rs"]
 mod insights_queries;
 #[path = "all/insights_semantic_refusal_spans.rs"]
@@ -261,6 +263,8 @@ mod query_cancellation;
 mod query_compilation;
 #[path = "all/query_compile_rule_refusals.rs"]
 mod query_compile_rule_refusals;
+#[path = "all/query_definition_removal.rs"]
+mod query_definition_removal;
 #[path = "all/query_definitions.rs"]
 mod query_definitions;
 #[path = "all/query_language_admission.rs"]

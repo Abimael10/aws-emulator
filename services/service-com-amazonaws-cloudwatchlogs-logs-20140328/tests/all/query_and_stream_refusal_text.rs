@@ -9,8 +9,9 @@
 //!
 //! * a `queryId` this account holds no query under is INVALID, and the refusal names the
 //!   id the request sent;
-//! * a query definition id nothing is stored under is refused with the class's fixed
-//!   sentence inside the SDK error envelope, whose only per-run field is the request id;
+//! * a query definition id nothing is stored under is refused with the sentence the refusing
+//!   call words that condition with, inside the SDK error envelope, whose only per-run field
+//!   is the request id;
 //! * ordering log streams by event time together with a name prefix is refused with the
 //!   service's fixed sentence for the combination;
 //! * a `nextToken` a read cannot resume from is refused with one fixed sentence, whichever
@@ -152,10 +153,9 @@ async fn a_queryid_no_query_is_stored_under_is_refused_naming_the_id() {
     );
 }
 
-/// A query definition id nothing is stored under is refused with the class's fixed
-/// sentence plus the SDK error envelope, whose status and code are the ones the response
-/// itself answers with and whose request id is the one per-run field — the same for every
-/// operation that addresses a definition by id.
+/// A query definition id nothing is stored under is refused with the sentence the refusing
+/// call words that condition with, plus the SDK error envelope, whose status and code are the
+/// ones the response itself answers with and whose request id is the one per-run field.
 #[tokio::test]
 async fn a_query_definition_id_that_is_not_stored_is_refused_in_the_services_wording() {
     let logs = Logs::new();
@@ -188,20 +188,27 @@ async fn a_query_definition_id_that_is_not_stored_is_refused_in_the_services_wor
         ("an id that is not a UUID at all", "not-a-definition".to_string()),
     ];
 
-    // The WHOLE sentence the service states for an id that resolves to no definition: the
-    // verdict on the id, and then what to do about it on each of the two calls that may
-    // carry the member — an update, which has to name a definition, and a create, which
-    // leaves the id out. Written out here rather than read from the crate, so a sentence
-    // the implementation shortens fails this.
-    let expected_text = "Query definition id is invalid. If you are updating query definition, \
-                         please provide correct query definition id; If you are creating new \
-                         query definition, do not use --query-definition-id as a parameter";
+    // The sentence each call states for an id that resolves to no definition, written out
+    // here rather than read from the crate, so a sentence the implementation lengthens or
+    // shortens fails this. The delete addresses a definition by its id and nothing else, so
+    // it states the verdict on the id alone; the put's `queryDefinitionId` is the OPTIONAL
+    // update selector, so it also says what to do on each of the two requests that call
+    // serves — an update, which has to name a definition, and a create, which leaves the id
+    // out.
+    let verdict = "Query definition id is invalid.";
+    let update_guidance = " If you are updating query definition, please provide correct query \
+                           definition id; If you are creating new query definition, do not use \
+                           --query-definition-id as a parameter";
     let mut seen_request_ids: Vec<String> = Vec::new();
     for (case, id) in absent {
         // Both operations that resolve a `queryDefinitionId`: the delete, and the put
         // that updates an existing definition.
-        for (operation, body) in [
-            ("DeleteQueryDefinition", json!({"queryDefinitionId": id})),
+        for (operation, body, expected_text) in [
+            (
+                "DeleteQueryDefinition",
+                json!({"queryDefinitionId": id}),
+                verdict.to_string(),
+            ),
             (
                 "PutQueryDefinition",
                 json!({
@@ -209,6 +216,7 @@ async fn a_query_definition_id_that_is_not_stored_is_refused_in_the_services_wor
                     "name": "updated",
                     "queryString": VALID_QUERY,
                 }),
+                format!("{verdict}{update_guidance}"),
             ),
         ] {
             let case = format!("{operation}: {case}");
@@ -224,7 +232,7 @@ async fn a_query_definition_id_that_is_not_stored_is_refused_in_the_services_wor
                     "{expected_text} (Service: AWSLogs; Status Code: 400; Error Code: \
                      {NOT_FOUND}; Request ID: {request_id}; Proxy: null)"
                 ),
-                "case {case}: expected the class's fixed sentence in the SDK envelope, got \
+                "case {case}: expected this call's fixed sentence in the SDK envelope, got \
                  {said:?}"
             );
             // The sentence is FIXED: it carries nothing of the request, not even the id.

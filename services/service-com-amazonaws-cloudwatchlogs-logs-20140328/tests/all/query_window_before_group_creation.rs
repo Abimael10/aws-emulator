@@ -23,7 +23,9 @@
 //! `endTime`'s published minimum of 0), which of the three members names the log groups, how many
 //! groups the request names and whether only one of them is younger than the range, and — for
 //! what is SERVED — the range that ends in the second the group was created in, one second past
-//! it, and one in the future.
+//! it, and one in the future. A row's range is placed against the creation instant the service
+//! REPORTS for the groups that row names, so where the clock stood when they were created
+//! decides nothing.
 //!
 //! The groups judged are the ones the REQUEST names, which is where `StartQuery` resolves them;
 //! a query whose own `SOURCE` command selects its log groups by prefix names none, and selects
@@ -90,15 +92,19 @@ async fn group_creation_ms(logs: &Logs, group: &str) -> i64 {
         .unwrap_or_else(|| panic!("a log group carries creationTime, got {reported}"))
 }
 
-/// Create both log groups and answer the epoch second the younger one was created in.
+/// Create both log groups and answer the epoch second the EARLIEST of them was created in.
+///
+/// The earliest one decides, because a row's range has to close before the creation instant of
+/// every group that row names: a range ending before the first group came into existence ends
+/// before the second one did too, whichever second each create happened to land in.
 async fn groups(logs: &Logs) -> i64 {
-    let mut latest = 0;
+    let mut earliest = i64::MAX;
     for group in [GROUP, OTHER_GROUP] {
         logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
             .await;
-        latest = latest.max(group_creation_ms(logs, group).await);
+        earliest = earliest.min(group_creation_ms(logs, group).await);
     }
-    creation_second(latest)
+    creation_second(earliest)
 }
 
 /// The queries `DescribeQueries` reports for `filter`.

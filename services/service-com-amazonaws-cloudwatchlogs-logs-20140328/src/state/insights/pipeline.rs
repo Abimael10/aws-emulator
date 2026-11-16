@@ -17,6 +17,10 @@
 //! * `filter` / `where` keep the records their expression selects ([`super::expression`]);
 //! * `parse` extracts ephemeral fields from a field's text, by regular expression or by the
 //!   glob pattern whose `*`s the `as` clause names;
+//! * a field a stage DEFINES — a `parse` capture, an `eval` definition, a column a `lookup`
+//!   joins — is reported as a column of the result beside the columns it already carried
+//!   ([`declare_fields`]), so a pipeline that creates fields and projects nothing further
+//!   still answers the fields it created;
 //! * `stats` aggregates the records into one row per group, and `pattern` groups them by the
 //!   shape of their messages;
 //! * `sort`, `limit`/`head` and `dedup` order, bound and deduplicate what is left;
@@ -492,7 +496,8 @@ fn filter(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execu
 ///
 /// Two forms, both of which the language documents: a regular expression whose NAMED capture
 /// groups name the fields, and a glob pattern whose `*`s are named by the `as` clause in the
-/// order they appear.
+/// order they appear. The fields it creates are columns of the result ([`declare_fields`]), so
+/// a pipeline that parses and projects nothing further reports what it parsed.
 fn parse_stage(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     let (text, aliases) = split_alias_list(arguments);
     let source = text
@@ -574,6 +579,9 @@ fn glob_to_pattern(glob: &str) -> String {
 }
 
 /// `eval`: define a field from an expression, as PPL writes it (`eval name = expression`).
+///
+/// The field it defines is a column of the result ([`declare_fields`]), like every other field
+/// a command of the pipeline computes.
 fn eval(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     for item in split_items(arguments) {
         let Some((name, text)) = item.split_once('=') else {

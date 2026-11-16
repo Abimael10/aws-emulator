@@ -162,6 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteQueryDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
+                    // This call addresses a definition by id alone — there is no other
+                    // reading of the member here — so the refusal is the verdict on the id
+                    // and nothing else.
                     message: Some(crate::state::query_definition_not_found_message()),
                 },
             )
