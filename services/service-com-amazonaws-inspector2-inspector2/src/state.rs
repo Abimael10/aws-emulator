@@ -80,6 +80,17 @@ pub const STATUS_ENABLED: &str = "ENABLED";
 /// Source: `smithy_query(query="shape", shape="Status")`.
 pub const STATUS_DISABLED: &str = "DISABLED";
 
+/// The `ErrorCode` token a per-account entry carries when the calling account is not
+/// allowed to act on, or read, the account that entry names.
+/// Source: `smithy_query(query="shape", shape="ErrorCode")` — `ACCESS_DENIED` is one of
+/// its tokens, and `FailedAccount$errorCode` targets it.
+pub const ERROR_CODE_ACCESS_DENIED: &str = "ACCESS_DENIED";
+
+/// How this service words an [`ERROR_CODE_ACCESS_DENIED`] per-account entry: the calling
+/// account has no access to the account the entry names. The entry's only variable part is
+/// its `accountId`, so the message itself carries no value from the request.
+pub const NO_ACCOUNT_ACCESS_MESSAGE: &str = "Invoking account does not have access to this account";
+
 /// The `Ec2DeepInspectionStatus` token of an account deep inspection is running for.
 /// Source: `smithy_query(query="shape", shape="Ec2DeepInspectionStatus")` —
 /// `ACTIVATED | DEACTIVATED | PENDING | FAILED`.
@@ -790,10 +801,26 @@ impl ComAmazonawsInspector2Inspector2State {
     /// through it. That set is what a `TARGET_ACCOUNT_ALL` target names, and it is read on
     /// every call rather than recorded, because an account that joins later is inside a
     /// configuration that already targets every account.
+    ///
+    /// This is the set form of [`Self::administers_account`] — the same membership, enumerated
+    /// rather than asked about one id — so the two answer the same question and a caller needing
+    /// the ids and a caller needing the decision cannot disagree.
     fn organization_account_ids(&self, owner_id: &str) -> BTreeSet<String> {
         let mut accounts: BTreeSet<String> = self.accounts.keys().cloned().collect();
         accounts.insert(owner_id.to_string());
         accounts
+    }
+
+    /// Whether `account_id` is an account the calling account `caller_id` administers —
+    /// membership of the set [`Self::organization_account_ids`] enumerates, answered without
+    /// building it so a batch of ids costs one lookup each.
+    ///
+    /// This is the one place an operation asks whether the calling account may act on
+    /// another account: its own account always, and otherwise an account Amazon Inspector
+    /// holds a record for, which in this emulator is how an account enters the
+    /// administrator's organization. An id no write ever recorded is outside it.
+    pub fn administers_account(&self, caller_id: &str, account_id: &str) -> bool {
+        account_id == caller_id || self.accounts.contains_key(account_id)
     }
 
     /// The account ids `stored` targets, as the wire `CisTargets$accountIds` reports them.

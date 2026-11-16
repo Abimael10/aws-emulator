@@ -12,7 +12,10 @@
 //! * an operation that takes a filter ARN naming a filter checks that ARN's SHAPE before
 //!   it consults the store, refusing a value that is not a well-formed filter ARN of this
 //!   service with HTTP 400 `ValidationException`; only a well-formed ARN reaches the
-//!   store, where naming no stored filter is HTTP 404 `ResourceNotFoundException`;
+//!   store, where naming no stored filter is HTTP 404 `ResourceNotFoundException` for the
+//!   operations that must resolve a filter to answer (`DeleteFilter`, whose postcondition
+//!   an absent filter already satisfies, succeeds idempotently instead — see
+//!   `delete_filter_idempotence`);
 //! * a filter's tag set is reported unconditionally, as an empty map when the filter has
 //!   no tags, so a response's shape never depends on whether tags were set.
 
@@ -37,10 +40,10 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// Well-formed filter ARNs this emulator never minted, one per part of the ARN that may be
 /// unfamiliar: the partition, the region, the account, the owner (an account and an
 /// organization) and the id. Every one of them passes the shape check, so each reaches the
-/// store and is answered as a MISSING RESOURCE rather than as a bad request.
+/// store and is answered from what the store holds rather than as a bad request.
 ///
-/// Shared with the suite that pins how that refusal is WORDED, so one table serves both
-/// halves of the rule instead of two drifting copies.
+/// Shared with the suites that pin how a lookup's refusal is WORDED and how `DeleteFilter`
+/// answers an ARN it does not hold, so one table serves them instead of drifting copies.
 pub(crate) fn unknown_filter_arns() -> [(&'static str, String); 6] {
     [
         (
@@ -195,33 +198,30 @@ async fn malformed_filter_arns_are_refused_as_invalid() {
 }
 
 /// A WELL-FORMED filter ARN reaches the store, so the answer is about the resource rather
-/// than the request: the ARN of a stored filter succeeds, and one that names no stored
-/// filter is a 404 `ResourceNotFoundException`.
+/// than the request: for `UpdateFilter`, which must resolve a filter to apply its changes,
+/// an ARN that names no stored filter is a 404 `ResourceNotFoundException`, while the ARN of
+/// a stored filter is served by both operations that take one.
 ///
 /// The rows differ along which part of a well-formed ARN is unfamiliar: the partition, the
 /// region, the account, the owner and the id — every one of them still a value the shape
 /// check must accept.
 #[tokio::test]
 async fn well_formed_filter_arns_reach_the_store() {
+    let (uri, member) = UPDATE;
     for (case, candidate) in unknown_filter_arns() {
-        for (uri, member) in [UPDATE, DELETE] {
-            let router = router();
-            let mut body = json!({ member: candidate });
-            if uri == UPDATE.0 {
-                body["description"] = Value::String("tuned".to_string());
-            }
-            let (status, error_type, response) = post_in(&router, "us-east-1", uri, &body).await;
-            assert_eq!(
-                status, 404,
-                "case {case} / {uri}: expected 404, got {status} / {response}"
-            );
-            assert_eq!(
-                error_type.as_deref(),
-                Some("ResourceNotFoundException"),
-                "case {case} / {uri}: expected ResourceNotFoundException, got {error_type:?} / \
-                 {response}"
-            );
-        }
+        let router = router();
+        let body = json!({ member: candidate, "description": "tuned" });
+        let (status, error_type, response) = post_in(&router, "us-east-1", uri, &body).await;
+        assert_eq!(
+            status, 404,
+            "case {case} / {uri}: expected 404, got {status} / {response}"
+        );
+        assert_eq!(
+            error_type.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case} / {uri}: expected ResourceNotFoundException, got {error_type:?} / \
+             {response}"
+        );
     }
 
     // And the ARN of a filter that IS stored is served, so the shape check refuses nothing

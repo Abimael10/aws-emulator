@@ -2,7 +2,9 @@
 
 //! @op BatchGetAccountStatus
 //! IMPLEMENTED: reports the Amazon Inspector enablement `Enable` recorded for each
-//! requested account. A reporting operation: it reads the shared state and writes nothing.
+//! requested account the calling account may read, and reports every other requested
+//! account in `failedAccounts` with `ACCESS_DENIED`. A reporting operation: it reads the
+//! shared state and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,44 +156,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Like `Enable`, an absent (or empty) `accountIds` means the calling account; and
-        // `AccountIdSet` is `@uniqueItems`, so a repeated id was already refused at the
-        // boundary and each account here is named exactly once.
+        // Like `Enable`, an absent (or empty) `accountIds` means the calling account. The
+        // list the loop below walks is BOUNDED by the model, and the request boundary is
+        // where that bound is enforced: `AccountIdSet` is `@length 0..100`, so at most a
+        // hundred ids reach this handler and the answer holds at most a hundred entries
+        // however many a caller sends; it is `@uniqueItems`, so a repeated id was already
+        // refused and each account here is named exactly once; and its member `AccountId` is
+        // `@length 12` with `@pattern ^\d{12}$`, so every id below is twelve digits and a
+        // malformed one was already refused as a `ValidationException` rather than reaching
+        // the per-account decision.
+        // Source: `smithy_query(query="shape", shape="AccountIdSet,AccountId")`.
         let requested: Vec<String> = match input.account_ids {
             Some(ids) if !ids.is_empty() => ids,
             _ => vec![::engine::emulator_account_id().to_string()],
         };
 
+        let caller = ::engine::emulator_account_id();
         let guard = state.lock();
-        let accounts = requested
-            .into_iter()
-            .map(|account_id| {
-                // An account Amazon Inspector was never enabled for has no record, and
-                // reports the same thing a disabled account does: everything off.
-                let enablement = guard.accounts.get(&account_id).cloned().unwrap_or_default();
-                let scan_state = |resource_type: &str| State {
-                    status: enablement.status_of(resource_type).to_string(),
-                };
-                AccountState {
+        let mut accounts = Vec::with_capacity(requested.len());
+        let mut failed_accounts = Vec::new();
+        for account_id in requested {
+            // An account outside what the caller administers is not the caller's to read,
+            // and the per-entry failure list is where that is reported: the request as a
+            // whole still succeeds, and the entry carries no status at all, so no posture
+            // is ever reported for an account the caller may not see.
+            if !guard.administers_account(caller, &account_id) {
+                failed_accounts.push(FailedAccount {
                     account_id,
-                    state: State {
-                        status: enablement.account_status().to_string(),
-                    },
-                    resource_state: ResourceState {
-                        ec2: scan_state("EC2"),
-                        ecr: scan_state("ECR"),
-                        lambda: Some(scan_state("LAMBDA")),
-                        lambda_code: Some(scan_state("LAMBDA_CODE")),
-                        code_repository: Some(scan_state("CODE_REPOSITORY")),
-                    },
-                }
-            })
-            .collect();
+                    status: None,
+                    resource_status: None,
+                    error_code: crate::state::ERROR_CODE_ACCESS_DENIED.to_string(),
+                    error_message: crate::state::NO_ACCOUNT_ACCESS_MESSAGE.to_string(),
+                });
+                continue;
+            }
+
+            // A member account Amazon Inspector was never enabled for has no record, and
+            // reports the same thing a disabled account does: everything off.
+            let enablement = guard.accounts.get(&account_id).cloned().unwrap_or_default();
+            let scan_state = |resource_type: &str| State {
+                status: enablement.status_of(resource_type).to_string(),
+            };
+            accounts.push(AccountState {
+                account_id,
+                state: State {
+                    status: enablement.account_status().to_string(),
+                },
+                resource_state: ResourceState {
+                    ec2: scan_state("EC2"),
+                    ecr: scan_state("ECR"),
+                    lambda: Some(scan_state("LAMBDA")),
+                    lambda_code: Some(scan_state("LAMBDA_CODE")),
+                    code_repository: Some(scan_state("CODE_REPOSITORY")),
+                },
+            });
+        }
 
         Ok(BatchGetAccountStatusOutput {
             accounts,
-            // Every requested account was reported, so nothing failed.
-            failed_accounts: None,
+            // Absent rather than an empty list when every requested account was reported,
+            // so "nothing failed" is not rendered as a failure list with no entries.
+            failed_accounts: (!failed_accounts.is_empty()).then_some(failed_accounts),
         })
     }
 }

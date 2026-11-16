@@ -11,6 +11,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_disable.rs"]
 mod account_disable;
+#[path = "all/account_status_access.rs"]
+mod account_status_access;
 #[path = "all/cis_scan_configurations.rs"]
 mod cis_scan_configurations;
 #[path = "all/cis_sessions.rs"]
@@ -19,6 +21,8 @@ mod cis_sessions;
 mod code_security_scan_configurations;
 #[path = "all/constraint_refusal_wording.rs"]
 mod constraint_refusal_wording;
+#[path = "all/delete_filter_idempotence.rs"]
+mod delete_filter_idempotence;
 #[path = "all/ec2_deep_inspection.rs"]
 mod ec2_deep_inspection;
 #[path = "all/encryption_key.rs"]

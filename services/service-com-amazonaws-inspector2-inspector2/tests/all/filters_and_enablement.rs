@@ -183,8 +183,9 @@ async fn enable_records_exactly_the_resource_types_requested() {
 }
 
 /// `Enable` acts on the accounts the request names, and on the calling account only when
-/// it names none. `BatchGetAccountStatus` reports each requested account from its own
-/// record, so an account that was not enabled still reports DISABLED.
+/// it names none. `BatchGetAccountStatus` reports each of those accounts from its own
+/// record; an account the caller does not administer is reported per entry instead, which
+/// `account_status_access` pins.
 #[tokio::test]
 async fn enable_and_status_are_per_account() {
     let other = "012345678901";
@@ -220,7 +221,13 @@ async fn enable_and_status_are_per_account() {
         status, 200,
         "BatchGetAccountStatus: expected 200, got {status} / {reported}"
     );
-    for (index, (account, expected)) in [(ACCOUNT, "ENABLED"), (other, "ENABLED"), (third, "DISABLED")]
+    // `third` was never recorded, so it is not the caller's to read: it is reported per
+    // entry instead of with a status of its own.
+    assert_eq!(
+        reported["failedAccounts"][0]["accountId"], third,
+        "an account the caller does not administer belongs in failedAccounts, got {reported}"
+    );
+    for (index, (account, expected)) in [(ACCOUNT, "ENABLED"), (other, "ENABLED")]
         .into_iter()
         .enumerate()
     {
@@ -742,8 +749,10 @@ async fn update_filter_mutates_only_the_supplied_members() {
     }
 }
 
-/// An ARN that names no stored filter is a 404 `ResourceNotFoundException` for both
-/// `UpdateFilter` and `DeleteFilter` — including the ARN of a filter already deleted.
+/// An ARN that names no stored filter is a 404 `ResourceNotFoundException` for
+/// `UpdateFilter`, which has to resolve a filter to apply its changes — including the ARN of
+/// a filter already deleted. `DeleteFilter` answers the same ARN with its idempotent
+/// success, which `delete_filter_idempotence` pins.
 #[tokio::test]
 async fn unknown_filter_arns_are_not_found() {
     let router = router();
@@ -795,23 +804,6 @@ async fn unknown_filter_arns_are_not_found() {
         ),
     ];
     for (case, candidate) in unknown {
-        let (status, error_type, body) = post_in(
-            &router,
-            "us-east-1",
-            "/filters/delete",
-            &json!({ "arn": candidate }),
-        )
-        .await;
-        assert_eq!(
-            status, 404,
-            "case {case}: DeleteFilter: expected 404, got {status} / {body}"
-        );
-        assert_eq!(
-            error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: DeleteFilter: expected ResourceNotFoundException, got {error_type:?}"
-        );
-
         let (status, error_type, body) = post_in(
             &router,
             "us-east-1",
@@ -963,7 +955,8 @@ async fn enable_refuses_past_the_enabled_account_cap() {
     );
 
     // Nothing was stored for the refused account, and an account already in the store can
-    // still be enabled again.
+    // still be enabled again. The refused account is therefore not one the caller
+    // administers, so it is reported per entry rather than with a status.
     let (status, reported) = post(
         &router,
         "/status/batch/get",
@@ -972,11 +965,15 @@ async fn enable_refuses_past_the_enabled_account_cap() {
     .await;
     assert_eq!(status, 200, "BatchGetAccountStatus: got {status} / {reported}");
     assert_eq!(
-        reported["accounts"][0]["state"]["status"], "DISABLED",
+        reported["failedAccounts"][0]["accountId"], "999999999999",
         "the refused account must not have been stored, got {reported}"
     );
     assert_eq!(
-        reported["accounts"][1]["state"]["status"], "ENABLED",
+        reported["accounts"][0]["accountId"], "000000000042",
+        "an account inside the cap is still readable, got {reported}"
+    );
+    assert_eq!(
+        reported["accounts"][0]["state"]["status"], "ENABLED",
         "an account inside the cap stays enabled, got {reported}"
     );
 }

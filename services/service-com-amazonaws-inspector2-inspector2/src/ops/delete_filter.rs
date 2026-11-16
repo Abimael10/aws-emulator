@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFilter
-//! IMPLEMENTED: removes the stored filter and returns its ARN; an ARN that names no
-//! stored filter is a 404 `ResourceNotFoundException`.
+//! IMPLEMENTED: removes the filter the requested ARN names and echoes that ARN back. The
+//! delete is IDEMPOTENT — a well-formed filter ARN the store does not hold is already in
+//! the state the call asks for, so it answers 200 with the same echo; only a value that is
+//! not a well-formed filter ARN is refused, with 400 `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,15 +165,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut guard = state.lock();
-        // `remove` is what makes a second delete of the same ARN a 404: the record is
-        // gone, so the lookup that reports it cannot find it either.
-        let removed = guard.filters.remove(&input.arn).ok_or_else(|| {
-            DeleteFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::filter_not_found_message(&input.arn),
-            })
-        })?;
+        // One idempotent state transition: the whole postcondition of the call is that no
+        // filter is stored under this ARN, and the only thing it reports is that ARN, so an
+        // ARN the store does not hold is ALREADY in the state the call asks for and nothing
+        // is missing to report. `remove` under the one state lock is that transition, so a
+        // retry, a defensive teardown and two callers racing on one ARN all observe the
+        // same success — the removal, not the record it removed, is what the answer is
+        // about.
+        state.lock().filters.remove(&input.arn);
 
-        Ok(DeleteFilterOutput { arn: removed.arn })
+        // The echo is the ARN the REQUEST named, which is also the key the record was
+        // stored under, so the two can never disagree.
+        Ok(DeleteFilterOutput { arn: input.arn })
     }
 }
