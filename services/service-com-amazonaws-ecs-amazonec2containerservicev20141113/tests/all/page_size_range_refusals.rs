@@ -54,7 +54,7 @@ const REVISIONS: usize = 3;
 /// The sentence a daemon-plane page size outside `min..=max` earns, as Amazon ECS words
 /// it: fixed text around the two documented bounds, naming neither the value the request
 /// carried nor the member's spelling on the wire.
-fn range_sentence(min: i32, max: i32) -> String {
+pub(crate) fn range_sentence(min: i32, max: i32) -> String {
     format!("MaxResults must be a positive number between {min}-{max}.")
 }
 

@@ -61,7 +61,7 @@ const POLL_BUDGET: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The image the daemon task definitions here run; irrelevant to every rule, so one value.
-const IMAGE: &str = "public.ecr.aws/aws-observability/aws-otel-collector:latest";
+pub(crate) const IMAGE: &str = "public.ecr.aws/aws-observability/aws-otel-collector:latest";
 
 /// Every `DaemonDeploymentStatus` a rollout that has not ended may be in, from the model's
 /// own enum (`smithy_query(query="shape", shape="DaemonDeploymentStatus")`: `PENDING`,
@@ -72,7 +72,7 @@ const ONGOING_STATUSES: [&str; 2] = ["PENDING", "IN_PROGRESS"];
 
 /// Create a MANAGED INSTANCES capacity provider scoped to `cluster` and return its ARN.
 /// "Managed instances capacity providers are cluster-scoped", so the create names one.
-async fn create_managed_provider(
+pub(crate) async fn create_managed_provider(
     router: &MultiServiceRouter,
     cluster: &str,
     name: &str,
@@ -94,7 +94,7 @@ async fn create_managed_provider(
 
 /// Register one daemon task-definition revision of `family` running `image`, and return its
 /// ARN. The image is what tells two revisions of one family apart in a report.
-async fn register_daemon_definition(
+pub(crate) async fn register_daemon_definition(
     router: &MultiServiceRouter,
     family: &str,
     image: &str,
@@ -115,7 +115,7 @@ async fn register_daemon_definition(
 
 /// Create one daemon over `providers` running `definition`, and return its ARN with the ARN
 /// of the initial daemon deployment the create answered.
-async fn create_daemon(
+pub(crate) async fn create_daemon(
     router: &MultiServiceRouter,
     cluster: &str,
     name: &str,
@@ -154,7 +154,7 @@ async fn describe_daemon(router: &MultiServiceRouter, daemon_arn: &str, case: &s
 }
 
 /// `ListDaemonDeployments` for one request, returning the summaries and the token.
-async fn list_deployments_page(
+pub(crate) async fn list_deployments_page(
     router: &MultiServiceRouter,
     request: Value,
     case: &str,
