@@ -452,6 +452,104 @@ pub fn terminate<Eng: Send + Sync + 'static>(engine: &Eng, instance_ids: &[Strin
     }
 }
 
+/// The `InstanceStateName` a RUNNING instance carries, as Amazon EC2 names it on the wire.
+///
+/// Read from Amazon EC2's own enum rather than written out, so a consumer that has to hold
+/// an instance to that state ([`super::attached_instances`]) and Amazon EC2's own reports
+/// can never disagree about how it is spelled.
+#[must_use]
+pub fn running_state() -> &'static str {
+    ec2::InstanceStateName::Running.as_str()
+}
+
+/// What the account's own Amazon EC2 store holds for one instance a request named: the
+/// facts a consumer of an EXISTING instance needs, as Amazon EC2 holds them.
+#[derive(Debug, Clone)]
+pub struct HeldInstance {
+    /// The Availability Zone Amazon EC2 placed the instance in.
+    pub availability_zone: String,
+    /// The `InstanceStateName` Amazon EC2 reports for it, as EC2 names it on the wire.
+    pub state: String,
+    /// What Amazon EC2 launched it as.
+    pub instance_type: String,
+    /// The AMI it was launched from, when EC2's record holds one.
+    pub image_id: Option<String>,
+    /// When Amazon EC2 launched it, which is how old the instance is.
+    pub launched_at: SystemTime,
+}
+
+/// What the account's own Amazon EC2 store holds for each of `instance_ids`, keyed by
+/// instance id — an id the store holds nothing for is simply absent from the answer.
+///
+/// The store is read ONCE for the whole batch, so the cost of one call does not grow with
+/// the account's inventory, and Amazon EC2's own clock-owed moves are materialised through
+/// EC2's own pass before it is read: an instance whose move to `running` has already fallen
+/// due IS running whether or not anybody described it, so a consumer does not refuse an
+/// instance that Amazon EC2's own reader reports as up. EC2's store lock is taken for that
+/// one pass and released before this returns; the answer is empty on an engine carrying no
+/// Amazon EC2 store at all.
+pub fn held<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_ids: &[String],
+) -> BTreeMap<String, HeldInstance> {
+    if instance_ids.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        return BTreeMap::new();
+    };
+    let mut store = state.lock();
+    store.materialize_due_transitions();
+    instance_ids
+        .iter()
+        .filter_map(|instance_id| {
+            let record = store.instances.get(instance_id)?;
+            Some((
+                instance_id.clone(),
+                HeldInstance {
+                    availability_zone: record.placement_az.clone(),
+                    state: record.state.as_str().to_string(),
+                    instance_type: record.instance_type.clone(),
+                    image_id: record.image_id.clone(),
+                    launched_at: record.launch_time,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Record in the account's own Amazon EC2 store that the instances `instance_ids` names are
+/// now instances of the group `group_name`: the tag Amazon EC2 Auto Scaling itself puts on
+/// every instance of a group ([`GROUP_NAME_TAG`]).
+///
+/// An instance a capacity change launched is given that tag by the launch itself, so this is
+/// the same fact for an instance the group was GIVEN rather than launched — an attach
+/// ([`super::attached_instances`]) — and it is written where the instance lives, so the tag
+/// a client reads off the instance comes from Amazon EC2's own record of it. An id the store
+/// holds nothing for records nothing. EC2's store lock is taken for the one pass and
+/// released before this returns.
+pub fn record_group_membership<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_ids: &[String],
+    group_name: &str,
+) {
+    if instance_ids.is_empty() {
+        return;
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    for instance_id in instance_ids {
+        let Some(instance) = store.instances.get_mut(instance_id) else {
+            continue;
+        };
+        instance
+            .tags
+            .insert(GROUP_NAME_TAG.to_string(), group_name.to_string());
+    }
+}
+
 /// The subnet the account's Amazon EC2 store placed `instance_id` in, when it placed it
 /// in one.
 ///

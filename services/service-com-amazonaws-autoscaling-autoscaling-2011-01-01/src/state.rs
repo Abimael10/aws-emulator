@@ -181,6 +181,12 @@ pub mod standby;
 
 pub use standby::{StandbyMove, StandbyRefusal};
 
+/// Bringing the account's own Amazon EC2 instances into a group: the one transition
+/// `AttachInstances` performs, and the rules an instance it takes has to meet.
+pub mod attached_instances;
+
+pub use attached_instances::{attach_description, AttachRefusal};
+
 /// The preferences an instance refresh actually runs under: the ones the request stated,
 /// each member the request left out at the default this service applies.
 pub mod refresh_preferences;
@@ -475,22 +481,23 @@ pub const ACTIVITY_WINDOW: Duration = Duration::from_secs(6 * 7 * 24 * 60 * 60);
 /// the bound is the service's own and is checked by the handler.
 pub const MAX_ACTIVITY_IDS_PER_CALL: usize = 50;
 
-/// The most instance IDs ONE standby move may name.
+/// The most instance IDs ONE move of a group's instances may name.
 ///
-/// From the model's own documentation for `EnterStandby$InstanceIds` and
-/// `ExitStandby$InstanceIds`: "You can specify up to 20 instances." The member carries no
-/// modelled length, so the bound is the service's own and is checked by the handlers.
-pub const MAX_STANDBY_INSTANCE_IDS_PER_CALL: usize = 20;
+/// From the model's own documentation for the `InstanceIds` member of every operation that
+/// moves the instances it names — `EnterStandby`, `ExitStandby` and `AttachInstances`:
+/// "You can specify up to 20 instances." The member carries no modelled length, so the
+/// bound is the service's own and is checked by the handlers.
+pub const MAX_MOVED_INSTANCE_IDS_PER_CALL: usize = 20;
 
-/// The message a standby move naming more instance IDs than
-/// [`MAX_STANDBY_INSTANCE_IDS_PER_CALL`] is refused with: the framework's own envelope for
+/// The message a move of a group's instances naming more instance IDs than
+/// [`MAX_MOVED_INSTANCE_IDS_PER_CALL`] is refused with: the framework's own envelope for
 /// a member value outside its bounds, naming the member as the wire names it and the bound
 /// the request missed.
-pub fn too_many_standby_instance_ids_message(count: usize) -> String {
+pub fn too_many_moved_instance_ids_message(count: usize) -> String {
     format!(
         "1 validation error detected: Value with {count} items at 'instanceIds' failed to \
          satisfy constraint: Member must have length less than or equal to \
-         {MAX_STANDBY_INSTANCE_IDS_PER_CALL}"
+         {MAX_MOVED_INSTANCE_IDS_PER_CALL}"
     )
 }
 
@@ -2816,6 +2823,21 @@ pub fn instance_not_in_group_message(instance_id: &str, group_name: Option<&str>
     let group_name = group_name.unwrap_or(UNFILLED_DETAIL_TOKEN);
     format!("Instance {instance_id}{NOT_PART_OF_GROUP_CLAUSE}{group_name}.")
 }
+
+/// The message a request that would bring an instance into a group which is ALREADY an
+/// instance of an Auto Scaling group is refused with.
+///
+/// An Amazon EC2 instance belongs to at most one Auto Scaling group, so the sentence names
+/// the instance and the group that holds it — which may be the group the request itself
+/// named, when a caller attaches the same instance twice. The fixed text is `Instance ` /
+/// [`ALREADY_PART_OF_GROUP_CLAUSE`] / `.`; it is the converse of
+/// [`instance_not_in_group_message`], and worded the same way.
+pub fn instance_already_in_group_message(instance_id: &str, group_name: &str) -> String {
+    format!("Instance {instance_id}{ALREADY_PART_OF_GROUP_CLAUSE}{group_name}.")
+}
+
+/// The fixed clause [`instance_already_in_group_message`] is built around, stated once.
+const ALREADY_PART_OF_GROUP_CLAUSE: &str = " is already part of Auto Scaling group ";
 
 /// The message a termination request that names no instance at all is refused with: the
 /// operation terminates the instances a request names, so one of the two members that

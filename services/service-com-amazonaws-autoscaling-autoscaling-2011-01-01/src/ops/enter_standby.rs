@@ -166,9 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which the model does not express as a length: checked ahead of the group lookup
         // and of any per-id membership check, like the other per-call bounds of this
         // service, because how many ids one request carries is a fact of the REQUEST.
-        if requested.len() > crate::state::MAX_STANDBY_INSTANCE_IDS_PER_CALL {
+        if requested.len() > crate::state::MAX_MOVED_INSTANCE_IDS_PER_CALL {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::too_many_standby_instance_ids_message(requested.len()),
+                crate::state::too_many_moved_instance_ids_message(requested.len()),
             ));
         }
 

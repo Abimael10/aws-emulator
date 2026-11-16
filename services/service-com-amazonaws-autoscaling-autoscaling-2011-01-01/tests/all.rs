@@ -15,6 +15,8 @@ mod absent_group_refusal_messages;
 mod account_level_reads_publish_service_data;
 #[path = "all/account_wide_read_authorization.rs"]
 mod account_wide_read_authorization;
+#[path = "all/attach_instances.rs"]
+mod attach_instances;
 #[path = "all/auto_scaling_group_lifecycle.rs"]
 mod auto_scaling_group_lifecycle;
 #[path = "all/cancel_instance_refresh.rs"]

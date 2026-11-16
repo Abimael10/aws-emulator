@@ -157,9 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The operation's own documented bound on how many instances ONE call may name,
         // checked exactly as `EnterStandby` checks its own: how many ids one request
         // carries is a fact of the REQUEST, so it is answered before anything is looked up.
-        if requested.len() > crate::state::MAX_STANDBY_INSTANCE_IDS_PER_CALL {
+        if requested.len() > crate::state::MAX_MOVED_INSTANCE_IDS_PER_CALL {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::too_many_standby_instance_ids_message(requested.len()),
+                crate::state::too_many_moved_instance_ids_message(requested.len()),
             ));
         }
 
