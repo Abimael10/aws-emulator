@@ -37,6 +37,10 @@ mod archive_replay;
 mod archive_state_is_settled;
 #[path = "all/array_field_element_matching.rs"]
 mod array_field_element_matching;
+#[path = "all/bulk_fan_out.rs"]
+mod bulk_fan_out;
+#[path = "all/bulk_profile.rs"]
+mod bulk_profile;
 #[path = "all/bus_forward_authorization.rs"]
 mod bus_forward_authorization;
 #[path = "all/bus_forward_failure_accounting.rs"]

@@ -507,6 +507,9 @@ async fn fire<Eng: Send + Sync + 'static>(
     };
     let mut clients = crate::ops::put_events::Clients::default();
     let mut budget = crate::ops::put_events::DeliveryBudget::new();
+    // The messages the QUEUE targets of this firing are handed, sent in batches
+    // once every target has been decided (`crate::ops::put_events::queue_sends`).
+    let mut sends = crate::ops::put_events::QueueSends::default();
     let mut invocations = Vec::with_capacity(targets.len());
     for target in &targets {
         let handover = crate::ops::put_events::Handover {
@@ -530,6 +533,7 @@ async fn fire<Eng: Send + Sync + 'static>(
             &stores,
             &handover,
             &mut budget,
+            &mut sends,
         )
         .await
         {
@@ -537,6 +541,9 @@ async fn fire<Eng: Send + Sync + 'static>(
             // The destination's own invocation rate has this invocation waiting for its
             // slot on a task of its own, which records it when it is made.
             crate::ops::put_events::Handed::Deferred => continue,
+            // A queue target's message is waiting for its queue's batch, which records
+            // it when it is sent (the flush below).
+            crate::ops::put_events::Handed::Held => continue,
             crate::ops::put_events::Handed::BudgetSpent => break,
         };
         invocations.push(super::TargetInvocation {
@@ -547,6 +554,16 @@ async fn fire<Eng: Send + Sync + 'static>(
             outcome,
         });
     }
+    // The messages the queue targets of this firing are waiting for go out now, and
+    // what came of each is recorded beside the deliveries made above.
+    crate::ops::put_events::queue_sends::flush(
+        callback,
+        &mut clients,
+        &stores,
+        sends,
+        &mut invocations,
+    )
+    .await;
     let mut store = state.lock();
     // The firing itself is recorded as the delivery it is, so a client reading the routing
     // log sees the scheduled event beside the published ones.

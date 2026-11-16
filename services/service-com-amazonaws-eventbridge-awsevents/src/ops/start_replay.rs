@@ -393,6 +393,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut budget = crate::ops::put_events::DeliveryBudget::new();
         let mut clients = crate::ops::put_events::Clients::default();
+        // The messages the QUEUE targets of this replay are handed, sent in
+        // batches once the replayed events have been matched and decided
+        // (`crate::ops::put_events::queue_sends`).
+        let mut sends = crate::ops::put_events::QueueSends::default();
         // When the events this replay re-publishes are published: a replay
         // "re-publishes" the archived events onto a bus NOW, so a replayed event
         // is as old as the replay rather than as old as the archived copy.
@@ -449,6 +453,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             published: republished_at,
                         },
                         &mut budget,
+                        &mut sends,
                     )
                     .await
                     {
@@ -457,6 +462,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // invocation waiting for its slot on a task of its own,
                         // which records it when it is made.
                         crate::ops::put_events::Handed::Deferred => continue,
+                        // A queue target's message is waiting for its queue's
+                        // batch, which records it when it is sent (the flush
+                        // below).
+                        crate::ops::put_events::Handed::Held => continue,
                         // The replay's delivery budget is spent: the remaining
                         // targets are not handed anything, and nothing is
                         // recorded for them either.
@@ -477,6 +486,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // match is counted on the matched rule's `MatchedEvents` and
         // `TriggeredRules` metrics, as a publication through `PutEvents` is.
         crate::state::count_rule_matches(cloudwatch.as_ref(), &deliveries).await;
+
+        // The messages the queue targets of this replay are waiting for go out
+        // now, and what came of each is recorded beside the deliveries made above.
+        crate::ops::put_events::queue_sends::flush(
+            ctx.callback(),
+            &mut clients,
+            &stores,
+            sends,
+            &mut invocations,
+        )
+        .await;
 
         // Back under the lock, briefly: how far the replay got is part of what
         // `DescribeReplay` reports, and the routing and invocation logs are how a

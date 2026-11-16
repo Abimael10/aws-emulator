@@ -24,7 +24,6 @@
 // note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // file, which is where the prose earlier landings had left in the list already lives.
 // EVERY comment in this file is an ordinary `//` one, this header included: an inner doc
-//
 // Past this header the file holds one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per
 // file under `tests/all/`, sorted by name, and no other line — no prose between the pairs, no
 // blank line, and nothing after the last pair. Two branches landing at once then insert two
@@ -109,7 +108,6 @@
 // asks of a doc list item; the lint is allowed here so a header line is a header line rather
 // than a build failure. An inner attribute, like an inner doc comment, is legal only before
 // the first item, so it stands here rather than in the list below.
-// note about THIS file belongs in `all/appended_notes.rs`, declared below like any other
 // suite.
 // comment is legal only before the first item, so one left past the declarations is `E0753`
 // and compiles no suite of this target. With none anywhere in the file, no merge of two
@@ -1554,8 +1552,6 @@ mod zz_probe_whole_emulator;
 // crate's `tests/all.rs`, so check there rather than leaving a note here;
 // `all/appended_header_notes.rs`, `all/appended_notes.rs`, `all/appended_notes_tail.rs` and
 // `all/appended_prose.rs` keep what the notes landings had appended to this file.
-// declarations compiles no suite of this target at all — which is what the re-typed copies of
-// this header that kept arriving in its tail had done. With none anywhere below this block, no
 // `mod <name>;` pair into the list below, in the one place its name sorts to. Past this header
 // the file holds those pairs and no other line: no prose between them, no blank line, and
 // nothing at all after the last one — so two branches landing at once insert two lines in two
@@ -1581,3 +1577,25 @@ mod zz_probe_whole_emulator;
 // under `tests/`, which the layout check refuses: the `#[path]` above each declaration is
 // what points it into `tests/all/`.
 // `all/all_rs_is_a_canonical_declaration_list.rs`, the `all/declaration_roots_*.rs` ones and
+// Single integration-test target for the router: this header, the inner attribute below it,
+// and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per suite file under
+// them, no blank line, and nothing at all after the last one — so two branches landing at
+// once insert two lines in two places and have nothing here to duplicate, re-word or mistype.
+// `all/appended_notes_tail.rs` or `all/appended_prose.rs`, which keep what earlier landings
+// had appended here and are each declared below like any other file.
+// This header is ONE block, and every comment in it is an ordinary `//` one: a doc comment of
+// the enclosing module, like an inner attribute, is legal only ahead of the first item, so a
+// copy left among or below the declarations compiles no suite of this target at all rather
+// than failing one test. Re-typed copies of these paragraphs are what had grown both here and
+// in the tail of the list, until no suite of this target ran.
+// A suite file no `mod` here names is compiled nowhere and its tests never run; a name
+// declared twice compiles neither copy; and a suite left at the top level of `tests/` fails
+// the build. This file is a test-target CRATE ROOT, so a bare `mod` would resolve to a sibling
+// of it under `tests/`, which the layout check refuses: the `#[path]` above each declaration
+// is what points it into `tests/all/`. Some of the files declared below are shared harnesses
+// or probes rather than suites, and each is declared for that reason.
+// service crate's own `tests/all.rs`, so check there rather than leaving a note here.
+// is a note rather than a build failure. An inner attribute is legal only ahead of the first
+// item, so it stands with this header.
+#[path = "all/zz_bulk_profile.rs"]
+mod zz_bulk_profile;

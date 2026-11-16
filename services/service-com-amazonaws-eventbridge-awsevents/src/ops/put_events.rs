@@ -170,6 +170,15 @@ mod api_destination;
 // them.
 use api_destination::*;
 
+/// The queue half of the delivery pass: the messages one request hands to its
+/// QUEUE targets, sent to each queue in batches rather than one call per event.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason
+/// the api-destination module above gives.
+#[path = "put_events/queue_sends.rs"]
+pub(crate) mod queue_sends;
+pub(crate) use queue_sends::QueueSends;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -600,6 +609,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`MAX_BUS_HOPS`].
         let mut budget = DeliveryBudget::new();
         let mut clients = Clients::default();
+        // The messages this request's QUEUE targets are handed, sent to each queue
+        // in batches once routing has decided them all ([`queue_sends`]): a
+        // fan-out handing one queue many of this request's events makes one call
+        // per batch instead of one per event.
+        let mut sends = QueueSends::default();
         let mut invocations: Vec<crate::state::TargetInvocation> = Vec::new();
         let mut republished: Vec<crate::state::DeliveredEvent> = Vec::new();
         // ONE matching budget for every copy this request re-publishes, spent
@@ -674,6 +688,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &stores,
                             &handover,
                             &mut budget,
+                            &mut sends,
                         )
                         .await
                         {
@@ -684,6 +699,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // nothing to record here, and the remaining targets
                             // are delivered to as usual.
                             Handed::Deferred => continue,
+                            // A queue target's message is waiting for its
+                            // queue's batch, which records it when it is sent
+                            // ([`queue_sends::flush`] below).
+                            Handed::Held => continue,
                             // The request's delivery budget is spent: the
                             // remaining targets are not handed anything, and
                             // nothing is recorded for them either.
@@ -700,6 +719,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+
+        // The messages the queue targets of this request are waiting for go out
+        // now, in one batched send per batch of them, and what came of each is
+        // recorded beside the deliveries made above.
+        queue_sends::flush(
+            ctx.callback(),
+            &mut clients,
+            &stores,
+            sends,
+            &mut invocations,
+        )
+        .await;
 
         // A copy re-published onto another bus was matched by THAT bus's rules,
         // so those rules triggered too, and are counted the same way.
@@ -1798,6 +1829,7 @@ pub(crate) async fn deliver(
     stores: &Stores<'_>,
     handover: &Handover<'_>,
     budget: &mut DeliveryBudget,
+    sends: &mut QueueSends,
 ) -> Handed {
     let target = handover.target;
     // Which API call this target is invoked by — `None` for a target kind this
@@ -1905,10 +1937,21 @@ pub(crate) async fn deliver(
                     {
                         return Handed::Deferred;
                     }
-                    kind.invoke(
-                        callback, clients, stores, region, handover, body, &mut retries, budget,
-                    )
-                    .await
+                    match kind
+                        .invoke(
+                            callback, clients, stores, region, handover, body, &mut retries,
+                            budget, sends,
+                        )
+                        .await
+                    {
+                        Some(outcome) => outcome,
+                        // A queue target's message is waiting for the batch its
+                        // queue's messages of this request go out in: there is
+                        // nothing to record here, and what came of it is recorded
+                        // where that batch is sent
+                        // ([`queue_sends::flush`]).
+                        None => return Handed::Held,
+                    }
                 }
             },
         }
@@ -1947,6 +1990,12 @@ pub(crate) enum Handed {
     /// dead-letters itself — when it is made. The caller has nothing to record for
     /// it and goes on to the next target.
     Deferred,
+    /// A queue target's message is held for the batch its queue's messages of this
+    /// request go out in ([`queue_sends`]): the caller has nothing to record for it
+    /// and goes on to the next target, and `queue_sends::flush` records what came
+    /// of it — which is why every caller of [`deliver`] flushes before it records
+    /// the invocations of its own pass.
+    Held,
     /// The request's delivery budget is spent: the remaining targets of the
     /// matched rules are not delivered to.
     BudgetSpent,
@@ -2833,90 +2882,44 @@ impl TargetKind {
         body: &str,
         retries: &mut Option<Retries>,
         budget: &mut DeliveryBudget,
-    ) -> crate::state::InvocationOutcome {
+        sends: &mut QueueSends,
+    ) -> Option<crate::state::InvocationOutcome> {
         let target = handover.target;
         let arn = target.arn.as_str();
         // The target's OWN Region — the ARN's — which is not necessarily the one
         // this request was signed for, falling back to it when the ARN names no
         // Region label.
         let region = ::service_common::arn::region_of(arn, self.vendor()).unwrap_or(region);
-        match self {
+        Some(match self {
+            // A queue target's message is HELD for the batch its queue's messages
+            // of this request go out in ([`queue_sends`]), once the documents in
+            // force over that queue have admitted it: `None` out of this
+            // operation is a delivery that is going to be made and recorded from
+            // what that batch answered, not one that was skipped.
             Self::Queue => {
-                let Some(queue) = sqs_queue(arn) else {
-                    return crate::state::InvocationOutcome::NotAttempted(
-                        "the target ARN names no queue".to_string(),
-                    );
-                };
-                // One client for both calls this delivery makes on the queue:
-                // the handle is a copy over the shared in-process transport, so
-                // it addresses the same endpoint the cached one does.
-                let client = clients.sqs(callback, region).clone();
-                // The QUEUE's own documents decide this delivery before anything
-                // is enqueued: its `Policy`, and — for an encrypted queue — the
-                // policy of the key its messages are encrypted under
-                // ([`queue_delivery_refusal`]).
-                if let Some(refusal) = queue_delivery_refusal(
-                    &client,
-                    stores.kms,
-                    region,
-                    &queue,
-                    self.action(),
-                    arn,
-                    handover,
+                match queue_sends::hand_over(
+                    callback, clients, stores, region, handover, body, sends,
                 )
                 .await
                 {
-                    return refusal;
+                    queue_sends::Handled::Held => return None,
+                    queue_sends::Handled::Outcome(outcome) => outcome,
                 }
-                let mut request = client
-                    .send_message()
-                    .queue_url(queue)
-                    .message_body(body);
-                // "Contains the message group ID to use when the target is an
-                // Amazon SQS fair or FIFO queue" (`Target$SqsParameters`): such a
-                // queue takes no message without one, so the group the target
-                // names travels with the delivery. No deduplication id goes with
-                // it — "if you specify a fair or FIFO queue as a target, the queue
-                // must have content-based deduplication enabled", so the queue
-                // derives one from the body.
-                if let Some(message_group_id) = &target.message_group_id {
-                    request = request.message_group_id(message_group_id);
-                }
-                // "An X-Ray trace header … that contains the trace-id
-                // associated with the event" travels WITH the event: a queue
-                // carries it as the one message system attribute Amazon SQS
-                // takes on a send, under the name that attribute publishes, so
-                // a consumer of the queue reads the trace the publisher named.
-                if let Some(trace_header) = handover.trace_header {
-                    match ::aws_sdk_sqs::types::MessageSystemAttributeValue::builder()
-                        .data_type(STRING_ATTRIBUTE_TYPE)
-                        .string_value(trace_header)
-                        .build()
-                    {
-                        Ok(attribute) => {
-                            request = request.message_system_attributes(
-                                ::aws_sdk_sqs::types::MessageSystemAttributeNameForSends::AwsTraceHeader,
-                                attribute,
-                            );
-                        }
-                        Err(error) => ::tracing::warn!(
-                            error = %error,
-                            "an event's trace header could not be carried to its queue target"
-                        ),
-                    }
-                }
-                outcome(request.send().await)
             }
             Self::Function => {
                 // One client for both calls this delivery makes on the function,
                 // for the reason the queue branch above gives.
                 let client = clients.lambda(callback, region).clone();
                 // The FUNCTION's own resource-based policy decides this delivery
-                // before anything is invoked ([`function_delivery_refusal`]).
+                // before anything is invoked ([`function_delivery_refusal`]). It
+                // is read ONCE per request per function
+                // ([`Clients::function_policy`]), for the reason the queue branch
+                // above gives.
+                let policy = clients.function_policy(&client, arn).await;
                 if let Some(refusal) =
-                    function_delivery_refusal(&client, arn, self.action(), handover).await
+                    function_delivery_refusal(policy, arn, self.action(), handover)
                 {
-                    return refusal;
+                    return Some(refusal);
                 }
                 outcome(
                     client
@@ -2939,17 +2942,19 @@ impl TargetKind {
                 // anything is published: its access policy
                 // ([`topic_delivery_refusal`]) and, for an encrypted topic, the
                 // policy of the key its messages are encrypted under
-                // ([`topic_key_refusal`]).
-                let attributes = topic_attributes(&client, arn).await;
+                // ([`topic_key_refusal`]). The attributes are read ONCE per
+                // request per topic ([`Clients::topic_attributes`]), for the
+                // reason the queue branch above gives.
+                let attributes = clients.topic_attributes(&client, arn).await;
                 if let Some(refusal) =
                     topic_delivery_refusal(attributes.as_ref(), arn, self.action(), handover)
                 {
-                    return refusal;
+                    return Some(refusal);
                 }
                 if let Some(refusal) =
                     topic_key_refusal(stores.kms, attributes.as_ref(), region, arn, handover)
                 {
-                    return refusal;
+                    return Some(refusal);
                 }
                 outcome(client.publish().topic_arn(arn).message(body).send().await)
             }
@@ -3022,9 +3027,9 @@ impl TargetKind {
                 // what `StartPipelineExecution$name` takes.
                 let name = ::service_common::arn::parse(arn).map(|parsed| parsed.resource);
                 let Some(name) = name.filter(|name| !name.is_empty()) else {
-                    return crate::state::InvocationOutcome::NotAttempted(
+                    return Some(crate::state::InvocationOutcome::NotAttempted(
                         "the target ARN names no pipeline".to_string(),
-                    );
+                    ));
                 };
                 outcome(
                     clients
@@ -3061,9 +3066,9 @@ impl TargetKind {
                     DELIVERY_STREAM_RESOURCE_TYPE,
                 );
                 let Some(name) = name.filter(|name| !name.is_empty()) else {
-                    return crate::state::InvocationOutcome::NotAttempted(
+                    return Some(crate::state::InvocationOutcome::NotAttempted(
                         "the target ARN names no delivery stream".to_string(),
-                    );
+                    ));
                 };
                 // The record's data is what the target receives, as the bytes
                 // the stream then delivers to its own destination: "the data
@@ -3087,7 +3092,7 @@ impl TargetKind {
                     )),
                 }
             }
-        }
+        })
     }
 
     /// The ARN namespace of the service this kind of target lives in.
@@ -3327,11 +3332,12 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 /// The attributes are read through the queue's own `GetQueueAttributes`, so what
 /// decides a delivery is what a client's last write left on the queue — a policy
 /// just written grants the next delivery and one just cleared stops granting it.
-/// A queue that does not ANSWER that read decides nothing here: the `SendMessage`
-/// that follows reports what such a queue answers, which is the queue's own
-/// refusal rather than a verdict read off a document this never saw.
-async fn queue_delivery_refusal(
-    client: &::aws_sdk_sqs::Client,
+/// A queue that does not ANSWER that read decides nothing here (`attributes` is
+/// `None`): the `SendMessage` that follows reports what such a queue answers,
+/// which is the queue's own refusal rather than a verdict read off a document
+/// this never saw.
+fn queue_delivery_refusal(
+    attributes: Option<&QueueAttributes>,
     kms: Option<&::engine::ServiceState<crate::state::target_encryption::KmsState>>,
     region: &str,
     queue_url: &str,
@@ -3339,7 +3345,7 @@ async fn queue_delivery_refusal(
     resource: &str,
     handover: &Handover<'_>,
 ) -> Option<crate::state::InvocationOutcome> {
-    let attributes = queue_attributes(client, queue_url).await?;
+    let attributes = attributes?;
     let attempt = crate::state::DeliveryAttempt {
         rule: handover.rule,
         target_id: &handover.target.id,
@@ -3361,7 +3367,7 @@ async fn queue_delivery_refusal(
         let (code, message) = crate::state::queue_access_refusal(resource);
         return Some(crate::state::InvocationOutcome::Failed { code, message });
     }
-    queue_key_refusal(kms, &attributes, region, resource, handover)
+    queue_key_refusal(kms, attributes, region, resource, handover)
 }
 
 /// Why the key the queue `queue_arn` names is encrypted with does not let this
@@ -3484,6 +3490,7 @@ fn target_key_refusal_message(service: &str, status: u16, code: &str) -> String 
 /// The attributes of a queue target that decide a delivery to it: its policy, and
 /// the customer managed key its messages are encrypted under. Either is `None`
 /// for a queue that carries it not at all.
+#[derive(Clone)]
 struct QueueAttributes {
     policy: Option<String>,
     kms_master_key_id: Option<String>,
@@ -3498,7 +3505,10 @@ struct QueueAttributes {
 /// answered and carries no policy has granted this service nothing, while a
 /// queue that did not answer is one nothing is known about (see
 /// [`queue_delivery_refusal`]).
-async fn queue_attributes(
+///
+/// Called through [`Clients::queue_attributes`], which is what makes one request
+/// read one queue once.
+async fn read_queue_attributes(
     client: &::aws_sdk_sqs::Client,
     queue_url: &str,
 ) -> Option<QueueAttributes> {
@@ -3633,6 +3643,7 @@ async fn topic_attributes(
 /// The attributes of a topic target that decide a delivery to it: its access
 /// policy, and the customer managed key its messages are encrypted under. Either
 /// is `None` for a topic that carries it not at all.
+#[derive(Clone)]
 struct TopicAttributes {
     policy: Option<String>,
     kms_master_key_id: Option<String>,
@@ -3811,20 +3822,21 @@ const KMS_GENERATE_DATA_KEY_OPERATION: &str = "GenerateDataKey";
 /// gives it ([`function_invoke_refusal`]), which names the PERMISSION
 /// ([`crate::state::NO_PERMISSIONS`]) as that service's answer does.
 ///
-/// The policy is read through the function's own `GetPolicy`, so what decides a
-/// delivery is the document a client's last `AddPermission` or `RemovePermission`
+/// The policy is read through the function's own `GetPolicy` by the caller, so
+/// what decides a delivery is the document a client's last `AddPermission` or
+/// `RemovePermission`
 /// left on it: a grant just added admits the next delivery and one just removed
 /// stops admitting it. A function that answers that read with anything other than
-/// the absence of a policy decides nothing here: the `Invoke` that follows
-/// reports what such a function answers, which is that service's own answer
-/// rather than a verdict read off a policy this never saw.
-async fn function_delivery_refusal(
-    client: &::aws_sdk_lambda::Client,
+/// the absence of a policy decides nothing here (`policy` is `None`): the `Invoke`
+/// that follows reports what such a function answers, which is that service's own
+/// answer rather than a verdict read off a policy this never saw.
+fn function_delivery_refusal(
+    policy: Option<Option<String>>,
     function_arn: &str,
     action: &str,
     handover: &Handover<'_>,
 ) -> Option<crate::state::InvocationOutcome> {
-    let policy = function_policy(client, function_arn).await?;
+    let policy = policy?;
     let attempt = crate::state::DeliveryAttempt {
         rule: handover.rule,
         target_id: &handover.target.id,
@@ -4312,8 +4324,9 @@ async fn dead_letter(
         }
     }
     let client = clients.sqs(callback, region).clone();
+    let documents = clients.queue_attributes(&client, queue).await;
     if queue_delivery_refusal(
-        &client,
+        documents.as_ref(),
         kms,
         region,
         queue,
@@ -4321,7 +4334,6 @@ async fn dead_letter(
         dead_letter_arn,
         handover,
     )
-    .await
     .is_some()
     {
         return false;
@@ -4429,6 +4441,12 @@ fn sqs_queue(arn: &str) -> Option<String> {
 /// first use and then reused: a fan-out to several targets of one service must
 /// not construct a client per target.
 ///
+/// It also holds what the request has already READ from a target to decide a
+/// delivery to it ([`Self::queue_attributes`]): a document a request has read is
+/// read once for that request however many of its events reach the same target,
+/// which is what keeps the calls one fan-out makes proportional to the TARGETS it
+/// reaches rather than to the (events x targets) product.
+///
 /// Each slot remembers the Region its client was built for, because a target is
 /// reached in the Region ITS OWN ARN names: a fan-out spanning two Regions of
 /// one service rebuilds the client rather than sending the second delivery to the
@@ -4443,6 +4461,23 @@ pub(crate) struct Clients {
     codepipeline: Option<(String, ::aws_sdk_codepipeline::Client)>,
     logs: Option<(String, ::aws_sdk_cloudwatchlogs::Client)>,
     firehose: Option<(String, ::aws_sdk_firehose::Client)>,
+    /// What each queue this request has already handed an event to answered when
+    /// the attributes that decide a delivery to it were read, keyed by that
+    /// queue's url. `None` under a url is a queue that did not answer the read,
+    /// which decides nothing (see [`queue_delivery_refusal`]) and is remembered
+    /// as such rather than asked again.
+    ///
+    /// It holds one entry per QUEUE this request reached, so it is bounded by the
+    /// request's own delivery budget ([`MAX_DELIVERIES_PER_REQUEST`]): a request
+    /// hands over no more deliveries than that, and a queue it never reached has
+    /// no entry here.
+    queue_attributes: ::std::collections::BTreeMap<String, Option<QueueAttributes>>,
+    /// The same, for each TOPIC this request has published to: its access policy
+    /// and the key its messages are encrypted under ([`topic_attributes`]).
+    topic_attributes: ::std::collections::BTreeMap<String, Option<TopicAttributes>>,
+    /// The same, for each FUNCTION this request has invoked: the resource-based
+    /// policy that decides the invocation ([`function_policy`]).
+    function_policies: ::std::collections::BTreeMap<String, Option<Option<String>>>,
 }
 
 /// Build the clients the same way: over the in-process callback into this
@@ -4499,6 +4534,68 @@ impl Clients {
     // Amazon CloudWatch Logs publishes its endpoint and signs under `logs`.
     callback_client!(logs, aws_sdk_cloudwatchlogs, "logs");
     callback_client!(firehose, aws_sdk_firehose, "firehose");
+
+    /// The attributes that decide a delivery to the queue at `queue_url`, read
+    /// through that queue's own `GetQueueAttributes` on first use and then
+    /// remembered for the rest of this request
+    /// ([`read_queue_attributes`]).
+    ///
+    /// ONE read per queue per request, because what it reads is a property of the
+    /// QUEUE rather than of the event: a rule's fan-out hands one queue every
+    /// event of the request its pattern matched, and asking that queue for its
+    /// own documents once per event would make the calls a request makes the
+    /// (events x targets) product instead of the targets it reaches. A write a
+    /// client makes to those documents still decides the deliveries of every
+    /// request after it — which is the grain AWS states for a resource policy
+    /// taking effect — and this request's own dead-letter write to the same queue
+    /// reads what the delivery did.
+    async fn queue_attributes(
+        &mut self,
+        client: &::aws_sdk_sqs::Client,
+        queue_url: &str,
+    ) -> Option<QueueAttributes> {
+        if let Some(held) = self.queue_attributes.get(queue_url) {
+            return held.clone();
+        }
+        let read = read_queue_attributes(client, queue_url).await;
+        self.queue_attributes
+            .insert(queue_url.to_string(), read.clone());
+        read
+    }
+
+    /// The attributes that decide a delivery to the topic `topic_arn` names, read
+    /// once per topic per request for the reason [`Self::queue_attributes`]
+    /// gives.
+    async fn topic_attributes(
+        &mut self,
+        client: &::aws_sdk_sns::Client,
+        topic_arn: &str,
+    ) -> Option<TopicAttributes> {
+        if let Some(held) = self.topic_attributes.get(topic_arn) {
+            return held.clone();
+        }
+        let read = topic_attributes(client, topic_arn).await;
+        self.topic_attributes
+            .insert(topic_arn.to_string(), read.clone());
+        read
+    }
+
+    /// The resource-based policy that decides an invocation of the function
+    /// `function_arn` names, read once per function per request for the reason
+    /// [`Self::queue_attributes`] gives.
+    async fn function_policy(
+        &mut self,
+        client: &::aws_sdk_lambda::Client,
+        function_arn: &str,
+    ) -> Option<Option<String>> {
+        if let Some(held) = self.function_policies.get(function_arn) {
+            return held.clone();
+        }
+        let read = function_policy(client, function_arn).await;
+        self.function_policies
+            .insert(function_arn.to_string(), read.clone());
+        read
+    }
 }
 
 #[cfg(test)]

@@ -43,3 +43,41 @@ Note on attribution: the timeout is the suite's per-check budget, and the check'
 4. Publish two throwaway events (tenant t-000 and t-001) and poll all four queues until each has received at least one message — this is the warm-up; observe whether every one of the four confirms. Then drain each queue to empty.
 5. events:PutEvents 1,000 entries in batches of 10 on that bus, Source S / DetailType T / Detail {"tenant":"t-%03d" (i mod 20),"n":i,"id":...}; every batch must answer FailedEntryCount 0 with an EventId per entry.
 6. Drain all four queues and count distinct published ids per rule. Expect 50 / 500 / 1000 / 950, no foreign ids, and the prefix and anything-but sets disjoint and covering the match-everything set. Observed: the run does not converge — it is still publishing/warming/draining when the budget ends.
+
+## Resolution
+
+The fan-out itself is fixed and pinned by tests, and a residual cost outside the
+service crate is recorded here rather than left implied.
+
+What was wrong: the delivery pass read the documents that decide a delivery
+(a queue's `Policy` and `KmsMasterKeyId`, a topic's attributes, a function's
+resource policy) inside EACH handover and then handed each event over with a
+one-message `SendMessage`, so one request's fan-out cost two whole in-process
+emulator requests per (event, rule, target) — 5,000 of them for the workload
+above.
+
+What it does now: a document that decides a delivery is a property of the TARGET,
+so it is read once per target per request, and the messages one request hands a
+queue go out with `SendMessageBatch` in groups of at most ten messages and
+256 KiB, each message's own outcome, dead letter and invocation metrics taken
+from the per-entry answer. The in-process calls one 10-entry request makes fell
+from 50 to 8, and the workload above costs the emulator 4.2 s instead of 13.8 s
+(assembled router, request authentication on). The four pattern forms deliver
+exactly 50 / 500 / 1,000 / 950 with the prefix and anything-but sets disjoint and
+covering the match-everything set — pinned by
+`services/service-com-amazonaws-eventbridge-awsevents/tests/all/bulk_fan_out.rs`,
+`.../tests/all/bulk_profile.rs` and `core/router/tests/all/zz_bulk_profile.rs`.
+
+What is left, and where: replaying this check still ends in `Check timed out
+after 60.0s`, now inside the check's own drain phase. Every request the emulator
+serves — a client's and each in-process delivery alike — pays a fixed claim scan
+in `vendor/smithy-server-runtime/src/multi_service_router.rs`, whose
+`select_service` asks every registered service's `can_handle`: measured on the
+assembled router, 100 dispatches that no service claims cost 257 ms, i.e. about
+2.57 ms of every 3.6 ms request. The check's drain makes thousands of
+`ReceiveMessage` / `DeleteMessage` requests, so the remaining distance to the
+suite's 60 s budget is that per-dispatch cost rather than the fan-out, and no
+change inside a service crate can reduce it. Indexing the registered services by
+routing key, so a dispatch resolves its claimant without asking each service,
+is the core change that would close it.
+
