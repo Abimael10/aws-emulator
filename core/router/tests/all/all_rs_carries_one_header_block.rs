@@ -40,6 +40,26 @@ pub(crate) fn header_of(source: &str) -> Vec<&str> {
     }
 }
 
+/// The prose `line` carries: its text with the comment marker — `//`, or the `//!` spelling a
+/// service crate's root is written in — and the surrounding whitespace removed. `None` is a line
+/// that says nothing: a blank one, or a marker with nothing after it, which separates two
+/// paragraphs rather than stating anything.
+///
+/// A line that is no comment at all carries its own text, since an inner attribute standing in a
+/// header is owed one place in the block like any other line; a reader that asks instead for the
+/// prose a PARAGRAPH is written in filters that line out itself.
+///
+/// Shared with the sibling that reads the other rule of a header block from the same lines, so
+/// the two cannot disagree about which of them say something.
+pub(crate) fn prose_of(line: &str) -> Option<&str> {
+    let marked = line.trim();
+    let prose = match marked.strip_prefix("//!").or_else(|| marked.strip_prefix("//")) {
+        Some(comment) => comment.trim(),
+        None => marked,
+    };
+    (!prose.is_empty()).then_some(prose)
+}
+
 /// One report per header line of `source` that repeats an earlier header line, naming the line
 /// it is on and the line it repeats.
 ///
@@ -55,13 +75,7 @@ pub(crate) fn repeated_header_lines(source: &str) -> Vec<String> {
     let mut reports = Vec::new();
     for (index, line) in header_of(source).into_iter().enumerate() {
         let text = line.trim_end();
-        let marked = text.trim_start();
-        let prose = marked
-            .strip_prefix("//!")
-            .or_else(|| marked.strip_prefix("//"))
-            .unwrap_or(marked)
-            .trim();
-        if prose.is_empty() {
+        if prose_of(line).is_none() {
             continue;
         }
         match seen.iter().find(|(_, earlier)| *earlier == text) {
