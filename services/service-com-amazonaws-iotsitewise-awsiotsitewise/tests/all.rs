@@ -611,6 +611,8 @@ mod asset_hierarchy_refusal_classes;
 mod asset_lifecycle;
 #[path = "all/asset_composite_model_instances.rs"]
 mod asset_composite_model_instances;
+#[path = "all/asset_model_absent_version_refusal.rs"]
+mod asset_model_absent_version_refusal;
 #[path = "all/asset_model_composite_model.rs"]
 mod asset_model_composite_model;
 #[path = "all/asset_model_composite_model_delete.rs"]
@@ -619,6 +621,8 @@ mod asset_model_composite_model_delete;
 mod asset_model_properties;
 #[path = "all/asset_model_property_interface_summaries.rs"]
 mod asset_model_property_interface_summaries;
+#[path = "all/asset_model_settle_diagnosis_sentences.rs"]
+mod asset_model_settle_diagnosis_sentences;
 // Declared only because the build requires every file under `tests/all/` to be:
 // the suite was folded into `update_asset_model.rs` and this module now carries
 // no test. See the file's own note.

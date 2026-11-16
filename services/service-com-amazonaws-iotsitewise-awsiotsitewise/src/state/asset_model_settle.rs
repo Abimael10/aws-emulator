@@ -51,9 +51,14 @@ pub const MISSING_CHILD_PROPERTY_FAILURE: &str =
 /// the assets under a hierarchy is the child model's own metric, not a raw
 /// measurement of it.
 ///
-/// Entirely fixed text, like its sibling above.
+/// Entirely fixed text, like its sibling above: two sentences — the rule that
+/// fired, then what a metric MAY consume — and no id, member or value of the
+/// request. Distinct from [`MISSING_CHILD_PROPERTY_FAILURE`], which diagnoses a
+/// reference that does not resolve at all.
 pub const NON_METRIC_CHILD_PROPERTY_FAILURE: &str =
-    "A formula property references a non-metric property from a child model.";
+    "A metric property references a non-metric property from a child model. \
+     Metrics can reference properties from the current model and metric properties \
+     from child models.";
 
 /// The diagnosis a hierarchy graph that leads back to the model being written
 /// settles the model at.

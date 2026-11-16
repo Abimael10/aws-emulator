@@ -487,19 +487,27 @@ async fn a_model_with_no_active_version_refuses_the_active_selector() {
             "ResourceNotFoundException",
             "case {which:?}: unexpected error code in {body}"
         );
-        // Written out by hand from the rule, as an independent oracle: the
-        // absence names the model the request named and the state it does
-        // report, which is what tells the caller to wait.
+        // Written out by hand from the rule, as an independent oracle: the version
+        // a read asks for is part of what it addresses, so a model that holds no
+        // such version is an asset model the read finds nothing for, stated in the
+        // one wording every absent asset model is stated in and naming the label
+        // the request supplied.
         assert_eq!(
             error_message(&body),
-            format!("The asset model {model_id} has no ACTIVE version yet; it is CREATING."),
+            format!("Asset Model with ID {model_id} not found"),
             "case {which:?}: unexpected refusal message in {body}"
         );
     }
 
     // The create's own owed transition makes that version the active one, so the
-    // same requests are answered.
-    tokio::time::sleep(PAST_ACTIVATION).await;
+    // same requests are answered. Waited for by POLLING the model until it
+    // settles, so this holds on a host of any speed.
+    let settled = crate::support::settled_asset_model_status(&router, &model_id).await;
+    assert_eq!(
+        settled["state"].as_str(),
+        Some("ACTIVE"),
+        "the create must settle ACTIVE before the reads below, got {settled}"
+    );
     for which in READS {
         let body = read(&router, which, &model_id, Some(ACTIVE)).await;
         assert_eq!(

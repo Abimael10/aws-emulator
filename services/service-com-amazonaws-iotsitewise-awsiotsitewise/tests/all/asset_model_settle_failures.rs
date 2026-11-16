@@ -49,9 +49,14 @@ const MISSING_CHILD_PROPERTY: &str =
     "A formula property references a child asset model property that doesn't exist.";
 
 /// The diagnosis a METRIC whose variable reaches through a hierarchy at a raw
-/// property of the child model settles the model at.
+/// property of the child model settles the model at: two sentences of fixed text,
+/// the second stating what a metric MAY reference. Distinct from
+/// [`MISSING_CHILD_PROPERTY`], the diagnosis of a reference that resolves to
+/// nothing at all.
 const NON_METRIC_CHILD_PROPERTY: &str =
-    "A formula property references a non-metric property from a child model.";
+    "A metric property references a non-metric property from a child model. \
+     Metrics can reference properties from the current model and metric properties \
+     from child models.";
 
 /// The diagnosis a hierarchy graph that leads back to the model being written
 /// settles the model at.

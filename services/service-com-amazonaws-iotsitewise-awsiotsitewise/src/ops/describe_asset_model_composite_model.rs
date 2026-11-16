@@ -210,10 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // settling. The selector is resolved on the record, so this read and the
         // reads of the model itself answer from the same version, and a version
         // the model does not have — one still being created has no active version
-        // — is the modelled 404.
+        // — is the modelled 404. The version asked for is part of what the read
+        // ADDRESSES, so a model that holds no such version is an asset model this
+        // read finds nothing for: the absence is stated in the one wording every
+        // absent asset model is stated in, naming the label the request supplied.
         let record = record
             .version_view(input.asset_model_version.as_deref(), now)
-            .ok_or_else(|| no_active_version(&asset_model_id, record.state(now)))?;
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
         let record = &*record;
 
         let composite_model_id = record
@@ -280,20 +283,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action_definitions: None,
         })
     }
-}
-
-/// HTTP 404 `ResourceNotFoundException` for a read scoped to the ACTIVE version
-/// of a model that has none, in this service's one wording for that absence.
-fn no_active_version(
-    asset_model_id: &str,
-    state: &str,
-) -> DescribeAssetModelCompositeModelError {
-    DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: crate::state::no_active_version_message(asset_model_id, state),
-        },
-    )
-    .into()
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the asset model label that

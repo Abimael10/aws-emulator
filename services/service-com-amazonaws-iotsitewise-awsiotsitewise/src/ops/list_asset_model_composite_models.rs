@@ -186,10 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `version_view`, so this listing and the reads of the model itself answer
         // from the same version, and a version the model does not have — one still
         // being created has no active version — is the modelled 404 rather than
-        // another version's composite models under its name.
+        // another version's composite models under its name. The version asked
+        // for is part of what the read ADDRESSES, so a model that holds no such
+        // version is an asset model this read finds nothing for: the absence is
+        // stated in the one wording every absent asset model is stated in, naming
+        // the label the request supplied.
         let record = record
             .version_view(input.asset_model_version.as_deref(), now)
-            .ok_or_else(|| no_active_version(&asset_model_id, record.state(now)))?;
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
         let record = &*record;
 
         // Every composite model the model holds, at any nesting depth: this is the
@@ -264,18 +268,6 @@ fn internal_failure(message: String) -> ListAssetModelCompositeModelsError {
     ListAssetModelCompositeModelsErrorModeled::InternalFailureException(InternalFailureException {
         message,
     })
-    .into()
-}
-
-/// HTTP 404 `ResourceNotFoundException` for a listing scoped to the ACTIVE
-/// version of a model that has none, in this service's one wording for that
-/// absence.
-fn no_active_version(asset_model_id: &str, state: &str) -> ListAssetModelCompositeModelsError {
-    ListAssetModelCompositeModelsErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: crate::state::no_active_version_message(asset_model_id, state),
-        },
-    )
     .into()
 }
 

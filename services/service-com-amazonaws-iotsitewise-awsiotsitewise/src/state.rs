@@ -2913,18 +2913,6 @@ pub fn precondition_failed_removal_message(header: &str) -> String {
     format!("Precondition failed for provided {header} value.")
 }
 
-/// The message a read or a precondition carries when the asset model has no
-/// ACTIVE version: the model has never finished settling, so the only
-/// definition it holds is one no version alias but `LATEST` names.
-///
-/// One wording for every operation that resolves the selector, so the reads of
-/// a model, of its properties and of one of its composite models cannot word
-/// the same absence three ways. `state` is the `AssetModelState` the model does
-/// report, which is what tells the caller to wait rather than to look elsewhere.
-pub fn no_active_version_message(asset_model_id: &str, state: &str) -> String {
-    format!("The asset model {asset_model_id} has no ACTIVE version yet; it is {state}.")
-}
-
 /// The entity tag of an asset model's stored definition.
 ///
 /// CONTENT-DERIVED, never minted: the SHA-256 digest of the fields a write to the
