@@ -2247,7 +2247,24 @@ async fn serving<Eng: Send + Sync + 'static>(
             // What the integration answered is the INTEGRATION response, and the
             // integration's own responses map it to the method response — here, for this
             // request, exactly as they will for every later request the entry answers.
-            Ok(answer) => {
+            Ok(performed) => {
+                // A backend answer API Gateway could not use is a configuration error of the
+                // integration, recorded for the stage's own execution log: the request IS
+                // answered from that answer, so nothing a reader of the response holds says
+                // what was wrong with it ([`stage_logs`]).
+                if let Some(reason) = performed.configuration_error {
+                    tracing::warn!(
+                        api_id = %integration.api_id,
+                        stage = %integration.stage,
+                        path = %integration.path,
+                        verb = %integration.verb,
+                        reason = %reason,
+                        "the method's integration answered this call with something this api \
+                         cannot use"
+                    );
+                    recorded.answered_badly(reason);
+                }
+                let answer = performed.answer;
                 let mapped = match integration_response::mapped(
                     integration.method.as_ref(),
                     &integration.call,

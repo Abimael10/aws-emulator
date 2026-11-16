@@ -32,6 +32,12 @@
 //! [`delivered_into_held_group`] writes into the group CloudWatch Logs already holds and
 //! creates none — a destination that is not there loses the records and stays absent.
 //!
+//! A group of the first kind is PUBLISHED rather than merely written to, so it exists from the
+//! moment the configuration that turns its log on is accepted, before any record is written
+//! into it: [`provisioned`] is that creation on its own, and a client reads such a group — or
+//! attaches a retention policy or a subscription filter to it — without waiting for the first
+//! delivery.
+//!
 //! Whichever form it takes, the write goes in through CloudWatch Logs' OWN ingest path
 //! (`PutLogEvents`) rather than into that service's store: a delivered record is an
 //! ingestion into the destination group, so it is subject to every consumer that group is
@@ -352,6 +358,69 @@ const EVENT_OVERHEAD_BYTES: usize = 26;
 /// in a single batch cannot exceed 24 hours. Otherwise, the operation fails".
 const MAX_BATCH_SPAN_MS: i64 = 24 * 60 * 60 * 1_000;
 
+/// Bring the log group a delivering service publishes under its OWN name into existence,
+/// with no record delivered into it.
+///
+/// A group of the delivering service's own is one it PUBLISHES, so it exists from the moment
+/// the configuration that turns its log on is accepted rather than from the first record
+/// written into it: a client reads such a group to confirm the log is on, and attaches a
+/// retention policy or a subscription filter to it, before anything has been logged. The
+/// records themselves go in through [`delivered`], which creates the group too, so a group
+/// provisioned here and one created by the first delivery are the same group.
+///
+/// `true` once CloudWatch Logs holds the group — including a group it already held, which is
+/// the group this service has been writing to — and `false` when it could not be created.
+/// Creating it is best effort, as every vended-logs write is: the configuration the caller is
+/// being answered for is not failed by it. Call it with NO state guard held — it awaits.
+pub async fn provisioned(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    log_group: &str,
+) -> bool {
+    provisioned_over(ctx.callback(), region, log_group).await
+}
+
+/// [`provisioned`] for a deliverer that holds the in-process transport ITSELF rather than a
+/// request's context, as [`delivered_over`] is for [`delivered`].
+pub async fn provisioned_over(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    log_group: &str,
+) -> bool {
+    created_group(&logs_client(callback, region), log_group).await
+}
+
+/// Create `log_group` where CloudWatch Logs does not hold it, which is what a group the
+/// delivering service publishes under its own name needs before anything is written to it.
+///
+/// A group already there is the one this service has been writing to, so that answer is this
+/// one: `true` means CloudWatch Logs holds the group now.
+async fn created_group(client: &::aws_sdk_cloudwatchlogs::Client, log_group: &str) -> bool {
+    match client
+        .create_log_group()
+        .log_group_name(log_group)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(error)
+            if error
+                .as_service_error()
+                .is_some_and(|service| service.is_resource_already_exists_exception()) =>
+        {
+            true
+        }
+        Err(error) => {
+            ::tracing::warn!(
+                log_group = %log_group,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the vended-logs log group this service publishes could not be created"
+            );
+            false
+        }
+    }
+}
+
 /// [`write`] for records that carry their own instants, which is what both forms end in.
 ///
 /// The events are delivered in CHRONOLOGICAL order and in requests inside the three bounds
@@ -370,28 +439,15 @@ async fn write_events(
         return true;
     }
     let client = logs_client(callback, region);
-    if provisions_group {
-        match client
-            .create_log_group()
-            .log_group_name(log_group)
-            .send()
-            .await
-        {
-            Ok(_) => {}
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_resource_already_exists_exception()) => {}
-            Err(error) => {
-                ::tracing::warn!(
-                    log_group = %log_group,
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "the vended-logs destination could not be created, so these records are not \
-                     delivered"
-                );
-                return false;
-            }
-        }
+    if provisions_group && !created_group(&client, log_group).await {
+        // The group this service publishes is not there and could not be created, so these
+        // records have nowhere to go.
+        ::tracing::warn!(
+            log_group = %log_group,
+            "the vended-logs destination could not be created, so these records are not \
+             delivered"
+        );
+        return false;
     }
     match client
         .create_log_stream()

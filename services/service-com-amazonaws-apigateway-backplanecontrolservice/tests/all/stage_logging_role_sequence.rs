@@ -496,30 +496,29 @@ async fn the_account_role_sequence_answers_every_call_and_makes_each_outcome_obs
             row.traces_the_served_request
         );
         if row.traces_the_served_request {
-            let body_line = if row.payloads {
-                traced_line(
-                    &request_id,
-                    &format!(
-                        "Method response body after transformations: {}",
-                        served.text()
-                    ),
-                )
-            } else {
-                traced_line(
-                    &request_id,
-                    &format!(
-                        "Method response body after transformations: {} byte(s)",
-                        served.text().len()
-                    ),
-                )
-            };
+            // The payload lines ARE the data trace: a trace written with `dataTrace` off
+            // carries no line about a payload at all, and one written with it on carries the
+            // bytes.
+            let body_line = traced_line(
+                &request_id,
+                &format!(
+                    "Method response body after transformations: {}",
+                    served.text()
+                ),
+            );
+            assert_eq!(
+                events.contains(&body_line),
+                row.payloads,
+                "case {case:?}: expected the line {body_line:?} in the execution log={}, got \
+                 {events:?}",
+                row.payloads
+            );
             for expected in [
                 traced_line(
                     &request_id,
                     &format!("HTTP Method: {}, Resource Path: /{RESOURCE}", row.verb),
                 ),
                 traced_line(&request_id, "Method completed with status: 200"),
-                body_line,
             ] {
                 assert!(
                     events.contains(&expected),

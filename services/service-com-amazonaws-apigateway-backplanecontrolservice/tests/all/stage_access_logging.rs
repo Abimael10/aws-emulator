@@ -889,30 +889,32 @@ async fn the_method_settings_in_force_gate_the_execution_log() {
                  {trace:?}"
             );
         }
-        // The payload lines: the bytes of the call where data tracing is on, and their
-        // sizes where it is off, which is the control that setting exists for.
+        // The payload lines ARE the data trace: the bytes of the call where data tracing is
+        // on, and NO payload line at all where it is off, which is the control that setting
+        // exists for.
         let served = r#"{"seen": "traced"}"#;
         let with_data = traced_line(
             &request_id,
             &format!("Method response body after transformations: {served}"),
         );
-        let without_data = traced_line(
+        let any_payload_line = traced_line(
             &request_id,
-            &format!(
-                "Method response body after transformations: {} byte(s)",
-                served.len()
-            ),
+            "Method response body after transformations: ",
         );
-        let (present, absent) = if level.payloads {
-            (with_data, without_data)
+        if level.payloads {
+            assert!(
+                trace.contains(&with_data),
+                "case {case:?}: expected {with_data:?} in this request's trace, got {trace:?}"
+            );
         } else {
-            (without_data, with_data)
-        };
-        assert!(
-            trace.contains(&present) && !trace.contains(&absent),
-            "case {case:?}: expected {present:?} and not {absent:?} in this request's trace, \
-             got {trace:?}"
-        );
+            assert!(
+                !trace
+                    .iter()
+                    .any(|record| record.starts_with(&any_payload_line)),
+                "case {case:?}: expected no payload line at all in this request's trace, got \
+                 {trace:?}"
+            );
+        }
         // One request is one trace: the group holds as many opening lines as requests that
         // were traced. Anchored at the record's own start — every record opens with the
         // `(<request id>) ` naming the request it is about — so a record that merely embeds

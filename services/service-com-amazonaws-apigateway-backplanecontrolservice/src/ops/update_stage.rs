@@ -1302,58 +1302,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(patch_failure)?;
 
         let now = crate::state::now();
-        let mut store = state.lock();
-        // The `(restApiId, stageName)` pair is resolved as ONE lookup for the stage the URI
-        // addresses, so an identifier no stored API answers to is reported as the stage.
-        //
-        // Patched on a COPY: a list whose later op is refused leaves the stored stage
-        // untouched, rather than keeping the ops before it.
-        let (api, stage) = store
-            .api_and_stage(&input.rest_api_id, &input.stage_name)
-            .map_err(|message| {
-                UpdateStageErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(message),
-                })
-            })?;
-        let mut updated = stage.clone();
-        let deployments: BTreeSet<String> = api.deployments.keys().cloned().collect();
-        // The account singleton's CloudWatch Logs role, which a patch that turns this
-        // stage's execution logging on is a configuration of: a role set to no ARN at all
-        // is an account with none, exactly as `GetAccount` reports it.
-        let logging_role_configured = store
-            .account
-            .cloudwatch_role_arn
-            .as_deref()
-            .is_some_and(|arn| !arn.trim().is_empty());
-        // The account's client certificates, one of which a stage presents to its
-        // integration endpoint.
-        let client_certificates: BTreeSet<String> =
-            store.client_certificates.keys().cloned().collect();
-        let context = StagePatchContext {
-            deployments: &deployments,
-            client_certificates: &client_certificates,
-            logging_role_configured,
+        // The store is locked for THIS block alone, which is the whole state change: what it
+        // answers is owned, so the group the stage publishes is created below with no guard
+        // held — a write into CloudWatch Logs is a call into another service.
+        let (body, region, publishes_execution_log_group) = {
+            let mut store = state.lock();
+            // The `(restApiId, stageName)` pair is resolved as ONE lookup for the stage the
+            // URI addresses, so an identifier no stored API answers to is reported as the
+            // stage.
+            //
+            // Patched on a COPY: a list whose later op is refused leaves the stored stage
+            // untouched, rather than keeping the ops before it.
+            let (api, stage) = store
+                .api_and_stage(&input.rest_api_id, &input.stage_name)
+                .map_err(|message| {
+                    UpdateStageErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(message),
+                    })
+                })?;
+            let mut updated = stage.clone();
+            let deployments: BTreeSet<String> = api.deployments.keys().cloned().collect();
+            // The account singleton's CloudWatch Logs role, which a patch that turns this
+            // stage's execution logging on is a configuration of: a role set to no ARN at all
+            // is an account with none, exactly as `GetAccount` reports it.
+            let logging_role_configured = store
+                .account
+                .cloudwatch_role_arn
+                .as_deref()
+                .is_some_and(|arn| !arn.trim().is_empty());
+            // The account's client certificates, one of which a stage presents to its
+            // integration endpoint.
+            let client_certificates: BTreeSet<String> =
+                store.client_certificates.keys().cloned().collect();
+            let context = StagePatchContext {
+                deployments: &deployments,
+                client_certificates: &client_certificates,
+                logging_role_configured,
+            };
+
+            for patch in &patches {
+                apply_patch(&mut updated, patch, &context).map_err(patch_failure)?;
+            }
+            // A successful patch is when the record last changed. An empty list changes
+            // nothing, so it moves nothing.
+            if !patches.is_empty() {
+                updated.last_updated_date = Some(now);
+            }
+
+            let api = store
+                .rest_apis
+                .get_mut(&input.rest_api_id)
+                .ok_or_else(crate::state::state_unavailable)?;
+            // Rendered through the one `Stage` body this crate builds, from the record about
+            // to be stored, so the update reports the stage exactly as `GetStage` will read
+            // it back.
+            let body = super::create_stage::stage_body(&updated, None);
+            let region = api.arn_region().to_string();
+            // Whether the stage this patch leaves behind has its EXECUTION logging on, which
+            // is what API Gateway publishes the stage's own log group for
+            // ([`provisioned_execution_log_group`]). Read off the record about to be stored,
+            // so it is the configuration now in force rather than what any one patch asked
+            // for.
+            let publishes_execution_log_group =
+                logging_role_configured && stage_logs_executions(&updated);
+            api.stages.insert(input.stage_name.clone(), updated);
+            (body, region, publishes_execution_log_group)
         };
-
-        for patch in &patches {
-            apply_patch(&mut updated, patch, &context).map_err(patch_failure)?;
-        }
-        // A successful patch is when the record last changed. An empty list changes
-        // nothing, so it moves nothing.
-        if !patches.is_empty() {
-            updated.last_updated_date = Some(now);
-        }
-
-        let api = store
-            .rest_apis
-            .get_mut(&input.rest_api_id)
-            .ok_or_else(crate::state::state_unavailable)?;
-        // Rendered through the one `Stage` body this crate builds, from the record about
-        // to be stored, so the update reports the stage exactly as `GetStage` will read
-        // it back.
-        let body = super::create_stage::stage_body(&updated, None);
-        let region = api.arn_region().to_string();
-        api.stages.insert(input.stage_name.clone(), updated);
         let output = UpdateStageOutput {
             deployment_id: body.deployment_id,
             client_certificate_id: body.client_certificate_id,
@@ -1373,9 +1387,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_date: body.created_date,
             last_updated_date: body.last_updated_date,
         };
-        // Everything below is owned, so the lock is released before the audit record is
-        // emitted: the critical section covers the state change only.
-        drop(store);
+        // The stage's OWN execution log group, for a stage whose execution logging this
+        // configuration leaves on: a group API Gateway publishes rather than one it was
+        // pointed at, so it is there before the stage serves anything.
+        if publishes_execution_log_group {
+            provisioned_execution_log_group(ctx, &region, &input.rest_api_id, &input.stage_name)
+                .await;
+        }
         // "The ARN of the WebAcl associated with the Stage": WAFv2's own record, read
         // with this service's store released, so the update reports the web ACL in front
         // of the stage exactly as `GetStage` reads it back.
@@ -1401,6 +1419,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         Ok(output)
     }
+}
+
+/// Whether the stage `stage` carries a method setting that turns its EXECUTION logging on.
+///
+/// `MethodSetting$loggingLevel` is the setting ("valid values are `OFF`, `ERROR`, and
+/// `INFO`"), and a stage's execution log is configured per METHOD scope, so the stage's log is
+/// on as soon as ANY scope it carries — `*/*` as much as one method — is at a level that
+/// writes a trace. The reading of "this level writes a trace" is the data plane's own
+/// ([`crate::service::invoke::stage_logs::logs_executions`]), called rather than restated, so
+/// the group this operation publishes and the lines that go into it cannot disagree about
+/// which configuration turns the log on.
+fn stage_logs_executions(stage: &crate::state::StageEntry) -> bool {
+    stage.method_settings.values().any(|setting| {
+        crate::service::invoke::stage_logs::logs_executions(setting.logging_level.as_deref())
+    })
+}
+
+/// Bring the stage's own EXECUTION LOG GROUP into existence, for a stage whose execution
+/// logging is on.
+///
+/// `API-Gateway-Execution-Logs_{rest-api-id}/{stage-name}` is a group API Gateway publishes
+/// under its OWN name for every stage it writes an execution log for — unlike an access-log
+/// `destinationArn`, which names a group of the account's — so it exists from the moment the
+/// configuration that turns that log on is accepted, before the stage has served any request:
+/// a client reads the group to confirm logging is on, and attaches a retention policy or a
+/// subscription filter to it, without having to send traffic first. The group is created where
+/// CloudWatch Logs does not already hold it, and the traces the stage goes on to deliver land
+/// in that same group ([`crate::service::invoke::stage_logs`]).
+///
+/// API Gateway writes the account's logs as the account's own CloudWatch role
+/// (`Account$cloudwatchRoleArn`), which is what every patch that turns this logging on
+/// requires ([`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`]), so an account with no role has nothing for
+/// API Gateway to publish the group as and none is created.
+///
+/// Best effort, and called with no store lock held: the stage has already been updated, and
+/// the caller is answered whatever CloudWatch Logs does with the create.
+async fn provisioned_execution_log_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    api_id: &str,
+    stage_name: &str,
+) {
+    let group = crate::service::invoke::stage_logs::execution_log_group(api_id, stage_name);
+    ::service_common::cloudwatch_logs::provisioned(ctx, region, &group).await;
 }
 
 /// The modelled failure for a patch this operation cannot apply.

@@ -75,7 +75,11 @@
 //! * the function ran and returned something else, or raised (the `FunctionError` signal
 //!   Lambda reports): API Gateway "returns a 502 Bad Gateway" for a proxy response not in
 //!   the required format, with the `{"message":"Internal server error"}` body it words such
-//!   a response with, and the reason is logged ([`BAD_GATEWAY_STATUS`]);
+//!   a response with ([`BAD_GATEWAY_STATUS`]) — and because that `502` is answered from the
+//!   backend's own answer rather than through a gateway response of the api, what was wrong
+//!   with it is said in the EXECUTION LOG of the request: an answer whose SHAPE is not a proxy
+//!   response is traced in API Gateway's own words for that class
+//!   ([`MALFORMED_PROXY_RESPONSE`]);
 //! * the invocation could not be MADE at all — no Lambda answered it, the `uri` names no
 //!   function (or no version or alias of one) Lambda holds, or the function's policy admits
 //!   no call from this method: there
@@ -142,6 +146,19 @@ const BAD_GATEWAY_STATUS: u16 = 502;
 /// The sentence that response carries, which is the one API Gateway words every
 /// server-side failure of a call it could not pass on with.
 const BAD_GATEWAY_MESSAGE: &str = "Internal server error";
+
+/// The CONFIGURATION ERROR a function's answer that is not a proxy response IS, as API
+/// Gateway words it in the execution log of the request it answered `502`: a proxy
+/// integration has to return the documented response format, and "if the response is not in
+/// this format, API Gateway returns a 502 Bad Gateway error response" — so what went wrong is
+/// the SHAPE of the answer, in those fixed words, naming nothing of the request or of the
+/// document the function returned.
+///
+/// `pub(super)` because the trace this phrase belongs to is the stage's own
+/// ([`super::stage_logs`]) as much as the log of a simulated invocation
+/// ([`crate::ops::test_invoke_method`]): one vocabulary, so a developer reading either sees
+/// the same sentence for the same answer.
+pub(super) const MALFORMED_PROXY_RESPONSE: &str = "Malformed Lambda proxy response";
 
 /// The member the function's returned document carries the response status in.
 const STATUS_CODE_MEMBER: &str = "statusCode";
@@ -260,6 +277,24 @@ pub struct ProxyInputs {
     pub tracing_enabled: bool,
 }
 
+/// What performing a method's `AWS_PROXY` integration produced: the method response the
+/// function's answer IS, and — where that answer was no proxy response at all — the
+/// configuration error it was, worded as API Gateway words it
+/// ([`MALFORMED_PROXY_RESPONSE`]).
+///
+/// The two travel together because the `502` such an answer earns is this module's own
+/// response rather than a gateway response of the api — no gateway response type carries that
+/// status — so nothing a reader of the response holds says why it came, and the execution log
+/// of the request is where API Gateway says so.
+#[derive(Debug)]
+pub(super) struct ProxyAnswer {
+    /// The method response the call is answered with.
+    pub(super) response: IntegratedResponse,
+    /// The configuration error the function's own answer was, or `None` where it returned a
+    /// proxy response API Gateway could read.
+    pub(super) configuration_error: Option<&'static str>,
+}
+
 /// Perform this call through the method's `AWS_PROXY` integration, or `None` when the
 /// integration is not a Lambda proxy — in which case the caller performs it from the api's
 /// own records ([`super::perform_integration`]).
@@ -271,7 +306,7 @@ pub(super) async fn performed(
     region: &str,
     method: &crate::state::MethodEntry,
     call: &MethodRequest,
-) -> Option<Result<IntegratedResponse, UnservedIntegration>> {
+) -> Option<Result<ProxyAnswer, UnservedIntegration>> {
     let integration = method.integration.as_ref()?;
     if integration.r#type.as_deref() != Some(LAMBDA_PROXY_INTEGRATION_TYPE) {
         return None;
@@ -335,7 +370,7 @@ async fn served(
     call: &MethodRequest,
     within: Duration,
     credentials: Option<&str>,
-) -> Result<IntegratedResponse, UnservedIntegration> {
+) -> Result<ProxyAnswer, UnservedIntegration> {
     // The stage's own work begins here. The trace context it propagates onto the invocation
     // was decided when the method request was built — ONCE for the request, so an
     // authorizer's function and this integration's belong to one trace
@@ -362,7 +397,7 @@ async fn served(
         stage: context.get("stage").map(String::as_str).unwrap_or_default(),
         function_name: function,
         status: match &outcome {
-            Ok(response) => Some(response.status),
+            Ok(answered) => Some(answered.response.status),
             // An integration this stage could not perform is answered through a gateway
             // response of the api's own, whose status this layer does not resolve: the
             // segment records the FAULT rather than a status nothing answered with.
@@ -389,7 +424,7 @@ async fn invoked(
     within: Duration,
     trace: Option<&str>,
     credentials: Option<&str>,
-) -> Result<IntegratedResponse, UnservedIntegration> {
+) -> Result<ProxyAnswer, UnservedIntegration> {
     let client = lambda_client(ctx, region);
     if let Some(reason) = unpermitted(ctx, region, &client, function, call, credentials).await {
         return Err(UnservedIntegration {
@@ -472,13 +507,18 @@ async fn invoked(
     };
     // "FunctionError: if present, indicates that an error occurred during function
     // execution" — a run that errored returned no proxy response, which API Gateway answers
-    // the same way it answers one it cannot read.
+    // the same way it answers one it cannot read. What API Gateway LOGS about that class names
+    // the function's own error rather than the shape of its answer, which is a sentence this
+    // emulator does not state yet, so this answer carries no configuration error of its own.
     if let Some(signal) = answered.function_error() {
         ::tracing::warn!(
             function_error = %signal,
             "the proxy integration's function errored, so it returned no proxy response"
         );
-        return Ok(bad_gateway());
+        return Ok(ProxyAnswer {
+            response: bad_gateway(),
+            configuration_error: None,
+        });
     }
     let returned = answered
         .payload()
@@ -486,13 +526,19 @@ async fn invoked(
         .unwrap_or_default();
     bounded(returned.len())?;
     match proxy_response(&returned, &call.proxy.binary_media_types) {
-        Ok(response) => Ok(response),
+        Ok(response) => Ok(ProxyAnswer {
+            response,
+            configuration_error: None,
+        }),
         Err(reason) => {
             ::tracing::warn!(
                 reason = %reason,
                 "the proxy integration's function returned no well-formed proxy response"
             );
-            Ok(bad_gateway())
+            Ok(ProxyAnswer {
+                response: bad_gateway(),
+                configuration_error: Some(MALFORMED_PROXY_RESPONSE),
+            })
         }
     }
 }
@@ -514,6 +560,11 @@ fn bounded(bytes: usize) -> Result<(), UnservedIntegration> {
 
 /// The response API Gateway answers a proxy integration whose function returned no
 /// well-formed proxy response with.
+///
+/// The `502` is this module's own answer rather than a gateway response of the api — no
+/// gateway response type carries that status — so nothing a reader of the response holds says
+/// why it came, and where the answer's own SHAPE is what was wrong the configuration error
+/// travels beside it for the execution log ([`MALFORMED_PROXY_RESPONSE`]).
 fn bad_gateway() -> IntegratedResponse {
     IntegratedResponse {
         status: BAD_GATEWAY_STATUS,

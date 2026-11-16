@@ -24,6 +24,10 @@ mod documentation_part_creation;
 #[path = "all/deployment_mints_the_missing_stage.rs"]
 mod deployment_mints_the_missing_stage;
 // Declared here, at the head, for the reason the entry above records.
+#[path = "all/stage_execution_log_failure_lines.rs"]
+mod stage_execution_log_failure_lines;
+#[path = "all/stage_execution_log_group_published.rs"]
+mod stage_execution_log_group_published;
 #[path = "all/stage_lambda_proxy_integration.rs"]
 mod stage_lambda_proxy_integration;
 #[path = "all/stage_custom_authorizer.rs"]

@@ -712,8 +712,9 @@ pub(crate) async fn one_leg(
     // And what the STAGE logged about it, read back through CloudWatch Logs' own reader: the
     // records of this request in the group API Gateway publishes for this stage, each naming
     // the request they are about. At `ERROR` the stage traces the requests it answered with an
-    // error, which is the refused leg of this differential; the served leg leaves no trace of
-    // its own, and so names no configuration error either.
+    // error, which is the refused leg of this differential, and such a trace carries the
+    // entries that report the failure; the served leg leaves no trace of its own, and so names
+    // no configuration error either.
     //
     // A REFUSED leg has to find that group: its records are what the rule requires to be
     // delivered. A SERVED leg traces nothing, so a stage that has delivered no record yet has
@@ -747,13 +748,21 @@ pub(crate) async fn one_leg(
              function served, got {trace:?}"
         );
     } else {
-        for line in [&status_line, &refused, &answered_through] {
+        for line in [&refused, &answered_through] {
             assert!(
                 trace.contains(line),
                 "case {case:?}: expected the record {line:?} in this request's trace, \
                  got {trace:?}"
             );
         }
+        // At `ERROR` the trace carries the entries that report the FAILURE and not the
+        // informational steps `INFO` adds beside them, and the status the method completed
+        // with is one of those steps.
+        assert!(
+            !trace.contains(&status_line),
+            "case {case:?}: expected no informational {status_line:?} in a trace written at \
+             ERROR, got {trace:?}"
+        );
     }
 }
 

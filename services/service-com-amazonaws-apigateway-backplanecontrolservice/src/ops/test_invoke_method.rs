@@ -507,8 +507,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // stand is served.
                     performed_integration(ctx, api.arn_region(), Some(&resolved), &call)
                         .await
-                        .and_then(|answer| {
-                            integration_response::mapped(Some(&resolved), &call, &answer)
+                        .and_then(|performed| {
+                            integration_response::mapped(
+                                Some(&resolved),
+                                &call,
+                                &performed.answer,
+                            )
+                            .map(|mapped| (mapped, performed.configuration_error))
                         })
                         .map_err(Refused::Integration)
                 }
@@ -516,10 +521,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
         let (status, body, headers) = match performed {
-            Ok(served) => {
+            Ok((served, configuration_error)) => {
                 let mut headers = served.headers;
                 headers.insert(CONTENT_TYPE_HEADER.to_string(), vec![served.content_type]);
-                log.line("Successfully completed execution".to_string());
+                // A backend answer API Gateway could not use is a configuration error of the
+                // integration, in the same sentence the stage's own execution log states it
+                // in ([`crate::service::invoke::stage_logs`]): the call WAS performed, so
+                // this is what the log says instead of a completed execution.
+                match configuration_error {
+                    Some(reason) => log.line(format!(
+                        "Execution failed due to configuration error: {reason}"
+                    )),
+                    None => log.line("Successfully completed execution".to_string()),
+                }
                 (served.status, served.body, headers)
             }
             Err(refused) => {

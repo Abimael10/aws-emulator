@@ -44,27 +44,39 @@
 //! logging is enabled for this method, which affects the log entries pushed to Amazon
 //! CloudWatch Logs". So the setting in force for the method the request reached decides:
 //!
-//! * `INFO` — the trace of the request is written;
+//! * `INFO` — the whole trace of the request is written: every step of serving it, and the
+//!   failure where there was one;
 //! * `ERROR` — only a request the stage answered with an error has a trace written, which
-//!   is what logging errors only means;
+//!   is what logging errors only means, and that trace carries only the entries that report
+//!   the FAILURE: the levels are nested, so the informational steps `INFO` adds — the verb
+//!   and path, the header names, the payload lines and the status the method completed with —
+//!   are not among them ([`Level`]);
 //! * `OFF`, or no setting at all — nothing is written.
 //!
-//! `dataTrace` adds the request's and the response's own payloads to that trace, which is
-//! the data the setting exists to gate: turned off, the trace names the sizes and not the
-//! bytes.
+//! `dataTrace` is what puts the request's and the response's own payloads in that trace, which
+//! is the data the setting exists to gate: turned off, the trace carries no line about a
+//! payload at all. Both payload lines are informational, so the data a `dataTrace` adds is
+//! data `INFO` writes.
 //!
 //! The group is the one API Gateway publishes for a stage's execution log,
-//! `API-Gateway-Execution-Logs_{rest-api-id}/{stage-name}` ([`execution_log_group`]), and
-//! the trace is worded exactly as `TestInvokeMethod` words the log of a simulated
-//! invocation: one vocabulary, so a developer reading a stage's execution log and one
+//! `API-Gateway-Execution-Logs_{rest-api-id}/{stage-name}` ([`execution_log_group`]) — a group
+//! API Gateway publishes under its OWN name, so it is there as soon as a configuration turning
+//! the log on is accepted ([`crate::ops::update_stage`]) rather than from the first record
+//! written into it — and the trace is worded exactly as `TestInvokeMethod` words the log of a
+//! simulated invocation: one vocabulary, so a developer reading a stage's execution log and one
 //! reading a test invocation's see the same steps.
 //!
 //! The trace is the steps the stage TOOK, so a request it could not serve through the
 //! method's integration — a configuration this api cannot be performed through, a grant the
 //! backend does not carry — carries the step that stopped it: the configuration error that
 //! was found and the gateway response the request was then answered through ([`Unperformed`]).
-//! A developer reads that line to tell a backend that answered badly from one that was never
-//! reached at all, and a status alone does not say which.
+//! A request whose integration WAS performed and whose backend answered something this api
+//! cannot use — a Lambda proxy response API Gateway cannot read, answered `502` from that
+//! answer itself rather than through a gateway response — carries that configuration error
+//! too, in API Gateway's own words for it
+//! ([`super::lambda_proxy::MALFORMED_PROXY_RESPONSE`]). A developer reads those lines to tell
+//! a backend that answered badly from one that was never reached at all, and a status alone
+//! does not say which.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -84,21 +96,25 @@ pub(super) struct Recorded {
     /// `$context` member path a reference reads it by, which a record's format may name as
     /// `$context.authorizer.<member>`; empty for a request no authorizer decided.
     pub(super) authorized: BTreeMap<String, String>,
-    /// The configuration error that stopped the method's integration, for a request the
-    /// stage could not serve through it; `None` for every request whose integration was
-    /// performed, cached or never reached.
+    /// The configuration error the method's integration ran into, for a request the stage
+    /// could not serve through it and for one whose backend answered something API Gateway
+    /// could not use; `None` for every request whose integration answered usably, was
+    /// served from the cache or was never reached.
     pub(super) unperformed: Option<Unperformed>,
 }
 
-/// An integration the stage could not perform, as the execution log records it.
+/// A configuration error of the method's integration, as the execution log records it.
 #[derive(Debug)]
 pub(super) struct Unperformed {
-    /// Why it could not be performed, in one sentence: `UnservedIntegration`'s own reason,
-    /// which states the configuration and never a backend answer.
+    /// What the error was, in one sentence: the words API Gateway states this class of
+    /// configuration error in.
     reason: String,
     /// The `GatewayResponseType` the request was answered through, which is what names the
-    /// CLASS of the configuration error to a developer reading the trace.
-    response_type: &'static str,
+    /// CLASS of the configuration error to a developer reading the trace; `None` for an
+    /// error the request was NOT answered through a gateway response for — a backend answer
+    /// API Gateway could not use is answered from that answer itself, so no gateway response
+    /// type is involved and the trace claims none.
+    response_type: Option<&'static str>,
 }
 
 impl Recorded {
@@ -106,7 +122,18 @@ impl Recorded {
     pub(super) fn stopped_by(&mut self, unserved: &super::UnservedIntegration) {
         self.unperformed = Some(Unperformed {
             reason: unserved.reason.clone(),
-            response_type: unserved.refusal.response_type(),
+            response_type: Some(unserved.refusal.response_type()),
+        });
+    }
+
+    /// Record that the integration WAS performed and `reason` is the configuration error its
+    /// backend's own answer was — a Lambda proxy response API Gateway cannot read, which it
+    /// answers `502` from rather than through a gateway response of the api
+    /// ([`super::lambda_proxy::MALFORMED_PROXY_RESPONSE`]).
+    pub(super) fn answered_badly(&mut self, reason: &'static str) {
+        self.unperformed = Some(Unperformed {
+            reason: reason.to_string(),
+            response_type: None,
         });
     }
 }
@@ -126,8 +153,56 @@ const LOGGING_LEVEL_ERROR: &str = "ERROR";
 /// classes.
 const FIRST_ERROR_STATUS: u16 = 400;
 
+/// A `loggingLevel` execution logging is ON at, and the CLASS one line of a trace belongs to.
+///
+/// `MethodSetting$loggingLevel` "specifies the logging level for this method, which affects
+/// the log entries pushed to Amazon CloudWatch Logs", with "valid values are `OFF`, `ERROR`,
+/// and `INFO`": the levels are nested, so `ERROR` pushes the entries that report the request's
+/// FAILURE and `INFO` pushes those and the informational steps beside them. Every line of a
+/// trace therefore belongs to one of the two, and the setting in force decides which of them
+/// are written ([`Self::writes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// Reports the failure of the request: `ERROR` writes it, and so does `INFO`.
+    Error,
+    /// An informational step of serving the request: only `INFO` writes it.
+    Info,
+}
+
+impl Level {
+    /// The level `loggingLevel` names, or `None` for a value execution logging is off at —
+    /// `OFF`, no setting at all, and any other value, none of which writes a trace.
+    fn of(level: Option<&str>) -> Option<Self> {
+        match level {
+            Some(LOGGING_LEVEL_INFO) => Some(Self::Info),
+            Some(LOGGING_LEVEL_ERROR) => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    /// Whether a trace written at this level carries a line of the class `line`.
+    fn writes(self, line: Self) -> bool {
+        self == Self::Info || line == Self::Error
+    }
+}
+
+/// Whether a method whose `loggingLevel` is `level` has EXECUTION LOGGING ON — the two
+/// documented levels that write a trace at all, as against `OFF` and no setting, which write
+/// nothing ([`traces`] decides which request each of the two writes one for).
+///
+/// `pub(crate)` because the stage's execution log GROUP is published for exactly this
+/// configuration, which is what the control plane provisions it for
+/// ([`crate::ops::update_stage`]): one reading of "logging is on", so a stage whose group
+/// exists and one whose requests are traced cannot disagree.
+pub(crate) fn logs_executions(level: Option<&str>) -> bool {
+    Level::of(level).is_some()
+}
+
 /// The execution log group of the stage `stage` of the api `api_id`.
-fn execution_log_group(api_id: &str, stage: &str) -> String {
+///
+/// `pub(crate)` for the control plane, which provisions this group as soon as a stage's
+/// execution logging is turned on; see [`logs_executions`].
+pub(crate) fn execution_log_group(api_id: &str, stage: &str) -> String {
     format!("{EXECUTION_LOG_GROUP_PREFIX}{api_id}/{stage}")
 }
 
@@ -302,8 +377,11 @@ fn planned<Eng: Send + Sync + 'static>(
         });
 
     let execution = super::response_cache::method_settings_in_force(stage, matched_path, verb)
-        .filter(|settings| traces(settings.logging_level.as_deref(), status))
-        .map(|settings| {
+        .and_then(|settings| {
+            let level = Level::of(settings.logging_level.as_deref())?;
+            traces(level, status).then_some((level, settings))
+        })
+        .map(|(level, settings)| {
             (
                 execution_log_group(&api.id, stage_name),
                 trace(
@@ -323,6 +401,7 @@ fn planned<Eng: Send + Sync + 'static>(
                         .and_then(|method| method.integration.as_ref())
                         .and_then(|integration| integration.r#type.as_deref()),
                     recorded.unperformed.as_ref(),
+                    level,
                     settings.data_trace_enabled,
                 ),
             )
@@ -336,13 +415,12 @@ fn planned<Eng: Send + Sync + 'static>(
     })
 }
 
-/// Whether a method whose `loggingLevel` is `level` writes a trace of a request answered
-/// with `status`; see the module docs.
-fn traces(level: Option<&str>, status: u16) -> bool {
+/// Whether a method whose execution logging is on at `level` writes a trace of a request
+/// answered with `status`; see the module docs.
+fn traces(level: Level, status: u16) -> bool {
     match level {
-        Some(LOGGING_LEVEL_INFO) => true,
-        Some(LOGGING_LEVEL_ERROR) => status >= FIRST_ERROR_STATUS,
-        _ => false,
+        Level::Info => true,
+        Level::Error => status >= FIRST_ERROR_STATUS,
     }
 }
 
@@ -394,13 +472,20 @@ fn answered_context(
 /// group holds the records of every request the stage served and a client reading it has
 /// nothing else to separate two traces by.
 ///
-/// `data_trace` adds the payloads of the call to the trace; without it the trace names their
-/// sizes, exactly as a simulated invocation's log does ([`payload_line`]).
+/// `level` is the `loggingLevel` in force, which decides WHICH of those lines are written:
+/// every line belongs to one of the two documented levels ([`Level`]), so a trace written at
+/// `ERROR` carries the lines that report the failure and none of the informational steps.
 ///
-/// `unperformed` is the configuration error that stopped the integration, for a request the
-/// stage could not serve through it: it is recorded where the integration's own step belongs —
-/// after the type that was to answer and before what the caller was answered with — in the
-/// two sentences a simulated invocation's log words that outcome with.
+/// `data_trace` is what puts the payloads of the call in the trace: with it off the trace
+/// carries no payload line at all, and with it on each payload line carries the bytes
+/// ([`payload_line`]). Both payload lines are informational, so what a data trace adds is
+/// something a trace written at `INFO` carries.
+///
+/// `unperformed` is the configuration error of the method's integration, for a request the
+/// stage could not serve through it or whose backend answered something this api could not
+/// use: it is recorded where the integration's own step belongs — after the type that was to
+/// answer and before what the caller was answered with — in the sentences a simulated
+/// invocation's log words that outcome with.
 #[allow(clippy::too_many_arguments)]
 fn trace(
     req: &RtRequest,
@@ -410,47 +495,73 @@ fn trace(
     resource_path: &str,
     integration_type: Option<&str>,
     unperformed: Option<&Unperformed>,
+    level: Level,
     data_trace: bool,
 ) -> Vec<String> {
     let request_body = req.body().bytes().unwrap_or_default();
     let response_body = response.body().bytes().unwrap_or_default();
     let mut lines = vec![
-        format!("Execution log for request {request_id}"),
-        format!("Starting execution for request: {request_id}"),
-        format!("HTTP Method: {verb}, Resource Path: {resource_path}"),
-        traced_header_names_line(&header_names(req)),
+        // The line that OPENS a request's log, which is the one line of it that is about the
+        // request rather than about a step of serving it.
+        (Level::Error, format!("Execution log for request {request_id}")),
+        (
+            Level::Info,
+            format!("Starting execution for request: {request_id}"),
+        ),
+        (
+            Level::Info,
+            format!("HTTP Method: {verb}, Resource Path: {resource_path}"),
+        ),
+        (Level::Info, traced_header_names_line(&header_names(req))),
+    ];
+    // The REQUEST's payload, which only a data trace puts in the log ([`payload_line`]).
+    lines.extend(
         payload_line(
             "Method request body before transformations",
             request_body,
             data_trace,
-        ),
-        format!(
-            "Integration type: {}",
-            integration_type.unwrap_or("none")
-        ),
-    ];
-    if let Some(unperformed) = unperformed {
-        lines.push(format!(
-            "Execution failed due to configuration error: {}",
-            unperformed.reason
-        ));
-        lines.push(format!(
-            "Answered through this API's {} gateway response",
-            unperformed.response_type
-        ));
-    }
-    lines.push(payload_line(
-        "Method response body after transformations",
-        response_body,
-        data_trace,
+        )
+        .map(|line| (Level::Info, line)),
+    );
+    lines.push((
+        Level::Info,
+        format!("Integration type: {}", integration_type.unwrap_or("none")),
     ));
-    lines.push(format!(
-        "Method completed with status: {}",
-        response.status().as_u16()
+    if let Some(unperformed) = unperformed {
+        lines.push((
+            Level::Error,
+            format!(
+                "Execution failed due to configuration error: {}",
+                unperformed.reason
+            ),
+        ));
+        if let Some(response_type) = unperformed.response_type {
+            lines.push((
+                Level::Error,
+                format!("Answered through this API's {response_type} gateway response"),
+            ));
+        }
+    }
+    // The RESPONSE's payload, gated by the same data trace as the request's.
+    lines.extend(
+        payload_line(
+            "Method response body after transformations",
+            response_body,
+            data_trace,
+        )
+        .map(|line| (Level::Info, line)),
+    );
+    lines.push((
+        Level::Info,
+        format!(
+            "Method completed with status: {}",
+            response.status().as_u16()
+        ),
     ));
     lines
         .into_iter()
-        .map(|line| about_request(request_id, &line))
+        .filter(|(written_at, _)| level.writes(*written_at))
+        .map(|(_, line)| about_request(request_id, &line))
         .collect()
 }
 
@@ -502,13 +613,23 @@ pub(crate) fn traced_header_names_line(names: &[String]) -> String {
     }
 }
 
-/// One payload line of the trace: the BYTES of the payload where data tracing is on and the
-/// payload is within [`MAX_TRACED_PAYLOAD_BYTES`], and its SIZE otherwise.
-fn payload_line(what: &str, payload: &[u8], data_trace: bool) -> String {
-    if data_trace && payload.len() <= MAX_TRACED_PAYLOAD_BYTES {
-        return format!("{what}: {}", String::from_utf8_lossy(payload));
+/// One payload line of the trace, or `None` where the trace carries none.
+///
+/// `dataTrace` is what puts a call's payloads in the log — "specifies whether data trace
+/// logging is enabled for this method, which affects the log entries pushed to Amazon
+/// CloudWatch Logs" (`MethodSetting$dataTrace`) — so the payload lines ARE the data trace: with
+/// it off the trace carries no line about a payload at all, and with it on the line carries the
+/// payload's bytes. A payload past [`MAX_TRACED_PAYLOAD_BYTES`] is reported by its size
+/// instead, which is this emulator's resource guard on one log event rather than a line API
+/// Gateway words that way.
+fn payload_line(what: &str, payload: &[u8], data_trace: bool) -> Option<String> {
+    if !data_trace {
+        return None;
     }
-    format!("{what}: {} byte(s)", payload.len())
+    if payload.len() <= MAX_TRACED_PAYLOAD_BYTES {
+        return Some(format!("{what}: {}", String::from_utf8_lossy(payload)));
+    }
+    Some(format!("{what}: {} byte(s)", payload.len()))
 }
 
 /// The NAMES of the headers the request carries, in name order.
@@ -565,7 +686,7 @@ mod tests {
             ("OFF logs nothing", Some("OFF"), 500, false),
             ("no level logs nothing", None, 500, false),
         ] {
-            let got = traces(level, status);
+            let got = Level::of(level).is_some_and(|level| traces(level, status));
             assert_eq!(
                 got, expected,
                 "case {case:?}: expected {expected}, got {got}"
@@ -574,7 +695,38 @@ mod tests {
     }
 
     #[test]
-    fn a_traced_payload_carries_its_bytes_within_the_guard_and_its_size_past_it() {
+    fn the_logging_level_in_force_decides_which_lines_a_trace_carries() {
+        for (case, level, line, expected) in [
+            ("INFO writes a failure line", Level::Info, Level::Error, true),
+            (
+                "INFO writes an informational line",
+                Level::Info,
+                Level::Info,
+                true,
+            ),
+            (
+                "ERROR writes a failure line",
+                Level::Error,
+                Level::Error,
+                true,
+            ),
+            (
+                "ERROR writes no informational line",
+                Level::Error,
+                Level::Info,
+                false,
+            ),
+        ] {
+            let got = level.writes(line);
+            assert_eq!(
+                got, expected,
+                "case {case:?}: expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_line_is_the_data_trace_and_carries_its_bytes_within_the_guard() {
         let label = "Method request body before transformations";
         let at_the_bound = "x".repeat(MAX_TRACED_PAYLOAD_BYTES);
         let past_the_bound = "x".repeat(MAX_TRACED_PAYLOAD_BYTES + 1);
@@ -583,31 +735,37 @@ mod tests {
                 "a small payload, traced",
                 r#"{"id":"1"}"#,
                 true,
-                format!("{label}: {}", r#"{"id":"1"}"#),
+                Some(format!("{label}: {}", r#"{"id":"1"}"#)),
             ),
             (
-                "a small payload, not traced",
+                "a small payload with the data trace off, which logs no payload line",
                 r#"{"id":"1"}"#,
                 false,
-                format!("{label}: 10 byte(s)"),
+                None,
+            ),
+            (
+                "a payload with the data trace off, whatever its size",
+                past_the_bound.as_str(),
+                false,
+                None,
             ),
             (
                 "no payload at all, traced",
                 "",
                 true,
-                format!("{label}: "),
+                Some(format!("{label}: ")),
             ),
             (
                 "a payload at the guard, traced",
                 at_the_bound.as_str(),
                 true,
-                format!("{label}: {at_the_bound}"),
+                Some(format!("{label}: {at_the_bound}")),
             ),
             (
                 "a payload past the guard, traced",
                 past_the_bound.as_str(),
                 true,
-                format!("{label}: {} byte(s)", MAX_TRACED_PAYLOAD_BYTES + 1),
+                Some(format!("{label}: {} byte(s)", MAX_TRACED_PAYLOAD_BYTES + 1)),
             ),
         ] {
             let got = payload_line(label, payload.as_bytes(), data_trace);

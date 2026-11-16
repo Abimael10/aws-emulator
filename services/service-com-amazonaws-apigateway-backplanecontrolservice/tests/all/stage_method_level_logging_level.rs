@@ -309,6 +309,10 @@ async fn gate(
 /// Drive ONE request through the stage, served by `verb` and answered with `status`, and assert
 /// what the stage's execution log then holds about it: the trace the level in force calls for,
 /// or nothing at all.
+///
+/// `at_info` is whether the level in force for that method is `INFO`, which is what decides
+/// WHICH lines a written trace carries: `INFO` writes the informational steps of serving the
+/// request beside the entries that report a failure, and `ERROR` writes only the latter.
 async fn one_leg(
     router: &MultiServiceRouter,
     api: &str,
@@ -316,6 +320,7 @@ async fn one_leg(
     verb: &str,
     status: u16,
     traced: bool,
+    at_info: bool,
 ) {
     let case = &format!("{row_case}: {verb} answered {status}");
     let answered = invoke(
@@ -358,6 +363,15 @@ async fn one_leg(
         );
         return;
     }
+    // The line that OPENS a request's log is in every trace, whichever level wrote it: it is
+    // what names the request the following records are about.
+    let opens = traced_line(&request_id, &format!("Execution log for request {request_id}"));
+    assert!(
+        trace.contains(&opens),
+        "case {case:?}: expected the record {opens:?} in this request's trace, got {trace:?}"
+    );
+    // The INFORMATIONAL steps of serving the request, which only a trace written at `INFO`
+    // carries: a trace written at `ERROR` reports the failure and nothing beside it.
     for line in [
         traced_line(
             &request_id,
@@ -365,9 +379,11 @@ async fn one_leg(
         ),
         traced_line(&request_id, &format!("Method completed with status: {status}")),
     ] {
-        assert!(
+        assert_eq!(
             trace.contains(&line),
-            "case {case:?}: expected the record {line:?} in this request's trace, got {trace:?}"
+            at_info,
+            "case {case:?}: expected the record {line:?} in this request's trace={at_info}, \
+             got {trace:?}"
         );
     }
 }
@@ -439,17 +455,21 @@ async fn the_entry_of_the_matched_method_gates_its_execution_log() {
         let api = deployed(&router, &function_arn, &index.to_string()).await;
         gate(&router, &api, case, row.stage_wide, row.per_method).await;
         for (verb, traced) in row.traced {
-            one_leg(&router, &api, case, verb, 200, *traced).await;
+            // Every leg here is answered `200`, which only `INFO` traces at all, so a written
+            // trace of one is an `INFO` trace.
+            one_leg(&router, &api, case, verb, 200, *traced, true).await;
         }
     }
 }
 
 /// One leg of the status table: the verb a request is served by, the status the stage answers it
-/// with, and whether the level in force for THAT method traces it.
+/// with, whether the level in force for THAT method traces it, and whether that level is `INFO`
+/// — which is what decides which lines the trace carries.
 struct Leg {
     verb: &'static str,
     status: u16,
     traced: bool,
+    at_info: bool,
 }
 
 /// The legs: the level in force for a method decides which of ITS requests leave a trace —
@@ -457,12 +477,12 @@ struct Leg {
 /// is decided by its own level rather than by another method's.
 fn legs() -> Vec<Leg> {
     vec![
-        Leg { verb: "GET", status: 200, traced: true },
-        Leg { verb: "GET", status: 503, traced: true },
-        Leg { verb: "POST", status: 200, traced: false },
-        Leg { verb: "POST", status: 500, traced: true },
-        Leg { verb: "DELETE", status: 200, traced: false },
-        Leg { verb: "DELETE", status: 500, traced: false },
+        Leg { verb: "GET", status: 200, traced: true, at_info: true },
+        Leg { verb: "GET", status: 503, traced: true, at_info: true },
+        Leg { verb: "POST", status: 200, traced: false, at_info: false },
+        Leg { verb: "POST", status: 500, traced: true, at_info: false },
+        Leg { verb: "DELETE", status: 200, traced: false, at_info: false },
+        Leg { verb: "DELETE", status: 500, traced: false, at_info: false },
     ]
 }
 
@@ -486,6 +506,15 @@ async fn a_methods_own_level_decides_which_of_its_requests_leave_a_trace() {
     .await;
 
     for leg in legs() {
-        one_leg(&router, &api, case, leg.verb, leg.status, leg.traced).await;
+        one_leg(
+            &router,
+            &api,
+            case,
+            leg.verb,
+            leg.status,
+            leg.traced,
+            leg.at_info,
+        )
+        .await;
     }
 }

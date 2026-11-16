@@ -235,6 +235,35 @@ pub(super) fn unusable_vpc_link(
     }
 }
 
+/// What performing a method's integration produced: the integration's own ANSWER, and —
+/// where the backend's answer was itself a configuration error API Gateway could not use —
+/// the sentence the execution log of the request states that error in.
+///
+/// The second half exists because such an answer is not a refusal: the call WAS performed and
+/// the caller is answered from what came back, so nothing in that response says what was
+/// wrong with it, and the request's own trace is where API Gateway says
+/// ([`lambda_proxy::MALFORMED_PROXY_RESPONSE`] is the one class of it).
+#[derive(Debug)]
+pub struct Performed {
+    /// The integration response the call was answered from, which the integration's own
+    /// responses then map ([`integration_response::mapped`]).
+    pub answer: IntegrationAnswer,
+    /// The configuration error the backend's answer was, or `None` for an answer API Gateway
+    /// could use.
+    pub configuration_error: Option<&'static str>,
+}
+
+impl Performed {
+    /// An answer that is no configuration error, which is what every integration performed
+    /// from the api's own records or by making another service's call produces.
+    fn of(answer: IntegrationAnswer) -> Self {
+        Self {
+            answer,
+            configuration_error: None,
+        }
+    }
+}
+
 /// Perform the call through the method's integration, through the IN-PROCESS transport
 /// `ctx` carries where the integration names another emulated service's action.
 ///
@@ -253,18 +282,21 @@ pub async fn performed_integration(
     region: &str,
     method: Option<&MethodEntry>,
     call: &MethodRequest,
-) -> Result<IntegrationAnswer, UnservedIntegration> {
+) -> Result<Performed, UnservedIntegration> {
     if let Some(method) = method {
         if let Some(served) = lambda_proxy::performed(ctx, region, method, call).await {
             // A proxy integration returns the method response itself, so what it answered is
             // an integration response nothing maps ([`integration_response::passed_answer`]).
-            return served.map(integration_response::passed_answer);
+            return served.map(|answered| Performed {
+                answer: integration_response::passed_answer(answered.response),
+                configuration_error: answered.configuration_error,
+            });
         }
         if let Some(served) = aws_integration::performed(ctx, region, method, call).await {
-            return served;
+            return served.map(Performed::of);
         }
     }
-    perform_integration(method, call)
+    perform_integration(method, call).map(Performed::of)
 }
 
 /// Perform the call through the method's integration, answering the INTEGRATION RESPONSE
