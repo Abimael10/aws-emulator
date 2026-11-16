@@ -40,6 +40,9 @@ mod membership_removal;
 #[path = "all/object_naming.rs"]
 mod object_naming;
 
+#[path = "all/paginated_realm.rs"]
+mod paginated_realm;
+
 #[path = "all/request_layer_envelopes.rs"]
 mod request_layer_envelopes;
 
