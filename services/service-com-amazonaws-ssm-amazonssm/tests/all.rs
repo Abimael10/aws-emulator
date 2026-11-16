@@ -143,6 +143,8 @@ mod patch_baseline_listing;
 mod patch_properties_catalog;
 #[path = "all/public_amazon_linux_alias_namespace.rs"]
 mod public_amazon_linux_alias_namespace;
+#[path = "all/public_catalog_batch_resolution.rs"]
+mod public_catalog_batch_resolution;
 #[path = "all/public_image_metadata_hierarchies.rs"]
 mod public_image_metadata_hierarchies;
 #[path = "all/public_parameter_catalog.rs"]
