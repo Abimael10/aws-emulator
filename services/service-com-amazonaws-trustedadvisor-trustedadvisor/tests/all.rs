@@ -17,6 +17,8 @@ mod account_scoped_recommendation_identifier;
 mod account_scoped_recommendation_list;
 #[path = "all/affected_account_filter.rs"]
 mod affected_account_filter;
+#[path = "all/arn_account_segment_form.rs"]
+mod arn_account_segment_form;
 #[path = "all/batch_exclusion_foreign_account.rs"]
 mod batch_exclusion_foreign_account;
 #[path = "all/batch_exclusion_unique_arns.rs"]

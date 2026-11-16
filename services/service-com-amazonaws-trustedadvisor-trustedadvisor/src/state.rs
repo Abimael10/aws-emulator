@@ -2235,25 +2235,48 @@ pub fn support_level_refusal<Eng: Send + Sync + 'static>(
 
 /// The account segment of an AWS resource ARN
 /// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for a
-/// string with fewer segments than that. The segment is EMPTY for a resource type
-/// whose ARNs carry no account (an S3 bucket, a Trusted Advisor check), which is
-/// not another account's resource.
+/// string with fewer segments than that. The segment is whatever the ARN carries
+/// in that position, which is not always an account id ([`is_account_id`]): it is
+/// EMPTY for a resource type whose ARNs carry no account (an S3 bucket, a Trusted
+/// Advisor check), and an AWS-managed resource carries a non-account owner token
+/// there instead — neither names an account, so neither is another account's
+/// resource.
 pub fn arn_account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
 }
 
+/// Whether `segment` is an AWS account id: the one account notion this service
+/// models is `AccountId`, `@length(12,12)` plus `@pattern("^\\d+$")`
+/// (`smithy_query(query="shape",shape="AccountId")`) — exactly twelve decimal
+/// digits — so a segment of any other shape is not a value any modelled
+/// `accountId` member can carry.
+///
+/// Read through the workspace's ONE reading of that form, so no two callers can
+/// disagree about what an account id is.
+pub fn is_account_id(segment: &str) -> bool {
+    ::service_common::arn::is_account_id(segment)
+}
+
 /// The owning account a modelled `accountId` member reports for a resource,
 /// derived from that resource's own ARN: its account segment, owned, and `None`
-/// when the ARN names no account at all — it carries fewer segments than an ARN,
-/// or its account segment is EMPTY, which (see [`arn_account`]) is what the
-/// segment is for a resource type whose ARNs carry no account.
+/// when that segment is not an account id ([`is_account_id`]) — so the ARN names
+/// no account at all.
+///
+/// The account position of an ARN holds an account id only for a resource type
+/// whose ARNs carry one. It is EMPTY for a type whose ARNs carry no account (an
+/// S3 bucket, a Trusted Advisor check), absent for a string with fewer segments
+/// than an ARN (see [`arn_account`]), and for an AWS-managed resource it holds a
+/// non-account token instead (`arn:aws:iam::aws:policy/ReadOnlyAccess`) — none of
+/// which name an account, since none can satisfy the only account form this
+/// service models.
 ///
 /// Every view that reports a stored resource's owning account goes through this,
 /// so the account-level and the organization-level view of one stored resource
-/// cannot report its account differently.
+/// cannot report its account differently, and no view can report an `accountId`
+/// the model would reject.
 pub fn arn_account_id(arn: &str) -> Option<String> {
     arn_account(arn)
-        .filter(|account| !account.is_empty())
+        .filter(|account| is_account_id(account))
         .map(str::to_string)
 }
 
@@ -2280,7 +2303,9 @@ pub fn affected_account_keeps(arn: &str, affected_account_id: Option<&str>) -> b
 /// Whether `arn` names a resource owned by an account OTHER than the calling
 /// one: the account segment of the resource's OWN ARN ([`arn_account_id`])
 /// differs from the account the request is made from. An ARN that names no
-/// account at all (see [`arn_account`]) is not another account's resource.
+/// account at all — one whose account position is empty, absent or holds a
+/// non-account token (see [`arn_account_id`]) — is not another account's
+/// resource.
 ///
 /// The ONE test every account-level view of a stored resource makes, so a
 /// listing and a refusal cannot disagree about who owns one stored resource:
