@@ -2952,6 +2952,25 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
             "TaskRoleArn",
             "Volumes",
         ],
+        // An AWS Batch job-definition REVISION is immutable in the same way: that service
+        // publishes no call that edits one — `RegisterJobDefinition` is the only way to state
+        // a configuration, and it makes a NEW revision under the name — so a declaration that
+        // states any of these differently asks for a new revision, with its own ARN, rather
+        // than a change to the one the stack has.
+        BATCH_JOB_DEFINITION => &[
+            "ConsumableResourceProperties",
+            "ContainerProperties",
+            "EcsProperties",
+            "EksProperties",
+            "NodeProperties",
+            "Parameters",
+            "PlatformCapabilities",
+            "PropagateTags",
+            "RetryStrategy",
+            "SchedulingPriority",
+            "Timeout",
+            "Type",
+        ],
         // An Amazon RDS DB INSTANCE is created with the database it hosts, the character sets
         // it stores text in, the master user it is reached as, whether its storage is
         // encrypted and under which key, the time zone its engine runs in, the system

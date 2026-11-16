@@ -1051,6 +1051,29 @@ pub(crate) fn return_values(
             attributes.insert("JobQueueArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // "Ref returns the job definition ARN"; Fn::GetAtt: JobDefinitionArn.
+        //
+        // A job definition is identified by its name AND a revision, not by the name alone:
+        // the ARN AWS Batch mints for one ends `:<revision>` (`job_definition_arn` in that
+        // service's own state module), and that revision is the one the REGISTRATION was
+        // given — "the revision of the job definition", one past the highest the account
+        // already holds under the name. Nothing in a template decides it, so the revision
+        // here is the FIRST one, which is what a name no revision is registered under yet
+        // gets, and the identity in force is the one that service answered
+        // ([`identity_is_service_assigned`] names the type, and
+        // [`crate::state::provisioner::batch_job_definitions`] registers the revision).
+        BATCH_JOB_DEFINITION => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("job-definition/{name}:{FIRST_JOB_DEFINITION_REVISION}"),
+            );
+            attributes.insert(
+                "JobDefinitionArn".to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
         // And one more: "Ref returns the service environment ARN"; Fn::GetAtt:
         // ServiceEnvironmentArn (`service_environment_arn`).
         BATCH_SERVICE_ENVIRONMENT => {

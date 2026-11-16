@@ -175,6 +175,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         SSM_ASSOCIATION => &[SSM_ASSOCIATION_ID_ATTRIBUTE],
         BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
         BATCH_JOB_QUEUE => &["JobQueueArn"],
+        BATCH_JOB_DEFINITION => &["JobDefinitionArn"],
         BATCH_SERVICE_ENVIRONMENT => &["ServiceEnvironmentArn"],
         ECS_TASK_DEFINITION => &["TaskDefinitionArn"],
         ELB_LOAD_BALANCER => &[
@@ -913,6 +914,18 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // answered ([`crate::state::provisioning`]'s task-definition provider), and the ARN
         // computed here is the stand-in a declaration is resolved against until then.
         || resource_type == ECS_TASK_DEFINITION
+        // An AWS Batch job-definition REVISION is in exactly that position:
+        // `RegisterJobDefinition` takes the definition's NAME and no identifier, and AWS
+        // Batch allocates the revision — one past the highest revision the account holds
+        // under that name — so the `<name>:<revision>` ARN "Ref returns the job definition
+        // ARN" publishes cannot be computed from the template: a name the account already
+        // holds revisions of is registered at the next number, not at the first. That ARN is
+        // also the `jobDefinition` handle every call on one takes (`SubmitJob`,
+        // `DescribeJobDefinitions`, `DeregisterJobDefinition`), so the identity in force is
+        // the one that service answered
+        // ([`crate::state::provisioner`]'s job-definition arms), and the ARN computed here is
+        // the stand-in a declaration is resolved against until then.
+        || resource_type == BATCH_JOB_DEFINITION
 }
 
 /// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
@@ -1550,6 +1563,11 @@ pub(super) fn apigatewayv2_regional_domain_name(name: &str, region: &str) -> Str
 /// carries: "the first task definition that you registered to a family is given a revision
 /// of 1".
 pub(super) const FIRST_TASK_DEFINITION_REVISION: u32 = 1;
+
+/// The revision a job definition registered under a name the account holds none under yet
+/// carries: AWS Batch allocates "the revision of the job definition" one past the highest it
+/// already holds for the name, so a first registration is revision 1.
+pub(super) const FIRST_JOB_DEFINITION_REVISION: u32 = 1;
 
 /// How many characters the id Elastic Load Balancing assigns a load balancer, a target
 /// group or a listener carries: 16 lowercase hexadecimal, the form that service's own

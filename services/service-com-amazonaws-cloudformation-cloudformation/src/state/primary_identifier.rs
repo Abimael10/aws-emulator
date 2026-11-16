@@ -136,14 +136,15 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         APIGATEWAYV2_API_MAPPING => "ApiMappingId",
         // The AWS Transfer Family types, each identified by the ARN its create answers.
         TRANSFER_SERVER => "Arn",
-        // The Amazon EKS association, the Batch environments and queues, and a task
-        // definition: each one's `Ref` is the ARN its create answered.
+        // The Amazon EKS association, the Batch environments, queues and job definitions, and
+        // a task definition: each one's `Ref` is the ARN its create answered.
         EKS_POD_IDENTITY_ASSOCIATION => "AssociationArn",
         // A State Manager association, identified by the `AssociationId` Systems Manager
         // minted — "Ref returns the association ID", the handle every call on one takes.
         SSM_ASSOCIATION => SSM_ASSOCIATION_ID_ATTRIBUTE,
         BATCH_COMPUTE_ENVIRONMENT => "ComputeEnvironmentArn",
         BATCH_JOB_QUEUE => "JobQueueArn",
+        BATCH_JOB_DEFINITION => "JobDefinitionArn",
         BATCH_SERVICE_ENVIRONMENT => "ServiceEnvironmentArn",
         ECS_TASK_DEFINITION => "TaskDefinitionArn",
         // The Elastic Load Balancing v2 types: a load balancer, a target group, a listener

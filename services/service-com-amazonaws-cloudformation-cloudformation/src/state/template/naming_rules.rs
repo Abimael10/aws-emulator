@@ -208,13 +208,15 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // character set and starts with one of its characters, but may be longer than the
         // bound.
         EKS_CLUSTER => rules(100, Characters::AsGenerated),
-        // AWS Batch `CreateComputeEnvironment.computeEnvironmentName` and
-        // `CreateJobQueue.jobQueueName`: each "can be up to 128 characters long. It can
-        // contain uppercase and lowercase letters, numbers, hyphens (-), and underscores
-        // (_)" (those members' own docs) — Batch's model types both as plain strings.
-        BATCH_COMPUTE_ENVIRONMENT | BATCH_JOB_QUEUE | BATCH_SERVICE_ENVIRONMENT => {
-            rules(128, Characters::AsGenerated)
-        }
+        // AWS Batch `CreateComputeEnvironment.computeEnvironmentName`,
+        // `CreateJobQueue.jobQueueName` and `RegisterJobDefinition.jobDefinitionName`: each
+        // "can be up to 128 characters long. It can contain uppercase and lowercase letters,
+        // numbers, hyphens (-), and underscores (_)" (those members' own docs) — Batch's model
+        // types them all as plain strings.
+        BATCH_COMPUTE_ENVIRONMENT
+        | BATCH_JOB_QUEUE
+        | BATCH_JOB_DEFINITION
+        | BATCH_SERVICE_ENVIRONMENT => rules(128, Characters::AsGenerated),
         // Elastic Load Balancing `CreateLoadBalancer.Name` and
         // `CreateTargetGroup.Name`: each "can have a maximum of 32 characters" (Elastic
         // Load Balancing API reference) — the ELBv2 model carries no `@length` for either.

@@ -479,7 +479,8 @@ use super::template::{
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
-    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_FLOW, BEDROCK_GUARDRAIL,
+    BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_FLOW,
+    BEDROCK_GUARDRAIL,
     BEDROCK_KNOWLEDGE_BASE,
     BRAKET_SPENDING_LIMIT,
     CLOUDWATCH_DASHBOARD,
@@ -966,6 +967,14 @@ pub(super) enum Provisioner {
     BatchComputeEnvironment,
     BatchJobQueue,
     BatchServiceEnvironment,
+    /// `AWS::Batch::JobDefinition`: the job-definition REVISION `RegisterJobDefinition`
+    /// registers and `DeregisterJobDefinition` takes out of `ACTIVE`, whose arms are
+    /// [`batch_job_definitions`]'s.
+    ///
+    /// Its identity is the ARN that service answered — revision and all, which AWS Batch
+    /// allocates — so the create replaces the stand-in the naming rules computed
+    /// ([`super::template::identity_is_service_assigned`] names the type).
+    BatchJobDefinition,
     EksAccessEntry,
     /// `AWS::EKS::Cluster`: the Kubernetes control plane `CreateCluster` creates under the
     /// name the template states and `DeleteCluster` removes. That create is asynchronous,
@@ -1289,6 +1298,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEDEPLOY_DEPLOYMENT_CONFIG => Some(Provisioner::CodeDeployDeploymentConfig),
         BATCH_COMPUTE_ENVIRONMENT => Some(Provisioner::BatchComputeEnvironment),
         BATCH_JOB_QUEUE => Some(Provisioner::BatchJobQueue),
+        BATCH_JOB_DEFINITION => Some(Provisioner::BatchJobDefinition),
         BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
         EKS_CLUSTER => Some(Provisioner::EksCluster),
@@ -1817,6 +1827,12 @@ impl Provisioner {
                 create_compute_environment(ctx, region, resource, propagated).await
             }
             Self::BatchJobQueue => create_job_queue(ctx, region, resource, propagated).await,
+            // A job-definition revision IS taggable: its `Tags` property is the tag map
+            // `RegisterJobDefinition` takes, so the revision carries the tags CloudFormation
+            // gives the resource beside its own.
+            Self::BatchJobDefinition => {
+                create_job_definition(ctx, region, resource, propagated).await
+            }
             Self::BatchServiceEnvironment => {
                 create_service_environment(ctx, region, resource, propagated).await
             }
@@ -3681,6 +3697,9 @@ impl Provisioner {
             Self::BatchJobQueue => {
                 delete_batch_job_queue(ctx, region, physical_resource_id).await
             }
+            Self::BatchJobDefinition => {
+                delete_batch_job_definition(ctx, region, physical_resource_id).await
+            }
             Self::BatchServiceEnvironment => {
                 delete_batch_service_environment(ctx, region, physical_resource_id).await
             }
@@ -4255,6 +4274,9 @@ impl Provisioner {
                 )
                 .await
             }
+            Self::BatchJobDefinition => {
+                describe_batch_job_definition(ctx, region, physical_resource_id).await
+            }
             Self::BatchServiceEnvironment => {
                 batch_described(
                     ctx,
@@ -4543,6 +4565,11 @@ pub(in crate::state) mod ssm_maintenance_windows;
 /// the type's own NAME lives here, beside the arms that provision it.
 pub(in crate::state) mod ssm_documents;
 mod resource_groups;
+/// The AWS Batch JOB DEFINITION arms, beside the compute environment, job queue and service
+/// environment arms the same owning service has in [`network_and_delivery`]: a revision's
+/// identity is the revision-qualified ARN that service allocates, which makes its create,
+/// delete and read a concern of their own.
+mod batch_job_definitions;
 pub(super) mod elasticache_caches;
 /// The Amazon RDS DB CLUSTER arm: the cluster an `AWS::RDS::DBCluster` declares, created in
 /// the service that owns it so a member DB instance of that cluster resolves it.
@@ -4565,6 +4592,7 @@ use ssm_associations::*;
 use ssm_maintenance_windows::*;
 use ssm_documents::*;
 use resource_groups::*;
+use batch_job_definitions::*;
 use compute_fleet::*;
 pub(crate) use network_and_delivery::*;
 use eks_cluster_workloads::*;

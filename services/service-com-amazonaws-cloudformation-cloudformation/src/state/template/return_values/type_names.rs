@@ -937,6 +937,15 @@ pub const BATCH_COMPUTE_ENVIRONMENT: &str = "AWS::Batch::ComputeEnvironment";
 /// An AWS Batch job queue's resource type. "Ref returns the job queue ARN";
 /// `Fn::GetAtt`: `JobQueueArn`.
 pub const BATCH_JOB_QUEUE: &str = "AWS::Batch::JobQueue";
+/// An AWS Batch JOB DEFINITION's resource type. "Ref returns the job definition ARN", which
+/// is revision-qualified (`…:job-definition/<name>:<revision>`); `Fn::GetAtt`:
+/// `JobDefinitionArn`.
+///
+/// The revision is AWS Batch's to allocate, so the ARN this emulator computes for a
+/// declaration is only the stand-in it is resolved against until that service has registered
+/// the revision ([`identity_is_service_assigned`] names the type, and
+/// [`crate::state::provisioner::batch_job_definitions`] is what registers it).
+pub const BATCH_JOB_DEFINITION: &str = "AWS::Batch::JobDefinition";
 /// An AWS Batch service environment's resource type. "Ref returns the service environment
 /// ARN"; `Fn::GetAtt`: `ServiceEnvironmentArn`.
 pub const BATCH_SERVICE_ENVIRONMENT: &str = "AWS::Batch::ServiceEnvironment";

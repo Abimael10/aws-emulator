@@ -27,7 +27,10 @@
 //!
 //! Only a plan's ADDITIONS fail the validation, and only those whose name the template
 //! states: a resource whose name CloudFormation generates is unique by construction, and one
-//! the plan MODIFIES or REMOVES already exists because the stack has it. The question is put
+//! the plan MODIFIES or REMOVES already exists because the stack has it. Nor does a name fail
+//! it for a type whose owning service VERSIONS its resources ([`owning_service_versions`]): a
+//! create that mints a new revision under a name already in use is a create that can be
+//! carried out. The question is put
 //! to the service that OWNS the type, through the same in-process read drift detection asks
 //! ([`super::provisioning::Owner::actual_configuration`]), so a name is reported taken only
 //! when that service really holds a resource under it; a type with no owning provisioner
@@ -207,6 +210,7 @@ pub fn named_resources(
     template::provision(template, &scope, &mut budget)
         .into_iter()
         .filter(|provisioned| states_its_name(template, provisioned))
+        .filter(|provisioned| !owning_service_versions(&provisioned.resource_type))
         .map(|provisioned| NamedResource {
             logical_id: provisioned.logical_id,
             resource_type: provisioned.resource_type,
@@ -225,6 +229,24 @@ fn states_its_name(template: &Template, provisioned: &StoredResource) -> bool {
         .is_some_and(|declared| {
             template::name_property(&declared.resource_type, &declared.properties).is_some()
         })
+}
+
+/// Whether the service that owns `resource_type` VERSIONS the resources of it: one whose
+/// create, asked for a name it already holds a resource under, mints a NEW version under that
+/// name rather than refusing.
+///
+/// A name such a service holds is no obstacle to the create, which is the only thing this
+/// stage is about: `RegisterJobDefinition` gives the registration "the revision of the job
+/// definition" one past the highest that service holds under the name, and
+/// `RegisterTaskDefinition` does the same inside a family ("the revision is a version number
+/// of a task definition in a family"), so a second declaration of either name asks for a
+/// second VERSION and is carried out. The identifier a declaration of such a type resolves to
+/// here is in any case the stand-in the naming rules computed for a version that service has
+/// not assigned yet ([`template::identity_is_service_assigned`] names both types), so reading
+/// it back establishes nothing about what the create would do.
+fn owning_service_versions(resource_type: &str) -> bool {
+    resource_type == template::BATCH_JOB_DEFINITION
+        || resource_type == template::ECS_TASK_DEFINITION
 }
 
 /// The resources a DEPLOYMENT would CREATE whose physical name its template STATES: what
