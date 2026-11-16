@@ -908,6 +908,20 @@ pub(super) fn scalar_text(value: &Value) -> Option<String> {
     super::scalar_text(value)
 }
 
+/// One declared scalar property as the text it states, or the empty string where the
+/// declaration states it as nothing or as a composite.
+///
+/// Here beside [`scalar_text`] because more than one per-type arm reads a declared scalar it
+/// has to put in a URI or a request member — the app and the environment an Amplify UI
+/// Builder entity lives in, the knowledge base an Amazon Bedrock data source is attached to —
+/// so what an absent or composite declaration contributes is decided once.
+pub(super) fn declared_scalar(properties: &Value, property: &str) -> String {
+    properties
+        .get(property)
+        .and_then(scalar_text)
+        .unwrap_or_default()
+}
+
 /// A policy-document property as the JSON text the IAM member takes.
 ///
 /// CloudFormation accepts a policy document as an inline object (JSON or YAML) or as a

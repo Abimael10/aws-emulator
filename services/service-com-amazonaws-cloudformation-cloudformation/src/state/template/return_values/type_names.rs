@@ -75,6 +75,49 @@ pub(super) const BEDROCK_GUARDRAIL_DRAFT_VERSION: &str = "DRAFT";
 pub(super) const BEDROCK_KNOWLEDGE_BASE_ID_SALT: &str = "bedrock/knowledge-base";
 pub(super) const BEDROCK_KNOWLEDGE_BASE_ID_DIGITS: usize = 10;
 
+/// The salt the data-source-id stand-in is derived under, and how many characters it carries:
+/// a `dataSourceId` is `^[0-9a-zA-Z]{10}$` (the `Id` shape `CreateDataSource`'s answer and
+/// every later call's `dataSourceId` target), so the stand-in is exactly ten alphanumeric
+/// characters and carries no separator.
+pub(super) const BEDROCK_DATA_SOURCE_ID_SALT: &str = "bedrock/data-source";
+pub(super) const BEDROCK_DATA_SOURCE_ID_DIGITS: usize = 10;
+
+/// The property an `AWS::Bedrock::DataSource` declaration states the knowledge base the data
+/// source is attached to in, which is the `knowledgeBaseId` `CreateDataSource` binds as its
+/// URI label.
+pub(crate) const BEDROCK_DATA_SOURCE_KNOWLEDGE_BASE_ID_PROPERTY: &str = "KnowledgeBaseId";
+
+/// The attribute carrying the id Amazon Bedrock Agent mints for a data source, which is the
+/// second part of the identity the type is addressed by and the one return value these naming
+/// rules compute a stand-in for.
+pub(crate) const BEDROCK_DATA_SOURCE_ID_ATTRIBUTE: &str = "DataSourceId";
+
+/// The physical resource id of an [`BEDROCK_DATA_SOURCE`]: the PAIR that type's primary
+/// identifier is — the knowledge base the data source belongs to and the `dataSourceId` Amazon
+/// Bedrock Agent minted, which are exactly the two labels `GetDataSource`,
+/// `UpdateDataSource`, `DeleteDataSource` and `StartIngestionJob` each address one by — joined
+/// with [`COMPOSITE_IDENTITY_SEPARATOR`], which is what the type's `Ref` returns.
+///
+/// Not a row of [`composite_identity_properties`]: that one builds an identity out of the
+/// values a declaration STATES, and the second part of this one is the id Amazon Bedrock Agent
+/// assigns, which no declaration carries. So the identity is built here as a stand-in and
+/// again by [`crate::state::provisioner`] from the data source that service answered — the one
+/// place both parts are really known.
+pub(crate) fn bedrock_data_source_identity(knowledge_base_id: &str, data_source_id: &str) -> String {
+    [knowledge_base_id, data_source_id].join(COMPOSITE_IDENTITY_SEPARATOR)
+}
+
+/// The two parts of such an identity, where `identity` is one
+/// ([`bedrock_data_source_identity`]); `None` for a value that is not.
+pub(crate) fn bedrock_data_source_identity_parts(identity: &str) -> Option<(&str, &str)> {
+    let mut parts = identity.split(COMPOSITE_IDENTITY_SEPARATOR);
+    let (knowledge_base_id, data_source_id) = (parts.next()?, parts.next()?);
+    parts
+        .next()
+        .is_none()
+        .then_some((knowledge_base_id, data_source_id))
+}
+
 /// The salt the flow-id stand-in is derived under, and how many characters it carries: a
 /// `FlowId` is `^[0-9a-zA-Z]{10}$`, so the stand-in is exactly ten alphanumeric characters
 /// and carries no separator.

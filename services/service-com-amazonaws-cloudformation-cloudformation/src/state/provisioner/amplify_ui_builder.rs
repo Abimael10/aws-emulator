@@ -427,15 +427,6 @@ fn entity_identity(resource: &StoredResource) -> (String, String, String) {
     )
 }
 
-/// One declared scalar property as the text it states, or the empty string where the
-/// declaration states it as nothing or as a composite.
-fn declared_scalar(properties: &Value, property: &str) -> String {
-    properties
-        .get(property)
-        .and_then(scalar_text)
-        .unwrap_or_default()
-}
-
 /// The NAME the entity is created under: the `Name` the declaration states, or — for a
 /// declaration that states none, which that type's own contract marks required — the id
 /// CloudFormation's naming rules computed for the resource, so the create carries a name that

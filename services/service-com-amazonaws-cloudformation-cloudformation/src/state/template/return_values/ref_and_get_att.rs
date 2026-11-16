@@ -1640,6 +1640,41 @@ pub(crate) fn return_values(
             attributes.insert("KnowledgeBaseId".to_string(), id.clone());
             (id, attributes)
         }
+        // Amazon Bedrock Agent's build-time control plane: the data source an
+        // `AWS::Bedrock::DataSource` attaches to one of those knowledge bases. The type's
+        // primary identifier is the PAIR `<KnowledgeBaseId>|<DataSourceId>`, which is what
+        // `Ref` returns; `Fn::GetAtt` reads `DataSourceId` beside the data source's status and
+        // the two instants. That service MINTS the id — `CreateDataSource` answers a
+        // `dataSourceId` of `^[0-9a-zA-Z]{10}$`, which is what `GetDataSource`,
+        // `UpdateDataSource`, `DeleteDataSource` and `StartIngestionJob` each take and which
+        // the data source's NAME (`^([0-9a-zA-Z][_-]?){1,100}$`) is not — so the id here is a
+        // STAND-IN of the form that service's own model fixes, and `super::provisioning`
+        // re-points it and the identity built around it at what the create really answered
+        // ([`super::provisioner::Provisioner::BedrockDataSource`]). The knowledge base half is
+        // the declaration's own, resolved through the template's intrinsics, so a `Ref` to a
+        // knowledge base of the same stack carries the id that service minted for it by the
+        // time the create is made. The status and the two instants are that service's to
+        // report and are not computed here: they reach the resource off its create's own
+        // answer, exactly as a knowledge base's do.
+        BEDROCK_DATA_SOURCE => {
+            let data_source_id = service_assigned_label(
+                BEDROCK_DATA_SOURCE_ID_SALT,
+                name,
+                BEDROCK_DATA_SOURCE_ID_DIGITS,
+            );
+            let knowledge_base_id = properties
+                .get(BEDROCK_DATA_SOURCE_KNOWLEDGE_BASE_ID_PROPERTY)
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_default();
+            attributes.insert(
+                BEDROCK_DATA_SOURCE_ID_ATTRIBUTE.to_string(),
+                data_source_id.clone(),
+            );
+            (
+                bedrock_data_source_identity(&knowledge_base_id, &data_source_id),
+                attributes,
+            )
+        }
         // Amazon Braket's own control plane: the spending limit an
         // `AWS::Braket::SpendingLimit` declares. "Ref returns the spending limit ARN" (the
         // type's primary identifier); Fn::GetAtt reads `SpendingLimitArn` and `CreatedAt`.

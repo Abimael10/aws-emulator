@@ -479,7 +479,8 @@ use super::template::{
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
-    BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_FLOW,
+    BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_DATA_SOURCE,
+    BEDROCK_FLOW,
     BEDROCK_GUARDRAIL,
     BEDROCK_KNOWLEDGE_BASE,
     BRAKET_SPENDING_LIMIT,
@@ -1040,6 +1041,14 @@ pub(super) enum Provisioner {
     /// knowledge-base API takes — so it is read off that create's own answer and is the
     /// identity a `Ref` resolves to.
     BedrockKnowledgeBase,
+    /// `AWS::Bedrock::DataSource`: the data source attached to one of those knowledge bases,
+    /// which `CreateDataSource` creates under the name the template states,
+    /// `UpdateDataSource` changes and `DeleteDataSource` removes. That service MINTS the
+    /// ten-character `dataSourceId` the type publishes — the handle every data-source and
+    /// ingestion API takes beside the knowledge base's own id — so it is read off that
+    /// create's own answer, and the identity a `Ref` resolves to is the knowledge base and
+    /// that id joined ([`super::template::bedrock_data_source_identity`]).
+    BedrockDataSource,
     /// `AWS::Bedrock::Flow`: a FLOW of Amazon Bedrock Agent's build-time control plane, which
     /// `CreateFlow` creates under the name the template states, `UpdateFlow` changes and
     /// `DeleteFlow` removes. That service MINTS the ten-character `id` and the `flow/<id>`
@@ -1326,6 +1335,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
         BEDROCK_GUARDRAIL => Some(Provisioner::BedrockGuardrail),
         BEDROCK_KNOWLEDGE_BASE => Some(Provisioner::BedrockKnowledgeBase),
+        BEDROCK_DATA_SOURCE => Some(Provisioner::BedrockDataSource),
         BEDROCK_FLOW => Some(Provisioner::BedrockFlow),
         BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
@@ -1963,6 +1973,9 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 create_bedrock_knowledge_base(ctx, region, resource, propagated).await
             }
+            // `AWS::Bedrock::DataSource` publishes no `Tags` property and `CreateDataSource`
+            // takes no `tags` member, so no tags are propagated to a data source.
+            Self::BedrockDataSource => create_bedrock_data_source(ctx, region, resource).await,
             // `AWS::Bedrock::Flow` publishes `Tags` as a MAP, which is the shape
             // `CreateFlow`'s own `tags` member takes, so a flow a stack creates carries the
             // tags CloudFormation gives it beside the ones the declaration asks for.
@@ -2409,6 +2422,13 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 knowledge_base_readiness(ctx, region, physical_resource_id).await
             }
+            // The modelled `DataSource$status` documents `AVAILABLE` as the status of a data
+            // source that "has been created and is ready for ingestion into the knowledge
+            // base", so a data source still `CREATING` serves no ingestion yet and the
+            // resource's creation is finished once that service reports it `AVAILABLE`.
+            Self::BedrockDataSource => {
+                data_source_readiness(ctx, region, physical_resource_id).await
+            }
             // `CreateFlow` leaves the flow `NotPrepared` and the preparation this type's
             // create then asks for answers it `Preparing` — in neither can the flow be
             // invoked — so the resource is held open until Amazon Bedrock Agent reports the
@@ -2525,6 +2545,12 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 knowledge_base_ready_attributes(ctx, region, physical_resource_id).await
             }
+            // A data source's `DataSourceStatus` and `UpdatedAt` are not the ones its create
+            // answered with once that service has settled it, so the type's attributes are
+            // read off the data source again when it reports it `AVAILABLE`.
+            Self::BedrockDataSource => {
+                data_source_ready_attributes(ctx, region, physical_resource_id).await
+            }
             // A flow's `Status` and `UpdatedAt` are not the ones its create answered with once
             // that service has prepared it, so the type's attributes are read off the flow
             // again when it reports it `Prepared`.
@@ -2620,6 +2646,12 @@ impl Provisioner {
             // answers and the deletion is finished once that service no longer holds it.
             Self::BedrockKnowledgeBase => {
                 knowledge_base_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteDataSource` answers 202 with the data source `DELETING` — "the data
+            // source is being deleted" — so it is still there when the delete answers and the
+            // deletion is finished once that service no longer holds it.
+            Self::BedrockDataSource => {
+                data_source_removal(ctx, region, physical_resource_id).await
             }
             // `DeleteEnvironment` leaves the environment `DELETING` — "the request to delete
             // the environment is in progress" — so it is still there when the delete answers
@@ -2950,6 +2982,12 @@ impl Provisioner {
             // map is no part of that call, which that arm reports as not applied.
             Self::BedrockKnowledgeBase => {
                 update_bedrock_knowledge_base(ctx, region, resource, declared).await
+            }
+            // `UpdateDataSource` takes the knowledge base and the data source's own id
+            // together with the whole declared configuration, so it is what applies a changed
+            // declaration to the data source the stack created.
+            Self::BedrockDataSource => {
+                update_bedrock_data_source(ctx, region, resource, declared).await
             }
             // `UpdateFlow` takes the flow's whole declared configuration by the identity
             // Amazon Bedrock Agent minted for it, the flow's name and its definition
@@ -3811,6 +3849,9 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 delete_bedrock_knowledge_base(ctx, region, physical_resource_id).await
             }
+            // Removed by the same knowledge-base-and-data-source pair the create was answered
+            // with, which is this resource's physical id.
+            Self::BedrockDataSource => delete_bedrock_data_source(ctx, region, resource).await,
             // The delete addresses the flow by the ARN Amazon Bedrock Agent minted for it,
             // which is this resource's physical id.
             Self::BedrockFlow => delete_bedrock_flow(ctx, region, physical_resource_id).await,
@@ -4377,6 +4418,11 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 describe_bedrock_knowledge_base(ctx, region, physical_resource_id).await
             }
+            // Amazon Bedrock Agent's own read of the data source the stack created, by the
+            // knowledge base and the id it minted for it.
+            Self::BedrockDataSource => {
+                describe_bedrock_data_source(ctx, region, resource).await
+            }
             // Amazon Bedrock Agent's own read of the flow the stack created, by the ARN it
             // minted for it.
             Self::BedrockFlow => describe_bedrock_flow(ctx, region, physical_resource_id).await,
@@ -4502,6 +4548,11 @@ mod event_pipes;
 mod event_buses;
 mod bedrock_guardrails;
 mod bedrock_knowledge_bases;
+/// The Amazon Bedrock DATA SOURCE arms: the data source an `AWS::Bedrock::DataSource` attaches
+/// to one of those knowledge bases, created in the build-time control plane that owns it so the
+/// data source the stack reports created is the one `ListDataSources` finds and `GetDataSource`
+/// resolves.
+mod bedrock_data_sources;
 /// The Amazon Bedrock FLOW arms: the flow an `AWS::Bedrock::Flow` declares, created in the
 /// build-time control plane that owns it so the handles the stack publishes resolve — for
 /// that plane's own reads and for the runtime plane that INVOKES the flow.
@@ -4607,6 +4658,7 @@ use ecs_capacity_providers::*;
 use config_recording::*;
 use bedrock_guardrails::*;
 use bedrock_knowledge_bases::*;
+use bedrock_data_sources::*;
 use bedrock_flows::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;

@@ -250,6 +250,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // flow, exactly as a knowledge base's do.
         BEDROCK_FLOW => &["Arn", "Id", "Version"],
         BEDROCK_KNOWLEDGE_BASE => &["KnowledgeBaseArn", "KnowledgeBaseId"],
+        // The id Amazon Bedrock Agent mints for a data source is the one return value these
+        // naming rules can compute a stand-in for; its `DataSourceStatus` and the two instants
+        // are that service's clock and reach the resource off its own report of the data
+        // source, exactly as a knowledge base's status and instants do.
+        BEDROCK_DATA_SOURCE => &[BEDROCK_DATA_SOURCE_ID_ATTRIBUTE],
         // A spending limit's ARN is the one return value these naming rules can compute; its
         // `CreatedAt` is Amazon Braket's clock, which reaches the resource off that
         // service's own report of the limit rather than from here, exactly as a knowledge
@@ -701,6 +706,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // takes — a pattern no name CloudFormation decides can satisfy — so the identifier in
         // force is the one that service answered.
         || resource_type == BEDROCK_KNOWLEDGE_BASE
+        // An Amazon Bedrock DATA SOURCE of one of those knowledge bases is the same case:
+        // `CreateDataSource` takes the data source's NAME and answers the `dataSourceId`
+        // Amazon Bedrock Agent minted (`^[0-9a-zA-Z]{10}$`), which every later call on the
+        // data source takes beside the knowledge base's own id — and the type's primary
+        // identifier, which is what `Ref` returns, is that pair
+        // ([`bedrock_data_source_identity`]). No name CloudFormation decides satisfies that
+        // pattern, so the identifier in force is the one that service answered.
+        || resource_type == BEDROCK_DATA_SOURCE
         // An Amazon Bedrock FLOW is the same case: `CreateFlow` takes the flow's NAME and
         // answers the `id` Amazon Bedrock Agent minted (`^[0-9a-zA-Z]{10}$`) with the
         // `flow/<id>` ARN built around it, which is the ARN that type's `Ref` returns and the
