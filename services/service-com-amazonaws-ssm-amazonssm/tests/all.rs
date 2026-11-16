@@ -119,6 +119,8 @@ mod ops_item_updates;
 mod ops_items;
 #[path = "all/ops_metadata.rs"]
 mod ops_metadata;
+#[path = "all/ops_metadata_listing.rs"]
+mod ops_metadata_listing;
 #[path = "all/parameter_arn_spellings.rs"]
 mod parameter_arn_spellings;
 #[path = "all/parameter_deletion.rs"]

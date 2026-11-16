@@ -24,6 +24,8 @@
 //! ARN of another service, a name under a path), how many metadata entries an object carries
 //! and at the published bounds, the Region the object is held at, and the account, Region and
 //! path an ARN names.
+//!
+//! What a LISTING reports of these objects is `all/ops_metadata_listing.rs`'s subject.
 
 use serde_json::{json, Value};
 
@@ -98,9 +100,7 @@ async fn a_created_object_is_read_back_under_the_arn_the_create_minted() {
         },
         Row {
             case: "a CloudFormation stack ARN, whose last segment is the stack id",
-            resource_id: format!(
-                "arn:aws:cloudformation:{REGION}:{ACCOUNT}:stack/web/ab12cd34"
-            ),
+            resource_id: format!("arn:aws:cloudformation:{REGION}:{ACCOUNT}:stack/web/ab12cd34"),
             application: "ab12cd34",
             entries: METADATA_MAX,
         },
@@ -132,12 +132,7 @@ async fn a_created_object_is_read_back_under_the_arn_the_create_minted() {
             "case {case:?}: the ARN carries the application the resource id names, got {created}"
         );
 
-        let (status, read) = call(
-            &router,
-            "GetOpsMetadata",
-            &json!({ "OpsMetadataArn": arn }),
-        )
-        .await;
+        let (status, read) = call(&router, "GetOpsMetadata", &json!({ "OpsMetadataArn": arn })).await;
         assert_eq!(
             status, 200,
             "case {case:?}: the read must be served, got {status} with {read}"
@@ -345,12 +340,7 @@ async fn an_arn_that_names_no_object_of_this_requester_is_classified_by_whose_it
 
     for row in rows {
         for operation in ["GetOpsMetadata", "DeleteOpsMetadata"] {
-            let (status, body) = call(
-                &router,
-                operation,
-                &json!({ "OpsMetadataArn": row.arn }),
-            )
-            .await;
+            let (status, body) = call(&router, operation, &json!({ "OpsMetadataArn": row.arn })).await;
             assert_eq!(
                 status, 400,
                 "case {:?} under {operation}: must be refused, got {status} with {body}",

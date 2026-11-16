@@ -193,6 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let arn = metadata::ops_metadata_arn(&region, application);
         let now = ::std::time::SystemTime::now();
+        // Who is writing this object, resolved from the credential the request was signed
+        // with, through the same reading `sts:GetCallerIdentity` answers from: it is the
+        // `LastModifiedUser` a listing reports, since the create is the last write to the
+        // object until something else writes to it. Taken before the store guard, so no guard
+        // of this service is held while another service's store is read.
+        let user = crate::state::identity_authorization::caller_arn(&*self.engine, ctx);
         let mut store = state.lock();
 
         // "An OpsMetadata object already exists for the specified resource": the ARN is
@@ -229,6 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             metadata: metadata::to_metadata_entries(input.metadata),
             tags: crate::state::to_btree_map(input.tags),
             created_at: now,
+            // Nothing has written to the object since, so it was last written when it was
+            // created, by the principal that created it.
+            last_modified_user: user,
+            last_modified_at: now,
         });
 
         // "The Amazon Resource Name (ARN) of the OpsMetadata Object": the ARN this call

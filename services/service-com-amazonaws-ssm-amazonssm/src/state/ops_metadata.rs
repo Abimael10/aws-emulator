@@ -5,15 +5,16 @@
 //!
 //! "Systems Manager calls this type of data OpsData" — an OpsMetadata object is the
 //! metadata Application Manager keeps ABOUT one application: `CreateOpsMetadata` registers
-//! one for the application a `ResourceId` names, `GetOpsMetadata` reports what it holds and
-//! `DeleteOpsMetadata` removes it. All three reach the one store below
+//! one for the application a `ResourceId` names, `GetOpsMetadata` reports what it holds,
+//! `ListOpsMetadata` reports the objects a Region holds and `DeleteOpsMetadata` removes one.
+//! All four reach the one store below
 //! ([`super::ComAmazonawsSsmAmazonssmState::ops_metadata`]), so whatever the create
 //! persisted is what a later read reports.
 //!
-//! An object is addressed by its `OpsMetadataArn` — the only thing the reads take — so the
-//! store is keyed by `(region, arn)`: Systems Manager is regional, the ARN carries that
-//! Region, and the ARN is MINTED by the create ([`ops_metadata_arn`]) rather than chosen by
-//! a caller. An ARN no create minted therefore names no object, which is what
+//! An object is addressed by its `OpsMetadataArn` — the only thing the single-object reads
+//! take — so the store is keyed by `(region, arn)`: Systems Manager is regional, the ARN
+//! carries that Region, and the ARN is MINTED by the create ([`ops_metadata_arn`]) rather
+//! than chosen by a caller. An ARN no create minted therefore names no object, which is what
 //! [`OPS_METADATA_NOT_FOUND`] reports.
 //!
 //! The two ways an ARN names nothing are DIFFERENT refusals, and the order between them is
@@ -27,11 +28,18 @@
 //!    (`OpsMetadataNotFoundException`).
 //!
 //! So a caller cannot learn from a not-found whether another account holds the object.
+//!
+//! A LISTING takes no ARN at all: it reports the objects the endpoint's Region holds, in
+//! ascending ARN order ([`super::ComAmazonawsSsmAmazonssmState::ops_metadata_in_region`]),
+//! narrowed to the ones meeting every filter the request carries
+//! ([`OpsMetadataRecord::matches_filter`]) and bounded by the page it asked for
+//! ([`list_ops_metadata_page_size`]), with the ARN of the object left over past the page
+//! handed back as the token the next page resumes at.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use crate::ops::types::MetadataValue;
+use crate::ops::types::{MetadataValue, OpsMetadata};
 
 /// The resource prefix an `OpsMetadata` ARN carries, from the modelled `OpsMetadataArn`
 /// pattern `^arn:(aws[a-zA-Z-]*)?:ssm:…:opsmetadata\/([a-zA-Z0-9-_\.\/]*)$`.
@@ -112,6 +120,74 @@ pub fn ops_metadata_page_size(max_results: Option<i32>) -> Result<usize, String>
     )
 }
 
+/// The published bounds of `ListOpsMetadataMaxResults` (range 1..50): how many OBJECTS one
+/// page of a listing carries, where [`MAX_OPS_METADATA_PAGE_SIZE`] bounds the metadata
+/// ENTRIES of one object. The maximum is also the page a request naming no `MaxResults` is
+/// served.
+pub const MIN_LIST_OPS_METADATA_PAGE_SIZE: i32 = 1;
+
+/// See [`MIN_LIST_OPS_METADATA_PAGE_SIZE`].
+pub const MAX_LIST_OPS_METADATA_PAGE_SIZE: i32 = 50;
+
+/// The page of objects a listing serves, or the refusal message for a `MaxResults` outside
+/// the modelled range — which the boundary validator already refuses, so this is a backstop.
+pub fn list_ops_metadata_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(
+        max_results,
+        MIN_LIST_OPS_METADATA_PAGE_SIZE,
+        MAX_LIST_OPS_METADATA_PAGE_SIZE,
+    )
+}
+
+/// The `OpsMetadataFilter` key a listing narrows on the application an object was registered
+/// for (`OpsMetadata$ResourceId`, "The ID of the Application Manager application").
+pub const OPS_METADATA_FILTER_KEY_RESOURCE_ID: &str = "ResourceId";
+
+/// The `OpsMetadataFilter` key a listing narrows on what provisioned the application: an
+/// Application Manager property of the application rather than a member of the `OpsMetadata`
+/// shape, so an object carries it among its metadata entries
+/// ([`OpsMetadataRecord::matches_filter`]).
+pub const OPS_METADATA_FILTER_KEY_PROVISIONED_BY: &str = "provisioned-by";
+
+/// The `OpsMetadataFilter` key a listing narrows on the kind of application — "information
+/// about the new application, including the application type" (`CreateOpsMetadata`) — another
+/// property the object carries among its metadata entries.
+pub const OPS_METADATA_FILTER_KEY_APPLICATION_TYPE: &str = "application-type";
+
+/// Every filter key a listing searches on, in the order a refusal lists them back to the
+/// caller. A key outside it names no property of an OpsMetadata object, which is one of the
+/// arguments `OpsMetadataInvalidArgumentException` is for.
+pub const OPS_METADATA_FILTER_KEYS: &[&str] = &[
+    OPS_METADATA_FILTER_KEY_RESOURCE_ID,
+    OPS_METADATA_FILTER_KEY_PROVISIONED_BY,
+    OPS_METADATA_FILTER_KEY_APPLICATION_TYPE,
+];
+
+/// Whether `key` is a key a listing searches on ([`OPS_METADATA_FILTER_KEYS`]).
+#[must_use]
+pub fn is_ops_metadata_filter_key(key: &str) -> bool {
+    OPS_METADATA_FILTER_KEYS.contains(&key)
+}
+
+/// What a `Filters` entry naming a key a listing does not search on is refused with: the key
+/// the request named, and the keys an OpsMetadata listing accepts. The sentence names the
+/// filter SHAPE the key belongs to, which is how this operation words it.
+#[must_use]
+pub fn invalid_ops_metadata_filter_key_message(key: &str) -> String {
+    format!(
+        "The following OpsMetadataFilter key is not valid: {key}. Valid filter keys include: \
+         [{}].",
+        OPS_METADATA_FILTER_KEYS.join(", ")
+    )
+}
+
+/// What a `Filters` entry carrying a key but no value to search for is refused with, worded
+/// as the sibling listings of this service word it (`crate::ops::list_cloud_connectors`).
+#[must_use]
+pub fn ops_metadata_filter_value_missing(key: &str) -> String {
+    format!("Filter key '{key}' carries no value to search for")
+}
+
 /// The name the ARN of the object registered for `resource_id` carries: the id's own LAST
 /// segment, which is the application it names.
 ///
@@ -123,12 +199,9 @@ pub fn ops_metadata_page_size(max_results: Option<i32>) -> Result<usize, String>
 /// hold ([`OPS_METADATA_RESOURCE_ID_INVALID`]).
 #[must_use]
 pub fn application_name(resource_id: &str) -> Option<&str> {
-    let name = resource_id
-        .rsplit(['/', ':'])
-        .next()?;
-    let admitted = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-    };
+    let name = resource_id.rsplit(['/', ':']).next()?;
+    let admitted =
+        |character: char| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.');
     (!name.is_empty() && name.chars().all(admitted)).then_some(name)
 }
 
@@ -181,6 +254,49 @@ pub struct OpsMetadataRecord {
     pub tags: BTreeMap<String, String>,
     /// When the create ran.
     pub created_at: SystemTime,
+    /// "The user name who last updated the OpsMetadata object" — the principal the last
+    /// write to this object spoke for, as `sts:GetCallerIdentity` reports it
+    /// ([`super::identity_authorization::caller_arn`]). The create is that write until
+    /// something else writes to the object, so it is the creator until then.
+    pub last_modified_user: String,
+    /// "The date the OpsMetadata object was last updated." Equal to
+    /// [`created_at`](Self::created_at) until something updates the object.
+    pub last_modified_at: SystemTime,
+}
+
+impl OpsMetadataRecord {
+    /// Whether this object meets the filter `key` carrying `values`: it is reported when ANY
+    /// value names what the key filters on, so one filter is one criterion however many
+    /// values it carries.
+    ///
+    /// `ResourceId` is held against the application the create named, the one member of the
+    /// `OpsMetadata` shape a listing searches on; the other keys name Application Manager
+    /// properties of the application, which its metadata entries hold, so such a key is held
+    /// against the entry stored under it. A key outside [`OPS_METADATA_FILTER_KEYS`] names
+    /// neither, and a listing refuses one before it reaches this.
+    #[must_use]
+    pub fn matches_filter(&self, key: &str, values: &[String]) -> bool {
+        values.iter().any(|value| match key {
+            OPS_METADATA_FILTER_KEY_RESOURCE_ID => self.resource_id == *value,
+            OPS_METADATA_FILTER_KEY_PROVISIONED_BY | OPS_METADATA_FILTER_KEY_APPLICATION_TYPE => {
+                self.metadata.get(key).is_some_and(|held| held == value)
+            }
+            _ => false,
+        })
+    }
+
+    /// This object as a listing reports it: the `OpsMetadata` members, each read out of what
+    /// the writes to this object persisted.
+    #[must_use]
+    pub fn to_ops_metadata(&self) -> OpsMetadata {
+        OpsMetadata {
+            resource_id: Some(self.resource_id.clone()),
+            ops_metadata_arn: Some(self.arn.clone()),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_at)),
+            last_modified_user: Some(self.last_modified_user.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+        }
+    }
 }
 
 /// The entries a read reports, as the modelled `MetadataMap` carries them: one entry per
@@ -251,5 +367,20 @@ impl super::ComAmazonawsSsmAmazonssmState {
     /// Whether this store can hold another OpsMetadata object ([`MAX_OPS_METADATA`]).
     pub fn can_hold_another_ops_metadata(&self) -> bool {
         self.ops_metadata.len() < MAX_OPS_METADATA
+    }
+
+    /// Every OpsMetadata object `region` holds, in ascending ARN order.
+    ///
+    /// That order is what makes a listing's resume cursor total: the token a page hands back
+    /// is the ARN of the object the next page starts at, not an offset into a list that may
+    /// have grown or shrunk between two requests.
+    pub fn ops_metadata_in_region<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a OpsMetadataRecord> + 'a {
+        self.ops_metadata
+            .iter()
+            .filter(move |((held, _), _)| held == region)
+            .map(|(_, record)| record)
     }
 }

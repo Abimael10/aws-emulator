@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOpsMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOpsMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the OpsMetadata objects Application Manager holds for this account — the listing
+//! of this service's Application Manager slice. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOpsMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every object is read out of the one store in [`crate::state::ops_metadata`], so a listing
+//! reports exactly what `CreateOpsMetadata` persisted and nothing a `DeleteOpsMetadata`
+//! dropped. Systems Manager is regional, so a listing reports the objects held at the
+//! ENDPOINT's Region, in ascending `OpsMetadataArn` order
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::ops_metadata_in_region`]) — it takes no
+//! ARN, so there is no owner question for it to answer. A read writes nothing, so what a
+//! later caller sees is unchanged by it.
+//!
+//! `Filters` narrows the listing to the objects meeting EVERY filter the request carries,
+//! each held against the object's own members
+//! ([`crate::state::ops_metadata::OpsMetadataRecord::matches_filter`]), and a filter key
+//! outside the ones a listing searches on
+//! ([`crate::state::ops_metadata::OPS_METADATA_FILTER_KEYS`]) is one of the arguments
+//! `OpsMetadataInvalidArgumentException` is for. `MaxResults` bounds the page
+//! ([`crate::state::ops_metadata::list_ops_metadata_page_size`]); an object left over past
+//! the page is reported through `NextToken`, the ARN the next page resumes at.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +157,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOpsMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOpsMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOpsMetadata"))
+        use crate::state::ops_metadata::{
+            invalid_ops_metadata_filter_key_message, is_ops_metadata_filter_key,
+            list_ops_metadata_page_size, ops_metadata_filter_value_missing, OpsMetadataRecord,
+        };
+        use crate::state::{request_region, INVALID_NEXT_TOKEN};
+
+        // `MaxResults`'s 1..50 range, the `Filters` list's length, each filter's key and the
+        // length of the values it carries are MODELLED constraints the centralized walk has
+        // already refused anything outside of. What is read here is which of this Region's
+        // OpsMetadata objects the request's criteria select.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOpsMetadataErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the OpsMetadata store is unavailable".to_string()),
+            })
+        })?;
+
+        // "One of the arguments passed is invalid" is the class every refusal below belongs
+        // to: this operation models it for exactly the arguments a caller can get wrong.
+        let invalid_argument = |message: String| -> Self::Error {
+            ListOpsMetadataErrorModeled::OpsMetadataInvalidArgumentException(
+                OpsMetadataInvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // A filter narrows the listing by a property of an OpsMetadata object, so it has to
+        // name a key the listing searches on and a value to search for.
+        let mut filters: Vec<(&str, &[String])> = Vec::new();
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            if !is_ops_metadata_filter_key(&filter.key) {
+                return Err(invalid_argument(invalid_ops_metadata_filter_key_message(
+                    &filter.key,
+                )));
+            }
+            // `OpsMetadataFilter$Values` is `@required` with a length floor of one, so this
+            // is a backstop rather than the first line of defence.
+            if filter.values.is_empty() {
+                return Err(invalid_argument(ops_metadata_filter_value_missing(
+                    &filter.key,
+                )));
+            }
+            filters.push((filter.key.as_str(), filter.values.as_slice()));
+        }
+
+        let page_size = list_ops_metadata_page_size(input.max_results).map_err(invalid_argument)?;
+
+        // "Systems Manager calls this API operation when displaying all Application Manager
+        // OpsMetadata objects or blobs": the objects held at the endpoint this request was
+        // signed for, narrowed to the ones meeting EVERY filter it carries.
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+        let matching: Vec<&OpsMetadataRecord> = store
+            .ops_metadata_in_region(&region)
+            .filter(|record| {
+                filters
+                    .iter()
+                    .all(|(key, values)| record.matches_filter(key, values))
+            })
+            .collect();
+
+        // The token a page hands out is the ARN of the object the next page starts at, so a
+        // token naming no object of this result is not a page of it to resume. This operation
+        // models no `InvalidNextToken`, so such a token is refused as the invalid argument it
+        // is rather than answered with an arbitrary page.
+        let start = match crate::state::non_empty(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => match matching.iter().position(|record| record.arn == token) {
+                Some(at) => at,
+                None => return Err(invalid_argument(INVALID_NEXT_TOKEN.to_string())),
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page: &[&OpsMetadataRecord] = matching.get(start..).unwrap_or_default();
+        let ops_metadata_list = page
+            .iter()
+            .take(page_size)
+            .map(|record| record.to_ops_metadata())
+            .collect();
+        // An object is still waiting past this page: hand the caller the ARN it resumes at,
+        // so the next request continues where this one stopped.
+        let next_token = page.get(page_size).map(|record| record.arn.clone());
+
+        Ok(ListOpsMetadataOutput {
+            ops_metadata_list: Some(ops_metadata_list),
+            next_token,
+        })
     }
 }
