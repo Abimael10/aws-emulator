@@ -373,3 +373,7 @@ mod custom_lens_improvement_plans;
 // sorted middle is what repeatedly refused to merge.
 #[path = "all/exported_lens_document.rs"]
 mod exported_lens_document;
+// Appended at the end for the reason the notes above give: an insertion into this list's
+// sorted middle is what repeatedly refused to merge.
+#[path = "all/official_lens_question_content.rs"]
+mod official_lens_question_content;

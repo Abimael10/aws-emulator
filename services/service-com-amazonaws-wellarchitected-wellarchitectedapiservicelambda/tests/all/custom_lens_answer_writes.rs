@@ -88,18 +88,40 @@ const SELECTIONS: [Selection; 4] = [
     Selection::AllButLast,
 ];
 
-/// The `Risk` the service derives from an applicable answer: a question whose answer
-/// selects none of its best practices is still `UNANSWERED` — the selection is what
-/// answers it — one with some choice still unselected is `MEDIUM`, and one with nothing
-/// left unselected is `NONE` (`smithy_query(query="shape", shape="Risk")` publishes the
-/// value set).
-fn expected_risk(choices: usize, selected: usize) -> &'static str {
-    if selected == 0 {
+/// `Choice$Title` of the terminal choice every question of an AWS-official lens offers
+/// after its best practices: the answer that none of those best practices are in place.
+const NONE_OF_THESE: &str = "None of these";
+
+/// The `Risk` the service derives from an applicable answer to a question of `summary`,
+/// over the choices `selected` names.
+///
+/// A question whose answer selects none of its choices is still `UNANSWERED` — the
+/// selection is what answers it. Beyond that the LENS's own rating decides: a lens that
+/// publishes risk rules for its questions, as every AWS-official lens does, clears a
+/// question only when every best practice is in place, reduces it to `MEDIUM` while at
+/// least half of them are, and rates every thinner selection — and the terminal
+/// [`NONE_OF_THESE`] choice, which says none of them are in place — at its default `HIGH`;
+/// a lens whose content declares no rules this service evaluates rates an answer with some
+/// choice still unselected `MEDIUM` and one with nothing left unselected `NONE`
+/// (`smithy_query(query="shape", shape="Risk")` publishes the value set).
+fn expected_risk(summary: &Value, selected: &[String]) -> &'static str {
+    let best_practices = best_practice_ids(summary);
+    let in_place = selected
+        .iter()
+        .filter(|choice_id| best_practices.contains(choice_id))
+        .count();
+    let none_of_these = selected.len() > in_place;
+    let published_risk_rules = best_practices.len() < choice_ids(summary).len();
+    if selected.is_empty() {
         "UNANSWERED"
-    } else if selected < choices {
+    } else if none_of_these || in_place == 0 {
+        "HIGH"
+    } else if in_place == best_practices.len() {
+        "NONE"
+    } else if !published_risk_rules || in_place * 2 >= best_practices.len() {
         "MEDIUM"
     } else {
-        "NONE"
+        "HIGH"
     }
 }
 
@@ -236,6 +258,23 @@ fn choice_ids(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The `ChoiceId`s of the BEST PRACTICES a question asks about: its catalog
+/// ([`choice_ids`]) less the terminal [`NONE_OF_THESE`] choice, which is the answer that
+/// none of them are in place rather than one of them.
+fn best_practice_ids(value: &Value) -> Vec<String> {
+    value
+        .get("Choices")
+        .and_then(Value::as_array)
+        .map(|choices| {
+            choices
+                .iter()
+                .filter(|choice| string_member(choice, "Title") != NONE_OF_THESE)
+                .map(|choice| string_member(choice, "ChoiceId"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The `Answer` / `ReviewTemplateAnswer` a read or a write reported.
 fn answer_of(answer: &Answer) -> Value {
     answer.body.get("Answer").cloned().unwrap_or(Value::Null)
@@ -323,7 +362,7 @@ fn assert_recorded(case: &str, answer: &Value, summary: &Value, selected: &[Stri
     );
     assert_eq!(
         answer.get("Risk").and_then(Value::as_str),
-        Some(expected_risk(choices.len(), selected.len())),
+        Some(expected_risk(summary, selected)),
         "case {case:?}: the risk is derived from the choices in place, got {answer:?}"
     );
     assert_eq!(

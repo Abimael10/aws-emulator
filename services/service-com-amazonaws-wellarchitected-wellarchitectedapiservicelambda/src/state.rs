@@ -406,8 +406,17 @@ pub struct FrameworkQuestion {
     pub question_id: &'static str,
     /// `AnswerSummary$QuestionTitle` (`@length(1, 512)`).
     pub title: &'static str,
+    /// `Answer$QuestionDescription` (`@length(1, 1024)`) — the prose the lens publishes
+    /// for the question itself, and `None` where the lens publishes none here
+    /// ([`bp`]-carried content).
+    pub description: Option<&'static str>,
     /// The best practices this question asks about, in the lens's own order: the `Choice`
     /// the question offers for each of them.
+    ///
+    /// The terminal "None of these" choice is NOT one of them — it is not a best practice
+    /// but the answer that none of these are in place, so it is reported after them
+    /// ([`Self::none_of_these_id`]) and left out of every reading of "which best practices
+    /// does this question ask about?".
     pub best_practices: &'static [FrameworkChoice],
 }
 
@@ -472,6 +481,55 @@ impl FrameworkQuestion {
         }
     }
 
+    /// The `ChoiceId` of the terminal "None of these" choice this question offers after
+    /// its best practices: the question's own choice-id namespace with
+    /// [`NONE_OF_THESE_ID_SUFFIX`] — the id the lens publishes it under for a question
+    /// whose choice ids the lens publishes, and the authored namespace's counterpart for a
+    /// question whose content is this emulator's own ([`bp`]).
+    ///
+    /// A question's published choice ids all begin with the same namespace (the pillar and
+    /// the question the best practice belongs to), so that namespace is read off them
+    /// rather than restated per row: it cannot then disagree with the ids beside it. For a
+    /// question whose choices this emulator names by their position (`<question id>-bp-NN`)
+    /// the terminal choice is named in that same scheme.
+    pub fn none_of_these_id(&self) -> String {
+        match self.published_choice_namespace() {
+            Some(namespace) => format!("{namespace}{NONE_OF_THESE_ID_SUFFIX}"),
+            None => format!("{}-bp-no", self.question_id),
+        }
+    }
+
+    /// The namespace this question's PUBLISHED choice ids share — their longest common
+    /// prefix, cut back to a namespace boundary (`_`) — and `None` for a question whose
+    /// choices this emulator names itself ([`bp`]), which publishes no namespace.
+    fn published_choice_namespace(&self) -> Option<&'static str> {
+        let mut ids = self
+            .best_practices
+            .iter()
+            .map(|best_practice| best_practice.choice_id);
+        let mut shared = ids.next().flatten()?;
+        for id in ids {
+            let id = id?;
+            let common = shared
+                .char_indices()
+                .zip(id.chars())
+                .take_while(|((_, left), right)| left == right)
+                .count();
+            shared = shared.get(..common)?;
+        }
+        let boundary = shared.rfind('_')?;
+        shared.get(..boundary)
+    }
+
+    /// Whether the lens publishes this question's content HERE: its own description and
+    /// the ids and prose of its choices ([`c`]), as against a question set this emulator
+    /// authored for a lens AWS publishes the content of nowhere machine-readable
+    /// ([`bp`]). A published question is the one the lens serves a document for, so it is
+    /// the one whose projection carries that document's URL.
+    pub fn publishes_content(&self) -> bool {
+        self.description.is_some()
+    }
+
     /// This catalog row as the question a LENS REVIEW asks
     /// ([`ReviewQuestion`]): the one projection of a static catalog entry into the
     /// question set every answer operation reads and pages over, so an official lens's
@@ -480,12 +538,30 @@ impl FrameworkQuestion {
     /// Each best practice becomes a choice carrying the `ChoiceId` and the prose the lens
     /// publishes for it, or — where this emulator authored the content — an id derived
     /// from the question and the practice's position ([`Self::choice_id`]) and no prose; a
-    /// custom lens's choices carry the ids ITS document names them by.
-    pub fn to_review_question(&self) -> ReviewQuestion {
+    /// custom lens's choices carry the ids ITS document names them by. After them comes
+    /// the terminal "None of these" choice every question of a lens AWS publishes offers
+    /// ([`Self::none_of_these_id`]): it is the only way to answer a question negatively,
+    /// so a question that did not offer it could not be answered that way at all.
+    ///
+    /// `lens` is the catalog row this question belongs to: a lens serves the document for
+    /// one of its questions under the version its content is published at
+    /// ([`official_lenses::lens_question_document_url`]), so the question-level
+    /// helpful-resource and improvement-plan URLs are derived from that lens and this
+    /// question's own id.
+    pub fn to_review_question(&self, lens: &official_lenses::OfficialLens) -> ReviewQuestion {
+        let document = self
+            .publishes_content()
+            .then(|| official_lenses::lens_question_document_url(lens, self.question_id));
         ReviewQuestion {
             pillar_id: self.pillar_id.to_string(),
             question_id: self.question_id.to_string(),
             title: self.title.to_string(),
+            description: self.description.map(str::to_string),
+            improvement_plan_url: document
+                .as_deref()
+                .map(official_lenses::improvement_plan_url_of),
+            helpful_resource_url: document,
+            helpful_resource_display_text: None,
             best_practices: self
                 .best_practices
                 .iter()
@@ -502,8 +578,46 @@ impl FrameworkQuestion {
                     improvement_plan: None,
                 })
                 .collect(),
+            none_of_these: Some(LensChoice {
+                id: self.none_of_these_id(),
+                title: NONE_OF_THESE_TITLE.to_string(),
+                description: Some(NONE_OF_THESE_DESCRIPTION.to_string()),
+                helpful_resource: None,
+                improvement_plan: None,
+            }),
+            risk_rating: RiskRating::LensRiskRules,
         }
     }
+}
+
+/// `Choice$Title` of the terminal choice every question of a lens AWS publishes offers
+/// after its best practices: the answer that none of the best practices the question asks
+/// about are in place.
+pub const NONE_OF_THESE_TITLE: &str = "None of these";
+
+/// `Choice$Description` of that terminal choice — what selecting it says about the
+/// workload.
+pub const NONE_OF_THESE_DESCRIPTION: &str =
+    "Choose this if your workload does not follow these best practices.";
+
+/// The suffix the terminal choice's `ChoiceId` ends in, inside the choice-id namespace of
+/// the question that offers it ([`FrameworkQuestion::none_of_these_id`]).
+pub const NONE_OF_THESE_ID_SUFFIX: &str = "_no";
+
+/// How the lens a question belongs to rates an answer to it — which is lens content, so it
+/// travels with the question ([`ReviewQuestion::risk_rating`]) rather than being decided
+/// where an answer is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskRating {
+    /// The risk rules the lens publishes for the question, as an AWS-official lens's
+    /// catalog row carries them: a rule clears or reduces the question's risk only when
+    /// the best practices it names are in place, and the lens's own default rule rates
+    /// everything else ([`AnswerRecord::risk`]).
+    LensRiskRules,
+    /// The best practices the answer leaves out, for lens content that declares no rules
+    /// this emulator evaluates: an answer with every best practice in place is `NONE`, one
+    /// with none in place is `HIGH` and one in between is `MEDIUM`.
+    UnselectedBestPractices,
 }
 
 /// ONE question of ONE lens review, whatever lens the review is of: the pillar it belongs
@@ -526,9 +640,32 @@ pub struct ReviewQuestion {
     pub question_id: String,
     /// `AnswerSummary$QuestionTitle` (`@length(1, 512)`).
     pub title: String,
+    /// `Answer$QuestionDescription` (`@length(1, 1024)`) — the prose the lens's content
+    /// writes for the question itself, and `None` for content that writes none.
+    pub description: Option<String>,
+    /// `Answer$ImprovementPlanUrl` (`@length(1, 2048)`) — the improvement-plan document
+    /// the lens serves for this question, and `None` for content that serves none.
+    pub improvement_plan_url: Option<String>,
+    /// `Answer$HelpfulResourceUrl` (`@length(1, 2048)`) — the helpful-resources document
+    /// the lens serves for this question, and `None` for content that serves none.
+    pub helpful_resource_url: Option<String>,
+    /// `Answer$HelpfulResourceDisplayText` — the text the lens's content displays that
+    /// resource as, which a custom lens document declares beside its URL and an
+    /// AWS-official lens publishes none of here.
+    pub helpful_resource_display_text: Option<String>,
     /// The best practices this question asks about, in the lens's own order: each
     /// choice's `ChoiceId` and `Choice$Title`.
+    ///
+    /// The terminal choice is not one of them ([`Self::none_of_these`]): it is the answer
+    /// that none of these best practices are in place, so it is not a best practice an
+    /// improvement plan or a risk derivation counts.
     pub best_practices: Vec<LensChoice>,
+    /// The terminal "None of these" choice the question offers AFTER its best practices,
+    /// for the lens content that offers one — every question of a lens AWS publishes — and
+    /// `None` for content whose questions offer only the choices it declares.
+    pub none_of_these: Option<LensChoice>,
+    /// How the lens rates an answer to this question.
+    pub risk_rating: RiskRating,
 }
 
 impl ReviewQuestion {
@@ -547,8 +684,7 @@ impl ReviewQuestion {
     /// applies to custom lenses too and is not a property the lens JSON format
     /// specification declares, so there is nothing to report in it, and it is optional.
     pub fn choices(&self) -> Vec<Choice> {
-        self.best_practices
-            .iter()
+        self.each_choice()
             .map(|best_practice| Choice {
                 choice_id: Some(best_practice.id.clone()),
                 title: Some(best_practice.title.clone()),
@@ -574,30 +710,52 @@ impl ReviewQuestion {
         self.each_choice_id().any(|defined| defined == choice_id)
     }
 
-    /// The `ChoiceId` of every best practice this question asks about, in the lens's own
-    /// order — the key space an answer's per-choice statuses live in, and what a
-    /// request's `SelectedChoices` values and `ChoiceUpdates` keys are judged against.
+    /// Every choice this question offers, in the lens's own order: the best practices it
+    /// asks about and then the terminal choice, where the lens's content offers one.
+    ///
+    /// The one place the two halves of a question's choice set are put together, so the
+    /// catalog a read reports ([`Self::choices`]), the ids an update is judged against
+    /// ([`Self::each_choice_id`]) and the statuses an answer is resolved into
+    /// ([`AnswerRecord::reported_choice_answers`]) cannot disagree about which choices the
+    /// question offers.
+    pub fn each_choice(&self) -> impl Iterator<Item = &LensChoice> + '_ {
+        self.best_practices.iter().chain(self.none_of_these.iter())
+    }
+
+    /// The `ChoiceId` of every choice this question offers, in the lens's own order — the
+    /// key space an answer's per-choice statuses live in, and what a request's
+    /// `SelectedChoices` values and `ChoiceUpdates` keys are judged against.
     ///
     /// Lazy, so a caller that only has to RECOGNISE an id, or that consumes the ids one at
     /// a time, does not build the whole list to do it.
-    fn each_choice_id(&self) -> impl Iterator<Item = &str> + '_ {
-        self.best_practices
-            .iter()
-            .map(|best_practice| best_practice.id.as_str())
+    pub fn each_choice_id(&self) -> impl Iterator<Item = &str> + '_ {
+        self.each_choice().map(|choice| choice.id.as_str())
+    }
+
+    /// Whether `choice_id` names this question's terminal choice — the answer that none of
+    /// the best practices it asks about are in place.
+    fn is_none_of_these(&self, choice_id: &str) -> bool {
+        self.none_of_these
+            .as_ref()
+            .is_some_and(|terminal| terminal.id == choice_id)
     }
 }
 
-/// One [`FrameworkQuestion`], so the catalog above reads as a table.
+/// One [`FrameworkQuestion`] of a lens that PUBLISHES its question content, so the catalog
+/// above reads as a table: the question's own published description beside its title and
+/// the choices the lens publishes for it ([`c`]).
 const fn q(
     pillar_id: &'static str,
     question_id: &'static str,
     title: &'static str,
+    description: &'static str,
     best_practices: &'static [FrameworkChoice],
 ) -> FrameworkQuestion {
     FrameworkQuestion {
         pillar_id,
         question_id,
         title,
+        description: Some(description),
         best_practices,
     }
 }
@@ -1169,18 +1327,25 @@ impl AnswerRecord {
             .collect()
     }
 
-    /// The `Risk` this answer carries for the question it answers, derived from what it
-    /// records for that question's own choices.
+    /// The `Risk` this answer carries for the question it answers, as the LENS the
+    /// question belongs to rates it ([`ReviewQuestion::risk_rating`]).
     ///
-    /// The Well-Architected Tool rates a question by what its answer says about that
-    /// question's best practices, and a question is answered only while its answer says
-    /// something about one of them: an answer that records NO choice of the question —
-    /// because it selected none, or because a later update cleared the selection it had —
-    /// leaves the question unanswered, so it rates [`RISK_UNANSWERED`], the same rating a
-    /// question with no stored answer at all carries. Beyond that: a question that does not
-    /// apply is `NOT_APPLICABLE`, an answered question with no best practice in place is
-    /// `HIGH`, one where some choice is still unselected is `MEDIUM`, and one with nothing
-    /// left unselected is `NONE`.
+    /// Two ratings are common to both: a question the reviewed resource says does not apply
+    /// is [`RISK_NOT_APPLICABLE`], and a question whose answer says nothing about any of its
+    /// choices — because it selected none, or because a later update cleared the selection
+    /// it had — is [`RISK_UNANSWERED`], the same rating a question with no stored answer at
+    /// all carries. Beyond those:
+    ///
+    /// * [`RiskRating::LensRiskRules`] — the lens's own risk rules decide it. A rule clears
+    ///   or reduces a question's risk only when the best practices it names are in place,
+    ///   and the lens's `default` rule rates every other answer, so the rating is NOT a
+    ///   count of whether anything at all is selected: the question's terminal "None of
+    ///   these" choice says no best practice is in place, which the default rule rates
+    ///   [`RISK_HIGH`], as does any selection the rules leave to it
+    ///   ([`official_lens_risk`]).
+    /// * [`RiskRating::UnselectedBestPractices`] — the best practices the answer leaves
+    ///   out: with none in place `HIGH`, with some choice still unselected `MEDIUM`, and
+    ///   with nothing left unselected `NONE`.
     ///
     /// The best practices rated are the ones `question` asks about — the rating is of that
     /// question, so it moves with the choice set the review's lens version defines for it
@@ -1190,19 +1355,31 @@ impl AnswerRecord {
         if !self.is_applicable {
             return RISK_NOT_APPLICABLE;
         }
-        let mut any_in_place = false;
+        let mut in_place = 0usize;
+        let mut best_practices = 0usize;
         let mut any_left_out = false;
+        let mut none_of_these = false;
         // Whether the answer says anything at all about one of the question's choices: a
         // choice it records as in place, or one it records as not applying to this review.
         // A choice left UNSELECTED is what every choice of a question starts out as, so it
         // is not something an answer says.
         let mut answers_a_choice = false;
         for choice in self.reported_choice_answers(question) {
+            let terminal = question.is_none_of_these(choice.choice_id);
+            if !terminal {
+                best_practices = best_practices.saturating_add(1);
+            }
             if choice.status == CHOICE_STATUS_SELECTED {
-                any_in_place = true;
                 answers_a_choice = true;
+                if terminal {
+                    none_of_these = true;
+                } else {
+                    in_place = in_place.saturating_add(1);
+                }
             } else if choice.status == CHOICE_STATUS_UNSELECTED {
-                any_left_out = true;
+                if !terminal {
+                    any_left_out = true;
+                }
             } else {
                 answers_a_choice = true;
             }
@@ -1210,14 +1387,60 @@ impl AnswerRecord {
         if !answers_a_choice {
             return RISK_UNANSWERED;
         }
-        if !any_in_place {
-            return RISK_HIGH;
+        match question.risk_rating {
+            RiskRating::LensRiskRules => {
+                official_lens_risk(in_place, best_practices, any_left_out, none_of_these)
+            }
+            RiskRating::UnselectedBestPractices => {
+                if in_place == 0 {
+                    RISK_HIGH
+                } else if any_left_out {
+                    RISK_MEDIUM
+                } else {
+                    RISK_NONE
+                }
+            }
         }
-        if any_left_out {
-            return RISK_MEDIUM;
-        }
-        RISK_NONE
     }
+}
+
+/// The `Risk` an AWS-official lens's published risk rules rate one answered, applicable
+/// question at: `in_place` of its `best_practices` recorded as in place, `any_left_out`
+/// whether any best practice is still unselected, and `none_of_these` whether the answer
+/// selected the question's terminal choice.
+///
+/// A lens's rules are a list of conditions over the question's choices, each with the risk
+/// it assigns, ending in the `default` rule that rates every answer the conditions above
+/// it leave (the shape of `riskRules` in the lens JSON format, which this crate parses for
+/// an imported lens: [`LensRiskRule`]). The rules an AWS-official lens publishes per
+/// question are that lens's own content, which AWS publishes in no machine-readable form
+/// the model or the service docs carry, so the rule set stated here is the one this
+/// catalog carries for every question of such a lens:
+///
+/// 1. every best practice the question asks about is in place (selected, or recorded as
+///    not applying to this review) — the question's risk is cleared, [`RISK_NONE`];
+/// 2. at least half of them are in place — reduced to [`RISK_MEDIUM`];
+/// 3. `default` — [`RISK_HIGH`], which is what the terminal "None of these" choice and
+///    every thinner selection take, because neither satisfies a rule above.
+///
+/// Selecting the terminal choice says no best practice is in place, so it rates `HIGH`
+/// whatever else the answer records.
+pub fn official_lens_risk(
+    in_place: usize,
+    best_practices: usize,
+    any_left_out: bool,
+    none_of_these: bool,
+) -> &'static str {
+    if none_of_these || in_place == 0 {
+        return RISK_HIGH;
+    }
+    if !any_left_out {
+        return RISK_NONE;
+    }
+    if in_place.saturating_mul(2) >= best_practices {
+        return RISK_MEDIUM;
+    }
+    RISK_HIGH
 }
 
 /// The `Risk` a review IDENTIFIED in one question, and `None` for a question it identified
@@ -1335,9 +1558,9 @@ pub fn unselected_best_practices<'question>(
 /// the risk roll-up counts ([`WorkloadRecord::risk_counts`]).
 ///
 /// `QuestionDescription`, `ImprovementPlanUrl`, `HelpfulResourceUrl` and
-/// `HelpfulResourceDisplayText` are omitted: each is per-question or per-choice prose
-/// this emulator's lens content does not carry, and the members are optional, so they
-/// are left off rather than filled with something else.
+/// `HelpfulResourceDisplayText` are the question-level prose and documents the LENS's
+/// content carries for it ([`ReviewQuestion`]), so they are reported from there and are
+/// absent only for content that carries none.
 pub fn answer_projection(
     question: &ReviewQuestion,
     answer: Option<&AnswerRecord>,
@@ -1347,10 +1570,10 @@ pub fn answer_projection(
         question_id: Some(question.question_id.clone()),
         pillar_id: Some(question.pillar_id.clone()),
         question_title: Some(question.title.clone()),
-        question_description: None,
-        improvement_plan_url: None,
-        helpful_resource_url: None,
-        helpful_resource_display_text: None,
+        question_description: question.description.clone(),
+        improvement_plan_url: question.improvement_plan_url.clone(),
+        helpful_resource_url: question.helpful_resource_url.clone(),
+        helpful_resource_display_text: question.helpful_resource_display_text.clone(),
         // The question's CHOICE CATALOG: the best practices it asks about, reported
         // whether or not the question has been answered, because it describes the
         // QUESTION. It is also the only place a client can discover the `ChoiceId`s an
@@ -2597,9 +2820,9 @@ pub fn apply_carried_review_content(
 /// and as a `ReviewTemplateAnswerSummary` of the same question reports it.
 ///
 /// `QuestionDescription`, `ImprovementPlanUrl`, `HelpfulResourceUrl` and
-/// `HelpfulResourceDisplayText` are lens CONTENT this emulator's official-lens catalog
-/// does not carry, and every one of them is optional, so they are omitted rather than
-/// guessed at.
+/// `HelpfulResourceDisplayText` are the question-level prose and documents the LENS's
+/// content carries for it, reported from the question exactly as a workload's answer
+/// reports them ([`answer_projection`]).
 pub fn review_template_answer(
     question: &ReviewQuestion,
     answer: Option<&AnswerRecord>,
@@ -2608,10 +2831,10 @@ pub fn review_template_answer(
         question_id: Some(question.question_id.clone()),
         pillar_id: Some(question.pillar_id.clone()),
         question_title: Some(question.title.clone()),
-        question_description: None,
-        improvement_plan_url: None,
-        helpful_resource_url: None,
-        helpful_resource_display_text: None,
+        question_description: question.description.clone(),
+        improvement_plan_url: question.improvement_plan_url.clone(),
+        helpful_resource_url: question.helpful_resource_url.clone(),
+        helpful_resource_display_text: question.helpful_resource_display_text.clone(),
         // The per-question CHOICE CATALOG the lens defines: the best practices the
         // question asks about, each with the `ChoiceId` a client passes back in
         // `UpdateReviewTemplateAnswer$SelectedChoices` and `$ChoiceUpdates`. It describes
@@ -2771,7 +2994,28 @@ impl LensDefinition {
                     pillar_id: pillar.id.clone(),
                     question_id: question.id.clone(),
                     title: question.title.clone(),
+                    // The question-level content the document declares: its `description`
+                    // and the `helpfulResource` entry's display text and URL, which are
+                    // what `Answer$QuestionDescription`, `$HelpfulResourceDisplayText` and
+                    // `$HelpfulResourceUrl` report for a review of this lens. The lens
+                    // JSON format declares no question-level improvement plan — that
+                    // content is per CHOICE ([`LensChoice::improvement_plan`]) — so a
+                    // custom lens's question carries no improvement-plan URL.
+                    description: question.description.clone(),
+                    improvement_plan_url: None,
+                    helpful_resource_url: question
+                        .helpful_resource
+                        .as_ref()
+                        .and_then(|resource| resource.url.clone()),
+                    helpful_resource_display_text: question
+                        .helpful_resource
+                        .as_ref()
+                        .map(|resource| resource.display_text.clone()),
                     best_practices: question.choices.clone(),
+                    // A custom lens's questions offer exactly the choices its document
+                    // declares.
+                    none_of_these: None,
+                    risk_rating: RiskRating::UnselectedBestPractices,
                 })
             })
             .collect()

@@ -574,6 +574,21 @@ async fn every_official_lens_is_reviewable_on_a_workload() {
                 "case {alias:?}/{question_id:?}: a question asks about best practices, got \
                  {summary:?}"
             );
+            // Every question of a lens AWS publishes offers the terminal "None of these"
+            // choice after the best practices it asks about: the only way to answer the
+            // question negatively.
+            let (best_practices, terminal) = choices.split_at(choices.len().saturating_sub(1));
+            assert_eq!(
+                terminal.first().map(|choice| member(choice, "Title")),
+                Some(state::NONE_OF_THESE_TITLE.to_string()),
+                "case {alias:?}/{question_id:?}: the question's last choice is the terminal \
+                 one, got {choices:?}"
+            );
+            assert!(
+                !best_practices.is_empty(),
+                "case {alias:?}/{question_id:?}: a question asks about best practices beside \
+                 the terminal choice, got {summary:?}"
+            );
             // A choice is named by the id the LENS names it by: the framework lens
             // publishes its own `ChoiceId`s, and a lens whose content this emulator
             // authored names a choice by its position in the question.
@@ -591,9 +606,13 @@ async fn every_official_lens_is_reviewable_on_a_workload() {
                      {choice_id:?}"
                 );
                 if alias != &"wellarchitected" {
+                    let authored = if position < best_practices.len() {
+                        format!("{question_id}-bp-{:02}", position + 1)
+                    } else {
+                        format!("{question_id}-bp-no")
+                    };
                     assert_eq!(
-                        choice_id,
-                        format!("{question_id}-bp-{:02}", position + 1),
+                        choice_id, authored,
                         "case {alias:?}/{question_id:?}: an authored lens names a choice for \
                          its question and position, got {choice:?}"
                     );
@@ -727,6 +746,10 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
             .cloned()
             .unwrap_or_default()
             .iter()
+            // The best practices the question asks about: its catalog less the terminal
+            // "None of these" choice every question of an official lens offers after them,
+            // which is the answer that none of them are in place rather than one of them.
+            .filter(|choice| member(choice, "Title") != state::NONE_OF_THESE_TITLE)
             .map(|choice| member(choice, "ChoiceId"))
             .collect();
         assert!(

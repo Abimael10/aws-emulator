@@ -232,11 +232,7 @@ pub fn undefined_choices(
 /// One member's finding for [`undefined_choices`]: the member that carried the bad id,
 /// and the question's whole choice catalog as the valid values.
 fn invalid_choices(member: &str, question: &state::ReviewQuestion) -> ValidationException {
-    let valid: Vec<&str> = question
-        .best_practices
-        .iter()
-        .map(|best_practice| best_practice.id.as_str())
-        .collect();
+    let valid: Vec<&str> = question.each_choice_id().collect();
     fields_failed(
         member,
         format!(

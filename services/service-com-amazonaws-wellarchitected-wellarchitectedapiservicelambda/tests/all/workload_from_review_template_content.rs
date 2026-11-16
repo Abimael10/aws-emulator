@@ -117,8 +117,10 @@ fn answer_body(answer: &Answer, case: &str) -> Value {
         .unwrap_or_else(|| panic!("case {case:?}: Answer must be present, got {answer:?}"))
 }
 
-/// The `ChoiceId`s a question offers, in the order its `Choices` catalog reports them — the
-/// only place a client discovers them.
+/// The `ChoiceId`s of the BEST PRACTICES a question asks about, in the order its `Choices`
+/// catalog reports them — the only place a client discovers them — less the terminal "None
+/// of these" choice every question of an AWS-official lens offers after them, which is the
+/// answer that none of those best practices are in place.
 fn choice_ids(answer: &Value) -> Vec<String> {
     answer
         .get("Choices")
@@ -126,6 +128,9 @@ fn choice_ids(answer: &Value) -> Vec<String> {
         .map(|choices| {
             choices
                 .iter()
+                .filter(|choice| {
+                    choice.get("Title").and_then(Value::as_str) != Some(NONE_OF_THESE)
+                })
                 .map(|choice| {
                     choice
                         .get("ChoiceId")
@@ -137,6 +142,9 @@ fn choice_ids(answer: &Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// `Choice$Title` of that terminal choice.
+const NONE_OF_THESE: &str = "None of these";
 
 /// An answer's `ChoiceAnswers` as a `ChoiceId` -> `ChoiceStatus` table.
 fn choice_statuses(answer: &Value) -> BTreeMap<String, String> {
@@ -247,9 +255,10 @@ async fn a_workload_created_from_a_template_starts_with_the_templates_answers() 
     );
 
     // Answer every question of the template's lens, each in a different way, and remember
-    // the `Risk` the answer earns: a question that does not apply is NOT_APPLICABLE, one
-    // whose answer selects nothing is still UNANSWERED, one with something left out is
-    // MEDIUM, one with nothing left out is NONE.
+    // the `Risk` the answer earns from the lens's published risk rules: a question that does
+    // not apply is NOT_APPLICABLE, one whose answer selects nothing is still UNANSWERED, one
+    // with every best practice in place is NONE, one with at least half of them in place is
+    // MEDIUM, and a thinner selection takes the lens's default rating, HIGH.
     let mut expected_risks: BTreeMap<String, &'static str> = BTreeMap::new();
     for (index, question_id) in question_ids.iter().enumerate() {
         let case = format!("answer-{question_id}");
@@ -281,10 +290,12 @@ async fn a_workload_created_from_a_template_starts_with_the_templates_answers() 
             "NOT_APPLICABLE"
         } else if selected.is_empty() {
             "UNANSWERED"
-        } else if selected.len() < choices.len() {
+        } else if selected.len() == choices.len() {
+            "NONE"
+        } else if selected.len() * 2 >= choices.len() {
             "MEDIUM"
         } else {
-            "NONE"
+            "HIGH"
         };
         expected_risks.insert(question_id.clone(), risk);
 

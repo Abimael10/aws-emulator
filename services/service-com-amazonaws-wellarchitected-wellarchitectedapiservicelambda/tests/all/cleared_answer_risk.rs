@@ -207,6 +207,12 @@ struct Cycle<'a> {
     choices: &'a [String],
     selection: Selection,
     clearing: Clearing,
+    /// Whether the lens under review rates its questions by the risk rules it PUBLISHES,
+    /// as every AWS-official lens does: such a lens clears a question only when every best
+    /// practice is in place, reduces it to `MEDIUM` while at least half of them are, and
+    /// rates every thinner selection at its default `HIGH`. A lens whose content declares
+    /// no rules this service evaluates rates a partial selection `MEDIUM`.
+    published_risk_rules: bool,
 }
 
 /// The rating of one question over the whole cycle — rated, cleared, rated again — for one
@@ -221,6 +227,7 @@ async fn assert_clearing_unanswers(client: &Client, cycle: &Cycle<'_>) {
         choices,
         selection,
         clearing,
+        published_risk_rules,
     } = *cycle;
     let in_place: Vec<String> = match selection {
         Selection::First => choices[..1].to_vec(),
@@ -228,8 +235,10 @@ async fn assert_clearing_unanswers(client: &Client, cycle: &Cycle<'_>) {
     };
     let expected_rated = if in_place.len() == choices.len() {
         "NONE"
-    } else {
+    } else if !published_risk_rules || in_place.len() * 2 >= choices.len() {
         "MEDIUM"
+    } else {
+        "HIGH"
     };
 
     // Answered: the selection is what rates the question, and the review counts it there.
@@ -361,6 +370,7 @@ async fn clearing_the_selection_unanswers_a_framework_question() {
                         choices,
                         selection,
                         clearing,
+                        published_risk_rules: true,
                     },
                 )
                 .await;
@@ -422,6 +432,7 @@ async fn clearing_the_selection_unanswers_a_custom_lens_question() {
                     choices: &choices,
                     selection: Selection::First,
                     clearing,
+                    published_risk_rules: false,
                 },
             )
             .await;

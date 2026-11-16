@@ -179,10 +179,21 @@ fn choice_members(answer: &Value, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every `ChoiceId` the lens defines for one question, in the lens's own order — read off
-/// the lens content the service reports from, so a case states the question and not its
-/// wire ids.
+/// Every `ChoiceId` the lens defines for one question, in the lens's own order: the best
+/// practices it asks about and then the terminal "None of these" choice every question of
+/// an AWS-official lens offers after them — read off the lens content the service reports
+/// from, so a case states the question and not its wire ids.
 fn choice_ids_of(question: &state::FrameworkQuestion) -> Vec<String> {
+    (0..question.best_practices.len())
+        .map(|index| question.choice_id(index))
+        .chain(std::iter::once(question.none_of_these_id()))
+        .collect()
+}
+
+/// Every `ChoiceId` of the BEST PRACTICES one question asks about, in the lens's own
+/// order: [`choice_ids_of`] less that terminal choice — what an answer that puts every best
+/// practice in place names.
+fn best_practice_ids_of(question: &state::FrameworkQuestion) -> Vec<String> {
     (0..question.best_practices.len())
         .map(|index| question.choice_id(index))
         .collect()
@@ -317,9 +328,16 @@ async fn every_question_of_every_official_lens_is_reported_from_that_lenss_conte
                         .best_practices
                         .iter()
                         .map(|practice| practice.title.to_string())
+                        .chain(std::iter::once(state::NONE_OF_THESE_TITLE.to_string()))
                         .collect::<Vec<String>>(),
                     "case {case:?}: each reported choice must carry the best practice it asks \
                      about, got {read:?}"
+                );
+                assert_eq!(
+                    answer.get("QuestionDescription").and_then(Value::as_str),
+                    question.description,
+                    "case {case:?}: the answer must carry the question's own description where \
+                     the lens publishes one, got {read:?}"
                 );
                 assert_eq!(
                     answer.get("Risk").and_then(Value::as_str),
@@ -460,8 +478,8 @@ async fn a_milestone_scoped_read_reports_the_review_the_milestone_recorded() {
 
     let before_the_milestone = framework_question("manage-service-quotas");
     let after_the_milestone = framework_question("cloud-financial-management");
-    let every_choice_before = choice_ids_of(before_the_milestone);
-    let every_choice_after = choice_ids_of(after_the_milestone);
+    let every_choice_before = best_practice_ids_of(before_the_milestone);
+    let every_choice_after = best_practice_ids_of(after_the_milestone);
 
     // Answered with every best practice in place, so the milestone records an answer at
     // NONE risk.

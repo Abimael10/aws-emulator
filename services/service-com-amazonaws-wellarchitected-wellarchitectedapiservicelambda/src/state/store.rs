@@ -694,7 +694,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     official
                         .questions
                         .iter()
-                        .map(FrameworkQuestion::to_review_question)
+                        .map(|question| question.to_review_question(official))
                         .collect(),
                 )
             });

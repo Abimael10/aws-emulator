@@ -22,14 +22,21 @@ use super::*;
 /// framework's pillars, questions and best practices
 /// (<https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html>) — the
 /// pillars and the number of questions each asks are its published numbering (OPS 1-11,
-/// SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6 — 57 questions), and each `title` is
-/// that published question. The Smithy model cannot supply it: it bounds a `QuestionId`
+/// SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6 — 57 questions), each `title` is that
+/// published question and each `description` the prose the framework publishes under it.
+/// The Smithy model cannot supply it: it bounds a `QuestionId`
 /// and a `ChoiceId` only by length (`smithy_query(query="shape",
 /// shape="QuestionId,ChoiceId")`), so the content is written out here, the same way
 /// [`super::AWS_OFFICIAL_LENS_ALIASES`] writes out the published lens library.
+///
+/// The terminal "None of these" choice every one of these questions also offers is NOT a
+/// row here: it is the answer that none of the question's best practices are in place
+/// rather than one of them, so it is projected after them, named in the question's own
+/// choice-id namespace ([`FrameworkQuestion::none_of_these_id`]).
 pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
     // Operational excellence — OPS 1-11.
-    q("operationalExcellence", "organization-priorities", "How do you determine what your priorities are?", &[
+    q("operationalExcellence", "organization-priorities", "How do you determine what your priorities are?",
+      "Everyone must understand their part in enabling business success. Have shared goals in order to set priorities for resources. This will maximize the benefits of your efforts.", &[
         c("ops_priorities_ext_cust_needs", "Evaluate external customer needs",
           "Involve key stakeholders, including business, development and operations teams, when determining where to focus efforts on external customer needs."),
         c("ops_priorities_int_cust_needs", "Evaluate internal customer needs",
@@ -43,7 +50,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_priorities_eval_tradeoffs", "Evaluate tradeoffs while managing benefits and risks",
           "Evaluate the tradeoffs between competing interests to help make informed decisions about where to focus effort."),
     ]),
-    q("operationalExcellence", "organization-structure", "How do you structure your organization to support your business outcomes?", &[
+    q("operationalExcellence", "organization-structure", "How do you structure your organization to support your business outcomes?",
+      "Your teams must understand their part in achieving business outcomes. Teams must understand their roles in the success of other teams, the role of other teams in their success, and have shared goals.", &[
         c("ops_structure_resource_owners", "Resources have identified owners",
           "Resources for your workload have identified owners for change control, troubleshooting and other functions."),
         c("ops_structure_proc_owners", "Processes and procedures have identified owners",
@@ -57,7 +65,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_structure_resp_between_teams", "Responsibilities between teams are predefined or negotiated",
           "Have defined or negotiated agreements between teams that describe how they work with and support each other."),
     ]),
-    q("operationalExcellence", "organization-culture", "How does your organizational culture support your business outcomes?", &[
+    q("operationalExcellence", "organization-culture", "How does your organizational culture support your business outcomes?",
+      "Provide support for your team members so that they can be more effective in taking action and supporting your business outcomes.", &[
         c("ops_culture_exec_sponsor", "Provide executive sponsorship",
           "Senior leadership clearly sets expectations for the organization, evaluates success and is the sponsor of the operational model."),
         c("ops_culture_team_emp", "Team members are empowered to take action when outcomes are at risk",
@@ -75,7 +84,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_culture_diverse_opinions", "Diverse opinions are encouraged and sought within and across teams",
           "Leverage cross-organizational diversity to seek multiple unique perspectives, and use this to increase innovation and challenge assumptions."),
     ]),
-    q("operationalExcellence", "implement-observability", "How do you implement observability in your workload?", &[
+    q("operationalExcellence", "implement-observability", "How do you implement observability in your workload?",
+      "Implement observability in your workload so that you can understand its state and make data-driven decisions based on business requirements.", &[
         c("ops_observability_application_telemetry", "Implement application telemetry",
           "Instrument the application code to emit information about its internal state, status and the achievement of business outcomes."),
         c("ops_observability_workload_telemetry", "Implement and configure workload telemetry",
@@ -87,7 +97,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_observability_dist_trace", "Implement distributed tracing",
           "Trace a transaction as it moves through the components of the workload, so that latency and errors can be attributed to a component."),
     ]),
-    q("operationalExcellence", "reduce-defects", "How do you reduce defects, ease remediation, and improve flow into production?", &[
+    q("operationalExcellence", "reduce-defects", "How do you reduce defects, ease remediation, and improve flow into production?",
+      "Adopt approaches that improve flow of changes into production, that activate refactoring, fast feedback on quality, and bug fixing. These accelerate beneficial changes entering production, limit issues deployed, and activate rapid identification and remediation of issues introduced through deployment activities.", &[
         c("ops_dev_integ_version_control", "Use version control",
           "Use version control to activate tracking of changes and releases, and to make a change reversible."),
         c("ops_dev_integ_test_val_chg", "Test and validate changes",
@@ -109,7 +120,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_dev_integ_auto_integ_deploy", "Fully automate integration and deployment",
           "Automate the build, the deployment and the testing of the workload, which reduces errors and shortens the time to release."),
     ]),
-    q("operationalExcellence", "mitigate-deployment-risks", "How do you mitigate deployment risks?", &[
+    q("operationalExcellence", "mitigate-deployment-risks", "How do you mitigate deployment risks?",
+      "Adopt approaches that provide fast feedback on quality and achieve rapid recovery from changes that do not have desired outcomes. Using these practices mitigates the impact of issues introduced through the deployment of changes.", &[
         c("ops_mit_deploy_risks_plan_for_unsucessful_changes", "Plan for unsuccessful changes",
           "Plan to revert to a known good state, or to remediate in the production environment, if a change does not have the desired outcome."),
         c("ops_mit_deploy_risks_test_val_chg", "Test deployments",
@@ -119,7 +131,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_mit_deploy_risks_auto_testing_and_rollback", "Automate testing and rollback",
           "Automate the testing of a deployment, and the rollback of a deployment that fails its tests, so that recovery does not wait on a human."),
     ]),
-    q("operationalExcellence", "operational-readiness", "How do you know that you are ready to support a workload?", &[
+    q("operationalExcellence", "operational-readiness", "How do you know that you are ready to support a workload?",
+      "Evaluate the operational readiness of your workload, processes, procedures, and personnel to understand the operational risks related to your workload.", &[
         c("ops_ready_to_support_personnel_capability", "Ensure personnel capability",
           "Have a mechanism to validate that you have an appropriate number of trained personnel to support the workload."),
         c("ops_ready_to_support_const_orr", "Ensure a consistent review of operational readiness",
@@ -133,7 +146,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_ready_to_support_create_support_plan", "Create support plans for production workloads",
           "Have a support plan and an escalation path in place for the workload before it serves production traffic."),
     ]),
-    q("operationalExcellence", "workload-observability", "How do you utilize workload observability in your organization?", &[
+    q("operationalExcellence", "workload-observability", "How do you utilize workload observability in your organization?",
+      "Ensure optimal workload health by leveraging observability. Utilize relevant metrics, logs, and traces to gain a comprehensive view of your workload's performance and address issues efficiently.", &[
         c("ops_workload_observability_analyze_workload_metrics", "Analyze workload metrics",
           "Analyze the metrics the workload emits to understand whether it is achieving its business outcomes."),
         c("ops_workload_observability_analyze_workload_logs", "Analyze workload logs",
@@ -145,7 +159,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_workload_observability_create_dashboards", "Create dashboards",
           "Build dashboards that present the health of the workload to the audience that reads them."),
     ]),
-    q("operationalExcellence", "operations-health", "How do you understand the health of your operations?", &[
+    q("operationalExcellence", "operations-health", "How do you understand the health of your operations?",
+      "Define, capture, and analyze operations metrics to gain visibility to operations events so that you can take appropriate action.", &[
         c("ops_operations_health_measure_ops_goals_kpis", "Measure operations goals and KPIs with metrics",
           "Define and measure the metrics that show whether operations is achieving the goals the business set for it."),
         c("ops_operations_health_comms_status_trends", "Communicate status and trends to ensure visibility into operation",
@@ -153,7 +168,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_operations_health_review_ops_metrics_prioritize_improve", "Review operations metrics and prioritize improvement",
           "Review operations metrics with the team, and prioritize the improvements those metrics point to."),
     ]),
-    q("operationalExcellence", "workload-operations-events", "How do you manage workload and operations events?", &[
+    q("operationalExcellence", "workload-operations-events", "How do you manage workload and operations events?",
+      "Prepare and validate procedures for responding to events to minimize their disruption to your workload.", &[
         c("ops_event_response_event_incident_problem_process", "Use a process for event, incident, and problem management",
           "Have processes to address observed events, events that need intervention, and events that need intervention and recur or cannot be resolved."),
         c("ops_event_response_process_per_alert", "Have a process per alert",
@@ -169,7 +185,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("ops_event_response_automate_responses", "Automate responses to events",
           "Automate the response to an event where the response is well understood, so that it is consistent and immediate."),
     ]),
-    q("operationalExcellence", "evolve-operations", "How do you evolve operations?", &[
+    q("operationalExcellence", "evolve-operations", "How do you evolve operations?",
+      "Dedicate time and resources for nearly continuous incremental improvement to evolve the effectiveness and efficiency of your operations.", &[
         c("ops_evolve_ops_process_cont_imp", "Have a process for continuous improvement",
           "Evaluate your operations and the workload against the desired outcomes regularly, and improve them deliberately."),
         c("ops_evolve_ops_perform_rca_process", "Perform post-incident analysis",
@@ -190,7 +207,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
           "Dedicate time and resources to making improvements, so that improvement is not displaced by day-to-day work."),
     ]),
     // Security — SEC 1-11.
-    q("security", "securely-operate", "How do you securely operate your workload?", &[
+    q("security", "securely-operate", "How do you securely operate your workload?",
+      "To operate your workload securely, you must apply overarching best practices to every area of security. Take requirements and processes that you have defined in operational excellence at an organizational and workload level, and apply them to all areas. Staying up to date with recommendations from AWS, industry sources, and threat intelligence helps you evolve your threat model and control objectives. Automating security processes, testing, and validation allow you to scale your security operations.", &[
         c("sec_securely_operate_multi_accounts", "Separate workloads using accounts",
           "Organize workloads in separate accounts, grouped by function or by a common set of controls, rather than by the reporting structure."),
         c("sec_securely_operate_aws_account", "Secure account root user and properties",
@@ -208,7 +226,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_securely_operate_implement_services_features", "Evaluate and implement new security services and features regularly",
           "Evaluate new security services and features, and adopt the ones that improve the workload's security posture."),
     ]),
-    q("security", "identities", "How do you manage identities for people and machines?", &[
+    q("security", "identities", "How do you manage identities for people and machines?",
+      "There are two types of identities that you must manage when approaching operating secure AWS workloads. Understanding the type of identity you must manage and grant access helps you verify the right identities have access to the right resources under the right conditions.", &[
         c("sec_identities_strong_sign_in", "Use strong sign-in mechanisms",
           "Enforce a strong sign-in mechanism, including multi-factor authentication, for the identities of people."),
         c("sec_identities_unique", "Use temporary credentials",
@@ -222,7 +241,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_identities_groups_attributes", "Employ user groups and attributes",
           "Grant access through groups and attributes rather than per identity, so that permissions scale with the organization."),
     ]),
-    q("security", "permissions", "How do you manage permissions for people and machines?", &[
+    q("security", "permissions", "How do you manage permissions for people and machines?",
+      "Manage permissions to control access to people and machine identities that require access to AWS and your workload. Permissions control who can access what, and under what conditions.", &[
         c("sec_permissions_define", "Define access requirements",
           "Define who, or what, needs which access to each component of the workload, and why."),
         c("sec_permissions_least_privileges", "Grant least privilege access",
@@ -242,7 +262,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_permissions_share_securely_third_party", "Share resources securely with a third party",
           "Share a resource with a third party through temporary, scoped access that you can revoke."),
     ]),
-    q("security", "detect-investigate-events", "How do you detect and investigate security events?", &[
+    q("security", "detect-investigate-events", "How do you detect and investigate security events?",
+      "Capture and analyze events from logs and metrics to gain visibility. Take action on security events and potential threats to help secure your workload.", &[
         c("sec_detect_investigate_events_app_service_logging", "Configure service and application logging",
           "Configure logging throughout the workload, including service logs, application logs and audit events."),
         c("sec_detect_investigate_events_analyze_all", "Capture logs, findings, and metrics in standardized locations",
@@ -252,7 +273,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_detect_investigate_events_auto_response", "Initiate remediation for non-compliant resources",
           "Detect a resource that no longer meets its controls and initiate its remediation."),
     ]),
-    q("security", "network-protection", "How do you protect your network resources?", &[
+    q("security", "network-protection", "How do you protect your network resources?",
+      "Any workload that has some form of network connectivity, whether it's the internet or a private network, requires multiple layers of defense to help protect from external and internal network-based threats.", &[
         c("sec_network_protection_create_layers", "Create network layers",
           "Group components that share a reachability requirement into layers, so that a component is only reachable from where it has to be."),
         c("sec_network_protection_control_traffic", "Control traffic flow within your network layers",
@@ -262,7 +284,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_network_protection_auto_protect", "Automate network protection",
           "Automate the deployment and the maintenance of network protections, so that they keep pace with the workload."),
     ]),
-    q("security", "compute-protection", "How do you protect your compute resources?", &[
+    q("security", "compute-protection", "How do you protect your compute resources?",
+      "Compute resources in your workload require multiple layers of defense to help protect from external and internal threats. Compute resources include EC2 instances, containers, AWS Lambda functions, database services, IoT devices, and more.", &[
         c("sec_protect_compute_vulnerability_management", "Perform vulnerability management",
           "Scan for, and remediate, the vulnerabilities in the code, the dependencies and the infrastructure of the workload."),
         c("sec_protect_compute_hardened_images", "Provision compute from hardened images",
@@ -274,7 +297,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_protect_compute_auto_protection", "Automate compute protection",
           "Automate the protection of compute resources, including patching, scanning and the response to a finding."),
     ]),
-    q("security", "data-classification", "How do you classify your data?", &[
+    q("security", "data-classification", "How do you classify your data?",
+      "Classification provides a way to categorize data, based on criticality and sensitivity in order to help you determine appropriate protection and retention controls.", &[
         c("sec_data_classification_identify_data", "Understand your data classification scheme",
           "Understand the classification of the data the workload holds and the handling each class requires."),
         c("sec_data_classification_define_protection", "Apply data protection controls based on data sensitivity",
@@ -284,7 +308,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_data_classification_lifecycle_management", "Define scalable data lifecycle management",
           "Define how data is retained, archived and destroyed for each class, and apply it as the data volume grows."),
     ]),
-    q("security", "protect-data-at-rest", "How do you protect your data at rest?", &[
+    q("security", "protect-data-at-rest", "How do you protect your data at rest?",
+      "Protect your data at rest by implementing multiple controls, to reduce the risk of unauthorized access or mishandling.", &[
         c("sec_protect_data_rest_key_mgmt", "Implement secure key management",
           "Manage the keys that protect data at rest, including how they are created, rotated, used and revoked."),
         c("sec_protect_data_rest_encrypt", "Enforce encryption at rest",
@@ -296,7 +321,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_protect_data_rest_people_away", "Use mechanisms to keep people away from data",
           "Keep people away from production data by giving them tooling and automation that does the work instead."),
     ]),
-    q("security", "protect-data-in-transit", "How do you protect your data in transit?", &[
+    q("security", "protect-data-in-transit", "How do you protect your data in transit?",
+      "Protect your data in transit by implementing multiple controls to reduce the risk of unauthorized access or loss.", &[
         c("sec_protect_data_transit_key_cert_mgmt", "Implement secure key and certificate management",
           "Manage the keys and the certificates that protect data in transit, including their issuance and rotation."),
         c("sec_protect_data_transit_encrypt", "Enforce encryption in transit",
@@ -304,7 +330,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_protect_data_transit_authentication", "Authenticate network communications",
           "Authenticate the parties of a network communication, so that data is only exchanged with the party you intended."),
     ]),
-    q("security", "incident-response", "How do you anticipate, respond to, and recover from incidents?", &[
+    q("security", "incident-response", "How do you anticipate, respond to, and recover from incidents?",
+      "Even with mature preventive and detective controls, your organization should implement mechanisms to respond to and mitigate the potential impact of security incidents. Your preparation strongly affects the ability of your teams to operate effectively during an incident, to isolate, contain and perform forensics on issues, and to restore operations to a known good state.", &[
         c("sec_incident_response_identify_personnel", "Identify key personnel and external resources",
           "Identify the people, internal and external, who are needed during an incident, and how to reach them."),
         c("sec_incident_response_develop_plans", "Develop incident management plans",
@@ -322,7 +349,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sec_incident_response_learn_from_incidents", "Establish a framework for learning from incidents",
           "Review each incident for its contributing factors, and feed the findings back into the workload and the plans."),
     ]),
-    q("security", "application-security", "How do you incorporate and validate the security properties of applications?", &[
+    q("security", "application-security", "How do you incorporate and validate the security properties of applications?",
+      "Training people, testing using automation, understanding dependencies, and validating the security properties of tools and applications help to reduce the likelihood of security issues in production workloads.", &[
         c("sec_appsec_train_for_appsec", "Train for application security",
           "Train the teams that build the application in the security properties it has to hold."),
         c("sec_appsec_automate_testing_throughout_lifecycle", "Automate testing throughout the development and release lifecycle",
@@ -341,7 +369,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
           "Embed security ownership in the teams that build the workload rather than holding it in one central team."),
     ]),
     // Reliability — REL 1-13.
-    q("reliability", "manage-service-quotas", "How do you manage service quotas and constraints?", &[
+    q("reliability", "manage-service-quotas", "How do you manage service quotas and constraints?",
+      "For cloud-based workload architectures, there are service quotas (which are also referred to as service limits). These quotas exist to prevent accidentally provisioning more resources than you need and to limit request rates on API operations to protect services from abuse.", &[
         c("rel_manage_service_limits_aware_quotas_and_constraints", "Aware of service quotas and constraints",
           "Be aware of the quotas and the physical constraints that apply to every resource the workload uses."),
         c("rel_manage_service_limits_account_for_quotas", "Manage service quotas across accounts and Regions",
@@ -355,7 +384,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_manage_service_limits_suff_margin_limits", "Ensure that a sufficient gap exists between the current quotas and the maximum usage to accommodate failover",
           "Keep enough margin between a quota and the workload's peak usage that a failover does not exhaust it."),
     ]),
-    q("reliability", "network-topology", "How do you plan your network topology?", &[
+    q("reliability", "network-topology", "How do you plan your network topology?",
+      "Workloads often exist in multiple environments. These include multiple cloud environments (both publicly accessible and private) and possibly your existing data center infrastructure. Plans must include network considerations such as intra- and inter-system connectivity, public IP address management, private IP address management, and domain name resolution.", &[
         c("rel_planning_network_topology_ha_conn_users", "Use highly available network connectivity for your workload public endpoints",
           "Serve the workload's public endpoints over connectivity that survives the failure of one path."),
         c("rel_planning_network_topology_ha_conn_private_net", "Provision redundant connectivity between private networks in the cloud and on-premises environments",
@@ -367,7 +397,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_planning_network_topology_enforce_non_overlap", "Enforce non-overlapping private IP address ranges in all private address spaces where they are connected",
           "Keep the private address ranges of connected networks from overlapping, so that routing between them stays possible."),
     ]),
-    q("reliability", "service-architecture", "How do you design your workload service architecture?", &[
+    q("reliability", "service-architecture", "How do you design your workload service architecture?",
+      "Build highly scalable and reliable workloads using a service-oriented architecture (SOA) or a microservices architecture. Service-oriented architecture is the practice of making software components reusable through service interfaces. Microservices architecture goes further to make components smaller and simpler.", &[
         c("rel_service_architecture_monolith_soa_microservice", "Choose how to segment your workload",
           "Choose the granularity the workload is segmented at, weighing the independence it buys against the complexity it adds."),
         c("rel_service_architecture_business_domains", "Build services focused on specific business domains and functionality",
@@ -375,7 +406,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_service_architecture_api_contracts", "Provide service contracts per API",
           "Publish a contract per API, so that a consumer can depend on it and a provider can evolve behind it."),
     ]),
-    q("reliability", "prevent-interaction-failure", "How do you design interactions in a distributed system to prevent failures?", &[
+    q("reliability", "prevent-interaction-failure", "How do you design interactions in a distributed system to prevent failures?",
+      "Distributed systems rely on communications networks to interconnect components, such as servers or services. Your workload must operate reliably despite data loss or latency in these networks. Components of the distributed system must operate in a way that does not negatively impact other components or the workload.", &[
         c("rel_prevent_interaction_failure_identify_dependency", "Identify the kind of distributed system you depend on",
           "Identify whether the system is hard real-time, soft real-time or offline, because the mitigations differ."),
         c("rel_prevent_interaction_failure_loosely_coupled_system", "Implement loosely coupled dependencies",
@@ -385,7 +417,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_prevent_interaction_failure_idempotent", "Make mutating operations idempotent",
           "Make a mutating operation idempotent, so that a retry of it cannot change the outcome."),
     ]),
-    q("reliability", "mitigate-interaction-failure", "How do you design interactions in a distributed system to mitigate or withstand failures?", &[
+    q("reliability", "mitigate-interaction-failure", "How do you design interactions in a distributed system to mitigate or withstand failures?",
+      "Distributed systems rely on communications networks to interconnect components in order to send and receive data. Your workload must operate reliably despite data loss or latency over these networks. Components of the distributed system must operate in a way that does not negatively impact other components or the workload.", &[
         c("rel_mitigate_interaction_failure_graceful_degradation", "Implement graceful degradation to transform applicable hard dependencies into soft dependencies",
           "Serve a degraded but useful response when a dependency is unavailable rather than failing the request."),
         c("rel_mitigate_interaction_failure_throttle_requests", "Throttle requests",
@@ -401,7 +434,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_mitigate_interaction_failure_emergency_levers", "Implement emergency levers",
           "Build rapid, tested processes that mitigate an impairment during an event."),
     ]),
-    q("reliability", "monitor-workload-resources", "How do you monitor workload resources?", &[
+    q("reliability", "monitor-workload-resources", "How do you monitor workload resources?",
+      "Logs and metrics are powerful tools to gain insight into the health of your workload. You can configure your workload to monitor logs and metrics and send notifications when thresholds are crossed or significant events occur.", &[
         c("rel_monitor_aws_resources_monitor_all_layers", "Monitor all components for the workload",
           "Monitor every component of the workload, so that an impairment is detected wherever it occurs."),
         c("rel_monitor_aws_resources_define_calc_metrics", "Define and calculate metrics",
@@ -417,7 +451,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_monitor_aws_resources_monitor_end_to_end", "Monitor end-to-end tracing of requests through your system",
           "Trace a request end to end, so that latency and errors can be attributed to the component that caused them."),
     ]),
-    q("reliability", "adapt-to-changes-in-demand", "How do you design your workload to adapt to changes in demand?", &[
+    q("reliability", "adapt-to-changes-in-demand", "How do you design your workload to adapt to changes in demand?",
+      "A scalable workload provides elasticity to add or remove resources automatically so that they closely match the current demand at any given point in time.", &[
         c("rel_adapt_to_changes_automate_scaling", "Use automation when obtaining or scaling resources",
           "Obtain and release resources through automation rather than by hand, so that scaling keeps pace with demand."),
         c("rel_adapt_to_changes_obtain_res_impairment", "Obtain resources upon detection of impairment to a workload",
@@ -427,7 +462,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_adapt_to_changes_load_test", "Load test your workload",
           "Load test the workload at the demand you expect, so that its scaling behaviour is known before production meets it."),
     ]),
-    q("reliability", "implement-change", "How do you implement change?", &[
+    q("reliability", "implement-change", "How do you implement change?",
+      "Controlled changes are necessary to deploy new functionality, and to verify that the workloads and the operating environment are running known software and can be patched or replaced in a predictable manner. If these changes are uncontrolled, then it makes it difficult to predict the effect of these changes, or to address issues that arise because of them.", &[
         c("rel_tracking_change_management_runbooks", "Use runbooks for standard activities such as deployment",
           "Perform a standard activity, including a deployment, from a runbook rather than from memory."),
         c("rel_tracking_change_management_functional_testing", "Integrate functional testing as part of your deployment",
@@ -439,7 +475,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_tracking_change_management_automated_changemgmt", "Deploy changes with automation",
           "Deploy every change through automation, so that the deployment is repeatable and reversible."),
     ]),
-    q("reliability", "back-up-data", "How do you back up data?", &[
+    q("reliability", "back-up-data", "How do you back up data?",
+      "Back up data, applications, and configuration to meet your requirements for recovery time objectives (RTO) and recovery point objectives (RPO).", &[
         c("rel_backing_up_data_identified_backups_data", "Identify and back up all data that needs to be backed up, or reproduce the data from sources",
           "Identify the data that has to survive a failure, and either back it up or be able to reproduce it."),
         c("rel_backing_up_data_secured_backups_data", "Secure and encrypt backups",
@@ -449,7 +486,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_backing_up_data_periodic_recovery_testing", "Perform periodic recovery of the data to verify backup integrity and processes",
           "Restore from a backup periodically, so that both the backup and the process that uses it are known to work."),
     ]),
-    q("reliability", "fault-isolation", "How do you use fault isolation to protect your workload?", &[
+    q("reliability", "fault-isolation", "How do you use fault isolation to protect your workload?",
+      "Fault isolated boundaries limit the effect of a failure within a workload to a limited number of components. Components outside of the boundary are unaffected by the failure. Using multiple fault isolated boundaries, you can limit the impact on your workload.", &[
         c("rel_fault_isolation_multiaz_region_system", "Deploy the workload to multiple locations",
           "Deploy the workload across Availability Zones, or Regions, so that one location's failure does not take it down."),
         c("rel_fault_isolation_select_location", "Select the appropriate locations for your multi-location deployment",
@@ -459,7 +497,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_fault_isolation_bulkhead", "Use bulkhead architectures to limit scope of impact",
           "Partition the workload into cells, so that a failure is contained to the cell it occurs in."),
     ]),
-    q("reliability", "withstand-component-failures", "How do you design your workload to withstand component failures?", &[
+    q("reliability", "withstand-component-failures", "How do you design your workload to withstand component failures?",
+      "Workloads with a requirement for high availability and low mean time to recovery (MTTR) must be architected for resiliency.", &[
         c("rel_withstand_component_failures_monitor_health", "Monitor all components of the workload to detect failures",
           "Monitor every component for the failures the workload has to withstand."),
         c("rel_withstand_component_failures_failover2good", "Fail over to healthy resources",
@@ -475,7 +514,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_withstand_component_failures_avail_target_slas", "Architect your product to meet availability targets and uptime service level agreements (SLAs)",
           "Design the workload to the availability target it has committed to, and measure it against that target."),
     ]),
-    q("reliability", "test-reliability", "How do you test reliability?", &[
+    q("reliability", "test-reliability", "How do you test reliability?",
+      "After you have designed your workload to be resilient to the stresses of production, testing is the only way to help ensure that it will operate as designed, and deliver the resiliency you expect.", &[
         c("rel_testing_resiliency_playbook_resiliency", "Use playbooks to investigate failures",
           "Investigate a failure from a playbook, so that an unfamiliar failure is still investigated methodically."),
         c("rel_testing_resiliency_rca_resiliency", "Perform post-incident analysis",
@@ -489,7 +529,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("rel_testing_resiliency_game_days_resiliency", "Conduct game days regularly",
           "Rehearse a failure with the team that would respond to it, and improve the response with what the rehearsal shows."),
     ]),
-    q("reliability", "plan-for-dr", "How do you plan for disaster recovery (DR)?", &[
+    q("reliability", "plan-for-dr", "How do you plan for disaster recovery (DR)?",
+      "Having backups and redundant workload components in place is the start of your DR strategy. RTO and RPO are your objectives for restoration of your workload. Set these based on business needs. Implement a strategy to meet these objectives, considering locations and function of workload resources and data.", &[
         c("rel_planning_for_recovery_objective_defined_recovery", "Define recovery objectives for downtime and data loss",
           "Define the recovery time and recovery point the business requires of the workload."),
         c("rel_planning_for_recovery_disaster_recovery", "Use defined recovery strategies to meet the recovery objectives",
@@ -502,7 +543,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
           "Automate the recovery, so that it is as fast and as repeatable as the objectives require."),
     ]),
     // Performance efficiency — PERF 1-5.
-    q("performance", "architecture-selection", "How do you select appropriate cloud resources and architecture patterns for your workload?", &[
+    q("performance", "architecture-selection", "How do you select appropriate cloud resources and architecture patterns for your workload?",
+      "The optimal solution for a particular workload varies, and solutions often combine multiple approaches. Well-Architected workloads use multiple solutions and allow different features to improve performance.", &[
         c("perf_architecture_learn_cloud_services", "Learn about and understand available cloud services and features",
           "Learn what the available services and features do, so that the architecture can be chosen from what exists."),
         c("perf_architecture_guidance_cloud_provider", "Use guidance from your cloud provider or an appropriate partner to learn about architecture patterns and best practices",
@@ -516,7 +558,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("perf_architecture_data_driven_arch_choices", "Use a data-driven approach for architectural choices",
           "Base an architectural choice on data about the workload rather than on assumption."),
     ]),
-    q("performance", "compute-architecture-selection", "How do you select and use compute resources in your workload?", &[
+    q("performance", "compute-architecture-selection", "How do you select and use compute resources in your workload?",
+      "The optimal compute choice for a particular workload can vary based on application design, usage patterns, and configuration settings. Architectures may use different compute choices for various components and allow different features to improve performance. Selecting the wrong compute choice for an architecture can lead to lower performance efficiency.", &[
         c("perf_compute_best_options", "Select the best compute options for your workload",
           "Choose the compute option that fits the workload's shape, from instances to containers to functions."),
         c("perf_compute_configuration_features", "Understand the available compute configuration and features",
@@ -530,7 +573,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("perf_compute_hardware_accelerators", "Use optimized hardware-based compute accelerators",
           "Use a hardware accelerator where the workload's computation is suited to one."),
     ]),
-    q("performance", "data-management", "How do you store, manage, and access data in your workload?", &[
+    q("performance", "data-management", "How do you store, manage, and access data in your workload?",
+      "The optimal data management solution for a particular system varies based on the kind of data type (block, file, or object), access patterns (random or sequential), required throughput, frequency of access (online, offline, archival), frequency of update (WORM, dynamic), and availability and durability constraints.", &[
         c("perf_data_purpose_built", "Use a purpose-built data store that best supports your data access and storage requirements",
           "Choose the data store built for the access pattern the workload has rather than one store for everything."),
         c("perf_data_config_options", "Evaluate available configuration options for data store",
@@ -542,7 +586,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("perf_data_caching", "Implement data access patterns that utilize caching",
           "Cache the data that is read repeatedly, so that the data store serves only what has to come from it."),
     ]),
-    q("performance", "networking-architecture-selection", "How do you select and configure networking resources in your workload?", &[
+    q("performance", "networking-architecture-selection", "How do you select and configure networking resources in your workload?",
+      "The optimal networking solution for a workload varies based on latency, throughput requirements, jitter, and bandwidth. Physical constraints, such as user or on-premises resources, determine location options. These constraints can be offset with edge locations or resource placement.", &[
         c("perf_network_impact_performance", "Understand how networking impacts performance",
           "Understand how the network's latency, throughput and jitter affect the workload."),
         c("perf_network_features", "Evaluate available networking features",
@@ -558,7 +603,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("perf_network_optimize_config_metrics", "Optimize network configuration based on metrics",
           "Tune the network configuration from the metrics the workload produces."),
     ]),
-    q("performance", "performance-monitoring", "What process do you use to support more performance efficiency for your workload?", &[
+    q("performance", "performance-monitoring", "What process do you use to support more performance efficiency for your workload?",
+      "When architecting workloads, there are principles and practices that you can adopt to help you better run efficient high-performing cloud workloads. To adopt a culture that fosters performance efficiency of cloud workloads, consider these key principles and practices.", &[
         c("perf_process_kpis", "Establish key performance indicators (KPIs) to measure workload health and performance",
           "Define the indicators that say whether the workload performs as the business requires."),
         c("perf_process_monitoring_solutions", "Use monitoring solutions to understand the areas where performance is most critical",
@@ -575,27 +621,29 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
           "Review the performance metrics regularly, so that a regression is found by you rather than by a user."),
     ]),
     // Cost optimization — COST 1-11.
-    q("costOptimization", "cloud-financial-management", "How do you implement cloud financial management?", &[
+    q("costOptimization", "cloud-financial-management", "How do you implement cloud financial management?",
+      "Implementing Cloud Financial Management enables organizations to realize business value and financial success as they optimize their cost and usage and scale on AWS.", &[
         c("cost_cloud_financial_management_function", "Establish ownership of cost optimization",
-          "Create a team that is accountable for establishing and maintaining cost awareness across the organization."),
+          "Create a team (Cloud Business Office, Cloud Center of Excellence, or FinOps team) that is responsible for establishing and maintaining cost awareness across your organization. The team requires people from finance, technology, and business roles across the organization."),
         c("cost_cloud_financial_management_partnership", "Establish a partnership between finance and technology",
-          "Involve finance and technology teams in cost and usage discussions at every stage of the workload's life."),
-        c("cost_cloud_financial_management_cloud_budget_forecast", "Establish cloud budgets and forecasts",
-          "Adjust budgeting and forecasting to the variable, on-demand nature of cloud cost and usage."),
-        c("cost_cloud_financial_management_cost_aware_process", "Implement cost awareness in your organizational processes",
-          "Include cost awareness in the processes the organization already runs, including change and release processes."),
-        c("cost_cloud_financial_management_report_notify", "Report and notify on cost optimization",
-          "Report on cost and usage, and notify the owners of a workload when either moves outside what was expected."),
+          "Involve finance and technology teams in cost and usage discussions at all stages of your cloud journey. Teams regularly meet and discuss topics such as organizational goals and targets, current state of cost and usage, and financial and accounting practices."),
+        c("cost_cloud_financial_management_budget_forecast", "Establish cloud budgets and forecasts",
+          "Adjust existing organizational budgeting and forecasting processes to be dynamic and to account for the variable, on-demand nature of cloud cost and usage, using either a trend-based algorithm over historical cost and usage or an algorithm driven by business drivers, or a combination of both."),
+        c("cost_cloud_financial_management_cost_awareness", "Implement cost awareness in your organizational processes",
+          "Implement cost awareness, create transparency, and establish accountability for costs in new and existing processes that influence usage, and leverage existing processes for cost awareness. Implement cost awareness into employee training."),
         c("cost_cloud_financial_management_proactive_process", "Monitor cost proactively",
-          "Monitor cost and usage against the budget, so that a trend is acted on before the bill arrives."),
-        c("cost_cloud_financial_management_keep_up_to_date", "Keep up-to-date with new service releases",
-          "Evaluate new services, features and pricing, and adopt the ones that lower the workload's cost."),
-        c("cost_cloud_financial_management_cost_aware_culture", "Create a cost-aware culture",
-          "Build cost awareness into the organization's culture, so that cost is considered by the teams that incur it."),
-        c("cost_cloud_financial_management_business_value", "Quantify business value from cost optimization",
-          "Quantify what cost optimization returned to the business, so that further optimization can be justified."),
+          "Implement tooling and dashboards to monitor cost proactively for the workload, rather than reporting on cost after it has been incurred. Monitoring and analyzing costs proactively helps to identify trends and allows you to act on them before they reach the bill."),
+        c("cost_cloud_financial_management_scheduled", "Keep up-to-date with new service releases",
+          "Consult regularly with experts or AWS Partners to consider which services and features provide lower cost, and review new service and feature releases, pricing models and blog posts on a regular cadence so that the workload adopts the ones that reduce its cost."),
+        c("cost_cloud_financial_management_quantify_value", "Quantify business value from cost optimization",
+          "Quantify the business value delivered by cost optimization — the cost reduced and avoided, and the value of the resources and effort released by it — so that the return on the investment cost optimization requires can be explained to stakeholders and further optimization justified."),
+        c("cost_cloud_financial_management_usage_report", "Report and notify on cost optimization",
+          "Configure budgets, anomaly detection and notifications on cost and usage against the targets the organization set, and report on them to the teams that own the workload, so that an unexpected cost or usage trend reaches its owner."),
+        c("cost_cloud_financial_management_culture", "Create a cost-aware culture",
+          "Adopt a cost-aware culture that encourages cost awareness and accountability throughout your organization, implementing small changes continuously: small changes in cost add up across a high volume of resources and over time, and a culture that considers cost sustains them."),
     ]),
-    q("costOptimization", "govern-usage", "How do you govern usage?", &[
+    q("costOptimization", "govern-usage", "How do you govern usage?",
+      "Establish policies and mechanisms to make sure that appropriate costs are incurred while objectives are achieved. By employing a checks-and-balances approach, you can innovate without overspending.", &[
         c("cost_govern_usage_policies", "Develop policies based on your organization requirements",
           "Develop the policies that say which resources, Regions and services the organization allows."),
         c("cost_govern_usage_goals_targets", "Implement goals and targets",
@@ -609,7 +657,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_govern_usage_track_lifecycle", "Track project lifecycle",
           "Track the lifecycle of each project, so that the resources of a finished one are released."),
     ]),
-    q("costOptimization", "monitor-usage", "How do you monitor usage and cost?", &[
+    q("costOptimization", "monitor-usage", "How do you monitor usage and cost?",
+      "Establish policies and procedures to monitor and appropriately allocate your costs. This permits you to measure and improve the cost efficiency of this workload.", &[
         c("cost_monitor_usage_detailed_sources", "Configure detailed information sources",
           "Configure the detailed cost and usage data the organization needs to attribute cost."),
         c("cost_monitor_usage_org_information", "Add organization information to cost and usage",
@@ -623,7 +672,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_monitor_usage_allocate_wkld_metrics", "Allocate costs based on workload metrics",
           "Allocate cost by the workload's own metrics, so that each consumer sees the cost it causes."),
     ]),
-    q("costOptimization", "decomission-resources", "How do you decommission resources?", &[
+    q("costOptimization", "decomission-resources", "How do you decommission resources?",
+      "Implement change control and resource management from project inception to end-of-life. This ensures you shut down or terminate unused resources to reduce waste.", &[
         c("cost_decomissioning_resources_track", "Track resources over their lifetime",
           "Track each resource from its creation, so that one nothing uses can be found."),
         c("cost_decomissioning_resources_implement_process", "Implement a decommissioning process",
@@ -635,7 +685,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_decomissioning_resources_data_retention", "Enforce data retention policies",
           "Enforce the retention policy of each data set, so that data is kept only as long as it is needed."),
     ]),
-    q("costOptimization", "select-service", "How do you evaluate cost when you select services?", &[
+    q("costOptimization", "select-service", "How do you evaluate cost when you select services?",
+      "Amazon EC2, Amazon EBS, and Amazon S3 are building-block AWS services. Managed services, such as Amazon RDS and Amazon DynamoDB, are higher level, or application level, AWS services. By selecting the appropriate building blocks and managed services, you can optimize this workload for cost.", &[
         c("cost_select_service_requirements", "Identify organization requirements for cost",
           "Identify how much cost matters relative to the workload's other requirements."),
         c("cost_select_service_analyze_all", "Analyze all components of the workload",
@@ -649,7 +700,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_select_service_analysis_over_time", "Perform cost analysis for different usage over time",
           "Analyze cost against the usage the workload will have over time rather than against today's usage alone."),
     ]),
-    q("costOptimization", "resource-type-size-number", "How do you meet cost targets when you select resource type, size and number?", &[
+    q("costOptimization", "resource-type-size-number", "How do you meet cost targets when you select resource type, size and number?",
+      "Verify that you choose the appropriate resource size and number of resources for the task at hand. You minimize waste by selecting the most cost effective type, size, and number.", &[
         c("cost_type_size_number_resources_cost_modeling", "Perform cost modeling",
           "Model the cost of the workload at the resource types, sizes and numbers it could run on."),
         c("cost_type_size_number_resources_data", "Select resource type, size, and number based on data",
@@ -657,7 +709,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_type_size_number_resources_metrics", "Select resource type, size, and number automatically based on metrics",
           "Let automation choose the resource type, size and number from the workload's own metrics."),
     ]),
-    q("costOptimization", "pricing-model", "How do you use pricing models to reduce cost?", &[
+    q("costOptimization", "pricing-model", "How do you use pricing models to reduce cost?",
+      "Use the pricing model that is most appropriate for your resources to minimize expense.", &[
         c("cost_pricing_model_analysis", "Perform pricing model analysis",
           "Analyze the workload's usage against the available pricing models, and commit where the usage is steady."),
         c("cost_pricing_model_region_cost", "Choose Regions based on cost",
@@ -669,7 +722,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_pricing_model_master_account", "Perform pricing model analysis at the management account level",
           "Analyze pricing models across the organization, so that commitments are shared by every account."),
     ]),
-    q("costOptimization", "data-transfer", "How do you plan for data transfer charges?", &[
+    q("costOptimization", "data-transfer", "How do you plan for data transfer charges?",
+      "Verify that you plan and monitor data transfer charges so that you can make architectural decisions to minimize costs. A small yet effective architectural change can drastically reduce your operational costs over time.", &[
         c("cost_data_transfer_modeling", "Perform data transfer modeling",
           "Model the data the workload transfers, and where it transfers it, so that its cost is known."),
         c("cost_data_transfer_select_components", "Select components to optimize data transfer cost",
@@ -677,7 +731,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_data_transfer_implement_services", "Implement services to reduce data transfer costs",
           "Use services, such as a cache or a content delivery network, that lower what data transfer costs."),
     ]),
-    q("costOptimization", "manage-demand-and-supply-resources", "How do you manage demand, and supply resources?", &[
+    q("costOptimization", "manage-demand-and-supply-resources", "How do you manage demand, and supply resources?",
+      "For a workload that has balanced spend and performance, verify that everything you pay for is used and avoid significantly underutilizing instances. A skewed utilization metric in either direction has an adverse impact on your organization, in either operational costs (degraded performance due to over-utilization), or wasted AWS expenditures (due to over-provisioning).", &[
         c("cost_manage_demand_supply_analysis", "Perform an analysis on the workload demand",
           "Analyze the workload's demand over time, so that supply can be matched to it."),
         c("cost_manage_demand_supply_buffer_throttle", "Implement a buffer or throttle to manage demand",
@@ -685,22 +740,26 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("cost_manage_demand_supply_dynamic", "Supply resources dynamically",
           "Supply resources as demand arrives rather than provisioning for the peak in advance."),
     ]),
-    q("costOptimization", "evaluate-new-services", "How do you evaluate new services?", &[
+    q("costOptimization", "evaluate-new-services", "How do you evaluate new services?",
+      "As AWS releases new services and features, it's a best practice to review your existing architectural decisions to verify that they continue to be the most cost effective.", &[
         c("cost_evaluate_new_services_review_process", "Develop a workload review process",
           "Have a process for reviewing the workload against the services and features now available."),
         c("cost_evaluate_new_services_review_analyze", "Review and analyze this workload regularly",
           "Review the workload on a cadence, and act on the cost improvements the review finds."),
     ]),
-    q("costOptimization", "evaluate-cost-of-effort", "How do you evaluate the cost of effort?", &[
+    q("costOptimization", "evaluate-cost-of-effort", "How do you evaluate the cost of effort?",
+      "Evaluate the cost of effort for operations in the cloud, review your effort-reduction plan, and implement low-effort operations to achieve your cost optimization goals.", &[
         c("cost_evaluate_cost_effort_automation", "Perform automation for operations",
           "Evaluate the cost of the effort an operation takes, and automate it where automation costs less."),
     ]),
     // Sustainability — SUS 1-6.
-    q("sustainability", "region-selection", "How do you select Regions for your workload?", &[
+    q("sustainability", "region-selection", "How do you select Regions for your workload?",
+      "The choice of Region for your workload significantly affects its KPIs, including performance, cost, and carbon footprint. To effectively improve these KPIs, you should choose Regions for your workload based on both business requirements and sustainability goals.", &[
         c("sus_region_selection_business_sustainability", "Choose Region based on both business requirements and sustainability goals",
           "Choose the Regions the workload runs in from its business requirements and from the sustainability goals it serves."),
     ]),
-    q("sustainability", "user-behavior-patterns", "How do you align cloud resources to your demand?", &[
+    q("sustainability", "user-behavior-patterns", "How do you align cloud resources to your demand?",
+      "The way users and applications consume your workloads and other resources can help you identify improvements to meet sustainability goals. Scale infrastructure to continually match demand and verify that you use only the minimum resources required to support your users. Align service levels to customer needs. Position resources to limit the network required for users to consume them. Remove unused assets.", &[
         c("sus_align_demand_scale_dynamically", "Scale workload infrastructure dynamically",
           "Scale the infrastructure with demand, so that provisioned resources are used rather than idle."),
         c("sus_align_demand_align_slas", "Align SLAs with sustainability goals",
@@ -714,7 +773,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sus_align_demand_buffer_throttle", "Implement buffering or throttling to flatten the demand curve",
           "Buffer or throttle demand, so that the workload runs on a flatter and smaller capacity profile."),
     ]),
-    q("sustainability", "software-architecture", "How do you take advantage of software and architecture patterns to support your sustainability goals?", &[
+    q("sustainability", "software-architecture", "How do you take advantage of software and architecture patterns to support your sustainability goals?",
+      "Implement patterns for performing load smoothing and maintaining consistent high utilization of deployed resources to minimize the resources consumed. Components might become idle from lack of use because of changes in user behavior over time. Revise patterns and architecture to consolidate under-utilized components to increase overall utilization. Retire components that are no longer required.", &[
         c("sus_software_arch_async_scheduled", "Optimize software and architecture for asynchronous and scheduled jobs",
           "Run work asynchronously or on a schedule, so that it uses capacity that would otherwise be idle."),
         c("sus_software_arch_remove_low_use", "Remove or refactor workload components with low or no use",
@@ -726,7 +786,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sus_software_arch_data_patterns", "Use software patterns and architectures that best support data access and storage patterns",
           "Choose the patterns and architectures that fit how the workload accesses and stores its data."),
     ]),
-    q("sustainability", "data-patterns", "How do you take advantage of data access and usage patterns to support your sustainability goals?", &[
+    q("sustainability", "data-patterns", "How do you take advantage of data access and usage patterns to support your sustainability goals?",
+      "Implement data management practices to reduce the provisioned storage required to support your workload, and the resources required to use it. Understand your data, and use storage technologies and configurations that best support the business value of the data and how it's used. Lifecycle data to more efficient, less performant storage when requirements decrease, and delete data that's no longer required.", &[
         c("sus_data_classification_policy", "Implement a data classification policy",
           "Classify data by how it is accessed and how long it is needed, so that each class can be stored accordingly."),
         c("sus_data_access_storage_tech", "Use technologies that support data access and storage patterns",
@@ -744,7 +805,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sus_data_backup_difficult_to_recreate", "Back up data only when difficult to recreate",
           "Back up the data that would be hard to recreate, and recreate the rest instead of storing it twice."),
     ]),
-    q("sustainability", "hardware-patterns", "How do your hardware management and usage practices support your sustainability goals?", &[
+    q("sustainability", "hardware-patterns", "How do your hardware management and usage practices support your sustainability goals?",
+      "Look for opportunities to reduce workload sustainability impacts by making changes to your hardware management practices. Minimize the amount of hardware needed to provision and deploy, and select the most efficient hardware and services for your individual workload.", &[
         c("sus_hardware_minimum_amount", "Use the minimum amount of hardware to meet your needs",
           "Provision the smallest amount of hardware that meets the workload's requirements."),
         c("sus_hardware_instance_types", "Use instance types with the least impact",
@@ -754,7 +816,8 @@ pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
         c("sus_hardware_accelerators", "Optimize your use of hardware-based compute accelerators",
           "Use an accelerator only where it does the work more efficiently, and keep it utilized."),
     ]),
-    q("sustainability", "dev-deploy-patterns", "How do your development and deployment processes support your sustainability goals?", &[
+    q("sustainability", "dev-deploy-patterns", "How do your development and deployment processes support your sustainability goals?",
+      "Look for opportunities to reduce your sustainability impact by making changes to your development, test, and deployment practices.", &[
         c("sus_dev_deploy_rapid_improvements", "Adopt methods that can rapidly introduce sustainability improvements",
           "Adopt delivery methods that let a sustainability improvement reach production quickly."),
         c("sus_dev_deploy_keep_up_to_date", "Keep your workload up-to-date",

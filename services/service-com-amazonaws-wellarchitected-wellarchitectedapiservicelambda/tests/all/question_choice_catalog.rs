@@ -40,6 +40,10 @@ const CHOICE_TITLE_RANGE: (usize, usize) = (1, 512);
 /// One `ChoiceStatus` member, from `smithy_query(query="shape", shape="ChoiceStatus")`.
 const SELECTED: &str = "SELECTED";
 
+/// `Choice$Title` of the terminal choice every question of an AWS-official lens offers
+/// after the best practices it asks about.
+const NONE_OF_THESE: &str = "None of these";
+
 /// One question's choice catalog as the wire reports it: `(ChoiceId, Title)` in the
 /// order the lens offers the choices.
 type Catalog = Vec<(String, String)>;
@@ -363,8 +367,9 @@ async fn every_answer_summary_carries_the_questions_choice_catalog() {
 /// A `ChoiceId` discovered over the wire is the id the stored answer speaks about: the
 /// summary reports it in `SelectedChoices` and `ChoiceAnswerSummaries` and derives the
 /// question's `Risk` from it, while the catalog itself is unchanged by the answer. The
-/// rows differ along HOW MUCH of the discovered catalog the answer selects — the first
-/// choice, the last choice, all of them, and none — which is what moves the risk.
+/// rows differ along HOW MUCH of the discovered catalog the answer selects — one best
+/// practice, all but one, all of them, the terminal "None of these" choice, and none —
+/// which is what moves the risk.
 #[tokio::test]
 async fn a_discovered_choice_id_round_trips_through_the_stored_answer() {
     let client = Client::new();
@@ -390,12 +395,38 @@ async fn a_discovered_choice_id_round_trips_through_the_stored_answer() {
             .get(question_id)
             .unwrap_or_else(|| panic!("{question_id} must be reported by ListAnswers"));
         let ids: Vec<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
-        let last = ids.last().cloned().expect("a non-empty catalog");
+        // The best practices the question asks about are its catalog less the terminal
+        // "None of these" choice, which says none of them are in place.
+        let best_practices: Vec<String> = catalog
+            .iter()
+            .filter(|(_, title)| title != NONE_OF_THESE)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let none_of_these: Vec<String> = catalog
+            .iter()
+            .filter(|(_, title)| title == NONE_OF_THESE)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            none_of_these.len(),
+            1,
+            "{question_id}: the question must offer exactly one terminal choice, got \
+             {catalog:?}"
+        );
+        let all_but_one: Vec<String> = best_practices
+            .iter()
+            .take(best_practices.len().saturating_sub(1))
+            .cloned()
+            .collect();
 
         let rows: Vec<AnswerRow> = vec![
-            ("first-choice-only", vec![ids[0].clone()], "MEDIUM"),
-            ("last-choice-only", vec![last.clone()], "MEDIUM"),
-            ("every-choice", ids.clone(), "NONE"),
+            // One best practice of several satisfies no risk-reducing rule of the lens, so
+            // the answer takes its default rating.
+            ("first-best-practice-only", vec![best_practices[0].clone()], "HIGH"),
+            ("all-but-one-best-practice", all_but_one.clone(), "MEDIUM"),
+            ("every-best-practice", best_practices.clone(), "NONE"),
+            // The terminal choice says no best practice is in place.
+            ("none-of-these-only", none_of_these.clone(), "HIGH"),
             // Naming no choice at all answers nothing, so the question is back to
             // UNANSWERED whatever it recorded before.
             ("no-choice", Vec::new(), "UNANSWERED"),

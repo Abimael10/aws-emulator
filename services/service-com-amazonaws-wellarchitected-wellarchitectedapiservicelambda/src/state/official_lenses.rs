@@ -36,7 +36,16 @@
 //!
 //! The FRAMEWORK lens's content is the framework's own published content: its `question_id`s
 //! and its choices' `ChoiceId`s and prose are the ones the Well-Architected Framework lens
-//! publishes, carried verbatim (see [`super::FRAMEWORK_LENS_QUESTIONS`]).
+//! publishes, carried verbatim (see [`super::FRAMEWORK_LENS_QUESTIONS`]). A lens that
+//! publishes its question content also serves a document per question, which is what an
+//! answer's `HelpfulResourceUrl` and `ImprovementPlanUrl` address
+//! ([`lens_question_document_url`]).
+//!
+//! Every question of EVERY lens here also offers the terminal "None of these" choice after
+//! the best practices it asks about ([`super::FrameworkQuestion::none_of_these_id`]): it is
+//! the only way a client can answer a question negatively, and selecting it is what the
+//! lens's risk rules rate as leaving no best practice in place
+//! ([`super::official_lens_risk`]).
 //!
 //! Below each SPECIALISED lens, the pillars, questions and best practices are a question
 //! set written from that lens's published focus areas, under this emulator's own stable ids
@@ -88,9 +97,44 @@ macro_rules! authored_question {
             pillar_id: $pillar_id,
             question_id: $question_id,
             title: $title,
+            // This emulator has no published question description to report for such a
+            // lens either, and the member is optional, so it is left off rather than
+            // filled with something else.
+            description: None,
             best_practices: &[$(bp($best_practice)),*],
         }
     };
+}
+
+/// Where a lens AWS publishes serves its own content: the root the per-question documents
+/// a lens review links to live under, one path segment per lens version.
+///
+/// `Answer$HelpfulResourceUrl` and `$ImprovementPlanUrl` are documents of the LENS, so
+/// they are addressed under the lens's published content root, by the version the content
+/// is published at and the question's own id ([`lens_question_document_url`]) — every
+/// identifier here is one the lens publishes, so a question's documents move with the
+/// lens's content rather than being stored beside it.
+pub const LENS_CONTENT_ROOT: &str = "https://wa.aws.amazon.com/wellarchitected";
+
+/// The fragment of a question's document that holds the improvement plan for it: the plan
+/// is a section of the question's own published document, which is what makes
+/// `Answer$ImprovementPlanUrl` and `$HelpfulResourceUrl` point into the same document
+/// ([`improvement_plan_url_of`]).
+pub const IMPROVEMENT_PLAN_FRAGMENT: &str = "#improvement-plan";
+
+/// The document `lens` publishes for the question `question_id`, under the version its
+/// content is published at: `Answer$HelpfulResourceUrl` (`@length(1, 2048)`).
+pub fn lens_question_document_url(lens: &OfficialLens, question_id: &str) -> String {
+    format!(
+        "{LENS_CONTENT_ROOT}/{}/{}/{question_id}.html",
+        lens.version, lens.alias
+    )
+}
+
+/// The improvement plan of the question whose document is at `document`:
+/// `Answer$ImprovementPlanUrl` (`@length(1, 2048)`), the plan's section of that document.
+pub fn improvement_plan_url_of(document: &str) -> String {
+    format!("{document}{IMPROVEMENT_PLAN_FRAGMENT}")
 }
 
 /// The six pillars of the AWS Well-Architected Framework, in the order the framework

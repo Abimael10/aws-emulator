@@ -157,7 +157,10 @@ fn text(value: &Value, member: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The `ChoiceId`s the question asks about, in the order its catalog publishes them.
+/// The `ChoiceId`s of the BEST PRACTICES the question asks about, in the order its catalog
+/// publishes them — its catalog less the terminal "None of these" choice every question of
+/// an AWS-official lens offers after them, which is the answer that none of those best
+/// practices are in place rather than one of them.
 fn choice_ids(answer: &Value) -> Vec<String> {
     answer
         .get("Choices")
@@ -165,11 +168,15 @@ fn choice_ids(answer: &Value) -> Vec<String> {
         .map(|choices| {
             choices
                 .iter()
+                .filter(|choice| text(choice, "Title").as_deref() != Some(NONE_OF_THESE))
                 .filter_map(|choice| text(choice, "ChoiceId"))
                 .collect()
         })
         .unwrap_or_default()
 }
+
+/// `Choice$Title` of that terminal choice.
+const NONE_OF_THESE: &str = "None of these";
 
 /// Every `ChoiceAnswer` the answer reports, as `ChoiceId -> (Status, Reason, Notes)`.
 #[allow(clippy::type_complexity)]
@@ -195,12 +202,13 @@ fn choice_answers(answer: &Value) -> BTreeMap<String, (String, Option<String>, O
         .unwrap_or_default()
 }
 
-/// The `Risk` a question carries, derived the way the Well-Architected Tool rates one:
-/// a question that does not apply is `NOT_APPLICABLE`, one whose answer selects none of
-/// its best practices is still `UNANSWERED` — the selection is what answers it, so
-/// clearing it unanswers the question again — one with every best practice in place is
-/// `NONE`, and one in between is `MEDIUM`. The five members are what
-/// `smithy_query(query="shape", shape="Risk")` publishes.
+/// The `Risk` a question of an AWS-official lens carries, derived the way that lens's
+/// published risk rules rate one: a question that does not apply is `NOT_APPLICABLE`, one
+/// whose answer selects none of its best practices is still `UNANSWERED` — the selection is
+/// what answers it, so clearing it unanswers the question again — one with every best
+/// practice in place is `NONE`, one with at least half of them in place is `MEDIUM`, and
+/// every thinner selection takes the lens's default rating, `HIGH`. The five members are
+/// what `smithy_query(query="shape", shape="Risk")` publishes.
 fn expected_risk(selected: usize, asks: usize, is_applicable: bool) -> &'static str {
     if !is_applicable {
         "NOT_APPLICABLE"
@@ -208,8 +216,10 @@ fn expected_risk(selected: usize, asks: usize, is_applicable: bool) -> &'static 
         "UNANSWERED"
     } else if selected == asks {
         "NONE"
-    } else {
+    } else if selected * 2 >= asks {
         "MEDIUM"
+    } else {
+        "HIGH"
     }
 }
 
