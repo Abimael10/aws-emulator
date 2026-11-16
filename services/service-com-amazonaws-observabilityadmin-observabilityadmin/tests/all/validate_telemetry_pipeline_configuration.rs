@@ -22,10 +22,10 @@
 //!    declare (`MISSING_FIELD`, carrying that property's own NAME — the `pipeline` the
 //!    schema requires of a document that declares none, and the `source`/`sink` a
 //!    section it does declare is missing), a property the schema does not define
-//!    (`UNKNOWN_PROPERTY`, carrying the path it is written at), a property carrying a
-//!    number of items the schema does not allow, a POSITION of the processor sequence
-//!    this emulator cannot run (its own category, since the document may be one the real
-//!    service accepts), and every field naming an ARN carrying one — the IAM role syntax
+//!    (`UNKNOWN_PROPERTY`, carrying the path it is written at — the processor a POSITION
+//!    of the processor sequence names and the options it configures it with included), a
+//!    property carrying a number of items the schema does not allow, and every field
+//!    naming an ARN carrying one — the IAM role syntax
 //!    where the field names the role a plugin assumes. A section reading AWS-vended log
 //!    events is checked against the schema's restricted branches for that source as well,
 //!    whose own category and descriptors `vended_log_pipelines.rs` asserts;
@@ -47,11 +47,10 @@ const HOME_REGION: &str = "us-west-2";
 const PARSE_ERROR: &str = "PIPELINE_CONFIGURATION_PARSE_ERROR";
 const VALIDATION_ERROR: &str = "PIPELINE_CONFIGURATION_VALIDATION_ERROR";
 const INVALID_PATTERN: &str = "INVALID_PATTERN";
-/// The category for a processor, or a processor option, this emulator does not run —
-/// its own code, because such a document may be one the real service accepts.
-const UNSUPPORTED_PROCESSOR: &str = "UNSUPPORTED_PROCESSOR";
 /// The two categories a schema validator reports a property problem under: a required
-/// property that is not there, and a property the schema does not define.
+/// property that is not there, and a property the schema does not define — which is what
+/// a position of the processor sequence naming a processor the schema does not define,
+/// or an option it does not define for that processor, is reported as.
 const MISSING_FIELD: &str = "MISSING_FIELD";
 const UNKNOWN_PROPERTY: &str = "UNKNOWN_PROPERTY";
 /// The category a defect of one of the schema's vended-log restrictions carries, and the
@@ -432,14 +431,14 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
             vec![(VALIDATION_ERROR, "path")],
         ),
         (
-            "a processor this emulator does not run",
+            "a processor the schema does not define",
             top_level("processor:\n  - grok:\n      match: \"%{COMMONAPACHELOG}\"\n"),
-            vec![(UNSUPPORTED_PROCESSOR, "path")],
+            vec![(UNKNOWN_PROPERTY, "path")],
         ),
         (
-            "an option the processor does not take",
+            "an option the schema does not define for the processor it configures",
             top_level("processor:\n  - csv:\n      delete_source: true\n"),
-            vec![(UNSUPPORTED_PROCESSOR, "path")],
+            vec![(UNKNOWN_PROPERTY, "path")],
         ),
         (
             "an entry naming two processors at once",
@@ -485,7 +484,7 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
         (
             "a section with a processor defect AND no sink",
             "source:\n  http: {}\nprocessor:\n  - grok: {}\n".to_string(),
-            vec![(UNSUPPORTED_PROCESSOR, "path"), (MISSING_FIELD, "name")],
+            vec![(UNKNOWN_PROPERTY, "path"), (MISSING_FIELD, "name")],
         ),
         (
             "a role ARN that is not an ARN at all",

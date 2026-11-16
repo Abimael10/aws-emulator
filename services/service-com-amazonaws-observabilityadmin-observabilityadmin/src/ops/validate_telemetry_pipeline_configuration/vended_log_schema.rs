@@ -25,9 +25,12 @@
 //!
 //! The defects are the restriction's own ([`REASON_DATA_SOURCE_PROCESSOR_RESTRICTED`],
 //! keyed by the restriction's descriptors, because what is wrong is the pair of the
-//! source and the processor rather than one field of the document) and the schema's
-//! plain unknown-property one for a POSITION of the sequence naming a processor the
-//! vended-log branch does not define at all ([`defines_processor`]).
+//! source and the processor rather than one field of the document). A POSITION of the
+//! sequence naming a processor the vended-log branch does not define at all is the
+//! schema's plain unknown-property defect, which the schema walk in [`super`] reports
+//! for every section against the vocabulary that section's own source pins
+//! ([`defines_processor`], [`restricts_processors`]) — one place reports a position,
+//! whatever its section reads from.
 
 use ::std::collections::HashMap;
 
@@ -35,10 +38,7 @@ use crate::ops::test_telemetry_pipeline::{Node, PROCESSOR_KEY, SOURCE_KEY};
 use crate::ops::types::ValidationError;
 use crate::state::{declared_data_source_names, plugins_declared};
 
-use super::{
-    at_most_items_message, defect_prefix, missing_property_message, processor_path,
-    undefined_property_message, unknown_property,
-};
+use super::{at_most_items_message, missing_property_message, undefined_property_message};
 
 /// `ValidationError$Reason` for a configuration that pairs a data source with a
 /// processor the schema's branch for that source does not admit — including by running
@@ -135,7 +135,7 @@ const GENERAL_VENDED_LOG_PROCESSORS: &[&str] = &["parse_json"];
 /// A position naming anything else names a processor that schema does not define —
 /// whether or not this emulator happens to run it, which is a separate observation
 /// ([`super`]'s own category for a processor it cannot run).
-fn defines_processor(name: &str) -> bool {
+pub(super) fn defines_processor(name: &str) -> bool {
     GENERAL_VENDED_LOG_PROCESSORS.contains(&name)
         || RESTRICTIONS
             .iter()
@@ -155,11 +155,20 @@ pub(crate) fn is_vended_log_source_type(plugin: &str) -> bool {
         .any(|restriction| restriction.source_type == plugin)
 }
 
+/// Whether the vended-log branch of the schema is what names `section`'s processor
+/// vocabulary: a section reading AWS-vended log events, and a section declaring no
+/// source at all, which pins no branch and so is measured against every one of them. A
+/// section reading from a third-party source names its processors from the general
+/// vocabulary instead ([`super`]).
+pub(super) fn restricts_processors(section: &Node) -> bool {
+    vended_source(section).is_some()
+}
+
 /// Every defect the `sections` of a configuration document have against the vended-log
-/// branches of the schema, branch by branch and then position by position.
+/// branches of the schema, branch by branch.
 pub(crate) fn vended_log_defects(sections: &[(&str, &Node)]) -> Vec<ValidationError> {
     let mut defects = Vec::new();
-    for (name, section) in sections {
+    for (_, section) in sections {
         let Some(source) = vended_source(section) else {
             continue;
         };
@@ -176,15 +185,6 @@ pub(crate) fn vended_log_defects(sections: &[(&str, &Node)]) -> Vec<ValidationEr
         {
             if let Some(defect) = restriction.defect(section, &processors) {
                 defects.push(defect);
-            }
-        }
-        let prefix = defect_prefix(name);
-        for (index, processor) in &processors.named {
-            if !defines_processor(processor) {
-                defects.push(unknown_property(
-                    processor,
-                    &processor_path(prefix, *index),
-                ));
             }
         }
     }

@@ -698,16 +698,17 @@ struct ProcessorPositions {
     expected: Vec<(&'static str, &'static str)>,
 }
 
-/// Every POSITION of a processor sequence this emulator cannot run is reported on its
-/// own: its own entry, naming what is wrong and the path of that position, under this
-/// emulator's own category — the real service's processor catalogue is not in the
-/// model, so a name is never reported as one the schema does not define.
+/// Every POSITION of a processor sequence the schema does not define is reported on its
+/// own: its own entry, worded the way a schema validator reports an undefined property
+/// and pinned to the path that property is written at — the position for the processor
+/// it names, and the option's own place inside it for an option the schema does not
+/// define for that processor.
 ///
 /// The rows differ along what the rule generalises over: how many positions are at
 /// fault, where they are (one section, or one position in each of two chained
-/// sections), and whether the fault is the processor or one of its options.
+/// sections), and whether the undefined property is the processor or one of its options.
 #[tokio::test]
-async fn every_processor_position_this_emulator_cannot_run_is_reported_on_its_own() {
+async fn every_processor_position_the_schema_does_not_define_is_reported_on_its_own() {
     let emulator = emulator();
 
     let rows: Vec<ProcessorPositions> = vec![
@@ -724,10 +725,10 @@ async fn every_processor_position_this_emulator_cannot_run_is_reported_on_its_ow
             expected: vec![("processor[0]", "grok"), ("processor[1]", "geoip")],
         },
         ProcessorPositions {
-            case: "an option the processor does not take",
+            case: "an option the schema does not define for the processor it configures",
             body: "source:\n  http: {}\nprocessor:\n  - csv:\n      delete_source: true\nsink:\n  \
                    - cloudwatch_logs: {}\n",
-            expected: vec![("processor[0]", "delete_source")],
+            expected: vec![("processor[0].csv.delete_source", "delete_source")],
         },
         ProcessorPositions {
             case: "one position in each of two chained sections",
@@ -737,11 +738,11 @@ async fn every_processor_position_this_emulator_cannot_run_is_reported_on_its_ow
                    sink:\n    - cloudwatch_logs: {}\n",
             expected: vec![
                 ("entry.processor[0]", "grok"),
-                ("exit.processor[0]", "delete_source"),
+                ("exit.processor[0].csv.delete_source", "delete_source"),
             ],
         },
         ProcessorPositions {
-            case: "a sequence this emulator runs, which is no defect at all",
+            case: "a sequence the schema defines every position of, which is no defect at all",
             body: "source:\n  http: {}\nprocessor:\n  - parse_json: {}\n  - trim_string:\n      \
                    with_keys: [\"message\"]\nsink:\n  - cloudwatch_logs: {}\n",
             expected: vec![],
@@ -769,7 +770,7 @@ async fn every_processor_position_this_emulator_cannot_run_is_reported_on_its_ow
         let mut positions: Vec<(String, String)> = errors
             .iter()
             .filter(|error| {
-                error.get("Reason").and_then(Value::as_str) == Some("UNSUPPORTED_PROCESSOR")
+                error.get("Reason").and_then(Value::as_str) == Some("UNKNOWN_PROPERTY")
             })
             .map(|error| {
                 (

@@ -942,8 +942,22 @@ pub(crate) fn step_defect(name: &str, options: &Node, patterns: &mut usize) -> R
     compile_step(name, options, patterns).map(|_| ())
 }
 
+/// The options the processor `name` takes, or `None` for a name this format's processor
+/// catalogue ([`PROCESSORS`]) does not carry.
+///
+/// `ValidateTelemetryPipelineConfiguration` measures a position of a document's
+/// `processor` sequence against the SAME catalogue the chain compiles against, so the
+/// two never disagree about which processors the format defines, or about which options
+/// one of them takes.
+pub(crate) fn processor_options(name: &str) -> Option<&'static [&'static str]> {
+    PROCESSORS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, options)| *options)
+}
+
 fn compile_step(name: &str, options: &Node, patterns: &mut usize) -> Result<Step, String> {
-    let Some((_, allowed)) = PROCESSORS.iter().find(|(known, _)| known == &name) else {
+    let Some(allowed) = processor_options(name) else {
         return Err(format!(
             "the pipeline configuration names the processor '{name}', which this emulator does \
              not run; it runs [{}]",

@@ -35,13 +35,12 @@
 //! * a section reading log events AWS vends runs a processor the schema's branch for
 //!   that source does not admit, or more of them than it admits, or leaves out a
 //!   property that branch's source requires — each reported under the restriction's own
-//!   reason, keyed by the restriction's descriptors, and a position naming a processor
-//!   that branch does not define at all reported as the undefined property it is
-//!   ([`vended_log_schema`]);
-//! * a position of a section's `processor` sequence names a processor, or an option,
-//!   this emulator does not run, which carries its own reason code because the document
-//!   may be one the real service accepts: what the emulator cannot RUN is a different
-//!   observation from what the schema does not define;
+//!   reason, keyed by the restriction's descriptors ([`vended_log_schema`]);
+//! * a position of a section's `processor` sequence names a processor the schema does
+//!   not define — which processors it defines depends on the section's own source — or
+//!   configures a processor it does define with an option the schema does not define for
+//!   it, each reported as the undefined property it is; what this emulator can RUN is
+//!   not a property of the document and is reported about none of them;
 //! * a field of the document whose name names an ARN (its last name token is `arn`:
 //!   the role a source assumes, the resource a sink writes to) does not carry one,
 //!   measured against the ARN syntax this service's own model declares — the narrower
@@ -128,8 +127,8 @@ use ::std::sync::LazyLock;
 use ::regex::Regex;
 
 use crate::ops::test_telemetry_pipeline::{
-    declared_sections, is_section, parse_configuration, processor_chain, step_defect, Node,
-    PROCESSOR_KEY, SINK_KEY, SOURCE_KEY,
+    declared_sections, is_section, parse_configuration, processor_chain, processor_options,
+    step_defect, Node, PROCESSOR_KEY, SINK_KEY, SOURCE_KEY,
 };
 
 /// The vended-log branches of the pipeline schema, which the walk below reports a
@@ -312,12 +311,6 @@ pub(crate) const REASON_VALIDATION_ERROR: &str = "PIPELINE_CONFIGURATION_VALIDAT
 /// takes.
 const REASON_INVALID_PATTERN: &str = "INVALID_PATTERN";
 
-/// `ValidationError$Reason` for a processor, or a processor option, THIS EMULATOR does
-/// not run. It is its own code because the document may well be one the real service
-/// accepts: the defect is what the emulator cannot run, not a verdict that the
-/// configuration is invalid, and the message says which processor it is.
-const REASON_UNSUPPORTED_PROCESSOR: &str = "UNSUPPORTED_PROCESSOR";
-
 /// The ARN syntax this service's own model declares for an ARN and for the ARN of a
 /// ROLE, from `smithy_query(query="shape", shape="ResourceArn,IamRoleArn")`: the
 /// `pattern` trait on the shape every ARN member targets, and the one on the shape a
@@ -477,34 +470,97 @@ fn section_defects(prefix: &str, section: &Node, patterns: &mut usize) -> Vec<Va
     defects
 }
 
-/// One defect per POSITION of a section's `processor` sequence this emulator cannot
-/// run: a processor it does not run, or one of its options it does not take.
+/// One defect per POSITION of a section's `processor` sequence that the schema does not
+/// define, and one per property of such a position the schema does not define for the
+/// processor it names.
 ///
 /// Each position is judged on its own, so a defect at one position never hides the
-/// defect at another; the `FieldMap` carries that position's path, which is what tells
-/// a caller WHICH processor of the sequence the message is about.
+/// defect at another; the `FieldMap` carries the path the offending property is WRITTEN
+/// at, which is what tells a caller which processor of the sequence, or which of its
+/// options, the message is about.
 ///
-/// The category is this emulator's own ([`REASON_UNSUPPORTED_PROCESSOR`]) and NOT the
-/// schema's "not defined" one: the catalogue the real service validates a processor
-/// NAME against is not in this service's model, and the document may well be one it
-/// accepts — what this emulator knows is which processors IT runs.
+/// A position naming a processor the schema does not define is the schema's
+/// unknown-property defect ([`unknown_property`]), the same category and wording as any
+/// other property the schema does not define: which processors the schema defines
+/// depends on the section's own source — the vended-log branch's vocabulary for a
+/// section reading AWS-vended log events ([`vended_log_schema::restricts_processors`]),
+/// and the general processor vocabulary this format defines for any other section.
+/// Which processors this emulator happens to RUN is not a property of the document, so
+/// it is never reported here.
+///
+/// A position naming a processor the schema DOES define is measured against that
+/// processor's own properties: an option the schema does not define for it is reported
+/// as the undefined property it is, and anything else its compile refuses — an option
+/// carrying a value of the wrong form, or a required one left out — is a defect of what
+/// the document declares and carries that category. Only the general vocabulary
+/// declares the options a processor takes, so a position naming one of the vended-log
+/// parsers is measured by that branch's own restrictions alone.
 fn processor_defects(prefix: &str, section: &Node, patterns: &mut usize) -> Vec<ValidationError> {
     let Some(Node::Sequence(items)) = section.get(PROCESSOR_KEY) else {
         return Vec::new();
     };
-    items
+    let vended = vended_log_schema::restricts_processors(section);
+    let mut defects = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        // An entry naming no plugin, or more than one, is a defect of the sequence's
+        // own form and is reported as that.
+        let Some([(name, options)]) = item.as_mapping() else {
+            continue;
+        };
+        let path = processor_path(prefix, index);
+        if !defines_processor(name, vended) {
+            defects.push(unknown_property(name, &path));
+            continue;
+        }
+        let Some(allowed) = processor_options(name) else {
+            continue;
+        };
+        let undefined = undefined_options(&path, name, options, allowed);
+        if !undefined.is_empty() {
+            // The position declares a property the schema does not define, which is
+            // what is reported about it: the rest of its compile is measured against
+            // options the document did not write as the schema writes them.
+            defects.extend(undefined);
+            continue;
+        }
+        if let Err(why) = step_defect(name, options, patterns) {
+            defects.push(at_path(&path, REASON_VALIDATION_ERROR, why));
+        }
+    }
+    defects
+}
+
+/// Whether the pipeline schema defines a processor named `name` for a section whose
+/// processor vocabulary is the vended-log branch's (`vended`) or the general one.
+///
+/// Both vocabularies are read off the one record each has — the vended-log branch table
+/// and the processor catalogue this format's chain compiles against — so no second list
+/// can disagree with them about which names the schema defines.
+fn defines_processor(name: &str, vended: bool) -> bool {
+    if vended {
+        return vended_log_schema::defines_processor(name);
+    }
+    processor_options(name).is_some()
+}
+
+/// One defect per property of the processor at `path` that the schema does not define
+/// for a processor of that name, reported at the path the property is written at: inside
+/// the position, under the name of the processor it configures.
+///
+/// A position whose options are not a mapping at all declares no property to report, so
+/// the form of its value is reported by its compile instead.
+fn undefined_options(
+    path: &str,
+    name: &str,
+    options: &Node,
+    allowed: &[&str],
+) -> Vec<ValidationError> {
+    options
+        .as_mapping()
+        .unwrap_or_default()
         .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            // An entry naming no plugin, or more than one, is a defect of the
-            // sequence's own form and is reported as that.
-            let [(name, options)] = item.as_mapping()? else {
-                return None;
-            };
-            step_defect(name, options, patterns)
-                .err()
-                .map(|why| unsupported_processor(&processor_path(prefix, index), why))
-        })
+        .filter(|(option, _)| !allowed.contains(&option.as_str()))
+        .map(|(option, _)| unknown_property(option, &format!("{path}.{name}.{option}")))
         .collect()
 }
 
@@ -570,13 +626,6 @@ pub(crate) fn undefined_property_message(property: &str) -> String {
 /// processors a vended-log branch admits for a `processor` sequence.
 pub(crate) fn at_most_items_message(limit: usize, found: usize) -> String {
     format!("must have at most {limit} items but found {found}")
-}
-
-/// The defect of a processor position this emulator cannot run: the refusal the
-/// processor's own compile answered, reported under this emulator's own category, with
-/// the `FieldMap` carrying the position's path in the document.
-fn unsupported_processor(path: &str, why: String) -> ValidationError {
-    at_path(path, REASON_UNSUPPORTED_PROCESSOR, why)
 }
 
 /// The defect of a property carrying more items than the schema allows for it, worded
