@@ -69,6 +69,8 @@ mod usage_report_subscription;
 mod user_allocation_window;
 #[path = "all/user_concurrent_creation.rs"]
 mod user_concurrent_creation;
+#[path = "all/user_duplicate_create.rs"]
+mod user_duplicate_create;
 #[path = "all/user_enable_disable.rs"]
 mod user_enable_disable;
 #[path = "all/user_identity_allocation.rs"]

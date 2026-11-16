@@ -29,17 +29,26 @@ use crate::stack_fleet_lifecycle::{error_code, Emulator};
 /// The only authentication type the user pool operations accept, which both
 /// `CreateUser.AuthenticationType` and `DescribeUsers.AuthenticationType` document as
 /// "You must specify USERPOOL".
-const USER_POOL: &str = "USERPOOL";
+///
+/// Shared with the other user pool suites in this target
+/// (`tests/all/user_duplicate_create.rs`), so every suite states it once.
+pub(crate) const USER_POOL: &str = "USERPOOL";
 
 /// AWS's sentences for a username that is taken and for an identity the pool does not
 /// hold, read from the crate so the test tracks what the service states.
-const ALREADY_EXISTS: &str =
+///
+/// The taken-username sentence is shared with the other user pool suites in this target
+/// (`tests/all/user_duplicate_create.rs`).
+pub(crate) const ALREADY_EXISTS: &str =
     service_com_amazonaws_appstream_photonadminproxyservice::state::USER_ALREADY_EXISTS_MESSAGE;
 const NOT_FOUND: &str =
     service_com_amazonaws_appstream_photonadminproxyservice::state::USER_NOT_FOUND_MESSAGE;
 
 /// The users a read of the pool reports.
-async fn user_pool(emulator: &Emulator, case: &str) -> Vec<Value> {
+///
+/// Shared with the other user pool suites in this target
+/// (`tests/all/user_duplicate_create.rs`), so every suite reads the pool the same way.
+pub(crate) async fn user_pool(emulator: &Emulator, case: &str) -> Vec<Value> {
     let payload = emulator
         .ok(
             case,
@@ -106,7 +115,10 @@ fn rows() -> Vec<Row> {
 }
 
 /// The `CreateUser` request for `user_name` carrying `extra`.
-fn create_request(user_name: &str, extra: &Value) -> Value {
+///
+/// Shared with the other user pool suites in this target
+/// (`tests/all/user_duplicate_create.rs`), so every suite builds the request the same way.
+pub(crate) fn create_request(user_name: &str, extra: &Value) -> Value {
     let mut request = json!({ "UserName": user_name, "AuthenticationType": USER_POOL });
     for (member, value) in extra.as_object().expect("the row carries members") {
         request[member] = value.clone();
