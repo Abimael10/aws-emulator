@@ -1001,6 +1001,23 @@ pub fn data_catalog_name_error(name: &str, catalog_type: &str) -> Option<String>
     None
 }
 
+/// How a LAMBDA catalog's `Parameters` refusal is worded.
+///
+/// `DataCatalog$Parameters` documents the type as taking "one of the following sets of
+/// required parameters, but not both" — [`PARAMETER_METADATA_FUNCTION`] with
+/// [`PARAMETER_RECORD_FUNCTION`], or [`PARAMETER_FUNCTION`] on its own. That is ONE rule
+/// about which of the two sets is set, so the service states it in one sentence, naming
+/// both sets, for every map that breaks it: one that satisfies neither set, one that
+/// carries half of the split set, and one that carries both sets at once. Stated here once
+/// so the create path and the update path refuse the same map with the same words.
+pub fn lambda_parameter_sets_message() -> String {
+    format!(
+        "Lambda catalogs require that either the {PARAMETER_METADATA_FUNCTION} and \
+         {PARAMETER_RECORD_FUNCTION} parameters or the {PARAMETER_FUNCTION} parameter be \
+         set, but not both."
+    )
+}
+
 /// The refusal message a create or update whose `Parameters` map is EMPTY answers with,
 /// for a catalog type whose parameters are required.
 ///
@@ -1074,22 +1091,13 @@ fn data_catalog_parameter_keys_error(
         DATA_CATALOG_TYPE_LAMBDA => {
             let composite = has(PARAMETER_FUNCTION);
             let split = has(PARAMETER_METADATA_FUNCTION) && has(PARAMETER_RECORD_FUNCTION);
-            let partial_split = has(PARAMETER_METADATA_FUNCTION) || has(PARAMETER_RECORD_FUNCTION);
-            if composite && partial_split {
-                Some(format!(
-                    "Parameters for a {DATA_CATALOG_TYPE_LAMBDA} data catalog must contain \
-                     either {PARAMETER_FUNCTION} or {PARAMETER_METADATA_FUNCTION} with \
-                     {PARAMETER_RECORD_FUNCTION}, but not both."
-                ))
-            } else if composite || split {
-                None
-            } else {
-                Some(format!(
-                    "Parameters for a {DATA_CATALOG_TYPE_LAMBDA} data catalog must contain \
-                     either {PARAMETER_FUNCTION} or both {PARAMETER_METADATA_FUNCTION} and \
-                     {PARAMETER_RECORD_FUNCTION}."
-                ))
-            }
+            let any_split = has(PARAMETER_METADATA_FUNCTION) || has(PARAMETER_RECORD_FUNCTION);
+            // EXACTLY one of the two sets satisfies the rule: the composite key on its own,
+            // or both split keys without it. Every other map — neither set, half of the
+            // split set, or both sets at once — breaks the one rule, so it is refused with
+            // the one sentence that states it.
+            let satisfied = (composite && !any_split) || (split && !composite);
+            (!satisfied).then(lambda_parameter_sets_message)
         }
         // "The GLUE type takes a catalog ID parameter and is required."
         DATA_CATALOG_TYPE_GLUE if !has(PARAMETER_CATALOG_ID) => Some(format!(

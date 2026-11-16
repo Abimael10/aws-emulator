@@ -485,8 +485,9 @@ async fn an_update_whose_parameters_do_not_describe_the_stated_type_is_refused()
                     "record-function": lambda_arn("records"),
                 },
             }),
-            expected: "Parameters for a LAMBDA data catalog must contain either function \
-                       or metadata-function with record-function, but not both."
+            expected: "Lambda catalogs require that either the metadata-function and \
+                       record-function parameters or the function parameter be set, but \
+                       not both."
                 .to_string(),
         },
         RefusalCase {

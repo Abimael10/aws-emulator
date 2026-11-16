@@ -221,33 +221,41 @@ async fn an_empty_parameters_map_is_refused_as_empty_and_a_lacking_one_by_its_ke
         }
     }
 
-    // (case, the Type, a non-empty map that does not carry the keys the type documents) —
-    // the OTHER rule: the sentence names the keys instead, and says nothing about the map
-    // being empty.
-    let missing_keys: Vec<(&str, &str, Value)> = vec![
+    // (case, the Type, a non-empty map that does not carry the keys the type documents, the
+    // opening of the sentence that names what the map lacks) — the OTHER rule: the sentence
+    // names the parameters instead, and says nothing about the map being empty. The Lambda
+    // type's two required sets are one rule stated in one sentence, which is why its opening
+    // differs from the single-key types'.
+    let missing_keys: Vec<(&str, &str, Value, String)> = vec![
         (
             "LAMBDA with only one half of the split form",
             DATA_CATALOG_TYPE_LAMBDA,
             json!({ "metadata-function": "arn:aws:lambda:us-east-1:111122223333:function:meta" }),
+            "Lambda catalogs require that either the ".to_string(),
         ),
         (
             "HIVE with only the optional sdk version",
             DATA_CATALOG_TYPE_HIVE,
             json!({ "sdk-version": "1.0" }),
+            format!("Parameters for a {DATA_CATALOG_TYPE_HIVE} data catalog must "),
         ),
         (
             "GLUE without its catalog id",
             DATA_CATALOG_TYPE_GLUE,
             json!({ "sdk-version": "1.0" }),
+            format!("Parameters for a {DATA_CATALOG_TYPE_GLUE} data catalog must "),
         ),
         (
             "FEDERATED with neither connection parameter",
             DATA_CATALOG_TYPE_FEDERATED,
             json!({ "sdk-version": "1.0" }),
+            format!("Parameters for a {DATA_CATALOG_TYPE_FEDERATED} data catalog must "),
         ),
     ];
 
-    for (index, (case, catalog_type, parameters)) in missing_keys.into_iter().enumerate() {
+    for (index, (case, catalog_type, parameters, expected_opening)) in
+        missing_keys.into_iter().enumerate()
+    {
         let name = format!("lacking_{index}");
         let (status, body) = call(
             &router,
@@ -261,8 +269,9 @@ async fn an_empty_parameters_map_is_refused_as_empty_and_a_lacking_one_by_its_ke
         );
         let stated = message(&body);
         assert!(
-            stated.starts_with(&format!("Parameters for a {catalog_type} data catalog must ")),
-            "case {case:?}: expected the missing-key sentence, got {stated:?}"
+            stated.starts_with(&expected_opening),
+            "case {case:?}: expected the sentence naming what the map lacks, opening \
+             {expected_opening:?}, got {stated:?}"
         );
         assert!(
             !stated.contains("cannot be empty"),

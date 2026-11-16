@@ -21,6 +21,8 @@ mod catalog_statements;
 mod data_catalog_delete;
 #[path = "all/data_catalog_lifecycle.rs"]
 mod data_catalog_lifecycle;
+#[path = "all/data_catalog_parameter_sets.rs"]
+mod data_catalog_parameter_sets;
 #[path = "all/data_catalog_update.rs"]
 mod data_catalog_update;
 #[path = "all/database_statements.rs"]
