@@ -19,6 +19,8 @@ mod catalog_resource_lifecycle;
 mod copy_lineage_and_lookup_messages;
 #[path = "all/end_user_product_view_messages.rs"]
 mod end_user_product_view_messages;
+#[path = "all/end_user_view_of_minted_products.rs"]
+mod end_user_view_of_minted_products;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/launch_governance_tags.rs"]
