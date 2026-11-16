@@ -178,23 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = &*store;
         let store = held.region(&region);
 
-        // The configuration is a child of the scraper, so a scraper this account does
-        // not hold has no configuration to report and is itself the missing resource —
-        // a different resource from a configuration that was never written, which is
-        // why the two refusals name different ones.
-        if !store.scrapers.contains_key(&input.scraper_id) {
-            return Err(
-                DescribeScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::SCRAPER_NOT_FOUND_MESSAGE.to_string(),
-                        resource_id: input.scraper_id.clone(),
-                        resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // The resource this URI addresses is the scraper's LOGGING CONFIGURATION, and that
+        // is the resource reported missing whenever one does not resolve — whether the
+        // account holds no scraper by that id or holds one that carries no configuration.
+        // Both are the same thing to this operation: there is no configuration to report,
+        // so it names the configuration's own family rather than the scraper it hangs off.
         let Some(configuration) = store.scraper_logging.get(&input.scraper_id) else {
             return Err(
                 DescribeScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(

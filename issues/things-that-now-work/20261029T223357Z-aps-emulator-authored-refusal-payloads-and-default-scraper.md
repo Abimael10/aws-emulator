@@ -123,3 +123,38 @@ Cause 4 (amp-scraper-error-paths-and-defaults#task#10): DELETE /scrapers/{scrape
 Cause 5 (amp-anomaly-detector-workflow#task#6): create a workspace and wait until ACTIVE, then POST /workspaces/{workspaceId}/anomalydetectors with configuration.randomCutForest.query set to an expression whose root is not an aggregation operator (e.g. a bare selector). The status/code are right; $.message is the 'Invalid configuration.randomCutForest.query: Member must ...' template instead of the service's "Unsupported PromQL expression for RandomCutForest, ..." sentence.
 
 Cause 6 (amp-workspace-lifecycle-and-configuration#task#2): GET /workspaces/{workspaceId} for a workspaceId that does not exist — $.message is 'Workspace not found.' where the read path answers 'Workspace not found' with no trailing period.
+
+## Resolution, and what is NOT fixed
+
+FIXED — causes 1, 3 and 4, with causes 5 and 6 already closed on mainline before this
+landing (`state::RANDOM_CUT_FOREST_QUERY_UNSUPPORTED_MESSAGE` and
+`state::DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE`):
+
+* Cause 1 — `CreateScraper` resolves every subnet its `source` names against the service
+  that OWNS subnets (Amazon EC2, over the in-process callback; see
+  `src/state/ec2_subnets.rs` and `services/common/src/network.rs`) and refuses a subnet the
+  account does not have with the modelled `ValidationException` (400), carrying EC2's own
+  sentence inside the relayed-call envelope `service_common::relayed_refusal` renders —
+  before and independently of the destination-workspace lookup. Driven over a table in
+  `tests/all/scraper_source_subnets.rs`.
+* Causes 3 and 4 — `Describe`/`DeleteScraperLoggingConfiguration` report the scraper LOGGING
+  CONFIGURATION as the resource that does not resolve (`SCRAPER_LOGGING_NOT_FOUND_MESSAGE` /
+  `SCRAPER_LOGGING_DELETE_FAILED_MESSAGE`, `SCRAPER_LOGGING_RESOURCE_TYPE`, and the delete
+  path's request-scoped `resourceId` template `delete_scraper_logging_resource_id`).
+  `UpdateScraperLoggingConfiguration` keeps answering for the missing SCRAPER, which is what
+  the recorded corpus shows for that operation.
+
+NOT FIXED — cause 2 (`GetDefaultScraperConfiguration`'s two authentication members), left
+exactly as it was and declined as platform-blocked. The published document points the
+cAdvisor job's `authorization.credentials_file` and the API-server job's `bearer_token_file`
+at one in-cluster token file, and neither form in which emulator source could carry that
+file lands here: written out it is a blocking `host-secret-path` finding from this
+repository's deterministic pattern scan (raised on
+`src/ops/get_default_scraper_configuration.rs` and
+`tests/all/default_scraper_configuration.rs`), and assembled from path segments at run time
+it is a construct the security-controls review would not sanction. Any text that reproduces
+the document's bytes contains the forbidden substring, so the two members stay out and
+`tests/all/default_scraper_configuration.rs::exactly_the_documented_members_are_absent_from_the_served_document`
+pins exactly which members are absent so the gap cannot widen. The wire key
+`aps|GetDefaultScraperConfiguration|2xx->2xx|$.configuration` therefore remains open;
+closing it needs an explicit, reviewable exception to that pattern for a served document.

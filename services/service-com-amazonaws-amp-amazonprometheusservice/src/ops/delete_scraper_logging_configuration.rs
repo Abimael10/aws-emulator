@@ -172,31 +172,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(now);
 
-        // The configuration is a child of the scraper, so a scraper this account does
-        // not hold has no configuration to delete and is itself the missing resource —
-        // and a Region this account holds nothing in holds no scraper either.
-        let Some(store) = store
+        // The resource this URI addresses is the scraper's LOGGING CONFIGURATION, so that
+        // is the resource reported missing whenever the delete cannot resolve one —
+        // whether this Region's store holds no scraper by that id, holds one that carries
+        // no configuration, or holds nothing at all. All three are the same thing to this
+        // operation: there is no configuration to delete. The delete path states what it
+        // could not DO and identifies the failing REQUEST in `resourceId`, which is what
+        // it is recorded answering.
+        let configuration = store
             .held_region_mut(&region)
-            .filter(|store| store.scrapers.contains_key(&input.scraper_id))
-        else {
+            .and_then(|store| store.scraper_logging.get_mut(&input.scraper_id));
+        let Some(configuration) = configuration else {
             return Err(
                 DeleteScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::SCRAPER_NOT_FOUND_MESSAGE.to_string(),
-                        resource_id: input.scraper_id.clone(),
-                        resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
-                    },
-                )
-                .into(),
-            );
-        };
-
-        let Some(configuration) = store.scraper_logging.get_mut(&input.scraper_id) else {
-            return Err(
-                DeleteScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::SCRAPER_LOGGING_NOT_FOUND_MESSAGE.to_string(),
-                        resource_id: input.scraper_id.clone(),
+                        message: crate::state::SCRAPER_LOGGING_DELETE_FAILED_MESSAGE.to_string(),
+                        resource_id: crate::state::delete_scraper_logging_resource_id(
+                            &input.scraper_id,
+                            input.client_token.as_deref(),
+                        ),
                         resource_type: crate::state::SCRAPER_LOGGING_RESOURCE_TYPE.to_string(),
                     },
                 )

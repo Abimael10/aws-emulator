@@ -20,9 +20,9 @@ use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
     SCRAPER_STATUS_CODE_VALUES,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    Scraper, ScraperLoggingConfiguration, SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
-    SCRAPER_LOGGING_RESOURCE_TYPE, SCRAPER_LOGGING_STATUS_ACTIVE, SCRAPER_LOGGING_STATUS_DELETING,
-    SCRAPER_NOT_FOUND_MESSAGE, SCRAPER_RESOURCE_TYPE, STATUS_ACTIVE,
+    delete_scraper_logging_resource_id, Scraper, ScraperLoggingConfiguration,
+    SCRAPER_LOGGING_DELETE_FAILED_MESSAGE, SCRAPER_LOGGING_RESOURCE_TYPE,
+    SCRAPER_LOGGING_STATUS_ACTIVE, SCRAPER_LOGGING_STATUS_DELETING, STATUS_ACTIVE,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -265,8 +265,8 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
         );
         assert_eq!(
             text(&repeated.body["message"]),
-            SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected the service's not-found sentence, got {repeated:?}"
+            SCRAPER_LOGGING_DELETE_FAILED_MESSAGE,
+            "case {case:?}: expected the delete path's sentence, got {repeated:?}"
         );
         assert_eq!(
             stored(&amp, region, scraper_id).map(|record| record.status_code),
@@ -338,8 +338,9 @@ async fn a_delete_is_accepted_from_every_status_and_a_replay_is_the_same_request
 }
 
 /// A `scraperId` the store does not hold is the modelled `ResourceNotFoundException`
-/// (404) naming the SCRAPER, whatever the id looks like: the configuration is a child of
-/// the scraper, so the scraper is what is missing.
+/// (404) naming the scraper LOGGING CONFIGURATION, whatever the id looks like: this URI
+/// addresses the configuration, so the configuration is what the delete cannot resolve —
+/// the same refusal a scraper that holds none gets.
 #[tokio::test]
 async fn a_scraper_the_store_does_not_hold_is_not_found() {
     let region = "us-west-2";
@@ -383,17 +384,17 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
         );
         assert_eq!(
             text(&reply.body["message"]),
-            SCRAPER_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected the scraper not-found sentence, got {reply:?}"
+            SCRAPER_LOGGING_DELETE_FAILED_MESSAGE,
+            "case {case:?}: expected the delete path's sentence, got {reply:?}"
         );
         assert_eq!(
             text(&reply.body["resourceId"]),
-            scraper_id,
-            "case {case:?}: the refusal must name the id asked for, got {reply:?}"
+            delete_scraper_logging_resource_id(&scraper_id, None),
+            "case {case:?}: the refusal must identify the failing request, got {reply:?}"
         );
         assert_eq!(
             text(&reply.body["resourceType"]),
-            SCRAPER_RESOURCE_TYPE,
+            SCRAPER_LOGGING_RESOURCE_TYPE,
             "case {case:?}: the refusal must name the resource type, got {reply:?}"
         );
     }
@@ -443,13 +444,13 @@ async fn a_scraper_that_holds_no_configuration_is_not_found() {
         );
         assert_eq!(
             text(&reply.body["message"]),
-            SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
-            "case {status:?}: expected the configuration not-found sentence, got {reply:?}"
+            SCRAPER_LOGGING_DELETE_FAILED_MESSAGE,
+            "case {status:?}: expected the delete path's sentence, got {reply:?}"
         );
         assert_eq!(
             text(&reply.body["resourceId"]),
-            scraper_id,
-            "case {status:?}: the refusal must name the scraper asked for, got {reply:?}"
+            delete_scraper_logging_resource_id(scraper_id, Some("token-unlogged")),
+            "case {status:?}: the refusal must identify the failing request, got {reply:?}"
         );
         assert_eq!(
             text(&reply.body["resourceType"]),
@@ -465,6 +466,93 @@ async fn a_scraper_that_holds_no_configuration_is_not_found() {
                 .map(|record| record.status_code.clone()),
             Some((*status).to_string()),
             "case {status:?}: a refused delete must leave the scraper where it was"
+        );
+    }
+}
+
+/// The delete path's refusal identifies the failing REQUEST rather than the bare id: its
+/// `resourceId` is `DeleteScraperLoggingConfigurationRequest(scraperId=…,
+/// clientToken=…).scraperId/scraperlogging` with the `scraperId` and `clientToken` of
+/// THIS request substituted and everything else fixed, its `message` is the delete path's
+/// own sentence with no variable parts, and its `resourceType` is the configuration's
+/// family. One row per shape the two variable parts take: the id form, the length of the
+/// id, the token form, and a request that carries no token at all.
+#[tokio::test]
+async fn the_delete_refusal_identifies_the_request_it_could_not_serve() {
+    let region = "us-west-2";
+    let amp = Amp::new();
+
+    // (case, scraperId, clientToken) — `ScraperId` is len 1..64 and
+    // `IdempotencyToken` len 1..64, so both ends of both ranges are driven.
+    let long_token = "t".repeat(64);
+    let cases: Vec<(&str, String, Option<&str>)> = vec![
+        (
+            "a minted-looking id and a UUID token",
+            "s-99999999-9999-9999-9999-999999999999".to_string(),
+            Some("1e951cce-bf10-4459-9696-4c091d5c4fed"),
+        ),
+        (
+            "a one-character id and a one-character token",
+            "z".to_string(),
+            Some("t"),
+        ),
+        (
+            "an id and a token of the maximum modelled length",
+            "s".repeat(64),
+            Some(long_token.as_str()),
+        ),
+        (
+            "no clientToken at all",
+            "s-88888888-8888-8888-8888-888888888888".to_string(),
+            None,
+        ),
+    ];
+
+    for (case, scraper_id, client_token) in cases {
+        let reply = delete(&amp, region, &scraper_id, client_token).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: a configuration that does not resolve must answer 404, \
+             got {reply:?}"
+        );
+        assert_eq!(
+            reply.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected the modelled ResourceNotFoundException, got {reply:?}"
+        );
+        assert_eq!(
+            text(&reply.body["message"]),
+            SCRAPER_LOGGING_DELETE_FAILED_MESSAGE,
+            "case {case:?}: expected the delete path's fixed sentence, got {reply:?}"
+        );
+        assert_eq!(
+            text(&reply.body["resourceType"]),
+            SCRAPER_LOGGING_RESOURCE_TYPE,
+            "case {case:?}: expected the configuration's own resource type, got {reply:?}"
+        );
+        let reported = text(&reply.body["resourceId"]);
+        // The template's FIXED text, written out here rather than taken from the
+        // composition under test, so the wording itself is pinned and not just the
+        // handler's self-consistency; its two variable parts are this request's.
+        let expected = match client_token {
+            Some(token) => format!(
+                "DeleteScraperLoggingConfigurationRequest(scraperId={scraper_id}, \
+                 clientToken={token}).scraperId/scraperlogging"
+            ),
+            None => format!(
+                "DeleteScraperLoggingConfigurationRequest(scraperId={scraper_id})\
+                 .scraperId/scraperlogging"
+            ),
+        };
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: the refusal must identify the request it refused, got {reply:?}"
+        );
+        assert_eq!(
+            reported,
+            delete_scraper_logging_resource_id(&scraper_id, client_token),
+            "case {case:?}: the composition every caller of this service reads must answer \
+             that same identifier, got {reply:?}"
         );
     }
 }
@@ -534,7 +622,7 @@ async fn a_delete_touches_only_the_configuration_it_names() {
 
 /// A logging configuration belongs to its scraper, so the scraper's own removal takes it
 /// with it: once `DeleteScraper`'s owed removal has come due, the configuration is gone
-/// too and a delete that names it answers for the missing SCRAPER.
+/// too and a delete that names it answers for the missing CONFIGURATION.
 #[tokio::test]
 async fn a_scraper_the_clock_removes_takes_its_configuration_with_it() {
     let region = "us-west-2";
@@ -569,8 +657,8 @@ async fn a_scraper_the_clock_removes_takes_its_configuration_with_it() {
     );
     assert_eq!(
         text(&reply.body["message"]),
-        SCRAPER_NOT_FOUND_MESSAGE,
-        "expected the scraper not-found sentence, got {reply:?}"
+        SCRAPER_LOGGING_DELETE_FAILED_MESSAGE,
+        "expected the delete path's sentence, got {reply:?}"
     );
     assert_eq!(
         stored(&amp, region, scraper_id).map(|record| record.status_code),

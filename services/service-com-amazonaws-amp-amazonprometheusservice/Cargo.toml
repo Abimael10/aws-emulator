@@ -55,11 +55,28 @@ promql-parser = "0.11"
 # HTTP API accepts beside a Unix timestamp. Calendar arithmetic is what this crate is
 # for, so neither form is parsed by hand.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The AWS SDK for EC2, driven over the in-process callback into this same emulator: the
+# subnets a scraper's source names are EC2's resources, so `src/state/ec2_subnets.rs`
+# asks EC2 whether the account has them rather than deciding it here. Only the generated
+# client is needed — the emulator supplies the transport — and `behavior-version-latest`
+# is what `BehaviorVersion::latest()` in that module is gated behind.
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+# `arn::region_label` (the ONE reading of a caller-supplied Region as a Region LABEL,
+# which the endpoint the EC2 call above is made at is built from) and
+# `relayed_refusal` (the ONE rendering of the envelope a refusal another service
+# answered is reported inside).
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The EC2 service, mounted beside this one in the test harness: that a scraper's source
+# is resolved against the subnets the account HAS can only be driven end to end with the
+# owner of subnets on the same engine. DEV-ONLY: this crate depends on no other
+# service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["behavior-version-latest"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # Builds a remote-write body the way a sender does — the protobuf `WriteRequest` of the

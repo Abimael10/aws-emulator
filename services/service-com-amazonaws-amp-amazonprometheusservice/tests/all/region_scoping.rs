@@ -27,9 +27,10 @@ use crate::workspace_lifecycle::{
     announced_prometheus_endpoint, tags_of, text, wait_for_due_transition, Amp, Reply,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    region_ceiling_message, workspace_arn, IngestedMetrics, Workspace, WorkspaceConfiguration,
-    DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE, MAX_REGIONS, RESOURCE_NOT_FOUND_CODE,
-    RESOURCE_NOT_FOUND_MESSAGE, STATUS_ACTIVE, WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_QUOTA,
+    delete_scraper_logging_resource_id, region_ceiling_message, workspace_arn, IngestedMetrics,
+    Workspace, WorkspaceConfiguration, DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE, MAX_REGIONS,
+    RESOURCE_NOT_FOUND_CODE, RESOURCE_NOT_FOUND_MESSAGE, STATUS_ACTIVE,
+    WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_QUOTA,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -398,40 +399,48 @@ async fn a_scraper_is_reached_only_from_the_region_that_holds_it() {
             "case {region:?}: its own scraper must be describable, got {described:?}"
         );
 
-        // (case, method, the path of the scraper the OTHER Region holds, body)
-        let foreign_calls: Vec<(&str, &str, String, String)> = vec![
+        // (case, method, the path of the scraper the OTHER Region holds, body, the
+        // `resourceId` that operation reports for it) — four report the bare id, and
+        // `DeleteScraperLoggingConfiguration` reports the request-scoped identifier that
+        // path answers with (`crate::state::delete_scraper_logging_resource_id`).
+        let foreign_calls: Vec<(&str, &str, String, String, String)> = vec![
             (
                 "DescribeScraper",
                 "GET",
                 format!("/scrapers/{}", foreign.scraper_id),
                 String::new(),
+                foreign.scraper_id.clone(),
             ),
             (
                 "UpdateScraper",
                 "PUT",
                 format!("/scrapers/{}", foreign.scraper_id),
                 serde_json::json!({ "alias": "renamed-from-elsewhere" }).to_string(),
+                foreign.scraper_id.clone(),
             ),
             (
                 "DeleteScraperLoggingConfiguration",
                 "DELETE",
                 format!("/scrapers/{}/logging-configuration", foreign.scraper_id),
                 String::new(),
+                delete_scraper_logging_resource_id(&foreign.scraper_id, None),
             ),
             (
                 "DescribeScraperLoggingConfiguration",
                 "GET",
                 format!("/scrapers/{}/logging-configuration", foreign.scraper_id),
                 String::new(),
+                foreign.scraper_id.clone(),
             ),
             (
                 "DeleteScraper",
                 "DELETE",
                 format!("/scrapers/{}", foreign.scraper_id),
                 String::new(),
+                foreign.scraper_id.clone(),
             ),
         ];
-        for (operation, method, uri, body) in &foreign_calls {
+        for (operation, method, uri, body, resource_id) in &foreign_calls {
             let case = format!("{operation} in {region} on the scraper of the other Region");
             let reply = amp.call(method, uri, region, body).await;
             assert_eq!(
@@ -439,8 +448,8 @@ async fn a_scraper_is_reached_only_from_the_region_that_holds_it() {
                 "case {case:?}: another Region's scraper must not be found, got {reply:?}"
             );
             assert_eq!(
-                text(&reply.body["resourceId"]),
-                foreign.scraper_id,
+                &text(&reply.body["resourceId"]),
+                resource_id,
                 "case {case:?}: the refusal must name the scraper asked for, got {reply:?}"
             );
         }

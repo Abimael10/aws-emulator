@@ -79,13 +79,17 @@ use super::types::*;
 /// every series the caller scrapes. The `kubernetes-apiservers` job declares `scheme:
 /// https` and no `tls_config`, as the served document does.
 ///
-/// ONE deliberate omission: the published document points the cAdvisor and API-server
-/// jobs at the in-cluster service-account token and CA files under the kubelet's secret
-/// mount (`authorization.credentials_file`, `bearer_token_file`, `tls_config.ca_file`).
-/// Emulator source may not name a host secret path at all — the merge gate's exfil scan
-/// refuses it — so those three members are left out rather than pointed somewhere else;
-/// a caller that feeds this blob to a real in-cluster Prometheus supplies them itself.
-/// Every job, service-discovery role and relabel rule is otherwise the published one.
+/// The cAdvisor job's `authorization.credentials_file` and the API-server job's
+/// `bearer_token_file` are the ONE deliberate omission. The published document points both
+/// at the same file — the service-account token the kubelet projects into every pod of the
+/// cluster a scraper runs in — and emulator source may not carry a credential path, in any
+/// form: written out it is a path this repository's own checks refuse, and assembled from
+/// parts it is the same path spelled so those checks cannot see it. So the two members are
+/// left out rather than pointed somewhere else or spelled around, and a caller that feeds
+/// this blob to a real in-cluster Prometheus supplies them itself. Every job,
+/// service-discovery role and relabel rule is otherwise the published one, and
+/// `tests/all/default_scraper_configuration.rs` pins exactly which members are absent so
+/// the gap cannot widen unnoticed.
 ///
 /// Served as UTF-8 bytes; the `Blob` member is what base64-encodes it on the wire (the
 /// restJson1 serializer does that, so this handler must NOT encode it itself).

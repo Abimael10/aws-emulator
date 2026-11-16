@@ -228,6 +228,11 @@ pub mod remote_write;
 /// [`remote_write`] is.
 pub mod promql;
 
+/// The subnets a scraper's source names, resolved against the service that OWNS subnets.
+/// Named rather than re-exported, so a handler says `crate::state::ec2_subnets::…` and the
+/// one place this crate calls a peer service stays visible at the call site.
+pub mod ec2_subnets;
+
 /// The `resourceType` those same exceptions report for a rule groups namespace. The
 /// name is the one the model itself gives the resource: `RuleGroupsNamespaceArn`
 /// carries `@arnReference(type: "AWS::APS::RuleGroupsNamespace")`.
@@ -284,7 +289,52 @@ pub const SCRAPER_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::ScraperLoggingConfigu
 /// holds no logging configuration — one CONSTANT sentence naming the kind of resource
 /// that is missing, for the same reason [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is: the
 /// scraper the request named is reported in `resourceId` instead.
+///
+/// RECORDED BEHAVIOUR: a `DescribeScraperLoggingConfiguration` for a `scraperId` the
+/// account holds nothing for is refused this sentence with
+/// [`SCRAPER_LOGGING_RESOURCE_TYPE`] — the FAMILY the URI addresses, not the scraper it
+/// hangs off — so that operation reports the configuration as the missing resource
+/// whether the scraper exists or not. Each scraper-logging operation answers the text
+/// recorded for IT, and the three differ: `DeleteScraperLoggingConfiguration` answers
+/// [`SCRAPER_LOGGING_DELETE_FAILED_MESSAGE`], and the recorded
+/// `UpdateScraperLoggingConfiguration` for a `scraperId` the account holds no scraper for
+/// answers for the missing SCRAPER ([`SCRAPER_NOT_FOUND_MESSAGE`]), reaching this sentence
+/// only for a scraper that holds no configuration.
 pub const SCRAPER_LOGGING_NOT_FOUND_MESSAGE: &str = "Scraper logging configuration not found.";
+
+/// The `message` `DeleteScraperLoggingConfiguration` reports when it cannot resolve the
+/// scraper logging configuration its URI addresses.
+///
+/// RECORDED BEHAVIOUR: the delete path states what it could not DO rather than what it
+/// could not find — fixed text with no variable parts, like every other refusal sentence
+/// here, and distinct from the read path's [`SCRAPER_LOGGING_NOT_FOUND_MESSAGE`], exactly
+/// as `DeleteWorkspace`'s workspace not-found sentence is distinct from
+/// `DescribeWorkspace`'s ([`DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE`]).
+pub const SCRAPER_LOGGING_DELETE_FAILED_MESSAGE: &str =
+    "Failed to delete the scraper logging configuration.";
+
+/// The `resourceId` `DeleteScraperLoggingConfiguration` reports for a scraper logging
+/// configuration it could not resolve: the failing REQUEST rather than the bare id.
+///
+/// RECORDED BEHAVIOUR: the delete path identifies the request it refused —
+/// `DeleteScraperLoggingConfigurationRequest(scraperId=<scraperId>,
+/// clientToken=<clientToken>).scraperId/scraperlogging` — whose two variable parts are the
+/// `scraperId` and the `clientToken` of THIS request and whose text is otherwise fixed. A
+/// request that carries no `clientToken` (the member is optional, `@idempotencyToken`
+/// bound to the `clientToken` query string) states only the member it has, since there is
+/// no token to report.
+///
+/// Every other refusal of this service reports the bare id in `resourceId`, so this
+/// composition stays the one operation's own.
+pub fn delete_scraper_logging_resource_id(scraper_id: &str, client_token: Option<&str>) -> String {
+    let request = match client_token {
+        Some(client_token) => {
+            format!("scraperId={scraper_id}, clientToken={client_token}")
+        }
+        None => format!("scraperId={scraper_id}"),
+    };
+    format!("DeleteScraperLoggingConfigurationRequest({request}).scraperId/scraperlogging")
+}
 
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace this
 /// account does not hold.

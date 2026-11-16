@@ -24,7 +24,7 @@ use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
     ScraperLoggingConfiguration, SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
     SCRAPER_LOGGING_RESOURCE_TYPE, SCRAPER_LOGGING_STATUS_ACTIVE, SCRAPER_LOGGING_STATUS_DELETING,
-    SCRAPER_NOT_FOUND_MESSAGE, SCRAPER_RESOURCE_TYPE, STATUS_ACTIVE, TRANSITION_DELAY,
+    STATUS_ACTIVE, TRANSITION_DELAY,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -374,8 +374,10 @@ async fn a_describe_changes_nothing_a_later_caller_reads() {
 }
 
 /// A `scraperId` the store does not hold is the modelled `ResourceNotFoundException`
-/// (404) naming the SCRAPER, whatever the id looks like: the configuration is a child of
-/// the scraper, so the scraper is what is missing.
+/// (404) naming the scraper LOGGING CONFIGURATION, whatever the id looks like: this URI
+/// addresses the configuration, so the configuration is what cannot be resolved — the
+/// same refusal a scraper that holds none gets, which is what this operation is recorded
+/// answering.
 #[tokio::test]
 async fn a_scraper_the_store_does_not_hold_is_not_found() {
     let region = "us-west-2";
@@ -412,8 +414,8 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
             case,
             &reply,
             &scraper_id,
-            SCRAPER_NOT_FOUND_MESSAGE,
-            SCRAPER_RESOURCE_TYPE,
+            SCRAPER_LOGGING_NOT_FOUND_MESSAGE,
+            SCRAPER_LOGGING_RESOURCE_TYPE,
         );
     }
 

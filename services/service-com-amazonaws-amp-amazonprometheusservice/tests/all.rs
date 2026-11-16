@@ -91,6 +91,8 @@ mod scraper_logging_configuration_deletion;
 mod scraper_logging_configuration_describe;
 #[path = "all/scraper_logging_configuration_update.rs"]
 mod scraper_logging_configuration_update;
+#[path = "all/scraper_source_subnets.rs"]
+mod scraper_source_subnets;
 #[path = "all/scraper_update.rs"]
 mod scraper_update;
 #[path = "all/state_roundtrip.rs"]

@@ -230,6 +230,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The subnets the scraper would reach its source through are EC2's resources, not
+        // this service's, so what the request names is resolved against the service that
+        // owns them and a value it holds no subnet of is refused with the modelled
+        // `ValidationException` (400) — the sentence EC2 answered about that subnet,
+        // carried through as this service's EC2 hop reports it
+        // (`crate::state::ec2_subnets`). It is a judgement on the request's own `source`,
+        // so it runs BEFORE anything is looked up in this service's store: whether the
+        // caller is told about the subnet it got wrong cannot depend on whether the
+        // destination workspace resolves. Nothing is persisted either way, and a refusal
+        // is never assumed from silence: an EC2 that could not be asked refuses nothing.
+        if let Some(reason) = crate::state::ec2_subnets::source_subnet_refusal(
+            ctx,
+            &region,
+            crate::state::ec2_subnets::source_subnet_ids(&input.source),
+        )
+        .await
+        {
+            return Err(CreateScraperErrorModeled::ValidationException(
+                crate::state::request_validation_failed(&reason),
+            )
+            .into());
+        }
+
         let mut guard = state.lock();
         guard.materialize_due(now);
 

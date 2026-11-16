@@ -17,14 +17,14 @@
 //! test reaches the emulator.
 //!
 //! One known divergence from the AWS published document, stated here as well as on
-//! `DEFAULT_SCRAPER_CONFIGURATION` so it is visible from either side: the served blob
-//! omits the two members that name the kubelet's in-cluster secret file
-//! (`authorization.credentials_file` and `bearer_token_file`, both the service-account
-//! token), because emulator source may not reference a host secret path. A consumer that
-//! feeds this blob to a real in-cluster Prometheus supplies those itself.
-//! [`exactly_the_documented_members_are_absent_from_the_served_document`] pins exactly
-//! that gap — and, in its own table, the stanzas the published document does not carry at
-//! all — and goes away with the omission if the constraint is lifted.
+//! `DEFAULT_SCRAPER_CONFIGURATION` so it is visible from either side: the served blob omits
+//! the two members that name the in-cluster service-account token file
+//! (`authorization.credentials_file` and `bearer_token_file`), because emulator source may
+//! not carry a credential path in any form. A consumer that feeds this blob to a real
+//! in-cluster Prometheus supplies those itself.
+//! [`exactly_the_documented_members_are_absent_from_the_served_document`] pins exactly that
+//! gap — and, in its own table, the stanzas the published document does not carry at all —
+//! and goes away with the omission if the constraint is lifted.
 
 use std::collections::BTreeSet;
 
@@ -330,8 +330,8 @@ async fn the_external_labels_block_is_served_inert() {
 /// the published document does not carry at all (a correct absence, not an omission).
 #[tokio::test]
 async fn exactly_the_documented_members_are_absent_from_the_served_document() {
-    // (job_name, the member's path within that job) — omitted by design: both are the
-    // in-cluster service-account token path.
+    // (job_name, the member's path within that job) — omitted by design: both name the
+    // in-cluster service-account token file.
     let omitted: &[(&str, &[&str])] = &[
         ("cadvisor", &["authorization", "credentials_file"]),
         ("kubernetes-apiservers", &["bearer_token_file"]),

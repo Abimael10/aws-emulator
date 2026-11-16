@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
+// Single integration-test target for the router: this header, the one inner attribute at its
+// end, and then one `#[path = "all/<name>.rs"]` / `mod <name>;` pair per file under
+// `tests/all/`, sorted by name, and no other line.
+//
 // Single integration-test target for the router: a declaration list, and nothing else.
 //
 // Single integration-test target for the router: the canonical DECLARATION LIST of every

@@ -165,7 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The configuration is a child of the scraper, so a scraper this account does not
         // hold has no configuration to update and is itself the missing resource — and a
-        // Region this account holds nothing in holds no scraper either.
+        // Region this account holds nothing in holds no scraper either. RECORDED
+        // BEHAVIOUR, and the reason this operation reads the two lookups apart where
+        // `Describe`/`DeleteScraperLoggingConfiguration` do not: the recorded
+        // `UpdateScraperLoggingConfiguration` for a `scraperId` the account holds nothing
+        // for answers for the missing SCRAPER, while those two answer for the missing
+        // configuration — each operation answers the refusal recorded for it.
         let Some(store) = store
             .held_region_mut(&region)
             .filter(|store| store.scrapers.contains_key(&input.scraper_id))
