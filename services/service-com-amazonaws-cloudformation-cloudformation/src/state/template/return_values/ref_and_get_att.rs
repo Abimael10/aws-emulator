@@ -1008,11 +1008,12 @@ pub(crate) fn return_values(
             (arn, attributes)
         }
         // "Ref returns the DBClusterIdentifier"; Fn::GetAtt: DBClusterArn,
-        // DBClusterResourceId, Endpoint.Address, Endpoint.Port, ReadEndpoint.Address
-        // (MasterUserSecret.SecretArn is left out: it names a secret only RDS's own
-        // managed-password integration creates, which this emulator does not have). The
-        // endpoints are the published Aurora forms, `<identifier>.cluster-<label>` and
-        // `<identifier>.cluster-ro-<label>` under the regional RDS suffix.
+        // DBClusterResourceId, Endpoint.Address, Endpoint.Port, MasterUserSecret.SecretArn,
+        // ReadEndpoint.Address. The endpoints are the published Aurora forms,
+        // `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>` under the
+        // regional RDS suffix. The managed secret's ARN is a value only Amazon RDS can
+        // produce — it mints the secret when the declaration turns ManageMasterUserPassword
+        // on — so it stands in until that service has answered for the cluster.
         "AWS::RDS::DBCluster" => {
             let label = service_assigned_label(
                 RDS_ENDPOINT_LABEL_SALT,
@@ -1035,14 +1036,20 @@ pub(crate) fn return_values(
                 attributes.insert("Endpoint.Port".to_string(), port);
             }
             attributes.insert(
+                MASTER_USER_SECRET_ARN_ATTRIBUTE.to_string(),
+                service_assigned_document(name, MASTER_USER_SECRET_ARN_ATTRIBUTE),
+            );
+            attributes.insert(
                 "ReadEndpoint.Address".to_string(),
                 format!("{name}.cluster-ro-{label}.{region}.rds.{URL_SUFFIX}"),
             );
             (name.to_string(), attributes)
         }
         // "Ref returns the DBInstanceIdentifier"; Fn::GetAtt: DBInstanceArn, DbiResourceId,
-        // Endpoint.Address, Endpoint.Port (Endpoint.HostedZoneId is a value AWS allocated
-        // per Region — nothing computes it — so it is left out rather than invented).
+        // Endpoint.Address, Endpoint.Port, MasterUserSecret.SecretArn (Endpoint.HostedZoneId
+        // is a value AWS allocated per Region — nothing computes it — so it is left out
+        // rather than invented). The managed secret's ARN stands in for the same reason the
+        // DB cluster's does.
         "AWS::RDS::DBInstance" => {
             let label = service_assigned_label(
                 RDS_ENDPOINT_LABEL_SALT,
@@ -1064,6 +1071,10 @@ pub(crate) fn return_values(
             if let Some(port) = database_port(properties, scope, budget) {
                 attributes.insert("Endpoint.Port".to_string(), port);
             }
+            attributes.insert(
+                MASTER_USER_SECRET_ARN_ATTRIBUTE.to_string(),
+                service_assigned_document(name, MASTER_USER_SECRET_ARN_ATTRIBUTE),
+            );
             (name.to_string(), attributes)
         }
         // "Ref returns the ARN of the secret"; Fn::GetAtt: Id, which is that same ARN. A

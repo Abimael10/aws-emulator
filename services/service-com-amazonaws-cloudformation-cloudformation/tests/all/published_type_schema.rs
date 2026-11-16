@@ -131,8 +131,10 @@ fn table() -> Vec<SchemaCase> {
             identifiers: vec!["/properties/QueueUrl"],
         },
         // Published names that are PATHS through a property: an endpoint's address and
-        // port are members of the resource's `Endpoint`, so the document nests them. A DB
-        // instance is identified by its `DBInstanceIdentifier`, which it does not publish.
+        // port are members of the resource's `Endpoint`, and the ARN of the secret Amazon
+        // RDS manages the master user password in is a member of its `MasterUserSecret`, so
+        // the document nests each under its own property. A DB instance is identified by its
+        // `DBInstanceIdentifier`, which it does not publish.
         SchemaCase {
             type_name: "AWS::RDS::DBInstance",
             properties: vec![
@@ -140,10 +142,11 @@ fn table() -> Vec<SchemaCase> {
                 "/properties/DbiResourceId",
                 "/properties/Endpoint/properties/Address",
                 "/properties/Endpoint/properties/Port",
+                "/properties/MasterUserSecret/properties/SecretArn",
             ],
             identifiers: vec![],
         },
-        // The same shape with a second nested property beside the first.
+        // The same shape with a third nested property beside the first two.
         SchemaCase {
             type_name: "AWS::RDS::DBCluster",
             properties: vec![
@@ -151,6 +154,7 @@ fn table() -> Vec<SchemaCase> {
                 "/properties/DBClusterResourceId",
                 "/properties/Endpoint/properties/Address",
                 "/properties/Endpoint/properties/Port",
+                "/properties/MasterUserSecret/properties/SecretArn",
                 "/properties/ReadEndpoint/properties/Address",
             ],
             identifiers: vec![],

@@ -221,7 +221,38 @@ pub(crate) async fn create_db_cluster(
     {
         attributes.insert("DBClusterResourceId".to_string(), resource_id);
     }
+    push_master_user_secret_attribute(&answered, &mut attributes);
     Ok(Created::attributes(attributes))
+}
+
+/// Publish the managed master-user secret of the DB resource the owning service answered
+/// about, where it reports one.
+///
+/// `AWS::RDS::DBCluster` and `AWS::RDS::DBInstance` both publish
+/// [`MASTER_USER_SECRET_ARN_ATTRIBUTE`] as a return value: a declaration that turns
+/// `ManageMasterUserPassword` on has Amazon RDS generate the master user password and manage
+/// it in an Amazon Web Services Secrets Manager secret, and the resource reports that secret
+/// as its read-only `MasterUserSecret`. Only that service can produce the ARN — it is the
+/// secret Secrets Manager allocated — so it is read off its own answer rather than computed,
+/// which is what makes a template that hands the secret to another resource (a function that
+/// reads the credentials) resolve to the secret that really exists.
+///
+/// The member is a STRUCTURE (`<MasterUserSecret><SecretArn/><SecretStatus/>…`), read through
+/// the same nesting the published members of `Endpoint` are. A resource whose declaration
+/// manages no password has no such secret and reports no member, so nothing is re-pointed for
+/// it.
+pub(crate) fn push_master_user_secret_attribute(
+    answered: &str,
+    attributes: &mut BTreeMap<String, String>,
+) {
+    let reported = xml_scalar_children(answered, "MasterUserSecret");
+    if let Some(secret_arn) = reported
+        .get("SecretArn")
+        .and_then(scalar_text)
+        .filter(|arn| !arn.is_empty())
+    {
+        attributes.insert(MASTER_USER_SECRET_ARN_ATTRIBUTE.to_string(), secret_arn);
+    }
 }
 
 /// Whether Amazon RDS reports the DB cluster a stack created UP.
@@ -303,7 +334,7 @@ pub(crate) async fn update_db_cluster(
     {
         parameters.push(("ApplyImmediately".to_string(), "true".to_string()));
     }
-    call_query(
+    let answered = call_query(
         ctx,
         RDS_SIGNING_NAME,
         region,
@@ -313,8 +344,12 @@ pub(crate) async fn update_db_cluster(
     )
     .await?;
     // The cluster keeps the identity it was created with — the ARN, the resource id and the
-    // endpoints all follow the identifier — so a modification reports no new attribute.
-    Ok(Some(Created::attributes(BTreeMap::new())))
+    // endpoints all follow the identifier — so the one return value a modification can change
+    // is the managed master-user secret, which a modification that turns
+    // `ManageMasterUserPassword` on has Amazon RDS mint.
+    let mut attributes = BTreeMap::new();
+    push_master_user_secret_attribute(&answered, &mut attributes);
+    Ok(Some(Created::attributes(attributes)))
 }
 
 /// The properties the UPDATE does not send: the create's own list, plus every property that

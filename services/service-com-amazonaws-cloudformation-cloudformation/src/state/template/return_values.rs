@@ -187,6 +187,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "DBClusterResourceId",
             "Endpoint.Address",
             "Endpoint.Port",
+            MASTER_USER_SECRET_ARN_ATTRIBUTE,
             "ReadEndpoint.Address",
         ],
         "AWS::RDS::DBInstance" => &[
@@ -194,6 +195,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "DbiResourceId",
             "Endpoint.Address",
             "Endpoint.Port",
+            MASTER_USER_SECRET_ARN_ATTRIBUTE,
         ],
         SECRETSMANAGER_SECRET => &["Id"],
         EC2_VPC => &["VpcId"],
@@ -1746,6 +1748,18 @@ pub(super) const SECRET_ARN_SUFFIX_SALT: &str = "secretsmanager/secret";
 /// `DbClusterResourceId`/`DbiResourceId` are published as `cluster-`/`db-` plus 26
 /// characters.
 pub(super) const RDS_RESOURCE_ID_DIGITS: usize = 26;
+
+/// The `Fn::GetAtt` attribute an `AWS::RDS::DBCluster` and an `AWS::RDS::DBInstance` each
+/// publish for the secret Amazon RDS generates and manages the master user password in, from
+/// those two types' own "Return values" sections. The dotted name is a member of the
+/// resource's read-only `MasterUserSecret` property, exactly as `Endpoint.Address` is a
+/// member of its `Endpoint`.
+///
+/// The VALUE is one only Amazon RDS can produce — it mints the secret in Amazon Web Services
+/// Secrets Manager when a declaration turns `ManageMasterUserPassword` on — so the arm below
+/// computes a stand-in for it and the provisioning arm re-points it at what that service
+/// answered (`crate::state::provisioner::push_master_user_secret_attribute`).
+pub(crate) const MASTER_USER_SECRET_ARN_ATTRIBUTE: &str = "MasterUserSecret.SecretArn";
 
 /// How many characters the service-assigned suffix of a Secrets Manager secret ARN
 /// carries: "Secrets Manager automatically adds a hyphen and six random characters after

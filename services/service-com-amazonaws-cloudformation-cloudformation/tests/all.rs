@@ -439,6 +439,10 @@ mod rbin_rule_resource_type;
 mod rds_db_instance_replacement_plan;
 #[path = "all/rds_generated_resource_names.rs"]
 mod rds_generated_resource_names;
+// The managed master-user secret an `AWS::RDS::DBCluster`/`AWS::RDS::DBInstance` publishes as
+// its `MasterUserSecret.SecretArn` return value.
+#[path = "all/rds_managed_master_secret_return_value.rs"]
+mod rds_managed_master_secret_return_value;
 #[path = "all/rds_proxy_stack_resources.rs"]
 mod rds_proxy_stack_resources;
 #[path = "all/rds_published_name_identity.rs"]

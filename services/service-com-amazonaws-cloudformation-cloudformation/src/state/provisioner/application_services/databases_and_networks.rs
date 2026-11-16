@@ -1347,6 +1347,7 @@ pub(crate) async fn create_db_instance(
             attributes.insert(format!("Endpoint.{member}"), value);
         }
     }
+    push_master_user_secret_attribute(&answered, &mut attributes);
     Ok(Created::attributes(attributes))
 }
 
@@ -1773,7 +1774,7 @@ pub(crate) async fn update_db_instance(
     {
         parameters.push(("ApplyImmediately".to_string(), "true".to_string()));
     }
-    call_query(
+    let answered = call_query(
         ctx,
         RDS_SIGNING_NAME,
         region,
@@ -1783,8 +1784,12 @@ pub(crate) async fn update_db_instance(
     )
     .await?;
     // The instance keeps the identity it was created with — the ARN, the resource id and
-    // the endpoint all follow the identifier — so a modification reports no new attribute.
-    Ok(Some(Created::attributes(BTreeMap::new())))
+    // the endpoint all follow the identifier — so the one return value a modification can
+    // change is the managed master-user secret, which a modification that turns
+    // `ManageMasterUserPassword` on has Amazon RDS mint.
+    let mut attributes = BTreeMap::new();
+    push_master_user_secret_attribute(&answered, &mut attributes);
+    Ok(Some(Created::attributes(attributes)))
 }
 
 /// Whether `declared` asks for a DB instance the one `resource` records cannot BECOME: it
