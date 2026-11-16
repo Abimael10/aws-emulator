@@ -63,6 +63,8 @@ mod custom_engine_version_engine_availability;
 mod data_api_http_endpoint;
 #[path = "all/db_cluster_create_record.rs"]
 mod db_cluster_create_record;
+#[path = "all/db_cluster_custom_endpoints.rs"]
+mod db_cluster_custom_endpoints;
 #[path = "all/db_cluster_deletion.rs"]
 mod db_cluster_deletion;
 #[path = "all/db_cluster_engine_endpoint.rs"]

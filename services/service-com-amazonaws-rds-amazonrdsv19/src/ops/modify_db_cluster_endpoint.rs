@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBClusterEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBClusterEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBClusterEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +164,219 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBClusterEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBClusterEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBClusterEndpoint"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBClusterEndpointError::validation)?;
+
+        // "The identifier of the endpoint to modify. This parameter is stored as a
+        // lowercase string": the value names the endpoint this call addresses, folded the
+        // way the store keys it.
+        let named = input.db_cluster_endpoint_identifier;
+        // "The type of the endpoint. One of: READER, WRITER, ANY" — checked before the
+        // endpoint is looked up, since a value outside that domain is refused whatever the
+        // endpoint is doing.
+        let endpoint_type = match &input.endpoint_type {
+            Some(requested) => Some(
+                crate::state::check_custom_endpoint_type(requested)
+                    .map_err(ModifyDBClusterEndpointError::invalid_parameter_value)?,
+            ),
+            None => None,
+        };
+        let static_members = input.static_members;
+        let excluded_members = input.excluded_members;
+        // Only ONE of the two membership lists may be named: a request carrying both states
+        // the endpoint's membership twice.
+        crate::state::check_one_membership_list(static_members.as_ref(), excluded_members.as_ref())
+            .map_err(ModifyDBClusterEndpointError::invalid_parameter_value)?;
+        crate::state::check_cluster_endpoint_members(
+            static_members.as_deref().unwrap_or_default(),
+            excluded_members.as_deref().unwrap_or_default(),
+        )
+        .map_err(ModifyDBClusterEndpointError::invalid_parameter_value)?;
+        // A modification has to ask for something: "modifies the properties of an endpoint"
+        // — with no endpoint type and neither membership list named there is no property to
+        // change, and a 200 would report a modification that never happened. The request
+        // itself is what cannot be served, so this is decided before the endpoint it names
+        // is resolved — the order this front door evaluates a request in — and answered with
+        // the Query API's `InvalidParameterCombination`, the class a request whose members
+        // cannot stand as given belongs to.
+        let changes_a_property =
+            endpoint_type.is_some() || static_members.is_some() || excluded_members.is_some();
+        if !changes_a_property {
+            return Err(ModifyDBClusterEndpointError::invalid_parameter_combination(
+                crate::state::NO_MODIFICATIONS_REQUESTED_MESSAGE,
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a modification nothing applied.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this modification is judged against is the current
+        // one.
+        store.settle_due_transitions(&region);
+
+        // The endpoint this call ADDRESSES is resolved first: the operation models
+        // `DBClusterEndpointNotFoundFault` for exactly this, and an endpoint that does not
+        // exist has nothing to modify. RDS is regional, so only the region the request was
+        // signed for is in scope.
+        let Some(endpoint) = store.resolve_db_cluster_endpoint(&region, &named) else {
+            return Err(
+                ModifyDBClusterEndpointErrorModeled::DBClusterEndpointNotFoundFault(
+                    DBClusterEndpointNotFoundFault {
+                        message: Some(
+                            crate::state::DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "The requested operation can't be performed on the endpoint while the endpoint is
+        // in this state": an endpoint still being created, already applying another
+        // modification or on its way out takes no modification, which is what makes two
+        // concurrent modifications of one endpoint settle as one accepted and one refused.
+        if !endpoint.is_available() {
+            return Err(
+                ModifyDBClusterEndpointErrorModeled::InvalidDBClusterEndpointStateFault(
+                    InvalidDBClusterEndpointStateFault {
+                        message: Some(crate::state::DB_CLUSTER_ENDPOINT_STATE_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let key = (region.clone(), endpoint.identifier.clone());
+        let db_cluster_identifier = endpoint.db_cluster_identifier.clone();
+
+        // The endpoint is modified ON its cluster, so the cluster has to be in a state the
+        // change can be applied in — the same statuses a create is accepted on
+        // ([`crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES`]). A cluster that is stopped,
+        // stopping, starting, rebooting, failing over, taking a modification of its own or
+        // on its way out is the modelled `InvalidDBClusterStateFault`, and nothing is
+        // written for it.
+        let cluster_status = store
+            .resolve_db_cluster(&region, &db_cluster_identifier)
+            .filter(|cluster| !cluster.is_deleting())
+            .map(|cluster| cluster.status.clone());
+        let in_a_state_to_modify = cluster_status
+            .as_deref()
+            .is_some_and(|status| {
+                crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.contains(&status)
+            });
+        if !in_a_state_to_modify {
+            return Err(
+                ModifyDBClusterEndpointErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(crate::state::cluster_state_message(
+                            &db_cluster_identifier,
+                            cluster_status
+                                .as_deref()
+                                .unwrap_or(crate::state::DB_CLUSTER_STATUS_DELETING),
+                            &crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.join(", "),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each membership list the request carries REPLACES the stored one, and each entry
+        // of it names a DB instance that has to exist and to be in a state it can join the
+        // group in — the two faults this operation declares for a membership. A list the
+        // request does not carry leaves the stored one alone: "modifies the properties of an
+        // endpoint", so a property nobody named is not one this call changes.
+        let static_members = match &static_members {
+            Some(named) => Some(
+                store
+                    .resolve_cluster_endpoint_members(&region, named)
+                    .map_err(member_refusal)?,
+            ),
+            None => None,
+        };
+        let excluded_members = match &excluded_members {
+            Some(named) => Some(
+                store
+                    .resolve_cluster_endpoint_members(&region, named)
+                    .map_err(member_refusal)?,
+            ),
+            None => None,
+        };
+
+        // The modification is accepted: the endpoint carries the properties the request
+        // named, reports `modifying` now, and the clock owes it `available`. A key this
+        // handler resolved and a lookup under it can only disagree if the record is not
+        // where the resolve said it was, which answers the same modelled not-found fault as
+        // an endpoint that was never there: a disagreement is a "not found", never a panic
+        // that would take the whole emulator down with it.
+        let modified = {
+            let Some(record) = store.db_cluster_endpoints.get_mut(&key) else {
+                return Err(
+                    ModifyDBClusterEndpointErrorModeled::DBClusterEndpointNotFoundFault(
+                        DBClusterEndpointNotFoundFault {
+                            message: Some(
+                                crate::state::DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if let Some(endpoint_type) = endpoint_type {
+                record.custom_endpoint_type = endpoint_type;
+            }
+            if let Some(members) = static_members {
+                record.static_members = members;
+            }
+            if let Some(members) = excluded_members {
+                record.excluded_members = members;
+            }
+            record.begin_modification();
+            record.clone()
+        };
+        let modified = store.cluster_endpoint_to_wire(&modified);
+        // The generated types declare ONE struct per operation for the modelled
+        // `DBClusterEndpoint` shape, so the projection every cluster-endpoint operation
+        // shares (`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_to_wire`) is mapped
+        // onto this operation's own output rather than written out a second time here.
+        Ok(ModifyDBClusterEndpointOutput {
+            db_cluster_endpoint_identifier: modified.db_cluster_endpoint_identifier,
+            db_cluster_identifier: modified.db_cluster_identifier,
+            db_cluster_endpoint_resource_identifier: modified
+                .db_cluster_endpoint_resource_identifier,
+            endpoint: modified.endpoint,
+            status: modified.status,
+            endpoint_type: modified.endpoint_type,
+            custom_endpoint_type: modified.custom_endpoint_type,
+            static_members: modified.static_members,
+            excluded_members: modified.excluded_members,
+            db_cluster_endpoint_arn: modified.db_cluster_endpoint_arn,
+        })
     }
+}
+
+/// The modelled fault a membership entry this service cannot put in the endpoint group is
+/// refused with: the not-found fault for an identifier naming no DB instance, and the
+/// instance-state fault for one on its way out, each carrying the message
+/// [`crate::state::ComAmazonawsRdsAmazonrdsv19State::resolve_cluster_endpoint_members`]
+/// worded for it.
+fn member_refusal(miss: crate::state::MembershipMiss) -> ModifyDBClusterEndpointError {
+    match miss {
+        crate::state::MembershipMiss::NotFound(message) => {
+            ModifyDBClusterEndpointErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+                message: Some(message),
+            })
+        }
+        crate::state::MembershipMiss::InvalidState(message) => {
+            ModifyDBClusterEndpointErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterEndpoints"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBClusterEndpointsError::validation)?;
+        // "Default: 100 Constraints: Minimum 20, maximum 100."
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClusterEndpointsError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeDBClusterEndpointsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBClusterEndpointsError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the endpoints of the clusters of the region
+        // it was signed for. "The DB cluster identifier of the DB cluster associated with
+        // the endpoint" narrows the report to one cluster, and names one that has to exist
+        // — the single fault this operation models.
+        let clusters: Vec<&crate::state::DbClusterRecord> = match &input.db_cluster_identifier {
+            Some(named) => {
+                let cluster = store.resolve_db_cluster(&region, named).ok_or_else(|| {
+                    DescribeDBClusterEndpointsErrorModeled::DBClusterNotFoundFault(
+                        DBClusterNotFoundFault {
+                            message: Some(crate::state::db_cluster_not_found_message(named)),
+                        },
+                    )
+                })?;
+                vec![cluster]
+            }
+            None => store.clusters_in(&region),
+        };
+
+        // Every endpoint of each cluster in scope, in one order: the cluster's own writer
+        // and reader endpoints — which exist without a create and are what the
+        // `db-cluster-endpoint-type` filter's `writer` and `reader` values select — and
+        // then the custom endpoints created for it, in identifier order. The keys the page
+        // is cut on ascend in that same order, so a marker resumes where the caller left
+        // off ([`crate::state::paginate`]).
+        let mut reported: Vec<(String, CreateDBClusterEndpointOutput)> = Vec::new();
+        for cluster in clusters {
+            // "This action only applies to Aurora DB clusters": a Multi-AZ DB cluster has
+            // no endpoints this report describes, so none are reported for it.
+            if !crate::state::ClusterKind::Aurora.holds_for(&cluster.engine) {
+                continue;
+            }
+            for (rank, endpoint) in crate::state::builtin_cluster_endpoints(cluster)
+                .into_iter()
+                .enumerate()
+            {
+                reported.push((format!("{}#{rank}#", cluster.identifier), endpoint));
+            }
+            for record in store.cluster_endpoints_of(&region, &cluster.identifier) {
+                reported.push((
+                    format!("{}#{}#{}", cluster.identifier, BUILTIN_ENDPOINTS, record.identifier),
+                    store.cluster_endpoint_to_wire(record),
+                ));
+            }
+        }
+
+        // "The identifier of the endpoint to describe": a report narrowed to one endpoint
+        // reports that endpoint alone. The cluster's own two endpoints carry no identifier
+        // at all, so naming one selects a custom endpoint or nothing — and an identifier
+        // nothing was created under reports an empty list rather than a fault, since this
+        // operation models none for it.
+        if let Some(named) = &input.db_cluster_endpoint_identifier {
+            let wanted = crate::state::db_cluster_endpoint_key(named);
+            reported.retain(|(_, endpoint)| {
+                endpoint.db_cluster_endpoint_identifier.as_deref() == Some(wanted.as_str())
+            });
+        }
+        reported.retain(|(_, endpoint)| filters.iter().all(|filter| matches(filter, endpoint)));
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClusterEndpointsError::invalid_parameter_value)?;
+        Ok(DescribeDBClusterEndpointsOutput {
+            marker: page.next_marker,
+            db_cluster_endpoints: Some(page.items),
+        })
     }
+}
+
+/// How many endpoints a cluster has without a create — the writer and the reader — which is
+/// where the page keys of its CUSTOM endpoints start, so the keys of one cluster's
+/// endpoints ascend in the order the report serves them.
+const BUILTIN_ENDPOINTS: usize = 2;
+
+/// The filter names this report supports, as its `Filters` member publishes them: "`Name`
+/// can be one of: `db-cluster-endpoint-type`, `db-cluster-endpoint-custom-type`,
+/// `db-cluster-endpoint-id`, `db-cluster-endpoint-status`."
+const SUPPORTED_FILTER_NAMES: [&str; 4] = [
+    "db-cluster-endpoint-type",
+    "db-cluster-endpoint-custom-type",
+    "db-cluster-endpoint-id",
+    "db-cluster-endpoint-status",
+];
+
+/// Refuse a filter whose `Name` is none of [`SUPPORTED_FILTER_NAMES`].
+///
+/// A filter is refused rather than ignored, because ignoring it would report endpoints the
+/// caller excluded — the same reason every other report of this service checks its filter
+/// names, and with the same wording
+/// ([`crate::state::unrecognized_filter_name_message`]).
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    match filters
+        .iter()
+        .find(|filter| !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()))
+    {
+        None => Ok(()),
+        Some(filter) => Err(crate::state::unrecognized_filter_name_message(
+            &filter.name,
+        )),
+    }
+}
+
+/// Whether `endpoint` satisfies `filter`: one of its `Values` equals the member that filter
+/// names.
+///
+/// The published values are written in lower case (`reader`, `writer`, `custom`,
+/// `available`) while the members they select on are reported in the case the model
+/// publishes for each — `EndpointType` and `CustomEndpointType` in upper case, `Status` in
+/// lower — so the comparison disregards case rather than holding a caller to one spelling.
+/// An endpoint that carries NO value for the member a filter names (the cluster's own
+/// endpoints have no identifier and no custom type) matches none of that filter's values,
+/// which is what excluding it says.
+fn matches(filter: &Filter, endpoint: &CreateDBClusterEndpointOutput) -> bool {
+    let member = match filter.name.as_str() {
+        "db-cluster-endpoint-type" => endpoint.endpoint_type.as_deref(),
+        "db-cluster-endpoint-custom-type" => endpoint.custom_endpoint_type.as_deref(),
+        "db-cluster-endpoint-id" => endpoint.db_cluster_endpoint_identifier.as_deref(),
+        "db-cluster-endpoint-status" => endpoint.status.as_deref(),
+        // Unreachable: `check_filter_names` refused every other name before the report was
+        // built. Answered as "nothing matches" rather than with a panic in a request path.
+        _ => return false,
+    };
+    member.is_some_and(|value| {
+        filter
+            .values
+            .iter()
+            .any(|wanted| wanted.eq_ignore_ascii_case(value))
+    })
 }

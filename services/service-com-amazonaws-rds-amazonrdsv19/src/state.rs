@@ -75,7 +75,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AvailabilityZone, Certificate, CertificateDetails, ClusterPendingModifiedValues,
-    CreateDBShardGroupOutput,
+    CreateDBClusterEndpointOutput, CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
     DBClusterSnapshotAttributesResult, DBInstance, DBInstanceRole, DBInstanceStatusInfo,
@@ -154,6 +154,9 @@ pub mod tenant_databases;
 // `DescribeDBRecommendations`, and the event category / source-type catalog. Each is
 // glob-re-exported, so every one of them is still reached as `crate::state::<name>`.
 mod certificates;
+// The CUSTOM endpoints of a DB cluster: their record, their projection, and the two
+// endpoints every cluster publishes without a create.
+mod cluster_endpoints;
 mod default_catalog;
 mod event_catalog;
 mod recommendations;
@@ -171,6 +174,7 @@ mod sns_topics;
 
 pub use associated_roles::*;
 pub use certificates::*;
+pub use cluster_endpoints::*;
 pub use default_catalog::*;
 pub use event_catalog::*;
 pub use recommendations::*;
@@ -546,6 +550,17 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// ([`data_plane::cluster_endpoint`]), and [`Self::settle_due_transitions`] drops it
     /// with the cluster.
     pub db_cluster_engine_endpoints: BTreeMap<RegionalKey, DbEngineEndpoint>,
+    /// The CUSTOM endpoints of DB clusters by `(region, db_cluster_endpoint_key)` — the
+    /// identifier folded as `DBClusterEndpointIdentifier` documents ("this parameter is
+    /// stored as a lowercase string"). Ordered, so `DescribeDBClusterEndpoints` pages
+    /// deterministically within a region.
+    ///
+    /// `CreateDBClusterEndpoint` inserts here, bounded by
+    /// [`DB_CLUSTER_ENDPOINT_QUOTA_PER_CLUSTER`] endpoints per cluster — an entry exists
+    /// only for a cluster this store holds, so the per-region cluster quota and
+    /// [`MAX_REGIONS`] bound the map in total — and
+    /// [`Self::settle_due_transitions`] drops an endpoint with the cluster it belongs to.
+    pub db_cluster_endpoints: BTreeMap<RegionalKey, DbClusterEndpointRecord>,
 }
 
 impl ComAmazonawsRdsAmazonrdsv19State {
@@ -671,6 +686,28 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             // The cluster is gone from the service, so its engine endpoint goes with it:
             // dropping the record closes the port and severs every session on it.
             self.db_cluster_engine_endpoints.remove(&key);
+            // And so do the custom endpoints that stood in front of it: a custom endpoint
+            // "associated with an Amazon Aurora DB cluster" has nothing to point at once
+            // that cluster is gone, which is why it is removed here rather than left
+            // naming it.
+            self.db_cluster_endpoints
+                .retain(|endpoint_key, record| {
+                    endpoint_key.0 != key.0 || record.db_cluster_identifier != key.1
+                });
+        }
+        for (key, endpoint) in self
+            .db_cluster_endpoints
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if endpoint.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.db_cluster_endpoints.remove(&key);
         }
         for (key, shard_group) in self
             .db_shard_groups
@@ -1113,6 +1150,15 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                     snapshot.db_cluster_identifier == record.identifier
                         && snapshot.status == SNAPSHOT_STATUS_CREATING
                 }),
+            // "The custom endpoints associated with the DB cluster": the endpoints
+            // `CreateDBClusterEndpoint` stored for this cluster, read off those records and
+            // reported as the DNS addresses they publish — the same address each of them
+            // reports as its own `Endpoint`, since both come from one projection.
+            custom_endpoints: self
+                .cluster_endpoints_of(&record.region, &record.identifier)
+                .into_iter()
+                .filter_map(|endpoint| self.cluster_endpoint_to_wire(endpoint).endpoint)
+                .collect(),
         }
     }
 
@@ -1712,6 +1758,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.db_snapshots.keys())
             .chain(self.db_cluster_snapshots.keys())
             .chain(self.db_clusters.keys())
+            .chain(self.db_cluster_endpoints.keys())
             .chain(self.db_cluster_parameter_groups.keys())
             .chain(self.db_parameter_groups.keys())
             .chain(self.event_subscriptions.keys())

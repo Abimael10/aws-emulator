@@ -119,7 +119,7 @@ struct ErrorCase {
 /// (`smithy_query(query="operation", operation="DescribeOptionGroups,DescribeDBInstances,
 /// DescribeDBSnapshots")`: `OptionGroupNotFoundFault` 404, `DBInstanceNotFound` 404,
 /// `DBSnapshotNotFound` 404); `MaxRecords` is documented "Minimum 20, maximum 100", so 19
-/// is one past its published bound; `DescribeDBClusterEndpoints` is one of the operations
+/// is one past its published bound; `DescribeSourceRegions` is one of the operations
 /// still carrying the scaffold header, so it answers the 501 channel.
 ///
 /// The codes of the rows that are NOT modelled errors are the ones this service already
@@ -197,9 +197,9 @@ const ERROR_CASES: &[ErrorCase] = &[
     ErrorCase {
         case: "scaffolded operation, which answers the 501 channel",
         version: API_VERSION,
-        // `DescribeDBClusterEndpoints` is still a stub (`DescribeDBClusters`, which stood
-        // here before, reports the clusters `CreateDBCluster` stores).
-        action: "DescribeDBClusterEndpoints",
+        // `DescribeSourceRegions` is still a stub (`DescribeDBClusterEndpoints`, which
+        // stood here before, reports the endpoints `CreateDBClusterEndpoint` stores).
+        action: "DescribeSourceRegions",
         params: &[],
         status: 501,
         code: "NotImplemented",

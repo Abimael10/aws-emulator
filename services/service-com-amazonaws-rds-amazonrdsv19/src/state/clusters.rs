@@ -27,6 +27,14 @@ pub struct ClusterMembership {
     /// — which is the `backing-up` status the cluster reports while it lasts; see
     /// [`DbClusterRecord::reported_status`].
     pub backing_up: bool,
+    /// `CustomEndpoints`: "the custom endpoints associated with the DB cluster", as the
+    /// addresses they publish.
+    ///
+    /// Read from the endpoint records that NAME this cluster, as the members above are read
+    /// off the instances: a copy on the cluster would still report an endpoint a
+    /// `DeleteDBClusterEndpoint` took away. Empty for a cluster nobody created one for,
+    /// which is what RDS reports for a cluster that has none.
+    pub custom_endpoints: Vec<String>,
 }
 
 /// A stored DB cluster: everything the service persists about it.
@@ -654,9 +662,10 @@ impl DbClusterRecord {
             port: Some(self.published_port()),
             endpoint: Some(self.endpoint()),
             reader_endpoint: Some(self.reader_endpoint()),
-            // Only `CreateDBClusterEndpoint` adds a custom endpoint, and it is still a
-            // stub, so no cluster this service holds has one.
-            custom_endpoints: Some(Vec::new()),
+            // "The custom endpoints associated with the DB cluster": the endpoints created
+            // for this cluster, read off those records and reported as the addresses they
+            // publish.
+            custom_endpoints: Some(membership.custom_endpoints.clone()),
             hosted_zone_id: Some(hosted_zone_id(&self.region, endpoint_domain(&self.engine))),
             availability_zones: Some(self.availability_zones.clone()),
             // "The earliest / latest time to which a database can be restored with

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBClusterEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBClusterEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBClusterEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBClusterEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBClusterEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBClusterEndpoint"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DeleteDBClusterEndpointError::validation)?;
+        // "The identifier associated with the custom endpoint. This parameter is stored as a
+        // lowercase string": the value names the endpoint this call addresses, folded the
+        // way the store keys it.
+        let named = input.db_cluster_endpoint_identifier;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a delete nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this delete is judged against is the current one.
+        store.settle_due_transitions(&region);
+
+        // The endpoint this call ADDRESSES is resolved first: the operation models
+        // `DBClusterEndpointNotFoundFault` for exactly this, and an endpoint that does not
+        // exist has nothing to delete. RDS is regional, so only the region the request was
+        // signed for is in scope.
+        let Some(endpoint) = store.resolve_db_cluster_endpoint(&region, &named) else {
+            return Err(
+                DeleteDBClusterEndpointErrorModeled::DBClusterEndpointNotFoundFault(
+                    DBClusterEndpointNotFoundFault {
+                        message: Some(
+                            crate::state::DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "The requested operation can't be performed on the endpoint while the endpoint is
+        // in this state": an endpoint still being created, applying a modification or
+        // already on its way out takes no delete — so a second delete of one endpoint is
+        // refused rather than restarting the removal the first accepted.
+        if !endpoint.is_available() {
+            return Err(
+                DeleteDBClusterEndpointErrorModeled::InvalidDBClusterEndpointStateFault(
+                    InvalidDBClusterEndpointStateFault {
+                        message: Some(crate::state::DB_CLUSTER_ENDPOINT_STATE_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let key = (region.clone(), endpoint.identifier.clone());
+
+        // The delete is accepted: the endpoint reports `deleting` from now on and the clock
+        // owes its removal from the store, after which every read of the identifier is the
+        // modelled not-found fault — the signal a client polls for. A key this handler
+        // resolved and a lookup under it can only disagree if the record is not where the
+        // resolve said it was, which answers that same not-found fault rather than a panic
+        // in a request path.
+        let deleting = {
+            let Some(record) = store.db_cluster_endpoints.get_mut(&key) else {
+                return Err(
+                    DeleteDBClusterEndpointErrorModeled::DBClusterEndpointNotFoundFault(
+                        DBClusterEndpointNotFoundFault {
+                            message: Some(
+                                crate::state::DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            record.begin_deletion();
+            record.clone()
+        };
+        let deleting = store.cluster_endpoint_to_wire(&deleting);
+        // The generated types declare ONE struct per operation for the modelled
+        // `DBClusterEndpoint` shape, so the projection every cluster-endpoint operation
+        // shares (`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_to_wire`) is mapped
+        // onto this operation's own output rather than written out a second time here.
+        Ok(DeleteDBClusterEndpointOutput {
+            db_cluster_endpoint_identifier: deleting.db_cluster_endpoint_identifier,
+            db_cluster_identifier: deleting.db_cluster_identifier,
+            db_cluster_endpoint_resource_identifier: deleting
+                .db_cluster_endpoint_resource_identifier,
+            endpoint: deleting.endpoint,
+            status: deleting.status,
+            endpoint_type: deleting.endpoint_type,
+            custom_endpoint_type: deleting.custom_endpoint_type,
+            static_members: deleting.static_members,
+            excluded_members: deleting.excluded_members,
+            db_cluster_endpoint_arn: deleting.db_cluster_endpoint_arn,
+        })
     }
 }

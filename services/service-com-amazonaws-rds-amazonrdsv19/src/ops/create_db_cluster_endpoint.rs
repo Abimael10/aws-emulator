@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBClusterEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBClusterEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBClusterEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +171,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBClusterEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBClusterEndpoint"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateDBClusterEndpointError::validation)?;
+
+        // "The identifier to use for the new endpoint. This parameter is stored as a
+        // lowercase string." The INPUT member targets a plain string, so the boundary
+        // validator enforces nothing for it; the identifier is what the endpoint is
+        // reported and addressed under, so it is held to the identifier rule of the DB
+        // cluster namespace it sits in before anything is stored under it.
+        let named = input.db_cluster_endpoint_identifier;
+        crate::state::check_identifier(
+            "DBClusterEndpointIdentifier",
+            &named,
+            crate::state::MAX_DB_CLUSTER_ENDPOINT_IDENTIFIER_LEN,
+        )
+        .map_err(CreateDBClusterEndpointError::invalid_parameter_value)?;
+        let identifier = crate::state::db_cluster_endpoint_key(&named);
+
+        // "The type of the endpoint, one of: READER, WRITER, ANY" — reported back as the
+        // endpoint's `CustomEndpointType` in the case that member publishes.
+        let custom_endpoint_type =
+            crate::state::check_custom_endpoint_type(&input.endpoint_type)
+                .map_err(CreateDBClusterEndpointError::invalid_parameter_value)?;
+
+        // The membership lists and the tags are stored request data, so both are bounded
+        // before any of it is kept, and only ONE of the two lists may be named.
+        crate::state::check_one_membership_list(
+            input.static_members.as_ref(),
+            input.excluded_members.as_ref(),
+        )
+        .map_err(CreateDBClusterEndpointError::invalid_parameter_value)?;
+        let static_members = input.static_members.unwrap_or_default();
+        let excluded_members = input.excluded_members.unwrap_or_default();
+        crate::state::check_cluster_endpoint_members(&static_members, &excluded_members)
+            .map_err(CreateDBClusterEndpointError::invalid_parameter_value)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateDBClusterEndpointError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated endpoint.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // "Creates a new custom endpoint and associates it with an Amazon Aurora DB
+        // cluster": the endpoint hangs off a cluster, so a `DBClusterIdentifier` that
+        // resolves to no cluster in this region is the modelled not-found fault rather than
+        // an endpoint pointing at nothing. RDS is regional, so only the region the request
+        // was signed for is in scope.
+        let Some(cluster) = store.resolve_db_cluster(&region, &input.db_cluster_identifier) else {
+            return Err(CreateDBClusterEndpointErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_not_found_message(
+                        &input.db_cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        let db_cluster_identifier = cluster.identifier.clone();
+        let cluster_engine = cluster.engine.clone();
+        let cluster_status = cluster.status.clone();
+        let cluster_is_deleting = cluster.is_deleting();
+
+        // "This action applies only to Aurora DB clusters": a `DBClusterIdentifier` naming
+        // a Multi-AZ DB cluster names one this call cannot serve at all, which is a value
+        // the parameter does not accept rather than a state the cluster is in — the
+        // `InvalidParameterValue` this front door answers such a value with.
+        if !crate::state::ClusterKind::Aurora.holds_for(&cluster_engine) {
+            return Err(CreateDBClusterEndpointError::invalid_parameter_value(
+                crate::state::cluster_kind_unsupported_message(
+                    Self::NAME,
+                    &db_cluster_identifier,
+                    &cluster_engine,
+                    crate::state::ClusterKind::Aurora,
+                ),
+            ));
+        }
+        // A custom endpoint is added TO the cluster, so there has to be a cluster to add it
+        // to: only one that is up, or one still being created that the endpoint comes up
+        // with, can take it ([`crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES`]). Every
+        // other status — stopped, stopping, rebooting, failing over, taking a modification,
+        // or on its way out — is the modelled `InvalidDBClusterStateFault`, and nothing is
+        // stored for it.
+        if cluster_is_deleting
+            || !crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.contains(&cluster_status.as_str())
+        {
+            return Err(
+                CreateDBClusterEndpointErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(crate::state::cluster_state_message(
+                            &db_cluster_identifier,
+                            &cluster_status,
+                            &crate::state::CLUSTER_ENDPOINT_CLUSTER_STATUSES.join(", "),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "List of DB instance identifiers that are part of the custom endpoint group" and
+        // the list that is not: each names a DB instance, so an identifier that resolves to
+        // none is the modelled `DBInstanceNotFoundFault` and one naming an instance on its
+        // way out is the modelled `InvalidDBInstanceStateFault` — the two faults this
+        // operation declares for a membership — rather than a membership naming nothing.
+        let static_members = store
+            .resolve_cluster_endpoint_members(&region, &static_members)
+            .map_err(member_refusal)?;
+        let excluded_members = store
+            .resolve_cluster_endpoint_members(&region, &excluded_members)
+            .map_err(member_refusal)?;
+
+        // The identifier names ONE endpoint in the region: a second create under it is the
+        // modelled already-exists fault rather than a silent overwrite of the first, which
+        // is what makes two concurrent creates of one identifier settle as one success and
+        // one refusal — this store's lock serialises them.
+        let key = (region.clone(), identifier.clone());
+        if store.db_cluster_endpoints.contains_key(&key) {
+            return Err(
+                CreateDBClusterEndpointErrorModeled::DBClusterEndpointAlreadyExistsFault(
+                    DBClusterEndpointAlreadyExistsFault {
+                        message: Some(
+                            crate::state::DB_CLUSTER_ENDPOINT_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The cluster's custom endpoint allowance: "the cluster already has the maximum
+        // number of custom endpoints" is what the modelled fault reports, and the bound is
+        // the one Amazon Aurora publishes per DB cluster.
+        if store
+            .cluster_endpoints_of(&region, &db_cluster_identifier)
+            .len()
+            >= crate::state::DB_CLUSTER_ENDPOINT_QUOTA_PER_CLUSTER
+        {
+            return Err(
+                CreateDBClusterEndpointErrorModeled::DBClusterEndpointQuotaExceededFault(
+                    DBClusterEndpointQuotaExceededFault {
+                        message: Some(crate::state::DB_CLUSTER_ENDPOINT_QUOTA_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mint = store.next_mint();
+        let record = crate::state::DbClusterEndpointRecord {
+            identifier,
+            region: region.clone(),
+            db_cluster_identifier,
+            resource_id: crate::state::mint_db_cluster_endpoint_resource_id(mint),
+            custom_endpoint_type,
+            // The create is accepted and the endpoint is still being provisioned: it
+            // reports `creating` until the transition the clock owes it comes due, which
+            // the next call materialises. Nothing sleeps.
+            status: crate::state::DB_CLUSTER_ENDPOINT_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE,
+            )),
+            static_members,
+            excluded_members,
+            tags,
+        };
+        let created = store.cluster_endpoint_to_wire(&record);
+        store.db_cluster_endpoints.insert(key, record);
+        Ok(created)
     }
+}
+
+/// The modelled fault a membership entry this service cannot put in the endpoint group is
+/// refused with: the not-found fault for an identifier naming no DB instance, and the
+/// instance-state fault for one on its way out, each carrying the message
+/// [`crate::state::ComAmazonawsRdsAmazonrdsv19State::resolve_cluster_endpoint_members`]
+/// worded for it.
+fn member_refusal(miss: crate::state::MembershipMiss) -> CreateDBClusterEndpointError {
+    match miss {
+        crate::state::MembershipMiss::NotFound(message) => {
+            CreateDBClusterEndpointErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+                message: Some(message),
+            })
+        }
+        crate::state::MembershipMiss::InvalidState(message) => {
+            CreateDBClusterEndpointErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }
