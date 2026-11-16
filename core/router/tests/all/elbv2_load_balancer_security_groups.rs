@@ -23,7 +23,7 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::elbv2_network_resolution::{ec2_ok, elbv2, BOOT_STACK_SIZE};
+use crate::elbv2_network_resolution::{attach_internet_gateway, ec2_ok, elbv2, BOOT_STACK_SIZE};
 use crate::query_wire::{block_of, element, members_of};
 
 /// One VPC of the account, with the two subnets a load balancer is placed in and the id EC2
@@ -38,6 +38,9 @@ struct Vpc {
 
 /// Create one VPC with two subnets and a group of its own, and read the id EC2 gives its
 /// default security group.
+///
+/// The VPC is given an internet gateway, which an internet-facing load balancer of the rows
+/// below needs ([`attach_internet_gateway`]).
 fn seed_vpc(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
@@ -85,6 +88,7 @@ fn seed_vpc(
         ),
         "groupId",
     );
+    attach_internet_gateway(router, runtime, &vpc);
     let named_group = element(
         &ec2_ok(
             router,

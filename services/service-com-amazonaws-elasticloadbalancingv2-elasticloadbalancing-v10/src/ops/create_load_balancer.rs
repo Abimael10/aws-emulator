@@ -13,18 +13,20 @@
 //! cannot serve, so a refused create leaves the name free: a `Name` outside its documented
 //! form (`ValidationError`), a placement with fewer subnets than the family requires, an
 //! `IpAddressType` the family and scheme cannot carry or a `SubnetMapping` member
-//! documented for another family or scheme (`InvalidConfigurationRequest`), and a subnet
+//! documented for another family or scheme (`InvalidConfigurationRequest`), a subnet
 //! or Elastic IP allocation EC2 — which owns both — holds none of (`SubnetNotFound`,
-//! `AllocationIdNotFound`). Each rule is read once, in `crate::state`, because
+//! `AllocationIdNotFound`), and a VPC with no internet gateway attached for an
+//! internet-facing load balancer, whose nodes carry public addresses (`InvalidSubnet`).
+//! Each rule is read once, in `crate::state`, because
 //! `SetSubnets` and `SetIpAddressType` apply the same ones to a load balancer that
 //! already exists.
 //!
 //! What the create itself fills: the ARN and the `DNSName` the load balancer publishes —
-//! the `host:port` of the socket this emulator opens for an Application Load Balancer
+//! the `host:port` of the socket this emulator opens for a PUBLIC Application Load Balancer
 //! ([`crate::state::open_load_balancer_endpoint`]), which is the address a client that
-//! honours that name can actually reach it at, and otherwise the form its FAMILY publishes
-//! ([`crate::state::load_balancer_dns_name`]) — and, for an Application Load Balancer a
-//! request names no `SecurityGroups` for, the default security group of the VPC it is
+//! honours that name can actually reach it at, and otherwise the form its FAMILY and SCHEME
+//! publish ([`crate::state::load_balancer_dns_name`]) — and, for an Application Load Balancer
+//! a request names no `SecurityGroups` for, the default security group of the VPC it is
 //! placed in ([`starting_security_groups`]).
 //!
 //! ## Shape of an operation
@@ -423,6 +425,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(refusal);
         }
+        // The nodes of an internet-facing load balancer carry PUBLIC addresses, and a public
+        // address inside a VPC routes to the internet only through an internet gateway
+        // attached to that VPC — so a VPC that has none can carry no such load balancer, and
+        // the placement is refused rather than provisioned ([`ungatewayed_public_placement`]).
+        if let Some(refusal) =
+            ungatewayed_public_placement(ctx, &region, family, &scheme, vpc_id.as_deref()).await
+        {
+            return Err(refusal);
+        }
         // The groups the load balancer STARTS with: the ones the request named, or — for a
         // family whose load balancers always carry one — the default security group of the
         // VPC it is placed in ([`starting_security_groups`]).
@@ -485,14 +496,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The ADDRESS this load balancer answers on, opened BEFORE the store is locked
-        // because opening a socket is asynchronous. The family a client ON THIS MACHINE
-        // dials directly gets one and publishes it; any other keeps the name Elastic Load
-        // Balancing's own zone would carry, which is the name its own traffic is served on
-        // in process ([`crate::service::data_plane`]) — a port published for a client that
+        // because opening a socket is asynchronous. The load balancer a client ON THIS
+        // MACHINE dials directly gets one and publishes it; any other keeps the name Elastic
+        // Load Balancing's own zone would carry, which is the name its own traffic is served
+        // on in process ([`crate::service::data_plane`]) — a port published for a client that
         // cannot be its client would be worse than a name. A create this request goes on to
         // refuse drops the handle, which closes the port again.
+        //
+        // That is the Application family — the one whose listeners answer the client's own
+        // request — and, of it, the load balancers whose nodes carry PUBLIC addresses: "the
+        // nodes of an internal load balancer have only private IP addresses … internal load
+        // balancers can route requests only from clients with access to the VPC for the load
+        // balancer" (`Scheme`), and the client with that access is the one INSIDE this
+        // emulator, which is where the name its own zone gives it resolves
+        // ([`crate::state::load_balancer_dns_name`]).
         let endpoint = match family {
-            crate::state::LoadBalancerFamily::Application => {
+            crate::state::LoadBalancerFamily::Application
+                if candidate.scheme != crate::state::INTERNAL_SCHEME =>
+            {
                 crate::state::open_load_balancer_endpoint(&*self.engine, ctx.callback().clone())
                     .await
             }
@@ -667,6 +688,41 @@ async fn unusable_security_groups(
             .into(),
         ),
     }
+}
+
+/// The refusal a request placing an internet-facing load balancer in a VPC with no internet
+/// gateway earns, or `None` when the VPC has one — and also when there is no VPC or no EC2 to
+/// ask, because a refusal has to be grounded in what EC2 reported rather than assumed from
+/// silence.
+///
+/// The nodes of an internet-facing load balancer carry public addresses, and a public address
+/// inside a VPC reaches the internet only through an internet gateway attached to it, so a
+/// VPC with none can carry no internet-facing load balancer: the SUBNETS the request named are
+/// what it is placed in, which is why the modelled refusal is the one for a subnet a load
+/// balancer cannot be placed in. The gateway is EC2's resource, so it is READ from EC2
+/// ([`crate::state::network::vpc_internet_gateway`]) and judged by the one rule in
+/// `crate::state` ([`crate::state::check_internet_gateway`]), which is also what says whether
+/// this placement needs a gateway at all — a load balancer that needs none is never a read.
+async fn ungatewayed_public_placement(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    family: crate::state::LoadBalancerFamily,
+    scheme: &str,
+    vpc_id: Option<&str>,
+) -> Option<CreateLoadBalancerError> {
+    if !crate::state::placement_needs_internet_gateway(family, scheme) {
+        return None;
+    }
+    let vpc_id = vpc_id?;
+    let gateway = crate::state::network::vpc_internet_gateway(ctx, region, vpc_id).await;
+    let refusal =
+        crate::state::check_internet_gateway(family, scheme, Some(vpc_id), gateway).err()?;
+    Some(
+        CreateLoadBalancerErrorModeled::InvalidSubnetException(InvalidSubnetException {
+            message: Some(refusal),
+        })
+        .into(),
+    )
 }
 
 /// The security groups a load balancer this request creates STARTS with: the ones the

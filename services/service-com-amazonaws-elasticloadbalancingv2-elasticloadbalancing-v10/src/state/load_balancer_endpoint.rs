@@ -12,13 +12,18 @@
 //! the port range), and reports the `host:port` that socket answers on as its DNS name. A
 //! client dials exactly what it was told.
 //!
-//! Only an APPLICATION Load Balancer gets one: that is the family a client ON THIS MACHINE
-//! dials directly, because its listeners answer the client's own request. A Network or
-//! Gateway Load Balancer keeps the name Elastic Load Balancing's own zone would give it. A
-//! Network Load Balancer's traffic is served all the same — a listener of its hands the
-//! connection to what its target group names ([`crate::service::data_plane`]) — and the
-//! client of an internal one sits inside this emulator, which is where that name resolves:
-//! a port published for a client that cannot be its client would be worse than a name.
+//! Only an APPLICATION Load Balancer whose nodes carry PUBLIC addresses gets one: that is the
+//! family a client ON THIS MACHINE dials directly, because its listeners answer the client's
+//! own request, and the internet-facing scheme is the one whose "nodes … have public IP
+//! addresses" (`CreateLoadBalancerInput$Scheme`). An INTERNAL load balancer's nodes "have only
+//! private IP addresses", so "internal load balancers can route requests only from clients
+//! with access to the VPC for the load balancer" — and the client with that access sits INSIDE
+//! this emulator, which is where the name Elastic Load Balancing's own zone gives it resolves.
+//! A Network or Gateway Load Balancer keeps that name too. Their traffic is served all the
+//! same — a listener of theirs hands the connection to what its target group names
+//! ([`crate::service::data_plane`], which serves a load balancer addressed by the name it
+//! published) — and a port published for a client that cannot be its client would be worse
+//! than a name.
 //!
 //! The socket is the ADDRESS, not the data plane: everything a request is answered BY — the
 //! listener it reached, the rules, the web ACL in front of the load balancer and the target

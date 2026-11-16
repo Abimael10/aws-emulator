@@ -856,6 +856,9 @@ async fn await_the_change_set(router: &MultiServiceRouter, parent: &str, change_
 /// short-form intrinsics, and resources the template does not NAME, so every identifier is
 /// one CloudFormation generated for a child stack whose own name already carries its
 /// parent's.
+///
+/// Like its JSON sibling it attaches an INTERNET GATEWAY to the VPC, which the public load
+/// balancer of the service child placed in these subnets needs.
 fn yaml_network_template() -> &'static str {
     concat!(
         "Resources:\n",
@@ -863,6 +866,13 @@ fn yaml_network_template() -> &'static str {
         "    Type: AWS::EC2::VPC\n",
         "    Properties:\n",
         "      CidrBlock: 10.30.0.0/16\n",
+        "  Gateway:\n",
+        "    Type: AWS::EC2::InternetGateway\n",
+        "  GatewayAttachment:\n",
+        "    Type: AWS::EC2::VPCGatewayAttachment\n",
+        "    Properties:\n",
+        "      VpcId: !Ref Vpc\n",
+        "      InternetGatewayId: !Ref Gateway\n",
         "  SubnetA:\n",
         "    Type: AWS::EC2::Subnet\n",
         "    Properties:\n",

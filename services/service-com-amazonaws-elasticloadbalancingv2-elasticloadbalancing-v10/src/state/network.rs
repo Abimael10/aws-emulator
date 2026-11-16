@@ -548,6 +548,81 @@ pub async fn vpc_cidrs(
     Some(cidrs)
 }
 
+/// What EC2 says about the internet gateway of a VPC: the gateway a VPC reaches the internet
+/// through, which is EC2's resource and not this service's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternetGatewayLookup {
+    /// EC2 reports an internet gateway attached to the VPC.
+    Attached,
+    /// EC2 answered, and no internet gateway of the account is attached to the VPC.
+    Detached,
+    /// Nothing is known: there is no EC2 to ask, or it answered something else.
+    Unknown,
+}
+
+/// The EC2 filter that selects the internet gateways ATTACHED to a VPC, from
+/// `DescribeInternetGatewaysRequest$Filters`: "attachment.vpc-id - The ID of an attached
+/// VPC."
+const ATTACHED_VPC_FILTER: &str = "attachment.vpc-id";
+
+/// The state an internet-gateway attachment is IN EFFECT in, from
+/// `InternetGatewayAttachment$State` by way of `DescribeInternetGatewaysRequest$Filters`:
+/// "attachment.state - The current state of the attachment between a gateway and a VPC
+/// (available). Present only if a VPC is attached."
+const ATTACHMENT_IN_EFFECT: &str = "available";
+
+/// Whether EC2 reports an internet gateway attached to `vpc_id`.
+///
+/// A VPC reaches the internet through an internet gateway attached to it, and that gateway
+/// and its attachment are EC2's resources — so whether a VPC has one is EC2's to say, read
+/// here and never assumed. EC2 answering nothing about it ([`InternetGatewayLookup::Unknown`])
+/// is not the same answer as EC2 reporting none attached: a refusal has to be grounded in
+/// what EC2 reported rather than in silence.
+pub async fn vpc_internet_gateway(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+) -> InternetGatewayLookup {
+    let attached_to_vpc = ::aws_sdk_ec2::types::Filter::builder()
+        .name(ATTACHED_VPC_FILTER)
+        .values(vpc_id)
+        .build();
+    let answer = ec2(ctx, region)
+        .describe_internet_gateways()
+        .filters(attached_to_vpc)
+        .send()
+        .await;
+    match answer {
+        Ok(output) => {
+            // The filter already narrowed the read to the gateways EC2 holds an attachment
+            // to this VPC for; the attachment itself is read again here because what the
+            // rule is about is an attachment IN EFFECT, which is the one member of it that
+            // says so.
+            let attached = output.internet_gateways().iter().any(|gateway| {
+                gateway.attachments().iter().any(|attachment| {
+                    attachment.vpc_id() == Some(vpc_id)
+                        && attachment
+                            .state()
+                            .is_none_or(|state| state.as_str() == ATTACHMENT_IN_EFFECT)
+                })
+            });
+            if attached {
+                InternetGatewayLookup::Attached
+            } else {
+                InternetGatewayLookup::Detached
+            }
+        }
+        Err(error) => {
+            ::tracing::debug!(
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the internet gateway of the VPC could not be resolved against EC2"
+            );
+            InternetGatewayLookup::Unknown
+        }
+    }
+}
+
 /// One security group of the account, reduced to what Elastic Load Balancing reads off it:
 /// which VPC it governs traffic in, and the name and owner a load balancer reports it
 /// under.

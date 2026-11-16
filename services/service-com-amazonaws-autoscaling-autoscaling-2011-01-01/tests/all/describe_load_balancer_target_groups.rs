@@ -180,7 +180,10 @@ async fn forward_to(
     subnets: &[SeededSubnet],
     target_group_arn: &str,
 ) {
-    let mut params = vec![p("Name", name)];
+    // INTERNAL, because the VPC these subnets are in has no internet gateway attached: an
+    // internet-facing load balancer — the documented default — can only be placed in a VPC
+    // that has one, and what this suite needs is a load balancer forwarding to the group.
+    let mut params = vec![p("Name", name), p("Scheme", "internal")];
     for (index, subnet) in subnets.iter().enumerate() {
         params.push(p(
             format!("Subnets.member.{}", index + 1).as_str(),

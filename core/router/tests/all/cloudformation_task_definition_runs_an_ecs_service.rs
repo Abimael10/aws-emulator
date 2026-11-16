@@ -335,6 +335,9 @@ const ROWS: &[Row] = &[
                own network and bound to the target group its listener forwards to, named by the \
                ARN the stack published",
         stack: "cfn-ecs-service-estate",
+        // The load balancer the template declares is an INTERNAL one: the stack attaches no
+        // internet gateway to the VPC it declares, and an internet-facing load balancer can
+        // only be placed in a VPC that has one.
         template: r#"{
           "Resources": {
             "Vpc": {
@@ -368,6 +371,7 @@ const ROWS: &[Row] = &[
               "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
               "Properties": {
                 "Name": "cfn-ecs-alb",
+                "Scheme": "internal",
                 "Subnets": [{ "Ref": "SubnetA" }, { "Ref": "SubnetB" }]
               }
             },

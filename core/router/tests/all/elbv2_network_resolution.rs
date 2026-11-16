@@ -153,6 +153,38 @@ pub(crate) fn ec2_ok(
     answer.text
 }
 
+/// Create one internet gateway and attach it to `vpc_id` through EC2's own operations, and
+/// answer the gateway's id.
+///
+/// An internet-facing load balancer — the scheme `CreateLoadBalancer` documents as its
+/// default — can only be placed in a VPC that HAS one, so a suite that creates its own VPC and
+/// places a public load balancer in it holds the gateway beside the subnets. No route is added
+/// to any route table: what the rule reads is the ATTACHMENT, which is tabled in the ELBv2
+/// crate's `tests/all/internet_facing_placement.rs`.
+///
+/// `pub(crate)` for the reason the plumbing above is: the sibling suites that place a public
+/// load balancer in a VPC of their own attach its gateway the same way.
+pub(crate) fn attach_internet_gateway(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    vpc_id: &str,
+) -> String {
+    let gateway = element(
+        &ec2_ok(router, runtime, "CreateInternetGateway", &[]),
+        "internetGatewayId",
+    );
+    ec2_ok(
+        router,
+        runtime,
+        "AttachInternetGateway",
+        &[
+            ("InternetGatewayId", gateway.as_str()),
+            ("VpcId", vpc_id),
+        ],
+    );
+    gateway
+}
+
 /// Drive one awsQuery action against the ELBv2 model, addressed by its own routing key so
 /// this suite does not depend on which front door claims the shared signing name.
 pub(crate) fn elbv2(

@@ -48,6 +48,15 @@ pub use zonal_shift_registration::{
 #[cfg(test)]
 mod vpc_topology;
 
+/// Whether the VPC a load balancer is placed in can carry an INTERNET-FACING one: the
+/// internet gateway a public address needs to route anywhere.
+pub mod internet_facing_placement;
+
+pub use internet_facing_placement::{
+    check_internet_gateway, no_internet_gateway_message, placement_needs_internet_gateway,
+    INTERNET_FACING_SCHEME,
+};
+
 /// The page walk every paginated read of this service shares, and the opaque `NextMarker`
 /// it hands back.
 pub mod pagination;
@@ -4406,9 +4415,10 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     pub host_counts: HostCountPublisher,
     /// The ADDRESS each load balancer answers on, by load balancer ARN: the socket of this
     /// emulator's own whose `host:port` the load balancer publishes as its `DNSName`
-    /// ([`LoadBalancerEndpoint`]). One entry per load balancer that serves traffic of its
-    /// own, so it is bounded by the load balancer quota the create enforces; dropping an
-    /// entry closes the port and severs every connection in flight on it.
+    /// ([`LoadBalancerEndpoint`]). One entry per load balancer a client on this machine dials
+    /// DIRECTLY — a public Application Load Balancer — so it is bounded by the load balancer
+    /// quota the create enforces; dropping an entry closes the port and severs every
+    /// connection in flight on it.
     pub load_balancer_endpoints: HashMap<String, LoadBalancerEndpoint>,
 }
 

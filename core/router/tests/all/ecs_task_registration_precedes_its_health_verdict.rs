@@ -304,11 +304,28 @@ impl Network {
 }
 
 /// Create that network through EC2 itself, so every id asserted against is one EC2 minted.
+///
+/// The VPC is given the internet gateway AWS requires of the internet-facing load balancer
+/// below — the scheme `CreateLoadBalancer` documents as its default — attached through EC2's
+/// own `AttachInternetGateway`.
 async fn seed_network(router: &MultiServiceRouter) -> Network {
     let vpc = element(
         &ec2(router, "CreateVpc", &[("CidrBlock", VPC_CIDR)]).await,
         "vpcId",
     );
+    let gateway = element(
+        &ec2(router, "CreateInternetGateway", &[]).await,
+        "internetGatewayId",
+    );
+    ec2(
+        router,
+        "AttachInternetGateway",
+        &[
+            ("InternetGatewayId", gateway.as_str()),
+            ("VpcId", vpc.as_str()),
+        ],
+    )
+    .await;
     let mut subnets = Vec::new();
     for (cidr, zone) in SUBNET_CIDRS {
         subnets.push(element(

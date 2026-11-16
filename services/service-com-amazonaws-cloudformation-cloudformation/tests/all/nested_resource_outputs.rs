@@ -178,11 +178,24 @@ const TASK_DEFINITION: &str = concat!(
 /// The network a row's load balancer is placed in: a VPC and two subnets of it, in two
 /// Availability Zones, since Elastic Load Balancing resolves a placement against Amazon EC2
 /// and an Application Load Balancer needs subnets in at least two zones.
+///
+/// It carries the INTERNET GATEWAY a public placement needs, attached to the VPC: the nodes of
+/// an internet-facing load balancer have public addresses, which reach the internet only
+/// through a gateway attached to the VPC, so Elastic Load Balancing refuses such a placement in
+/// a VPC that has none. Declared ahead of the load balancer, which is the order CloudFormation
+/// creates them in.
 const NETWORK: &str = concat!(
     "  Vpc:\n",
     "    Type: AWS::EC2::VPC\n",
     "    Properties:\n",
     "      CidrBlock: 10.0.0.0/16\n",
+    "  Igw:\n",
+    "    Type: AWS::EC2::InternetGateway\n",
+    "  IgwAttachment:\n",
+    "    Type: AWS::EC2::VPCGatewayAttachment\n",
+    "    Properties:\n",
+    "      VpcId: !Ref Vpc\n",
+    "      InternetGatewayId: !Ref Igw\n",
     "  SubnetA:\n",
     "    Type: AWS::EC2::Subnet\n",
     "    Properties:\n",

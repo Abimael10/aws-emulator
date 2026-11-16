@@ -137,6 +137,22 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                 &ec2(&router, &runtime, "CreateVpc", &[("CidrBlock", "10.60.0.0/16")]),
                 "vpcId",
             );
+            // The internet gateway an internet-facing load balancer needs — which is what
+            // the ELBv2 rows below create, naming no scheme — attached to that VPC through
+            // EC2's own operations.
+            let gateway = element(
+                &ec2(&router, &runtime, "CreateInternetGateway", &[]),
+                "internetGatewayId",
+            );
+            ec2(
+                &router,
+                &runtime,
+                "AttachInternetGateway",
+                &[
+                    ("InternetGatewayId", gateway.as_str()),
+                    ("VpcId", vpc.as_str()),
+                ],
+            );
             let subnets: Vec<String> = [("10.60.1.0/24", "us-east-1a"), ("10.60.2.0/24", "us-east-1b")]
                 .into_iter()
                 .map(|(cidr, zone)| {

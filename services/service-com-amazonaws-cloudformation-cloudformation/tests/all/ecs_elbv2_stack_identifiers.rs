@@ -71,10 +71,23 @@ const ELBV2_ID_DIGITS: usize = 16;
 /// The network declaration every row's load balancer is placed in: a VPC and two subnets of
 /// it, in two Availability Zones, since Elastic Load Balancing resolves a placement against
 /// Amazon EC2 and an Application Load Balancer needs subnets in at least two zones.
+///
+/// It carries the INTERNET GATEWAY a public placement needs, attached to the VPC: the nodes of
+/// an internet-facing load balancer have public addresses, which reach the internet only
+/// through a gateway attached to the VPC, so Elastic Load Balancing refuses such a placement in
+/// a VPC that has none. Declared ahead of the load balancer, which is the order CloudFormation
+/// creates them in.
 const NETWORK: &str = r#"  Vpc:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: 10.0.0.0/16
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
   SubnetA:
     Type: AWS::EC2::Subnet
     Properties:

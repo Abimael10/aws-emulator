@@ -465,7 +465,9 @@ fn domain_host_attribute(reach: Reach) -> String {
 fn json_template(row: &Row) -> String {
     let mut load_balancer = json!({
         "Type": "application",
-        "Scheme": "internet-facing",
+        // INTERNAL: the estate attaches no internet gateway to the VPC it declares, and an
+        // internet-facing load balancer can only be placed in a VPC that has one.
+        "Scheme": "internal",
         "SecurityGroups": [{"Ref": "AlbSg"}],
         "Subnets": [{"Ref": "SubnetA"}, {"Ref": "SubnetB"}],
     });
@@ -664,7 +666,7 @@ fn yaml_template(row: &Row) -> String {
          \x20   Properties:\n\
          \x20     Name: {load_balancer}\n\
          \x20     Type: application\n\
-         \x20     Scheme: internet-facing\n\
+         \x20     Scheme: internal\n\
          \x20     SecurityGroups:\n\
          \x20       - !Ref AlbSg\n\
          \x20     Subnets:\n\

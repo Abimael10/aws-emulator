@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 
-use crate::elbv2_network_resolution::{ec2_ok, elbv2, Answer, BOOT_STACK_SIZE};
+use crate::elbv2_network_resolution::{attach_internet_gateway, ec2_ok, elbv2, Answer, BOOT_STACK_SIZE};
 use crate::query_wire::{element, opt_element};
 
 /// The EC2 code for an id the account holds no subnet for, which is what Elastic Load
@@ -121,6 +121,10 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                 &ec2_ok(&router, &runtime, "AllocateAddress", &[("Domain", "vpc")]),
                 "allocationId",
             );
+            // An Elastic IP is pinned on an INTERNET-FACING Network Load Balancer, which can
+            // only be placed in a VPC that has an internet gateway attached, so the network
+            // carries one ([`attach_internet_gateway`]).
+            attach_internet_gateway(&router, &runtime, &vpc);
 
             // -----------------------------------------------------------------
             // The subnets a create names must be subnets EC2 holds.

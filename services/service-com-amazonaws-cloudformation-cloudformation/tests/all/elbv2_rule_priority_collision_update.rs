@@ -167,25 +167,21 @@ const ROWS: &[Row] = &[
 /// The template of one row: the network, an internet-facing Application Load Balancer, an
 /// HTTP:80 listener answering a fixed 404 by default, and two rules of that listener matching
 /// the same path at the priorities asked for.
+///
+/// The internet gateway the public load balancer needs, and its attachment to the VPC, come
+/// with [`NETWORK`] (as `Igw` and `IgwAttachment`); the route below is this template's own.
 fn template_of(stack: &str, first_priority: i64, first_body: &str, second_priority: i64) -> String {
     let mut template = String::from("Resources:\n");
     template.push_str(NETWORK);
     template.push_str(&format!(
         concat!(
-            "  Igw:\n",
-            "    Type: AWS::EC2::InternetGateway\n",
-            "  Attachment:\n",
-            "    Type: AWS::EC2::VPCGatewayAttachment\n",
-            "    Properties:\n",
-            "      VpcId: !Ref Vpc\n",
-            "      InternetGatewayId: !Ref Igw\n",
             "  RouteTable:\n",
             "    Type: AWS::EC2::RouteTable\n",
             "    Properties:\n",
             "      VpcId: !Ref Vpc\n",
             "  DefaultRoute:\n",
             "    Type: AWS::EC2::Route\n",
-            "    DependsOn: Attachment\n",
+            "    DependsOn: IgwAttachment\n",
             "    Properties:\n",
             "      RouteTableId: !Ref RouteTable\n",
             "      DestinationCidrBlock: 0.0.0.0/0\n",

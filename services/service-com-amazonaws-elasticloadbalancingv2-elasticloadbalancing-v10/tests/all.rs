@@ -158,3 +158,7 @@ mod network_load_balancer_pass_on;
 // target's own security groups decide about the health check of it.
 #[path = "all/target_security_group_health_check.rs"]
 mod target_security_group_health_check;
+// Declared after the sorted list for the same reason the two suites above are. What the VPC's
+// own internet gateway decides about an internet-facing placement.
+#[path = "all/internet_facing_placement.rs"]
+mod internet_facing_placement;

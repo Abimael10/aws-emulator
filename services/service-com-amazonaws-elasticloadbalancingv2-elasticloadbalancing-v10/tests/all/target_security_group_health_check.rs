@@ -69,7 +69,11 @@ const HEALTHY: (&str, &str) = ("healthy", "");
 
 /// A router carrying this service and EC2 over one shared engine: the account's network is
 /// EC2's, so the rule under test needs both mounted.
-fn emulator_with_ec2() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the other suite of this binary whose rule is about an EC2-owned fact
+/// (`all/internet_facing_placement.rs`) needs the same two services on one engine: one
+/// builder for the crate, so no suite can drift on how they are mounted.
+pub(crate) fn emulator_with_ec2() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -86,7 +90,7 @@ fn emulator_with_ec2() -> MultiServiceRouter {
 
 /// Send one ec2Query request: the action, the API version and `params`, addressed to EC2's own
 /// signing name.
-async fn ec2(
+pub(crate) async fn ec2(
     router: &MultiServiceRouter,
     name: &str,
     params: &[(String, String)],
@@ -119,7 +123,7 @@ async fn ec2(
 }
 
 /// One ec2Query request that must be accepted, as its response body.
-async fn ec2_ok(
+pub(crate) async fn ec2_ok(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -134,7 +138,7 @@ async fn ec2_ok(
 }
 
 /// The text of the element `tag` of an EC2 answer, which must be there.
-fn reported(case: &str, body: &str, tag: &str) -> String {
+pub(crate) fn reported(case: &str, body: &str, tag: &str) -> String {
     first_text(body, tag)
         .unwrap_or_else(|| panic!("case {case:?}: no {tag} in {body}"))
 }
@@ -148,9 +152,23 @@ struct Network {
 }
 
 /// Create that network through EC2's own API.
+///
+/// The VPC is given the internet gateway AWS requires of an internet-facing load balancer —
+/// which is what the load balancer below is, naming no scheme — attached through EC2's own
+/// `AttachInternetGateway`; no route is added to any route table, which the rule about a
+/// public placement does not read (`all/internet_facing_placement.rs`).
 async fn seed_network(router: &MultiServiceRouter) -> Network {
     let created = ec2_ok(router, "setup", "CreateVpc", &[p("CidrBlock", VPC_CIDR)]).await;
     let vpc = reported("setup", &created, "vpcId");
+    let gateway = ec2_ok(router, "setup", "CreateInternetGateway", &[]).await;
+    let gateway = reported("setup", &gateway, "internetGatewayId");
+    ec2_ok(
+        router,
+        "setup",
+        "AttachInternetGateway",
+        &[p("InternetGatewayId", &gateway), p("VpcId", &vpc)],
+    )
+    .await;
     let mut subnets: Vec<String> = Vec::new();
     for (cidr, zone) in SUBNETS {
         let created = ec2_ok(

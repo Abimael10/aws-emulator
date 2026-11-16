@@ -30,7 +30,9 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::elbv2_network_resolution::{ec2_ok, elbv2, Answer, BOOT_STACK_SIZE};
+use crate::elbv2_network_resolution::{
+    attach_internet_gateway, ec2_ok, elbv2, Answer, BOOT_STACK_SIZE,
+};
 use crate::query_wire::{element, elements};
 
 /// The code Elastic Load Balancing answers a value it cannot accept with, for a rule its
@@ -65,11 +67,15 @@ struct Network {
 }
 
 /// Create that network through EC2 itself, so every id below is one EC2 minted.
+///
+/// The first VPC is given an internet gateway, which the internet-facing rows below need
+/// ([`attach_internet_gateway`]).
 fn seed(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime) -> Network {
     let vpc = element(
         &ec2_ok(router, runtime, "CreateVpc", &[("CidrBlock", "10.60.0.0/16")]),
         "vpcId",
     );
+    attach_internet_gateway(router, runtime, &vpc);
     let mut subnets = Vec::new();
     for (cidr, zone) in [("10.60.1.0/24", "us-west-2a"), ("10.60.2.0/24", "us-west-2b")] {
         subnets.push(element(

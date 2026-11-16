@@ -236,9 +236,26 @@ struct Subnet {
 
 /// Create one VPC carrying one subnet per entry of `zones`, through EC2's own operations —
 /// so every id and every zone ID below is one EC2 handed out.
+///
+/// The VPC is given an internet gateway, attached through EC2's own `AttachInternetGateway`:
+/// an internet-facing load balancer of the rows below can only be placed in a VPC that has
+/// one.
 async fn ec2_network(router: &MultiServiceRouter, second_octet: u8, zones: &[&str]) -> Vec<Subnet> {
     let cidr = format!("10.{second_octet}.0.0/16");
     let vpc_id = element(&ec2(router, "CreateVpc", &[("CidrBlock", &cidr)]).await, "vpcId");
+    let gateway = element(
+        &ec2(router, "CreateInternetGateway", &[]).await,
+        "internetGatewayId",
+    );
+    ec2(
+        router,
+        "AttachInternetGateway",
+        &[
+            ("InternetGatewayId", gateway.as_str()),
+            ("VpcId", vpc_id.as_str()),
+        ],
+    )
+    .await;
     let mut subnets = Vec::new();
     for (index, zone) in zones.iter().enumerate() {
         let subnet_cidr = format!("10.{second_octet}.{}.0/24", index + 1);

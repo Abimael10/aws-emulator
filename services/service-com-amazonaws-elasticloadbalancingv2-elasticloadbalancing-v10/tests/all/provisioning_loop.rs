@@ -814,28 +814,36 @@ async fn load_balancer_identity_follows_name_scheme_and_type() {
         );
         seen_ids.push(id.clone());
 
-        // What each family publishes as its `DNSName`: a Network or Gateway Load Balancer
-        // has no traffic this emulator serves, so it keeps the host Elastic Load
+        // What each load balancer publishes as its `DNSName`: a Network or Gateway Load
+        // Balancer has no traffic this emulator serves, so it keeps the host Elastic Load
         // Balancing's own zone gives it (the ARN's own id, the `elb` label ahead of the
-        // Region, its scheme stated nowhere), while an Application Load Balancer publishes
-        // the address of the socket this emulator opened for it — an address a client can
-        // dial. The whole table of forms is `load_balancer_dns_name_form.rs`.
-        let expected_host = if lb_type == "application" {
-            None
-        } else {
-            Some(format!("{name}-{id}.elb.{REGION}.amazonaws.com"))
-        };
+        // Region, its scheme stated nowhere), an INTERNAL Application Load Balancer — whose
+        // nodes carry only private addresses, so its client sits inside this emulator — keeps
+        // the host that zone gives IT (the reserved `internal-` prefix ahead of its name, and
+        // an id minted for the host alone), and an internet-facing one publishes the address
+        // of the socket this emulator opened for it — an address a client can dial. The whole
+        // table of forms is `load_balancer_dns_name_form.rs`.
         let dns_name = reply.text("DNSName").unwrap_or_default();
-        match expected_host {
-            Some(host) => assert_eq!(
+        if lb_type != "application" {
+            let host = format!("{name}-{id}.elb.{REGION}.amazonaws.com");
+            assert_eq!(
                 dns_name, host,
                 "case {name}/{lb_type}/{scheme}: unexpected DNS name {dns_name:?}"
-            ),
-            None => assert!(
+            );
+        } else if scheme == "internal" {
+            let head = format!("internal-{name}-");
+            let tail = format!(".{REGION}.elb.amazonaws.com");
+            assert!(
+                dns_name.starts_with(&head) && dns_name.ends_with(&tail),
+                "case {name}/{lb_type}/{scheme}: expected a host of the form \
+                 {head}<id>{tail}, got {dns_name:?}"
+            );
+        } else {
+            assert!(
                 dns_name.parse::<std::net::SocketAddr>().is_ok(),
                 "case {name}/{lb_type}/{scheme}: expected an address a client can dial, got \
                  {dns_name:?}"
-            ),
+            );
         }
         assert_eq!(
             reply.text("Type").as_deref(),

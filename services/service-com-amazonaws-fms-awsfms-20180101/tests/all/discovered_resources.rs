@@ -628,6 +628,11 @@ async fn discovers_what_the_owning_services_hold() {
         "CreateLoadBalancer",
         &[
             p("Name", load_balancer_name),
+            // INTERNAL, because the VPC these subnets are in has no internet gateway
+            // attached: an internet-facing load balancer — the documented default — can only
+            // be placed in a VPC that has one, and what this suite discovers is the load
+            // balancer itself.
+            p("Scheme", "internal"),
             p("Subnets.member.1", &subnet),
             p("Subnets.member.2", &second_subnet),
         ],

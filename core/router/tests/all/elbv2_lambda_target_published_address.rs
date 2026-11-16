@@ -559,8 +559,23 @@ async fn the_published_address_serves_a_lambda_target_and_generates_the_502_itse
             .to_string()
     };
 
-    // The network the load balancer is placed in, through EC2 itself.
+    // The network the load balancer is placed in, through EC2 itself. The VPC is given an
+    // internet gateway, attached through EC2's own `AttachInternetGateway`: an
+    // internet-facing load balancer can only be placed in a VPC that has one.
     let vpc = element(&ec2(&router, "CreateVpc", &[("CidrBlock", VPC_CIDR)]).await, "vpcId");
+    let gateway = element(
+        &ec2(&router, "CreateInternetGateway", &[]).await,
+        "internetGatewayId",
+    );
+    ec2(
+        &router,
+        "AttachInternetGateway",
+        &[
+            ("InternetGatewayId", gateway.as_str()),
+            ("VpcId", vpc.as_str()),
+        ],
+    )
+    .await;
     let mut subnets: Vec<String> = Vec::new();
     for (cidr, zone) in SUBNET_CIDRS {
         let created = ec2(

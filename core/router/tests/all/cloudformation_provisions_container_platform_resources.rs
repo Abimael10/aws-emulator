@@ -335,6 +335,9 @@ const ROWS: &[Row] = &[
             "    Type: AWS::ElasticLoadBalancingV2::LoadBalancer\n",
             "    Properties:\n",
             "      Name: warehouse-alb\n",
+            // INTERNAL: the stack attaches no internet gateway to the VPC it declares, and an
+            // internet-facing load balancer can only be placed in a VPC that has one.
+            "      Scheme: internal\n",
             "      Subnets:\n",
             "        - !Ref SubnetA\n",
             "        - !Ref SubnetB\n",
