@@ -38,6 +38,9 @@ mod component_wire_fidelity;
 #[path = "all/emulator_store_bound_refusals.rs"]
 mod emulator_store_bound_refusals;
 
+#[path = "all/exchange_code_for_token_declared_statuses.rs"]
+mod exchange_code_for_token_declared_statuses;
+
 #[path = "all/exchanged_session_names.rs"]
 mod exchanged_session_names;
 
