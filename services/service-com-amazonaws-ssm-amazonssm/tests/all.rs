@@ -171,6 +171,8 @@ mod secure_string_decryption;
 mod secure_string_encryption_at_rest;
 #[path = "all/secure_string_key_state.rs"]
 mod secure_string_key_state;
+#[path = "all/service_setting_overwrite.rs"]
+mod service_setting_overwrite;
 #[path = "all/service_settings.rs"]
 mod service_settings;
 #[path = "all/session_manager_sessions.rs"]
