@@ -287,6 +287,70 @@ impl DataQualityResultEntry {
         }
         .score()
     }
+
+    /// This result's place in a listing of results, as that listing's continuation token
+    /// renders it: the shared history cursor ([`history_page_cursor`]) over the instant the
+    /// run that produced it started and the result's own id, exactly as this service's run
+    /// histories page.
+    pub fn page_cursor(&self) -> String {
+        history_page_cursor(self.started_on, &self.id)
+    }
+
+    /// Rebuild the modelled `DataQualityResultDescription` from what is stored, so a listing
+    /// reports the same result the single-result read reports.
+    ///
+    /// `JobName` and `JobRunId` are "the job name" and "the job run ID associated with the
+    /// data quality result": a result this service holds was published by a ruleset
+    /// EVALUATION RUN ([`DataQualityRulesetEvaluationRunEntry::settle`] is what mints one),
+    /// which no job run produced, so neither member is reported rather than being filled with
+    /// a job this result never came out of.
+    pub fn to_result_description(&self) -> DataQualityResultDescription {
+        DataQualityResultDescription {
+            result_id: Some(self.id.clone()),
+            data_source: Some(self.data_source.clone()),
+            job_name: None,
+            job_run_id: None,
+            started_on: Some(to_date_time(self.started_on)),
+        }
+    }
+
+    /// Whether this result satisfies every criterion `filter` names.
+    ///
+    /// A `DataQualityResultFilterCriteria` is "criteria used to return data quality results":
+    /// a conjunction in which each member it carries narrows the listing and a member it
+    /// leaves out narrows nothing. `DataSource` filters "by the specified data source (for
+    /// example, retrieving all results for an Glue table)", so it is matched on the table this
+    /// result's own data source addresses, with the names folded the way the catalog stores
+    /// them — `wanted` is that table, resolved by the caller once rather than per result. The
+    /// instant pair bounds the window the criteria describe ([`instant_window_admits`], the
+    /// one reading this service's filtered listings share).
+    ///
+    /// `JobName` and `JobRunId` filter "by the specified job name" and "job run ID", which a
+    /// result this service holds carries neither of ([`Self::to_result_description`] says
+    /// why), so criteria naming either admit no result rather than admitting every one.
+    pub fn matches(
+        &self,
+        filter: &DataQualityResultFilterCriteria,
+        wanted: Option<&EvaluatedTable>,
+    ) -> bool {
+        if let Some(wanted) = wanted {
+            let Some(table) = data_source_table(&self.data_source) else {
+                return false;
+            };
+            let catalog_id = resolve_catalog_id(table.catalog_id.as_ref());
+            if !EvaluatedTable::of(&table, &catalog_id).addresses_same_table(wanted) {
+                return false;
+            }
+        }
+        if filter.job_name.is_some() || filter.job_run_id.is_some() {
+            return false;
+        }
+        instant_window_admits(
+            self.started_on,
+            filter.started_before.as_ref(),
+            filter.started_after.as_ref(),
+        )
+    }
 }
 
 /// The results a finished evaluation run produced, and how one is addressed.

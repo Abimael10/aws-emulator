@@ -369,6 +369,8 @@ use crate::ops::types::{
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityEvaluationRunAdditionalRunOptions,
     DataQualityRulesetEvaluationRunDescription, DataQualityRulesetEvaluationRunFilter,
+    DataQualityResultDescription, DataQualityResultFilterCriteria,
+    DataQualityRuleRecommendationRunDescription, DataQualityRuleRecommendationRunFilter,
     DataQualityRulesetFilterCriteria,
     DataQualityRulesetListDetails, DataQualityTargetTable,
     DataQualityRuleResult,
@@ -404,6 +406,7 @@ use crate::ops::types::{
     UpdateClassifierInput, UpdateCrawlerInput, UpdateDataQualityRulesetInput, UpdateGlossaryInput,
     UpdateMLTransformInput,
     UpdateWorkflowInput,
+    UsageProfileDefinition,
     Workflow, WorkflowGraph,
     WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
@@ -1905,6 +1908,33 @@ impl ComAmazonawsGlueAwsglueState {
                 &fold_name(&reference.name),
             ))
             .and_then(|catalog| catalog.definition.as_ref())
+    }
+
+    /// The catalog RESOURCES this store holds inside the Data Catalog of `account_id`, each
+    /// with the id it is KEYED by, in that key's order — the deterministic order
+    /// `GetCatalogs` pages over.
+    ///
+    /// A `CreateCatalog` registers its catalog in the Data Catalog of the account it was
+    /// served for and the record is keyed by that account and the catalog's folded name
+    /// ([`child_catalog_id`]), so the catalogs of one account are the records whose key
+    /// carries that account, read back in key order. The account's own Data Catalog is not
+    /// among them: it is a container nothing created ([`Catalog::definition`]), which a
+    /// listing reports only where it is asked for.
+    pub fn catalog_definitions_in(&self, account_id: &str) -> Vec<(&str, &CatalogDefinition)> {
+        let prefix = child_catalog_id(account_id, "");
+        let mut ordered: Vec<(&str, &CatalogDefinition)> = self
+            .catalogs
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .filter_map(|(key, catalog)| {
+                catalog
+                    .definition
+                    .as_ref()
+                    .map(|definition| (key.as_str(), definition))
+            })
+            .collect();
+        ordered.sort_by_key(|(key, _)| *key);
+        ordered
     }
 
     /// Remove the catalog RESOURCE `reference` names, handing back the entry that held

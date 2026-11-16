@@ -968,6 +968,17 @@ pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 pub const CATALOG_NAME_IS_ACCOUNT_ID: &str =
     "Catalog name cannot be the same as the account ID.";
 
+/// `GetCatalogs` that asks for the default catalog while addressing a parent OTHER than the
+/// account's own Data Catalog. Stated by the model: `IncludeRoot` governs "whether to list
+/// the default catalog in the account and region", and "when the `ParentCatalogId` is not
+/// equal to null, and this attribute is passed as `false` or `true`, an
+/// `InvalidInputException` is thrown" — the default catalog is not inside any catalog, so
+/// there is nothing for the flag to decide there. The sentence is that requirement; what is
+/// pinned is the behaviour — 400 with the operation's modelled `InvalidInputException`.
+pub const INCLUDE_ROOT_NEEDS_THE_ACCOUNT_CATALOG: &str =
+    "IncludeRoot is not supported when ParentCatalogId names a catalog other than the \
+     Amazon Web Services account ID.";
+
 /// `CreateCatalog` whose `Name` carries a character the catalog surface forbids
 /// ([`super::is_catalog_name`]).
 ///

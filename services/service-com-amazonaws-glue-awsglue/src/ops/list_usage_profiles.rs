@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsageProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsageProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsageProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the usage profiles this account holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::usage_profiles`]): one `MaxResults`-sized
+//! page at a time in profile-name order, with a `NextToken` that resumes the walk where the
+//! previous page stopped. Reporting only — nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +71,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListUsageProfilesRequest$MaxResults`, `OrchestrationPageSize200` range 1..200) — and so
+/// the page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 200;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +148,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsageProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsageProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsageProfiles"))
+        // A usage profile lives in one per-account namespace — `GetUsageProfile`,
+        // `UpdateUsageProfile` and `DeleteUsageProfile` all address one by `Name` alone, with
+        // no `CatalogId` and no Region member — so nothing here depends on the request's
+        // Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on — the same way
+            // the single-profile read reports it.
+            return Err(ListUsageProfilesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue usage profile store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum number of usage profiles to return in a single response"
+        // (`MaxResults`, range 1..200). Absent, the page is the largest the model accepts for
+        // it; the clamp re-states that range here so the page size is never 0 even if the
+        // boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored profiles are projected out and nothing is written.
+        let store = state.lock();
+        // The namespace is keyed by profile name and iterated in key order, so one page
+        // follows another deterministically.
+        let names: Vec<&str> = store.usage_profiles.keys().map(String::as_str).collect();
+
+        // "A continuation token, included if this is a continuation call": it is the last
+        // name of the previous page, so this page resumes at the first stored name strictly
+        // after it — which stays correct across profiles created or deleted between two
+        // calls, exactly as the sibling listings of this crate resume.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => names.partition_point(|name| *name <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<&str> = names.iter().skip(start).take(page_size).copied().collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token, present if the current list segment is not the last": it
+        // names the last entry of the page, taken from the page itself so there is no index
+        // arithmetic to underflow on an empty page.
+        let next_token = if end < names.len() {
+            page.last().map(|name| (*name).to_string())
+        } else {
+            None
+        };
+
+        Ok(ListUsageProfilesOutput {
+            // "A list of usage profile (UsageProfileDefinition) objects": each profile as the
+            // store holds it, so a listed profile reports what the single-profile read
+            // reports. Present even when empty — an account holding no profile, and a page
+            // past the end of the listing, have an EMPTY listing rather than an absent one,
+            // which is what an SDK's paginator iterates.
+            profiles: Some(
+                page.iter()
+                    .filter_map(|name| store.usage_profiles.get(*name))
+                    .map(crate::state::UsageProfileEntry::to_usage_profile_definition)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

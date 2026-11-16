@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetBlueprints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetBlueprints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetBlueprints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the blueprint registrations this account holds under the names a batch asks for
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::blueprints`]), each projected exactly as
+//! the single-blueprint read projects it, and the names this account holds no registration
+//! under under `MissingBlueprints`. Reporting only — the one write is materialising the
+//! registration statuses the CLOCK had already made due, exactly as `GetBlueprint` does.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetBlueprints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetBlueprintsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetBlueprints"))
+        // Blueprints live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(BatchGetBlueprintsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue blueprint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "Specifies whether or not to include the blueprint in the response" and "whether or
+        // not to include the parameters, as a JSON string": both ask for members Glue reads
+        // out of the blueprint ARCHIVE published at `BlueprintLocation` — the copy it takes of
+        // that archive, and the parameter list it parses from it. Nothing here reads that
+        // archive, so neither member is stored and this read reports the registration itself
+        // whichever way the two flags are set, exactly as the single-blueprint read does,
+        // rather than inventing the contents of an archive it never saw.
+        let _ = (input.include_blueprint, input.include_parameter_spec);
+
+        // `Names` is bounded `length 1..25` with each element bounded and patterned
+        // (`smithy_query operation=BatchGetBlueprints`), so an empty batch, an oversized one
+        // and a name too long to address a blueprint are all refused at the request boundary:
+        // reaching here, the only question per name is whether this account holds a blueprint
+        // under it.
+        let now = ::std::time::SystemTime::now();
+        let mut blueprints = Vec::new();
+        let mut missing_blueprints = Vec::new();
+        let mut store = state.lock();
+        // The walk keeps the request's order and its repeats — one answer per REQUESTED name,
+        // not per distinct name — and is bounded above by the batch's modelled maximum.
+        for name in &input.names {
+            // ONE lookup decides both lists, so every requested name is accounted for in
+            // exactly one of them: the projection when this account holds a blueprint under
+            // the name, and otherwise "a list of BlueprintNames that were not found" — a miss
+            // is reported back to the caller rather than failing the whole batch, since this
+            // operation models no not-found error.
+            match store.blueprint_mut(name) {
+                Some(entry) => {
+                    // The only write a read makes: the status change the clock had already
+                    // made due, materialised exactly as the single-blueprint read
+                    // materialises it, so a batch read reports the status each registration
+                    // has reached by now.
+                    entry.settle_if_due(now);
+                    blueprints.push(entry.to_blueprint());
+                }
+                None => missing_blueprints.push(name.clone()),
+            }
+        }
+        drop(store);
+
+        ::tracing::info!(
+            operation = "BatchGetBlueprints",
+            requested = input.names.len(),
+            found = blueprints.len(),
+            missing = missing_blueprints.len(),
+            "read Glue blueprints in a batch"
+        );
+
+        // The LIST a batch read answers out of is reported whatever it holds, the empty list
+        // included: a caller iterates `Blueprints` to read the batch's answer, so a batch that
+        // resolved nothing has to leave it an empty iteration rather than an absent member —
+        // which is what the batch reader beside this one does with its own found list
+        // (`BatchGetWorkflows`, `BatchGetJobs`). `MissingBlueprints` targets `BlueprintNames`,
+        // bounded `length 1..25`, so an empty list is not a value of that shape: a batch that
+        // missed nothing reports no such member, exactly as `BatchGetWorkflows` reports its
+        // own.
+        Ok(BatchGetBlueprintsOutput {
+            blueprints: Some(blueprints),
+            missing_blueprints: (!missing_blueprints.is_empty()).then_some(missing_blueprints),
+        })
     }
 }

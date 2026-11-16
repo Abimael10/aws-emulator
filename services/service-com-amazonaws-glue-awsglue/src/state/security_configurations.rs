@@ -96,6 +96,21 @@ impl UsageProfileEntry {
             tags: input.tags.clone().unwrap_or_default(),
         }
     }
+
+    /// Rebuild the modelled `UsageProfileDefinition` shape from what is stored, so a listing
+    /// reports the same profile the single-profile read reports: its name, the description the
+    /// write carried and the two instants the server stamped on it.
+    ///
+    /// The shape carries no `Configuration` member, so what a listed profile configures is
+    /// reported by `GetUsageProfile` rather than here.
+    pub fn to_usage_profile_definition(&self) -> UsageProfileDefinition {
+        UsageProfileDefinition {
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            created_on: Some(to_date_time(self.created_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+        }
+    }
 }
 
 /// Why the service refuses a submitted `ProfileConfiguration`, as the `Message` of the

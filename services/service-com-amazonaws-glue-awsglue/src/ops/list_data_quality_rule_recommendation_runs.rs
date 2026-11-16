@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataQualityRuleRecommendationRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataQualityRuleRecommendationRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataQualityRuleRecommendationRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the data quality rule recommendation runs this account holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_rule_recommendation_runs`]),
+//! from the same records `StartDataQualityRuleRecommendationRun` wrote and
+//! `GetDataQualityRuleRecommendationRun` reads back: one `MaxResults`-sized page at a time,
+//! newest run first, with a `NextToken` that resumes the walk, narrowed to the runs every
+//! member of the `Filter` admits. Reporting only — the one write is materialising the
+//! statuses the CLOCK had already made due
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_data_quality_rule_recommendation_runs`]),
+//! exactly as the single-run read does.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +74,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListDataQualityRuleRecommendationRunsRequest$MaxResults`, `PageSize` range 1..1000) —
+/// and so the page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +150,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataQualityRuleRecommendationRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataQualityRuleRecommendationRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataQualityRuleRecommendationRuns"))
+        // Data quality runs live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                ListDataQualityRuleRecommendationRunsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `DataQualityRuleRecommendationRunFilter$DataSource` is `@required`, so a filter that
+        // reached here carries one — but both members of a `DataSource` are optional, so it
+        // still has to address a table at all for there to be a data source to filter on. The
+        // same reading, and the same refusal, as the run listing beside this one gives a
+        // `DataSource` that addresses neither kind of table.
+        let criteria = match input.filter.as_ref() {
+            Some(filter) => {
+                let Some(table) = crate::state::data_source_table(&filter.data_source) else {
+                    return Err(invalid_input(
+                        crate::state::messages::DATA_SOURCE_REQUIRES_A_TABLE.to_string(),
+                    ));
+                };
+                let catalog_id = crate::state::resolve_catalog_id(table.catalog_id.as_ref());
+                Some((filter, crate::state::EvaluatedTable::of(&table, &catalog_id)))
+            }
+            None => None,
+        };
+
+        // "A list of key-value pair tags to filter recommendation runs": a recommendation run
+        // carries no tag at all — `StartDataQualityRuleRecommendationRun` models no `Tags`
+        // member (`smithy_query operation=StartDataQualityRuleRecommendationRun`), and no
+        // tagging operation reaches one, because [`crate::state::TaggedResourceKind`], the
+        // table every tag write and every tag read resolves an ARN against, carries no run
+        // variant. So criteria naming a tag admit no run, while an empty map, like an absent
+        // one, narrows nothing.
+        let required_tags = input.tags.unwrap_or_default();
+
+        // "The maximum number of results to return" (`MaxResults`, range 1..1000). Absent,
+        // the page is the largest the model accepts for it; the clamp re-states that range
+        // here so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the statuses the clock had already made due, so a
+        // listed run reports the status the single-run read reports at the same instant.
+        store.settle_due_data_quality_rule_recommendation_runs(now);
+
+        // Each admitted run is paired with its ordering key ONCE, so neither the sort nor the
+        // cursor comparison below rebuilds a key per probe.
+        let mut ordered: Vec<(String, &crate::state::DataQualityRuleRecommendationRunEntry)> =
+            store
+                .data_quality_rule_recommendation_runs
+                .iter()
+                .filter(|run| {
+                    // "Lists the recommendation runs meeting the filter criteria": a request
+                    // naming no criteria narrows nothing, so every run this account holds is
+                    // listed, and which runs criteria admit is the store's own reading of
+                    // them.
+                    required_tags.is_empty()
+                        && criteria
+                            .as_ref()
+                            .is_none_or(|(filter, wanted)| run.matches(filter, wanted))
+                })
+                .map(|run| (run.page_cursor(), run))
+                .collect();
+        // The model states no order for this listing, so the runs are reported newest first —
+        // the order this service's run histories document ("GetJobRuns returns the job runs in
+        // chronological order, with the newest jobs returned first") — with the run's own id
+        // breaking a tie between two runs started in the same nanosecond, so the order is
+        // total and the same on every call.
+        ordered.sort_by(|(left, _), (right, _)| right.cmp(left));
+
+        // The token is the ordering key of the last run of the previous page, so the page
+        // resumes at the first run strictly older than it — which stays correct across runs
+        // started or dropped between two calls, exactly as this crate's other run listings
+        // resume. A token this service never issued is DELIBERATELY a position in that order
+        // rather than a refusal, for the same reason: the cursor is a key in the listing's own
+        // order, so every string names one.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|(key, _)| key.as_str() >= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        let page = &ordered[start..end];
+
+        Ok(ListDataQualityRuleRecommendationRunsOutput {
+            // "A list of DataQualityRuleRecommendationRunDescription objects": element for
+            // element what the store holds, as the single-run read projects it. Present even
+            // when empty — an account holding no run, and a page past the end of the listing,
+            // have an EMPTY listing rather than an absent one, which is what an SDK's
+            // paginator iterates.
+            runs: Some(
+                page.iter()
+                    .map(|(_, run)| run.to_run_description())
+                    .collect(),
+            ),
+            // "A pagination token, if more results are available": it names the last entry of
+            // the page, taken from the page itself so there is no index arithmetic to
+            // underflow on an empty page, and is absent once the page reaches the end of the
+            // listing.
+            next_token: if end < ordered.len() {
+                page.last().map(|(key, _)| key.clone())
+            } else {
+                None
+            },
+        })
     }
+}
+
+/// This operation's modelled refusal of a filter it cannot read a data source out of.
+fn invalid_input(message: String) -> ListDataQualityRuleRecommendationRunsError {
+    ListDataQualityRuleRecommendationRunsErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            from_federation_source: None,
+        },
+    )
+    .into()
 }

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataQualityResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataQualityResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataQualityResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the data quality results this account holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_results`]), the records a
+//! finished ruleset evaluation run published and `GetDataQualityResult` reads back: one
+//! `MaxResults`-sized page at a time, newest result first, with a `NextToken` that resumes
+//! the walk, narrowed to the results every member of the `Filter` admits. Reporting only —
+//! the one write is materialising the statuses the CLOCK had already made due
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_data_quality_ruleset_evaluation_runs`]),
+//! which is what publishes a finished run's results, exactly as the single-result read does.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +71,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListDataQualityResultsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page
+/// size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +147,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataQualityResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataQualityResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataQualityResults"))
+        // Data quality results live in one per-account namespace, so nothing here depends on
+        // the request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                ListDataQualityResultsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Filter results by the specified data source. For example, retrieving all results
+        // for an Glue table": the member is optional, so criteria that name none narrow by no
+        // data source at all. One that IS named still has to address a table, since both
+        // members of a `DataSource` are optional — the same reading, and the same refusal, as
+        // the run listing beside this one gives a `DataSource` that addresses neither kind of
+        // table.
+        let wanted_table = match input.filter.as_ref().and_then(|filter| {
+            filter
+                .data_source
+                .as_ref()
+                .map(crate::state::data_source_table)
+        }) {
+            Some(Some(table)) => {
+                let catalog_id = crate::state::resolve_catalog_id(table.catalog_id.as_ref());
+                Some(crate::state::EvaluatedTable::of(&table, &catalog_id))
+            }
+            Some(None) => {
+                return Err(invalid_input(
+                    crate::state::messages::DATA_SOURCE_REQUIRES_A_TABLE.to_string(),
+                ));
+            }
+            None => None,
+        };
+
+        // "The maximum number of results to return" (`MaxResults`, range 1..1000). Absent,
+        // the page is the largest the model accepts for it; the clamp re-states that range
+        // here so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the statuses the clock had already made due. Settling
+        // a finished evaluation run is what PUBLISHES its results, so this listing reports
+        // every result that was owed by now rather than only those a previous caller happened
+        // to materialise.
+        store.settle_due_data_quality_ruleset_evaluation_runs(now);
+
+        // Each admitted result is paired with its ordering key ONCE, so neither the sort nor
+        // the cursor comparison below rebuilds a key per probe.
+        let mut ordered: Vec<(String, &crate::state::DataQualityResultEntry)> = store
+            .data_quality_results
+            .iter()
+            .filter(|result| {
+                // A request naming no criteria narrows nothing, so every result this account
+                // holds is listed, and which results criteria admit is the store's own
+                // reading of them.
+                input
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| result.matches(filter, wanted_table.as_ref()))
+            })
+            .map(|result| (result.page_cursor(), result))
+            .collect();
+        // The model states no order for this listing, so the results are reported newest
+        // first — the order this service's run histories document ("GetJobRuns returns the job
+        // runs in chronological order, with the newest jobs returned first") — with the
+        // result's own id breaking a tie between two produced in the same nanosecond, so the
+        // order is total and the same on every call.
+        ordered.sort_by(|(left, _), (right, _)| right.cmp(left));
+
+        // The token is the ordering key of the last result of the previous page, so the page
+        // resumes at the first result strictly older than it — which stays correct across
+        // results published or dropped between two calls, exactly as this crate's other
+        // histories resume. A token this service never issued is DELIBERATELY a position in
+        // that order rather than a refusal, for the same reason: the cursor is a key in the
+        // listing's own order, so every string names one.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|(key, _)| key.as_str() >= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        let page = &ordered[start..end];
+
+        Ok(ListDataQualityResultsOutput {
+            // "A list of DataQualityResultDescription objects": element for element what the
+            // store holds, as the single-result read projects it. The member is `@required`,
+            // and an account holding no result has an EMPTY listing rather than an absent
+            // one.
+            results: page
+                .iter()
+                .map(|(_, result)| result.to_result_description())
+                .collect(),
+            // "A pagination token, if more results are available": it names the last entry of
+            // the page, taken from the page itself so there is no index arithmetic to
+            // underflow on an empty page, and is absent once the page reaches the end of the
+            // listing.
+            next_token: if end < ordered.len() {
+                page.last().map(|(key, _)| key.clone())
+            } else {
+                None
+            },
+        })
     }
+}
+
+/// This operation's modelled refusal of a filter whose data source addresses no table.
+fn invalid_input(message: String) -> ListDataQualityResultsError {
+    ListDataQualityResultsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

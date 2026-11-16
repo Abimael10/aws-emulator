@@ -759,6 +759,60 @@ impl DataQualityRuleRecommendationRunEntry {
         );
         true
     }
+
+    /// This run's place in a listing of runs, as that listing's continuation token renders
+    /// it: the shared history cursor ([`history_page_cursor`]) over the instant the run
+    /// started and its own id, exactly as this service's other run histories page.
+    pub fn page_cursor(&self) -> String {
+        history_page_cursor(self.started_on, &self.id)
+    }
+
+    /// Rebuild the modelled `DataQualityRuleRecommendationRunDescription` from what is stored,
+    /// so a listing reports the same run the single-run read does.
+    pub fn to_run_description(&self) -> DataQualityRuleRecommendationRunDescription {
+        DataQualityRuleRecommendationRunDescription {
+            run_id: Some(self.id.clone()),
+            status: Some(self.status.clone()),
+            started_on: Some(to_date_time(self.started_on)),
+            data_source: Some(self.data_source.clone()),
+            created_ruleset_name: self.created_ruleset_name.clone(),
+            recommendation_mode: Some(self.recommendation_mode.clone()),
+        }
+    }
+
+    /// Whether this run satisfies every criterion `filter` names.
+    ///
+    /// A `DataQualityRuleRecommendationRunFilter` is "a filter for listing data quality
+    /// recommendation runs": a conjunction in which each member it carries narrows the
+    /// listing and a member it leaves out narrows nothing. `DataSource` is `@required` and
+    /// filters "based on a specified data source (Glue table)", so it is matched on the table
+    /// this run's own data source covers — with the names folded the way the catalog stores
+    /// them, so another casing of the same table still matches. The instant pair bounds the
+    /// window the criteria describe ([`instant_window_admits`], the one reading this service's
+    /// filtered listings share).
+    ///
+    /// `wanted` is the table the filter's `DataSource` addresses, already resolved into the
+    /// catalog that serves it — the caller resolves it once rather than per run, and a
+    /// `DataSource` addressing no table at all is refused before this is reached.
+    pub fn matches(
+        &self,
+        filter: &DataQualityRuleRecommendationRunFilter,
+        wanted: &EvaluatedTable,
+    ) -> bool {
+        let covered = EvaluatedTable {
+            catalog_id: self.catalog_id.clone(),
+            database_name: self.database_name.clone(),
+            table_name: self.table_name.clone(),
+        };
+        if !covered.addresses_same_table(wanted) {
+            return false;
+        }
+        instant_window_admits(
+            self.started_on,
+            filter.started_before.as_ref(),
+            filter.started_after.as_ref(),
+        )
+    }
 }
 
 /// How long a data quality run that started at `started_on` consumed resources, in whole

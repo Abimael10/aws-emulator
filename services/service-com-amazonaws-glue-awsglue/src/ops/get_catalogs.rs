@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCatalogs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCatalogs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCatalogs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog RESOURCES one parent catalog holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::catalog_definitions_in`]), the records a
+//! `CreateCatalog` registered and `GetCatalog` reads back: one `MaxResults`-sized page at a
+//! time in catalog-id order, with a `NextToken` that resumes the walk where the previous
+//! page stopped, and the account's own Data Catalog among them where the request asks for
+//! it. Reporting only — nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +96,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`GetCatalogsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page size for a
+/// request that names none.
+const MAX_PAGE_SIZE: i32 = 1_000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -173,18 +176,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCatalogs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCatalogsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCatalogs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(GetCatalogsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        // "The ID of the parent catalog in which the catalog resides. If none is provided,
+        // the Amazon Web Services Account Number is used by default" — the same default every
+        // `CatalogId` of this service resolves to.
+        let parent_id = crate::state::resolve_catalog_id(input.parent_catalog_id.as_ref());
+        let parent = crate::state::parse_catalog_reference(&parent_id);
+        // Authorization comes BEFORE the entity lookup, exactly as the single-catalog read
+        // does it: a catalog in another account's Data Catalog is reachable on the real
+        // service only through that catalog's own resource-based policy, and this store can
+        // hold no such grant.
+        if !crate::state::is_served_account(&parent.account_id) {
+            return Err(GetCatalogsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::messages::not_authorized_on_catalog(
+                        Self::NAME,
+                        &crate::state::catalog_resource_arn(
+                            &region,
+                            &parent.account_id,
+                            &parent.name,
+                        ),
+                    )),
+                },
+            )
+            .into());
+        }
+        // Whether the parent is the account's own Data Catalog — the container every account
+        // HAS, which holds the catalogs a create registers — rather than one of those
+        // catalogs.
+        let parent_is_the_account_catalog = crate::state::is_known_catalog(&parent_id);
+
+        // "Whether to list the default catalog in the account and region in the response":
+        // the default catalog sits in no catalog, so the flag decides nothing for a parent
+        // that is one — "when the `ParentCatalogId` is not equal to null, and this attribute
+        // is passed as `false` or `true`, an `InvalidInputException` is thrown".
+        if input.include_root.is_some() && !parent_is_the_account_catalog {
+            return Err(GetCatalogsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::INCLUDE_ROOT_NEEDS_THE_ACCOUNT_CATALOG
+                            .to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        let include_root = input.include_root.unwrap_or(false);
+        // "Whether to list all catalogs across the catalog hierarchy, starting from the
+        // `ParentCatalogId`": a catalog this service holds is registered IN the account's own
+        // Data Catalog and holds databases rather than catalogs
+        // ([`crate::state::ComAmazonawsGlueAwsglueState::catalog_definitions_in`]), so that
+        // hierarchy is one level deep and the catalogs below a parent recursively are exactly
+        // its own — the flag narrows and widens nothing here.
+        let _ = input.recursive;
+        // "When true, the response only includes catalogs that can contain databases. Some
+        // catalogs are organizational containers that hold only other catalogs, not
+        // databases": every catalog this store holds is one a `CreateCatalog` registered
+        // inside the account's own Data Catalog, and what a catalog holds here is DATABASES
+        // ([`crate::state::Catalog::databases`]) — none of them is a container of other
+        // catalogs — so the flag excludes none of them rather than hiding catalogs that do
+        // hold databases.
+        let _ = input.has_databases;
+
+        // "The maximum number of catalogs to return in one response" (`MaxResults`, range
+        // 1..1000). Absent, the page is the largest the model accepts for it; the clamp
+        // re-states that range here so the page size is never 0 even if the boundary
+        // validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored catalogs are projected out and nothing is written.
+        let store = state.lock();
+        // Each listed catalog is paired with the id it is KEYED by, so the listing is ordered
+        // and resumed by one value: the account's own Data Catalog answers to the account id,
+        // which is the prefix of every catalog id inside it, so it sorts ahead of them.
+        let mut listed: Vec<(String, Catalog)> = Vec::new();
+        if parent_is_the_account_catalog {
+            if include_root {
+                listed.push((
+                    parent.account_id.clone(),
+                    crate::state::account_data_catalog(&region),
+                ));
+            }
+            listed.extend(
+                store
+                    .catalog_definitions_in(&parent.account_id)
+                    .into_iter()
+                    .map(|(id, definition)| (id.to_string(), definition.to_catalog(&region))),
+            );
+        } else {
+            // A parent that is a catalog resource has to exist for there to be a listing at
+            // all — the same miss the single-catalog read answers for a name this account
+            // holds no catalog under — and it holds databases rather than catalogs, so what
+            // it holds in CATALOGS is the empty listing.
+            if store.catalog_definition(&parent).is_none() {
+                return Err(GetCatalogsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::CATALOG_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+        listed.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // "A continuation token, if this is a continuation call": it is the id of the last
+        // catalog of the previous page, so this page resumes at the first catalog strictly
+        // after it — which stays correct across catalogs created or deleted between two
+        // calls, exactly as the sibling listings of this crate resume.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => listed.partition_point(|(id, _)| id.as_str() <= cursor),
+            None => 0,
+        };
+        let total = listed.len();
+        let end = start.saturating_add(page_size).min(total);
+        // "A continuation token ... returned if the current segment of the list is not the
+        // last": it names the id of the last catalog of the page, read off the page itself so
+        // there is no index arithmetic to underflow on an empty page.
+        let page_cursor = listed[start..end].last().map(|(id, _)| id.clone());
+        let page: Vec<Catalog> = listed
+            .into_iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(_, catalog)| catalog)
+            .collect();
+        let next_token = if end < total { page_cursor } else { None };
+
+        Ok(GetCatalogsOutput {
+            // "A list of `Catalog` objects from the specified parent catalog": each catalog as
+            // the store holds it, projected the way the single-catalog read projects one. The
+            // member is `@required`, and a parent holding no catalog has an EMPTY listing
+            // rather than an absent one.
+            catalog_list: page,
+            next_token,
+        })
     }
 }
