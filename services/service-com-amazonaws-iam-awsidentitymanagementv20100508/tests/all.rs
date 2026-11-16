@@ -147,6 +147,8 @@ mod inline_policy_name_echo;
 mod inline_policy_size_quota;
 #[path = "all/instance_profile_listing.rs"]
 mod instance_profile_listing;
+#[path = "all/instance_profile_listing_document_alphabet.rs"]
+mod instance_profile_listing_document_alphabet;
 #[path = "all/instance_profile_listing_document_encoding.rs"]
 mod instance_profile_listing_document_encoding;
 #[path = "all/instance_profile_role_binding.rs"]
