@@ -222,6 +222,22 @@ pub(crate) fn at_path<'a>(item: &'a Value, path: &[&str]) -> Option<&'a str> {
     cursor.as_str()
 }
 
+/// Every string the list `member` of `item` carries, in the order served, and an empty
+/// list when the member is absent or carries none.
+///
+/// `pub(crate)`: the ONE reading of a string-list member this test target does, shared
+/// with the sibling suites rather than rewritten beside them.
+pub(crate) fn strings(item: &Value, member: &str) -> Vec<String> {
+    item.get(member)
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every distinct string at `path` (a chain of object members) across `items`.
 fn distinct<'a>(items: &'a [Value], path: &[&str]) -> Vec<&'a str> {
     let mut values: Vec<&str> = items

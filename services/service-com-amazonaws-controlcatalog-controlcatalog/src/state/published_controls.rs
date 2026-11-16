@@ -1303,11 +1303,13 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("RDS_SNAPSHOT_ENCRYPTED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.RDS.DT.39"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
-        governed_resources: &["AWS::RDS::DBSnapshot"],
+        // The catalog publishes no governed resource type for this control: its recorded
+        // response carries the empty list.
+        governed_resources: NO_GOVERNED_RESOURCES,
         governed_providers: AWS,
         implements: "encrypt-data-at-rest-in-storage-services",
         frameworks: NO_FRAMEWORK_ITEMS,
@@ -1410,7 +1412,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("ELBV2_ACM_CERTIFICATE_REQUIRED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.ELASTICLOADBALANCING.DT.3"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1449,11 +1451,11 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
                       not deliver to a CloudWatch Logs log group, or if its last delivery \
                       is older than the age the rule's input parameter allows.",
         behavior: DETECTIVE,
-        severity: MEDIUM,
+        severity: LOW,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("CLOUD_TRAIL_CLOUD_WATCH_LOGS_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.CLOUDTRAIL.DT.8"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1598,10 +1600,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
                       accessible. The rule is NON_COMPLIANT if the publiclyAccessible \
                       field of the cluster configuration is true.",
         behavior: DETECTIVE,
-        severity: HIGH,
+        severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("REDSHIFT_CLUSTER_PUBLIC_ACCESS_CHECK"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_REDSHIFT_CLUSTER_PUBLIC_ACCESS_CHECK"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -1619,10 +1621,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
                       SageMaker notebook instance. The rule is NON_COMPLIANT if the \
                       notebook instance reaches the internet directly.",
         behavior: DETECTIVE,
-        severity: MEDIUM,
+        severity: HIGH,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: US_REGIONS,
@@ -1634,24 +1636,23 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "ebs-snapshot-public-restorable-check",
-        name: "Checks whether Amazon Elastic Block Store (Amazon EBS) snapshots are not \
-               publicly restorable",
+        name: "Detect whether Amazon EBS snapshots are restorable by all AWS accounts",
         description: "Checks whether Amazon Elastic Block Store (Amazon EBS) snapshots \
                       are not publicly restorable. The rule is NON_COMPLIANT if an \
                       Amazon EBS snapshot is restorable by all Amazon Web Services \
                       accounts.",
         behavior: DETECTIVE,
-        severity: HIGH,
+        severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("EBS_SNAPSHOT_PUBLIC_RESTORABLE_CHECK"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_EBS_SNAPSHOT_PUBLIC_RESTORABLE_CHECK"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
-        // The snapshot sharing this control governs has no available resource type of
-        // its own, so the catalog publishes the list empty.
-        governed_resources: NO_GOVERNED_RESOURCES,
+        // The catalog publishes the resource type its recorded response names for this
+        // control, which is the volume the snapshot was taken from.
+        governed_resources: &["AWS::EC2::Volume"],
         governed_providers: AWS,
         implements: "restrict-public-access",
         frameworks: NO_FRAMEWORK_ITEMS,
@@ -1694,7 +1695,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("SECRETSMANAGER_ROTATION_ENABLED_CHECK"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.SECRETSMANAGER.DT.5"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1764,7 +1765,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("ROOT_ACCOUNT_HARDWARE_MFA_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.ACCOUNT.DT.2"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1790,7 +1791,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.IAM.DT.7"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         parameters: NO_PARAMETERS,
@@ -1801,17 +1802,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "restricted-common-ports",
-        name: "Checks whether the security groups in use do not allow unrestricted \
-               incoming TCP traffic to the specified ports",
+        name: "Disallow Internet connection via RDP",
         description: "Checks whether the security groups in use do not allow unrestricted \
                       incoming TCP traffic to the specified ports. The rule is \
                       NON_COMPLIANT if a security group allows inbound traffic from any \
                       address to a port the rule's input parameters name.",
         behavior: DETECTIVE,
-        severity: HIGH,
+        severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("RESTRICTED_INCOMING_TRAFFIC"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_RESTRICTED_COMMON_PORTS"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -2289,6 +2289,62 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         identifier: "1038h7d21e6g8i10g6v3xsssi",
         release_time: None,
     },
+    // The rest of the AWS Config-implemented surface whose published identifier this
+    // catalog records: the controls the catalog publishes under a `CONFIG.…` designator
+    // and the Control Tower controls an AWS Config managed rule implements. A release
+    // instant is recorded only where this crate holds the one the catalog publishes; the
+    // identifier and the instant are separate published facts, so a row records the
+    // identifier whether or not the instant is known.
+    PublishedCatalogRecord {
+        slug: "ebs-snapshot-public-restorable-check",
+        identifier: "87qo8rsoettjrxjevmjqcw1tu",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "cloud-trail-cloud-watch-logs-enabled",
+        identifier: "9vnj728czsv4m6pflfqt21bw2",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "elbv2-acm-certificate-required",
+        identifier: "aazzef7lptl5umta6690p6u5c",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "iam-policy-no-statements-with-admin-access",
+        identifier: "byrg7iwyl4azhecyhqtq8ocw1",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "rds-snapshot-encrypted",
+        identifier: "84hd48gyrb6e5ribkmsoub44c",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "redshift-cluster-public-access-check",
+        identifier: "1oxkwnc4hwhi2ndv6ekwy7np7",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "restricted-common-ports",
+        identifier: "df2ta5ytg2zatj1q7y5e09u32",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "root-account-hardware-mfa-enabled",
+        identifier: "227ph3vim64tdwv5mfagjd22r",
+        release_time: Some(1_535_587_200),
+    },
+    PublishedCatalogRecord {
+        slug: "sagemaker-notebook-no-direct-internet-access",
+        identifier: "66gfl06uj1v999z53szvu0exa",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "secretsmanager-rotation-enabled-check",
+        identifier: "4tf01viblttjxqhu35yz90vw1",
+        release_time: None,
+    },
 ];
 
 /// The published catalog record of the control `slug` names, or `None` when this catalog
@@ -2407,6 +2463,24 @@ const CONFIG_RULE_PARAMETERS: &[(&str, &[(&str, &str)])] = &[
             ("blockedPort3", OPTIONAL),
             ("blockedPort4", OPTIONAL),
             ("blockedPort5", OPTIONAL),
+        ],
+    ),
+    // The certificate authorities a listener's certificate may come from.
+    (
+        "ELBV2_ACM_CERTIFICATE_REQUIRED",
+        &[("AcmCertificateArns", OPTIONAL)],
+    ),
+    // Whether a policy used only as a permissions boundary is exempt from the check.
+    (
+        "IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS",
+        &[("excludePermissionBoundaryPolicy", OPTIONAL)],
+    ),
+    // The longest rotation interval a secret may be scheduled on, in days and in hours.
+    (
+        "SECRETSMANAGER_ROTATION_ENABLED_CHECK",
+        &[
+            ("maximumAllowedRotationFrequency", OPTIONAL),
+            ("maximumAllowedRotationFrequencyInHours", OPTIONAL),
         ],
     ),
 ];

@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::control_catalog::{catalog_arn, drain, Emulator};
+use crate::control_catalog::{catalog_arn, drain, strings, Emulator};
 
 /// One published control, as the catalog publishes it.
 ///
@@ -221,14 +221,7 @@ const PUBLISHED_PARAMETER_SUMMARIES: &[(&str, &str)] = &[
 
 /// The `Aliases` of a served control summary.
 fn aliases(control: &Value) -> Vec<String> {
-    control["Aliases"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|alias| alias.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    strings(control, "Aliases")
 }
 
 /// Every control the catalog serves, keyed by each designator it is published under.
@@ -249,18 +242,6 @@ async fn by_alias(emulator: &Emulator) -> BTreeMap<String, Value> {
         }
     }
     indexed
-}
-
-/// The list of strings a summary member carries.
-fn strings(control: &Value, member: &str) -> Vec<String> {
-    control[member]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Every published control is served under its own catalog ARN, with the catalog's own

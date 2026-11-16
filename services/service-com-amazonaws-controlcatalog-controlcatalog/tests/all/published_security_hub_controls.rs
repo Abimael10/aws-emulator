@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::control_catalog::{catalog_arn, drain, Emulator};
+use crate::control_catalog::{catalog_arn, drain, strings, Emulator};
 
 /// One Security Hub control's published catalog record.
 ///
@@ -226,26 +226,7 @@ fn requests() -> Vec<String> {
 
 /// The `Aliases` of a served control.
 fn aliases(control: &Value) -> Vec<String> {
-    control["Aliases"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|alias| alias.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The list of strings a member of a served control carries.
-fn strings(control: &Value, member: &str) -> Vec<String> {
-    control[member]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    strings(control, "Aliases")
 }
 
 /// The `CreateTime` of a served control, in whole seconds since the Unix epoch.
