@@ -444,7 +444,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner_id: ::engine::emulator_account_id().to_string(),
             share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
             status: crate::state::RULE_STATUS_COMPLETE.to_string(),
-            status_message: None,
+            // "A detailed description of the status of a Resolver rule": the
+            // step this call reached, stated as the sentence that step carries
+            // and traced to this request, and kept with the record so every
+            // later read of the rule describes its status the same way.
+            status_message: Some(crate::state::rule_status_message(
+                crate::state::RULE_STATUS_MESSAGE_CREATED,
+                &crate::state::request_trace_root(&ctx.parts().headers),
+            )),
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: timestamp.clone(),
             modification_time: timestamp,

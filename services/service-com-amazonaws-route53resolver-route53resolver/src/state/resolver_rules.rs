@@ -86,6 +86,36 @@ pub fn rule_content_digest(content: &RuleContent<'_>) -> String {
     hex::encode(&hasher.finalize()[..16])
 }
 
+/// The sentence a Resolver rule's `StatusMessage` states for the step the call
+/// that CREATED it reached — the settled step every stored rule stands in
+/// ([`RULE_STATUS_COMPLETE`]), which is the only step a rule of this store is
+/// ever moved into by a caller.
+///
+/// `ResolverRule$StatusMessage` is "a detailed description of the status of a
+/// Resolver rule"
+/// (`smithy_query(query="doc",shape="ResolverRule",member="StatusMessage")`),
+/// and what Route 53 Resolver describes there is the lifecycle step the rule
+/// reached: fixed text for that step, with nothing the caller asked for in it,
+/// exactly as a DNS Firewall resource's step sentence is
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`]).
+pub const RULE_STATUS_MESSAGE_CREATED: &str = "Successfully created Resolver Rule";
+
+/// The `StatusMessage` a Resolver rule reports for the step `stated`, opened by
+/// the trace clause Route 53 Resolver stamps on it: the trace id of the request
+/// that reached the step, in brackets, ahead of the sentence.
+///
+/// The id is the trace of the REQUEST that moved the rule into that step
+/// ([`request_trace_root`]), the same id this service's refusals quote
+/// ([`traced_message`]) — so it is a different value on every call and is never
+/// derived from anything the caller asked about. It is stamped onto the record
+/// ONCE, by the call that reached the step, and carried by every later
+/// projection of the rule, which is why a read reports the sentence the create
+/// answered rather than a freshly traced one. The whole message fits
+/// `StatusMessage` (length 0..255).
+pub fn rule_status_message(stated: &str, trace_root: &str) -> String {
+    format!("[Trace id: {trace_root}] {stated}")
+}
+
 /// A Resolver rule, as stored.
 #[derive(Debug, Clone)]
 pub struct ResolverRuleRecord {
@@ -106,6 +136,10 @@ pub struct ResolverRuleRecord {
     /// The `ResolverRuleStatus` this rule reports; see [`RULE_STATUS_COMPLETE`]
     /// on why a stored rule is already settled.
     pub status: String,
+    /// The `StatusMessage` describing the step [`Self::status`] names, as the
+    /// call that created the rule stamped it ([`rule_status_message`]), so every
+    /// projection of the rule — the create's, the read's, the listing's and the
+    /// update's — describes its status with the same sentence.
     pub status_message: Option<String>,
     pub tags: Vec<Tag>,
     pub creation_time: String,
@@ -137,6 +171,10 @@ impl ResolverRuleRecord {
     }
 
     /// Project the record onto the modelled `ResolverRule`.
+    ///
+    /// This is the ONE serializer of the shape: the create, the read, the list
+    /// and the update all answer through it, so no operation can report a rule
+    /// with fewer members than another.
     pub fn to_rule(&self) -> ResolverRule {
         ResolverRule {
             id: Some(self.id.clone()),

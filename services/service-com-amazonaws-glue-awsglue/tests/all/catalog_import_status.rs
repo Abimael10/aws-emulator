@@ -106,7 +106,6 @@ fn assert_service_authored(case: &str, reported: &Value) -> f64 {
 #[tokio::test]
 async fn an_unmigrated_catalog_reports_the_status_it_carries_by_default() {
     let router = emulator();
-    let before = epoch_seconds(SystemTime::now()).ceil();
 
     // (case, the request body)
     let cases: Vec<(&str, Value)> = vec![
@@ -122,11 +121,16 @@ async fn an_unmigrated_catalog_reports_the_status_it_carries_by_default() {
     let mut first_reported: Option<Value> = None;
     for (case, request) in &cases {
         let first = import_status(&router, request).await;
+        // The bound is read AFTER the call that reported the stamp, at the same
+        // precision the stamp crosses the wire at: a stamp taken during the read is at or
+        // before this instant, whatever second the read happened to fall in, so no case
+        // turns on how close to a second boundary the host ran it.
+        let read_by = epoch_seconds(SystemTime::now());
         let stamped_at = assert_service_authored(case, &first);
         assert!(
-            stamped_at <= before,
-            "case {case}: a catalog no import has migrated carries a stamp taken before the \
-             read, at most {before}, got {stamped_at}"
+            stamped_at <= read_by,
+            "case {case}: a catalog no import has migrated carries a stamp taken no later \
+             than the read, at most {read_by}, got {stamped_at}"
         );
         // Reporting, not mutating: a second read of the same catalog answers the same, and
         // so does a read of the other spelling of the same catalog id.

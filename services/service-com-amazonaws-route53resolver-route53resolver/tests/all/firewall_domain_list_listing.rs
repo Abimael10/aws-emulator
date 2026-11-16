@@ -18,20 +18,35 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{call, emulator, error_type, ok, string_member, ACCOUNT, REGION};
 
-/// The domain lists Route 53 Resolver DNS Firewall publishes to every account,
-/// in the order this emulator reports them.
+/// The domain lists Route 53 Resolver DNS Firewall publishes to every account —
+/// `(Name, Category, ManagedListType)` — in the order this emulator reports
+/// them.
 ///
-/// Source: the managed domain lists AWS publishes for DNS Firewall. The model
-/// itself names the first of them, with its owner, in
-/// `FirewallDomainList$ManagedOwnerName`'s doc
+/// Source: the managed domain lists AWS publishes for DNS Firewall, each with
+/// the category published beside it. The model itself names the first of them,
+/// with its owner, in `FirewallDomainList$ManagedOwnerName`'s doc
 /// (`smithy_query(query="doc",shape="FirewallDomainList",member="ManagedOwnerName")`):
 /// "the managed domain list `AWSManagedDomainsMalwareDomainList` has the managed
-/// owner name `Route 53 Resolver DNS Firewall`".
-const PUBLISHED_LISTS: &[&str] = &[
-    "AWSManagedDomainsMalwareDomainList",
-    "AWSManagedDomainsBotnetCommandandControl",
-    "AWSManagedDomainsAggregateThreatList",
-    "AWSManagedDomainsAmazonGuardDutyThreatList",
+/// owner name `Route 53 Resolver DNS Firewall`"; `ManagedListType` is "the type
+/// of the managed domain list, for example `THREAT`", out of the model's
+/// `DomainListType` enum ([`DOMAIN_LIST_TYPES`]).
+const PUBLISHED_LISTS: &[(&str, &str, &str)] = &[
+    ("AWSManagedDomainsMalwareDomainList", "Malware", "THREAT"),
+    (
+        "AWSManagedDomainsBotnetCommandandControl",
+        "Botnet/Command and Control",
+        "THREAT",
+    ),
+    (
+        "AWSManagedDomainsAggregateThreatList",
+        "Aggregate Threat List",
+        "THREAT",
+    ),
+    (
+        "AWSManagedDomainsAmazonGuardDutyThreatList",
+        "Amazon GuardDuty Threat List",
+        "THREAT",
+    ),
 ];
 
 /// The `ManagedOwnerName` every published list reports, from the model doc cited
@@ -130,12 +145,19 @@ async fn the_published_lists_are_visible_without_any_create() {
         .collect();
     assert_eq!(
         names,
-        PUBLISHED_LISTS.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        PUBLISHED_LISTS
+            .iter()
+            .map(|(name, _, _)| (*name).to_string())
+            .collect::<Vec<_>>(),
         "case \"a store nobody wrote to\": the listing must report exactly the published lists, got {first:?}"
     );
 
-    for item in &first {
+    for (item, (name, category, managed_list_type)) in first.iter().zip(PUBLISHED_LISTS) {
         let case = string_member(item, "Name");
+        assert_eq!(
+            &case, name,
+            "case {case:?}: the published lists must be reported in the catalog's order, got {first:?}"
+        );
         let id = string_member(item, "Id");
         assert!(
             id.starts_with("rslvr-fdl-") && !id.is_empty() && id.len() <= 64,
@@ -157,15 +179,22 @@ async fn the_published_lists_are_visible_without_any_create() {
             "case {case:?}: ManagedListType must be one of {DOMAIN_LIST_TYPES:?}, got {managed_type:?}"
         );
         assert_eq!(
+            &managed_type, managed_list_type,
+            "case {case:?}: the catalog publishes this list as a {managed_list_type} list, got {item}"
+        );
+        assert_eq!(
             string_member(item, "CreatorRequestId"),
             case,
             "case {case:?}: a published list is identified by the name DNS Firewall publishes it \
              under, got {item}"
         );
-        // Every published list says what the intelligence inside it is about.
-        assert!(
-            !string_member(item, "Category").is_empty(),
-            "case {case:?}: a published list must report its Category, got {item}"
+        // Every published list says what the intelligence inside it is about,
+        // which is the category published with the list and is the same for
+        // every account that reads it.
+        assert_eq!(
+            &string_member(item, "Category"),
+            category,
+            "case {case:?}: expected the published Category {category:?}, got {item}"
         );
 
         // The id the listing reported resolves to the same list through the

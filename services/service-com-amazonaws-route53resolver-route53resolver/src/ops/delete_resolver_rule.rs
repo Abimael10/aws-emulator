@@ -192,6 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Information about the DeleteResolverRule request, including the status
         // of the request": the rule is on its way out, so it reports `DELETING`.
+        // Its `StatusMessage` is the sentence stamped on the record when the rule
+        // was created, carried over with every other member — the answer is "the
+        // Resolver rule that you deleted" as the store held it.
         rule.status = Some(crate::state::RULE_STATUS_DELETING.to_string());
         rule.modification_time = Some(crate::state::now_rfc3339());
 
