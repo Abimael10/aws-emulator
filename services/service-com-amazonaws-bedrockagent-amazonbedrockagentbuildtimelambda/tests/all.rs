@@ -31,6 +31,8 @@ mod document_delete_retires_the_document;
 mod document_delete_unindexes_the_document;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/flow_alias_create_contention.rs"]
+mod flow_alias_create_contention;
 #[path = "all/flow_alias_deployment.rs"]
 mod flow_alias_deployment;
 #[path = "all/flow_alias_name_uniqueness.rs"]
