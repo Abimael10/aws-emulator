@@ -3278,6 +3278,20 @@ pub fn with_stage_variables(
     Ok(resolved)
 }
 
+/// Whether `value` CARRIES a stage-variable reference: one that is both opened and closed,
+/// which is what [`resolved_references`] substitutes.
+///
+/// `pub` because the CONTROL PLANE stores such a configuration long before any stage
+/// resolves it: a member whose value is a reference cannot be held to the form that member
+/// takes once resolved (`crate::ops::put_integration::validate_integration`), because the
+/// ARN or the id is the STAGE's. A name no stage defines is answered when the method is
+/// invoked ([`with_stage_variables`]), not when the integration is written.
+pub fn carries_stage_variable_reference(value: &str) -> bool {
+    value
+        .split_once(STAGE_VARIABLE_REFERENCE_PREFIX)
+        .is_some_and(|(_, referenced)| referenced.contains(STAGE_VARIABLE_REFERENCE_CLOSE))
+}
+
 /// `value` with every stage-variable reference in it replaced by the value `variables`
 /// gives that name — `None` when it carries no reference at all, so an untouched value is
 /// never rewritten — or `Err(name)` for the FIRST reference the map holds no entry for.

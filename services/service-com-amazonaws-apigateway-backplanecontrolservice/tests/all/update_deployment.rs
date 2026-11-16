@@ -164,10 +164,12 @@ async fn a_patched_deployment_description_is_stored_and_read_back() {
             json!("déploiement « canari » 🚀"),
         ),
         (
+            // An explicitly empty description leaves the deployment with none: API
+            // Gateway normalizes a description of no characters to an absent member.
             "replace with an empty value",
             json!({ "description": "initial description" }),
             vec![replace("/description", "")],
-            json!(""),
+            Value::Null,
         ),
         (
             // The published bound this emulator holds caller-sized strings to; one past

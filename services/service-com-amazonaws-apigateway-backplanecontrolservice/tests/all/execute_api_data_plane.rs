@@ -1096,8 +1096,11 @@ async fn the_deployed_methods_authorization_decides_which_requests_are_served() 
     .await;
     put_integration(&gateway, &api, &custom, "GET", json!({ "type": "MOCK" })).await;
 
-    // A CUSTOM method that names no authorizer at all: the call cannot be authorized, which
-    // is a configuration the stage cannot serve.
+    // A method whose authorization type no authorizer of this api can serve: the stage
+    // cannot authorize the call, which is the configuration-error class. The type is one
+    // no `Method$authorizationType` value names — the way such a method is now reachable
+    // at all, since a `CUSTOM` method naming no authorizer is refused when it is put
+    // (`PutMethod` requires an authorizer the api holds).
     let unauthorized = create_resource(&gateway, &api, &root, "no-authorizer").await;
     let unauthorized = string_member(&unauthorized, "id", "no-authorizer");
     put_method(
@@ -1105,7 +1108,7 @@ async fn the_deployed_methods_authorization_decides_which_requests_are_served() 
         &api,
         &unauthorized,
         "GET",
-        json!({ "authorizationType": "CUSTOM" }),
+        json!({ "authorizationType": "SOMETHING_ELSE" }),
     )
     .await;
     put_integration(&gateway, &api, &unauthorized, "GET", json!({ "type": "MOCK" })).await;
@@ -1215,7 +1218,7 @@ async fn the_deployed_methods_authorization_decides_which_requests_are_served() 
             expected: "Internal server error",
         },
         AuthorizationCase {
-            name: "a CUSTOM method that names no authorizer",
+            name: "a method whose authorization type no authorizer can serve",
             path: "/prod/no-authorizer",
             headers: &[("auth", "a-token")],
             expected_status: 500,

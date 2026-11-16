@@ -839,3 +839,10 @@ mod definition_payload_refusals;
 // of the records it reports.
 #[path = "all/client_certificate_collection_pages.rs"]
 mod client_certificate_collection_pages;
+// Appended for the reason the note above gives: what this control plane REFUSES about the
+// inputs it is handed — the path-part grammar, an empty api name, a method's authorizer
+// reference, a request-parameter mapping expression and an integration's credentials — and
+// the two representations it normalizes: an explicitly empty description, and a constraint
+// broken by a list ELEMENT stated at the list member.
+#[path = "all/control_plane_input_rules.rs"]
+mod control_plane_input_rules;

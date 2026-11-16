@@ -591,7 +591,9 @@ fn apply_stage_patch(
     }
     match patch.member() {
         "deploymentId" => apply_deployment_id(entry, patch, context.deployments),
-        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "description" => {
+            crate::state::patch_description(&mut entry.description, patch, MAX_STRING_CHARS)
+        }
         "documentationVersion" => {
             patch_optional_string(&mut entry.documentation_version, patch, MAX_STRING_CHARS)
         }

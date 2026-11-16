@@ -155,7 +155,9 @@ fn apply_patch(
         // replaced, a collection has elements added and removed.
         PatchOpKind::Replace => match patch.member() {
             "name" => patch_optional_string(&mut entry.name, patch, MAX_STRING_CHARS),
-            "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+            "description" => {
+                crate::state::patch_description(&mut entry.description, patch, MAX_STRING_CHARS)
+            }
             "customerId" => patch_optional_string(&mut entry.customer_id, patch, MAX_STRING_CHARS),
             "enabled" => patch_bool(&mut entry.enabled, patch),
             // Unreachable while the table and these cases name the same members, which

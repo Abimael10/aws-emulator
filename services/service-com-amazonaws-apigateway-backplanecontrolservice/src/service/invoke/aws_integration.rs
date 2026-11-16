@@ -149,10 +149,10 @@ const INTEGRATION_REQUEST_PATH_PREFIX: &str = "integration.request.path.";
 const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
 
 /// The `credentials` value that asks for the CALLER's own identity to be passed through
-/// rather than for a role to be assumed: `Integration$credentials` documents it as "to
-/// require that the caller's identity be passed through from the request, specify the
-/// string `arn:aws:iam::\*:user/\*`". It names no role, so there is no role to resolve.
-const CALLER_CREDENTIALS: &str = "arn:aws:iam::*:user/*";
+/// rather than for a role to be assumed, as the operation that stores the member states it
+/// (`crate::ops::put_integration::CALLER_CREDENTIALS`): one value, read here and written
+/// there.
+const CALLER_CREDENTIALS: &str = crate::ops::put_integration::CALLER_CREDENTIALS;
 
 /// The error code an AWS service refuses an unauthorized call with, and the sentence
 /// Amazon S3 publishes beside it ("AccessDenied — Access Denied", Amazon S3 "Error

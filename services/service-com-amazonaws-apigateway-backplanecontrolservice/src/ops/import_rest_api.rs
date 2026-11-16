@@ -534,7 +534,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // document carries the API's name, description and version, and
             // `binaryMediaTypes` comes from API Gateway's own document extension.
             name,
-            description: definition.description.clone(),
+            description: crate::state::stored_description(definition.description.clone()),
             version: definition.version.clone(),
             created_date: Some(crate::state::now()),
             // The Region the import is addressed in, on the same rule

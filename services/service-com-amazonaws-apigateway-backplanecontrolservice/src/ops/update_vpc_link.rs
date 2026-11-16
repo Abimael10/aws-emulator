@@ -87,8 +87,7 @@
 use super::types::*;
 
 use crate::state::{
-    patch_optional_string, patch_required_string, Patch, PatchFailure, VpcLinkEntry,
-    MAX_STRING_CHARS,
+    patch_description, patch_required_string, Patch, PatchFailure, VpcLinkEntry, MAX_STRING_CHARS,
 };
 
 // The `path` values `UpdateVpcLink` accepts are the ones `apply_patch` below has an arm
@@ -111,7 +110,7 @@ fn apply_patch(entry: &mut VpcLinkEntry, patch: &Patch) -> Result<(), PatchFailu
         "name" => patch_required_string(&mut entry.name, patch, MAX_STRING_CHARS),
         // The description is optional, so a `remove` clears it back to the state a link
         // created without one is in.
-        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "description" => patch_description(&mut entry.description, patch, MAX_STRING_CHARS),
         _ => Err(patch.unsupported_path()),
     }
 }

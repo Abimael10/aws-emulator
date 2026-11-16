@@ -373,7 +373,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The deployment is the API's methods as they stand at this instant.
         let entry = DeploymentEntry {
             id: id.clone(),
-            description: input.description,
+            // An explicitly empty description is stored as none, the way this service
+            // stores every description (`crate::state::stored_description`).
+            description: crate::state::stored_description(input.description),
             created_date: Some(now),
             api_summary: api_summary(api),
             // ... and the resource tree they hang off, which is what a stage pointing at
@@ -434,7 +436,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         StageEntry {
                             stage_name,
                             deployment_id: id.clone(),
-                            description: input.stage_description,
+                            description: crate::state::stored_description(
+                                input.stage_description,
+                            ),
                             cache_cluster_enabled,
                             cache_cluster_size: input.cache_cluster_size,
                             // A cache cluster the caller asked for is still coming up

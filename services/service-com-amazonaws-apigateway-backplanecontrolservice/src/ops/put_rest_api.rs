@@ -2270,7 +2270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             api.name = title.clone();
         }
         if definition.description.is_some() {
-            api.description = definition.description.clone();
+            api.description = crate::state::stored_description(definition.description.clone());
         }
         if definition.version.is_some() {
             api.version = definition.version.clone();

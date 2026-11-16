@@ -319,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let entry = UsagePlanEntry {
             id: id.clone(),
             name: input.name,
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             api_stages: requested_stages,
             throttle: input.throttle,
             quota: input.quota,

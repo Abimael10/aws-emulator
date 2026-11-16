@@ -577,9 +577,10 @@ pub(super) fn stated_role(credentials: Option<&str>) -> Option<&str> {
 /// The `credentials` spelling that asks for the CALLER's own identity to be passed through
 /// rather than for a role to be assumed, as `Integration$credentials` documents it.
 ///
-/// The same reading [`super::aws_integration`] takes of that member; stated once here, because
-/// the value is the same member of the same record whichever integration type carries it.
-const CALLER_CREDENTIALS: &str = "arn:aws:iam::*:user/*";
+/// The same value the operation that STORES the member states
+/// (`crate::ops::put_integration::CALLER_CREDENTIALS`), read here rather than spelled
+/// again: it is the same member of the same record whichever integration type carries it.
+const CALLER_CREDENTIALS: &str = crate::ops::put_integration::CALLER_CREDENTIALS;
 
 /// Why the ROLE `role_arn` does not admit an invocation of `function` made under it, or `None`
 /// when it does — and when nothing about the role could be shown, which refuses nothing.

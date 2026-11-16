@@ -2877,6 +2877,23 @@ pub fn is_status_code(code: &str) -> bool {
         && code.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// A caller-supplied `description` as it is STORED and reported: ABSENT where the request
+/// set it to the empty string, so a member nothing describes is omitted rather than
+/// reported present-and-empty.
+///
+/// API Gateway NORMALIZES an explicitly empty description to an absent one — a create
+/// that sets `description: ""` answers without the member, and so does every later read of
+/// the record — so a client that distinguishes absent from empty never sees a field this
+/// service would not have reported. The rule is the MEMBER's, not one resource's: every
+/// `description` this service stores goes through here, whichever record carries it and
+/// whether a create or a patch wrote it ([`patch_description`]).
+///
+/// Only a value of no characters is normalized: a description of a single space carries
+/// characters and is stored as the caller wrote it.
+pub fn stored_description(description: Option<String>) -> Option<String> {
+    description.filter(|value| !value.is_empty())
+}
+
 /// A caller-supplied map as it is STORED and reported: absent when the caller set no
 /// entry, so an empty map in the request does not become an empty map in every later
 /// read.

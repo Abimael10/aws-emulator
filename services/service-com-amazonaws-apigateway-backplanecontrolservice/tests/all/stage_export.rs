@@ -1022,39 +1022,75 @@ async fn the_vendor_extensions_are_carried_only_when_the_parameters_ask_for_them
 
 #[tokio::test]
 async fn a_method_whose_authorizer_record_is_missing_still_exports_its_authorization() {
-    // `PutMethod` stores an `authorizerId` without resolving it, so a method can carry an
-    // authorization whose `Authorizer` record the API does not hold. An export must not
-    // describe such a method as an open one: it names the authorization the METHOD
-    // carries. Rows differ along which part is missing — an id that resolves to nothing,
-    // and no id at all — and along the authorization type.
-    let cases: Vec<(&str, &str, Option<&str>, &str, &str)> = vec![
+    // A method's `authorizerId` names an `Authorizer` the api holds — `PutMethod` resolves
+    // it — so the one state in which a method's authorizer record is MISSING is a DEPLOYED
+    // SNAPSHOT: the stage serves the tree as it was deployed, and the authorizer that tree
+    // named has since been deleted along with the method that named it. An export of that
+    // stage must not describe such a method as an open one: it names the authorization the
+    // METHOD carries. Rows differ along the authorization type.
+    let cases: Vec<(&str, &str, &str)> = vec![
         (
-            "a custom authorizer id that resolves to no record",
+            "a custom authorization whose authorizer record is gone",
             "CUSTOM",
-            Some("deadbeef00"),
-            "deadbeef00",
             "custom",
         ),
         (
-            "a Cognito authorization with no authorizer id at all",
+            "a Cognito authorization whose authorizer record is gone",
             "COGNITO_USER_POOLS",
-            None,
-            "cognito_user_pools",
             "cognito_user_pools",
         ),
     ];
 
-    for (case, authorization_type, authorizer_id, scheme_name, authtype) in cases {
+    for (case, authorization_type, authtype) in cases {
         let gateway = Gateway::new();
         let (api, root) = create_api(&gateway, case).await;
         let created = create_resource(&gateway, &api, &root, "pets").await;
         let pets = string_member(&created, "id", case);
-        let mut request = json!({ "authorizationType": authorization_type });
-        if let Some(authorizer_id) = authorizer_id {
-            request["authorizerId"] = json!(authorizer_id);
-        }
-        put_method(&gateway, &api, &pets, "GET", request).await;
+        let answer = gateway
+            .call(
+                "POST",
+                &format!("/restapis/{api}/authorizers"),
+                Some(json!({
+                    "name": "to-be-deleted",
+                    "type": "TOKEN",
+                    "identitySource": "method.request.header.X-Auth",
+                    "authorizerUri": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:auth/invocations",
+                })),
+            )
+            .await;
+        let authorizer_id = string_member(&answer.body, "id", case);
+        put_method(
+            &gateway,
+            &api,
+            &pets,
+            "GET",
+            json!({
+                "authorizationType": authorization_type,
+                "authorizerId": authorizer_id.clone(),
+            }),
+        )
+        .await;
         deploy(&gateway, &api, "dev").await;
+
+        // The live tree gives the reference up; the deployed snapshot keeps it.
+        for (verb, uri) in [
+            (
+                "DELETE",
+                format!("/restapis/{api}/resources/{pets}/methods/GET"),
+            ),
+            (
+                "DELETE",
+                format!("/restapis/{api}/authorizers/{authorizer_id}"),
+            ),
+        ] {
+            let removed = gateway.call(verb, &uri, None).await;
+            assert!(
+                (200..300).contains(&removed.status),
+                "case {case}: expected {uri} to be deleted, got {} with {:?}",
+                removed.status,
+                removed.body
+            );
+        }
 
         for dialect in DIALECTS {
             let case = format!("{case} as {dialect}");
@@ -1064,20 +1100,20 @@ async fn a_method_whose_authorizer_record_is_missing_still_exports_its_authoriza
             let security = &document["paths"]["/pets"]["get"]["security"];
             assert_eq!(
                 security,
-                &json!([{ scheme_name: [] }]),
+                &json!([{ authorizer_id.clone(): [] }]),
                 "case {case}: expected the method's authorization to be named, got {security}"
             );
             let schemes = document_schemes(&document, dialect);
             assert_eq!(
                 sorted_keys(&schemes),
-                vec![scheme_name],
-                "case {case}: expected the scheme {scheme_name}, got {schemes:?}"
+                vec![authorizer_id.as_str()],
+                "case {case}: expected the scheme {authorizer_id}, got {schemes:?}"
             );
             assert_eq!(
-                schemes[scheme_name]["x-amazon-apigateway-authtype"].as_str(),
+                schemes[&authorizer_id]["x-amazon-apigateway-authtype"].as_str(),
                 Some(authtype),
                 "case {case}: expected the authtype {authtype}, got {:?}",
-                schemes[scheme_name]
+                schemes[&authorizer_id]
             );
         }
     }

@@ -336,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = ModelEntry {
             id: id.clone(),
             name: input.name.clone(),
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             content_type: input.content_type,
             schema: input.schema,
             sequence,

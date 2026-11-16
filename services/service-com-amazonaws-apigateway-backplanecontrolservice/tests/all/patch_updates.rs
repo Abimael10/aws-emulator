@@ -152,9 +152,11 @@ async fn a_patched_api_key_member_is_stored_and_read_back() {
             vec![("customerId", json!("marketplace-customer-7"))],
         ),
         (
+            // An explicitly empty description leaves the key with none: API Gateway
+            // normalizes a description of no characters to an absent member.
             "replace /description with an empty value",
             vec![replace("/description", "")],
-            vec![("description", json!(""))],
+            vec![("description", Value::Null)],
         ),
         (
             "three members in one request",
@@ -889,6 +891,36 @@ async fn a_patched_method_member_is_stored_and_read_back() {
     );
     let uri = format!("/restapis/{api}/resources/{resource_id}/methods/GET");
 
+    // An `authorizerId` names an `Authorizer` OF THIS API, and an authorization type that
+    // is served by an authorizer (`CUSTOM`, `COGNITO_USER_POOLS`) needs one — the same
+    // rule `PutMethod` applies — so the authorizer the rows below name is created first
+    // and bound to the method before the type is patched at all.
+    let created_authorizer = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/authorizers"),
+            Some(json!({
+                "name": "patched-method-authorizer",
+                "type": "TOKEN",
+                "identitySource": "method.request.header.Auth",
+                "authorizerUri": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:auth/invocations",
+            })),
+        )
+        .await;
+    assert_eq!(
+        created_authorizer.status, 201,
+        "case CreateAuthorizer: expected 201, got {} with {:?}",
+        created_authorizer.status, created_authorizer.body
+    );
+    let authorizer_id = string_member(&created_authorizer.body, "id", "CreateAuthorizer");
+    patch_ok(
+        &gateway,
+        "replace /authorizerId with the api's own authorizer",
+        &uri,
+        vec![replace("/authorizerId", &authorizer_id)],
+    )
+    .await;
+
     // Every documented authorization type is accepted and read back, not just the one
     // the method was created with.
     for authorization_type in authorization_types {
@@ -938,11 +970,11 @@ async fn a_patched_method_member_is_stored_and_read_back() {
         (
             "set the authorizer and the validator in one request",
             vec![
-                replace("/authorizerId", "authz1"),
+                replace("/authorizerId", &authorizer_id),
                 replace("/requestValidatorId", "val1"),
             ],
             vec![
-                ("authorizerId", json!("authz1")),
+                ("authorizerId", json!(authorizer_id)),
                 ("requestValidatorId", json!("val1")),
             ],
         ),

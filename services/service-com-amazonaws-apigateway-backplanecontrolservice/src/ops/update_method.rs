@@ -291,6 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let api_model_names: ::std::collections::BTreeSet<String> =
             api.models.keys().cloned().collect();
+        // The authorizers this api holds, read once per request before the resource is
+        // borrowed out of the api: what the patched record's `authorizerId` has to name.
+        let api_authorizer_ids: ::std::collections::BTreeSet<String> =
+            api.authorizers.keys().cloned().collect();
         let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
             UpdateMethodErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
@@ -311,6 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for patch in &patches {
             apply_patch(&mut updated, patch, &api_model_names).map_err(patch_failure)?;
         }
+        // The PATCHED record is held to the same rules a created one is — the forms a
+        // `requestParameters` key takes, and the authorizer an authorization type needs —
+        // so a patch cannot store a method `PutMethod` would refuse. Checked on the copy,
+        // with nothing written yet, so a refused list leaves the stored method untouched.
+        super::put_method::validate_method(&updated, &api_authorizer_ids)
+            .map_err(|message| patch_failure(PatchFailure::BadRequest(message)))?;
 
         resource.methods.insert(verb.clone(), updated);
         let stored = resource.methods.get(&verb).ok_or_else(|| {

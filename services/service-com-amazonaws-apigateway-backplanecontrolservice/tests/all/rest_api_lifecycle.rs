@@ -525,7 +525,9 @@ async fn a_created_rest_api_is_persisted_and_read_back_member_for_member() {
 #[tokio::test]
 async fn a_child_resources_path_is_its_parents_path_plus_its_own_path_part() {
     // Rows differ along what the rule generalises over: the form of the path part and
-    // how deep the resource sits under the root.
+    // how deep the resource sits under the root. Every row is a path part the grammar
+    // admits (`crate::ops::create_resource::is_path_segment`): letters, digits and
+    // `._-:`, a path variable in braces, and the greedy one.
     let cases: &[&[&str]] = &[
         &["pets"],
         &["pets", "{petId}"],
@@ -534,7 +536,7 @@ async fn a_child_resources_path_is_its_parents_path_plus_its_own_path_part() {
         &["v2.0"],
         &["order_items"],
         &["Mixed-Case"],
-        &["%7Bid%7D"],
+        &["tenant:acme"],
     ];
 
     let gateway = Gateway::new();

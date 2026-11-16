@@ -260,12 +260,19 @@ async fn a_generated_client_certificate_is_persisted_and_read_back_member_for_me
         materials.push(material);
 
         // Every member the request set is reported as it set it, and the members it did
-        // not set are absent — `description` and `tags` among them.
+        // not set are absent — `description` and `tags` among them. An explicitly EMPTY
+        // description is the one value that is not echoed: API Gateway normalizes a
+        // description of no characters to an absent member, so the record reports none.
         for member in ["description", "tags"] {
+            let expected = if request[member] == json!("") {
+                Value::Null
+            } else {
+                request[member].clone()
+            };
             assert_eq!(
-                created[member], request[member],
-                "case {case}: expected {member} {:?}, got {:?}",
-                request[member], created[member]
+                created[member], expected,
+                "case {case}: expected {member} {expected:?}, got {:?}",
+                created[member]
             );
         }
 
@@ -403,10 +410,12 @@ async fn a_patch_changes_the_description_and_nothing_the_service_assigned() {
             Value::Null,
         ),
         (
-            "an empty value is a description of no characters",
+            // An explicitly empty description leaves the certificate with none: API
+            // Gateway normalizes a description of no characters to an absent member.
+            "an empty value clears the description",
             json!({ "description": "before" }),
             vec![replace("/description", "")],
-            json!(""),
+            Value::Null,
         ),
         (
             "two ops on one member, the last one wins",

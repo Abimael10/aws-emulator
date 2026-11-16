@@ -110,7 +110,9 @@ fn apply_patch(entry: &mut ModelEntry, patch: &Patch) -> Result<(), PatchFailure
     match patch.member() {
         // `Model$description` is optional — a model created without one carries none — so
         // it can be set and also cleared.
-        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "description" => {
+            crate::state::patch_description(&mut entry.description, patch, MAX_STRING_CHARS)
+        }
         // `Model$schema` is optional for the same reason, and is bounded by the maximum
         // the member's own documentation publishes rather than by the generic string
         // bound: "The maximum size of the model is 400 KB."

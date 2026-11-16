@@ -101,6 +101,72 @@ pub fn sibling_clash_message(path_part: &str) -> String {
     format!("Another resource with the same parent already has this name: {path_part}")
 }
 
+/// The character a resource path is composed OF rather than a character a segment of one
+/// may carry: "the last path segment for this resource" (`Resource$pathPart`) is ONE
+/// segment, and the separator is what divides two of them.
+pub const PATH_SEPARATOR: char = '/';
+
+/// The characters a path part may carry beside ASCII letters and digits, as API Gateway's
+/// own refusal of a malformed one lists them ([`INVALID_PATH_PART`]): the dot, the
+/// underscore, the hyphen and the colon.
+pub const PATH_PART_CHARACTERS: &str = "._-:";
+
+/// The character that opens a PATH VARIABLE's braces: a path part may be a variable the
+/// request's own segment is bound to ("curly braces at the beginning and the end",
+/// [`INVALID_PATH_PART`]), which is how `{petId}` declares a path parameter.
+pub const PATH_VARIABLE_OPEN: char = '{';
+
+/// The character that closes those braces; see [`PATH_VARIABLE_OPEN`].
+pub const PATH_VARIABLE_CLOSE: char = '}';
+
+/// What a GREEDY path variable's name ends with: `{proxy+}` matches the whole remainder of
+/// a request path rather than one segment, which is the "valid greedy path variable"
+/// [`INVALID_PATH_PART`] names.
+pub const GREEDY_PATH_VARIABLE_SUFFIX: char = '+';
+
+/// Whether `path_part` is a path part API Gateway admits: ONE path segment composed of
+/// letters, digits and [`PATH_PART_CHARACTERS`], or a path variable spelling one of those
+/// in curly braces — greedy (`{proxy+}`) or not (`{petId}`).
+///
+/// A path part "is the last path segment for this resource" (`Resource$pathPart`) and a
+/// resource's full `path` is materialised by appending it to its parent's
+/// ([`child_path`]), so a value outside that grammar — one carrying a separator, a space
+/// or no characters at all — would materialise a path no resource of the tree can be
+/// addressed at.
+///
+/// `pub` because `UpdateResource` writes the same member under the same rule — a rename is
+/// held to exactly what a create accepts — so the grammar is resolved in one place.
+pub fn is_path_segment(path_part: &str) -> bool {
+    // A path variable is read down to its NAME: the braces are the variable's own
+    // spelling, and the greedy marker closes that name.
+    let named = path_part
+        .strip_prefix(PATH_VARIABLE_OPEN)
+        .and_then(|rest| rest.strip_suffix(PATH_VARIABLE_CLOSE));
+    let token = match named {
+        Some(variable) => variable
+            .strip_suffix(GREEDY_PATH_VARIABLE_SUFFIX)
+            .unwrap_or(variable),
+        None => path_part,
+    };
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|character| {
+                character.is_ascii_alphanumeric() || PATH_PART_CHARACTERS.contains(character)
+            })
+}
+
+/// The `BadRequestException` message for a `pathPart` outside that grammar; see
+/// [`is_path_segment`].
+///
+/// API Gateway's own sentence for it, as a recorded refusal reports: entirely fixed text,
+/// which states the characters a segment may carry and the two ways a path variable is
+/// written, and quotes back neither the value nor the member it arrived in. Shared with
+/// `UpdateResource`, which refuses the same value when a rename carries it, so one rule
+/// has one message.
+pub const INVALID_PATH_PART: &str = "Resource's path part only allow a-zA-Z0-9._-: or a \
+     valid greedy path variable and curly braces at the beginning and the end.";
+
 /// Whether a request's `embed` query parameter asks for `token`.
 ///
 /// Every `embed` member of this service documents the same form: "The query parameter
@@ -241,12 +307,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
 
         // Nothing caller-sized reaches the store unchecked, and the check runs before
-        // the store lock is taken. An empty path part would materialise the parent's
-        // own path again, so there is no resource it could name.
-        if input.path_part.is_empty() {
+        // the store lock is taken. A path part is ONE path segment of the grammar API
+        // Gateway admits: a value outside it names no resource of the tree the path would
+        // be materialised into, so it is refused rather than stored
+        // ([`is_path_segment`]).
+        if !is_path_segment(&input.path_part) {
             return Err(CreateResourceErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some("pathPart must not be empty".to_string()),
+                    message: Some(INVALID_PATH_PART.to_string()),
                 },
             )
             .into());

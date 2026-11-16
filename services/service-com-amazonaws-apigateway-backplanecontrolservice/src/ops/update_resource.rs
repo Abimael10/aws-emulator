@@ -161,17 +161,13 @@ fn apply_patch(
                 return Err(patch.unsupported_op());
             }
             let path_part = patch.require_value()?.to_string();
-            if path_part.is_empty() {
-                return Err(PatchFailure::BadRequest(format!(
-                    "{} must not be empty",
-                    patch.path
-                )));
-            }
-            if path_part.contains('/') {
-                return Err(PatchFailure::BadRequest(format!(
-                    "{} is a single path segment and must not contain '/': {path_part:?}",
-                    patch.path
-                )));
+            // One rule for the member, wherever it is written: a rename is held to
+            // exactly what a create accepts
+            // ([`super::create_resource::is_path_segment`]).
+            if !super::create_resource::is_path_segment(&path_part) {
+                return Err(PatchFailure::BadRequest(
+                    super::create_resource::INVALID_PATH_PART.to_string(),
+                ));
             }
             crate::state::bound_chars(&patch.path, &path_part, crate::state::MAX_PATH_PART_CHARS)
                 .map_err(PatchFailure::BadRequest)?;

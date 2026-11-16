@@ -308,8 +308,10 @@ async fn re_pointing_the_method_frees_the_authorizer_it_named() {
 
 #[tokio::test]
 async fn a_method_of_another_api_does_not_block_the_delete() {
-    // A method references the authorizer of ITS OWN API, so a method of another API that
-    // happens to carry the same identifier is no dependency of this one.
+    // A method references the authorizer of ITS OWN API — `PutMethod` resolves an
+    // `authorizerId` against the api the method hangs off, so a cross-api reference cannot
+    // be stored at all — and a method of ANOTHER API that references that api's own
+    // authorizer is no dependency of this one.
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "authorizer-scope").await;
     let (other, other_root) = create_api(&gateway, "authorizer-scope-other").await;
@@ -328,20 +330,42 @@ async fn a_method_of_another_api_does_not_block_the_delete() {
     .await;
     let id = string_member(&authorizer, "id", "the authorizer of the first API");
 
-    // The method on the OTHER API names that very identifier.
+    // The OTHER API has an authorizer of its own, and its method names that one.
+    let other_authorizer = created_authorizer(
+        &gateway,
+        &other,
+        "the authorizer of the other API",
+        json!({
+            "name": "scoped-other",
+            "type": "TOKEN",
+            "identitySource": "method.request.header.Auth",
+            "authorizerUri": lambda_uri("scoped-other"),
+        }),
+    )
+    .await;
+    let other_id = string_member(&other_authorizer, "id", "the authorizer of the other API");
     put_method(
         &gateway,
         &other,
         &other_root,
         "GET",
-        json!({ "authorizationType": "CUSTOM", "authorizerId": id.clone() }),
+        json!({ "authorizationType": "CUSTOM", "authorizerId": other_id.clone() }),
     )
     .await;
 
+    // The first API's authorizer is named by no method of its OWN api, so the delete is
+    // not blocked by the other API's referencing method.
     let answer = delete_authorizer(&gateway, &api, &id).await;
     assert_eq!(
         answer.status, 202,
         "case a method of another API: expected 202, got {} with {:?}",
         answer.status, answer.body
+    );
+    // And the other API's own reference still stands: its authorizer cannot be deleted.
+    assert_failure(
+        &delete_authorizer(&gateway, &other, &other_id).await,
+        409,
+        CONFLICT,
+        "the other API's authorizer its own method names",
     );
 }

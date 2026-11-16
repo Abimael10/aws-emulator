@@ -81,7 +81,7 @@
 use super::types::*;
 
 use crate::state::{
-    patch_optional_string, ClientCertificateEntry, InvalidPathRefusal, Patch, PatchFailure,
+    patch_description, ClientCertificateEntry, InvalidPathRefusal, Patch, PatchFailure,
     SupportedPatchPaths, MAX_STRING_CHARS,
 };
 
@@ -113,7 +113,7 @@ fn apply_patch(entry: &mut ClientCertificateEntry, patch: &Patch) -> Result<(), 
         // `patch_optional_string` is this crate's one reading of an op on a single-valued
         // optional string member: `add`/`replace` set it, `remove` clears it, and any
         // other op is refused as unsupported.
-        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "description" => patch_description(&mut entry.description, patch, MAX_STRING_CHARS),
         // Every other member of the record is the SERVICE's: the id it is keyed by, the
         // certificate API Gateway generated and the window that certificate is valid over
         // are not things a caller patches, so a pointer naming one is refused rather than

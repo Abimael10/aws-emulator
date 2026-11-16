@@ -313,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let entry = VpcLinkEntry {
             id: id.clone(),
             name: input.name,
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             target_arns: input.target_arns,
             // Creating a VPC link is "an asynchronous operation": the link is still being
             // provisioned when this answer is written, so it is reported `PENDING` until

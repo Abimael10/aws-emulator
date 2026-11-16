@@ -79,7 +79,7 @@
 use super::types::*;
 
 use crate::state::{
-    patch_optional_string, DeploymentEntry, InvalidPathRefusal, Patch, PatchFailure,
+    patch_description, DeploymentEntry, InvalidPathRefusal, Patch, PatchFailure,
     SupportedPatchPaths, MAX_STRING_CHARS,
 };
 
@@ -112,7 +112,7 @@ fn apply_patch(entry: &mut DeploymentEntry, patch: &Patch) -> Result<(), PatchFa
         // `patch_optional_string` is this crate's one reading of an op on a
         // single-valued optional string member: `add`/`replace` set it, `remove` clears
         // it, and any other op is refused as unsupported.
-        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "description" => patch_description(&mut entry.description, patch, MAX_STRING_CHARS),
         _ => Err(patch.unsupported_path()),
     }
 }

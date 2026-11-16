@@ -176,6 +176,118 @@ pub fn wire_verb(verb: &str) -> String {
     verb.to_ascii_uppercase()
 }
 
+/// The `authorizationType`s whose method is authorized BY AN `Authorizer` of its own api:
+/// "`CUSTOM` for using a custom authorizer, or `COGNITO_USER_POOLS` for using a Cognito
+/// user pool" (`Method$authorizationType`).
+///
+/// Such a method NAMES that authorizer — "specifies the identifier of an `Authorizer` to
+/// use on this `Method`, if the type is `CUSTOM` or `COGNITO_USER_POOLS`"
+/// (`Method$authorizerId`) — so one that names none is authorized by nothing and is
+/// refused rather than stored ([`validate_method`]).
+///
+/// `pub` because the operation that PATCHES a method states the same rule over the same
+/// record (`UpdateMethod`), so the set is resolved in one place.
+pub const AUTHORIZATION_BY_AUTHORIZER: &[&str] = &["CUSTOM", "COGNITO_USER_POOLS"];
+
+/// The prefix of a method request parameter mapping expression: "a key defines a method
+/// request parameter name matching the pattern of `method.request.{location}.{name}`"
+/// (`Method$requestParameters`).
+///
+/// Hand-written because the model types the map key as a bare `String` and declares no
+/// pattern for it; the form is the one that member's own documentation publishes.
+pub const METHOD_REQUEST_PARAMETER_PREFIX: &str = "method.request.";
+
+/// The `{location}`s that pattern admits: "where location is querystring, path, or header"
+/// (`Method$requestParameters`).
+pub const METHOD_REQUEST_PARAMETER_LOCATIONS: &[&str] = &["querystring", "path", "header"];
+
+/// Whether `key` is a `method.request.{location}.{name}` mapping expression naming a
+/// parameter: the documented prefix, one of the documented locations, and a non-empty
+/// parameter name.
+///
+/// The name's character set is the HTTP field-name token of RFC 9110 §5.1 (`tchar`), the
+/// same one a method RESPONSE parameter's header name is read with
+/// ([`super::put_method_response::is_field_name_char`]): it is what "a valid … parameter
+/// name" admits for a header, and a query-string or path parameter travels in a URI, where
+/// the same token is safe unencoded.
+pub fn is_method_request_parameter(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix(METHOD_REQUEST_PARAMETER_PREFIX) else {
+        return false;
+    };
+    let Some((location, name)) = rest.split_once('.') else {
+        return false;
+    };
+    METHOD_REQUEST_PARAMETER_LOCATIONS.contains(&location)
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(super::put_method_response::is_field_name_char)
+}
+
+/// The `BadRequestException` message for a `requestParameters` key that is not a
+/// `method.request.{location}.{name}` mapping expression; see
+/// [`is_method_request_parameter`].
+///
+/// API Gateway's own wording for it, as a recorded refusal reports: the sentence names the
+/// member class it could not read, and then states the service's own validation finding
+/// about the key — the envelope this service's recorded refusals carry around a finding
+/// about one submitted value (`crate::state::INVALID_MODEL_SCHEMA` is the same shape).
+/// BUILT FROM THE REQUEST: the only variable part is the key the caller has to change.
+///
+/// `pub` because `UpdateMethod` writes the same member under the same rule, so the two
+/// operations cannot disagree on how a key outside the documented form is stated.
+pub fn invalid_request_parameter(key: &str) -> String {
+    format!(
+        "Invalid mapping expression specified: Validation Result: warnings : [], errors : \
+         [Invalid mapping expression specified: {key}]"
+    )
+}
+
+/// The `BadRequestException` message for a method whose `authorizationType` is authorized
+/// by an `Authorizer` ([`AUTHORIZATION_BY_AUTHORIZER`]) and which names none: API Gateway's
+/// own sentence for it, which states the rule as well as the refusal.
+pub const MISSING_METHOD_AUTHORIZER: &str = "Invalid authorizer ID specified. Setting the \
+     authorization type to CUSTOM or COGNITO_USER_POOLS requires a valid authorizer.";
+
+/// Refuse a `Method` record that breaks one of the rules its own members publish: a
+/// `requestParameters` key that is no method request parameter mapping expression, and an
+/// `authorizerId` that names no `Authorizer` of the api the method belongs to.
+///
+/// Every rule is stated over the RECORD, so the same check serves the operation that
+/// creates a method and the one that patches it (`UpdateMethod`) — the way
+/// [`super::put_integration::validate_integration`] serves both of an integration's.
+/// `api_authorizer_ids` are the ids of the authorizers the method's own api holds, which is
+/// what an `authorizerId` has to name: an `Authorizer` lives inside one REST API
+/// ([`crate::state::RestApiEntry::authorizers`] is keyed by that id), and the set is passed
+/// in rather than the api because a patch is applied to a COPY of the record with the api's
+/// borrow already given up (as [`crate::state::unknown_model_name`] takes the model names).
+pub fn validate_method(
+    method: &MethodEntry,
+    api_authorizer_ids: &::std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    // Read in key order, so a record carrying several malformed keys is refused with the
+    // same one every time.
+    for key in method.request_parameters.keys() {
+        if !is_method_request_parameter(key) {
+            return Err(invalid_request_parameter(key));
+        }
+    }
+    // A member set to the empty string names no authorizer, so it is the same unnamed
+    // authorizer an absent member is.
+    match method.authorizer_id.as_deref().filter(|id| !id.is_empty()) {
+        // A reference that resolves to nothing authorizes nothing: the method would claim
+        // an authorization no record of the api can take, so it is refused with the
+        // sentence this service states for an authorizer identifier that names no record.
+        Some(id) if !api_authorizer_ids.contains(id) => {
+            Err(crate::state::NO_SUCH_AUTHORIZER.to_string())
+        }
+        None if AUTHORIZATION_BY_AUTHORIZER.contains(&method.authorization_type.as_str()) => {
+            Err(MISSING_METHOD_AUTHORIZER.to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Refuse a request whose caller-sized members would grow the store past a bound.
 ///
 /// Called BEFORE the store lock is taken, so an over-sized request never reaches the
@@ -334,6 +446,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // The authorizers the method's own api holds, read off the same api and in the
+        // same place, which is what the record's `authorizerId` has to name.
+        let api_authorizer_ids: ::std::collections::BTreeSet<String> = store
+            .rest_apis
+            .get(&input.rest_api_id)
+            .map(|api| api.authorizers.keys().cloned().collect())
+            .unwrap_or_default();
         // A method is put ON a resource, so the `(restApiId, resourceId)` pair is resolved
         // as ONE lookup for that resource: an identifier no stored API answers to leaves
         // the addressed resource unresolvable too, and the refusal names the resource the
@@ -356,33 +475,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        resource.methods.insert(
-            verb.clone(),
-            MethodEntry {
-                http_method: verb.clone(),
-                authorization_type: input.authorization_type,
-                authorizer_id: input.authorizer_id,
-                api_key_required: input.api_key_required,
-                operation_name: input.operation_name,
-                request_parameters: input
-                    .request_parameters
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<BTreeMap<String, bool>>(),
-                request_models: input
-                    .request_models
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<BTreeMap<String, String>>(),
-                request_validator_id: input.request_validator_id,
-                authorization_scopes: input.authorization_scopes.unwrap_or_default(),
-                // `PutMethodResponse` is the call that adds a method response and
-                // `PutIntegration` the one that attaches an integration, so a method is
-                // created with neither.
-                method_responses: BTreeMap::new(),
-                integration: None,
-            },
-        );
+        let entry = MethodEntry {
+            http_method: verb.clone(),
+            authorization_type: input.authorization_type,
+            authorizer_id: input.authorizer_id,
+            api_key_required: input.api_key_required,
+            operation_name: input.operation_name,
+            request_parameters: input
+                .request_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, bool>>(),
+            request_models: input
+                .request_models
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            request_validator_id: input.request_validator_id,
+            authorization_scopes: input.authorization_scopes.unwrap_or_default(),
+            // `PutMethodResponse` is the call that adds a method response and
+            // `PutIntegration` the one that attaches an integration, so a method is
+            // created with neither.
+            method_responses: BTreeMap::new(),
+            integration: None,
+        };
+        // The record is held to the rules its own members publish — the forms a
+        // `requestParameters` key takes, and the authorizer an authorization type needs —
+        // BEFORE it is stored, so a refused request leaves the resource's methods as they
+        // were. The same check holds a patched method ([`validate_method`]).
+        validate_method(&entry, &api_authorizer_ids).map_err(|message| {
+            PutMethodErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        resource.methods.insert(verb.clone(), entry);
 
         let stored = resource.methods.get(&verb).ok_or_else(|| {
             PutMethodErrorModeled::NotFoundException(NotFoundException {

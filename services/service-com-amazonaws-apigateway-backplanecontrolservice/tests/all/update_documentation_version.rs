@@ -202,7 +202,11 @@ async fn a_patch_of_description_stores_the_value_it_carries() {
                 "case {case}: expected 200, got {} with {:?}",
                 answer.status, answer.body
             );
-            assert_description(&answer.body, Some(&description), &case, "the update");
+            // An explicitly EMPTY description is normalized to an absent member: API
+            // Gateway reports no description for a value of no characters, so that row's
+            // expectation is absence rather than the empty string.
+            let stored = (!description.is_empty()).then_some(description.as_str());
+            assert_description(&answer.body, stored, &case, "the update");
             // The members the patch did not name are untouched: the identifier stays the
             // record's key, and the creation date is stamped once by the create rather
             // than re-stamped by an update.
@@ -227,7 +231,7 @@ async fn a_patch_of_description_stores_the_value_it_carries() {
                 answer.body
             );
             let listed = listed_version(&gateway, &api, VERSION, &case).await;
-            assert_description(&listed, Some(&description), &case, "the collection");
+            assert_description(&listed, stored, &case, "the collection");
         }
     }
 }

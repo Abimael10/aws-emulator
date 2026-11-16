@@ -189,6 +189,13 @@ pub fn accepted_compression_size(requested: i32) -> Result<i32, String> {
 /// created in the terminal `AVAILABLE` state and no later call moves it.
 pub const API_STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// The `BadRequestException` message for a `name` the request left empty.
+///
+/// API Gateway's own sentence for it, as a recorded refusal reports: entirely fixed text
+/// naming the member and quoting nothing back.
+pub const EMPTY_NAME: &str = "Name cannot be an empty string";
+
+
 /// The `path` of an API's implicit root resource.
 pub const ROOT_RESOURCE_PATH: &str = "/";
 
@@ -396,6 +403,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `name` is @required and is what the API is named by, so a value carrying no
+        // characters names nothing: it is refused with API Gateway's own sentence for an
+        // empty name ([`EMPTY_NAME`]).
+        if input.name.is_empty() {
+            return Err(CreateRestApiErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(EMPTY_NAME.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The model declares no range on `minimumCompressionSize`, so the boundary
         // validator passes any integer; the member's documented bounds are enforced
         // here, with the fixed sentence the service answers an out-of-range size with:
@@ -508,7 +527,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut entry = RestApiEntry {
             id: id.clone(),
             name: input.name,
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             version: input.version,
             created_date: Some(crate::state::now()),
             region,

@@ -648,6 +648,23 @@ pub fn patch_optional_string(
     Ok(())
 }
 
+/// Apply `patch` to a record's `description`: [`patch_optional_string`], with the value it
+/// sets NORMALIZED the way this service stores a description
+/// ([`crate::state::stored_description`]).
+///
+/// A patch that replaces a description with the empty string leaves the record with none,
+/// exactly as a create that sets one does — the rule belongs to the MEMBER, so one helper
+/// serves every operation that patches a `description`.
+pub fn patch_description(
+    current: &mut Option<String>,
+    patch: &Patch,
+    max_chars: usize,
+) -> Result<(), PatchFailure> {
+    patch_optional_string(current, patch, max_chars)?;
+    *current = crate::state::stored_description(current.take());
+    Ok(())
+}
+
 /// Apply `patch` to a single-valued REQUIRED string member: as
 /// [`patch_optional_string`], except that `remove` is refused — the member always has a
 /// value — and an empty value is refused for the same reason.

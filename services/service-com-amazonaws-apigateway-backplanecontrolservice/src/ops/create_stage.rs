@@ -425,7 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let entry = StageEntry {
             stage_name: input.stage_name.clone(),
             deployment_id: input.deployment_id,
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             cache_cluster_enabled: input.cache_cluster_enabled,
             cache_cluster_size: input.cache_cluster_size,
             // A cache cluster the caller asked for is still coming up when this answer

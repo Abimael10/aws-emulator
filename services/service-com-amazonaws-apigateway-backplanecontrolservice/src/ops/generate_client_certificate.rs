@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .ok_or_else(crate::state::client_certificate_not_issued)?;
         let entry = ClientCertificateEntry {
             id: id.clone(),
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             pem_encoded_certificate: Some(pem_encoded_certificate),
             created_date: Some(created_date),
             // "The timestamp when the client certificate will expire": the creation instant

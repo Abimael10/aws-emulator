@@ -472,7 +472,9 @@ fn apply_patch(
         "name" => patch_required_string(&mut entry.name, patch, MAX_STRING_CHARS),
         // The description is optional, so a `remove` clears it back to the state a plan
         // created without one is in.
-        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        "description" => {
+            crate::state::patch_description(&mut entry.description, patch, MAX_STRING_CHARS)
+        }
         // The Marketplace product code is a member of the `UsagePlan` shape that no create
         // input carries, so an update is what associates one and what clears it again.
         "productCode" => patch_optional_string(&mut entry.product_code, patch, MAX_STRING_CHARS),

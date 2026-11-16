@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version.clone(),
             DocumentationVersionEntry {
                 version: version.clone(),
-                description: input.description.clone(),
+                description: crate::state::stored_description(input.description.clone()),
                 created_date: Some(created_date),
                 documentation_parts: snapshot,
                 sequence,

@@ -289,6 +289,29 @@ pub fn integration_method_key(http_method: &str) -> String {
 /// `connectionType` documents "The default value is INTERNET".
 pub const DEFAULT_CONNECTION_TYPE: &str = "INTERNET";
 
+/// The `credentials` value that asks for the CALLER's own identity to be passed through
+/// rather than for a role to be assumed: `Integration$credentials` documents it as "to
+/// require that the caller's identity be passed through from the request, specify the
+/// string `arn:aws:iam::\*:user/\*`". It names no role, so there is no role to resolve.
+///
+/// `pub` and HOME of the value: the data plane reads the same member to decide whether to
+/// assume a role or to act for the caller
+/// (`crate::service::invoke::aws_integration`, `…::lambda_proxy`), so the operation that
+/// stores it and the plane that performs it cannot disagree about which value means that.
+pub const CALLER_CREDENTIALS: &str = "arn:aws:iam::*:user/*";
+
+/// The refusal for a `credentials` value that names neither an IAM role nor the caller's
+/// own identity; see [`validate_integration`].
+///
+/// A `credentials` value IS an ARN — "to specify an IAM Role for API Gateway to assume,
+/// use the role's Amazon Resource Name (ARN)" (`Integration$credentials`) — so a value
+/// that is not one earns the sentence this service states for a malformed ARN in a
+/// request, as a recorded refusal of this member reports
+/// ([`crate::state::INVALID_ARN`]): entirely fixed text, quoting back neither the value
+/// nor the member it arrived in. Shared with `UpdateIntegration`, which patches the same
+/// member, so one rule has one message.
+pub const INVALID_CREDENTIALS: &str = crate::state::INVALID_ARN;
+
 /// The `connectionType` of a private integration, the only one that takes a
 /// `connectionId`: `connectionId` documents "Specify this value only if you specify
 /// VPC_LINK as the connection type".
@@ -616,6 +639,27 @@ pub fn validate_integration(
     }
 
     accepted_timeout(integration.timeout_in_millis)?;
+
+    // `credentials`: "To specify an IAM Role for API Gateway to assume, use the role's
+    // Amazon Resource Name (ARN). To require that the caller's identity be passed through
+    // from the request, specify the string arn:aws:iam::*:user/*. To use resource-based
+    // permissions on supported Amazon Web Services services, specify null"
+    // (`Integration$credentials`) — so a value that is none of those three names no
+    // credentials at all: the call could never be made under it, which is refused here
+    // rather than at every invocation.
+    //
+    // A value carrying a STAGE VARIABLE reference is exempt: what it resolves to is the
+    // stage's own value, which no control-plane call can know
+    // ([`crate::service::invoke::carries_stage_variable_reference`]), and a stage that
+    // defines no value for the name is answered when the method is invoked.
+    if let Some(credentials) = integration.credentials.as_deref() {
+        if credentials != CALLER_CREDENTIALS
+            && !::service_common::arn::IAM_ROLE.admits(credentials)
+            && !crate::service::invoke::carries_stage_variable_reference(credentials)
+        {
+            return Err(INVALID_CREDENTIALS.to_string());
+        }
+    }
 
     // `cacheKeyParameters`: "To be valid values for cacheKeyParameters, these parameters
     // must also be specified for Method requestParameters."

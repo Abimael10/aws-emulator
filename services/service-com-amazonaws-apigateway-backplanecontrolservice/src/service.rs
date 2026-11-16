@@ -129,6 +129,7 @@ use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
     OperationRoutingTable, Refusal, Refused, Service, Violation,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Whether this service serves the request these `parts` came from.
@@ -497,25 +498,36 @@ impl<O, Eng> StatedPerOperation<O, Eng> {
 fn violations_of<O: Operation>(
     protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
     req: &RtRequest,
-) -> Vec<Violation> {
+) -> (Vec<Violation>, HashMap<String, String>) {
     let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     };
     let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
     drop(deserializer);
     match read {
-        Ok(input) => aws_smithy_schema_server::constraints::validate(&input, O::INPUT_SCHEMA),
+        Ok(input) => (
+            aws_smithy_schema_server::constraints::validate(&input, O::INPUT_SCHEMA),
+            // The LISTS the request carried, keyed by the member path the walk reports a
+            // list at: a clause stated at a COLLECTION member quotes the value that member
+            // held, which no violation carries and only the request can answer. Collected
+            // by the one walk in this tree that collects it
+            // (`service_common::validation::submitted_lists`), under bounds of its own.
+            ::service_common::validation::submitted_lists(&input, O::INPUT_SCHEMA),
+        ),
         // `member_name` is already a violation path in the spelling the constraint walk
         // uses (`aws_smithy_schema_server::missing_member` applies `path::member`, and
         // each enclosing member prepends its own segment), so it places the same way a
         // walked violation does.
-        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
-            path: member_name,
-            kind: ViolationKind::MissingRequiredMember,
-            value: None,
-            sensitive: false,
-        }],
-        Err(_) => Vec::new(),
+        Err(SerdeError::MissingMember { member_name }) => (
+            vec![Violation {
+                path: member_name,
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+                sensitive: false,
+            }],
+            HashMap::new(),
+        ),
+        Err(_) => (Vec::new(), HashMap::new()),
     }
 }
 
@@ -562,8 +574,10 @@ where
             if let Some(message) = query_coercion::refusal_for(O::INPUT_SCHEMA, req) {
                 return query_coercion::serialization_exception(&message);
             }
-            let refused = violations_of::<O>(svc.definition().protocol(), req);
-            if let Some(stated) = validation::refusal(O::NAME, O::INPUT_SCHEMA, &refused) {
+            let (refused, carried_lists) = violations_of::<O>(svc.definition().protocol(), req);
+            if let Some(stated) =
+                validation::refusal(O::NAME, O::INPUT_SCHEMA, &refused, &carried_lists)
+            {
                 return svc
                     .definition()
                     .refusal_response(ProtocolError::Invalid(refused), Some(stated), req);

@@ -397,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             value,
             name: input.name,
-            description: input.description,
+            description: crate::state::stored_description(input.description),
             customer_id: input.customer_id,
             enabled: input.enabled,
             created_date: Some(now),

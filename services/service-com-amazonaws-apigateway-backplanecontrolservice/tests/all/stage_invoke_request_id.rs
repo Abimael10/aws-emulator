@@ -203,14 +203,16 @@ async fn deployed_api(gateway: &Gateway, name: &str) -> String {
     // credentialed seam rather than the anonymous one.
     let signed = child(gateway, &api, &root, "signed").await;
     mock_method(gateway, &api, &signed, "GET", "AWS_IAM", r#"{"at":"signed"}"#).await;
-    // An authorizer-backed method naming no authorizer of this api: a configuration the
-    // stage cannot authorize, which is the server-side fault class.
+    // A method whose authorization type no authorizer of this api can serve: a
+    // configuration the stage cannot authorize, which is the server-side fault class. (A
+    // `CUSTOM` method naming no authorizer cannot be put at all — `PutMethod` requires one
+    // the api holds — so the type is one no `Method$authorizationType` value names.)
     let broken = child(gateway, &api, &root, "broken").await;
     accepted(
         gateway,
         "PUT",
         &format!("/restapis/{api}/resources/{broken}/methods/GET"),
-        json!({ "authorizationType": "CUSTOM" }),
+        json!({ "authorizationType": "SOMETHING_ELSE" }),
     )
     .await;
     deploy(gateway, &api, "prod").await;
@@ -293,7 +295,7 @@ async fn every_response_a_deployed_stage_serves_names_the_request_it_answered() 
             status: 403,
         },
         Case {
-            case: "a method whose authorizer this api does not hold",
+            case: "a method whose authorization type no authorizer can serve",
             host: invoke_host(&api),
             verb: "GET",
             path: "/prod/broken".to_string(),

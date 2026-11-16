@@ -36,10 +36,16 @@
 //!
 //! Status (400) is the framework's own choice for a constraint failure and is left
 //! alone; the error code and the constructed sentence are this service's.
+//!
+//! 4. **A constraint one of a LIST's ELEMENTS breaks is stated at the LIST member**, with
+//!    the list the request carried quoted and the element shape's requirement nested — see
+//!    [`stated_over_elements`], which delegates that rendering to the shared crate.
+
+use std::collections::{BTreeMap, HashMap};
 
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{path, ViolationKind};
-use smithy_server_runtime::{Refused, Violation};
+use smithy_server_runtime::{Refusal, Refused, Violation};
 
 /// The error code a value outside a member's modelled constraint is refused under.
 ///
@@ -97,10 +103,16 @@ const SELF_VALIDATED_MEMBERS: [(&str, &str, &str); 1] = [(
 /// request, and is recorded as such: a value set is rendered in the service's declared
 /// order, which for every other enum of this service is the order the public model
 /// preserves.
-const DECLARED_VALUE_SETS: [&[&str]; 3] = [
+const DECLARED_VALUE_SETS: [&[&str]; 4] = [
     &["add", "remove", "move", "test", "replace", "copy"],
     &["overwrite", "merge"],
     &["HTTP", "MOCK", "AWS_PROXY", "HTTP_PROXY", "AWS"],
+    // `EndpointConfiguration$types`' element shape, `com.amazonaws.apigateway#EndpointType`,
+    // which the public model declares `[REGIONAL, EDGE, PRIVATE]`
+    // (`smithy_query(query="shape", shape="com.amazonaws.apigateway#EndpointType")`); the
+    // recorded refusals of an out-of-enum `types` element on `CreateRestApi` list it as
+    // below.
+    &["PRIVATE", "EDGE", "REGIONAL"],
 ];
 
 /// This service's wording for the violations the framework found on `operation`'s
@@ -109,10 +121,16 @@ const DECLARED_VALUE_SETS: [&[&str]; 3] = [
 /// `input_schema` is the operation's own input schema, which is what says how each
 /// violated member TRAVELS — the one request-shaped fact a clause of this service depends
 /// on (see [`binds_to_query`]).
+///
+/// `carried_lists` are the lists the request itself carried, keyed by the member path the
+/// walk reports a list at (`service_common::validation::submitted_lists`): a clause stated
+/// at a COLLECTION member quotes the value that member held, which no violation carries —
+/// see [`stated_over_elements`].
 pub(super) fn refusal(
     operation: &str,
     input_schema: &'static Schema,
     violations: &[Violation],
+    carried_lists: &HashMap<String, String>,
 ) -> Option<Refused> {
     // A member the OPERATION checks itself is its own semantic refusal, and that refusal
     // is one sentence of the operation's own: the constraint envelope reports which
@@ -131,12 +149,86 @@ pub(super) fn refusal(
     // The envelope — `1 validation error detected: <clause>` / `N validation errors
     // detected: <clause>; <clause>` — and each clause's own frame are the framework's,
     // reached through the same `Violation` the walk produced, so a new constraint class
-    // cannot arrive here with wording of its own.
-    let message = aws_smithy_schema_server::envelope(&stated)?;
+    // cannot arrive here with wording of its own. The one clause this service states
+    // itself is the one a COLLECTION's elements earn ([`stated_over_elements`]), which the
+    // framework reports per element and AWS states at the member.
+    let message = stated_over_elements(&stated, &root, carried_lists)?;
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
         message,
     })
+}
+
+/// The message stating `violations`, with a constraint broken by the ELEMENTS of a list
+/// stated AT THE LIST MEMBER.
+///
+/// The framework checks a list's element shape on each element and reports the violation at
+/// that element (`<list>.<position>.member`, carrying the one constraint that failed), where
+/// AWS reports it at the list member itself: no position and no `member` step, the value
+/// half quoting the WHOLE list the request carried, and the requirement nested inside
+/// `Member must satisfy constraint: [ … ]`. Two offending elements of one list are ONE
+/// validation error about one member, which is what the grouping makes of them.
+///
+/// Every other clause, the nesting sentence, the envelope and the dedupe are the shared
+/// crate's (`service_common::validation_message`), which is where AWS's rendering of a
+/// collection's clause lives; what this service decides is the REQUIREMENT the nested set
+/// states — read off the violations, because this service's own constrained element shapes
+/// are enums, whose whole declared set IS the constraint a value breaks — and the list the
+/// clause quotes, looked up by the member path the clause is stated at.
+fn stated_over_elements(
+    violations: &[Violation],
+    root: &str,
+    carried_lists: &HashMap<String, String>,
+) -> Option<String> {
+    // The requirement each offending collection's clause nests, keyed by the collection's
+    // own (rooted) member path: every requirement its elements broke, in the order the
+    // violations were reported, stated once each.
+    let mut sets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for violation in violations {
+        let Some(collection) = ::service_common::validation::list_of_element(&violation.path)
+        else {
+            continue;
+        };
+        let requirement =
+            ::service_common::validation_message::requirement(violation.kind.clone());
+        let stated = sets.entry(collection.to_string()).or_default();
+        if !stated.contains(&requirement) {
+            stated.push(requirement);
+        }
+    }
+    let refused = ::service_common::validation_message::aws_validation_refusal_over_elements_stating(
+        &Refusal::Invalid(violations.to_vec()),
+        // The `@pattern` is already rendered the way this service renders one
+        // ([`as_rendered`]), so the expression is passed through unchanged.
+        str::to_string,
+        |collection| quoted_list(collection, root, carried_lists),
+        |collection| {
+            sets.get(collection).map(|requirements| {
+                ::service_common::validation_message::element_set_requirement(requirements)
+            })
+        },
+    )?;
+    Some(refused.message)
+}
+
+/// The list the clause at the collection member `collection` quotes, as AWS renders a
+/// list-valued member, or `None` when the request's own value for it is not available.
+///
+/// `collection` is the path as the CLAUSE states it — rooted at the operation's input shape
+/// ([`input_root`]) — while the request's lists are keyed by the path the framework's walk
+/// reports, so the root is taken off again before the lookup. A member bound to the query
+/// string carries no root at all ([`binds_to_query`]), so the path is tried as it stands
+/// too.
+fn quoted_list(
+    collection: &str,
+    root: &str,
+    carried_lists: &HashMap<String, String>,
+) -> Option<String> {
+    collection
+        .strip_prefix(&format!("{root}."))
+        .and_then(|path| carried_lists.get(path))
+        .or_else(|| carried_lists.get(collection))
+        .cloned()
 }
 
 /// The sentence `operation` words this refusal with itself, or `None` when the refusal
@@ -338,7 +430,14 @@ mod tests {
     /// The refusal `operation` states for `violations`, through that operation's own
     /// input schema.
     fn stated_refusal(operation: &str, violations: &[Violation]) -> Option<Refused> {
-        refusal(operation, schema_of(operation), violations)
+        refusal(
+            operation,
+            schema_of(operation),
+            violations,
+            // No list of the request is offered, so a clause stated at a collection member
+            // states no value — which is what a case here asserts.
+            &HashMap::new(),
+        )
     }
 
     /// A path is rooted at the operation's own input shape, for every operation name
@@ -710,10 +809,13 @@ mod tests {
                 "createRestApiInput.name",
             ),
             (
+                // A nested body member that is NOT a collection ELEMENT: an element's own
+                // clause is stated at the collection member instead, which
+                // `tests/all/validation_message_rules.rs` pins on the wire.
                 "a nested body member",
                 "CreateRestApi",
-                "endpointConfiguration.types.0.member",
-                "createRestApiInput.endpointConfiguration.types.0.member",
+                "endpointConfiguration.ipAddressType",
+                "createRestApiInput.endpointConfiguration.ipAddressType",
             ),
             (
                 "a member no schema of the operation declares",
