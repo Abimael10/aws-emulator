@@ -41,7 +41,7 @@ const NOT_IMPLEMENTED_STATUS: u16 = 501;
 /// The three members an error body of this service carries: the error code the
 /// restJson1 envelope discriminates on, the refusal's text, and the id naming
 /// the response.
-const ERROR_BODY_MEMBERS: [&str; 3] = ["__type", "message", "requestId"];
+pub(crate) const ERROR_BODY_MEMBERS: [&str; 3] = ["__type", "message", "requestId"];
 
 /// `PercentEnabled`'s documented maximum ("Valid values: 0 - 100"), the limit
 /// the configure-logs refusal names.

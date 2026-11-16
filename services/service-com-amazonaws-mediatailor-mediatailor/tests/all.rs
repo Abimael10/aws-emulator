@@ -23,6 +23,8 @@ mod channel_response_projection;
 mod channel_schedule;
 #[path = "all/channel_start_stop.rs"]
 mod channel_start_stop;
+#[path = "all/configure_logs_for_channel_miss.rs"]
+mod configure_logs_for_channel_miss;
 #[path = "all/configure_logs_scope.rs"]
 mod configure_logs_scope;
 #[path = "all/create_channel_name_collision.rs"]
