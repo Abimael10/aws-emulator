@@ -51,7 +51,11 @@ const POLLS: usize = 9_600;
 /// One AWS AppSync READ over the `restJson1` wire its model declares, on the URI that
 /// operation's own `@http` binding names, signed for `appsync` — that model's own `sigv4Name` —
 /// in the Region the stack's resources live in.
-async fn appsync(router: &MultiServiceRouter, uri: &str) -> (u16, Value) {
+///
+/// `pub(crate)` so the suite over a resource named after an identifier another service minted
+/// (`declared_name_from_a_minted_identifier.rs`) reads an API back through this one caller
+/// rather than a second copy of it.
+pub(crate) async fn appsync(router: &MultiServiceRouter, uri: &str) -> (u16, Value) {
     let request = http::Request::builder()
         .method("GET")
         .uri(format!("https://appsync.{REGION}.amazonaws.com{uri}"))

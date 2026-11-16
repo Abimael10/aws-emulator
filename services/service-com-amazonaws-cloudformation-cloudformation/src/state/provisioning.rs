@@ -140,7 +140,12 @@
 //! endpoint's create has answered, a property of a resource this walk has not reached yet
 //! whose value IS that stand-in is re-pointed at the minted identifier
 //! ([`repoint_references`]): the create carries the identifier the owning service knows its
-//! dependency by. A LATER deployment resolves its declarations against the identifiers the
+//! dependency by. A declaration that composes such an identifier INTO ITS OWN NAME — a log
+//! group named `/aws/<service>/<kind>/<the api id of an api in the same template>` — is the
+//! same case one level in: the identity the naming rules took from that name carries the
+//! stand-in too, so it is re-pointed with the declaration ([`repoint_identity`]) and the
+//! resource is created under the name every reader of that dependency builds. A LATER
+//! deployment resolves its declarations against the identifiers the
 //! stack already has ([`super::StoredStack::deploy_template`]), which is what makes a
 //! re-deploy of the same template read as unchanged.
 //!
@@ -337,6 +342,11 @@ mod model_validation;
 /// resource-signal wait of a resource whose signals come from the instances it consists of
 /// ([`instance_signals`]).
 mod instance_signals;
+/// Re-pointing a deployment's stand-ins at the identifiers the owning services MINTED: what
+/// brings a declaration, and the identity of the resource it names, into step with what each
+/// create really answered ([`repointing`]).
+mod repointing;
+use repointing::*;
 
 /// AWS's reserved tag-key namespace: "the `aws:` prefix is reserved for AWS use". Matched
 /// case-insensitively, as the services that refuse it match it.
@@ -2036,6 +2046,16 @@ pub async fn reconcile(
         // are re-pointed, since both name that dependency.
         repoint_references(&mut resource.properties, &minted);
         repoint_references(&mut deployed_properties, &minted);
+        // ...and so is the resource's OWN IDENTITY, for a type whose physical id is the NAME
+        // its declaration states. A name the template COMPOSES out of a dependency's
+        // identifier (`/aws/<service>/<kind>/${Api.ApiId}`) was computed before that
+        // dependency's create had minted the identifier, so the name the naming rules
+        // produced carries the stand-in. The resource has to be created — and reported — under
+        // the name its declaration resolves to NOW: that is the name every other reader of
+        // the same dependency builds, so a group created under the stand-in is one a child
+        // resolved later (a resource withheld behind a dependency still coming up, an output,
+        // a client's own call) addresses in vain.
+        repoint_identity(&mut resource, &minted);
         // A resource the walk could not carry out holds back every resource that DEPENDS on
         // it: what such a declaration reads is the resource that failed, so there is nothing
         // its owning service could be asked for, and CloudFormation records no transition for
@@ -2838,9 +2858,16 @@ pub async fn reconcile(
                         minted.push(Minted {
                             stand_in: stand_in.clone(),
                             assigned: assigned.clone(),
-                            // An attribute is an ARN, an endpoint or a url — a value a
-                            // property carries WHOLE.
-                            composed: false,
+                            // An attribute's stand-in is matched inside a longer value for
+                            // the same reason a computed identifier's is: a value this
+                            // resource's own declaration does not state is one CloudFormation
+                            // DERIVED, so another declaration carries it because a reference
+                            // to this resource put it there — the api id a log-group name is
+                            // built around, the ARN or the endpoint an `Fn::Sub` wraps in a
+                            // longer string. A value the declaration itself states (a port it
+                            // asked for) is a value of its own wherever it appears, so that
+                            // one is matched whole only, exactly as a declared NAME is.
+                            composed: !states_value(&resource.properties, stand_in, 0),
                         });
                     }
                 }
@@ -3107,165 +3134,6 @@ pub async fn reconcile(
     // ([`super::stabilising`]).
     outcome.stabilising.extend(deleted.removing);
     outcome
-}
-
-/// How deep [`repoint_references`] walks a property document.
-///
-/// The document's nesting is the REQUESTER's, and a recursive walk bounded by its input
-/// exhausts the native stack — which aborts the process rather than failing one stack. Past
-/// this depth the values are left exactly as they are: a reference to another resource is a
-/// property of it, never a hundred levels inside one.
-const MAX_REPOINTED_NESTING: usize = 64;
-
-/// Re-point every reference inside one property document from the stand-in identifier a
-/// resource was given before its create to the identifier its owning service MINTED.
-///
-/// The rule: a reference to a resource resolves to the identifier that resource really has,
-/// and for a type whose identity its owning service assigns
-/// ([`super::template::identity_is_service_assigned`]) that identifier only exists once the
-/// create has answered. A declaration is resolved before any of them have, so a property
-/// naming such a resource (`ResolverRuleId: !Ref Rule`) holds the stand-in the naming rules
-/// computed; `minted` pairs each stand-in with what its service answered, and a property
-/// whose value IS one of those stand-ins becomes the minted identifier.
-///
-/// The same holds for an ATTRIBUTE the owning service reports differently from the computed
-/// one (`KmsMasterKeyId: !GetAtt [Key, Arn]`, where the ARN carries the key id KMS minted):
-/// [`reconcile`] pairs those too, so a property reaches its own service as the value the
-/// resource it names really publishes.
-///
-/// Matched WHOLE value — or, where the stand-in is an identifier CloudFormation computed
-/// rather than a name the declaration asked for ([`Minted::composed`]), as one whole TOKEN
-/// of a longer value ([`retokenised`]), which is how a template composes an identifier into
-/// one of its own strings (`integrations/<IntegrationId>`, or the ARN an `Fn::Sub` builds
-/// around a `Ref`). Never as any shorter run of characters: a stand-in is often the NAME the
-/// declaration asked for, so a longer value that merely contains one (an association named
-/// `<rule name>-assoc`) is a value of its own and is left exactly as written.
-///
-/// Called by [`reconcile`] for the identifiers minted in the walk it is driving. A resource
-/// is never re-pointed with its OWN pair — it cannot reference itself, and for a type whose
-/// stand-in is the name it declares that pair would rewrite that very property. The
-/// identifiers a stack ALREADY has are not substituted at all:
-/// [`super::StoredStack::deploy_template`] resolves the declarations against them instead.
-fn repoint_references(properties: &mut Value, minted: &[Minted]) {
-    repoint(properties, minted, 0);
-}
-
-/// One identifier an owning service MINTED in a deployment walk, against the stand-in the
-/// naming rules had computed for the same resource ([`repoint_references`]).
-#[derive(Debug, Clone)]
-struct Minted {
-    /// What a reference to the resource was resolved to before its create.
-    stand_in: String,
-    /// What that reference has to carry now.
-    assigned: String,
-    /// Whether the stand-in may also be matched INSIDE a longer value, as one whole token
-    /// of it ([`retokenised`]).
-    ///
-    /// True only where the stand-in is an identifier CloudFormation COMPUTED rather than
-    /// the name the declaration asked for: such a value is not one a template composed out
-    /// of its own strings, so a longer value carrying it carries it because a reference to
-    /// this resource put it there. That is how an API Gateway v2 route names the
-    /// integration it is wired to — `Target: !Join ['/', ['integrations', !Ref
-    /// Integration]]`, which is the `integrations/<IntegrationId>` form that service
-    /// accepts — and how a template builds the ARN of a resource it declares, with the
-    /// reference inside a longer string (`!Sub 'arn:aws:execute-api:${AWS::Region}:\
-    /// ${AWS::AccountId}:${Api}/*/*'`). Without this, such a route would be created
-    /// pointing at an integration id nothing minted, and such a grant made for an api id
-    /// nothing minted.
-    composed: bool,
-}
-
-/// [`repoint_references`] over one value, `depth` levels into the document.
-fn repoint(properties: &mut Value, minted: &[Minted], depth: usize) {
-    if minted.is_empty() || depth >= MAX_REPOINTED_NESTING {
-        return;
-    }
-    match properties {
-        Value::String(text) => {
-            if let Some(minted) = minted
-                .iter()
-                .find(|minted| minted.stand_in.as_str() == text.as_str())
-            {
-                *text = minted.assigned.clone();
-                return;
-            }
-            for minted in minted.iter().filter(|minted| minted.composed) {
-                if let Some(repointed) = retokenised(text, &minted.stand_in, &minted.assigned) {
-                    *text = repointed;
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                repoint(item, minted, depth + 1);
-            }
-        }
-        Value::Object(members) => {
-            for value in members.values_mut() {
-                repoint(value, minted, depth + 1);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Whether `character` can be part of one IDENTIFIER: an ASCII letter or digit, a hyphen or
-/// an underscore, which is what the identifiers AWS services assign are made of.
-///
-/// It is the boundary [`retokenised`] matches a stand-in at: a stand-in whose neighbour in a
-/// longer value is one of these is part of a longer token of that value, so it is not a
-/// reference to the resource and is left exactly as written.
-fn is_identifier_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '-' || character == '_'
-}
-
-/// `text` with every WHOLE-TOKEN occurrence of `stand_in` replaced by `assigned`, or `None`
-/// for a text that carries none.
-///
-/// This is how a reference COMPOSED INTO a longer string reaches the identifier its resource
-/// really has: a template builds the ARN of a resource it declares out of its own text and
-/// that reference (`!Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*'`),
-/// so the identifier sits inside a longer value delimited by whatever the template wrote
-/// around it — a colon, a slash, a quote, a space — rather than being the whole value or one
-/// whole slash-separated segment of it.
-///
-/// A token is bounded by any character an identifier cannot carry
-/// ([`is_identifier_character`]), so a stand-in that merely begins or ends a longer
-/// identifier is left alone. Only a stand-in CloudFormation itself computed is matched this
-/// way ([`Minted::composed`]): a value a declaration asked for is a value of its own
-/// wherever it appears.
-fn retokenised(text: &str, stand_in: &str, assigned: &str) -> Option<String> {
-    if stand_in.is_empty() {
-        return None;
-    }
-    let mut repointed = String::new();
-    let mut cursor = 0;
-    let mut replaced = false;
-    while let Some(offset) = text[cursor..].find(stand_in) {
-        let at = cursor + offset;
-        let end = at + stand_in.len();
-        let bounded = text[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|character| !is_identifier_character(character))
-            && text[end..]
-                .chars()
-                .next()
-                .is_none_or(|character| !is_identifier_character(character));
-        repointed.push_str(&text[cursor..at]);
-        if bounded {
-            repointed.push_str(assigned);
-            replaced = true;
-        } else {
-            repointed.push_str(stand_in);
-        }
-        cursor = end;
-    }
-    if !replaced {
-        return None;
-    }
-    repointed.push_str(&text[cursor..]);
-    Some(repointed)
 }
 
 /// Record the identity an owning service ASSIGNED to a resource it created: the id its

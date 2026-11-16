@@ -143,6 +143,8 @@ mod customerprofiles_domain_resource_type;
 mod declared_alarm_is_readable_in_cloudwatch;
 #[path = "all/declared_function_logs_on_first_invoke.rs"]
 mod declared_function_logs_on_first_invoke;
+#[path = "all/declared_name_from_a_minted_identifier.rs"]
+mod declared_name_from_a_minted_identifier;
 #[path = "all/declared_notification_runs_its_function.rs"]
 mod declared_notification_runs_its_function;
 #[path = "all/declared_topic_policy_decides_the_alarm_action.rs"]
