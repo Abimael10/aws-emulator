@@ -170,5 +170,7 @@ mod delete_origin_endpoint_cascade;
 mod segment_service_applied_blocks;
 #[path = "all/harvest_export.rs"]
 mod harvest_export;
+#[path = "all/announced_addresses_per_operation.rs"]
+mod announced_addresses_per_operation;
 #[path = "all/cancel_harvest_job_idempotence.rs"]
 mod cancel_harvest_job_idempotence;

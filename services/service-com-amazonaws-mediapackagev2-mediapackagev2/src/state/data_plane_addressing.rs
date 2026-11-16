@@ -69,17 +69,12 @@ pub fn announced_data_plane_domain(
 /// whose host names a service, which is a client that resolves AWS's own hosts.
 ///
 /// The tree's one reading of that question
-/// (`service_common::data_plane_addressing::reached_emulator_endpoint`), so this service
-/// writes no second rule for which host is the emulator's own; it reads the host off the
-/// header or off an absolute-form URI, as both carry it.
+/// (`service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`), so this
+/// service writes no second rule for which host is the emulator's own, nor a second
+/// extraction of the two places a request carries its host — the `Host` header and an
+/// absolute-form URI, as both carry it.
 fn reached_emulator_endpoint(parts: &::http::request::Parts) -> Option<String> {
-    ::service_common::data_plane_addressing::reached_emulator_endpoint(
-        &parts.uri.to_string(),
-        parts
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|value| value.to_str().ok()),
-    )
+    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts)
 }
 
 /// The `host[:port]` this emulator is SERVED at, or `None` for one served on no port at
