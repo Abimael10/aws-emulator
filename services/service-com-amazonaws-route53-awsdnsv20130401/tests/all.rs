@@ -136,6 +136,11 @@ mod hosted_zone_records;
 mod hosted_zones_by_name;
 #[path = "all/hosted_zones_by_vpc.rs"]
 mod hosted_zones_by_vpc;
+// Declared beside the zones-by-VPC suite: this one is the TEXT that listing
+// refuses an unusable pagination token with, which its own tables assert only
+// the error code of.
+#[path = "all/invalid_next_token_text.rs"]
+mod invalid_next_token_text;
 // Declared beside the key-signing key suite: this one is what a SERVED
 // deactivation leaves behind — the one key's status it moves, and everything
 // about the zone's DNSSEC state it must not touch.

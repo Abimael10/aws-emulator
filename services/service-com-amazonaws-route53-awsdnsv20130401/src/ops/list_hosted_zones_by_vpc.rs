@@ -100,7 +100,7 @@
 use super::types::*;
 
 use crate::state::account_vpcs::{account_holds_vpc, vpc_not_owned_message};
-use crate::state::{invalid_pagination_token, served_page_size, DEFAULT_PAGE_SIZE};
+use crate::state::{invalid_next_token, served_page_size, DEFAULT_PAGE_SIZE};
 
 /// The most hosted zones one page carries.
 ///
@@ -229,13 +229,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let vpc_region = input.vpc_region.trim();
 
         // The token this operation mints is the hosted-zone id the next page
-        // starts at; one it never minted identifies no page at all.
+        // starts at; one it never minted identifies no page at all. The refusal
+        // is this listing's own FIXED sentence: it carries nothing from the
+        // request, so the token that was refused is not reflected back into the
+        // error body.
         let resume_at = match input.next_token.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(token) if token_is_well_formed(token) => Some(token.to_string()),
-            Some(token) => {
+            Some(_) => {
                 return Err(ListHostedZonesByVPCErrorModeled::InvalidPaginationToken(
-                    invalid_pagination_token(token),
+                    invalid_next_token(),
                 )
                 .into());
             }

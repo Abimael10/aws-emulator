@@ -3571,16 +3571,40 @@ pub fn conflicting_domain_exists(
 }
 
 /// The modelled `InvalidPaginationToken` (HTTP 400) for a `NextToken` that
-/// identifies no page of results.
+/// identifies no page of a listing that words this refusal from the request.
 ///
-/// The ONE place this service words that refusal, so every paginated operation
-/// answers a token it did not mint identically. REQUEST-DERIVED from the token
-/// ALONE: the sentence names the token that arrived and makes no claim about
-/// what a token stands for, because what a token encodes is the service's own
-/// business and a caller can only act on which token it sent.
+/// REQUEST-DERIVED from the token ALONE: the sentence names the token that
+/// arrived and makes no claim about what a token stands for, because what a
+/// token encodes is the service's own business and a caller can only act on
+/// which token it sent.
+///
+/// The listing of a zone's association authorizations is recorded answering in
+/// exactly this form, and the listing of query logging configurations — the
+/// other zone-filtered listing of the same control plane — answers with it too.
+/// The listing of the zones a VPC is associated with words the SAME modelled
+/// error differently, as [`INVALID_NEXT_TOKEN_MESSAGE`]: a refusal's text
+/// belongs to the operation that answers it, not to the error shape the model
+/// reuses across operations, so neither helper may be substituted for the other.
 pub fn invalid_pagination_token(token: &str) -> InvalidPaginationToken {
     InvalidPaginationToken {
         message: Some(format!("Invalid pagination token: {token}")),
+    }
+}
+
+/// The message `ListHostedZonesByVPC` words `InvalidPaginationToken` with.
+///
+/// FIXED TEXT for the class: the whole sentence is a constant with no variable
+/// part whatsoever — it names neither the token that arrived, nor the member it
+/// arrived in, nor the VPC the request asked about — so a token a caller made up
+/// is never reflected back into the error body.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The nextToken provided is invalid.";
+
+/// The modelled `InvalidPaginationToken` (HTTP 400) worded as
+/// [`INVALID_NEXT_TOKEN_MESSAGE`]: request-INDEPENDENT, so every refused token
+/// earns byte-for-byte the same body.
+pub fn invalid_next_token() -> InvalidPaginationToken {
+    InvalidPaginationToken {
+        message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
     }
 }
 

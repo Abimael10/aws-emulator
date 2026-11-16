@@ -17,10 +17,12 @@
 //!   id and region from the request and the ID of the zone ALREADY associated
 //!   with that VPC under the same name — the actionable half, which the caller
 //!   cannot know without another read;
-//! * a `NextToken` that identifies no page is `InvalidPaginationToken` (HTTP
-//!   400) whose message names the token that arrived and nothing else, from
-//!   EVERY paginated operation that refuses one, because what a token encodes
-//!   is the service's own business;
+//! * a `NextToken` that identifies no page of a zone's authorization ledger is
+//!   `InvalidPaginationToken` (HTTP 400) whose message names the token that
+//!   arrived and nothing else, because what a token encodes is the service's
+//!   own business (the zones-by-VPC listing words that same modelled error as a
+//!   FIXED sentence of its own, which the suite `invalid_next_token_text`
+//!   asserts);
 //! * a traffic policy document the published format does not define is
 //!   `InvalidTrafficPolicyDocument` (HTTP 400) whose message enumerates EVERY
 //!   constraint the document violates, one clause per violated constraint,
@@ -38,7 +40,6 @@
 use service_com_amazonaws_route53_awsdnsv20130401::state::TRAFFIC_POLICY_FORMAT_VERSION;
 
 use crate::hosted_zone_records::{router, router_holding_vpcs, Reply};
-use crate::hosted_zones_by_vpc::list_by_vpc;
 use crate::traffic_policies::{create_policy, document_with_start_endpoint};
 use crate::vpc_association_authorizations::{authorize_ok, list_authorizations};
 use crate::vpc_associations::{associate, create_private_zone, vpc_block, CREATION_VPC, HOME_REGION};
@@ -390,7 +391,7 @@ async fn a_domain_conflict_names_the_vpc_its_region_and_the_zone_holding_it() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_invalid_pagination_token_is_reported_as_the_token_alone() {
+async fn an_invalid_pagination_token_of_the_ledger_is_reported_as_the_token_alone() {
     let router = router();
     let zone = create_private_zone(
         &router,
@@ -404,11 +405,11 @@ async fn an_invalid_pagination_token_is_reported_as_the_token_alone() {
     authorize_ok(&router, &zone, "vpc-11112222333344445", "us-west-2").await;
 
     // The tokens differ along length, character class and how closely they
-    // resemble a token one of these listings could have minted (a VPC id, a
-    // zone id, a bare number) — none of them identifies a page in either
-    // listing. Each row is `(the token as the query string sends it, the token
-    // the service receives)`; the last row carries XML metacharacters, so the
-    // refusal has to report the token AND leave its own envelope well-formed.
+    // resemble a token this listing could have minted (a VPC id, a zone id, a
+    // bare number) — none of them identifies one of its pages. Each row is
+    // `(the token as the query string sends it, the token the service
+    // receives)`; the last row carries XML metacharacters, so the refusal has to
+    // report the token AND leave its own envelope well-formed.
     let long_token = "Z".repeat(40);
     let rows = [
         (
@@ -455,39 +456,14 @@ async fn an_invalid_pagination_token_is_reported_as_the_token_alone() {
              {from_authorizations:?}"
         );
 
-        // The other paginated listing that refuses a token reads the SAME
-        // sentence: the wording belongs to the fact, not to the operation.
-        let by_vpc = list_by_vpc(&router, CREATION_VPC, HOME_REGION, None, Some(sent)).await;
-        assert_eq!(
-            by_vpc.status, 400,
-            "case {case:?}: expected HTTP 400 from ListHostedZonesByVPC, got {} with body {}",
-            by_vpc.status, by_vpc.body
-        );
-        assert_eq!(
-            by_vpc.error_code(),
-            "InvalidPaginationToken",
-            "case {case:?}: expected InvalidPaginationToken, got body {}",
-            by_vpc.body
-        );
-        let from_by_vpc = message_of(&by_vpc, &case);
-        assert_eq!(
-            from_by_vpc, expected,
-            "case {case:?}: expected message {expected:?}, got {from_by_vpc:?}"
-        );
-
         // A caller-influenced value is output-encoded into the envelope rather
         // than written into it raw, so the body stays well-formed XML whatever
         // the token carried.
-        for (operation, body) in [
-            ("ListVPCAssociationAuthorizations", &authorizations.body),
-            ("ListHostedZonesByVPC", &by_vpc.body),
-        ] {
-            assert!(
-                !body.contains("<token>"),
-                "case {case:?}: {operation} must encode the token into its envelope, got body \
-                 {body}"
-            );
-        }
+        assert!(
+            !authorizations.body.contains("<token>"),
+            "case {case:?}: the refusal must encode the token into its envelope, got body {}",
+            authorizations.body
+        );
     }
 }
 
