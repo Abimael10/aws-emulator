@@ -123,7 +123,10 @@ impl DbBackupSnapshot {
             vpc_subnet_ids: instance.vpc_subnet_ids.clone(),
             vpc_security_group_ids: instance.vpc_security_group_ids.clone(),
             publicly_accessible: instance.publicly_accessible,
-            port: instance.port,
+            // The port the backup reports is the one every READ of the source reports: the
+            // port a client dials it on, which for a DB instance this emulator serves an
+            // InfluxDB API for is that socket's ([`DbInstance::reported_port`]).
+            port: instance.reported_port(),
             network_type: instance.network_type.clone(),
             influx_auth_parameters_secret_arn: instance.influx_auth_parameters_secret_arn.clone(),
             kms_key_id: instance.kms_key_id.clone(),

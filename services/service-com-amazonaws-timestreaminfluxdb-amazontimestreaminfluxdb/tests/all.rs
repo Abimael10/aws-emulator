@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/already_exists_conflicts.rs"]
 mod already_exists_conflicts;
+#[path = "all/constraint_refusal_wording.rs"]
+mod constraint_refusal_wording;
 #[path = "all/db_backup_snapshot.rs"]
 mod db_backup_snapshot;
 #[path = "all/db_cluster_lifecycle.rs"]
@@ -33,6 +35,8 @@ mod db_parameter_group_catalog;
 mod db_parameter_group_listing;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
+#[path = "all/influx_data_plane_round_trip.rs"]
+mod influx_data_plane_round_trip;
 #[path = "all/parameters_union_roundtrip.rs"]
 mod parameters_union_roundtrip;
 #[path = "all/resource_tags.rs"]

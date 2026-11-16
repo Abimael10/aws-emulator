@@ -283,6 +283,11 @@ impl DbCluster {
             status: STATUS_CREATING.to_string(),
             endpoint: db_instance_endpoint(&node.name, instance_id, &self.region),
             port: self.port,
+            // A node of a DB cluster is reached through the CLUSTER's own endpoints, which
+            // this emulator serves no socket for, so a node publishes no socket of its own
+            // and keeps the host Timestream for InfluxDB's own zone would carry.
+            served_endpoint: None,
+            served_port: None,
             network_type: self.network_type.clone(),
             db_instance_type: self.db_instance_type.clone(),
             db_storage_type: self.db_storage_type.clone(),

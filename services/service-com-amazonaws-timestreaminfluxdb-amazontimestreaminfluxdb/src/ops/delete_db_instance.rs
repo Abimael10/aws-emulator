@@ -236,6 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The name index is released with the record, so the name can be reused in the
         // region the record was created in.
         state.release_db_instance_name(&record.region, &record.name);
+        // And the socket this emulator served the instance's InfluxDB v2 API on is closed
+        // with it: dropping the handle closes the port, so a deleted instance stops
+        // answering at the address it published.
+        state.db_instance_planes.remove(&input.identifier);
 
         // The deleted record is reported as DELETING: it is gone from state, so no
         // further read resolves it and no clock transition is owed on it.

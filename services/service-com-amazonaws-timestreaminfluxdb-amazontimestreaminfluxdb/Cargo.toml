@@ -35,9 +35,29 @@ tracing = { workspace = true }
 # Mints the opaque service-generated DbInstanceId / renders it as hex.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The HTTP/1.1 server the socket a DB instance's own InfluxDB v2 API is served on speaks
+# (`src/state/influx_data_plane.rs`): the core hands that socket a plain TCP connection,
+# so the HTTP framing on it is the `hyper` server's rather than this emulator's.
+# `hyper-util` carries the tokio IO and timer adapters for it, and `http-body-util` the
+# bounded body reader and the one-shot body.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# InfluxData's own line-protocol parser: the body of an InfluxDB v2 `/api/v2/write` is
+# line protocol, so the points a client writes are parsed by the format's own reader
+# rather than by this emulator.
+influxdb-line-protocol = "2.0"
+# Decodes the `Authorization: Basic` credential an InfluxDB client presents on that
+# plane; the codec is the crate's, not this emulator's.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The data-plane suite presents the `Authorization: Basic` credential an InfluxDB client
+# presents, which it encodes with the same codec the plane decodes it with.
+base64 = "0.22"
 
 [lints]
 workspace = true

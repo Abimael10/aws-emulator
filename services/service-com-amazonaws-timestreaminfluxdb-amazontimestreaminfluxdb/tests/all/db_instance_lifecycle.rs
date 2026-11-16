@@ -29,6 +29,11 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// Members that `CreateDbInstanceInput` and `CreateDbInstanceOutput` BOTH model, from
 /// `smithy_query(query="operation", operation="CreateDbInstance")`. A value the request
 /// supplies for one of these must come back from the stored record unchanged.
+///
+/// `port` is NOT one of them: it is reported together with `endpoint` as the address this
+/// emulator serves the instance's InfluxDB v2 API at — the pair a client DIALS — so the
+/// port a request asked InfluxDB to accept connections on is not what a read reports
+/// (`crate::influx_data_plane_round_trip` is the rule for that pair).
 const ECHOED_CREATE_MEMBERS: &[&str] = &[
     "allocatedStorage",
     "dbBackupConfigurations",
@@ -41,7 +46,6 @@ const ECHOED_CREATE_MEMBERS: &[&str] = &[
     "maintenanceSchedule",
     "name",
     "networkType",
-    "port",
     "publiclyAccessible",
     "vpcSecurityGroupIds",
     "vpcSubnetIds",
@@ -179,8 +183,6 @@ fn minimal_create(name: &str) -> Value {
 struct CreateCase {
     label: &'static str,
     body: Value,
-    /// `port` carries `@default: 8086`, so an omitted port must come back as 8086.
-    expected_port: i64,
     /// A standby's Availability Zone is reported only for `WITH_MULTIAZ_STANDBY`.
     expects_secondary_zone: bool,
 }
@@ -192,7 +194,6 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             label: "only the required members, port omitted",
             body: minimal_create("minimal-instance"),
-            expected_port: 8086,
             expects_secondary_zone: false,
         },
         CreateCase {
@@ -226,7 +227,6 @@ fn create_cases() -> Vec<CreateCase> {
                 ],
                 "tags": { "team": "data", "env": "test" },
             }),
-            expected_port: 9999,
             expects_secondary_zone: false,
         },
         CreateCase {
@@ -240,7 +240,6 @@ fn create_cases() -> Vec<CreateCase> {
                 "vpcSecurityGroupIds": ["sg-aaa"],
                 "deploymentType": "WITH_MULTIAZ_STANDBY",
             }),
-            expected_port: 8086,
             expects_secondary_zone: true,
         },
         CreateCase {
@@ -254,7 +253,6 @@ fn create_cases() -> Vec<CreateCase> {
                 "vpcSubnetIds": ["subnet-aaa"],
                 "vpcSecurityGroupIds": ["sg-aaa"],
             }),
-            expected_port: 1024,
             expects_secondary_zone: false,
         },
         CreateCase {
@@ -273,20 +271,17 @@ fn create_cases() -> Vec<CreateCase> {
                     "sg-b1", "sg-b2", "sg-b3", "sg-b4", "sg-b5"
                 ],
             }),
-            expected_port: 65535,
             expects_secondary_zone: false,
         },
         CreateCase {
             label: "the shortest name the model allows",
             body: minimal_create("abc"),
-            expected_port: 8086,
             expects_secondary_zone: false,
         },
         CreateCase {
             label: "the longest name the model allows",
             // DbInstanceName length 3..40.
             body: minimal_create("a23456789-123456789-123456789-123456789"),
-            expected_port: 8086,
             expects_secondary_zone: false,
         },
     ]
@@ -314,14 +309,25 @@ async fn a_created_db_instance_reads_back_from_state_member_for_member() {
                 );
             }
         }
-        assert_eq!(
-            created["port"].as_i64(),
-            Some(case.expected_port),
-            "case {:?}: expected port {}, got {:?}",
+        // `port` is reported together with `endpoint` as the address this emulator serves
+        // the instance's InfluxDB v2 API on, so what is asserted is that the PAIR is an
+        // address that API answers on — which is what a client does with the two — and that
+        // the port is inside the modelled `Port` range (1024..65535).
+        let (served_host, served_port) = crate::influx_data_plane_round_trip::address(
+            case.label, &created,
+        );
+        assert!(
+            (1024..=65535).contains(&served_port),
+            "case {:?}: expected a port inside the modelled Port range, got {:?}",
             case.label,
-            case.expected_port,
             created["port"]
         );
+        crate::influx_data_plane_round_trip::poll_health(
+            case.label,
+            &served_host,
+            served_port,
+        )
+        .await;
         assert_eq!(
             created.get("secondaryAvailabilityZone").is_some(),
             case.expects_secondary_zone,
@@ -383,7 +389,6 @@ async fn the_minted_id_arn_and_endpoint_follow_the_modelled_formats() {
                 call_in(&router, region, "CreateDbInstance", case.body.clone()).await,
             );
             let id = id_of(&case_label, &created);
-            let name = case.body["name"].as_str().expect("a name");
 
             assert!(
                 is_modelled_db_instance_id(&id),
@@ -402,12 +407,27 @@ async fn the_minted_id_arn_and_endpoint_follow_the_modelled_formats() {
                 "case {case_label:?}: unexpected arn {:?}",
                 created["arn"]
             );
+            // `endpoint` is "the endpoint used to connect to InfluxDB": a bare HOST a
+            // client dials, with no scheme, no port and no path — and it must be the host
+            // of a socket that answers the InfluxDB API, which is what a client does with
+            // it, rather than a name that resolves nowhere.
             let endpoint = created["endpoint"].as_str().unwrap_or_default();
             assert!(
-                endpoint.starts_with(&format!("{name}-")) && endpoint.contains(region),
-                "case {case_label:?}: endpoint {endpoint:?} must be prefixed by the name \
-                 and scoped to {region}"
+                !endpoint.is_empty()
+                    && !endpoint.contains("://")
+                    && !endpoint.contains('/')
+                    && !endpoint.contains('?'),
+                "case {case_label:?}: endpoint {endpoint:?} must be a bare host a client \
+                 can dial"
             );
+            let (served_host, served_port) =
+                crate::influx_data_plane_round_trip::address(&case_label, &created);
+            crate::influx_data_plane_round_trip::poll_health(
+                &case_label,
+                &served_host,
+                served_port,
+            )
+            .await;
             assert_eq!(
                 created["availabilityZone"].as_str(),
                 Some(format!("{region}a").as_str()),
@@ -848,6 +868,13 @@ async fn update_mutates_the_stored_record_and_reports_the_matching_transient_sta
             call(&router, "GetDbInstance", json!({ "identifier": &id })).await,
         );
         for (member, value) in case.patch.as_object().expect("a patch object") {
+            // `port` is the one member whose new value is not the request's: it is the port
+            // of the socket this emulator serves the instance's InfluxDB v2 API on, which
+            // the core assigns. That it MOVES, and that the new address answers, is
+            // asserted below.
+            if member == "port" {
+                continue;
+            }
             assert_eq!(
                 fetched.get(member),
                 Some(value),
@@ -856,7 +883,36 @@ async fn update_mutates_the_stored_record_and_reports_the_matching_transient_sta
                 fetched.get(member)
             );
         }
-        for member in ["id", "name", "arn", "endpoint", "vpcSubnetIds", "vpcSecurityGroupIds"] {
+        // A patch that asks InfluxDB to accept connections on another port moves the
+        // instance onto another socket: the reported port changes, and the new address is
+        // one the InfluxDB API answers on.
+        if case.patch.get("port").is_some() {
+            assert_ne!(
+                fetched.get("port"),
+                created.get("port"),
+                "case {:?}: a port change must move the address the instance publishes",
+                case.label
+            );
+            let (served_host, served_port) =
+                crate::influx_data_plane_round_trip::address(case.label, &fetched);
+            crate::influx_data_plane_round_trip::poll_health(
+                case.label,
+                &served_host,
+                served_port,
+            )
+            .await;
+        }
+
+        // The address's HOST does not move, and neither does anything that identifies the
+        // instance.
+        for member in [
+            "id",
+            "name",
+            "arn",
+            "endpoint",
+            "vpcSubnetIds",
+            "vpcSecurityGroupIds",
+        ] {
             assert_eq!(
                 fetched.get(member),
                 created.get(member),

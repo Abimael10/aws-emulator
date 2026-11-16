@@ -36,6 +36,10 @@ mod marketplace;
 /// carries — the slice the three tagging operations share.
 mod tags;
 
+/// The SOCKET one DB instance's own InfluxDB v2 HTTP API is served on, and the data that
+/// API reads and writes — the address `endpoint` and `port` report for a client to dial.
+pub mod influx_data_plane;
+
 pub use backups::*;
 pub use clusters::*;
 pub use marketplace::*;
@@ -196,8 +200,10 @@ pub const MAX_RESULTS_DEFAULT: i32 = 100;
 /// is what stops the state growing without end: every record it holds is released by
 /// `DeleteDbInstance`, which also forgets that instance's name, so the name index can
 /// never outgrow this bound either. It also caps the per-request work `ListDbInstances`
-/// does when it settles the clock-owed statuses.
-pub const DB_INSTANCE_QUOTA: usize = 1_000;
+/// does when it settles the clock-owed statuses, and — because each standalone instance is
+/// served on a SOCKET of its own ([`influx_data_plane`]) — how many ports one store can
+/// hold open at once.
+pub const DB_INSTANCE_QUOTA: usize = 100;
 
 /// How many DB parameter groups the store holds before `CreateDbParameterGroup` refuses
 /// with the modelled `ServiceQuotaExceededException`.
@@ -222,6 +228,14 @@ pub struct DbInstance {
     pub status: String,
     pub endpoint: String,
     pub port: i32,
+    /// The host the socket this emulator serves this instance's InfluxDB v2 API on answers
+    /// at, once that socket is open ([`influx_data_plane`]) — the `endpoint` every reader
+    /// reports, because it is the one host a client of this instance can dial. `None` on an
+    /// emulator that could open no socket, where [`Self::endpoint`] is reported instead.
+    pub served_endpoint: Option<String>,
+    /// The port that socket answers on, reported as `port` for the same reason. `None`
+    /// alongside [`Self::served_endpoint`], where [`Self::port`] is reported instead.
+    pub served_port: Option<i32>,
     pub network_type: Option<String>,
     pub db_instance_type: String,
     pub db_storage_type: Option<String>,
@@ -274,6 +288,28 @@ impl DbInstanceClusterRole {
 }
 
 impl DbInstance {
+    /// The host a client dials to reach this instance's InfluxDB v2 API: the socket this
+    /// emulator serves it on when one is open, and otherwise the host Timestream for
+    /// InfluxDB's own zone would carry.
+    #[must_use]
+    pub fn reported_endpoint(&self) -> String {
+        self.served_endpoint
+            .clone()
+            .unwrap_or_else(|| self.endpoint.clone())
+    }
+
+    /// The port it dials, under the same rule as [`Self::reported_endpoint`]: the open
+    /// socket's port, and otherwise the port the request asked InfluxDB to accept
+    /// connections on.
+    ///
+    /// The socket is the core's, so its port is the core's too: a request that asks for a
+    /// particular port is stored (see `UpdateDbInstance`) and the reported port stays the
+    /// one a client can actually dial, which is what the member is for.
+    #[must_use]
+    pub fn reported_port(&self) -> i32 {
+        self.served_port.unwrap_or(self.port)
+    }
+
     /// Materialise the status change the clock already made due.
     ///
     /// A reporting operation calls this before answering: the transition was owed at
@@ -307,8 +343,8 @@ impl DbInstance {
             name: self.name.clone(),
             arn: self.arn.clone(),
             status: Some(self.status.clone()),
-            endpoint: Some(self.endpoint.clone()),
-            port: Some(self.port),
+            endpoint: Some(self.reported_endpoint()),
+            port: Some(self.reported_port()),
             network_type: self.network_type.clone(),
             db_instance_type: Some(self.db_instance_type.clone()),
             db_storage_type: self.db_storage_type.clone(),
@@ -365,8 +401,8 @@ macro_rules! db_instance_record_projections {
                         name: self.name.clone(),
                         arn: self.arn.clone(),
                         status: Some(self.status.clone()),
-                        endpoint: Some(self.endpoint.clone()),
-                        port: Some(self.port),
+                        endpoint: Some(self.reported_endpoint()),
+                        port: Some(self.reported_port()),
                         network_type: self.network_type.clone(),
                         db_instance_type: Some(self.db_instance_type.clone()),
                         db_storage_type: self.db_storage_type.clone(),
@@ -680,6 +716,11 @@ pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     /// Live DB instances by their service-generated `id`. Ordered, so `ListDbInstances`
     /// pages deterministically.
     pub db_instances: BTreeMap<String, DbInstance>,
+    /// The SOCKET each DB instance's own InfluxDB v2 API is served on, by that instance's
+    /// `id`. Beside the records rather than on them, because a socket is a live resource
+    /// and a record is cloneable data: dropping the handle closes the port, so removing an
+    /// instance's entry here is what stops its address answering.
+    pub db_instance_planes: BTreeMap<String, influx_data_plane::InfluxDataPlane>,
     /// `(region, name)` -> `id`: the uniqueness index behind `ConflictException` on a
     /// duplicate name. The key carries the region because the rule the model documents is
     /// "DB instance names must be unique per customer and per region", so the same name

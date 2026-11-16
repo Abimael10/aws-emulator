@@ -24,9 +24,8 @@
 //!   table's, but every operation whose model declares `AccessDeniedException` is served
 //!   behind [`authorization::Gated`], so IAM's decision about the action the request names
 //!   is taken before that operation runs.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_refusal` — EDITED HERE: how this service words a request the framework
+//!   refused before any handler ran, which is [`validation_refusal`]'s one function.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -45,6 +44,11 @@
 /// of every operation whose model declares `AccessDeniedException`, through the
 /// [`authorization::Gated`] wrapper `override_operation` below resolves.
 pub mod authorization;
+
+/// How this service WORDS a request the framework refused at the boundary, before any
+/// handler ran — the envelope, the `@pattern` rendering and the clause's value half that
+/// `override_refusal` below resolves.
+pub mod validation_refusal;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Operation, Refusal, Refused, Service,
@@ -169,15 +173,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. This service words one as Timestream for InfluxDB does:
+        // `ValidationException` over the `<N> validation error(s) detected: ` envelope,
+        // with a `@pattern` quoted unanchored and no submitted value in the clause (see
+        // [`validation_refusal`]). Anything that is not a constraint refusal keeps the
+        // framework's own code and wording.
+        validation_refusal::constraint_refusal(refusal)
     }
 
     fn override_routing_error(

@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state as st;
 
         let _ = ctx;
-        let Some(state) = st::service_state(&*self.engine) else {
+        let Some(handle) = st::service_state(&*self.engine) else {
             return Err(UpdateDbInstanceErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the service state store is unavailable".to_string(),
@@ -242,76 +242,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
-        let mut state = state.lock();
-        let Some(record) = state.db_instances.get_mut(&input.identifier) else {
-            return Err(UpdateDbInstanceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("DB instance {} not found", input.identifier),
-                    resource_id: input.identifier.clone(),
-                    resource_type: st::RESOURCE_TYPE_DB_INSTANCE.to_string(),
+        // The whole store-locked section is a BLOCK, so the guard is released at its end
+        // and no non-`Send` guard is held across the socket bind that may follow.
+        let moves_the_port = {
+            let mut state = handle.lock();
+            let Some(record) = state.db_instances.get_mut(&input.identifier) else {
+                return Err(UpdateDbInstanceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("DB instance {} not found", input.identifier),
+                        resource_id: input.identifier.clone(),
+                        resource_type: st::RESOURCE_TYPE_DB_INSTANCE.to_string(),
+                    },
+                )
+                .into());
+            };
+            record.settle(now);
+
+            // Which transient status the change moves through: the modeled `Status` enum
+            // names the instance-type and deployment-type reconfigurations separately from
+            // a plain update, so report the one that matches what actually changed. A
+            // member the request omitted is left alone — this is a partial update.
+            let changes_deployment_type = input
+                .deployment_type
+                .as_ref()
+                .is_some_and(|new| Some(new) != record.deployment_type.as_ref());
+            let changes_instance_type = input
+                .db_instance_type
+                .as_ref()
+                .is_some_and(|new| *new != record.db_instance_type);
+
+            if let Some(value) = input.db_instance_type {
+                record.db_instance_type = value;
+            }
+            if let Some(value) = input.port {
+                // The port a client dials this instance's InfluxDB API on is the one thing
+                // this member changes, so the stored value moves AND the instance is
+                // published on a socket of its own again below. The number is the core's,
+                // not the request's: the service never binds a socket or chooses a port, so
+                // what the request names is recorded and the address every read reports is
+                // the one the core assigned to the new socket.
+                record.port = value;
+            }
+            if let Some(value) = input.allocated_storage {
+                record.allocated_storage = value;
+            }
+            if let Some(value) = input.db_storage_type {
+                record.db_storage_type = Some(value);
+            }
+            if let Some(value) = input.deployment_type {
+                record.deployment_type = Some(value);
+            }
+            if let Some(value) = input.db_parameter_group_identifier {
+                record.db_parameter_group_identifier = Some(value);
+            }
+            if let Some(value) = input.log_delivery_configuration {
+                record.log_delivery_configuration = Some(value);
+            }
+            if let Some(value) = input.maintenance_schedule {
+                record.maintenance_schedule = Some(value);
+            }
+            if let Some(value) = input.db_backup_configurations {
+                record.db_backup_configurations = Some(value);
+            }
+
+            // A standby lives in a second Availability Zone only under the deployment type
+            // that places one, so the reported zones follow the new deployment type.
+            let (availability_zone, secondary_availability_zone) =
+                st::availability_zones(&record.region, record.deployment_type.as_deref());
+            record.availability_zone = Some(availability_zone);
+            record.secondary_availability_zone = secondary_availability_zone;
+
+            let status = if changes_deployment_type {
+                st::STATUS_UPDATING_DEPLOYMENT_TYPE
+            } else if changes_instance_type {
+                st::STATUS_UPDATING_INSTANCE_TYPE
+            } else {
+                st::STATUS_UPDATING
+            };
+            record.begin_transition(status, now);
+
+            input.port.is_some()
+        };
+
+        // A request that asked InfluxDB to accept connections on another port moves the
+        // instance onto another socket, keeping the data it holds: the new port is bound
+        // before the old one closes, so the address every read reports is one that answers.
+        if moves_the_port {
+            st::influx_data_plane::rebind_db_instance_plane(
+                &*self.engine,
+                &handle,
+                &input.identifier,
+            )
+            .await;
+        }
+
+        let Some(output) = handle
+            .lock()
+            .db_instances
+            .get(&input.identifier)
+            .map(st::DbInstance::to_update_output)
+        else {
+            return Err(UpdateDbInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the updated DB instance is no longer in the store".to_string(),
                 },
             )
             .into());
         };
-        record.settle(now);
-
-        // Which transient status the change moves through: the modeled `Status` enum
-        // names the instance-type and deployment-type reconfigurations separately from a
-        // plain update, so report the one that matches what actually changed. A member
-        // the request omitted is left alone — this is a partial update.
-        let changes_deployment_type = input
-            .deployment_type
-            .as_ref()
-            .is_some_and(|new| Some(new) != record.deployment_type.as_ref());
-        let changes_instance_type = input
-            .db_instance_type
-            .as_ref()
-            .is_some_and(|new| *new != record.db_instance_type);
-
-        if let Some(value) = input.db_instance_type {
-            record.db_instance_type = value;
-        }
-        if let Some(value) = input.port {
-            record.port = value;
-        }
-        if let Some(value) = input.allocated_storage {
-            record.allocated_storage = value;
-        }
-        if let Some(value) = input.db_storage_type {
-            record.db_storage_type = Some(value);
-        }
-        if let Some(value) = input.deployment_type {
-            record.deployment_type = Some(value);
-        }
-        if let Some(value) = input.db_parameter_group_identifier {
-            record.db_parameter_group_identifier = Some(value);
-        }
-        if let Some(value) = input.log_delivery_configuration {
-            record.log_delivery_configuration = Some(value);
-        }
-        if let Some(value) = input.maintenance_schedule {
-            record.maintenance_schedule = Some(value);
-        }
-        if let Some(value) = input.db_backup_configurations {
-            record.db_backup_configurations = Some(value);
-        }
-
-        // A standby lives in a second Availability Zone only under the deployment type
-        // that places one, so the reported zones follow the new deployment type.
-        let (availability_zone, secondary_availability_zone) =
-            st::availability_zones(&record.region, record.deployment_type.as_deref());
-        record.availability_zone = Some(availability_zone);
-        record.secondary_availability_zone = secondary_availability_zone;
-
-        let status = if changes_deployment_type {
-            st::STATUS_UPDATING_DEPLOYMENT_TYPE
-        } else if changes_instance_type {
-            st::STATUS_UPDATING_INSTANCE_TYPE
-        } else {
-            st::STATUS_UPDATING
-        };
-        record.begin_transition(status, now);
-
-        Ok(record.to_update_output())
+        Ok(output)
     }
 }
