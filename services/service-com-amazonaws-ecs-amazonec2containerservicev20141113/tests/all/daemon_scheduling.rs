@@ -21,6 +21,10 @@
 //! * "A daemon revision is a snapshot of the daemon's configuration at the time a deployment
 //!   was initiated" — an update captures a new revision, rolls the daemon's tasks over onto
 //!   it, and leaves the earlier revision readable exactly as it was captured;
+//! * `UpdateDaemon` "updates the specified daemon": the call states the WHOLE configuration
+//!   the daemon then runs under rather than patching one member of it, so the revision it
+//!   captures snapshots exactly the members the request stated, with each optional member it
+//!   left out at the default its own documentation gives;
 //! * "Amazon ECS daemons are cluster specific and Region specific" — every daemon operation
 //!   resolves its `daemonArn` and refuses what it cannot resolve: the cluster first, then
 //!   the daemon, and a value that is no daemon ARN at all last;
@@ -1264,4 +1268,399 @@ async fn a_daemon_scheduled_service_keeps_one_task_per_instance_its_cluster_hold
         "case {CASE:?}: expected the service's task on the instance still accepting \
          placements, got {tasks:?}"
     );
+}
+
+/// A required boolean member of a reported shape, the way [`string`] reads a string one.
+fn flag(body: &Value, member: &str, case: &str) -> bool {
+    body[member]
+        .as_bool()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a boolean {member}, got {body}"))
+}
+
+/// The configuration one reported `DaemonRevision` snapshotted: `propagateTags`,
+/// `enableECSManagedTags`, `enableExecuteCommand` and `critical`
+/// (`smithy_query(query="shape", shape="DaemonRevision")`).
+fn snapshot(revision: &Value, case: &str) -> (String, bool, bool, bool) {
+    (
+        string(revision, "propagateTags", case),
+        flag(revision, "enableECSManagedTags", case),
+        flag(revision, "enableExecuteCommand", case),
+        flag(revision, "critical", case),
+    )
+}
+
+/// The same four values as a table row states them, so a row is written without a `String`.
+fn stated_snapshot(expected: (&str, bool, bool, bool)) -> (String, bool, bool, bool) {
+    (
+        expected.0.to_string(),
+        expected.1,
+        expected.2,
+        expected.3,
+    )
+}
+
+/// One row of the configuration table in
+/// [`an_update_states_the_whole_configuration_and_the_revision_it_captures_snapshots_it`]:
+/// what an `UpdateDaemon` states, and the configuration the revision it captures therefore
+/// reports.
+struct UpdateRow {
+    case: &'static str,
+    /// Whether the update names its daemon task definition by the FAMILY alone — which
+    /// resolves to the latest ACTIVE revision of that family — rather than by a stored ARN.
+    by_family: bool,
+    /// Which registered revision the update points the daemon at, as an index into the two
+    /// registered for the case; ignored when the reference is the family alone.
+    definition: usize,
+    /// How many of the cluster's managed-instances capacity providers the update deploys
+    /// onto.
+    providers: usize,
+    /// The optional members the request carries beside the three required ones.
+    stated: fn() -> Value,
+    /// `propagateTags`, `enableECSManagedTags`, `enableExecuteCommand` and `critical` as the
+    /// captured revision must report them: the value the row states, or the member's own
+    /// documented default where the row leaves it out.
+    expected: (&'static str, bool, bool, bool),
+}
+
+#[tokio::test]
+async fn an_update_states_the_whole_configuration_and_the_revision_it_captures_snapshots_it() {
+    let router = service();
+    const CLUSTER: &str = "daemon-configuration";
+    const FAMILY: &str = "daemonconfiguration";
+    const CASE: &str = "setup";
+    /// The image the SECOND registered revision of the family runs, so the revision a
+    /// reference resolved to is told apart by what it runs rather than by its ARN alone.
+    const NEXT_IMAGE: &str = "public.ecr.aws/aws-observability/aws-otel-collector:1.32.0";
+    create_cluster(&router, CLUSTER, CASE).await;
+    // Two providers, so a row deploys onto one of them or onto both: the list an update
+    // states is the capacity the revision it captures is rolled out over.
+    let mut providers = Vec::new();
+    for slot in 0..2 {
+        providers.push(
+            create_managed_provider(&router, CLUSTER, &format!("mi-configuration{slot}"), CASE)
+                .await,
+        );
+    }
+    // Two revisions of ONE family, so a reference that names the family alone resolves to
+    // the later of them while an ARN names exactly the one it carries.
+    let definitions = [
+        register_daemon_definition(&router, FAMILY, IMAGE, CASE).await,
+        register_daemon_definition(&router, FAMILY, NEXT_IMAGE, CASE).await,
+    ];
+    let images = [IMAGE, NEXT_IMAGE];
+    let (daemon_arn, first_deployment) = create_daemon(
+        &router,
+        CLUSTER,
+        "agents",
+        std::slice::from_ref(&providers[0]),
+        &definitions[0],
+        CASE,
+    )
+    .await;
+    let created = describe_daemon(&router, &daemon_arn, CASE).await;
+    let created_at = created["createdAt"].as_f64().unwrap_or_else(|| {
+        panic!("case {CASE:?}: expected the instant the daemon was created, got {created}")
+    });
+    let mut updated_at = created["updatedAt"].as_f64().unwrap_or_default();
+
+    // The revision the CREATE captured, with the configuration it snapshotted: the create
+    // states no optional member either, so it is the same documented defaults an update
+    // that states none has to report.
+    let opening = describe_deployment(&router, &first_deployment, CASE).await;
+    let first_revision = string(&opening["targetDaemonRevision"], "arn", CASE);
+    let first_captured = snapshot(
+        &describe_revision(&router, &first_revision, CASE).await,
+        CASE,
+    );
+    assert_eq!(
+        first_captured,
+        stated_snapshot(("NONE", false, false, true)),
+        "case {CASE:?}: expected the documented defaults of the members the create left \
+         out, got {first_captured:?}"
+    );
+    let mut deployments = vec![first_deployment];
+    let mut captured = vec![(first_revision, first_captured)];
+
+    // The rows differ along what the rule generalises over: WHICH optional members the
+    // update states and with which values, how the daemon task definition is referenced,
+    // and how much capacity the update deploys onto. `propagateTags` is taken over the whole
+    // published enum (`smithy_query(query="shape", shape="DaemonPropagateTags")`: `DAEMON`,
+    // `NONE`), and the deployment configuration's drain percentage over the interval its
+    // member documents ("Valid values are between 0.0 and 100.0").
+    let rows = [
+        UpdateRow {
+            case: "an update that states nothing optional",
+            by_family: false,
+            definition: 1,
+            providers: 1,
+            stated: || json!({}),
+            expected: ("NONE", false, false, true),
+        },
+        UpdateRow {
+            case: "an update that states every optional member, over both providers",
+            by_family: false,
+            definition: 0,
+            providers: 2,
+            stated: || {
+                json!({
+                    "critical": false,
+                    "propagateTags": "DAEMON",
+                    "enableECSManagedTags": true,
+                    "enableExecuteCommand": true,
+                    "deploymentConfiguration": {
+                        "drainPercent": 25.0,
+                        "bakeTimeInMinutes": 5,
+                        "alarms": { "alarmNames": ["daemon-errors"], "enable": true },
+                    },
+                })
+            },
+            expected: ("DAEMON", true, true, false),
+        },
+        UpdateRow {
+            case: "an update that leaves out every member the one before it stated",
+            by_family: false,
+            definition: 1,
+            providers: 1,
+            stated: || json!({}),
+            expected: ("NONE", false, false, true),
+        },
+        UpdateRow {
+            case: "an update that states those members explicitly, by family reference",
+            by_family: true,
+            definition: 1,
+            providers: 2,
+            stated: || {
+                json!({
+                    "critical": true,
+                    "propagateTags": "NONE",
+                    "enableECSManagedTags": false,
+                    "enableExecuteCommand": false,
+                    "deploymentConfiguration": { "drainPercent": 0.0 },
+                })
+            },
+            expected: ("NONE", false, false, true),
+        },
+        UpdateRow {
+            case: "an update that drains every container instance at once",
+            by_family: false,
+            definition: 1,
+            providers: 1,
+            stated: || {
+                json!({
+                    "propagateTags": "DAEMON",
+                    "deploymentConfiguration": {
+                        "drainPercent": 100.0,
+                        "bakeTimeInMinutes": 0,
+                        "alarms": { "alarmNames": [], "enable": false },
+                    },
+                })
+            },
+            expected: ("DAEMON", false, false, true),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let reference = if row.by_family {
+            FAMILY.to_string()
+        } else {
+            definitions[row.definition].clone()
+        };
+        // A family alone names the latest ACTIVE revision of it, which is the last one
+        // registered above; an ARN names the revision it carries.
+        let resolved = if row.by_family {
+            definitions.len() - 1
+        } else {
+            row.definition
+        };
+        let deploying: Vec<String> = providers[..row.providers].to_vec();
+        let stated = (row.stated)();
+        let mut request = json!({
+            "daemonArn": daemon_arn,
+            "daemonTaskDefinitionArn": reference,
+            "capacityProviderArns": deploying.clone(),
+        });
+        for (member, value) in stated
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: the row's stated members are an object"))
+        {
+            request[member.as_str()] = value.clone();
+        }
+
+        let answer = ok(&router, "UpdateDaemon", request, case).await;
+        assert_eq!(
+            string(&answer, "daemonArn", case),
+            daemon_arn,
+            "case {case:?}: expected the daemon the update names back, got {answer}"
+        );
+        assert_eq!(
+            string(&answer, "status", case),
+            "ACTIVE",
+            "case {case:?}: an updated daemon is still ACTIVE, got {answer}"
+        );
+        assert_eq!(
+            answer["createdAt"].as_f64(),
+            Some(created_at),
+            "case {case:?}: an update never moves the instant the daemon was created, got \
+             {answer}"
+        );
+        let answered_updated_at = answer["updatedAt"].as_f64().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the instant the update was made, got {answer}")
+        });
+        assert!(
+            answered_updated_at >= updated_at,
+            "case {case:?}: expected an updatedAt not earlier than {updated_at}, got {answer}"
+        );
+        updated_at = answered_updated_at;
+        let deployment_arn = string(&answer, "deploymentArn", case);
+        assert!(
+            !deployments.contains(&deployment_arn),
+            "case {case:?}: an update triggers a NEW deployment, but {deployment_arn:?} was \
+             reported twice"
+        );
+        deployments.push(deployment_arn.clone());
+
+        // The rollout the update started: it deploys a revision none of the earlier ones
+        // was, over exactly the capacity the request stated.
+        let deployment = describe_deployment(&router, &deployment_arn, case).await;
+        let target = deployment["targetDaemonRevision"].clone();
+        let revision_arn = string(&target, "arn", case);
+        assert!(
+            !captured.iter().any(|(arn, _)| *arn == revision_arn),
+            "case {case:?}: an update captures a NEW revision, got {deployment}"
+        );
+        assert_eq!(
+            list(&target, "capacityProviders", case)
+                .iter()
+                .map(|entry| string(entry, "arn", case))
+                .collect::<Vec<String>>(),
+            deploying,
+            "case {case:?}: expected the rollout over exactly the capacity the update \
+             stated, got {deployment}"
+        );
+
+        // "Optional deployment parameters that control how the daemon rolls out updates":
+        // the rollout runs under the configuration the request carried, member for member —
+        // and under none at all where the request carried none.
+        match stated.get("deploymentConfiguration") {
+            Some(configuration) => {
+                let reported = deployment["deploymentConfiguration"].clone();
+                assert_eq!(
+                    reported["drainPercent"].as_f64(),
+                    configuration["drainPercent"].as_f64(),
+                    "case {case:?}: expected the drain percentage the update stated, got \
+                     {reported}"
+                );
+                // "The default value is 0" for a configuration that states no bake time.
+                assert_eq!(
+                    reported["bakeTimeInMinutes"].as_i64(),
+                    Some(configuration["bakeTimeInMinutes"].as_i64().unwrap_or(0)),
+                    "case {case:?}: expected the bake time the update stated, got {reported}"
+                );
+                let alarms = deployment["alarms"].clone();
+                assert_eq!(
+                    list(&alarms, "alarmNames", case),
+                    configuration["alarms"]["alarmNames"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                    "case {case:?}: expected the alarms the update stated, got {alarms}"
+                );
+                // "Amazon ECS is not using alarms for daemon deployment failures when the
+                // status is DISABLED": a configuration that enables none leaves them off,
+                // and one that enables them is watching the rollout or has finished doing so.
+                let status = string(&alarms, "status", case);
+                if configuration["alarms"]["enable"].as_bool().unwrap_or(false) {
+                    assert!(
+                        ["MONITORING", "MONITORING_COMPLETE"].contains(&status.as_str()),
+                        "case {case:?}: expected the alarms of the rollout to be watched, \
+                         got {alarms}"
+                    );
+                } else {
+                    assert_eq!(
+                        status, "DISABLED",
+                        "case {case:?}: expected no alarm option on the rollout, got {alarms}"
+                    );
+                }
+            }
+            None => assert!(
+                deployment
+                    .get("deploymentConfiguration")
+                    .is_none_or(Value::is_null),
+                "case {case:?}: expected no deployment configuration on a rollout the \
+                 update stated none for, got {deployment}"
+            ),
+        }
+
+        // The revision the update captured, read back: the daemon task definition the
+        // reference resolved to, and the configuration the request stated with the
+        // documented default of every optional member it left out.
+        let revision = describe_revision(&router, &revision_arn, case).await;
+        assert_eq!(
+            string(&revision, "daemonArn", case),
+            daemon_arn,
+            "case {case:?}: a revision names the daemon it belongs to, got {revision}"
+        );
+        assert_eq!(
+            string(&revision, "daemonTaskDefinitionArn", case),
+            definitions[resolved],
+            "case {case:?}: expected the revision the reference resolves to, got {revision}"
+        );
+        assert_eq!(
+            list(&revision, "containerImages", case)
+                .iter()
+                .map(|entry| string(entry, "image", case))
+                .collect::<Vec<String>>(),
+            vec![images[resolved].to_string()],
+            "case {case:?}: expected the images of the definition it runs, got {revision}"
+        );
+        let reported = snapshot(&revision, case);
+        assert_eq!(
+            reported,
+            stated_snapshot(row.expected),
+            "case {case:?}: expected the configuration the update states, got {revision}"
+        );
+
+        // The daemon itself follows the update: it names the rollout this call started, is
+        // deploying the revision that rollout targets, and dates the two in agreement with
+        // what the call answered.
+        let daemon = describe_daemon(&router, &daemon_arn, case).await;
+        assert_eq!(
+            string(&daemon, "deploymentArn", case),
+            deployment_arn,
+            "case {case:?}: a daemon names its most recent deployment, got {daemon}"
+        );
+        assert_eq!(
+            daemon["createdAt"].as_f64(),
+            Some(created_at),
+            "case {case:?}: expected the instant the daemon was created, got {daemon}"
+        );
+        assert_eq!(
+            daemon["updatedAt"].as_f64(),
+            Some(answered_updated_at),
+            "case {case:?}: expected the daemon to date the update as the call did, got \
+             {daemon}"
+        );
+        assert!(
+            list(&daemon, "currentRevisions", case)
+                .iter()
+                .any(|detail| string(detail, "arn", case) == revision_arn),
+            "case {case:?}: expected the daemon to be running the revision the update \
+             captured, got {daemon}"
+        );
+
+        captured.push((revision_arn, reported));
+        // "A daemon revision is a snapshot of the daemon's configuration at the time a
+        // deployment was initiated": every revision captured up to here still reports
+        // exactly the configuration it captured, however the daemon has been updated since.
+        for (arn, kept) in &captured {
+            let still = describe_revision(&router, arn, case).await;
+            assert_eq!(
+                &snapshot(&still, case),
+                kept,
+                "case {case:?}: expected {arn:?} to keep the configuration it captured, \
+                 got {still}"
+            );
+        }
+    }
 }
