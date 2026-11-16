@@ -48,14 +48,19 @@
 //!   selected by its `level` ([`delivered_at_level`]) and the execution data included
 //!   only where `includeExecutionData` asks for it.
 //!
-//! Both are written into the stores the OWNING service's own readers answer from —
-//! CloudWatch's for the metrics, CloudWatch Logs' for the events — through those
-//! services' own record types, so a published metric and `GetMetricData`, and a
-//! delivered event and `FilterLogEvents`, cannot disagree. Neither goes out over
-//! `PutMetricData` or `PutLogEvents`: CloudWatch reserves the `AWS/` namespaces for
-//! the services that own them ("you should not specify a namespace that begins with
-//! `AWS/`", `PutMetricData$Namespace`), so a service's own metric never travels over
-//! that API.
+//! Each reaches the OWNING service the way that service takes what it owns. A METRIC is
+//! written into CloudWatch's own store through that service's own record types, because
+//! CloudWatch reserves the `AWS/` namespaces for the services that own them ("you should
+//! not specify a namespace that begins with `AWS/`", `PutMetricData$Namespace`), so a
+//! service's own metric never travels over that API. A LOG EVENT, by contrast, is an
+//! ORDINARY INGESTION into the group the configuration names, so it goes in over
+//! CloudWatch Logs' own ingest path (`deliver_events`): that is what subjects it to
+//! every consumer the destination group is configured with — a metric filter extracting
+//! from it, a subscription filter forwarding it, a Live Tail session carrying it, the
+//! group's data protection policy masking it, an Insights rule attributing it and the
+//! group's own ingestion metrics counting it — which is the whole reason a client points
+//! those consumers at a vended log group. Either way a published metric and
+//! `GetMetricData`, and a delivered event and `FilterLogEvents`, cannot disagree.
 //!
 //! ## When it is published
 //!
@@ -82,7 +87,6 @@ use ::std::collections::BTreeMap;
 use ::std::time::{SystemTime, UNIX_EPOCH};
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
-use ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
 
 use super::ComAmazonawsSfnAwsstepfunctionsState;
 
@@ -1619,16 +1623,26 @@ fn work_datapoints(execution: &super::Execution) -> Vec<Datapoint> {
 }
 
 /// Publish everything this service's store has queued: the metric datapoints into
-/// CloudWatch's own store, and the history events into CloudWatch Logs'. Answers how
+/// CloudWatch's own store, and the history events into the log group a logging
+/// configuration names, through CloudWatch Logs' own ingest path. Answers how
 /// many observations were handed over, which is what tells the clock that drives this
 /// store's owed transitions whether it is still moving
 /// ([`super::events`]).
 ///
 /// Call it with NO store of this service locked — it takes this service's guard to
-/// drain the queue, and then the owning service's to write — so the two are never held
-/// at once. An engine carrying neither store has nowhere to publish to, so the
-/// observations are dropped rather than kept for a reader that cannot exist.
-pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng) -> usize {
+/// drain the queue, and then publishes with none of it held — so no store of this
+/// service is locked across the in-process call a delivery is made by. An engine
+/// carrying no CloudWatch has nowhere to publish a metric to, so the observations are
+/// dropped rather than kept for a reader that cannot exist.
+///
+/// `callback` is the in-process handle into this same emulator the log delivery is made
+/// over (`deliver_events`): the delivery is an ingestion served by CloudWatch Logs'
+/// own handler, so it travels the same seam every other cross-service call of this
+/// emulator does.
+pub async fn publish<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+) -> usize {
     let Some(state) = super::service_state(engine) else {
         return 0;
     };
@@ -1641,7 +1655,7 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng) -> usize {
     }
     let handed = pending.datapoints.len() + pending.deliveries.len();
     publish_datapoints(engine, &pending.datapoints);
-    deliver_events(engine, &pending.deliveries);
+    deliver_events(callback, &pending.deliveries).await;
     handed
 }
 
@@ -1691,121 +1705,43 @@ fn publish_datapoints<Eng: Send + Sync + 'static>(engine: &Eng, datapoints: &[Da
     }
 }
 
-/// Write every delivery into the CloudWatch Logs store of the SAME engine — the store
-/// `FilterLogEvents`, `GetLogEvents` and `DescribeLogStreams` answer from.
+/// Write every delivery into the destination log group through CloudWatch Logs' OWN
+/// ingest path, so a delivered history event is an INGESTION into that group rather than
+/// a row placed in another service's store.
+///
+/// That is what makes the consumers of a vended log group work at all: an ingested event
+/// is run against the group's metric filters, fanned out to the destination of every
+/// subscription filter whose pattern matches it, streamed to the Live Tail sessions
+/// tailing the group, masked by the group's data protection policy, attributed to the
+/// Contributor Insights rules collecting from it and counted in the group's own ingestion
+/// metrics — none of which a write placed straight into that store passes through. Each
+/// event goes in with its OWN instant, which is when the step it reports happened, so a
+/// value a metric filter extracts falls in the period of the step rather than in the
+/// period the delivery was made in.
 ///
 /// The log group a configuration names is CREATED if the account does not hold it yet:
-/// the configuration says where the executions' logs go, and a group a reader cannot
-/// find is a destination nothing reaches. A group the account ALREADY holds is left
-/// exactly as it is — its retention, its tags and the events already in it belong to
-/// the account — and so is a group this emulator has no room for, which takes no
-/// delivery rather than displacing another one.
+/// the configuration says where the executions' logs go, and a group a reader cannot find
+/// is a destination nothing reaches. A group the account ALREADY holds is left exactly as
+/// it is — its retention, its tags and the events already in it belong to the account.
 ///
-/// Every factor a caller can grow is admitted against the OWNING service's own
-/// ceiling before anything is written: how many groups the store holds
-/// ([`logs::MAX_LOG_GROUPS`]), how many streams one group holds
-/// ([`logs::MAX_STREAMS_PER_GROUP`], the ceiling that service's own `CreateLogStream`
-/// admits one against) and how much one stream retains (its own
-/// `enforce_storage_ceiling`), so the product of the executions started and the events
-/// each delivers is bounded by that store rather than by the requests made.
-fn deliver_events<Eng: Send + Sync + 'static>(engine: &Eng, deliveries: &[Delivery]) {
-    if deliveries.is_empty() {
-        return;
-    }
-    let Some(state) = logs::service_state(engine) else {
-        return;
-    };
-    let mut store = state.lock();
+/// Delivery is BEST EFFORT, as every vended-logs delivery is: what the owning service
+/// will not take — a store already at its own capacity, a group already holding its full
+/// complement of streams — is reported in tracing rather than failing an execution that
+/// has already run. Every ceiling that bounds what these writes can grow is therefore the
+/// OWNING service's own, applied by its own handlers.
+async fn deliver_events(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    deliveries: &[Delivery],
+) {
     for delivery in deliveries {
-        let now_ms = logs::now_ms();
-        if !store.log_groups.contains_key(&delivery.log_group)
-            && store.log_groups.len() >= logs::MAX_LOG_GROUPS
-        {
-            ::tracing::warn!(
-                log_group = %delivery.log_group,
-                "the CloudWatch Logs store is at capacity; a Step Functions log delivery was \
-                 not made"
-            );
-            continue;
-        }
-        // The data identifiers the data protection policies in force for the group name: such
-        // a policy masks what is ingested into the group, by whichever path the events arrive
-        // ("Sensitive data is detected and masked when it is ingested into the log group"). A
-        // group this delivery is about to create is covered by no group-level policy.
-        let data_identifiers = store
-            .log_groups
-            .get(&delivery.log_group)
-            .map(|group| store.data_protection_identifiers_for(group))
-            .unwrap_or_default();
-        // The customer managed key the destination group is associated with, under which the
-        // data it takes in is encrypted — by whichever path the events arrive.
-        let ingest_kms_key_id = store
-            .log_groups
-            .get(&delivery.log_group)
-            .and_then(|group| group.kms_key_id.clone());
-        let events: Vec<logs::StoredEvent> = delivery
-            .events
-            .iter()
-            .map(|(timestamp, message)| logs::StoredEvent {
-                timestamp: *timestamp,
-                masked_message: logs::data_protection::masked(message, &data_identifiers),
-                message: message.clone(),
-                ingestion_time: now_ms,
-                ingestion_seq: store.take_ingestion_seq(),
-                ingest_kms_key_id: ingest_kms_key_id.clone(),
-            })
-            .collect();
-        let added: i64 = events
-            .iter()
-            .map(logs::StoredEvent::stored_bytes)
-            .fold(0i64, i64::saturating_add);
-        let group = store
-            .log_groups
-            .entry(delivery.log_group.clone())
-            .or_insert_with(|| {
-                logs::LogGroupRecord::new(&delivery.region, &delivery.log_group, now_ms)
-            });
-        // A stream is opened per EXECUTION, so how many of them one group holds grows
-        // with the executions a caller starts: the delivery is admitted against the
-        // same per-group ceiling the owning service's own `CreateLogStream` admits one
-        // against ([`logs::MAX_STREAMS_PER_GROUP`]), so no write path can take a group
-        // past it. A group already holding its full complement takes no further
-        // delivery rather than displacing a stream the account holds.
-        if !group.streams.contains_key(&delivery.log_stream)
-            && group.streams.len() >= logs::MAX_STREAMS_PER_GROUP
-        {
-            ::tracing::warn!(
-                log_group = %delivery.log_group,
-                log_stream = %delivery.log_stream,
-                "the log group already holds the maximum number of streams; a Step Functions \
-                 log delivery was not made"
-            );
-            continue;
-        }
-        let stream = group
-            .streams
-            .entry(delivery.log_stream.clone())
-            .or_insert_with(|| {
-                logs::LogStreamRecord::new(
-                    &delivery.region,
-                    &delivery.log_group,
-                    &delivery.log_stream,
-                    now_ms,
-                )
-            });
-        stream.events.extend(events);
-        // The stream is kept in `(timestamp, ingestion_seq)` order, which is the order
-        // its reader pages it in; a run's events are already in that order, so only a
-        // delivery that predates events already there needs the sort.
-        stream.events.sort_by_key(logs::StoredEvent::key);
-        let discarded = stream.enforce_storage_ceiling();
-        stream.refresh_event_times();
-        stream.last_ingestion_time = Some(now_ms);
-        group.stored_bytes = group
-            .stored_bytes
-            .saturating_add(added)
-            .saturating_sub(discarded)
-            .max(0);
+        ::service_common::cloudwatch_logs::delivered_stamped_over(
+            callback,
+            &delivery.region,
+            &delivery.log_group,
+            &delivery.log_stream,
+            &delivery.events,
+        )
+        .await;
     }
 }
 
@@ -1896,7 +1832,11 @@ fn one_dimension(name: &str, value: &str) -> BTreeMap<String, String> {
 /// also where the observations that call queued are handed over ([`publish`]), so a
 /// mutation's own series reach CloudWatch's store as soon as the call that made it has
 /// answered rather than waiting for the next caller.
-pub fn meter_api_call<Eng: Send + Sync + 'static>(engine: &Eng, api_name: &str) {
+pub async fn meter_api_call<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    api_name: &str,
+) {
     if let Some(state) = super::service_state(engine) {
         state.lock().pending_observations.queue_datapoint(Datapoint {
             dimensions: api_name_dimensions(api_name),
@@ -1906,7 +1846,7 @@ pub fn meter_api_call<Eng: Send + Sync + 'static>(engine: &Eng, api_name: &str) 
             at: super::now(),
         });
     }
-    publish(engine);
+    publish(engine, callback).await;
 }
 
 #[cfg(test)]

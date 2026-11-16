@@ -168,6 +168,16 @@ impl Observed {
         let holds = store.lock().log_groups.contains_key(name);
         holds
     }
+
+    /// The engine the three services are mounted on.
+    ///
+    /// `pub(crate)`, not private: a sibling suite that reads a series this suite does not
+    /// name — one a CloudWatch Logs metric filter published, in its own namespace and
+    /// under its own dimensions — reads the store through the shared engine rather than
+    /// mounting a second copy of this router.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
+    }
 }
 
 /// The qualified ARN of the log group `name`, which is the form `logGroupArn` takes.

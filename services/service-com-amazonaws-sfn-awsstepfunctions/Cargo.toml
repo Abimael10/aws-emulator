@@ -90,9 +90,12 @@ service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 # control-plane request makes is decided for the identity that signed it.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # Where this service's own observability goes: the `AWS/States` metric series an
-# execution publishes, and the execution-history events a logging configuration
-# delivers — written into the stores CloudWatch's and CloudWatch Logs' own readers
-# answer from, so a published metric and its reader cannot disagree.
+# execution publishes — written into the store CloudWatch's own readers answer from, so a
+# published metric and its reader cannot disagree. The execution-history events a logging
+# configuration delivers go in over CloudWatch Logs' own ingest path instead, because a
+# delivered event is an ordinary ingestion into the destination group; that service is
+# mounted beside this one by this crate's suites, which read the delivered events back
+# through its own API.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The opaque name of the session this service assumes a state machine's execution role

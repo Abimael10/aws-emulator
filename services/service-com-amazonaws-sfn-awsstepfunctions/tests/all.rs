@@ -342,5 +342,7 @@ mod vended_log_delivery_clock;
 mod vended_log_destination_grants;
 #[path = "all/vended_log_event_members.rs"]
 mod vended_log_event_members;
+#[path = "all/vended_log_ingest_consumers.rs"]
+mod vended_log_ingest_consumers;
 #[path = "all/zz_scratch.rs"]
 mod zz_scratch;

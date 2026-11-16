@@ -32,6 +32,14 @@
 //! [`delivered_into_held_group`] writes into the group CloudWatch Logs already holds and
 //! creates none — a destination that is not there loses the records and stays absent.
 //!
+//! Whichever form it takes, the write goes in through CloudWatch Logs' OWN ingest path
+//! (`PutLogEvents`) rather than into that service's store: a delivered record is an
+//! ingestion into the destination group, so it is subject to every consumer that group is
+//! configured with — its metric filters, its subscription filters, its data protection
+//! policy, the Insights rules collecting from it and its own ingestion metrics — exactly as
+//! a record a client put there is. A deliverer whose records already carry the instants they
+//! report delivers them at those instants ([`delivered_stamped_over`]).
+//!
 //! `service-com-amazonaws-mediapackage-mediapackage` still carries its own copy of this
 //! reading (`state::is_log_group_name`), inlined before this module existed and pinned by
 //! that service's own refusal suite; it is to be MIGRATED onto this one rather than copied
@@ -40,8 +48,12 @@
 //! in `service-com-amazonaws-ivschat-amazoninteractivevideoservicechat/src/state/log_destinations.rs`
 //! and the variant in
 //! `service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice/src/ops/set_log_delivery_configuration/log_destinations.rs`,
-//! each to be migrated in the change that owns its service. Nothing new should restate any of
-//! it — call this module.
+//! each to be migrated in the change that owns its service — and for the two copies of the
+//! BATCH SPLIT [`delivered_stamped_over`] now states, in
+//! `service-com-amazonaws-rum-rum/src/state/cw_log_delivery.rs` and
+//! `service-com-amazonaws-fis-faultinjectionsimulator/src/state/experiment_logs.rs`, each of
+//! which splits its own delivery against its own copy of `PutLogEvents`' published bounds.
+//! Nothing new should restate any of it — call this module.
 
 /// The shortest log group name CloudWatch Logs holds — so the empty string names no group.
 pub const MIN_LOG_GROUP_NAME_CHARS: usize = 1;
@@ -237,6 +249,33 @@ pub async fn delivered_over(
     write(callback, region, log_group, log_stream, records, true).await
 }
 
+/// [`delivered_over`] for records that each carry the instant it OBSERVED, rather than the
+/// instant they are handed over.
+///
+/// A deliverer whose records are already stamped — the history events of a workflow
+/// execution, each written as its own step happened — delivers them at those instants, so a
+/// consumer of the group reads each record in the period it belongs to instead of in the
+/// period the delivery happened to be made in. Everything else is the same write
+/// ([`delivered_over`]): the group and the stream are created, and the events go in through
+/// CloudWatch Logs' own ingest path.
+///
+/// `events` are `(instant in epoch milliseconds, record)` pairs, in any order: they are
+/// delivered oldest first, because "the log events in the batch must be in chronological
+/// order by their timestamp" (`PutLogEvents`).
+pub async fn delivered_stamped_over(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    log_group: &str,
+    log_stream: &str,
+    events: &[(i64, String)],
+) -> bool {
+    let stamped: Vec<(i64, &str)> = events
+        .iter()
+        .map(|(at, record)| (*at, record.as_str()))
+        .collect();
+    write_events(callback, region, log_group, log_stream, &stamped, true).await
+}
+
 /// [`delivered`] into a destination the service delivering is POINTED AT rather than one it
 /// publishes itself: the records go into the log group CloudWatch Logs already holds under
 /// that name, and no group is created.
@@ -275,7 +314,7 @@ pub async fn delivered_into_held_group_over(
 }
 
 /// The one vended-logs write both forms above are: the records as log events in
-/// `log_stream` of `log_group`.
+/// `log_stream` of `log_group`, each stamped with the instant it is delivered.
 ///
 /// `provisions_group` is the ONE difference between them — whether the group itself is
 /// created when CloudWatch Logs does not hold it — so a destination the delivering service
@@ -289,7 +328,45 @@ async fn write(
     records: &[String],
     provisions_group: bool,
 ) -> bool {
-    if records.is_empty() {
+    let at = epoch_millis(::std::time::SystemTime::now());
+    let events: Vec<(i64, &str)> = records
+        .iter()
+        .map(|record| (at, record.as_str()))
+        .collect();
+    write_events(callback, region, log_group, log_stream, &events, provisions_group).await
+}
+
+/// The most log events ONE `PutLogEvents` request may carry. Source: that operation's own
+/// documentation — "the maximum number of log events in a batch is 10,000".
+const MAX_BATCH_EVENTS: usize = 10_000;
+
+/// The most one `PutLogEvents` request may weigh. Source: "the maximum batch size is
+/// 1,048,576 bytes. This size is calculated as the sum of all event messages in UTF-8, plus
+/// 26 bytes for each log event".
+const MAX_BATCH_BYTES: usize = 1_048_576;
+
+/// The per-event overhead that accounting rule charges; see [`MAX_BATCH_BYTES`].
+const EVENT_OVERHEAD_BYTES: usize = 26;
+
+/// The longest span one `PutLogEvents` request's events may cover. Source: "the time span
+/// in a single batch cannot exceed 24 hours. Otherwise, the operation fails".
+const MAX_BATCH_SPAN_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// [`write`] for records that carry their own instants, which is what both forms end in.
+///
+/// The events are delivered in CHRONOLOGICAL order and in requests inside the three bounds
+/// `PutLogEvents` publishes for one batch ([`MAX_BATCH_EVENTS`], [`MAX_BATCH_BYTES`],
+/// [`MAX_BATCH_SPAN_MS`]), so a deliverer handing over more than one request's worth of
+/// records delivers all of them rather than having the whole batch refused for its size.
+async fn write_events(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    log_group: &str,
+    log_stream: &str,
+    events: &[(i64, &str)],
+    provisions_group: bool,
+) -> bool {
+    if events.is_empty() {
         return true;
     }
     let client = logs_client(callback, region);
@@ -355,36 +432,76 @@ async fn write(
             return false;
         }
     }
-    let at = epoch_millis(::std::time::SystemTime::now());
-    let events: Vec<::aws_sdk_cloudwatchlogs::types::InputLogEvent> = records
-        .iter()
-        .filter_map(|record| {
-            ::aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
-                .timestamp(at)
-                .message(record)
-                .build()
-                .ok()
-        })
-        .collect();
-    let count = events.len();
-    if let Err(error) = client
-        .put_log_events()
-        .log_group_name(log_group)
-        .log_stream_name(log_stream)
-        .set_log_events(Some(events))
-        .send()
-        .await
-    {
-        ::tracing::warn!(
-            log_group = %log_group,
-            log_stream = %log_stream,
-            records = count,
-            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-            "these records could not be delivered to CloudWatch Logs"
-        );
-        return false;
+    // Oldest first, keeping the order the deliverer handed records of one instant over in:
+    // a batch out of chronological order is refused whole.
+    let mut ordered: Vec<(i64, &str)> = events.to_vec();
+    ordered.sort_by_key(|(at, _)| *at);
+    let mut delivered = true;
+    for batch in batches(&ordered) {
+        let inputs: Vec<::aws_sdk_cloudwatchlogs::types::InputLogEvent> = batch
+            .iter()
+            .filter_map(|(at, record)| {
+                ::aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
+                    .timestamp(*at)
+                    .message(*record)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        let count = inputs.len();
+        if let Err(error) = client
+            .put_log_events()
+            .log_group_name(log_group)
+            .log_stream_name(log_stream)
+            .set_log_events(Some(inputs))
+            .send()
+            .await
+        {
+            ::tracing::warn!(
+                log_group = %log_group,
+                log_stream = %log_stream,
+                records = count,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "these records could not be delivered to CloudWatch Logs"
+            );
+            delivered = false;
+        }
     }
-    true
+    delivered
+}
+
+/// `ordered` split into the runs one `PutLogEvents` request carries: at most
+/// [`MAX_BATCH_EVENTS`] events, weighing at most [`MAX_BATCH_BYTES`] between them and
+/// covering at most [`MAX_BATCH_SPAN_MS`].
+///
+/// A single record past the batch weight is its own batch rather than being dropped here:
+/// what CloudWatch Logs does with an event over its own per-event limit is that service's to
+/// answer, and this is only the split.
+fn batches<'r>(ordered: &[(i64, &'r str)]) -> Vec<Vec<(i64, &'r str)>> {
+    let mut batches: Vec<Vec<(i64, &str)>> = Vec::new();
+    let mut batch: Vec<(i64, &str)> = Vec::new();
+    let mut bytes: usize = 0;
+    let mut opened_at: i64 = 0;
+    for event in ordered {
+        let weight = event.1.len().saturating_add(EVENT_OVERHEAD_BYTES);
+        let full = !batch.is_empty()
+            && (batch.len() >= MAX_BATCH_EVENTS
+                || bytes.saturating_add(weight) > MAX_BATCH_BYTES
+                || event.0.saturating_sub(opened_at) > MAX_BATCH_SPAN_MS);
+        if full {
+            batches.push(::std::mem::take(&mut batch));
+            bytes = 0;
+        }
+        if batch.is_empty() {
+            opened_at = event.0;
+        }
+        batch.push(*event);
+        bytes = bytes.saturating_add(weight);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
 }
 
 /// A CloudWatch Logs client over the in-process callback into this same emulator.
@@ -518,6 +635,94 @@ mod tests {
                 acceptable,
                 "case {length} characters: expected acceptable={acceptable}, got {}",
                 is_log_group_name(&name)
+            );
+        }
+    }
+
+    /// One row of the split table: what it is about, the records handed over, and how many
+    /// requests the published bounds make of them.
+    struct Split {
+        case: &'static str,
+        events: Vec<(i64, String)>,
+        requests: usize,
+    }
+
+    #[test]
+    fn a_delivery_is_split_into_requests_inside_both_published_batch_bounds() {
+        let kilobyte = "m".repeat(1_024);
+        let rows: Vec<Split> = vec![
+            Split {
+                case: "one record is one request",
+                events: vec![(1, "one".to_string())],
+                requests: 1,
+            },
+            Split {
+                case: "a delivery inside both bounds is one request",
+                events: (0..100).map(|index| (index, kilobyte.clone())).collect(),
+                requests: 1,
+            },
+            Split {
+                case: "a delivery past the event count is split by it",
+                events: (0..(MAX_BATCH_EVENTS as i64 + 1))
+                    .map(|index| (index, "m".to_string()))
+                    .collect(),
+                requests: 2,
+            },
+            Split {
+                case: "a delivery past the batch weight is split by it",
+                events: (0..2_048).map(|index| (index, kilobyte.clone())).collect(),
+                requests: 3,
+            },
+            Split {
+                case: "a record heavier than one batch is its own request",
+                events: vec![
+                    (1, "m".repeat(MAX_BATCH_BYTES + 1)),
+                    (2, "after".to_string()),
+                ],
+                requests: 2,
+            },
+            Split {
+                case: "a delivery spanning more than one batch's span is split by it",
+                events: vec![
+                    (0, "first".to_string()),
+                    (MAX_BATCH_SPAN_MS, "at the bound".to_string()),
+                    (MAX_BATCH_SPAN_MS + 1, "past it".to_string()),
+                ],
+                requests: 2,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let expected = row.requests;
+            let ordered: Vec<(i64, &str)> = row
+                .events
+                .iter()
+                .map(|(at, record)| (*at, record.as_str()))
+                .collect();
+            let split = batches(&ordered);
+            assert_eq!(
+                split.len(),
+                expected,
+                "case {case:?}: expected {expected} request(s), got {}",
+                split.len()
+            );
+            for batch in &split {
+                assert!(
+                    batch.len() <= MAX_BATCH_EVENTS,
+                    "case {case:?}: a request carries at most {MAX_BATCH_EVENTS} events, got {}",
+                    batch.len()
+                );
+            }
+            // Every record is delivered exactly once, in the order it was handed over.
+            let regrouped: Vec<(i64, &str)> = split
+                .iter()
+                .flat_map(|batch| batch.iter().copied())
+                .collect();
+            assert_eq!(
+                regrouped, ordered,
+                "case {case:?}: expected every record once and in order, got {} of {}",
+                regrouped.len(),
+                ordered.len()
             );
         }
     }

@@ -80,7 +80,8 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for Metered<Eng> {
             .ok()
             .and_then(super::identity_authorization::served_operation)
             {
-                crate::state::observability::meter_api_call(&*self.engine, api_name);
+                crate::state::observability::meter_api_call(&*self.engine, ctx.callback(), api_name)
+                    .await;
             }
             answered
         })

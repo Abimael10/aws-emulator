@@ -470,7 +470,7 @@ async fn hand_over<Eng: Send + Sync + 'static>(
     // X-Ray whether or not anybody calls this service again
     // ([`super::xray_tracing`]).
     let segments = super::xray_tracing::publish(engine, callback).await;
-    changes + segments + super::observability::publish(&**engine)
+    changes + segments + super::observability::publish(&**engine, callback).await
 }
 
 /// Publish what is queued onto the account's event bus, and answer how many changes went
