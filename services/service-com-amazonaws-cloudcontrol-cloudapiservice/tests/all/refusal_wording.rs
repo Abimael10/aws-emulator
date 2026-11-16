@@ -158,6 +158,24 @@ pub(crate) fn generic_not_found(type_name: &str, identifier: &str) -> String {
     format!("Resource of type '{type_name}' with identifier '{identifier}' was not found.")
 }
 
+/// The identifier a not-found diagnostic NAMES, taken from between the fixed text that
+/// brackets it ([`generic_not_found`]) — so a case reads the rendering the service chose
+/// rather than being handed the one it expected.
+///
+/// The fixed text is spelled once, here, beside the composer that writes it, so a suite
+/// that reads a rendering back out of a refusal cannot disagree with one that states the
+/// whole sentence.
+pub(crate) fn rendered_identifier(stated: &str, type_name: &str, case: &str) -> String {
+    let opening = format!("Resource of type '{type_name}' with identifier '");
+    stated
+        .split_once(&opening)
+        .and_then(|(_, rest)| rest.split_once("' was not found."))
+        .map(|(identifier, _)| identifier.to_string())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a not-found diagnostic, got {stated:?}")
+        })
+}
+
 /// The resource types whose handler names the resource as the PRIMARY-IDENTIFIER OBJECT
 /// the type's registry schema declares, with the pointer that schema's `primaryIdentifier`
 /// holds.

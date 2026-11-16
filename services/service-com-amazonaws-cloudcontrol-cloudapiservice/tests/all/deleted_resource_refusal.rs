@@ -24,7 +24,9 @@
 use serde_json::{json, Value};
 
 use super::emulator::{code, message, progress, text, Emulator, STATUS_FAILED};
-use super::refusal_wording::{assert_handler_not_found, handler_rendered_not_found, inert_patch};
+use super::refusal_wording::{
+    assert_handler_not_found, handler_rendered_not_found, inert_patch, rendered_identifier,
+};
 
 /// The type whose resources live in the CloudWatch Logs service's own store, and whose
 /// handler names the resource as the type's primary-identifier object.
@@ -47,7 +49,7 @@ const QUEUE: &str = "AWS::SQS::Queue";
 /// asynchronous delete is ADMITTED and reports the same verdict on the request record it
 /// minted, where the diagnostic and the handler error code each have a member of their
 /// own.
-async fn assert_every_refusal_names_the_resource(
+pub(crate) async fn assert_every_refusal_names_the_resource(
     emulator: &Emulator,
     type_name: &str,
     identifier: &str,
@@ -207,12 +209,7 @@ async fn a_rendered_identifier_is_the_json_object_the_schemas_pointer_names() {
         "the deleted group: expected HTTP 400, got {status} with body {body:?}"
     );
     let stated = message(&body);
-    let opening = format!("Resource of type '{LOG_GROUP}' with identifier '");
-    let rendered = stated
-        .split_once(&opening)
-        .and_then(|(_, rest)| rest.split_once("' was not found."))
-        .map(|(identifier, _)| identifier.to_string())
-        .unwrap_or_else(|| panic!("expected a not-found diagnostic, got {stated:?}"));
+    let rendered = rendered_identifier(&stated, LOG_GROUP, "the deleted group");
     let parsed: Value = serde_json::from_str(&rendered)
         .unwrap_or_else(|_| panic!("expected the identifier as JSON, got {rendered:?}"));
     assert_eq!(

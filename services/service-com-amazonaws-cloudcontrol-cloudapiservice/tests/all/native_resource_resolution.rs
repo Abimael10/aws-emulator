@@ -69,9 +69,17 @@ fn expected_model(name: &str, retention: Option<i64>) -> Value {
     model
 }
 
-/// Every log group name the OWNING service's own reader reports.
-async fn native_groups(emulator: &Emulator) -> Vec<String> {
-    let described = emulator.logs_ok("DescribeLogGroups", json!({})).await;
+/// Every log group name the OWNING service's own reader reports, under `prefix` where one
+/// narrows the read.
+///
+/// Shared with the sibling suites that ask the same reader, so no two of them open
+/// `DescribeLogGroups` a different way.
+pub(crate) async fn native_groups(emulator: &Emulator, prefix: Option<&str>) -> Vec<String> {
+    let mut request = json!({});
+    if let Some(prefix) = prefix {
+        request["logGroupNamePrefix"] = json!(prefix);
+    }
+    let described = emulator.logs_ok("DescribeLogGroups", request).await;
     described["logGroups"]
         .as_array()
         .cloned()
@@ -203,9 +211,9 @@ async fn a_resource_the_owning_service_no_longer_holds_is_reported_as_not_found(
              body {body:?}"
         );
         assert!(
-            native_groups(&emulator).await.contains(&name),
+            native_groups(&emulator, None).await.contains(&name),
             "case {case:?}: the owning service must hold the created group, it holds {:?}",
-            native_groups(&emulator).await
+            native_groups(&emulator, None).await
         );
 
         if delete_through_cc {
@@ -241,9 +249,9 @@ async fn a_resource_the_owning_service_no_longer_holds_is_reported_as_not_found(
             "case {case:?}: the refusal must name the handler invocation that failed"
         );
         assert!(
-            !native_groups(&emulator).await.contains(&name),
+            !native_groups(&emulator, None).await.contains(&name),
             "case {case:?}: the owning service must hold the group no longer, it holds {:?}",
-            native_groups(&emulator).await
+            native_groups(&emulator, None).await
         );
         let listed = emulator.walk(LOG_GROUP, None).await;
         assert!(
@@ -427,7 +435,7 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
              {body:?}"
         );
         assert!(
-            !native_groups(&emulator).await.contains(&identifier),
+            !native_groups(&emulator, None).await.contains(&identifier),
             "case {case:?}: a refused create must leave the owning service holding nothing"
         );
     }
@@ -521,7 +529,7 @@ async fn a_delete_the_owning_service_refuses_leaves_the_resource_where_it_is() {
         "the resource must stay exactly as the owning service holds it"
     );
     assert!(
-        native_groups(&emulator).await.contains(&name.to_string()),
+        native_groups(&emulator, None).await.contains(&name.to_string()),
         "the owning service must still hold the group"
     );
 }

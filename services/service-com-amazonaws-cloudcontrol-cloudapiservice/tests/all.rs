@@ -39,6 +39,8 @@ mod native_queue_lifecycle;
 mod native_resource_resolution;
 #[path = "all/not_found_refusal_status.rs"]
 mod not_found_refusal_status;
+#[path = "all/owning_service_delete_refusal.rs"]
+mod owning_service_delete_refusal;
 #[path = "all/patch_path_refusals.rs"]
 mod patch_path_refusals;
 #[path = "all/patch_removal_defaults.rs"]
