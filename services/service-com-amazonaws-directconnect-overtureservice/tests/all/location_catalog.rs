@@ -26,22 +26,27 @@
 //!   the partners that deliver at THAT location, published in the roster's own
 //!   (non-alphabetical) order and named in the trade forms AWS prints (`Colt`,
 //!   `GTT`, `Comcast`, `Console Connect`), never an expanded company name;
-//! * `availableBillingModes` holds exactly one entry, the usage-based mode, on the
-//!   location's own port speeds and with no `includedRegions`.
+//! * `availableBillingModes` opens with the usage-based mode, on the location's own
+//!   port speeds and with no `includedRegions`, and then carries one entry per
+//!   flat-rate tier offered at that location, in tier order, each on that location's
+//!   own flat-rate (10G/100G) ports and naming the Amazon Web Services Regions whose
+//!   data transfer that tier includes.
 //!
 //! The tables span the class the rule generalises over: every Region the catalog
 //! holds (and one it holds none in), facilities with one partner and with several,
 //! port-speed sets with and without 100G and 400G, demarcations with and without
-//! MACsec, and partner lists from a whole-roster carrier hotel down to a handful at a
-//! metro site.
+//! MACsec, partner lists from a whole-roster carrier hotel down to a handful at a
+//! metro site, and locations publishing no flat-rate tier, one and several.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_directconnect_overtureservice::ops::types::BILLING_MODE_VALUES;
 use service_com_amazonaws_directconnect_overtureservice::state::{
-    built_in_location_catalog, catalog_port_speeds, published_providers,
-    ComAmazonawsDirectconnectOvertureserviceState, LocationRecord, DEDICATED_PORT_SPEEDS,
-    DIRECT_CONNECT_PROVIDERS, MAC_SEC_PORT_SPEEDS, USAGE_BILLING_MODE,
+    built_in_location_catalog, catalog_port_speeds, flat_rate_billing_mode,
+    flat_rate_included_regions, published_providers, ComAmazonawsDirectconnectOvertureserviceState,
+    LocationRecord, DEDICATED_PORT_SPEEDS, DIRECT_CONNECT_PROVIDERS, FLAT_RATE_PORT_SPEEDS,
+    MAC_SEC_PORT_SPEEDS, MAX_FLAT_RATE_TIERS, USAGE_BILLING_MODE,
 };
 
 use crate::connection_and_virtual_interface_lifecycle::Emulator;
@@ -55,6 +60,143 @@ async fn describe_locations(dx: &Emulator) -> (u16, Vec<Value>) {
         status,
         response["locations"].as_array().cloned().unwrap_or_default(),
     )
+}
+
+/// The `includedRegions` a flat-rate tier publishes at a location in each Region the
+/// catalog holds one in, WRITTEN OUT rather than derived, so the expectation below
+/// cannot agree with the implementation by construction.
+///
+/// One row per (Region, tier) up to the highest tier the catalog offers: each tier
+/// names one area of Regions further out from the location's own, starting with the
+/// rest of its own area.
+const EXPECTED_INCLUDED_REGIONS: &[(&str, usize, &[&str])] = &[
+    ("us-east-1", 1, &["us-east-2"]),
+    ("us-east-1", 2, &["ca-central-1"]),
+    (
+        "us-east-1",
+        3,
+        &["eu-west-1", "eu-west-2", "eu-central-1", "eu-north-1"],
+    ),
+    ("us-east-2", 1, &["us-east-1"]),
+    ("us-east-2", 2, &["ca-central-1"]),
+    (
+        "us-east-2",
+        3,
+        &["eu-west-1", "eu-west-2", "eu-central-1", "eu-north-1"],
+    ),
+    ("us-west-1", 1, &["us-west-2"]),
+    ("us-west-1", 2, &["us-east-1", "us-east-2"]),
+    ("us-west-1", 3, &["ca-central-1"]),
+    ("us-west-2", 1, &["us-west-1"]),
+    ("us-west-2", 2, &["us-east-1", "us-east-2"]),
+    ("us-west-2", 3, &["ca-central-1"]),
+    (
+        "eu-west-2",
+        1,
+        &["eu-west-1", "eu-central-1", "eu-north-1"],
+    ),
+    (
+        "eu-west-2",
+        2,
+        &[
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-south-1",
+        ],
+    ),
+    ("eu-west-2", 3, &["sa-east-1"]),
+    (
+        "eu-central-1",
+        1,
+        &["eu-west-1", "eu-west-2", "eu-north-1"],
+    ),
+    (
+        "eu-central-1",
+        2,
+        &[
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-south-1",
+        ],
+    ),
+    ("eu-central-1", 3, &["sa-east-1"]),
+    (
+        "ap-southeast-1",
+        1,
+        &[
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-southeast-2",
+            "ap-south-1",
+        ],
+    ),
+    ("ap-southeast-1", 2, &["sa-east-1"]),
+    ("ap-southeast-1", 3, &["us-west-1", "us-west-2"]),
+    (
+        "ap-northeast-1",
+        1,
+        &[
+            "ap-northeast-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-south-1",
+        ],
+    ),
+    ("ap-northeast-1", 2, &["sa-east-1"]),
+    ("ap-northeast-1", 3, &["us-west-1", "us-west-2"]),
+];
+
+/// The written-out `includedRegions` for `region`'s tier `tier`, or `None` where this
+/// table names none (which makes the missing row the test's failure, not a silent
+/// pass).
+fn expected_included_regions(region: &str, tier: usize) -> Option<&'static [&'static str]> {
+    EXPECTED_INCLUDED_REGIONS
+        .iter()
+        .find(|(known, known_tier, _)| *known == region && *known_tier == tier)
+        .map(|(_, _, regions)| *regions)
+}
+
+/// The `availableBillingModes` a catalog record must publish, computed here from the
+/// record's own fields: the usage-based mode on every speed the location offers, then
+/// one entry per flat-rate tier offered there, in tier order, on the location's own
+/// flat-rate ports and naming the Regions that tier includes.
+fn expected_billing_modes(record: &LocationRecord) -> Vec<Value> {
+    let port_speeds: Vec<&str> = record
+        .available_port_speeds
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut modes = vec![json!({
+        "billingMode": USAGE_BILLING_MODE,
+        "availablePortSpeeds": port_speeds,
+    })];
+
+    let flat_rate_speeds: Vec<&str> = FLAT_RATE_PORT_SPEEDS
+        .iter()
+        .copied()
+        .filter(|speed| port_speeds.contains(speed))
+        .collect();
+    if flat_rate_speeds.is_empty() {
+        return modes;
+    }
+    for tier in 1..=record.flat_rate_tiers.min(MAX_FLAT_RATE_TIERS) {
+        let included = expected_included_regions(&record.region, tier).unwrap_or_else(|| {
+            panic!(
+                "case {:?}: this test's table names no Regions for tier {tier} in {}",
+                record.location_code, record.region
+            )
+        });
+        modes.push(json!({
+            "billingMode": format!("FlatRateTier{tier}"),
+            "availablePortSpeeds": flat_rate_speeds,
+            "includedRegions": included,
+        }));
+    }
+    modes
 }
 
 /// The `Location` JSON a catalog record must render to, computed here from the
@@ -83,11 +225,7 @@ fn expected_location(record: &LocationRecord) -> Value {
         "availablePortSpeeds": port_speeds,
         "availableProviders": record.available_providers,
         "availableMacSecPortSpeeds": mac_sec_speeds,
-        // Exactly one mode, on the location's own speeds, with no `includedRegions`.
-        "availableBillingModes": [{
-            "billingMode": USAGE_BILLING_MODE,
-            "availablePortSpeeds": port_speeds,
-        }],
+        "availableBillingModes": expected_billing_modes(record),
     })
 }
 
@@ -248,13 +386,15 @@ async fn a_location_is_published_per_colocation_partner_at_a_facility() {
 async fn a_location_the_issue_did_not_cite_renders_every_modeled_member() {
     // Two catalog entries spelled out rather than derived: eu-central-1's Frankfurt
     // facility, which no recorded trace names. Both its partner demarcations, one
-    // with MACsec on its own 10G/100G and one with none, and each with the single
-    // usage-based billing mode.
+    // with MACsec on its own 10G/100G and one with none, one offering flat-rate
+    // tiers and one offering the usage-based mode alone.
     //
     // Sources: `Location` (locationCode/locationName/region/availablePortSpeeds/
     // availableProviders/availableMacSecPortSpeeds/availableBillingModes, via
-    // smithy_query shape="Location"), the AWS Direct Connect facility and
-    // delivery-partner lists for the provider names and sites.
+    // smithy_query shape="Location"), `AvailableBillingMode` (billingMode/
+    // availablePortSpeeds/includedRegions) and `BillingMode` (the FlatRateTier names)
+    // for the billing modes, the AWS Direct Connect facility and delivery-partner
+    // lists for the provider names and sites.
     let dx = Emulator::in_region("eu-central-1");
     let (status, locations) = describe_locations(&dx).await;
     assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
@@ -290,6 +430,22 @@ async fn a_location_the_issue_did_not_cite_renders_every_modeled_member() {
                 "availableMacSecPortSpeeds": ["100G", "10G"],
                 "availableBillingModes": [
                     {"billingMode": "PayAsYouGo", "availablePortSpeeds": ["100G", "1G", "10G"]},
+                    {
+                        "billingMode": "FlatRateTier1",
+                        "availablePortSpeeds": ["10G", "100G"],
+                        "includedRegions": ["eu-west-1", "eu-west-2", "eu-north-1"],
+                    },
+                    {
+                        "billingMode": "FlatRateTier2",
+                        "availablePortSpeeds": ["10G", "100G"],
+                        "includedRegions": [
+                            "ap-northeast-1",
+                            "ap-northeast-2",
+                            "ap-southeast-1",
+                            "ap-southeast-2",
+                            "ap-south-1",
+                        ],
+                    },
                 ],
             }),
             json!({
@@ -318,6 +474,8 @@ async fn every_answered_location_satisfies_the_catalogs_invariants() {
     let known_providers: BTreeSet<&str> = DIRECT_CONNECT_PROVIDERS.iter().copied().collect();
     let mut speed_sets: BTreeSet<Vec<String>> = BTreeSet::new();
     let mut mac_sec_speeds_seen: BTreeSet<String> = BTreeSet::new();
+    let mut tiers_seen: BTreeSet<usize> = BTreeSet::new();
+    let mut modes_per_location: BTreeMap<String, usize> = BTreeMap::new();
 
     for region in regions {
         let dx = Emulator::in_region(region);
@@ -406,15 +564,70 @@ async fn every_answered_location_satisfies_the_catalogs_invariants() {
                 .cloned()
                 .unwrap_or_default();
             assert_eq!(
-                billing_modes,
-                vec![json!({
+                billing_modes.first(),
+                Some(&json!({
                     "billingMode": USAGE_BILLING_MODE,
                     "availablePortSpeeds": speeds,
-                })],
-                "case {case:?}: a location publishes exactly the usage-based mode, on its own port speeds and with no includedRegions, got {billing_modes:?}"
+                })),
+                "case {case:?}: a location publishes the usage-based mode first, on its own port speeds and with no includedRegions, got {billing_modes:?}"
             );
+
+            // Then one entry per flat-rate tier offered there: tier order without
+            // gaps, the location's own flat-rate ports, and a non-empty
+            // `includedRegions` that never names the location's own Region (its own
+            // Region's transfer is not what a tier adds).
+            let flat_rate_speeds: Vec<&str> = FLAT_RATE_PORT_SPEEDS
+                .iter()
+                .copied()
+                .filter(|speed| speeds.contains(speed))
+                .collect();
+            for (offset, mode) in billing_modes.iter().skip(1).enumerate() {
+                let tier = offset + 1;
+                let name = mode["billingMode"].as_str().unwrap_or_default();
+                assert_eq!(
+                    name,
+                    flat_rate_billing_mode(tier),
+                    "case {case:?}: the flat-rate modes follow the usage-based one in tier order, got {billing_modes:?}"
+                );
+                assert!(
+                    BILLING_MODE_VALUES.contains(&name),
+                    "case {case:?}: every published mode is a modelled BillingMode, got {name:?}"
+                );
+                assert!(
+                    tier <= MAX_FLAT_RATE_TIERS,
+                    "case {case:?}: no location publishes a tier above {MAX_FLAT_RATE_TIERS}, got {billing_modes:?}"
+                );
+                assert_eq!(
+                    mode["availablePortSpeeds"],
+                    json!(flat_rate_speeds),
+                    "case {case:?}: a flat-rate mode is offered on the location's own flat-rate ports {flat_rate_speeds:?}, got {:?}",
+                    mode["availablePortSpeeds"]
+                );
+                let included: Vec<&str> = mode["includedRegions"]
+                    .as_array()
+                    .map(|regions| regions.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                assert!(
+                    !included.is_empty() && !included.contains(&region),
+                    "case {case:?}: tier {tier} includes the Regions its flat fee covers, never the location's own, got {included:?}"
+                );
+                tiers_seen.insert(tier);
+            }
+            modes_per_location.insert(case.clone(), billing_modes.len());
         }
     }
+
+    // Per location, not catalog-wide: some locations offer flat-rate tiers and some
+    // publish the usage-based mode alone, and more than one tier is observable.
+    assert!(
+        modes_per_location.values().any(|count| *count == 1)
+            && modes_per_location.values().any(|count| *count > 2),
+        "flat-rate tiers are per-location data, so the catalog must publish locations without one and locations with several, got {modes_per_location:?}"
+    );
+    assert!(
+        tiers_seen.contains(&1) && tiers_seen.contains(&2),
+        "the catalog must publish the first tiers a location can offer, got {tiers_seen:?}"
+    );
 
     // Per-facility, not catalog-wide: the answers must not all carry one uniform
     // port-speed list, and 400G must be observable as something only some
@@ -654,13 +867,22 @@ async fn every_location_publishes_its_own_partners_in_the_catalogs_order() {
         distinct.len(),
         lists.len()
     );
-    // Two demarcations in ONE building are two locations, and a cross connect is
-    // ordered to one partner's patch panel, so their lists need not agree.
-    assert_ne!(
+    // Two demarcations in ONE building are two locations, and the recorded response
+    // prints the same partner list for both: a cross connect inside the building
+    // reaches the partners present in it.
+    assert_eq!(
         lists.get("EqSe2-EQ"),
         lists.get("EqSe2-WBE"),
-        "case \"EqSe2\": the demarcations in one building publish their own partner lists, got {:?}",
-        lists.get("EqSe2-EQ")
+        "case \"EqSe2\": the demarcations of one building publish the building's partners, got {:?} and {:?}",
+        lists.get("EqSe2-EQ"),
+        lists.get("EqSe2-WBE")
+    );
+    // Different buildings, though, publish their own lists.
+    assert_ne!(
+        lists.get("EqSe2-EQ"),
+        lists.get("TierPointSEA-TP"),
+        "case \"us-west-2\": a carrier hotel and a metro site in one Region publish their own partner lists, got {:?}",
+        lists.get("TierPointSEA-TP")
     );
     // Published order, not sorted order: at least one location's list is not
     // alphabetical, which an alphabetised catalog could never answer.
@@ -704,11 +926,10 @@ async fn every_location_publishes_its_own_partners_in_the_catalogs_order() {
 #[tokio::test]
 async fn the_seattle_demarcations_publish_the_partners_each_one_reaches() {
     // Three locations of one Region spelled out, spanning the class: the colocation
-    // partner's cage inside a carrier hotel (the demarcation a recorded
-    // `DescribeLocations` response for us-west-2 publishes these thirty partners
-    // for, in this order), the carrier hotel's own meet-me room in the SAME
-    // building, which reaches every partner on the roster, and a metro site in the
-    // same Region, which reaches a handful.
+    // partner's cage inside a carrier hotel and the carrier hotel's own meet-me room
+    // in the SAME building (the two demarcations a recorded `DescribeLocations`
+    // response for us-west-2 publishes these thirty partners for, in this order, for
+    // both), and a metro site in the same Region, which reaches a handful.
     let dx = Emulator::in_region("us-west-2");
     let (status, locations) = describe_locations(&dx).await;
     assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
@@ -755,18 +976,12 @@ async fn the_seattle_demarcations_publish_the_partners_each_one_reaches() {
     );
 
     // The meet-me room in the same building, spelled out rather than compared against
-    // the roster constant the implementation itself narrows: its list is the cage's
-    // thirty plus the one partner that delivers in the building but not at that cage,
-    // in the catalog's order.
-    let westin_building: Vec<String> = equinix_seattle
-        .iter()
-        .cloned()
-        .chain(["Tata Communications".to_string()])
-        .collect();
+    // the roster constant the implementation itself narrows: the recorded response
+    // publishes the building's thirty partners for it too, in the catalog's order.
     let answered = providers_of(&locations, "EqSe2-WBE");
     assert_eq!(
-        answered, westin_building,
-        "case \"EqSe2-WBE\": the carrier hotel's own meet-me room publishes every partner that delivers in the building, got {answered:?}"
+        answered, equinix_seattle,
+        "case \"EqSe2-WBE\": the carrier hotel's own meet-me room publishes the partners that deliver in the building, got {answered:?}"
     );
 
     let answered = providers_of(&locations, "TierPointSEA-TP");
@@ -774,6 +989,265 @@ async fn the_seattle_demarcations_publish_the_partners_each_one_reaches() {
         answered,
         vec!["Zayo Group", "CenturyLink", "AT&T", "Comcast"],
         "case \"TierPointSEA-TP\": a metro site publishes the carriers that deliver there, got {answered:?}"
+    );
+}
+
+/// The `locationName` the location `code` publishes.
+fn name_of(locations: &[Value], code: &str) -> String {
+    locations
+        .iter()
+        .find(|location| location["locationCode"] == json!(code))
+        .and_then(|location| location["locationName"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_locations_name_names_the_partners_site_inside_the_building() {
+    // `Location$locationName` is "the name of the location. This includes the name of
+    // the colocation partner and the physical site of the building" (via smithy_query
+    // shape="Location"), so the half after " | " has to say WHERE in the building the
+    // cross connect lands: a repeat of the building half names no site. Checked over
+    // every location the catalog publishes, in every Region it publishes one in.
+    let catalog = built_in_location_catalog();
+    let regions: BTreeSet<&str> = catalog
+        .values()
+        .map(|location| location.region.as_str())
+        .collect();
+
+    for region in regions {
+        let dx = Emulator::in_region(region);
+        let (status, locations) = describe_locations(&dx).await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: expected 200, got {status} with {locations:?}"
+        );
+
+        for location in &locations {
+            let case = location["locationCode"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let name = location["locationName"].as_str().unwrap_or_default();
+            let (building, site) = name.split_once(" | ").unwrap_or((name, ""));
+            assert!(
+                !building.is_empty() && !site.is_empty(),
+                "case {case:?}: a location name names the building AND the partner's site, got {name:?}"
+            );
+            assert_ne!(
+                site, building,
+                "case {case:?}: the second half names the partner's physical site inside the building, not the building again, got {name:?}"
+            );
+        }
+    }
+
+    // The carrier hotel's own meet-me room, spelled out: the building, then that
+    // room's own site designation inside it.
+    let dx = Emulator::in_region("us-west-2");
+    let (_, locations) = describe_locations(&dx).await;
+    assert_eq!(
+        name_of(&locations, "EqSe2-WBE"),
+        "Westin Building Exchange, Seattle, WA | Westin Building Exchange - SEA10 - Main FMMR, Seattle, WA",
+        "case \"EqSe2-WBE\": expected the building and the meet-me room's site designation, got {:?}",
+        name_of(&locations, "EqSe2-WBE")
+    );
+    // A building whose operator publishes its own demarcation names that room too,
+    // rather than repeating the building.
+    let pittock = name_of(&locations, "Pittock-PB");
+    assert_eq!(
+        pittock, "Pittock Block, Portland, OR | Pittock Block - Main MMR, Portland, OR",
+        "case \"Pittock-PB\": expected the building and its meet-me room, got {pittock:?}"
+    );
+}
+
+#[test]
+fn a_flat_rate_tier_includes_the_next_ring_of_regions_out() {
+    // The derivation every flat-rate mode's `includedRegions` is built by.
+    // `AvailableBillingMode$includedRegions` is "the Amazon Web Services Regions
+    // included with the billing mode" (via smithy_query
+    // shape="AvailableBillingMode"), and the catalog gives each successive tier the
+    // next area of Regions out from the location's own: tier 1 the rest of its own
+    // area, then one area per tier. The rows differ along what the rule generalises
+    // over: the Region asked about, its area's size, a tier past the last ring, a
+    // Region the catalog knows no area for, and tier 0.
+    let rows: &[(&str, &str, usize, &[&str])] = &[
+        // Recorded: a us-west-2 location's first tier includes us-west-1 and its
+        // second the US East Regions.
+        ("own-area", "us-west-2", 1, &["us-west-1"]),
+        ("next-area-out", "us-west-2", 2, &["us-east-1", "us-east-2"]),
+        ("third-ring", "us-west-2", 3, &["ca-central-1"]),
+        ("last-ring", "us-west-2", 6, &["sa-east-1"]),
+        ("past-the-last-ring", "us-west-2", 7, &[]),
+        (
+            "own-area-of-four",
+            "eu-central-1",
+            1,
+            &["eu-west-1", "eu-west-2", "eu-north-1"],
+        ),
+        (
+            "ring-after-a-four-region-area",
+            "eu-central-1",
+            2,
+            &[
+                "ap-northeast-1",
+                "ap-northeast-2",
+                "ap-southeast-1",
+                "ap-southeast-2",
+                "ap-south-1",
+            ],
+        ),
+        (
+            "own-area-minus-its-own-region",
+            "ap-northeast-1",
+            1,
+            &[
+                "ap-northeast-2",
+                "ap-southeast-1",
+                "ap-southeast-2",
+                "ap-south-1",
+            ],
+        ),
+        // An area holding only the location's own Region contributes no ring, so
+        // tier numbering does not skip: tier 1 is the next area out.
+        (
+            "area-of-one-does-not-skip-a-tier",
+            "ca-central-1",
+            1,
+            &["eu-west-1", "eu-west-2", "eu-central-1", "eu-north-1"],
+        ),
+        // A Region the catalog groups into no area: every area is a ring, from the
+        // first.
+        (
+            "region-outside-the-catalogs-areas",
+            "me-south-1",
+            1,
+            &["us-west-1", "us-west-2"],
+        ),
+        ("tier-zero", "us-west-2", 0, &[]),
+    ];
+
+    for (case, region, tier, expected) in rows {
+        let included = flat_rate_included_regions(region, *tier);
+        assert_eq!(
+            included, *expected,
+            "case {case:?}: expected {expected:?} for {region} tier {tier}, got {included:?}"
+        );
+    }
+
+    // Invariant over the tiers a location can publish: a tier never includes the
+    // location's own Region, and no Region is included by two tiers.
+    for region in ["us-west-2", "us-east-1", "eu-central-1", "ap-southeast-1"] {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for tier in 1..=MAX_FLAT_RATE_TIERS {
+            let included = flat_rate_included_regions(region, tier);
+            assert!(
+                !included.iter().any(|member| member == region),
+                "case {region:?}: tier {tier} must not include the location's own Region, got {included:?}"
+            );
+            for member in included {
+                assert!(
+                    seen.insert(member.clone()),
+                    "case {region:?}: {member} is included by more than one tier, got it again at tier {tier}"
+                );
+            }
+        }
+    }
+}
+
+/// The `availableBillingModes` of the location `code` names.
+fn billing_modes_of(locations: &[Value], code: &str) -> Vec<Value> {
+    locations
+        .iter()
+        .find(|location| location["locationCode"] == json!(code))
+        .and_then(|location| location["availableBillingModes"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_locations_billing_modes_are_the_usage_mode_then_its_flat_rate_tiers() {
+    // Five locations of one Region spelled out, spanning the class: the two
+    // demarcations the recording publishes the usage-based mode alone for, a
+    // demarcation offering two flat-rate tiers on its 10G/100G ports, one whose
+    // fastest port (400G) is not a flat-rate port, one offering a single tier with
+    // only a 10G flat-rate port, and a metro site offering none.
+    //
+    // Sources: `AvailableBillingMode` (billingMode/availablePortSpeeds/
+    // includedRegions) and `BillingMode` (PayAsYouGo, FlatRateTier1..FlatRateTier5),
+    // via smithy_query shape="AvailableBillingMode,BillingMode".
+    let dx = Emulator::in_region("us-west-2");
+    let (status, locations) = describe_locations(&dx).await;
+    assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
+
+    let usage_only_cases = [
+        ("EqSe2-EQ", json!(["100G", "1G", "10G"])),
+        ("EqSe2-WBE", json!(["100G", "1G", "10G", "400G"])),
+        ("TierPointSEA-TP", json!(["1G", "10G"])),
+    ];
+    for (case, speeds) in usage_only_cases {
+        let answered = billing_modes_of(&locations, case);
+        assert_eq!(
+            answered,
+            vec![json!({"billingMode": "PayAsYouGo", "availablePortSpeeds": speeds})],
+            "case {case:?}: a location offering no flat-rate tier publishes the usage-based mode alone, got {answered:?}"
+        );
+    }
+
+    let answered = billing_modes_of(&locations, "EqSe3-EQ");
+    assert_eq!(
+        answered,
+        vec![
+            json!({"billingMode": "PayAsYouGo", "availablePortSpeeds": ["100G", "1G", "10G"]}),
+            json!({
+                "billingMode": "FlatRateTier1",
+                "availablePortSpeeds": ["10G", "100G"],
+                "includedRegions": ["us-west-1"],
+            }),
+            json!({
+                "billingMode": "FlatRateTier2",
+                "availablePortSpeeds": ["10G", "100G"],
+                "includedRegions": ["us-east-1", "us-east-2"],
+            }),
+        ],
+        "case \"EqSe3-EQ\": expected the usage-based mode and the two flat-rate tiers offered there, got {answered:?}"
+    );
+
+    // 400G is not a flat-rate port, so a 400G facility's flat-rate modes still carry
+    // its 10G and 100G ports only.
+    let answered = billing_modes_of(&locations, "FlexHB1-FLX");
+    assert_eq!(
+        answered,
+        vec![
+            json!({
+                "billingMode": "PayAsYouGo",
+                "availablePortSpeeds": ["100G", "1G", "10G", "400G"],
+            }),
+            json!({
+                "billingMode": "FlatRateTier1",
+                "availablePortSpeeds": ["10G", "100G"],
+                "includedRegions": ["us-west-1"],
+            }),
+            json!({
+                "billingMode": "FlatRateTier2",
+                "availablePortSpeeds": ["10G", "100G"],
+                "includedRegions": ["us-east-1", "us-east-2"],
+            }),
+        ],
+        "case \"FlexHB1-FLX\": a flat-rate mode names the location's own flat-rate ports, got {answered:?}"
+    );
+
+    // A location that lands no 100G port offers its single tier on 10G alone.
+    let answered = billing_modes_of(&locations, "EqSe3-CL");
+    assert_eq!(
+        answered,
+        vec![
+            json!({"billingMode": "PayAsYouGo", "availablePortSpeeds": ["1G", "10G"]}),
+            json!({
+                "billingMode": "FlatRateTier1",
+                "availablePortSpeeds": ["10G"],
+                "includedRegions": ["us-west-1"],
+            }),
+        ],
+        "case \"EqSe3-CL\": expected the usage-based mode and one tier on its 10G port, got {answered:?}"
     );
 }
 

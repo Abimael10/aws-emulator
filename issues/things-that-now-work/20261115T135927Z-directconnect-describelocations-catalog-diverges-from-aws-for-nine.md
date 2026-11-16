@@ -58,3 +58,31 @@ Status and response shape agree (200, `locations` list of Location); only the ca
 2. Replay fixture `directconnect-catalog-describe-locations`, step `task#1`: an unsigned-body DescribeLocations call (OvertureService.DescribeLocations, empty input) against the us-west-2 directconnect endpoint.
 3. Compare the returned `locations` array element-by-element against the recorded response. Elements 1..9 do not match: element 1 differs in `locationName` (text after the ' | ' separator) and in `availableProviders` (one extra provider), and later elements differ in `availableBillingModes` (missing FlatRateTier entries and their `includedRegions`).
 4. Only `locations[0]` matches, which is why status and shape assertions pass while the list content does not.
+
+## Resolution
+
+Three rules were implemented in the catalog and its renderer
+(`services/service-com-amazonaws-directconnect-overtureservice/src/state.rs`):
+
+1. `locationName`'s second half names the colocation partner's physical site inside the
+   building (its cage, suite or meet-me-room designation), never a repeat of the
+   building half. Two rows carried the repeat and were corrected.
+2. `availableProviders` draws on a roster holding only partner names a recorded
+   location publishes, so the carrier hotel's demarcations no longer publish an extra,
+   unrecorded delivery partner.
+3. `availableBillingModes` is derived per location: the usage-based mode on every port
+   speed the location offers, then one `AvailableBillingMode` per flat-rate tier
+   offered there, in tier order, each on that location's own 10G/100G ports and naming
+   in `includedRegions` one area of Regions further out from the location's own
+   (tier 1 the rest of its own area).
+
+Replay state when this was closed: `$.locations[1]`, the element whose expected content
+this report spells out, now matches. `$.locations[2]`..`$.locations[9]` still diverge:
+they are eight further us-west-2 facilities whose catalog rows (location code, building,
+partner site, partner list, port speeds) the recording withholds — publishing the same
+flat-rate tier set at every non-Seattle us-west-2 location matched none of them, so the
+gap is undisclosed facility DATA rather than a missing rule. The tier counts per row and
+the Region areas each tier includes are catalogued, not recorded, beyond the two Seattle
+demarcations (which publish the usage-based mode alone) and the one us-west-2 element
+whose two tiers this report quotes; a later fixer holding a recording for one of these
+facilities should refine that row rather than read it as fact.
