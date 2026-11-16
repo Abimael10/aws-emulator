@@ -391,6 +391,29 @@ fn store(record: &mut Record, field: &str, value: String, budget: &Budget) {
     }
 }
 
+/// Report the ephemeral fields `names` as columns of the result.
+///
+/// A stage that DEFINES a field — a `parse`'s captures, an `eval`'s assignment, the columns a
+/// `lookup` joins — puts a field on every record it produces, and the fields the records carry
+/// are what the result reports: an ephemeral field is "available for use in subsequent
+/// commands" of the pipeline AND in the rows the query answers, so a run that computed one
+/// answers it beside the columns the result already carried. A stage that CHOOSES the columns
+/// (`fields`, `display`, an aggregation) still decides them for everything after it, so a
+/// projection narrowing the result after such a stage narrows it to what it names.
+fn declare_fields<N: IntoIterator<Item = String>>(rows: &mut Rows, names: N) {
+    let columns = rows.columns.get_or_insert_with(|| {
+        DEFAULT_COLUMNS
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect()
+    });
+    for name in names {
+        if !columns.contains(&name) {
+            columns.push(name);
+        }
+    }
+}
+
 /// `fields` / `display`: choose the columns the result carries, defining one for each item
 /// that is an expression rather than a plain field name.
 ///
@@ -522,6 +545,9 @@ fn parse_stage(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), 
             }
         }
     }
+    // The fields this stage extracted are fields of the records it produced, so the result
+    // reports them.
+    declare_fields(rows, names);
     Ok(())
 }
 
@@ -561,11 +587,7 @@ fn eval(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Executi
             let value = expression::evaluate(&expression, record, budget);
             store(record, &name, value.rendered(), budget);
         }
-        if let Some(columns) = rows.columns.as_mut() {
-            if !columns.contains(&name) {
-                columns.push(name);
-            }
-        }
+        declare_fields(rows, [name]);
     }
     Ok(())
 }
@@ -993,6 +1015,9 @@ fn lookup(
             }
         }
     }
+    // The columns this stage joined onto each record are fields of the records it produced, so
+    // the result reports them.
+    declare_fields(rows, joined.into_iter().map(|(_, name)| name));
     Ok(())
 }
 

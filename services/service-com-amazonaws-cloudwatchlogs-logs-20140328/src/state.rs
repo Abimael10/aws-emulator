@@ -220,6 +220,10 @@ pub mod kms_key_grant;
 /// decides whether a read is answered with that event or without it.
 pub mod event_key_access;
 
+/// Whether the key the ACCOUNT's query results are encrypted under can still serve them,
+/// which is what decides whether an Insights query runs at all.
+pub mod query_results_key_access;
+
 /// Why the ENTITY a `PutLogEvents` request carried was rejected, when it was — the one
 /// thing of such a request that is answered without costing the batch anything.
 pub mod entity_rejection;

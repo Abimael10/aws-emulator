@@ -280,9 +280,14 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
         // created declares that one field a second time. The fields of the log events
         // themselves are not declared by naming them: only a name the pipeline itself created
         // is already defined.
-        for (field, offset) in projected_fields(&lowercased, arguments, arguments_offset) {
+        //
+        // The text at fault is the whole COMMAND that declares the name a second time — the
+        // command word through the last character of what it acts on — which is the clause such
+        // a refusal points at ([`already_defined_failure`]).
+        let clause = (command_offset, command_offset + trimmed.chars().count());
+        for field in projected_fields(&lowercased, arguments) {
             if compiled.defined_fields.contains(&field) {
-                return Err(already_defined_failure(&field, offset));
+                return Err(already_defined_failure(&field, clause));
             }
         }
         // A command DEFINES an ephemeral field by naming it in an `as` clause, or with a named
@@ -290,9 +295,9 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
         // pipeline already defined cannot be defined again, because the two definitions would
         // name one field. A command that only READS a field (`display`, `stats`, `sort`,
         // `filter`, `dedup`) reads the one the pipeline already carries and declares nothing.
-        for (field, offset) in defined_fields(&lowercased, arguments, arguments_offset) {
+        for field in defined_fields(&lowercased, arguments) {
             if !compiled.defined_fields.insert(field.clone()) {
-                return Err(already_defined_failure(&field, offset));
+                return Err(already_defined_failure(&field, clause));
             }
         }
         compiled.stages.push(CompiledStage {
@@ -415,6 +420,22 @@ fn split_pipeline_of(query: &str, commands: &[&str]) -> Vec<Stage> {
             index = next;
             continue;
         }
+        // A regular-expression literal travels whole too, and the quotes INSIDE one are
+        // characters of the expression rather than string delimiters — a pattern that matches
+        // quoted text (`/"tag": "(?<tg>[^"]+)"/`) carries an odd number of them, so reading
+        // them as a string would leave one open and swallow every separator after it, and a
+        // `|` inside one is the expression's own alternation rather than a stage separator. A
+        // `/` opens a literal exactly where the command carrying it writes its pattern
+        // ([`opens_a_pattern`], the same places [`command_regex_literals`] reads one), so a `/`
+        // the query means as DIVISION opens none and cannot pair with a `/` standing later in
+        // the stage.
+        if character == REGEX_DELIMITER && opens_a_pattern(&current) {
+            if let Some(close) = closing_slash(&characters, index) {
+                current.extend(characters[index..=close].iter());
+                index = close + 1;
+                continue;
+            }
+        }
         if character == '|' && command_follows(&characters, index + 1, commands) {
             stages.push(Stage {
                 text: current.clone(),
@@ -438,6 +459,45 @@ fn split_pipeline_of(query: &str, commands: &[&str]) -> Vec<Stage> {
     }
     stages
 }
+
+/// Whether a regular-expression literal opens at the END of `stage_so_far` — the text of the
+/// stage read up to the `/` in question.
+///
+/// Each command that carries a pattern writes it in ONE place, which is the same place
+/// [`command_regex_literals`] reads one from, so the splitter and the per-stage reader cannot
+/// disagree about what is a pattern:
+///
+/// * `parse <field> <pattern>` — the pattern is the command's second operand, so a literal
+///   opens where the command word and the field have been read and nothing else has;
+/// * `filter <expression>` — an expression matches against a pattern with one of the match
+///   operators the query language defines, so a literal opens right after `like` or `=~`.
+///
+/// Everywhere else a `/` is the division operator (`filter (duration/1000) > 1`), which opens
+/// no literal at all.
+fn opens_a_pattern(stage_so_far: &str) -> bool {
+    let mut words = stage_so_far.split_whitespace();
+    let Some(command) = words.next().map(str::to_lowercase) else {
+        return false;
+    };
+    if command == PARSE {
+        // The field has been read, and the pattern is what follows it.
+        return words.next().is_some()
+            && words.next().is_none()
+            && stage_so_far.ends_with(char::is_whitespace);
+    }
+    if command != FILTER {
+        return false;
+    }
+    let before = stage_so_far.trim_end();
+    before.ends_with(MATCH_OPERATOR)
+        || before
+            .rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(LIKE))
+}
+
+/// The match operator written as a symbol, which a pattern may follow with no space.
+const MATCH_OPERATOR: &str = "=~";
 
 /// Whether a command of the language begins at `from`, after any blank space: the test a `|`
 /// is a stage separator by.
@@ -818,16 +878,15 @@ fn lookup_table_name(
     Ok(name.to_string())
 }
 
-/// The text of a `lookup` command's `OUTPUT` list and the character offset that text starts
-/// at, or `None` when the command carries no `OUTPUT` clause — which is optional, a `lookup`
-/// without one joining every column of the table.
-fn output_clause(arguments: &str, arguments_offset: usize) -> Option<(String, usize)> {
+/// The text of a `lookup` command's `OUTPUT` list, or `None` when the command carries no
+/// `OUTPUT` clause — which is optional, a `lookup` without one joining every column of the
+/// table.
+fn output_clause(arguments: &str) -> Option<String> {
     let keyword = tokens(arguments)
         .into_iter()
         .find(|token| token.text.to_lowercase() == OUTPUT)?;
     let after = keyword.offset + keyword.text.chars().count();
-    let text: String = arguments.chars().skip(after).collect();
-    Some((text, arguments_offset + after))
+    Some(arguments.chars().skip(after).collect())
 }
 
 /// Check a `limit` command's count: "limit — Specify the number of log events returned", so
@@ -852,7 +911,7 @@ fn check_limit_count(
     })
 }
 
-/// The ephemeral fields the stage DEFINES, each with the character offset of its name.
+/// The ephemeral fields the stage DEFINES.
 ///
 /// A field is defined by an `as <name>` clause — which `fields`, `parse`, `stats` and
 /// `pattern` all take — and by a named capture group of a `parse` command's regular
@@ -864,15 +923,11 @@ fn check_limit_count(
 /// OF ITEMS, each item an expression with an `as` clause of its own (`fields duration / 1000
 /// as seconds, svc`), so a comma there ends the clause and starts the next item — the names
 /// after the first are the items they belong to, which the stage reads rather than defines.
-fn defined_fields(
-    command: &str,
-    arguments: &str,
-    arguments_offset: usize,
-) -> Vec<(String, usize)> {
-    let mut defined: Vec<(String, usize)> = Vec::new();
+fn defined_fields(command: &str, arguments: &str) -> Vec<String> {
+    let mut defined: Vec<String> = Vec::new();
     if command == PARSE {
-        for literal in command_regex_literals(PARSE, arguments, arguments_offset) {
-            defined.extend(capture_group_names(&literal.pattern, literal.offset + 1));
+        for literal in command_regex_literals(PARSE, arguments, 0) {
+            defined.extend(capture_group_names(&literal.pattern));
         }
     }
     // A `lookup` command's two halves name different things. Before `OUTPUT` an `as` clause
@@ -881,40 +936,41 @@ fn defined_fields(
     // columns the `OUTPUT` list itself names are the table's own, joined onto each record, so
     // a pipeline that already names one of them is not defining it twice.
     if command == LOOKUP {
-        if let Some((output, offset)) = output_clause(arguments, arguments_offset) {
-            defined.extend(item_alias_names(&output, offset));
+        if let Some(output) = output_clause(arguments) {
+            defined.extend(item_alias_names(&output));
         }
         return defined;
     }
     if command == PARSE {
         // The glob form's one clause names every field the pattern extracts.
-        defined.extend(alias_names(arguments, arguments_offset));
+        defined.extend(alias_names(arguments));
         return defined;
     }
-    defined.extend(item_alias_names(arguments, arguments_offset));
+    defined.extend(item_alias_names(arguments));
     defined
 }
 
 /// The failure a query that names one ephemeral field twice over is refused with: the RULE it
-/// broke, the field's name, and then the marker this service prints where a refusal would
-/// otherwise state the SPAN of the text at fault ([`super::query_admission::NO_SPAN_MARKER`]),
-/// which this class carries none of — the fault is that the pipeline already holds a field of
-/// that name, not that any part of the query string is unreadable.
+/// broke, the field's name, and the span of the CLAUSE that declares it a second time — the
+/// command word through the last character of what that command acts on.
 ///
 /// Such a query PARSES: the duplicated name is a legal name where it stands. Naming a symbol
-/// the compiler stopped on would point the author at a legal token and state no rule at all.
-/// The modelled detail still locates the name inside the query
-/// (`QueryCompileError$location`), which is the structure the model declares for a location
-/// rather than text of the message.
-fn already_defined_failure(field: &str, offset: usize) -> QueryCompileFailure {
+/// the compiler stopped on would point the author at a legal token and state no rule at all, so
+/// the diagnostic states the rule and then the span, in the punctuation this service's compile
+/// diagnostics state one with: the clause's FIRST and LAST character, so the pair spans exactly
+/// the characters the clause occupies. The modelled detail carries the same place in the
+/// structure the model declares for it (`QueryCompileError$location`), where the second offset
+/// is one PAST the last character, the way every compile failure of this service reports one.
+fn already_defined_failure(field: &str, clause: (usize, usize)) -> QueryCompileFailure {
+    let (start_char_offset, end_char_offset) = clause;
     QueryCompileFailure {
         message: format!("{EPHEMERAL_FIELD_DEFINED_PREFIX}{field}"),
         refusal: Some(format!(
-            "{EPHEMERAL_FIELD_DEFINED_PREFIX}{field} {}",
-            super::query_admission::NO_SPAN_MARKER
+            "{EPHEMERAL_FIELD_DEFINED_PREFIX}{field} ([{start_char_offset},{}])",
+            end_char_offset.saturating_sub(1)
         )),
-        start_char_offset: offset,
-        end_char_offset: offset + field.chars().count(),
+        start_char_offset,
+        end_char_offset,
     }
 }
 
@@ -922,51 +978,47 @@ fn already_defined_failure(field: &str, offset: usize) -> QueryCompileFailure {
 /// it.
 const EPHEMERAL_FIELD_DEFINED_PREFIX: &str = "Ephemeral field is already defined: ";
 
-/// The fields a stage DECLARES by projecting them, each with the character offset of its name.
+/// The fields a stage DECLARES by projecting them.
 ///
 /// Only `fields` declares its projection: it "retrieves the specified fields from log events
 /// for display", so each item of its comma-separated list is a field of the records that stage
 /// produces. An item is a declaration only where it is a BARE NAME — an item that COMPUTES a
 /// value declares the name its own `as` clause gives it ([`defined_fields`]) and reads
 /// whatever fields its expression names.
-fn projected_fields(command: &str, arguments: &str, arguments_offset: usize) -> Vec<(String, usize)> {
+fn projected_fields(command: &str, arguments: &str) -> Vec<String> {
     if command != FIELDS {
         return Vec::new();
     }
-    let mut projected: Vec<(String, usize)> = Vec::new();
+    let mut projected: Vec<String> = Vec::new();
     let mut item = String::new();
-    let mut item_at = 0usize;
-    for (index, character) in arguments.chars().enumerate() {
+    for character in arguments.chars() {
         if character == ',' {
-            push_projected_item(&mut projected, &item, arguments_offset + item_at);
+            push_projected_item(&mut projected, &item);
             item.clear();
-            item_at = index + 1;
             continue;
         }
         item.push(character);
     }
-    push_projected_item(&mut projected, &item, arguments_offset + item_at);
+    push_projected_item(&mut projected, &item);
     projected
 }
 
-/// Add `item` to `projected` when it is one bare field name, at the offset that name itself
-/// starts at — the blank space an item opens with is not part of it.
-fn push_projected_item(projected: &mut Vec<(String, usize)>, item: &str, item_offset: usize) {
-    let leading = item.chars().take_while(|character| character.is_whitespace()).count();
+/// Add `item` to `projected` when it is one bare field name.
+fn push_projected_item(projected: &mut Vec<String>, item: &str) {
     let name = item.trim();
     if is_field_name(name) {
-        projected.push((name.to_string(), item_offset + leading));
+        projected.push(name.to_string());
     }
 }
 
-/// The named capture groups of `literal`, each with the character offset of its name.
+/// The named capture groups of `literal`.
 ///
 /// A named group is written `(?<name>` — the form `StartQuery`'s own `parse` examples use —
 /// or `(?P<name>`, the form the Python flavour spells the same group with; a group with no
 /// name defines no field.
-fn capture_group_names(literal: &str, literal_offset: usize) -> Vec<(String, usize)> {
+fn capture_group_names(literal: &str) -> Vec<String> {
     let characters: Vec<char> = literal.chars().collect();
-    let mut names: Vec<(String, usize)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut index = 0usize;
     while index < characters.len() {
         if characters[index] == '\\' {
@@ -996,23 +1048,21 @@ fn capture_group_names(literal: &str, literal_offset: usize) -> Vec<(String, usi
             .take_while(|character| **character != '>')
             .collect();
         if !name.is_empty() {
-            names.push((name.clone(), literal_offset + name_at));
+            names.push(name.clone());
         }
         index = name_at + name.chars().count();
     }
     names
 }
 
-/// The names the `as` clauses of `arguments` assign to, each with the character offset of the
-/// name.
+/// The names the `as` clauses of `arguments` assign to.
 ///
 /// One clause may name several fields, as a glob `parse` does (`parse @message "* *" as a,
 /// b`), so the names of a comma-separated list are all defined by it.
-fn alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)> {
-    let mut names: Vec<(String, usize)> = Vec::new();
+fn alias_names(arguments: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
     let mut after_as = false;
     for token in tokens(arguments) {
-        let token_offset = arguments_offset + token.offset;
         if token.text.to_lowercase() == AS {
             after_as = true;
             continue;
@@ -1026,7 +1076,7 @@ fn alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)>
             continue;
         }
         if is_field_name(name) {
-            names.push((name.to_string(), token_offset));
+            names.push(name.to_string());
         }
         // A token that does not end in a comma ends the list it belongs to.
         if !token.text.ends_with(',') {
@@ -1036,8 +1086,7 @@ fn alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)>
     names
 }
 
-/// The name each `as` clause of a LIST OF ITEMS assigns to, with the character offset of the
-/// name.
+/// The name each `as` clause of a LIST OF ITEMS assigns to.
 ///
 /// One `as` clause of such a list names ONE field — the item it belongs to is one expression
 /// under one name — so the clause ends at its name and whatever follows the comma after it
@@ -1045,11 +1094,10 @@ fn alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)>
 /// reads `svc`). This is the form `fields`, `display`, `stats`, `pattern` and a `lookup`
 /// command's `OUTPUT` list are written in; a glob `parse`, whose single clause names several
 /// fields, is read by [`alias_names`].
-fn item_alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)> {
-    let mut names: Vec<(String, usize)> = Vec::new();
+fn item_alias_names(arguments: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
     let mut after_as = false;
     for token in tokens(arguments) {
-        let token_offset = arguments_offset + token.offset;
         if token.text.to_lowercase() == AS {
             after_as = true;
             continue;
@@ -1060,7 +1108,7 @@ fn item_alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, us
         after_as = false;
         let name = token.text.trim_matches(',');
         if is_field_name(name) {
-            names.push((name.to_string(), token_offset));
+            names.push(name.to_string());
         }
     }
     names

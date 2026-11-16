@@ -138,16 +138,26 @@ pub(super) fn unknown_function_call(
         if characters.get(end) == Some(&'(') {
             let name: String = characters[index..end].iter().collect();
             if !is_named_function(&name) {
-                let (start_char_offset, end_char_offset) =
-                    (arguments_offset + index, arguments_offset + end);
+                // The offending clause is the whole CALL — the name, its brackets and the
+                // arguments between them — so the span covers it from the first character of
+                // the name to the bracket that closes it, which is what points a caller (or a
+                // console underlining the span) at the text that is wrong rather than at a
+                // truncated part of it.
+                let (start_char_offset, end_char_offset) = (
+                    arguments_offset + index,
+                    arguments_offset + call_end(&characters, end),
+                );
                 return Some(QueryCompileFailure {
                     message: format!("The function {name} is not a valid query function."),
                     // The sentence states the rule the query broke and where in the query
                     // string the call stands: the name parses fine, so a diagnostic naming a
                     // symbol the compiler stopped on would misreport a query that is wrong
-                    // about what the language defines.
+                    // about what the language defines. The pair it states is the clause's
+                    // FIRST and LAST character, while the modelled location carries one PAST
+                    // the last, the way every compile failure of this service reports one.
                     refusal: Some(format!(
-                        "{UNKNOWN_FUNCTION_PREFIX}{name} ([{start_char_offset},{end_char_offset}])"
+                        "{UNKNOWN_FUNCTION_PREFIX}{name} ([{start_char_offset},{}])",
+                        end_char_offset.saturating_sub(1)
                     )),
                     start_char_offset,
                     end_char_offset,
@@ -159,8 +169,31 @@ pub(super) fn unknown_function_call(
     None
 }
 
+/// One PAST the last character of the function call whose opening bracket stands at `open` in
+/// `characters` — the bracket that closes it, counting the brackets nested inside the
+/// arguments so a call taking another call is one clause.
+///
+/// A call the query never closed runs to the end of the text in hand, which is all there is of
+/// it to point at.
+fn call_end(characters: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (offset, character) in characters.iter().enumerate().skip(open) {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return offset + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    characters.len()
+}
+
 /// The fixed text such a refusal opens with, the name the call used following it.
-const UNKNOWN_FUNCTION_PREFIX: &str = "Unknown function: ";
+const UNKNOWN_FUNCTION_PREFIX: &str = "Unrecognized function name: ";
 
 /// `arguments` with every LITERAL in it blanked out, so a scan over the result reads only
 /// text the query means as an expression.

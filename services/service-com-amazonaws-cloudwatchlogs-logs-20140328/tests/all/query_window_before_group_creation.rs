@@ -4,25 +4,26 @@
 //! asked over and the log groups that query reads: a range that CLOSES before a log group came
 //! into existence.
 //!
-//! The rule under test: a query whose `endTime` lies before the creation instant of a log group
-//! it reads covers no instant of that group's lifetime, so the request is refused with HTTP 400
-//! `MalformedQueryException` and NO query is created — `DescribeQueries` reports nothing for the
-//! group afterwards. The range's end is inclusive ("the range is inclusive, so the specified end
-//! time is included in the query", `StartQuery$endTime`, in "epoch time, the number of seconds
-//! since January 1, 1970"), so a range ending exactly at the instant the group was created
-//! covers that instant and is served; where the range OPENS is free, and a range opening long
-//! before the group existed still reads the events the group holds in it.
+//! The rule under test: a query whose `endTime` names a second that closes before the second a
+//! log group it reads was created IN covers no instant of that group's lifetime, so the request
+//! is refused with HTTP 400 `MalformedQueryException` and NO query is created —
+//! `DescribeQueries` reports nothing for the group afterwards. The range's end is inclusive and
+//! stated in whole seconds ("the range is inclusive, so the specified end time is included in
+//! the query", `StartQuery$endTime`, in "epoch time, the number of seconds since January 1,
+//! 1970"), so a range ending in the second the group was created in covers that creation
+//! instant and is served; where the range OPENS is free, and a range opening long before the
+//! group existed still reads the events the group holds in it.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so an answer a
 //! handler does not compute from the shared store cannot pass.
 //!
 //! The tables span what the rule generalises over rather than the one request an issue cites:
-//! how far before the creation instant the range closes (one second, minutes, an hour, a day,
-//! and down at `endTime`'s published minimum of 0), which of the three members names the log
-//! groups, how many groups the request names and whether only one of them is younger than the
-//! range, and — for what is SERVED — the range that ends exactly at the creation instant, one
-//! second past it, and one in the future.
+//! how far before that second the range closes (one second, minutes, an hour, a day, and down at
+//! `endTime`'s published minimum of 0), which of the three members names the log groups, how many
+//! groups the request names and whether only one of them is younger than the range, and — for
+//! what is SERVED — the range that ends in the second the group was created in, one second past
+//! it, and one in the future.
 //!
 //! The groups judged are the ones the REQUEST names, which is where `StartQuery` resolves them;
 //! a query whose own `SOURCE` command selects its log groups by prefix names none, and selects
@@ -69,16 +70,11 @@ const COMPLETION_DEADLINE: Duration = Duration::from_secs(30);
 /// How long between two looks at a started query's status.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The epoch SECOND a range must close at or after to cover `creation_ms`: the creation instant
-/// rounded UP to a whole second, since the range is stated in whole seconds and its end is
-/// inclusive.
+/// The epoch SECOND `creation_ms` falls IN: the second a range's end has to name, at the
+/// earliest, to cover the creation instant — the range is stated in whole seconds and its end is
+/// inclusive, so the whole of that second is part of the range.
 fn creation_second(creation_ms: i64) -> i64 {
-    let whole = creation_ms / 1_000;
-    if creation_ms % 1_000 == 0 {
-        whole
-    } else {
-        whole + 1
-    }
+    creation_ms / 1_000
 }
 
 /// The `creationTime` the service reports for `group`, in the epoch milliseconds
@@ -94,8 +90,7 @@ async fn group_creation_ms(logs: &Logs, group: &str) -> i64 {
         .unwrap_or_else(|| panic!("a log group carries creationTime, got {reported}"))
 }
 
-/// Create both log groups and answer the epoch second the younger one's creation instant falls
-/// in, rounded up.
+/// Create both log groups and answer the epoch second the younger one was created in.
 async fn groups(logs: &Logs) -> i64 {
     let mut latest = 0;
     for group in [GROUP, OTHER_GROUP] {
@@ -124,12 +119,12 @@ async fn a_range_closing_before_a_read_group_existed_is_refused_and_creates_no_q
     let (_, group_arn) = logs.group_arns(GROUP).await;
     let day = 24 * 60 * 60;
 
-    // (case, startTime, endTime, how the request names the log groups to query). Every end is
-    // before the second the groups were created in, so every row is the same condition reached
-    // by a different route.
+    // (case, startTime, endTime, how the request names the log groups to query). Every end names
+    // a second that closes before the second the groups were created in, so every row is the same
+    // condition reached by a different route.
     let cases: Vec<(&str, i64, i64, Value)> = vec![
         (
-            "a range closing one second before the group existed",
+            "a range closing the second before the group existed",
             created - 60,
             created - 1,
             json!({"logGroupName": GROUP}),
@@ -297,9 +292,9 @@ async fn a_range_is_judged_against_every_group_the_query_reads() {
     }
 }
 
-/// What the rule SERVES: a range reaching the creation instant or beyond, however far back it
-/// opens — and the events it then reads are the ones the group holds in it, including events
-/// stamped before the group itself was created.
+/// What the rule SERVES: a range reaching the second the group was created in, or beyond,
+/// however far back it opens — and the events it then reads are the ones the group holds in it,
+/// including events stamped before the group itself was created.
 #[tokio::test]
 async fn a_range_reaching_the_creation_instant_is_served_and_reads_the_events_in_it() {
     let logs = Logs::new();
@@ -328,16 +323,16 @@ async fn a_range_reaching_the_creation_instant_is_served_and_reads_the_events_in
     )
     .await;
 
-    // (case, startTime, endTime) — each range reaches the creation instant or beyond, and each
-    // opens before the backdated event.
+    // (case, startTime, endTime) — each range reaches the second the group was created in or
+    // beyond, and each opens before the backdated event.
     let cases: [(&str, i64, i64); 4] = [
         (
-            "a range ending exactly at the instant the group was created",
+            "a range ending in the second the group was created in",
             created_second - 60 * 60,
             created_second,
         ),
         (
-            "a range ending one second past the creation instant",
+            "a range ending one second past that second",
             created_second - 60 * 60,
             created_second + 1,
         ),

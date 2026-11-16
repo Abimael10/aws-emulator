@@ -54,12 +54,6 @@ const REFUSAL_STATUS: u16 = 400;
 /// The fixed text a refusal for a query the compiler could not build opens with.
 const COMPILE_ERROR: &str = "Compile Error - ";
 
-/// What this service prints where a refusal would otherwise state the span of the text at
-/// fault, for a fault class that carries none — read from the crate, which states it as the
-/// recorded text of this service's refusals
-/// (`state::query_admission::NO_SPAN_MARKER`).
-const NO_SPAN: &str = service_com_amazonaws_cloudwatchlogs_logs_20140328::state::query_admission::NO_SPAN_MARKER;
-
 /// A log group and the window a query of it is started with, in the epoch SECONDS
 /// `StartQuery`'s range is specified in.
 async fn group_with_window(logs: &Logs, group: &str) -> (i64, i64) {
@@ -329,51 +323,57 @@ async fn an_expression_that_compiles_is_admitted_however_its_groups_are_named() 
 }
 
 /// A pipeline that names one ephemeral field twice over is refused with the duplicate-field
-/// rule, the field's name and the no-span marker, and the modelled detail locates that name.
+/// rule, the field's name and the span of the CLAUSE that declares it again, and the modelled
+/// detail locates that clause too.
 #[tokio::test]
 async fn an_ephemeral_field_the_pipeline_already_carries_is_refused_by_the_rule() {
     let logs = Logs::new();
     const GROUP: &str = "/compile-rules/ephemeral";
     let window = group_with_window(&logs, GROUP).await;
 
-    // (case, the query string, the duplicated name) — the located range is asserted from that
-    // name's LAST place in the query (the first one is the definition the pipeline already
-    // carries), so a detail built from a fixed string cannot pass. The rows span how the second
-    // definition is written: a glob `as` clause, a named capture group, an aggregation's
-    // alias, a renaming item, and an item of a `fields` projection, which declares the fields
-    // its stage produces.
-    let cases: Vec<(&str, String, &str)> = vec![
+    // (case, the query string, the duplicated name, the clause that declares it a second time)
+    // — the span is asserted from that clause's own place in the query, so a detail built from
+    // a fixed string cannot pass. The rows span how the second definition is written: a glob
+    // `as` clause, a named capture group, an aggregation's alias, a renaming item, and an item
+    // of a `fields` projection, which declares the fields its stage produces.
+    let cases: Vec<(&str, String, &str, String)> = vec![
         (
             "a glob parse redefining a field another glob parse named",
             r#"fields @message | parse @message "lat=*" as lat | parse @message "lon=*" as lat"#
                 .to_string(),
             "lat",
+            r#"parse @message "lon=*" as lat"#.to_string(),
         ),
         (
             "a named capture group redefining a parsed field",
             r"parse @message /lat=(?<lat>\d+)/ | parse @message /lon=(?<lat>\d+)/".to_string(),
             "lat",
+            r"parse @message /lon=(?<lat>\d+)/".to_string(),
         ),
         (
             "an aggregation naming a parsed field",
             r"parse @message /(?<num>\d+)/ | stats count(*) as num".to_string(),
             "num",
+            "stats count(*) as num".to_string(),
         ),
         (
             "a fields item renaming an expression to a parsed field",
             r#"parse @message "svc=*" as svc | fields @message as svc"#.to_string(),
             "svc",
+            "fields @message as svc".to_string(),
         ),
         (
             "a fields projection naming a parsed field",
             r#"filter @message like /mk/ | parse @message "svc=* lat=* status=*" as svc, lat, st | sort @timestamp asc | fields @message, lat"#
                 .to_string(),
             "lat",
+            "fields @message, lat".to_string(),
         ),
         (
             "a fields projection naming a field a capture group produced",
             r"parse @message /lat=(?<lat>\d+)/ | fields @timestamp, lat".to_string(),
             "lat",
+            "fields @timestamp, lat".to_string(),
         ),
         (
             // The projection is read item by item, so the name does not have to be the first
@@ -381,6 +381,7 @@ async fn an_ephemeral_field_the_pipeline_already_carries_is_refused_by_the_rule(
             "a fields projection naming it last of several items",
             r"parse @message /lat=(?<lat>\d+)/ | fields @timestamp, @message, lat".to_string(),
             "lat",
+            "fields @timestamp, @message, lat".to_string(),
         ),
         (
             "a lookup output naming a parsed field",
@@ -389,6 +390,7 @@ async fn an_ephemeral_field_the_pipeline_already_carries_is_refused_by_the_rule(
                 r#"parse @message "tag=*" as tag"#, "compile_rule_users"
             ),
             "tag",
+            "lookup compile_rule_users user_id OUTPUT name AS tag".to_string(),
         ),
     ];
 
@@ -401,19 +403,20 @@ async fn an_ephemeral_field_the_pipeline_already_carries_is_refused_by_the_rule(
     )
     .await;
 
-    for (case, query, field) in &cases {
+    for (case, query, field, clause) in &cases {
         let (said, body) = refused_with(&logs, case, GROUP, window, query).await;
         let at = query
-            .rfind(field)
-            .unwrap_or_else(|| panic!("case {case}: the row carries the name {field:?}"));
-        let last = at + field.chars().count() - 1;
+            .rfind(clause.as_str())
+            .unwrap_or_else(|| panic!("case {case}: the row carries the clause {clause:?}"));
+        let last = at + clause.chars().count() - 1;
         assert_eq!(
             said,
-            format!("Ephemeral field is already defined: {field} {NO_SPAN}"),
-            "case {case}: expected the duplicate-field rule for {field:?}, got {said:?}"
+            format!("Ephemeral field is already defined: {field} ([{at},{last}])"),
+            "case {case}: expected the duplicate-field rule for {field:?} and the clause's own \
+             span, got {said:?}"
         );
         // The detail travels in the structure the model declares for it, locating the same
-        // name inside the query.
+        // clause inside the query.
         let location = &body["queryCompileError"]["location"];
         assert_eq!(
             (
@@ -424,7 +427,7 @@ async fn an_ephemeral_field_the_pipeline_already_carries_is_refused_by_the_rule(
                 Some(i64::try_from(at).unwrap_or(i64::MAX)),
                 Some(i64::try_from(last + 1).unwrap_or(i64::MAX)),
             ),
-            "case {case}: the compile error locates the duplicated name, got {body}"
+            "case {case}: the compile error locates the clause at fault, got {body}"
         );
     }
 }

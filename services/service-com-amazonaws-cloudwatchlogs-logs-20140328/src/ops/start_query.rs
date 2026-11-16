@@ -329,6 +329,17 @@ fn log_group_not_found(log_group_name: &str) -> StartQueryError {
     .into()
 }
 
+/// Refuse a query of an account whose query-result KMS key no longer lets CloudWatch Logs use
+/// it: the results this query would store are encrypted under that key, so they are a resource
+/// the service can no longer reach — which is what this operation models
+/// `ResourceNotFoundException` for ([`crate::state::query_results_key_access`]).
+fn query_results_key_unusable(message: String) -> StartQueryError {
+    StartQueryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// Refuse a query string that IS a statement of the query language the request named and does
 /// not compile: the compiler's own account of what it stopped on, stated the way this service
 /// states a compile failure (recorded: a refusal for a query the compiler could not build
@@ -424,9 +435,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a query is identified by the id this call
-        // mints and by nothing about the request.
-        let _ = ctx;
+        // `ctx` carries the Region the credential scope names — which is where the key policy
+        // of the account's query-result key is read — and otherwise only request metadata: a
+        // query is identified by the id this call mints and by nothing about the request.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartQueryError::from(StartQueryErrorModeled::ServiceUnavailableException(
@@ -435,7 +447,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let mut store = state.lock();
 
         // "The range is inclusive, so the specified end time is included in the query"
         // (`StartQuery$endTime`) — a range whose end precedes its start includes nothing, so
@@ -501,25 +512,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::parameter_pairs::cannot_be_combined(first, second),
             ));
         }
+        // "The exception is queries using the OpenSearch Service SQL query language, where you
+        // specify the log group names inside the querystring instead of here": for that
+        // language the statement's own source clause is the ONE place the log groups are named,
+        // so one of the two LEGACY members — which name one group and a list of groups by name
+        // — names them a second time over. `logGroupIdentifiers` is the member that clause
+        // OVERRIDES rather than conflicts with, so a request may carry it.
+        if sql
+            && named_members
+                .iter()
+                .any(|member| LEGACY_LOG_GROUP_MEMBERS.contains(member))
+        {
+            return Err(invalid_parameter(
+                crate::state::query_admission::log_group_source_conflict_refusal(),
+            ));
+        }
+
+        // "If you have associated a KMS key with the query results in this account, then
+        // StartQuery uses that key to encrypt the results when it stores them": while such an
+        // association stands, the key is in the path of every query of the account, so a key
+        // whose own policy no longer lets CloudWatch Logs use it for the query-result ARN
+        // leaves the results unreachable and the query is refused rather than run
+        // ([`crate::state::query_results_key_access`]). It is asked AFTER everything about the
+        // shape of the request, so a request that is wrong in itself is answered as the client
+        // error it is rather than as this authorization decision; KMS is asked with the store
+        // RELEASED, and the key the account associated is read out of it first.
+        let query_results_key = state.lock().query_results_kms_key_id.clone();
+        if let Some(message) = crate::state::query_results_key_access::refusal_for(
+            ctx,
+            &region,
+            query_results_key.as_deref(),
+        )
+        .await
+        {
+            return Err(query_results_key_unusable(message));
+        }
+
+        let mut store = state.lock();
 
         // Whichever place names them, the log groups are resolved to the names the store keys
         // them by: an identifier may be a name or either ARN form of one group.
         let log_group_names: Vec<String> = if sql {
-            // "The exception is queries using the OpenSearch Service SQL query language,
-            // where you specify the log group names inside the querystring instead of here":
-            // for this language the statement's own source clause is the ONE place the log
-            // groups are named, so one of the two LEGACY members — which name one group and a
-            // list of groups by name — names them a second time over. `logGroupIdentifiers`
-            // is the member that clause OVERRIDES rather than conflicts with, so a request
-            // may carry it.
-            if named_members
-                .iter()
-                .any(|member| LEGACY_LOG_GROUP_MEMBERS.contains(member))
-            {
-                return Err(invalid_parameter(
-                    crate::state::query_admission::log_group_source_conflict_refusal(),
-                ));
-            }
             let sources =
                 crate::state::insights::sql::statement_sources(&input.query_string);
             // A statement of this language that does not compile is a malformed query, which

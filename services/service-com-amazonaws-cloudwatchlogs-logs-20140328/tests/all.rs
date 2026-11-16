@@ -159,6 +159,8 @@ mod index_policy_removal;
 mod ingestion_window;
 #[path = "all/insights_queries.rs"]
 mod insights_queries;
+#[path = "all/insights_semantic_refusal_spans.rs"]
+mod insights_semantic_refusal_spans;
 #[path = "all/integrations.rs"]
 mod integrations;
 #[path = "all/json_filter_pattern_element_selectors.rs"]
@@ -241,6 +243,8 @@ mod metric_transformation_exclusion_wording;
 mod missing_destination_refusal;
 #[path = "all/parameter_pair_refusals.rs"]
 mod parameter_pair_refusals;
+#[path = "all/parsed_field_result_columns.rs"]
+mod parsed_field_result_columns;
 #[path = "all/policy_surface_refusals.rs"]
 mod policy_surface_refusals;
 #[path = "all/put_log_events_batch_constraints.rs"]
@@ -261,10 +265,14 @@ mod query_compile_rule_refusals;
 mod query_definitions;
 #[path = "all/query_language_admission.rs"]
 mod query_language_admission;
+#[path = "all/query_result_key_gate.rs"]
+mod query_result_key_gate;
 #[path = "all/query_results.rs"]
 mod query_results;
 #[path = "all/query_row_limit_and_handle_refusals.rs"]
 mod query_row_limit_and_handle_refusals;
+#[path = "all/query_selector_conflict_wording.rs"]
+mod query_selector_conflict_wording;
 #[path = "all/query_window_before_group_creation.rs"]
 mod query_window_before_group_creation;
 #[path = "all/query_window_refusal.rs"]
@@ -281,6 +289,8 @@ mod refusal_messages;
 mod refusal_text_variable_parts;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/regex_literal_pipelines.rs"]
+mod regex_literal_pipelines;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_policy_revision_ids.rs"]
@@ -367,5 +377,9 @@ mod vended_log_template_schemas;
 mod vended_parser_position;
 #[path = "all/waf_vended_parser.rs"]
 mod waf_vended_parser;
+#[path = "all/zz_probe_candidates.rs"]
+mod zz_probe_candidates;
 #[path = "all/zz_probe_defaults.rs"]
 mod zz_probe_defaults;
+#[path = "all/zz_probe_wire.rs"]
+mod zz_probe_wire;

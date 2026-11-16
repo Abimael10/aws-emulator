@@ -169,6 +169,17 @@ fn invalid_parameter(message: &str) -> GetQueryResultsError {
     .into()
 }
 
+/// Refuse a read of an account whose query-result KMS key no longer lets CloudWatch Logs use
+/// it: the stored results are encrypted under that key, so they are a resource the service can
+/// no longer reach — which is what this operation models `ResourceNotFoundException` for
+/// ([`crate::state::query_results_key_access`]).
+fn query_results_key_unusable(message: String) -> GetQueryResultsError {
+    GetQueryResultsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The kind tag this operation's pagination cursor carries, so a token minted by another
 /// paginated operation is refused rather than misread.
 const CURSOR_KIND: &str = "GetQueryResults";
@@ -232,9 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the results are named by `queryId` and by
-        // nothing about the request.
-        let _ = ctx;
+        // `ctx` carries the Region the credential scope names — which is where the key policy
+        // of the account's query-result key is read — and otherwise only request metadata: the
+        // results are named by `queryId` and by nothing about the request.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetQueryResultsError::from(GetQueryResultsErrorModeled::ServiceUnavailableException(
@@ -243,6 +255,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // "Even if you have not associated a key with your query results, the query results are
+        // encrypted when stored" (`AssociateKmsKey`): where the account HAS associated one, that
+        // key is what the stored results are encrypted under, so a key whose own policy no
+        // longer lets CloudWatch Logs use it for the query-result ARN leaves them unreachable
+        // and the read is refused rather than answered with the rows
+        // ([`crate::state::query_results_key_access`]). KMS is asked with the store RELEASED.
+        let associated_key = state.lock().query_results_kms_key_id.clone();
+        if let Some(message) = crate::state::query_results_key_access::refusal_for(
+            ctx,
+            &region,
+            associated_key.as_deref(),
+        )
+        .await
+        {
+            return Err(query_results_key_unusable(message));
+        }
         // Everything the results are computed from is read out of the store HERE, while it
         // is locked, and the query then runs with it released: reading one caller's results
         // is bounded work over the records it read, and every other request of this service

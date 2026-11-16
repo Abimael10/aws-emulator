@@ -63,18 +63,21 @@ pub fn mixed_log_class_refusal() -> String {
 /// following: Either exactly one of the following parameters … Or the queryString must
 /// include a SOURCE command"), and for the SQL language the statement's own source clause is
 /// that place — so a request carrying one of the members that name log groups BY NAME beside
-/// such a statement names them twice. Fixed text for the class, naming the places a request
-/// may name them in and nothing of the request itself.
+/// such a statement names them twice. Fixed text for the class: it QUOTES the three members
+/// that may name the log groups and carries nothing of the request itself.
 pub const LOG_GROUP_SOURCE_CONFLICT_MESSAGE: &str =
-    "Only one of logGroupName, logGroupNames, logGroupIdentifiers, or a source named in the \
-     queryString can be specified";
+    "Only one of the parameters 'logGroupName', 'logGroupNames' or 'logGroupIdentifiers' may \
+     be specified in a request";
 
-/// That sentence inside the envelope of the `InvalidParameterException` it is refused under.
+/// That sentence, which is the whole message.
+///
+/// The fault is in the SHAPE of the request — two places naming the log groups — and not in
+/// anything a query backend answered, so the refusal states the sentence ALONE: the SDK
+/// envelope this service appends to a refusal relayed from the query backend
+/// ([`super::with_sdk_error_envelope`]) would make an input-validation refusal read as such a
+/// relayed failure.
 pub fn log_group_source_conflict_refusal() -> String {
-    super::with_sdk_error_envelope(
-        LOG_GROUP_SOURCE_CONFLICT_MESSAGE,
-        super::ENVELOPE_INVALID_PARAMETER,
-    )
+    LOG_GROUP_SOURCE_CONFLICT_MESSAGE.to_string()
 }
 
 /// The sentence a query over a log group this account does not hold is refused with: the
@@ -135,22 +138,26 @@ pub fn range_outside_group_data_refusal() -> String {
 /// Whether the query range ending at `end_time_secs` closes before one of the log groups the
 /// query reads was created — the condition [`range_outside_group_data_refusal`] words.
 ///
-/// The range is stated in epoch SECONDS and a log group's `creationTime` in epoch
-/// milliseconds, so the end is scaled to milliseconds before the two are compared
-/// ([`super::MILLIS_PER_SECOND`]). The end is INCLUSIVE ("the range is inclusive, so the
-/// specified end time is included in the query"), so a range ending exactly at the instant a
-/// group was created still covers that instant. Groups this account does not hold have no
-/// creation instant and count for nothing here.
+/// The range is stated in whole epoch SECONDS and a log group's `creationTime` in epoch
+/// milliseconds, and the end is INCLUSIVE ("the range is inclusive, so the specified end time
+/// is included in the query"): the second the end names is part of the range, so the range
+/// reaches the LAST instant of that second ([`super::MILLIS_PER_SECOND`]). A range whose end
+/// names the second a group was created IN therefore covers the creation instant and is
+/// served, however far into that second the group was created; only a range that closes before
+/// that second began covers no instant of the group's lifetime. Groups this account does not
+/// hold have no creation instant and count for nothing here.
 pub fn window_ends_before_a_group_existed(
     store: &State,
     names: &[String],
     end_time_secs: i64,
 ) -> bool {
-    let end_ms = end_time_secs.saturating_mul(super::MILLIS_PER_SECOND);
+    let last_instant_ms = end_time_secs
+        .saturating_mul(super::MILLIS_PER_SECOND)
+        .saturating_add(super::MILLIS_PER_SECOND - 1);
     names
         .iter()
         .filter_map(|name| store.log_groups.get(name))
-        .any(|group| end_ms < group.creation_time_ms)
+        .any(|group| last_instant_ms < group.creation_time_ms)
 }
 
 /// Whether `names` names log groups of more than one log class, which is what one query may
@@ -228,20 +235,16 @@ mod tests {
         }
     }
 
-    /// The conflict sentence names the places a request may name its log groups in, and
-    /// nothing of the request.
+    /// The conflict sentence QUOTES each of the three members that may name the log groups,
+    /// and carries nothing of the request.
     #[test]
-    fn the_conflict_sentence_names_the_places_the_log_groups_may_be_named_in() {
-        for place in [
-            "logGroupName",
-            "logGroupNames",
-            "logGroupIdentifiers",
-            "queryString",
-        ] {
+    fn the_conflict_sentence_quotes_the_members_the_log_groups_may_be_named_by() {
+        for member in ["logGroupName", "logGroupNames", "logGroupIdentifiers"] {
+            let quoted = format!("'{member}'");
             assert!(
-                LOG_GROUP_SOURCE_CONFLICT_MESSAGE.contains(place),
-                "case {place}: the sentence names every place the log groups may be named in, \
-                 got {LOG_GROUP_SOURCE_CONFLICT_MESSAGE:?}"
+                LOG_GROUP_SOURCE_CONFLICT_MESSAGE.contains(&quoted),
+                "case {member}: the sentence quotes every member the log groups may be named \
+                 by, got {LOG_GROUP_SOURCE_CONFLICT_MESSAGE:?}"
             );
         }
     }
