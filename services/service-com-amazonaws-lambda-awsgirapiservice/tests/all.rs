@@ -53,6 +53,8 @@ mod async_destination_record_shape;
 mod async_event_delivery_ownership;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
+#[path = "all/async_invoke_qualifier_resolution.rs"]
+mod async_invoke_qualifier_resolution;
 #[path = "all/asynchronous_invoke_run.rs"]
 mod asynchronous_invoke_run;
 #[path = "all/aws_refusal_wording_and_region_isolation.rs"]
