@@ -2206,6 +2206,11 @@ impl ServerConfig<'_> {
     ///   `AWS_DIRECTORY_SERVICE`, `AWS_LAMBDA`, or `API_GATEWAY`" and "If `Protocol`
     ///   includes `AS2`, then the `EndpointType` must be `VPC`, and domain must be
     ///   Amazon S3".
+    ///
+    /// Where one member's value makes a whole protocol FAMILY unservable, that gate is
+    /// evaluated before any rule about how a protocol of that family would be
+    /// configured, so every protocol of the family answers the one refusal the
+    /// condition they share earns rather than its own configuration rule.
     pub fn cross_member_violation(&self) -> Option<String> {
         let endpoint_type = self.endpoint_type;
         let hosted_in_vpc =
@@ -2277,6 +2282,22 @@ impl ServerConfig<'_> {
             _ => {}
         }
 
+        // The FTP/FTPS FAMILY gate, evaluated before ANY rule about how one of those
+        // protocols would be configured (the FTPS certificate below, the endpoint-type
+        // half further down): which protocols a server can serve at all follows from
+        // its authentication mode, and no certificate and no endpoint type makes a
+        // provider that cannot serve the family able to serve it. Reporting a
+        // configuration rule first would send the caller down a path that stays illegal
+        // once taken — and the two protocols of the one family would answer two
+        // different refusals for the one condition they share.
+        if (self.speaks(PROTOCOL_FTP) || self.speaks(PROTOCOL_FTPS))
+            && !self.needs_identity_provider_details()
+        {
+            return Some(unsupported_for_identity_provider(
+                self.identity_provider_type,
+            ));
+        }
+
         // An empty `Certificate` names no certificate: the member's `len 0..1600`
         // admits the empty string, so presence alone is not enough.
         if self.speaks(PROTOCOL_FTPS)
@@ -2293,19 +2314,6 @@ impl ServerConfig<'_> {
         for protocol in [PROTOCOL_FTP, PROTOCOL_FTPS] {
             if !self.speaks(protocol) {
                 continue;
-            }
-            // The identity-provider half of the requirement is evaluated FIRST,
-            // before the endpoint-type half: which protocols a server can serve
-            // follows from its authentication mode, and no endpoint type makes a
-            // provider that cannot serve FTP able to serve it. Evaluating the
-            // endpoint rule first would tell a caller to change the endpoint type
-            // for a combination that stays illegal once changed — and would accept
-            // `EndpointType=VPC` with the service-managed provider, which the
-            // requirement forbids.
-            if !self.needs_identity_provider_details() {
-                return Some(unsupported_for_identity_provider(
-                    self.identity_provider_type,
-                ));
             }
             if endpoint_type != ENDPOINT_TYPE_VPC {
                 return Some(must_be_when(

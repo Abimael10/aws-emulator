@@ -221,3 +221,7 @@ mod agreement_directory_conflict_message;
 // a server's S3 domain is stored with.
 #[path = "all/delivered_object_provenance.rs"]
 mod delivered_object_provenance;
+// `protocol_family_gate`, likewise appended: WHICH refusal a server write that asks for a
+// protocol its identity provider cannot serve at all is answered with.
+#[path = "all/protocol_family_gate.rs"]
+mod protocol_family_gate;
