@@ -81,6 +81,8 @@ mod load_balancer_target_registration;
 mod metric_collection_catalog;
 #[path = "all/policy_read_projection.rs"]
 mod policy_read_projection;
+#[path = "all/put_notification_configuration_event_types.rs"]
+mod put_notification_configuration_event_types;
 #[path = "all/reference_data_catalogs.rs"]
 mod reference_data_catalogs;
 #[path = "all/rollback_instance_refresh.rs"]
