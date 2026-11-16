@@ -267,6 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateServiceFunction` token to replay.
             service_functions: Default::default(),
             service_function_idempotency: Default::default(),
+            // Nor any assertion, nor a `CreateAssertion` token to replay.
+            assertions: Default::default(),
+            assertion_idempotency: Default::default(),
         };
         if let Some(requested) = input.dependency_discovery.as_deref() {
             record.set_dependency_discovery(requested, now);

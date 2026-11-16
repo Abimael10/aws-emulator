@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssertion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssertion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssertion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a resilience assertion FOR a service and STORES it under that service's record,
+//! so every later `ListAssertions` reads what this call wrote, and deleting the service
+//! drops its assertions with it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssertion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssertionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssertion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAssertionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let service_arn = input.service_arn;
+
+        // An assertion is created FOR a service, so the parent must exist before anything
+        // is stored: a `serviceArn` naming no service is a 404, not an assertion with no
+        // service. Every refusal below reads the service first, so nothing is minted or
+        // consumed until the call is known to be a create.
+        let Some(service) = store.services.get(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+
+        // `clientToken` is an @idempotencyToken: it makes a RETRY of this create safe, so a
+        // repeat of the same call answers the assertion the first one created rather than
+        // creating a second one. A token already used for DIFFERENT text is not a retry —
+        // the caller would be asking one token to stand for two distinct assertions — so it
+        // is refused with the conflict this operation models instead of answering an
+        // assertion that is not the one asked for.
+        if let Some(consumed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| service.assertion_idempotency.get(token))
+        {
+            if consumed.text != input.text {
+                return Err(CreateAssertionErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::two_requests_one_token_message(
+                        input.client_token.as_deref().unwrap_or_default(),
+                    ),
+                })
+                .into());
+            }
+            if let Some(replayed) = service.assertions.get(&consumed.assertion_id) {
+                return Ok(CreateAssertionOutput {
+                    assertion: replayed.to_assertion(&service_arn),
+                });
+            }
+        }
+
+        // The store is BOUNDED before it is written: every create grows the parent
+        // service's record by one entry carrying caller-supplied text, so a caller that
+        // repeats this call would otherwise grow the process's memory without limit. At the
+        // ceiling the create is refused with the quota error this operation models. The
+        // idempotency index is bounded by the same ceiling — a token already in it replays
+        // or is refused above, never inserting a second entry.
+        if service.assertions.len() >= crate::state::MAX_ASSERTIONS_PER_SERVICE {
+            return Err(CreateAssertionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of assertions for service {service_arn} has been \
+                         reached: {}. Delete an assertion before creating another.",
+                        crate::state::MAX_ASSERTIONS_PER_SERVICE
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The call is a create: take the next creation-order position and mint the id.
+        let sequence = store.next_sequence();
+        let assertion_id = crate::state::mint_assertion_id(&region);
+        let record = crate::state::AssertionRecord {
+            assertion_id: assertion_id.clone(),
+            text: input.text,
+            // This call is the CALLER asserting something about the service, not the
+            // assessment pipeline generating an assertion.
+            source: crate::state::ASSERTION_SOURCE_USER.to_string(),
+            created_at: now,
+            // Nothing has changed it yet, so it was last updated when it was created.
+            updated_at: now,
+            sequence,
+        };
+        // The response is projected through the same path every later read answers from.
+        let assertion = record.to_assertion(&service_arn);
+        // Re-reached mutably now that the counter has been read: the store has been held
+        // under this one lock throughout, so the service is still there, and a store that
+        // somehow lost it answers the same 404 rather than panicking.
+        let Some(service) = store.services.get_mut(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+        if let Some(token) = input.client_token {
+            service.assertion_idempotency.insert(
+                token,
+                crate::state::AssertionIdempotencyRecord {
+                    assertion_id: assertion_id.clone(),
+                    text: record.text.clone(),
+                },
+            );
+        }
+        service.assertions.insert(assertion_id, record);
+
+        Ok(CreateAssertionOutput { assertion })
     }
+}
+
+/// The refusal for a `serviceArn` that names no stored service: an assertion is created for
+/// a service, so without that service there is nothing to assert about.
+fn service_not_found(service_arn: &str) -> CreateAssertionErrorModeled {
+    CreateAssertionErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::SERVICE_RESOURCE_TYPE,
+        service_arn,
+    ))
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssertions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssertions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssertions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the resilience assertions STORED under a service's record — the ones
+//! `CreateAssertion` wrote there — in creation order, narrowed to one `source` when the
+//! request names one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssertions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssertionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssertions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAssertionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` must be one this service issued; anything else is a bad request,
+        // not an empty page. `None` means "start from the beginning".
+        let resume_from: Option<u64> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(
+                        ListAssertionsErrorModeled::ValidationException(forged_token()).into()
+                    );
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..100` with a default of 100, so the boundary
+        // refuses anything outside the range and supplies the default for a request that
+        // omits it. A value that still arrives outside the range is refused here rather
+        // than quietly served at some other page size.
+        let page_size = if (crate::state::MAX_RESULTS_MIN..=crate::state::MAX_RESULTS_MAX)
+            .contains(&input.max_results)
+        {
+            input.max_results as usize
+        } else {
+            return Err(ListAssertionsErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "maxResults must be between {} and {}",
+                    crate::state::MAX_RESULTS_MIN,
+                    crate::state::MAX_RESULTS_MAX
+                ),
+                reason: Some("INVALID_FIELD_VALUE".to_string()),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "maxResults".to_string(),
+                    message: format!(
+                        "must be between {} and {}",
+                        crate::state::MAX_RESULTS_MIN,
+                        crate::state::MAX_RESULTS_MAX
+                    ),
+                }]),
+            })
+            .into());
+        };
+
+        let store = state.lock();
+
+        // A token is valid only if it names a position this store actually handed out
+        // (positions start at 1), so a well-formed token this service never issued is
+        // refused rather than answered with a page.
+        if let Some(position) = resume_from {
+            if position == 0 || position > store.highest_sequence() {
+                return Err(
+                    ListAssertionsErrorModeled::ValidationException(forged_token()).into()
+                );
+            }
+        }
+
+        // Assertions live inside their service's record, so a `serviceArn` naming no
+        // service is a 404 — not an empty list, which would claim the service exists and
+        // has no assertions.
+        let Some(service) = store.services.get(&input.service_arn) else {
+            return Err(ListAssertionsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SERVICE_RESOURCE_TYPE,
+                    &input.service_arn,
+                ),
+            )
+            .into());
+        };
+
+        // `source` is a modelled enum (the boundary has already refused anything outside
+        // `ASSERTION_SOURCE_VALUES`) and it "filter[s] assertions by source type": a
+        // request that names one reports only the assertions carrying it, and one that
+        // names none reports them all.
+        let matched: Vec<&crate::state::AssertionRecord> = service
+            .assertions_in_creation_order()
+            .into_iter()
+            .filter(|assertion| assertion.sequence >= resume_from.unwrap_or(0))
+            .filter(|assertion| {
+                input
+                    .source
+                    .as_deref()
+                    .is_none_or(|source| assertion.source == source)
+            })
+            .collect();
+
+        Ok(ListAssertionsOutput {
+            assertions: matched
+                .iter()
+                .take(page_size)
+                .map(|assertion| assertion.to_assertion(&input.service_arn))
+                .collect(),
+            // The token names where the NEXT page resumes, and is emitted only when there
+            // is one: the last page carries no token.
+            next_token: matched
+                .get(page_size)
+                .map(|assertion| crate::state::encode_page_token(assertion.sequence)),
+        })
+    }
+}
+
+/// The refusal for a `nextToken` this service did not issue: the member is named and its
+/// rule stated, the way the boundary validator words a refusal.
+fn forged_token() -> ValidationException {
+    ValidationException {
+        message: "nextToken is not a token this service issued".to_string(),
+        reason: Some("INVALID_FIELD_VALUE".to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "nextToken".to_string(),
+            message: "must be a nextToken returned by a previous ListAssertions call".to_string(),
+        }]),
     }
 }

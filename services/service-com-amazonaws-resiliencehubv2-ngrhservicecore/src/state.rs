@@ -9,8 +9,10 @@
 //!
 //! A service's child resources are stored INSIDE its record — see
 //! [`ServiceRecord::service_functions`] for the `ServiceFunction` lifecycle
-//! (`CreateServiceFunction`, `ListServiceFunctions`) — so deleting a service cascades to
-//! them and no lookup can reach a child whose parent is gone.
+//! (`CreateServiceFunction`, `ListServiceFunctions`) and [`ServiceRecord::assertions`] for
+//! the `Assertion` one (`CreateAssertion`, `ListAssertions`, see [`assertions`]) — so
+//! deleting a service cascades to them and no lookup can reach a child whose parent is
+//! gone.
 //!
 //! Every response those operations return is projected from a record here —
 //! [`ServiceRecord::to_service`] for the full `Service` shape and
@@ -34,6 +36,7 @@
 //! the one tag map projection and the write path `TagResource` reaches a tagged resource
 //! through, whichever of this store's resources an ARN names.
 
+mod assertions;
 mod conflicts;
 mod invoker_role;
 mod not_found;
@@ -41,6 +44,10 @@ mod policies;
 mod systems;
 mod tagging;
 
+pub use assertions::{
+    mint_assertion_id, AssertionIdempotencyRecord, AssertionRecord, ASSERTION_SOURCE_USER,
+    MAX_ASSERTIONS_PER_SERVICE,
+};
 pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
 pub use invoker_role::{invoker_role_rejection, unassumable_message, SERVICE_PRINCIPAL};
 pub use not_found::{
@@ -259,6 +266,15 @@ pub struct ServiceRecord {
     /// `@idempotencyToken` returns the function the first call created instead of creating
     /// a second one. Scoped to the parent service for the same reason as above.
     pub service_function_idempotency: BTreeMap<String, String>,
+    /// The resilience assertions created on this service, keyed by `assertionId`. See
+    /// [`assertions`] — held inside the parent record for the same reason
+    /// [`Self::service_functions`] is.
+    pub assertions: BTreeMap<String, AssertionRecord>,
+    /// `clientToken` -> what that token created, so a replayed `CreateAssertion`
+    /// `@idempotencyToken` returns the assertion the first call created instead of creating
+    /// a second one, and the same token offered for different text is refused. Scoped to
+    /// the parent service for the same reason as above.
+    pub assertion_idempotency: BTreeMap<String, AssertionIdempotencyRecord>,
 }
 
 impl ServiceRecord {
@@ -601,6 +617,30 @@ static IDS_MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU
 /// Hashing a counter this process owns makes the id unique without a random-source
 /// dependency, and none of its bits comes from the request body.
 fn mint_uuid(region: &str) -> String {
+    mint_uuid_of_version(region, UUID_VERSION_CUSTOM)
+}
+
+/// A fresh UUID for an identifier the model types `Uuid`.
+///
+/// That shape's pattern admits only a version nibble in `0..=5`, so the custom version
+/// [`mint_uuid`] carries would not satisfy it: this mints the same derived bits under the
+/// version nibble the shape admits, so an id this service hands out is one an operation
+/// taking it back as input accepts.
+pub fn mint_modelled_uuid(region: &str) -> String {
+    mint_uuid_of_version(region, UUID_VERSION_MODELLED)
+}
+
+/// The version nibble [`mint_uuid`] sets, in the high nibble of octet 6: RFC 9562 reserves
+/// version 8 for a UUID whose bits an application constructs itself.
+const UUID_VERSION_CUSTOM: u8 = 0x80;
+
+/// The version nibble [`mint_modelled_uuid`] sets, the one the model's `Uuid` pattern
+/// admits in that position.
+const UUID_VERSION_MODELLED: u8 = 0x40;
+
+/// The shared minting path behind [`mint_uuid`] and [`mint_modelled_uuid`]: the two differ
+/// only in the version nibble they stamp.
+fn mint_uuid_of_version(region: &str, version: u8) -> String {
     use ::sha2::{Digest, Sha256};
 
     let minted = IDS_MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
@@ -615,9 +655,9 @@ fn mint_uuid(region: &str) -> String {
 
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    // Version 8 (custom) and the RFC 9562 variant, so the value is a well-formed UUID
-    // rather than 16 arbitrary bytes wearing a UUID's punctuation.
-    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    // The caller's version nibble and the RFC 9562 variant, so the value is a well-formed
+    // UUID rather than 16 arbitrary bytes wearing a UUID's punctuation.
+    bytes[6] = (bytes[6] & 0x0f) | version;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let rendered = ::hex::encode(bytes);
     format!(
