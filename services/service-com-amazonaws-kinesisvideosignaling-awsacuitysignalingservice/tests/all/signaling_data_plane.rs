@@ -38,12 +38,23 @@ fn emulator() -> (Arc<InMemoryEngine>, MultiServiceRouter) {
     (engine, router)
 }
 
+/// The EMULATOR'S OWN endpoint a client on this machine addresses it at: a loopback
+/// authority, which is the only address that reaches this process. Used by the rows that
+/// pin an announced address, so the expectation is the address the test itself sent to.
+const OWN_ENDPOINT: &str = "127.0.0.1:9297";
+
 /// A request addressed to this service the way an AWS SDK addresses it: the SigV4
 /// credential scope names the `kinesisvideo` signing name, and the path names the route.
 fn request(path: &str, body: &str) -> http::Request<Bytes> {
+    request_at("kinesisvideo.us-east-1.amazonaws.com", path, body)
+}
+
+/// [`request`], addressed at `authority` — the endpoint host the client carries.
+fn request_at(authority: &str, path: &str, body: &str) -> http::Request<Bytes> {
     http::Request::builder()
         .method("POST")
-        .uri(format!("https://kinesisvideo.us-east-1.amazonaws.com{path}"))
+        .uri(format!("https://{authority}{path}"))
+        .header("host", authority)
         .header("content-type", "application/json")
         .header(
             "authorization",
@@ -57,7 +68,25 @@ fn request(path: &str, body: &str) -> http::Request<Bytes> {
 
 /// One call: the HTTP status and the parsed JSON body.
 async fn call(router: &MultiServiceRouter, path: &str, body: &str) -> (u16, serde_json::Value) {
-    let response = router.dispatch(request(path, body)).await;
+    call_with(router, request(path, body)).await
+}
+
+/// [`call`], addressed at `authority`.
+async fn call_at(
+    router: &MultiServiceRouter,
+    authority: &str,
+    path: &str,
+    body: &str,
+) -> (u16, serde_json::Value) {
+    call_with(router, request_at(authority, path, body)).await
+}
+
+/// The status and parsed body of one dispatched request.
+async fn call_with(
+    router: &MultiServiceRouter,
+    request: http::Request<Bytes>,
+) -> (u16, serde_json::Value) {
+    let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let errortype = response
         .headers()
@@ -252,7 +281,8 @@ fn ice_request_body(case: &IceCase) -> String {
 }
 
 /// The rule: a channel in the registry is answered with one TURN credential set, whose
-/// relay URIs are in the channel's own region, whose `Ttl` is the channel's lifetime held
+/// relay URIs name the address this emulator is reached at, whose `Ttl` is the channel's
+/// lifetime held
 /// inside the modelled 30..86400 range, whose `Username` is `<unix-expiry>:<opaque token>`
 /// carrying nothing of the request, and which is RECORDED ON THE CHANNEL — so asking again
 /// inside that lifetime is answered with the very same credentials.
@@ -326,7 +356,11 @@ async fn get_ice_server_config_issues_recorded_turn_credentials_per_channel_and_
     ];
 
     let (engine, router) = emulator();
-    let mut hosts: Vec<String> = Vec::new();
+    // Every call below is addressed to the emulator's OWN endpoint, the way a client that
+    // resolves no AWS hostname reaches it, so the relay address the answer must carry is
+    // the address the test itself sent to.
+    let relay_authority = OWN_ENDPOINT.to_string();
+    let mut relay_authorities: Vec<String> = Vec::new();
 
     for case in &cases {
         seed_channel(&engine, case.arn, |channel| {
@@ -336,7 +370,7 @@ async fn get_ice_server_config_issues_recorded_turn_credentials_per_channel_and_
         });
 
         let body = ice_request_body(case);
-        let (status, answer) = call(&router, GET_ICE_SERVER_CONFIG, &body).await;
+        let (status, answer) = call_at(&router, OWN_ENDPOINT, GET_ICE_SERVER_CONFIG, &body).await;
         assert_eq!(
             status, 200,
             "case {:?}: expected HTTP 200, got {status} with {answer}",
@@ -365,47 +399,40 @@ async fn get_ice_server_config_issues_recorded_turn_credentials_per_channel_and_
                     .unwrap_or_else(|| panic!("case {:?}: a Uri is not a string", case.case))
             })
             .collect();
-        let host_suffix = format!(".kinesisvideo.{}.amazonaws.com:443", case.region);
         assert_eq!(
             uris.len(),
             3,
             "case {:?}: expected three relay URIs, got {uris:?}",
             case.case
         );
-        for expected in [
-            format!("turn:{{host}}{host_suffix}?transport=udp"),
-            format!("turns:{{host}}{host_suffix}?transport=udp"),
-            format!("turns:{{host}}{host_suffix}?transport=tcp"),
-        ]
-        .iter()
-        .enumerate()
+        // The relay is offered over the three transports recorded behaviour lists, every
+        // one of them at the address this emulator is reached at — never under the
+        // channel's regional AWS host, which this emulator does not serve.
+        let aws_regional_host = format!("kinesisvideo.{}.amazonaws.com", case.region);
+        for (index, (scheme, transport)) in [("turn", "udp"), ("turns", "udp"), ("turns", "tcp")]
+            .iter()
+            .enumerate()
         {
-            let (index, shape) = expected;
-            let (scheme, transport) = shape
-                .split_once("{host}")
-                .map(|(scheme, rest)| {
-                    (
-                        scheme,
-                        rest.rsplit_once('?').map(|(_, q)| q).unwrap_or_default(),
-                    )
-                })
-                .expect("the expected shape names a host");
             let uri = uris[index];
+            let expected = format!("{scheme}:{relay_authority}?transport={transport}");
+            assert_eq!(
+                uri, expected,
+                "case {:?}: URI {index} must be {expected:?}, got {uri:?}",
+                case.case
+            );
             assert!(
-                uri.starts_with(scheme)
-                    && uri.contains(&host_suffix)
-                    && uri.ends_with(transport),
-                "case {:?}: URI {index} must be {scheme}<relay>{host_suffix}?{transport}, got {uri:?}",
+                !uri.contains(&aws_regional_host) && !uri.contains("amazonaws.com"),
+                "case {:?}: URI {index} must name no AWS endpoint, got {uri:?}",
                 case.case
             );
         }
-        let host = uris[0]
-            .trim_start_matches("turn:")
-            .split(':')
-            .next()
-            .expect("the URI names a host")
-            .to_string();
-        hosts.push(host);
+        relay_authorities.push(
+            uris[0]
+                .trim_start_matches("turn:")
+                .rsplit_once("?transport=")
+                .map(|(authority, _)| authority.to_string())
+                .unwrap_or_else(|| panic!("case {:?}: {:?} names no relay", case.case, uris[0])),
+        );
 
         let ttl = server
             .get("Ttl")
@@ -487,7 +514,8 @@ async fn get_ice_server_config_issues_recorded_turn_credentials_per_channel_and_
         // The issuance is RECORDED: asking again inside the lifetime answers with the
         // same credentials rather than a freshly randomised set. The `Ttl` is the lifetime
         // the issuance has LEFT, so a repeat call reports the same or less — never more.
-        let (repeat_status, repeat) = call(&router, GET_ICE_SERVER_CONFIG, &body).await;
+        let (repeat_status, repeat) =
+            call_at(&router, OWN_ENDPOINT, GET_ICE_SERVER_CONFIG, &body).await;
         assert_eq!(
             repeat_status, 200,
             "case {:?}: a repeat call must succeed, got {repeat_status}",
@@ -559,14 +587,16 @@ async fn get_ice_server_config_issues_recorded_turn_credentials_per_channel_and_
         );
     }
 
-    // Each channel is served by its own relay address, so two channels never share one.
-    let mut unique = hosts.clone();
+    // Every channel is served by the ONE relay address this emulator is reached at: the
+    // address is the emulator's, not the channel's, so no row announces one of its own.
+    let mut unique = relay_authorities.clone();
     unique.sort();
     unique.dedup();
     assert_eq!(
-        unique.len(),
-        hosts.len(),
-        "each channel must be served by its own relay address, got {hosts:?}"
+        unique,
+        vec![relay_authority],
+        "every channel must be served at this emulator's own address, got \
+         {relay_authorities:?}"
     );
 }
 

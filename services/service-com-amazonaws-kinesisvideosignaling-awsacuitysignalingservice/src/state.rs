@@ -25,12 +25,15 @@ use std::time::{Duration, SystemTime};
 
 /// Whether IAM lets a request to this data plane perform the action it asks for.
 pub mod authorization;
+/// The address the relay URIs of an issued TURN credential set name.
+pub mod relay_address;
 /// The peers attached to one channel, and the frames routed between them.
 pub mod session;
 /// The address every channel's WebSocket data plane is reached at.
 pub mod wss_endpoint;
 
 pub use authorization::authorization_refusal;
+pub use relay_address::{relay_authority, relay_uris, turn_uris};
 pub use session::{Attachment, ChannelSession, PeerConnection};
 pub use wss_endpoint::{ensure_wss_endpoint, SignalingEndpoint, WSS_SCHEME};
 
@@ -240,8 +243,7 @@ pub struct SignalingChannel {
     pub arn: String,
     /// The channel name, from the ARN's resource part.
     pub name: String,
-    /// The region the channel lives in, from the ARN. The TURN relay the channel is
-    /// served by is addressed in this region.
+    /// The region the channel lives in, from the ARN.
     pub region: String,
     /// The owning account id, from the ARN.
     pub account: String,
@@ -339,6 +341,25 @@ impl SignalingChannel {
         self.ice_credential
             .as_ref()
             .expect("the record just stored is present")
+    }
+
+    /// Point the credential set this channel is serving at `uris` — the relay address the
+    /// request being served reached this emulator at — and hand back the stored record.
+    ///
+    /// The credentials themselves are untouched: an issuance is re-served for its whole
+    /// lifetime ([`valid_credential`](Self::valid_credential)), and only the ADDRESS a
+    /// client is sent to depends on which of this emulator's addresses the asking request
+    /// arrived on. So a record minted under one address is never replayed under another,
+    /// and a viewer is never handed a relay address its own call did not reach.
+    ///
+    /// `None` when the channel is serving no credential set at all, which has no address
+    /// to carry.
+    pub fn readdress_credential(&mut self, uris: &[String]) -> Option<&IceServerRecord> {
+        let held = self.ice_credential.as_mut()?;
+        if held.uris != uris {
+            held.uris = uris.to_vec();
+        }
+        Some(held)
     }
 
     /// Append `offer` to this channel's offer log and hand back the stored record.

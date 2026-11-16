@@ -19,5 +19,7 @@ mod route_claims;
 mod signaling_data_plane;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/turn_relay_address.rs"]
+mod turn_relay_address;
 #[path = "all/wss_signaling_plane.rs"]
 mod wss_signaling_plane;

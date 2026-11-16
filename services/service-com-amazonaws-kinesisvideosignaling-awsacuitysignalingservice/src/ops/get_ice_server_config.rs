@@ -11,11 +11,12 @@
 //! same credentials, which is what recorded behaviour shows for clients asking
 //! concurrently, and a channel nobody created answers `ResourceNotFoundException`.
 //!
-//! The relay the issued `Uris` name is UNREACHABLE BY CONSTRUCTION: this emulator serves
-//! no TURN listener, so the address is an AWS-form name (the form a client parses, logs
-//! and compares) that resolves nowhere. Only the control-plane answer is emulated here; if
-//! a TURN listener is ever served in-process, the `Uris` must name its loopback address
-//! instead. See [`relay_host`].
+//! The issued `Uris` are an address a WebRTC client DIALS, so every one of them names the
+//! address THIS emulator is reached at for the call being served
+//! ([`crate::state::relay_address`]) — never a host AWS publishes an endpoint at, which
+//! would send a client out of the environment the call was served from. Only the
+//! control-plane answer is emulated here: no TURN relay is served, so what the address
+//! gives a client is this emulator itself.
 //!
 //! ## Shape of an operation
 //!
@@ -101,7 +102,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{ChannelLookupError, IceServerRecord, SignalingChannel};
+use crate::state::{ChannelLookupError, IceServerRecord};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -144,14 +145,6 @@ impl From<GetIceServerConfigErrorModeled> for GetIceServerConfigError {
 /// The `Service` value a request that names none asks for: the `Service` enum's only
 /// member (`smithy_query(query="shape", shape="Service")` -> values `["TURN"]`).
 const DEFAULT_SERVICE: &str = "TURN";
-
-/// The port the relay URIs name.
-///
-/// A chosen value, not a documented one: 443 is the port a viewer behind a firewall that
-/// only allows HTTPS can still reach, which is why TURN deployments conventionally offer
-/// it. The relay itself is unreachable by construction (see this module's header), so the
-/// port is part of the address's form rather than something a caller connects to.
-const TURN_PORT: u16 = 443;
 
 /// Upper bound of the modelled `@length` on `IceServer$Username`
 /// (`smithy_query(query="shape", shape="IceServer")`: len 1..256).
@@ -235,69 +228,6 @@ fn mint_opaque(store: &::emulator_server::CredentialStore, length: usize) -> Opt
         }
     }
     None
-}
-
-/// The maximum length of ONE DNS label (RFC 1035 §2.3.4: "labels must be 63 characters or
-/// less"), which bounds the leading label of the relay address below.
-const MAX_DNS_LABEL_LEN: usize = 63;
-
-/// The address of the TURN relay that serves `channel`.
-///
-/// AWS answers with a relay in the channel's own region, addressed under
-/// `kinesisvideo.<region>.amazonaws.com`. There is no relay fleet here, so the leading
-/// label names the CHANNEL the relay serves — see [`relay_label`]: stable for a channel (a
-/// viewer that reconnects is sent back to the same relay), different between channels, and
-/// never a per-run value.
-///
-/// The address deliberately keeps the AWS form, which is what a client parses, logs and
-/// compares; the emulator itself never connects to it, and an unresolvable name is exactly
-/// what a client sees for a relay it has no route to.
-fn relay_host(channel: &SignalingChannel) -> String {
-    format!(
-        "{}.kinesisvideo.{}.amazonaws.com",
-        relay_label(channel),
-        channel.region
-    )
-}
-
-/// The leading DNS label of [`relay_host`]: the channel's own name and the creation id
-/// that distinguishes two channels of one name over time, folded into the character class
-/// a DNS label admits (lowercase letters, digits and `-`) and cut to
-/// [`MAX_DNS_LABEL_LEN`].
-///
-/// A channel name is modelled over `[a-zA-Z0-9_.-]`, which carries `_` and `.` that no DNS
-/// label may hold, so those fold to `-`; a label left with nothing admissible is `relay`,
-/// so the address always has one.
-fn relay_label(channel: &SignalingChannel) -> String {
-    let folded: String = format!("{}-{}", channel.name, channel.creation_id)
-        .chars()
-        .map(|c| {
-            let lower = c.to_ascii_lowercase();
-            if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
-                lower
-            } else {
-                '-'
-            }
-        })
-        .take(MAX_DNS_LABEL_LEN)
-        .collect();
-    let trimmed = folded.trim_matches('-');
-    if trimmed.is_empty() {
-        "relay".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// The relay URIs a credential set is good for, in the `I-D.petithuguenin-behave-turn-uris`
-/// form `IceServer$Uris` documents: the relay over plain UDP, and over TLS on UDP and TCP.
-fn turn_uris(channel: &SignalingChannel) -> Vec<String> {
-    let host = relay_host(channel);
-    vec![
-        format!("turn:{host}:{TURN_PORT}?transport=udp"),
-        format!("turns:{host}:{TURN_PORT}?transport=udp"),
-        format!("turns:{host}:{TURN_PORT}?transport=tcp"),
-    ]
 }
 
 /// Whether `c` is admitted by the modelled `IceServer$Username` / `IceServer$Password`
@@ -414,9 +344,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not part of this operation's answer: the whole response is a
-        // function of the channel registry and the request body. `ctx` is reached only for
-        // the emulator's credential store, the seam a minted secret comes from.
         // The channel registry lives in the shared in-memory engine. If this service was
         // mounted on some other engine there is no registry to read, so the operation
         // cannot be served at all: that is the scaffold's 501, not a modelled client
@@ -448,6 +375,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The relay the issued credentials are good for is reached where THIS emulator is
+        // reached: resolved from the request's own addressing before the store is locked,
+        // so no announced address depends on a host AWS publishes (see
+        // `crate::state::relay_address`).
+        let relay_uris = crate::state::relay_uris(ctx.parts(), ctx.endpoint().as_str());
+
         let now = SystemTime::now();
         let mut store = state.lock();
         let channel = store
@@ -476,8 +409,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record — so every viewer asking inside the issuance's lifetime is answered with
         // the same credentials (what recorded behaviour shows for clients asking
         // concurrently), and one the clock has run down is reissued.
-        let record = match channel.valid_credential(now) {
-            Some(held) => held.clone(),
+        // An issuance still being served keeps its credentials and is re-addressed onto
+        // the relay address this call reached, so a record minted under one of this
+        // emulator's addresses is never replayed under another.
+        let held = if channel.valid_credential(now).is_some() {
+            channel.readdress_credential(&relay_uris).cloned()
+        } else {
+            None
+        };
+        let record = match held {
+            Some(held) => held,
             None => {
                 let ttl_secs = channel.ttl_secs();
                 let expires_at = now + Duration::from_secs(u64::from(ttl_secs.unsigned_abs()));
@@ -493,7 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })?;
                 let issued = IceServerRecord {
-                    uris: turn_uris(channel),
+                    uris: relay_uris,
                     username: ice_username(expires_at, &token),
                     password,
                     ttl_secs,
