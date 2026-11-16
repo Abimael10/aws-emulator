@@ -17,6 +17,8 @@ mod assertion_lifecycle;
 mod constraint_report_wording;
 #[path = "all/effective_policy_values.rs"]
 mod effective_policy_values;
+#[path = "all/input_source_lifecycle.rs"]
+mod input_source_lifecycle;
 #[path = "all/invoker_role_trust.rs"]
 mod invoker_role_trust;
 #[path = "all/policy_lifecycle.rs"]

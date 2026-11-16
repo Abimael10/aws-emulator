@@ -27,9 +27,20 @@ pub const SYSTEM_RESOURCE_TYPE: &str = "System";
 /// [`service_function_not_found`].
 pub const SERVICE_FUNCTION_RESOURCE_TYPE: &str = "ServiceFunction";
 
+/// `resourceType` for an input source, as [`POLICY_RESOURCE_TYPE`] is for a policy.
+///
+/// An input source is addressed by its `inputSourceId` within its service rather than by
+/// an ARN of its own, so a refusal naming one reports that identifier as its `resourceId`
+/// — see [`input_source_not_found`].
+pub const INPUT_SOURCE_RESOURCE_TYPE: &str = "InputSource";
+
 /// How a refusal's MESSAGE names a service function: the resource as the service words it
 /// in prose, which is not always its shape name — see [`service_function_not_found`].
 const SERVICE_FUNCTION_LABEL: &str = "Service function";
+
+/// How a refusal's MESSAGE names an input source, as [`SERVICE_FUNCTION_LABEL`] does a
+/// service function.
+const INPUT_SOURCE_LABEL: &str = "Input source";
 
 /// The refusal for a request whose `arn` names no stored resource of `resource_type`.
 ///
@@ -58,6 +69,19 @@ pub fn service_function_not_found(service_function_id: &str) -> ResourceNotFound
         message: format!("{SERVICE_FUNCTION_LABEL} not found: {service_function_id}"),
         resource_id: Some(service_function_id.to_string()),
         resource_type: Some(SERVICE_FUNCTION_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// The refusal for an `inputSourceId` that names no stored input source.
+///
+/// An input source is identified by that id within its service rather than by an ARN, so
+/// the id is both the `resourceId` and what the message names, the way a service
+/// function's is.
+pub fn input_source_not_found(input_source_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("{INPUT_SOURCE_LABEL} not found: {input_source_id}"),
+        resource_id: Some(input_source_id.to_string()),
+        resource_type: Some(INPUT_SOURCE_RESOURCE_TYPE.to_string()),
     }
 }
 

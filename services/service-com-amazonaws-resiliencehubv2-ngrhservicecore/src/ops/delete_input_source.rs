@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInputSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInputSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInputSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes an input source: the stored record is REMOVED from the service it was created
+//! for, so the listing that reads that service stops serving it.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +141,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInputSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInputSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInputSource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteInputSourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // An input source lives inside its service's record, so the parent is resolved
+        // first: a `serviceArn` naming no service is a 404, not a delete of nothing.
+        let Some(service) = store.services.get_mut(&input.service_arn) else {
+            return Err(DeleteInputSourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SERVICE_RESOURCE_TYPE,
+                    &input.service_arn,
+                ),
+            )
+            .into());
+        };
+
+        // One identifier names ONE input source, whatever configuration it carries, so a
+        // delete removes exactly that source and leaves every other one — including one
+        // created from identical configuration — in place. An identifier that names no
+        // source there is a 404: repeating a delete does not report a second success.
+        let Some(removed) = service.input_sources.remove(&input.input_source_id) else {
+            return Err(DeleteInputSourceErrorModeled::ResourceNotFoundException(
+                crate::state::input_source_not_found(&input.input_source_id),
+            )
+            .into());
+        };
+        // No `clientToken` may replay into an input source that no longer exists, so the
+        // tokens that named it go with it — the same pruning `DeleteServiceFunction` performs.
+        service
+            .input_source_idempotency
+            .retain(|_, id| id != &removed.input_source_id);
+
+        Ok(DeleteInputSourceOutput {
+            service_arn: input.service_arn,
+            input_source_id: removed.input_source_id,
+        })
     }
 }

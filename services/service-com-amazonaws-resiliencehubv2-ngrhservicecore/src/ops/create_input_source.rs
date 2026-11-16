@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInputSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInputSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInputSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an input source for a service: one stored [`crate::state::InputSourceRecord`]
+//! under the service the request names, carrying the `ResourceConfiguration` the call
+//! supplied and a freshly minted `inputSourceId`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInputSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInputSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInputSource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateInputSourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let service_arn = input.service_arn;
+
+        // An input source is created FOR a service, so the parent must exist before
+        // anything is stored: a `serviceArn` naming no service is a 404, not a source with
+        // no parent. Every refusal below reads the service, so nothing is minted or
+        // consumed until the call is known to be a create.
+        let Some(service) = store.services.get(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same call returns the
+        // input source the first one created rather than creating a second one.
+        if let Some(replayed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| service.input_source_idempotency.get(token))
+            .cloned()
+            .filter(|id| service.input_sources.contains_key(id))
+        {
+            return Ok(CreateInputSourceOutput {
+                service_arn,
+                input_source_id: replayed,
+            });
+        }
+
+        // The store is BOUNDED before it is written: every create grows the parent
+        // service's record by one entry carrying caller-supplied payload, so a caller that
+        // repeats this call would otherwise grow the process's memory without limit. At
+        // the ceiling the create is refused with the quota error this operation models.
+        // The idempotency index is capped by the SAME ceiling here rather than assumed to
+        // follow the sources: a replayed token returns above instead of inserting, and
+        // `DeleteInputSource` drops the tokens that named the source it removed, so the
+        // index cannot outgrow the sources — and if it ever did, the create is refused
+        // rather than growing it further.
+        if service.input_sources.len() >= crate::state::MAX_INPUT_SOURCES_PER_SERVICE
+            || service.input_source_idempotency.len()
+                >= crate::state::MAX_INPUT_SOURCES_PER_SERVICE
+        {
+            return Err(
+                CreateInputSourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of input sources for service {service_arn} \
+                             has been reached: {}. Delete an input source before creating \
+                             another.",
+                            crate::state::MAX_INPUT_SOURCES_PER_SERVICE
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The call is a create: take the next creation-order position and mint the id.
+        // Nothing in the configuration identifies an input source, so two creates carrying
+        // identical configuration are two distinct sources, each with its own id.
+        let sequence = store.next_sequence();
+        let input_source_id = crate::state::mint_input_source_id(&region);
+        let record = crate::state::InputSourceRecord {
+            input_source_id: input_source_id.clone(),
+            // Stored as supplied: the union's one member is both what this source
+            // discovers from and what its reported `type` is derived from.
+            configuration: input.resource_configuration,
+            created_at: now,
+            sequence,
+        };
+        // Re-reached mutably now that the counter has been read: the store has been held
+        // under this one lock throughout, so the service is still there, and a store that
+        // somehow lost it answers the same 404 rather than panicking.
+        let Some(service) = store.services.get_mut(&service_arn) else {
+            return Err(service_not_found(&service_arn).into());
+        };
+        if let Some(token) = input.client_token {
+            service
+                .input_source_idempotency
+                .insert(token, input_source_id.clone());
+        }
+        service.input_sources.insert(input_source_id.clone(), record);
+
+        Ok(CreateInputSourceOutput {
+            service_arn,
+            input_source_id,
+        })
     }
+}
+
+/// The refusal for a `serviceArn` that names no stored service: an input source is created
+/// for a service, so without that service there is nothing to create it for.
+fn service_not_found(service_arn: &str) -> CreateInputSourceErrorModeled {
+    CreateInputSourceErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::SERVICE_RESOURCE_TYPE,
+        service_arn,
+    ))
 }

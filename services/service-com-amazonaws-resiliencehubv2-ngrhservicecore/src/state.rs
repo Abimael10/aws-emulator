@@ -9,10 +9,11 @@
 //!
 //! A service's child resources are stored INSIDE its record — see
 //! [`ServiceRecord::service_functions`] for the `ServiceFunction` lifecycle
-//! (`CreateServiceFunction`, `ListServiceFunctions`) and [`ServiceRecord::assertions`] for
-//! the `Assertion` one (`CreateAssertion`, `ListAssertions`, see [`assertions`]) — so
-//! deleting a service cascades to them and no lookup can reach a child whose parent is
-//! gone.
+//! (`CreateServiceFunction`, `ListServiceFunctions`), [`ServiceRecord::assertions`] for
+//! the `Assertion` one (`CreateAssertion`, `ListAssertions`, see [`assertions`]) and
+//! [`ServiceRecord::input_sources`] for the `InputSource` one (`CreateInputSource`,
+//! `ListInputSources`, `DeleteInputSource`, see [`input_sources`]) — so deleting a service
+//! cascades to them and no lookup can reach a child whose parent is gone.
 //!
 //! Every response those operations return is projected from a record here —
 //! [`ServiceRecord::to_service`] for the full `Service` shape and
@@ -38,6 +39,7 @@
 
 mod assertions;
 mod conflicts;
+mod input_sources;
 mod invoker_role;
 mod not_found;
 mod policies;
@@ -49,10 +51,16 @@ pub use assertions::{
     MAX_ASSERTIONS_PER_SERVICE,
 };
 pub use conflicts::{name_already_exists_message, two_requests_one_token_message};
+pub use input_sources::{
+    mint_input_source_id, InputSourceRecord, INPUT_SOURCE_TYPE_CFN_STACK,
+    INPUT_SOURCE_TYPE_DESIGN_FILE, INPUT_SOURCE_TYPE_EKS, INPUT_SOURCE_TYPE_TAGS,
+    INPUT_SOURCE_TYPE_TERRAFORM, MAX_INPUT_SOURCES_PER_SERVICE,
+};
 pub use invoker_role::{invoker_role_rejection, unassumable_message, SERVICE_PRINCIPAL};
 pub use not_found::{
-    arn_resource_id, resource_not_found, service_function_not_found, POLICY_RESOURCE_TYPE,
-    SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE, SYSTEM_RESOURCE_TYPE,
+    arn_resource_id, input_source_not_found, resource_not_found, service_function_not_found,
+    INPUT_SOURCE_RESOURCE_TYPE, POLICY_RESOURCE_TYPE, SERVICE_FUNCTION_RESOURCE_TYPE,
+    SERVICE_RESOURCE_TYPE, SYSTEM_RESOURCE_TYPE,
 };
 pub use systems::{
     mint_system_arn, SystemCreateRequest, SystemIdempotencyRecord, SystemRecord, MAX_SYSTEMS,
@@ -266,6 +274,17 @@ pub struct ServiceRecord {
     /// `@idempotencyToken` returns the function the first call created instead of creating
     /// a second one. Scoped to the parent service for the same reason as above.
     pub service_function_idempotency: BTreeMap<String, String>,
+    /// The input sources created for this service, keyed by `inputSourceId`. See
+    /// [`input_sources`].
+    ///
+    /// An input source exists only FOR a service (`CreateInputSource` is "Creates an
+    /// input source for a service"), so it is stored inside the parent record the way a
+    /// service function is: removing the service removes its input sources with it.
+    pub input_sources: BTreeMap<String, InputSourceRecord>,
+    /// `clientToken` -> `inputSourceId`, so a replayed `CreateInputSource`
+    /// `@idempotencyToken` returns the input source the first call created instead of
+    /// creating a second one. Scoped to the parent service for the same reason as above.
+    pub input_source_idempotency: BTreeMap<String, String>,
     /// The resilience assertions created on this service, keyed by `assertionId`. See
     /// [`assertions`] — held inside the parent record for the same reason
     /// [`Self::service_functions`] is.
