@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRunGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRunGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRunGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the settings this request names to the one stored run group its path id
+//! identifies, and answers 202 with no body. A setting the request omits is left exactly
+//! as it stood: this operation updates the settings it carries, so an omitted member means
+//! "leave that one alone" and never "clear it". Every later read of the group —
+//! `GetRunGroup`, `ListRunGroups` — reports the updated values, because the group is
+//! stored exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +181,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRunGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRunGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRunGroup"))
+        // The 1..128 length and pattern on `name`, and the 1..100000 range on each of the
+        // four caps, are modelled constraints the centralized walk has already refused
+        // anything outside of: reaching here means every value this request carries is
+        // admissible for the member it was sent in.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            UpdateRunGroupErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run group registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        let group = registry.run_group_mut(&input.id).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            UpdateRunGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no run group with id {} exists in this region", input.id),
+            })
+        })?;
+
+        // One assignment per settable member, each applied only when the request named it,
+        // so a request carrying one setting changes exactly that one and leaves the rest of
+        // the record — its id, ARN, creation time and tags included — as it stood.
+        if let Some(name) = input.name {
+            group.name = Some(name);
+        }
+        if let Some(max_cpus) = input.max_cpus {
+            group.max_cpus = Some(max_cpus);
+        }
+        if let Some(max_runs) = input.max_runs {
+            group.max_runs = Some(max_runs);
+        }
+        if let Some(max_duration) = input.max_duration {
+            group.max_duration = Some(max_duration);
+        }
+        if let Some(max_gpus) = input.max_gpus {
+            group.max_gpus = Some(max_gpus);
+        }
+
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::RunGroupUpdated,
+            Some(&input.id),
+        );
+
+        Ok(UpdateRunGroupOutput)
     }
 }

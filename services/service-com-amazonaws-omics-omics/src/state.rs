@@ -1937,6 +1937,8 @@ pub enum AuditOutcome {
     RunCacheCreated,
     /// A run group was minted and stored.
     RunGroupCreated,
+    /// A stored run group's settings were changed in place.
+    RunGroupUpdated,
     /// A cross-account resource share was minted and stored.
     ShareCreated,
     /// A stored share was asked to go away, and carries the status that move leaves it in.
@@ -1981,6 +1983,7 @@ impl AuditOutcome {
             Self::ReadSetUploadPartStored => "read-set-upload-part-stored",
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
+            Self::RunGroupUpdated => "run-group-updated",
             Self::ShareCreated => "share-created",
             Self::ShareDeleted => "share-deleted",
             Self::ResourceTagged => "resource-tagged",

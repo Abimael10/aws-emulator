@@ -2537,6 +2537,14 @@ async fn every_call_emits_a_structured_audit_record() {
     )
     .await;
     let cache = created_id("the audit fixture run cache", status, &response);
+    let (status, response) = call(
+        &router,
+        "POST",
+        "/runGroup",
+        Some(&json!({ "requestId": "audit-fixture-group", "maxCpus": 4 })),
+    )
+    .await;
+    let group = created_id("the audit fixture run group", status, &response);
 
     let over_the_tag_bound = tag_map(MAX_TAGS + 1);
 
@@ -2694,6 +2702,24 @@ async fn every_call_emits_a_structured_audit_record() {
             method: "GET",
             uri: format!("/runCache/{absent}"),
             body: None,
+            outcome: "not-found",
+            resource: ExpectedResource::Named(absent.to_string()),
+        },
+        AuditCase {
+            case: "a run group's settings updated",
+            operation: "UpdateRunGroup",
+            method: "POST",
+            uri: format!("/runGroup/{group}"),
+            body: Some(json!({ "maxCpus": 8 })),
+            outcome: "run-group-updated",
+            resource: ExpectedResource::Named(group.clone()),
+        },
+        AuditCase {
+            case: "a run group update naming an id nothing holds",
+            operation: "UpdateRunGroup",
+            method: "POST",
+            uri: format!("/runGroup/{absent}"),
+            body: Some(json!({ "maxCpus": 8 })),
             outcome: "not-found",
             resource: ExpectedResource::Named(absent.to_string()),
         },

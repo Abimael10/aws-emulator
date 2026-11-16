@@ -25,6 +25,8 @@ mod resource_shares;
 mod resource_tags;
 #[path = "all/run_caches.rs"]
 mod run_caches;
+#[path = "all/run_group_updates.rs"]
+mod run_group_updates;
 #[path = "all/run_groups.rs"]
 mod run_groups;
 #[path = "all/sequence_store_deletion.rs"]

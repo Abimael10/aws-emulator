@@ -39,18 +39,18 @@ use crate::private_workflow_runs::{
 /// Every member of `CreateRunGroupRequest` that caps a resource the group's runs may use.
 /// Source: the `maxCpus`, `maxRuns`, `maxDuration` and `maxGpus` members of
 /// `CreateRunGroupRequest`.
-const CAP_MEMBERS: &[&str] = &["maxCpus", "maxRuns", "maxDuration", "maxGpus"];
+pub(crate) const CAP_MEMBERS: &[&str] = &["maxCpus", "maxRuns", "maxDuration", "maxGpus"];
 
 /// The published range every one of [`CAP_MEMBERS`] shares (1..100000).
 /// Source: the same four members of `CreateRunGroupRequest`.
-const CAP_RANGE: (i64, i64) = (1, 100_000);
+pub(crate) const CAP_RANGE: (i64, i64) = (1, 100_000);
 
 /// The published bounds of the modelled `RunGroupId` length (1..18).
 /// Source: the `id` member of `CreateRunGroupResponse`.
 const RUN_GROUP_ID_WIDTH: (usize, usize) = (1, 18);
 
 /// The resource an omics run group ARN names.
-const RUN_GROUP_ARN_RESOURCE: &str = "runGroup";
+pub(crate) const RUN_GROUP_ARN_RESOURCE: &str = "runGroup";
 
 /// Members `CreateRunGroupResponse` does NOT model, so the create answers none of them
 /// however much the request carried: they are read back through `GetRunGroup`.
@@ -65,12 +65,12 @@ const NOT_ON_THE_CREATE_RESPONSE: &[&str] = &[
 ];
 
 /// `POST /runGroup`.
-async fn create_group(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn create_group(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/runGroup", Some(body)).await
 }
 
 /// `GET /runGroup/{id}`.
-async fn get_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn get_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/runGroup/{id}"), None).await
 }
 
@@ -103,7 +103,7 @@ fn tag_map(count: usize) -> Value {
 }
 
 /// A one-member object: the body of a row that names exactly one cap.
-fn member_object(member: &str, value: Value) -> Value {
+pub(crate) fn member_object(member: &str, value: Value) -> Value {
     let mut map = Map::new();
     map.insert(member.to_string(), value);
     Value::Object(map)
@@ -618,7 +618,7 @@ async fn a_run_joins_a_run_group_this_emulator_holds() {
 // ---------------------------------------------------------------------------
 
 /// `GET /runGroup{query}`.
-async fn list_groups(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub(crate) async fn list_groups(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     call(router, "GET", &format!("/runGroup{query}"), None).await
 }
 
