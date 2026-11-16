@@ -75,7 +75,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-west-2";
 
 /// The service principal Secrets Manager invokes a rotation function as.
-const SERVICE_PRINCIPAL: &str = "secretsmanager.amazonaws.com";
+pub(crate) const SERVICE_PRINCIPAL: &str = "secretsmanager.amazonaws.com";
 
 /// The IAM action an invocation of a function performs.
 const INVOKE_ACTION: &str = "lambda:InvokeFunction";
@@ -112,10 +112,10 @@ const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 const ACTIVATION_WAIT: Duration = ACTIVATION_DELAY.saturating_mul(60);
 
 /// The staging label the version a secret currently serves carries.
-const CURRENT_STAGE: &str = "AWSCURRENT";
+pub(crate) const CURRENT_STAGE: &str = "AWSCURRENT";
 
 /// The staging label a rotation stakes on the version it is creating.
-const PENDING_STAGE: &str = "AWSPENDING";
+pub(crate) const PENDING_STAGE: &str = "AWSPENDING";
 
 /// The tag key [`FAILING_FUNCTION`] records its attempt under, which is the literal that
 /// function's own source writes — a rotation that cannot finish leaves nothing else behind,
@@ -123,7 +123,7 @@ const PENDING_STAGE: &str = "AWSPENDING";
 const ATTEMPTED_STEP_TAG: &str = "attempted-step";
 
 /// Secrets Manager and Lambda over ONE shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -169,7 +169,12 @@ async fn sm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16,
 }
 
 /// The same, requiring the 200 the operation answers.
-async fn sm_ok(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sm_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = sm(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -179,7 +184,7 @@ async fn sm_ok(router: &MultiServiceRouter, case: &str, operation: &str, body: &
 }
 
 /// The same, requiring a refusal, as its status, error code and message.
-async fn sm_err(
+pub(crate) async fn sm_err(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -248,7 +253,7 @@ pub(crate) fn package(source: &str) -> Vec<u8> {
 
 /// Create the rotation function `name` running `source`, wait out its provisioning window,
 /// and answer its ARN.
-async fn create_function(
+pub(crate) async fn create_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -442,14 +447,14 @@ def lambda_handler(event, context):
 "#;
 
 /// What `DescribeSecret` reports for `secret_id`.
-async fn described(router: &MultiServiceRouter, case: &str, secret_id: &str) -> Value {
+pub(crate) async fn described(router: &MultiServiceRouter, case: &str, secret_id: &str) -> Value {
     sm_ok(router, case, "DescribeSecret", &json!({"SecretId": secret_id})).await
 }
 
 /// Wait until the rotation of `secret_id` has finished — `LastRotatedDate` stamped and no
 /// version other than the `AWSCURRENT` one holding `AWSPENDING` — and answer what
 /// `DescribeSecret` reported last.
-async fn rotated(router: &MultiServiceRouter, case: &str, secret_id: &str) -> Value {
+pub(crate) async fn rotated(router: &MultiServiceRouter, case: &str, secret_id: &str) -> Value {
     let looks = ROTATION_WAIT.as_millis() / LOOK_INTERVAL.as_millis().max(1);
     let mut last = Value::Null;
     for _ in 0..looks {
@@ -486,7 +491,7 @@ async fn attempted(router: &MultiServiceRouter, case: &str, secret_id: &str) -> 
 }
 
 /// The value of the tag `key` in a `DescribeSecret` answer, when it carries one.
-fn tag_value(described: &Value, key: &str) -> Option<String> {
+pub(crate) fn tag_value(described: &Value, key: &str) -> Option<String> {
     described["Tags"].as_array()?.iter().find_map(|tag| {
         (tag["Key"].as_str() == Some(key)).then(|| {
             tag["Value"]
@@ -498,7 +503,7 @@ fn tag_value(described: &Value, key: &str) -> Option<String> {
 }
 
 /// The versions a `DescribeSecret` answer reports the staging label `stage` on.
-fn staged_versions(described: &Value, stage: &str) -> Vec<String> {
+pub(crate) fn staged_versions(described: &Value, stage: &str) -> Vec<String> {
     described["VersionIdsToStages"]
         .as_object()
         .map(|versions| {
@@ -516,7 +521,7 @@ fn staged_versions(described: &Value, stage: &str) -> Vec<String> {
 }
 
 /// The value `GetSecretValue` serves for the staging label `stage`.
-async fn value_at(
+pub(crate) async fn value_at(
     router: &MultiServiceRouter,
     case: &str,
     secret_id: &str,
@@ -540,7 +545,7 @@ async fn value_at(
 
 /// How a row writes the rotation function's grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Grant {
+pub(crate) enum Grant {
     /// No statement at all: the function holds no policy.
     None,
     /// `lambda:InvokeFunction` to this service, unscoped.
@@ -608,7 +613,7 @@ const ANOTHER_PRINCIPAL: &str = "events.amazonaws.com";
 
 /// Write the grant `grant` states onto the rotation function `name`, for a rotation of
 /// `secret_arn`, clearing whatever the row before it left there.
-async fn apply_grant(
+pub(crate) async fn apply_grant(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

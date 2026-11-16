@@ -85,6 +85,8 @@ mod secret_rotation;
 mod secret_rotation_cancel;
 #[path = "all/secret_rotation_driver.rs"]
 mod secret_rotation_driver;
+#[path = "all/secret_rotation_grant_added_after_refusal.rs"]
+mod secret_rotation_grant_added_after_refusal;
 #[path = "all/secret_rotation_schedule.rs"]
 mod secret_rotation_schedule;
 #[path = "all/secret_rotation_span.rs"]
