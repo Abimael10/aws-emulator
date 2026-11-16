@@ -92,7 +92,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::vpc_network::{resolve_subnets, security_groups_refusal, subnet_outside_vpc};
+use crate::state::vpc_network::{
+    placed_vpc, resolve_security_groups, resolve_subnets, security_groups_outside_vpc_refusal,
+    security_groups_refusal, subnet_outside_vpc,
+};
 use crate::state::{
     request_region, subnet_outside_endpoint_vpc, vpc_endpoint_being_modified,
     vpc_endpoint_not_found,
@@ -186,7 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The security groups the change names have to fit on the network interface the
+        // Which VPC each security group the change names governs traffic in is EC2's to say
+        // too, so the groups are resolved there beside the subnets, before the store is
+        // touched; the pair is judged below, once the endpoint's own VPC is known.
+        let security_group_placements = match input.vpc_options.security_group_ids.as_deref() {
+            None => Vec::new(),
+            Some(group_ids) => {
+                resolve_security_groups(ctx, &request_region(ctx.parts()), group_ids).await
+            }
+        };
+
+        // The security groups a change names have to fit on the network interface the
         // endpoint is reached through: a list past the account's own
         // security-groups-per-network-interface quota asks for an interface the account's
         // network cannot carry, so it is refused and the endpoint keeps the groups it had
@@ -251,6 +264,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the endpoint has been resolved and before anything is written, so a refused
         // change leaves the endpoint with exactly the groups it had.
         if let Some(refusal) = security_groups_refused {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(refusal).into());
+        }
+
+        // ... and the groups have to govern traffic in the VPC the endpoint lives in: the
+        // interfaces they would be attached to are interfaces of that VPC, so a group the
+        // account's network puts in another one is refused and the endpoint keeps the groups
+        // it had ([`crate::state::vpc_network::security_groups_outside_vpc_refusal`]). That
+        // VPC is the endpoint's own, which no call moves; a record whose VPC was never
+        // resolved is judged against the one this change's subnets name.
+        let placement_vpc = endpoint
+            .vpc_options
+            .vpc_id
+            .clone()
+            .or_else(|| placed_vpc(&placements));
+        if let Some(refusal) =
+            security_groups_outside_vpc_refusal(placement_vpc.as_deref(), &security_group_placements)
+        {
             return Err(UpdateVpcEndpointErrorModeled::ValidationException(refusal).into());
         }
 

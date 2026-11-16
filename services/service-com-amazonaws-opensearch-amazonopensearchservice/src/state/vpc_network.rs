@@ -21,7 +21,7 @@
 //! `service_common::network` records; this service keeps what EC2 answered as well,
 //! because `VPCDerivedInfo` reports it, and keeps it only for the subnets EC2 resolved.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 
@@ -33,23 +33,44 @@ use super::*;
 /// named is still resolved against what EC2 does hold.
 const SUBNET_ID_FILTER: &str = "subnet-id";
 
-/// The most subnet identifiers asked about in ONE hop to EC2.
+/// The most identifiers asked about in ONE hop to EC2.
 ///
-/// A hop is evaluated against every subnet the account stores, so this caps the
-/// identifiers one question carries; the identifiers a request names beyond it are asked
-/// about in further hops ([`MAX_RESOLVED_SUBNET_HOPS`] of them).
-const SUBNET_IDS_PER_HOP: usize = 64;
+/// A hop is evaluated against every record the account stores of that kind, so this caps
+/// the identifiers one question carries; the identifiers a request names beyond it are
+/// asked about in further hops ([`MAX_RESOLVED_HOPS`] of them).
+const IDS_PER_HOP: usize = 64;
 
-/// The most hops one call makes, and so — with [`SUBNET_IDS_PER_HOP`] — the most
+/// The most hops one resolution makes, and so — with [`IDS_PER_HOP`] — the most
 /// identifiers it resolves.
 ///
 /// CHOSEN as a process-safety ceiling, not a published quota: the model declares no
-/// `@length` on `VPCOptions$SubnetIds`, so without one the work a single request causes
-/// would be sized by that request. A VPC endpoint is placed with one subnet per
-/// Availability Zone, so the product is far above what any real placement names;
-/// identifiers past it are left unresolved, which — like an EC2 that cannot be asked —
-/// grounds nothing.
-const MAX_RESOLVED_SUBNET_HOPS: usize = 8;
+/// `@length` on `VPCOptions$SubnetIds` or `VPCOptions$SecurityGroupIds`, so without one
+/// the work a single request causes would be sized by that request. A VPC endpoint is
+/// placed with one subnet per Availability Zone, so the product is far above what any real
+/// placement names; identifiers past it are left unresolved, which — like an EC2 that
+/// cannot be asked — grounds nothing.
+const MAX_RESOLVED_HOPS: usize = 8;
+
+/// The identifiers ONE resolution asks EC2 about: the ones `ids` names, each once and in
+/// the order they were named, capped at what [`IDS_PER_HOP`] hops of
+/// [`MAX_RESOLVED_HOPS`] resolve.
+///
+/// Deduplicated so a request that repeats an identifier costs one question, and capped so a
+/// caller cannot size this emulator's work by the length of its list.
+fn asked_ids(ids: &[String]) -> Vec<String> {
+    let ceiling = IDS_PER_HOP * MAX_RESOLVED_HOPS;
+    let mut asked: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for id in ids {
+        if asked.len() == ceiling {
+            break;
+        }
+        if seen.insert(id.as_str()) {
+            asked.push(id.clone());
+        }
+    }
+    asked
+}
 
 /// One subnet of the account, reduced to what this service reads off it: which VPC it
 /// belongs to and which Availability Zone it sits in, as EC2 reports them.
@@ -110,26 +131,15 @@ fn ec2(
 /// says, and says nothing of its own about what it could not resolve.
 ///
 /// EVERY identifier the request named is asked about, deduplicated and in hops of
-/// [`SUBNET_IDS_PER_HOP`] — so a placement is resolved whole rather than only as far as
-/// one hop reaches, and a caller cannot push a subnet past the question by listing more of
-/// them. The work is bounded by [`MAX_RESOLVED_SUBNET_HOPS`] hops whatever the request
-/// carries.
+/// [`IDS_PER_HOP`] ([`asked_ids`]) — so a placement is resolved whole rather than only as
+/// far as one hop reaches, and a caller cannot push a subnet past the question by listing
+/// more of them.
 pub async fn resolve_subnets(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
 ) -> Vec<SubnetPlacement> {
-    let ceiling = SUBNET_IDS_PER_HOP * MAX_RESOLVED_SUBNET_HOPS;
-    let mut asked: Vec<String> = Vec::new();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for subnet_id in subnet_ids {
-        if asked.len() == ceiling {
-            break;
-        }
-        if seen.insert(subnet_id.as_str()) {
-            asked.push(subnet_id.clone());
-        }
-    }
+    let asked = asked_ids(subnet_ids);
     if asked.is_empty() {
         return Vec::new();
     }
@@ -137,7 +147,7 @@ pub async fn resolve_subnets(
         return Vec::new();
     };
     let mut reported: Vec<::aws_sdk_ec2::types::Subnet> = Vec::new();
-    for hop in asked.chunks(SUBNET_IDS_PER_HOP) {
+    for hop in asked.chunks(IDS_PER_HOP) {
         let by_id = ::aws_sdk_ec2::types::Filter::builder()
             .name(SUBNET_ID_FILTER)
             .set_values(Some(hop.to_vec()))
@@ -157,14 +167,20 @@ pub async fn resolve_subnets(
             }
         }
     }
-    // In the order the REQUEST named them, so what a caller is told about is the subnet
-    // it listed rather than whichever row EC2 happened to answer first.
-    subnet_ids
+    // Indexed by identifier ONCE, so resolving a placement costs a logarithmic lookup per
+    // identifier rather than a scan of every row EC2 answered.
+    let by_id: BTreeMap<&str, &::aws_sdk_ec2::types::Subnet> = reported
+        .iter()
+        .filter_map(|subnet| subnet.subnet_id().map(|id| (id, subnet)))
+        .collect();
+    // Over the identifiers that were ASKED about — each once, and capped — in the order the
+    // REQUEST named them, so what a caller is told about is the subnet it listed rather than
+    // whichever row EC2 happened to answer first, and a repeated identifier is one placement
+    // rather than a copy per mention.
+    asked
         .iter()
         .filter_map(|subnet_id| {
-            let subnet = reported
-                .iter()
-                .find(|subnet| subnet.subnet_id() == Some(subnet_id.as_str()))?;
+            let subnet = by_id.get(subnet_id.as_str())?;
             Some(SubnetPlacement {
                 subnet_id: subnet_id.clone(),
                 vpc_id: subnet.vpc_id().map(str::to_owned),
@@ -222,15 +238,149 @@ pub fn subnets_not_in_one_vpc() -> ValidationException {
     }
 }
 
+/// The EC2 filter that selects security groups BY ID (`group-id`, listed by
+/// `DescribeSecurityGroups`'s own `Filters` documentation).
+///
+/// A filter rather than `GroupIds`, for the reason [`SUBNET_ID_FILTER`] is one: an
+/// identifier the account has no group for is then an absent row instead of a failure of
+/// the whole call, so every identifier the request named is still resolved against what EC2
+/// does hold.
+const SECURITY_GROUP_ID_FILTER: &str = "group-id";
+
+/// One security group of the account, reduced to what this service reads off it: which VPC
+/// EC2 reports it governs traffic in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityGroupPlacement {
+    /// The identifier the request named, which is the one EC2 answered for.
+    pub group_id: String,
+    /// The VPC EC2 reports the group governs traffic in, absent where its record carries
+    /// none.
+    pub vpc_id: Option<String>,
+}
+
+/// Every security group of `group_ids` the account has in `region`, as EC2 reports it, in
+/// the order the request named them.
+///
+/// A security group is Amazon EC2's resource, so which VPC one governs traffic in is EC2's
+/// to say, and this resolves exactly that: an identifier EC2 reports no group for is simply
+/// ABSENT from the answer, and so is every identifier when there is no EC2 to ask. Nothing
+/// of this service's own is said about what could not be resolved.
+///
+/// Asked about in the same hops a placement's subnets are ([`asked_ids`]), for the same
+/// reason.
+pub async fn resolve_security_groups(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    group_ids: &[String],
+) -> Vec<SecurityGroupPlacement> {
+    let asked = asked_ids(group_ids);
+    if asked.is_empty() {
+        return Vec::new();
+    }
+    let Some(client) = ec2(ctx, region) else {
+        return Vec::new();
+    };
+    let mut reported: Vec<::aws_sdk_ec2::types::SecurityGroup> = Vec::new();
+    for hop in asked.chunks(IDS_PER_HOP) {
+        let by_id = ::aws_sdk_ec2::types::Filter::builder()
+            .name(SECURITY_GROUP_ID_FILTER)
+            .set_values(Some(hop.to_vec()))
+            .build();
+        match client
+            .describe_security_groups()
+            .filters(by_id)
+            .send()
+            .await
+        {
+            Ok(output) => reported.extend(output.security_groups().iter().cloned()),
+            Err(error) => {
+                // At `warn`, for the reason the subnet hop warns: a deployment where this
+                // hop fails is one where the network a placement is judged against is
+                // never resolved, and it IS why an identifier did not resolve.
+                ::tracing::warn!(
+                    %region,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the security groups a request named could not be resolved against EC2"
+                );
+            }
+        }
+    }
+    // Indexed and walked the way the subnets above are, for the same reasons: one lookup
+    // per identifier asked about, each identifier once, in the order the REQUEST named them.
+    let by_id: BTreeMap<&str, &::aws_sdk_ec2::types::SecurityGroup> = reported
+        .iter()
+        .filter_map(|group| group.group_id().map(|id| (id, group)))
+        .collect();
+    asked
+        .iter()
+        .filter_map(|group_id| {
+            let group = by_id.get(group_id.as_str())?;
+            Some(SecurityGroupPlacement {
+                group_id: group_id.clone(),
+                vpc_id: group.vpc_id().map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// How this service states that the security groups a VPC-access placement names do not
+/// govern traffic in the VPC its subnets are in: one fixed sentence with no variable part,
+/// because what the caller has to fix is WHICH network the pair describes rather than
+/// anything about one value.
+pub const SECURITY_GROUPS_NOT_IN_SUBNET_VPC: &str =
+    "Subnets and security groups must be in the same VPC.";
+
+/// The first resolved security group that governs traffic in a VPC OTHER than `vpc_id`, in
+/// the order the request named them, or `None` where every resolved group governs traffic
+/// in that VPC.
+///
+/// A group EC2 resolved no VPC for is not evidence of governing another one, so it is not
+/// what this answers — only a group EC2 placed in a DIFFERENT VPC is.
+pub fn security_group_outside_vpc<'a>(
+    vpc_id: &str,
+    groups: &'a [SecurityGroupPlacement],
+) -> Option<&'a SecurityGroupPlacement> {
+    groups.iter().find(|group| {
+        group
+            .vpc_id
+            .as_deref()
+            .is_some_and(|governs| governs != vpc_id)
+    })
+}
+
+/// The `ValidationException` payload ([`SECURITY_GROUPS_NOT_IN_SUBNET_VPC`]) for a
+/// placement whose security groups do not govern traffic in `vpc_id`, the VPC the placement
+/// itself lives in.
+///
+/// A VPC-access placement — a domain's or an endpoint's — is reached through network
+/// interfaces that live in its subnets, and a security group governs traffic only to
+/// interfaces of the VPC it belongs to: a group of another VPC can never be attached to
+/// them, so the call asking for that pair is refused rather than stored as a placement
+/// nothing could reach. Decided from what EC2 ANSWERED on both sides: a placement whose own
+/// VPC is not known (`None`) and a group EC2 resolved nothing for ground no refusal.
+pub fn security_groups_outside_vpc_refusal(
+    vpc_id: Option<&str>,
+    groups: &[SecurityGroupPlacement],
+) -> Option<ValidationException> {
+    security_group_outside_vpc(vpc_id?, groups)?;
+    Some(ValidationException {
+        message: Some(SECURITY_GROUPS_NOT_IN_SUBNET_VPC.to_string()),
+    })
+}
+
 /// The Availability Zones the resolved subnets sit in, in the order the request named the
 /// subnets, each zone once; `None` where no resolved subnet names a zone.
+///
+/// Membership is kept in a set rather than rescanned per zone, so the work is logarithmic in
+/// the zones already seen however many subnets a request named.
 pub fn placed_zones(placements: &[SubnetPlacement]) -> Option<Vec<String>> {
     let mut zones: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for zone in placements
         .iter()
         .filter_map(|placement| placement.availability_zone.as_deref())
     {
-        if !zones.iter().any(|seen| seen == zone) {
+        if seen.insert(zone) {
             zones.push(zone.to_owned());
         }
     }

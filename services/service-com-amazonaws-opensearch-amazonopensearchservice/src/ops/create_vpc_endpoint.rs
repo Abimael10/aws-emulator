@@ -95,7 +95,8 @@
 use super::types::*;
 
 use crate::state::vpc_network::{
-    placed_vpc_options, resolve_subnets, security_groups_refusal, subnets_span_two_vpcs,
+    placed_vpc, placed_vpc_options, resolve_security_groups, resolve_subnets,
+    security_groups_outside_vpc_refusal, security_groups_refusal, subnets_span_two_vpcs,
 };
 use crate::state::{
     request_region, subnets_in_two_vpcs, vpc_endpoint_domain_unavailable, vpc_endpoint_host,
@@ -211,6 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Which VPC each security group the request names governs traffic in is EC2's to say
+        // too, so the groups are resolved there beside the subnets, before the store is
+        // touched; the pair is judged below.
+        let security_group_placements = match input.vpc_options.security_group_ids.as_deref() {
+            None => Vec::new(),
+            Some(group_ids) => {
+                resolve_security_groups(ctx, &request_region(ctx.parts()), group_ids).await
+            }
+        };
+
         // ... and the security groups it names have to fit on the network interface the
         // endpoint is reached through: a list past the account's own
         // security-groups-per-network-interface quota asks for an interface the account's
@@ -222,6 +233,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &request_region(ctx.parts()),
             Some(&input.vpc_options),
             crate::state::vpc_network::VPC_ENDPOINT_PLACEMENT,
+        ) {
+            return Err(CreateVpcEndpointErrorModeled::ValidationException(refusal).into());
+        }
+
+        // ... and the groups that do fit have to govern traffic in that same VPC: the
+        // endpoint is reached through network interfaces living in those subnets, and a
+        // group of another VPC could never be attached to them, so nothing is minted for
+        // that pair ([`crate::state::vpc_network::security_groups_outside_vpc_refusal`]).
+        // Stated AFTER the quota above, the order the domain paths state the two in, so one
+        // request failing both is answered the same way whichever placement it asked for.
+        if let Some(refusal) = security_groups_outside_vpc_refusal(
+            placed_vpc(&placements).as_deref(),
+            &security_group_placements,
         ) {
             return Err(CreateVpcEndpointErrorModeled::ValidationException(refusal).into());
         }

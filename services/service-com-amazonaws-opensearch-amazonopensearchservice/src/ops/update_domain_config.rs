@@ -157,7 +157,8 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::vpc_network::{
-    placed_vpc_options, resolve_subnets, subnets_not_in_one_vpc, subnets_span_two_vpcs,
+    placed_vpc, placed_vpc_options, resolve_security_groups, resolve_subnets,
+    security_groups_outside_vpc_refusal, subnets_not_in_one_vpc, subnets_span_two_vpcs,
     SubnetPlacement,
 };
 use crate::state::{
@@ -502,6 +503,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // Which VPC each security group a change names governs traffic in is EC2's to say
+        // too, so the groups are resolved there beside the subnets, before the store is
+        // touched and before the merge consumes the request. Judged below, after the domain
+        // this change addresses has been resolved.
+        let security_group_placements = match input
+            .vpc_options
+            .as_ref()
+            .and_then(|options| options.security_group_ids.as_deref())
+        {
+            None => Vec::new(),
+            Some(group_ids) => {
+                resolve_security_groups(ctx, &crate::state::request_region(ctx.parts()), group_ids)
+                    .await
+            }
+        };
+
         // The security groups a change names have to fit on the network interface a
         // VPC-access domain is reached through: a list past the account's own
         // security-groups-per-network-interface quota asks for an interface the account's
@@ -588,6 +605,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 subnets_not_in_one_vpc(),
             )
             .into());
+        }
+
+        // ... and the security groups it names have to govern traffic in the VPC the domain
+        // is placed in, by the rule the create path applies: a group the account's network
+        // puts in another VPC could never be attached to the interfaces the domain is
+        // reached through, so the change is refused and the domain keeps the placement it
+        // had. The VPC is the one the change's own subnets name — the request's container
+        // REPLACES the stored one whole — and, for a change naming no subnet, the one the
+        // domain already reports.
+        let placement_vpc = placed_vpc(&placements).or_else(|| {
+            merged
+                .vpc_options
+                .as_ref()
+                .and_then(|options| options.vpc_id.clone())
+        });
+        if let Some(refusal) = security_groups_outside_vpc_refusal(
+            placement_vpc.as_deref(),
+            &security_group_placements,
+        ) {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
         }
 
         // The master credential of the internal user database has to meet the

@@ -143,7 +143,8 @@ use super::types::*;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::state::vpc_network::{
-    placed_vpc_options, resolve_subnets, subnets_not_in_one_vpc, subnets_span_two_vpcs,
+    placed_vpc, placed_vpc_options, resolve_security_groups, resolve_subnets,
+    security_groups_outside_vpc_refusal, subnets_not_in_one_vpc, subnets_span_two_vpcs,
 };
 use crate::state::{
     domain_arn, domain_endpoint, domain_id, stored_advanced_security_options, stored_aiml_options,
@@ -282,6 +283,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             None => Vec::new(),
             Some(subnet_ids) => resolve_subnets(ctx, &region, subnet_ids).await,
+        };
+
+        // Which VPC each security group the request names governs traffic in is EC2's to
+        // say too, so the groups are resolved there beside the subnets, before the store is
+        // touched: a group is only ever judged against the VPC the placement itself lives
+        // in, which the resolved subnets name. Judged further down, among the other
+        // refusals.
+        let security_group_placements = match input
+            .vpc_options
+            .as_ref()
+            .and_then(|options| options.security_group_ids.as_deref())
+        {
+            None => Vec::new(),
+            Some(group_ids) => resolve_security_groups(ctx, &region, group_ids).await,
         };
 
         // A VPC-access domain is reached through network interfaces carrying the security
@@ -545,6 +560,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDomainErrorModeled::ValidationException(subnets_not_in_one_vpc()).into(),
             );
+        }
+
+        // ... and the network interfaces it is reached through live in those subnets, so the
+        // security groups the request names have to govern traffic in that same VPC: a group
+        // the account's network puts in another VPC could never be attached to them, so the
+        // create is refused and no domain exists afterwards
+        // ([`crate::state::vpc_network::security_groups_outside_vpc_refusal`]). Decided from
+        // what EC2 ANSWERED on both sides, so a placement whose VPC is not known and a group
+        // it resolved nothing for refuse nothing.
+        if let Some(refusal) = security_groups_outside_vpc_refusal(
+            placed_vpc(&placements).as_deref(),
+            &security_group_placements,
+        ) {
+            return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
         }
 
         // A domain is created carrying the tags the request named, and the same bound
