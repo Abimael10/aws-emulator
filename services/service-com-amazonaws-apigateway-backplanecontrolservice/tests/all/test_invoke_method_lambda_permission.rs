@@ -52,8 +52,10 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/lambda-exec";
 const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// How long this suite waits for another service's clock-owed transition (a created function
-/// becoming `Active`), and how often it looks.
-const WAIT: Duration = Duration::from_secs(20);
+/// becoming `Active`), and how often it looks. Generous: the suite is one of thousands a run
+/// may be executing at once, so the deadline leaves room for a loaded host, while the wait
+/// itself is for the CONDITION and no assertion here is on how long anything took.
+const WAIT: Duration = Duration::from_secs(60);
 const LOOK: Duration = Duration::from_millis(100);
 
 /// The marker the handler answers with, which is how a reported body is told from one the
@@ -230,7 +232,13 @@ pub(crate) async fn lambda(
 }
 
 /// One CloudWatch Logs call over its `awsJson1_1` wire, answering its status and parsed body.
-async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+/// Shared with the sibling suites that read the same group
+/// ([`crate::test_invoke_method_lambda_permission_loop`]) rather than written twice.
+pub(crate) async fn logs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let answered = dispatch(
         router,
         "POST",
@@ -273,8 +281,10 @@ pub(crate) async fn runs_logged(router: &MultiServiceRouter) -> usize {
         .unwrap_or_default()
 }
 
-/// A .zip deployment package holding `source` as the module the handler names.
-fn package(source: &str) -> Vec<u8> {
+/// A .zip deployment package holding `source` as the module the handler names. Shared with the
+/// sibling suites that deploy a handler of their own
+/// ([`crate::test_invoke_method_lambda_permission_loop`]) rather than written twice.
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -290,23 +300,28 @@ fn package(source: &str) -> Vec<u8> {
     buffer.into_inner()
 }
 
-/// The member `name` of a JSON object, as text.
-fn member(case: &str, body: &Value, name: &str) -> String {
+/// The member `name` of a JSON object, as text. Shared with the sibling suites that read the
+/// same envelopes ([`crate::test_invoke_method_lambda_permission_loop`]) rather than written
+/// twice.
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("setup {case:?}: no {name:?} in {body}"))
         .to_string()
 }
 
-/// Poll `GetFunctionConfiguration` until Lambda first reports the function `Active`.
-async fn wait_until_active(router: &MultiServiceRouter) {
+/// Poll `GetFunctionConfiguration` until Lambda first reports `function` `Active`. Shared with
+/// the sibling suites that deploy a function of their own
+/// ([`crate::test_invoke_method_lambda_permission_loop`]) rather than written twice, so it is
+/// named the function to wait for rather than assuming this suite's.
+pub(crate) async fn wait_until_active(router: &MultiServiceRouter, function: &str) {
     let looks = WAIT.as_millis() / LOOK.as_millis().max(1);
     let mut last = Value::Null;
     for _ in 0..looks {
         let (_, configuration) = lambda(
             router,
             "GET",
-            &format!("/2015-03-31/functions/{FUNCTION}/configuration"),
+            &format!("/2015-03-31/functions/{function}/configuration"),
             None,
         )
         .await;
@@ -316,7 +331,7 @@ async fn wait_until_active(router: &MultiServiceRouter) {
         last = configuration;
         tokio::time::sleep(LOOK).await;
     }
-    panic!("setup CreateFunction: the function never became Active, last read {last}");
+    panic!("setup CreateFunction: {function} never became Active, last read {last}");
 }
 
 /// The api, its one `GET` method proxying to the function, and a deployment released to the
@@ -414,7 +429,7 @@ pub(crate) async fn wired(router: &MultiServiceRouter) -> (String, String) {
         201,
     )
     .await;
-    wait_until_active(router).await;
+    wait_until_active(router, FUNCTION).await;
     (api, resource)
 }
 
