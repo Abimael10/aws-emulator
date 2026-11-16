@@ -161,9 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DisableSecurityHubErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
-                    )),
+                    message: Some(crate::state::not_subscribed_message(&account_id)),
                     code: Some("ResourceNotFoundException".to_string()),
                 },
             )

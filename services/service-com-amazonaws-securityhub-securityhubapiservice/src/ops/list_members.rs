@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.hubs.contains_key(&hub) {
             return Err(ListMembersErrorModeled::InvalidAccessException(
                 InvalidAccessException {
-                    message: Some(crate::state::not_subscribed_message(administrator_id, region)),
+                    message: Some(crate::state::not_subscribed_message(administrator_id)),
                     code: Some("InvalidAccessException".to_string()),
                 },
             )

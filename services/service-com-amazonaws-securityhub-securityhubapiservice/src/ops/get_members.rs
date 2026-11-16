@@ -175,7 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let hub = crate::state::hub_key(ctx);
         let administrator_id = hub.0.as_str();
-        let region = hub.1.as_str();
 
         // Reading an administrator account's members needs that account to be
         // subscribed, exactly as creating them does.
@@ -183,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.hubs.contains_key(&hub) {
             return Err(GetMembersErrorModeled::InvalidAccessException(
                 InvalidAccessException {
-                    message: Some(crate::state::not_subscribed_message(administrator_id, region)),
+                    message: Some(crate::state::not_subscribed_message(administrator_id)),
                     code: Some("InvalidAccessException".to_string()),
                 },
             )

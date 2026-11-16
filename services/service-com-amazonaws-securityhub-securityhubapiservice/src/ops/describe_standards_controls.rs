@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeStandardsControlsErrorModeled::InvalidAccessException(
                     InvalidAccessException {
-                        message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                        message: Some(crate::state::not_subscribed_message(&account_id)),
                         code: Some("InvalidAccessException".to_string()),
                     },
                 )

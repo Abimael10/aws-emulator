@@ -205,10 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.hubs.contains_key(&hub) {
             return Err(ListAutomationRulesErrorModeled::InvalidAccessException(
                 InvalidAccessException {
-                    message: Some(format!(
-                        "Account {} is not subscribed to Security Hub CSPM in Region {}",
-                        hub.0, hub.1
-                    )),
+                    message: Some(crate::state::not_subscribed_message(&hub.0)),
                     code: Some("InvalidAccessException".to_string()),
                 },
             )

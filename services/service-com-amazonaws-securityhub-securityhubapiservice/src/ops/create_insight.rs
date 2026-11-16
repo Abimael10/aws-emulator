@@ -224,9 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.hubs.contains_key(&key) {
             return Err(CreateInsightErrorModeled::InvalidAccessException(
                 InvalidAccessException {
-                    message: Some(format!(
-                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
-                    )),
+                    message: Some(crate::state::not_subscribed_message(&account_id)),
                     code: Some("InvalidAccessException".to_string()),
                 },
             )

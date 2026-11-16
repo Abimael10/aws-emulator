@@ -355,14 +355,18 @@ pub const STATE_UNAVAILABLE_MESSAGE: &str = "the Security Hub CSPM state store i
 /// The message a hub-scoped operation refuses a caller with when the account is not
 /// subscribed to Security Hub CSPM in the request's Region.
 ///
+/// The caller's account id is the ONLY variable part: the subscription is per
+/// account/Region, but the refusal names just the account, with no Region clause, and
+/// spells the product with its full name.
+///
 /// Only a HUB-SCOPED operation — one that reads or writes this account's hub,
 /// findings, insights, action targets, members or standards subscriptions — has that
 /// precondition. An operation that reports the service's own published metadata (the
 /// standards catalog, the product catalog, the security-control definitions) answers
 /// every caller, subscribed or not: those are the reads a client makes to discover
 /// what it can enable, before any hub exists.
-pub fn not_subscribed_message(account_id: &str, region: &str) -> String {
-    format!("Account {account_id} is not subscribed to Security Hub CSPM in Region {region}")
+pub fn not_subscribed_message(account_id: &str) -> String {
+    format!("Account {account_id} is not subscribed to AWS Security Hub CSPM")
 }
 
 /// The whole message `EnableSecurityHub` refuses a second enable of an already

@@ -179,10 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let hub = store.hubs.get(&key).ok_or_else(|| {
             DescribeHubError::Modeled(DescribeHubErrorModeled::InvalidAccessException(
                 InvalidAccessException {
-                    message: Some(format!(
-                        "Account {} is not subscribed to Security Hub CSPM in Region {}",
-                        key.0, key.1
-                    )),
+                    message: Some(crate::state::not_subscribed_message(&key.0)),
                     code: Some("InvalidAccessException".to_string()),
                 },
             ))
