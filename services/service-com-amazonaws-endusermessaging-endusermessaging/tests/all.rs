@@ -25,3 +25,5 @@ mod notify_code_configuration_lifecycle;
 mod notify_code_verification_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/timestamp_wire_resolution.rs"]
+mod timestamp_wire_resolution;

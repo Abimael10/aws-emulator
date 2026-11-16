@@ -318,17 +318,22 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// A stored instant as the modelled `Timestamp` the wire carries.
+/// A stored instant as the modelled `Timestamp` the wire carries: the whole epoch
+/// second it falls in.
 ///
-/// Built from whole seconds plus sub-second nanoseconds so a stored instant keeps
-/// the resolution `SystemTime::now()` gave it; going through an `f64` of epoch
-/// seconds would quantise it to roughly a quarter of a microsecond.
+/// Every `Timestamp` member of this service is `smithy.api#Timestamp` with no
+/// `@timestampFormat` override, so restJson1 carries it in the body in its default
+/// epoch-seconds form, and this API — which documents each one as a time "in Unix
+/// epoch time" — reports it as a whole count of seconds, with no sub-second
+/// fraction. A stored instant is therefore reported as the second it falls in, and
+/// the resolution of the host clock that recorded it never reaches the wire.
+/// Truncating rather than rounding keeps the reported instant inside the second the
+/// event happened in, so it never runs ahead of the clock that recorded it. Every
+/// projection of every stored instant goes through here, so one instant has one
+/// wire form whichever operation reports it.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_and_nanos(
-        i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-        since_epoch.subsec_nanos(),
-    )
+    ::aws_smithy_types::DateTime::from_secs(i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// The message for the one failure that is not about the request: this service was

@@ -39,6 +39,14 @@ const SIGNING_NAME: &str = "end-user-messaging";
 /// The account id every generated emulator presents, as `engine` defines it.
 const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
 
+/// How long to keep looking for a reported instant to advance before giving up:
+/// generous, because the condition is the clock's second moving on, not a bound on
+/// how fast the host serves a request.
+const BUMP_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
+
+/// How long to wait between looks while waiting for a reported instant to advance.
+const BUMP_POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(20);
+
 /// One response, reduced to what the assertions read.
 #[derive(Debug)]
 struct Reply {
@@ -497,7 +505,22 @@ async fn an_update_applies_only_the_members_it_carries() {
             .await;
         let id = created.string("brandProfileId");
 
-        let updated = em.update(&id, body.clone()).await;
+        // A reported instant is the whole epoch second it falls in, so an update
+        // served inside the same second as the create reports that same instant.
+        // Apply the update again until the reported instant advances — which it does
+        // as soon as the clock's second moves on — instead of assuming the host is
+        // slow enough for one update to land in a later second. Each row's update is
+        // the same body applied to the same profile, so repeating it changes nothing
+        // but the instant.
+        let bump_deadline = ::std::time::Instant::now() + BUMP_DEADLINE;
+        let mut updated = em.update(&id, body.clone()).await;
+        while updated.status == 200
+            && updated.number("updatedAt") <= created.number("updatedAt")
+            && ::std::time::Instant::now() < bump_deadline
+        {
+            ::tokio::time::sleep(BUMP_POLL_INTERVAL).await;
+            updated = em.update(&id, body.clone()).await;
+        }
         assert_eq!(
             updated.status, 200,
             "case {case}: UpdateBrandProfile must succeed, got {} / {:?}",
