@@ -69,6 +69,8 @@ mod launch_cluster_shapes;
 mod malformed_input_refusals;
 #[path = "all/managed_scaling_policy.rs"]
 mod managed_scaling_policy;
+#[path = "all/managed_security_group_ingress.rs"]
+mod managed_security_group_ingress;
 #[path = "all/master_public_dns_name.rs"]
 mod master_public_dns_name;
 #[path = "all/modification_refusal_sentences.rs"]

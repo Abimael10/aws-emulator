@@ -129,6 +129,11 @@ pub use normalized_hours::*;
 mod launch_placement;
 pub use launch_placement::*;
 
+/// The ingress Amazon EMR writes onto the security groups a launch handed it to manage, and
+/// takes off again when the cluster shuts down — split out and re-exported the same way.
+mod managed_security_groups;
+pub use managed_security_groups::*;
+
 /// The launch's own INSTANCE configuration — what a cluster reports back of the
 /// `JobFlowInstancesConfig` it was created with — split out of this root as its own concern
 /// and re-exported the same way. Its file sits in the directory the release-catalog split
@@ -1816,6 +1821,17 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// The cluster state changes waiting to be published, oldest first. Bounded in
     /// [`cluster_events`].
     pending_cluster_events: Vec<ClusterStateChange>,
+    /// The phase the security groups Amazon EMR manages for a cluster have reached, per
+    /// cluster id: what the next change to them is recognised against
+    /// ([`Self::record_cluster_managed_group_changes`]), so nothing is authorized or revoked
+    /// twice. Bounded by the cluster map itself — an entry goes when its cluster does.
+    managed_group_phases: BTreeMap<String, ManagedGroupPhase>,
+    /// The grants Amazon EC2 really accepted for a cluster, per cluster id, which is exactly
+    /// what that cluster's shutdown revokes. Bounded the same way.
+    managed_group_rules: BTreeMap<String, Vec<ManagedGroupGrant>>,
+    /// The authorizations and revocations waiting to be made in Amazon EC2, oldest first.
+    /// Bounded in [`managed_security_groups`].
+    pending_managed_group_actions: Vec<ManagedGroupAction>,
     /// Whether a cluster clock pump holds this store's single claim
     /// ([`drive_cluster_clock`]).
     cluster_clock_pump_running: bool,
@@ -1859,6 +1875,9 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             next_session_seq: 0,
             announced_cluster_states: BTreeMap::new(),
             pending_cluster_events: Vec::new(),
+            managed_group_phases: BTreeMap::new(),
+            managed_group_rules: BTreeMap::new(),
+            pending_managed_group_actions: Vec::new(),
             cluster_clock_pump_running: false,
             cluster_clock_pump_generation: 0,
             cluster_clock_pump: None,

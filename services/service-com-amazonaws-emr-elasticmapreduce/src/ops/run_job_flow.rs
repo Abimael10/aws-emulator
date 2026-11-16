@@ -887,6 +887,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the service that owns instances to launch it and keeps the ids Amazon EC2 minted
         // — which is what `ListInstances` reports. An instance Amazon EC2 did not launch is
         // not recorded at all ([`crate::state::launch_cluster_instances`]).
+        //
+        // The groups the launch handed Amazon EMR to MANAGE are provisioned first, so the
+        // rules the cluster's nodes need are on those groups before the nodes come up: the
+        // ingress Amazon EMR authorizes onto them is written in the service that owns security
+        // group rules ([`crate::state::settle_managed_security_groups`]), and taken off again
+        // when this cluster shuts down.
+        crate::state::settle_managed_security_groups(ctx.callback(), &*self.engine, &region).await;
         let launched = match &planned {
             Some((launches, placement)) => {
                 crate::state::launch_cluster_instances(ctx, &region, placement, launches).await

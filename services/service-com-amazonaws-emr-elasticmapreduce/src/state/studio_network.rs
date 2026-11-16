@@ -29,10 +29,20 @@ pub(super) fn ec2_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_ec2::Client {
+    ec2_client_over(ctx.callback(), region)
+}
+
+/// The same client built over the callback ALONE, for a caller that is not inside a request:
+/// the cluster clock pump outlives the request that started it and reaches Amazon EC2 over
+/// the same callback ([`super::managed_security_groups`]).
+pub(super) fn ec2_client_over(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_ec2::Client {
     let config = ::aws_sdk_ec2::Config::builder()
         .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_ec2::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://ec2.{region}.amazonaws.com"))
         .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
