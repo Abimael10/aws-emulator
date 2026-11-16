@@ -69,7 +69,10 @@ pub(crate) fn prose_of(line: &str) -> Option<&str> {
 /// attribute included, is owed exactly one place in the block.
 ///
 /// Shared with the sibling that reads the same rule for the other declaration roots in the
-/// workspace rather than copied there.
+/// workspace rather than copied there, and with [`super::all_rs_holds_no_line_twice`], which
+/// reads the other half of THIS root — the LIST, where a copy of a header line lands when a
+/// branch appends it instead of inserting its pair — through this reader rather than a second
+/// copy of it.
 pub(crate) fn repeated_header_lines(source: &str) -> Vec<String> {
     let mut seen: Vec<(usize, &str)> = Vec::new();
     let mut reports = Vec::new();

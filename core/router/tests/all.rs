@@ -157,6 +157,8 @@ mod all_rs_carries_one_header_block;
 mod all_rs_declares_each_suite_once;
 #[path = "all/all_rs_header_holds_no_sentence_fragment.rs"]
 mod all_rs_header_holds_no_sentence_fragment;
+#[path = "all/all_rs_holds_no_line_twice.rs"]
+mod all_rs_holds_no_line_twice;
 #[path = "all/all_rs_inner_doc_comments_precede_the_first_item.rs"]
 mod all_rs_inner_doc_comments_precede_the_first_item;
 #[path = "all/all_rs_is_a_canonical_declaration_list.rs"]
