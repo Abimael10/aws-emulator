@@ -21,6 +21,8 @@ mod idempotency_tokens;
 mod record_approval;
 #[path = "all/record_status_curation.rs"]
 mod record_status_curation;
+#[path = "all/registry_delete_precondition.rs"]
+mod registry_delete_precondition;
 #[path = "all/registry_lifecycle.rs"]
 mod registry_lifecycle;
 #[path = "all/resource_tagging.rs"]

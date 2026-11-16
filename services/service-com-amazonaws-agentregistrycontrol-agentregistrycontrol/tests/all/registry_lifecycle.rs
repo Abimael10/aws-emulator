@@ -1197,10 +1197,10 @@ async fn an_idempotency_token_is_scoped_to_its_operation_and_dropped_with_its_re
         readable.status, readable.body
     );
 
-    // A replay stays idempotent even once the parent registry has left READY: the
-    // remembered answer is consulted before any state refusal, so deleting the registry
-    // (which moves it to DELETING) does not turn a replay into a conflict.
-    let registry_deleted = call(
+    // A registry holding a record is not deleted, so the record (and the token that
+    // remembers it) outlives the attempt: the refused delete leaves the registry READY and
+    // the replay still answers the stored record.
+    let registry_delete_refused = call(
         &router,
         "DELETE",
         &format!("/registries/{registry_id}"),
@@ -1208,13 +1208,12 @@ async fn an_idempotency_token_is_scoped_to_its_operation_and_dropped_with_its_re
     )
     .await;
     assert_eq!(
-        registry_deleted.str_field("status"),
-        "DELETING",
-        "case \"delete the parent registry\": got {} {:?}",
-        registry_deleted.status,
-        registry_deleted.body
+        registry_delete_refused.status, 409,
+        "case \"delete the parent registry while it holds a record\": got {} {:?}",
+        registry_delete_refused.status,
+        registry_delete_refused.body
     );
-    let replay_while_deleting = create_record(
+    let replay_after_refusal = create_record(
         &router,
         &registry_id,
         json!({
@@ -1226,15 +1225,16 @@ async fn an_idempotency_token_is_scoped_to_its_operation_and_dropped_with_its_re
     )
     .await;
     assert_eq!(
-        replay_while_deleting.status, 202,
-        "case \"replay while the registry is DELETING\": a replay is not refused, got {} {:?}",
-        replay_while_deleting.status, replay_while_deleting.body
+        replay_after_refusal.status, 202,
+        "case \"replay after the registry's delete was refused\": a replay is not refused, got {} {:?}",
+        replay_after_refusal.status,
+        replay_after_refusal.body
     );
     assert_eq!(
-        replay_while_deleting.str_field("recordArn"),
+        replay_after_refusal.str_field("recordArn"),
         recreated.str_field("recordArn"),
-        "case \"replay while the registry is DELETING\": the replay answers the stored record, got {:?}",
-        replay_while_deleting.body
+        "case \"replay after the registry's delete was refused\": the replay answers the stored record, got {:?}",
+        replay_after_refusal.body
     );
 }
 
@@ -1305,7 +1305,7 @@ async fn delete_registry_record_removes_it_from_state() {
 }
 
 #[tokio::test]
-async fn delete_registry_moves_it_to_deleting_and_then_removes_it_with_its_records() {
+async fn delete_registry_moves_an_emptied_registry_to_deleting_and_then_removes_it() {
     let router = router();
     // Created with a token, so the test can also show that removing the registry drops
     // what that token remembered.
@@ -1335,6 +1335,16 @@ async fn delete_registry_moves_it_to_deleting_and_then_removes_it_with_its_recor
     .await;
     let record_id = id_of(record.str_field("recordArn")).to_string();
 
+    // A registry is deleted only once it is empty, so the record goes first; the refusal a
+    // non-empty registry answers with has its own suite
+    // (`tests/all/registry_delete_precondition.rs`).
+    let removed_record = delete_record(&router, &registry_id, &record_id).await;
+    assert_eq!(
+        removed_record.status, 200,
+        "case \"empty the registry first\": DeleteRegistryRecord answers 200, got {} {:?}",
+        removed_record.status, removed_record.body
+    );
+
     let deleted = call(
         &router,
         "DELETE",
@@ -1344,13 +1354,13 @@ async fn delete_registry_moves_it_to_deleting_and_then_removes_it_with_its_recor
     .await;
     assert_eq!(
         deleted.status, 202,
-        "case \"delete a READY registry\": DeleteRegistry answers 202, got {} {:?}",
+        "case \"delete an emptied READY registry\": DeleteRegistry answers 202, got {} {:?}",
         deleted.status, deleted.body
     );
     assert_eq!(
         deleted.str_field("status"),
         "DELETING",
-        "case \"delete a READY registry\": deletion is asynchronous, so the status is DELETING, got {:?}",
+        "case \"delete an emptied READY registry\": deletion is asynchronous, so the status is DELETING, got {:?}",
         deleted.body
     );
 
@@ -1393,7 +1403,7 @@ async fn delete_registry_moves_it_to_deleting_and_then_removes_it_with_its_recor
     let record_gone = get_record(&router, &registry_id, &record_id).await;
     assert_eq!(
         record_gone.status, 404,
-        "case \"read a record after its registry was deleted\": records go with the registry, got {} {:?}",
+        "case \"read a record of a registry that was deleted\": neither is there any more, got {} {:?}",
         record_gone.status, record_gone.body
     );
 

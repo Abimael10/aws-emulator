@@ -656,48 +656,77 @@ async fn submitting_accepts_either_identifier_form_and_refuses_an_unknown_resour
 }
 
 #[tokio::test]
-async fn a_registry_that_is_not_ready_accepts_no_submission() {
-    // The registry is still CREATING, so no record of it can enter the approval
-    // workflow; the row below is the only state a registry can be in that holds a
-    // record while not being READY, since a record cannot be created before READY.
+async fn a_record_held_by_a_registry_stays_submittable_because_that_registry_is_not_deleted() {
+    // A registry is deleted only once it is empty, so a record never lives under a
+    // registry that is being deleted: the delete is refused while the record is there,
+    // which leaves the registry READY and its record submittable, and the registry can
+    // only be deleted after the record has been — at which point a submission names a
+    // record that is gone.
+    let case = "a registry holding a record";
     let router = router();
-    let registry_id = ready_registry(
-        &router,
-        "deleting registry",
-        json!({ "name": "doomed-registry" }),
-    )
-    .await;
-    let record_id = draft_record(&router, "deleting registry", &registry_id, "doomed", "MCP").await;
+    let registry_id = ready_registry(&router, case, json!({ "name": "doomed-registry" })).await;
+    let record_id = draft_record(&router, case, &registry_id, "doomed", "MCP").await;
+    let delete_registry_path = format!("/registries/{}", encode_label(&registry_id));
 
-    let deleted = call(
+    let refused_delete = call(&router, "DELETE", &delete_registry_path, None).await;
+    assert_eq!(
+        refused_delete.status, 409,
+        "case {case:?}: a registry holding records refuses the delete, got {} {:?}",
+        refused_delete.status, refused_delete.body
+    );
+
+    let submitted = submit_record(&router, &registry_id, &record_id).await;
+    assert_eq!(
+        submitted.status, 202,
+        "case {case:?}: the registry is untouched, so its record can still be submitted, \
+         got {} {:?}",
+        submitted.status, submitted.body
+    );
+    assert_eq!(
+        submitted.str_field("status"),
+        "PENDING_APPROVAL",
+        "case {case:?}: the registry auto-approves nothing, got {:?}",
+        submitted.body
+    );
+
+    let deleted_record = call(
         &router,
         "DELETE",
-        &format!("/registries/{}", encode_label(&registry_id)),
+        &format!(
+            "/registries/{}/records/{}",
+            encode_label(&registry_id),
+            encode_label(&record_id)
+        ),
         None,
     )
     .await;
     assert_eq!(
+        deleted_record.status, 200,
+        "case {case:?}: DeleteRegistryRecord answers 200, got {} {:?}",
+        deleted_record.status, deleted_record.body
+    );
+    let deleted = call(&router, "DELETE", &delete_registry_path, None).await;
+    assert_eq!(
         deleted.status, 202,
-        "case \"deleting registry\": DeleteRegistry answers 202, got {} {:?}",
+        "case {case:?}: an emptied registry is deleted with 202, got {} {:?}",
         deleted.status, deleted.body
     );
 
     let refused = submit_record(&router, &registry_id, &record_id).await;
     assert_eq!(
-        refused.status, 409,
-        "case \"deleting registry\": a registry that is not READY refuses a submission, \
-         got {} {:?}",
+        refused.status, 404,
+        "case {case:?}: a record that is gone cannot be submitted, got {} {:?}",
         refused.status, refused.body
     );
     assert_eq!(
         refused.error_code.as_deref(),
-        Some("ConflictException"),
-        "case \"deleting registry\": expected ConflictException, got {:?}",
+        Some("ResourceNotFoundException"),
+        "case {case:?}: expected ResourceNotFoundException, got {:?}",
         refused.error_code
     );
     assert!(
-        refused.message().contains("DELETING"),
-        "case \"deleting registry\": the message must name the registry's status, got {:?}",
+        refused.message().contains(&record_id),
+        "case {case:?}: the message must name the record, got {:?}",
         refused.message()
     );
 }

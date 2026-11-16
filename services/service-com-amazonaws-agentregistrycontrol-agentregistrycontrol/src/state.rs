@@ -82,6 +82,21 @@ pub fn record_not_found_message(record_id: &str) -> String {
     format!("Registry record with ID {record_id} not found.")
 }
 
+/// How this service states that a registry cannot be deleted while it still holds
+/// registry records.
+///
+/// The ONE place this sentence is written, for the same reason as the not-found sentences
+/// above. Its fixed text names the precondition and what the caller has to do about it;
+/// the one variable part is the registry's own ARN, taken from the stored registry (the
+/// value its create answered) rather than from the request, since `RegistryIdentifier`
+/// also admits the bare id and the sentence quotes an ARN.
+pub fn registry_not_empty_message(registry_arn: &str) -> String {
+    format!(
+        "Cannot delete registry '{registry_arn}' because it contains registry records. \
+         Delete all registry records before deleting the registry."
+    )
+}
+
 /// How this service states that a name a create asked for is already held by a live
 /// resource of the same class in the same scope: the class, the requested name in single
 /// quotes so a client can read it back out of the sentence, and the scope the name has to

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRegistry
-//! IMPLEMENTED: moves the stored registry into `DELETING` and answers that status.
-//! Deletion is asynchronous, so the clock owes the removal of the registry and of its
-//! records; after it, `GetRegistry` answers 404.
+//! IMPLEMENTED: refuses a registry that still holds registry records with the modelled
+//! `ConflictException`, and otherwise moves the stored registry into `DELETING` and
+//! answers that status. Deletion is asynchronous, so the clock owes the removal of the
+//! registry; after it, `GetRegistry` answers 404.
 //!
 //! ## Shape of an operation
 //!
@@ -171,6 +172,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A registry is deleted only once it is empty: the delete is refused while any
+        // registry record still lives under it, and the refusal leaves the registry
+        // exactly as it was (no status change, no `updatedAt` bump, no armed removal).
+        if !registry.records.is_empty() {
+            let message = crate::state::registry_not_empty_message(&registry.registry_arn);
+            return Err(DeleteRegistryErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // @idempotent: a registry already on its way out keeps the status and the
         // removal instant the first call set.
