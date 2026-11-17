@@ -27,6 +27,9 @@ tracing = { workspace = true }
 # Opaque hex encoding for the GetTranscript `NextToken`, which carries its cursor, and for
 # the content digest an idempotency key carries.
 hex = { workspace = true }
+# URL composition for the Cognito sign-in URL `GetAuthenticationUrl` reports, so its query
+# string is percent-encoded by a parser rather than pasted together.
+url = "2"
 # The digest a `ClientToken` idempotency key reduces a request's `Content` to.
 sha2 = { workspace = true }
 

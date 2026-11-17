@@ -25,6 +25,9 @@ use sha2::{Digest, Sha256};
 mod attachments;
 pub use attachments::*;
 
+mod authentication;
+pub use authentication::*;
+
 /// How long a connection token stays usable.
 ///
 /// `CreateParticipantConnection`'s own documentation: "The expiry time for the
@@ -474,6 +477,16 @@ pub struct ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaSt
     /// with the session whose chat it was uploaded in — and by
     /// [`MAX_ATTACHMENTS_PER_CONTACT`] per contact.
     pub attachments: HashMap<String, Attachment>,
+    /// Session id -> the customer-authentication session that id names: what
+    /// `GetAuthenticationUrl` reports a sign-in URL for and
+    /// `CancelParticipantAuthentication` closes. Written where authentication is
+    /// INITIATED (see [`AuthenticationSession`]) — the AuthenticateCustomer flow block,
+    /// which no component of this workspace emulates yet, so nothing here produces an
+    /// entry and an empty map is the normal state of a chat that was never asked to
+    /// authenticate. Bounded by its own window and by the sessions it belongs to —
+    /// [`Self::prune_expired`] drops a session past its window and one whose chat has
+    /// been reclaimed.
+    pub authentication_sessions: HashMap<String, AuthenticationSession>,
     /// Idempotency for the attachment operations:
     /// [`attachment_idempotency_key`] -> the id of the attachment that request answered
     /// for. Gains an entry only alongside an attachment, so the attachment bound bounds it.
@@ -552,6 +565,12 @@ impl ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState {
         // chat's session is.
         self.shown_views
             .retain(|_, view| sessions.contains_key(&view.contact_id));
+        // An authentication session was initiated inside one chat, and is only ever the
+        // current one for the window the API documents, so it dies with either.
+        self.authentication_sessions.retain(|_, authentication| {
+            now < authentication.window_closes_at()
+                && sessions.contains_key(&authentication.contact_id)
+        });
         // And an attachment was uploaded inside one chat, for the same reason.
         self.attachments
             .retain(|_, attachment| sessions.contains_key(&attachment.contact_id));

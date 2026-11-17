@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelParticipantAuthentication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelParticipantAuthentication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelParticipantAuthentication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Closes the current authentication session of the calling participant's own chat, so
+//! "the opted out branch of the Authenticate Customer flow block will be taken" and no
+//! sign-in URL is reported for it again. The session itself is minted where authentication
+//! is INITIATED (see [`crate::state::AuthenticationSession`]); this operation marks the
+//! one the request names as cancelled.
+//!
+//! A `SessionId` that names no current authentication session of that chat — unknown,
+//! another contact's, already cancelled, or past the window — is refused
+//! `ValidationException`, and a connection token that authenticates nobody is refused
+//! `AccessDeniedException`, exactly as every other operation of this service words that
+//! refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +149,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelParticipantAuthentication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelParticipantAuthenticationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelParticipantAuthentication"))
+        // Which session is closed is decided by the request's members and this service's
+        // own state, so nothing about the request's metadata is read.
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CancelParticipantAuthenticationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the connectparticipant store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // Reclaim what the clock has already retired before the session is looked up.
+        state.prune_expired(now);
+
+        // A connection token that authenticates nobody is this service's one denial,
+        // worded so it tells a caller nothing about which credential failed.
+        let Some(contact_id) = state
+            .session_for_connection_token(&input.connection_token, now)
+            .map(|chat| chat.contact_id.clone())
+        else {
+            return Err(
+                CancelParticipantAuthenticationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A chat with no current authentication session under that id is refused with the
+        // same wording `GetAuthenticationUrl` uses for it: which member was rejected, and
+        // nothing about which sessions exist for whom.
+        let Some(session) = state.authentication_session_mut(&input.session_id, &contact_id, now)
+        else {
+            return Err(
+                CancelParticipantAuthenticationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::unknown_authentication_session_message(
+                            &input.session_id,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        session.cancelled = true;
+
+        Ok(CancelParticipantAuthenticationOutput::default())
     }
 }

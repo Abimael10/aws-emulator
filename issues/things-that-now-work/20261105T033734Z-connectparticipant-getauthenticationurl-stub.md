@@ -33,3 +33,21 @@ AssertionError: got ('NotImplemented', 'operation GetAuthenticationUrl is scaffo
 Boot the connectparticipant emulator
 Call GetAuthenticationUrl and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+`GetAuthenticationUrl` and `CancelParticipantAuthentication` are implemented over a stored
+customer-authentication session (`src/state/authentication.rs`): the sign-in URL is composed
+from the session's Cognito authorize endpoint, app client and scopes plus the request's
+`RedirectUri` and `SessionId`; the retrieval writes nothing, the cancel closes the session,
+and a `SessionId` naming no current session of the caller's own chat is refused HTTP 400
+`ValidationException`, a connection token that authenticates nobody HTTP 403
+`AccessDeniedException`. Both scaffold census lines are gone and the suites in
+`tests/all/chat_participant_slice.rs` cover the class over the wire.
+
+Residual divergence, left open on purpose: the recorded unit asserts the
+`ValidationException` MESSAGE against a constant the report does not quote, so the exact
+text AWS returns for that refusal class is not recoverable from this evidence. The status
+(400) and the code (`ValidationException`) match the recording; the message is worded the
+way this service words a rejected input. A later run with the recorded text in hand should
+replace that one string.

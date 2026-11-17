@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAuthenticationUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAuthenticationUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAuthenticationUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the sign-in URL of the current authentication session of the calling
+//! participant's own chat. The session is minted where authentication is INITIATED (the
+//! AuthenticateCustomer flow block raising the `authenticationInitiated` event), so this
+//! operation reads [`crate::state::AuthenticationSession`] and composes the URL from it;
+//! it writes nothing, because retrieving a URL takes nothing away from the next caller.
+//!
+//! A `SessionId` that names no current authentication session of that chat — unknown,
+//! another contact's, already cancelled, or past the one-minute window the API documents —
+//! is refused `ValidationException`, and a connection token that authenticates nobody is
+//! refused `AccessDeniedException`, exactly as every other operation of this service words
+//! that refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +159,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAuthenticationUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAuthenticationUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAuthenticationUrl"))
+        // The URL is composed from what the flow block stored, so nothing about the
+        // request's metadata is read.
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAuthenticationUrlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // Retrieving the authentication URL reports what is stored: this call writes
+        // nothing, so a second call — and the cancel that may follow it — sees exactly
+        // what this one did. The windows it judges its session and its token by are read,
+        // never materialised here.
+        let state = store.lock();
+
+        // A connection token that authenticates nobody is this service's one denial,
+        // worded so it tells a caller nothing about which credential failed.
+        let Some(chat) = state.session_for_connection_token(&input.connection_token, now) else {
+            return Err(GetAuthenticationUrlErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A session this chat has no current authentication session under is refused with
+        // the one wording that covers every reason it is not the current one, so the
+        // refusal tells the caller nothing about which sessions exist for whom.
+        let Some(session) = state.authentication_session(&input.session_id, &chat.contact_id, now)
+        else {
+            return Err(GetAuthenticationUrlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::unknown_authentication_session_message(
+                        &input.session_id,
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(authentication_url) =
+            session.authentication_url(&input.session_id, &input.redirect_uri)
+        else {
+            return Err(GetAuthenticationUrlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the authentication session's authorize endpoint is not a URL"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        // `AuthenticationUrl` is modelled `length 1..2083`, and what the caller asks for
+        // is part of what the composed URL carries, so a request whose answer would not
+        // fit is refused — reporting the composed length and the maximum — rather than
+        // answered with a URL the model does not permit.
+        let composed_chars = authentication_url.chars().count();
+        if composed_chars > crate::state::MAX_AUTHENTICATION_URL_CHARS {
+            return Err(GetAuthenticationUrlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::authentication_url_too_long_message(composed_chars),
+                },
+            )
+            .into());
+        }
+
+        Ok(GetAuthenticationUrlOutput {
+            authentication_url: Some(authentication_url),
+        })
     }
 }

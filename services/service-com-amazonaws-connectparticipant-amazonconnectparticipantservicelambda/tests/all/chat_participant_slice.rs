@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the chat-participant slice: `CreateParticipantConnection`,
-//! `SendMessage`, `SendEvent`, `GetTranscript` and `DisconnectParticipant`.
+//! `SendMessage`, `SendEvent`, `GetTranscript`, `DisconnectParticipant` and the
+//! participant's two authentication operations, `GetAuthenticationUrl` and
+//! `CancelParticipantAuthentication`.
 //!
 //! Every case goes over the wire, through the same `MultiServiceRouter` the production
 //! router dispatches with, so the HTTP status, the restJson1 envelope and the stored
 //! state are all exercised together.
+//!
+//! An authentication session is minted where authentication is INITIATED, which no call
+//! this service's API carries does, so the authentication cases write the session into
+//! this service's store the way the AuthenticateCustomer flow block does
+//! (`state::AuthenticationSession`) and then read it back through the operations.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -1221,6 +1228,460 @@ async fn a_contact_id_from_another_connection_is_refused() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// The participant's authentication operations: `GetAuthenticationUrl` and
+// `CancelParticipantAuthentication`.
+// ---------------------------------------------------------------------------------------
+
+/// Write the record the AuthenticateCustomer flow block writes when it raises the
+/// `authenticationInitiated` event for a contact's participant.
+fn initiate_authentication(
+    harness: &Harness,
+    session_id: &str,
+    session: participant::state::AuthenticationSession,
+) {
+    harness
+        .store()
+        .lock()
+        .authentication_sessions
+        .insert(session_id.to_string(), session);
+}
+
+/// One authentication session as the flow block stored it, for `contact_id`, raised
+/// `initiated_secs_ago` seconds ago.
+fn authentication_session(
+    contact_id: &str,
+    authorize_endpoint: &str,
+    client_id: &str,
+    scopes: &[&str],
+    initiated_secs_ago: u64,
+    cancelled: bool,
+) -> participant::state::AuthenticationSession {
+    participant::state::AuthenticationSession {
+        contact_id: contact_id.to_string(),
+        initiated_at: SystemTime::now() - std::time::Duration::from_secs(initiated_secs_ago),
+        authorize_endpoint: authorize_endpoint.to_string(),
+        client_id: client_id.to_string(),
+        scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+        cancelled,
+    }
+}
+
+/// `GetAuthenticationUrl`: `POST /participant/authentication-url`, the connection token in
+/// the `X-Amz-Bearer` header.
+async fn get_authentication_url(
+    router: &MultiServiceRouter,
+    connection_token: &str,
+    session_id: &str,
+    redirect_uri: &str,
+) -> (u16, Value) {
+    post(
+        router,
+        "/participant/authentication-url",
+        Some(connection_token),
+        &json!({"SessionId": session_id, "RedirectUri": redirect_uri}),
+    )
+    .await
+}
+
+/// `CancelParticipantAuthentication`: `POST /participant/cancel-authentication`.
+async fn cancel_participant_authentication(
+    router: &MultiServiceRouter,
+    connection_token: &str,
+    session_id: &str,
+) -> (u16, Value) {
+    post(
+        router,
+        "/participant/cancel-authentication",
+        Some(connection_token),
+        &json!({"SessionId": session_id}),
+    )
+    .await
+}
+
+/// The query parameters of `url`, decoded — read back with a URL parser, so what the
+/// service encoded is checked by decoding it rather than by matching its text.
+fn query_pairs(case: &str, url: &str) -> Vec<(String, String)> {
+    let parsed = ::url::Url::parse(url)
+        .unwrap_or_else(|error| panic!("case {case:?}: {url:?} is not a URL: {error}"));
+    parsed
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// The single value `name` carries in `pairs`, or `None` when it carries none.
+fn query_value<'pairs>(pairs: &'pairs [(String, String)], name: &str) -> Option<&'pairs str> {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The `ValidationException$Message` both authentication operations refuse a `SessionId`
+/// that names no current authentication session of the caller's own chat with, as this
+/// service words such a refusal: the member that was rejected, carrying the id the request
+/// named (`GetAttachment` refuses an attachment of another contact the same way).
+fn no_such_session_message(session_id: &str) -> String {
+    format!("Authentication session with id {session_id} does not exist for this contact")
+}
+
+/// One initiated authentication session, and the redirect a caller asks for it with.
+struct AuthenticationCase {
+    /// What the assertions name this row.
+    name: &'static str,
+    /// `SessionId`, which the model constrains to exactly 36 characters.
+    session_id: &'static str,
+    /// The Cognito user pool's authorize endpoint the flow block is configured with.
+    authorize_endpoint: &'static str,
+    /// The user-pool app client the customer is authenticated through.
+    client_id: &'static str,
+    /// The scopes that app client asks for.
+    scopes: &'static [&'static str],
+    /// `RedirectUri`, "The URL where the customer will be redirected after Amazon Cognito
+    /// authorizes the user".
+    redirect_uri: &'static str,
+    /// How long ago the `authenticationInitiated` event was raised — inside the one minute
+    /// `GetAuthenticationUrl` documents for every row here.
+    initiated_secs_ago: u64,
+}
+
+/// The rows differ along what the sign-in URL is composed of: whether the authorize
+/// endpoint already carries a query, how many scopes the app client asks for, and what the
+/// redirect itself contains — plus how long ago the session was initiated.
+fn authentication_cases() -> Vec<AuthenticationCase> {
+    vec![
+        AuthenticationCase {
+            name: "a plain authorize endpoint and one scope",
+            session_id: "11111111-2222-4333-8444-555555555555",
+            authorize_endpoint:
+                "https://chat-auth.auth.us-east-1.amazoncognito.com/oauth2/authorize",
+            client_id: "1example23456789abcdefghij",
+            scopes: &["openid"],
+            redirect_uri: "https://example.com/connect/callback",
+            initiated_secs_ago: 0,
+        },
+        AuthenticationCase {
+            name: "an authorize endpoint that already carries a query parameter",
+            session_id: "22222222-3333-4444-8555-666666666666",
+            authorize_endpoint:
+                "https://chat-auth.auth.eu-west-1.amazoncognito.com/oauth2/authorize?lang=fr",
+            client_id: "2example23456789abcdefghij",
+            scopes: &["openid", "email"],
+            redirect_uri: "https://example.com/retour",
+            initiated_secs_ago: 1,
+        },
+        AuthenticationCase {
+            name: "an app client that asks for no scope at all",
+            session_id: "33333333-4444-4555-8666-777777777777",
+            authorize_endpoint: "https://pool-3.auth.us-west-2.amazoncognito.com/oauth2/authorize",
+            client_id: "3example23456789abcdefghij",
+            scopes: &[],
+            redirect_uri: "https://example.com/callback?from=chat",
+            initiated_secs_ago: 2,
+        },
+        AuthenticationCase {
+            name: "several scopes, in the order the app client asks for them",
+            session_id: "44444444-5555-4666-8777-888888888888",
+            authorize_endpoint: "https://pool-4.auth.ap-south-1.amazoncognito.com/oauth2/authorize",
+            client_id: "4example23456789abcdefghij",
+            scopes: &["openid", "profile", "aws.cognito.signin.user.admin"],
+            redirect_uri: "https://example.com/done",
+            initiated_secs_ago: 3,
+        },
+        AuthenticationCase {
+            name: "a redirect carrying a query, a space and non-ASCII text",
+            session_id: "55555555-6666-4777-8888-999999999999",
+            authorize_endpoint: "https://pool-5.auth.sa-east-1.amazoncognito.com/oauth2/authorize",
+            client_id: "5example23456789abcdefghij",
+            scopes: &["openid"],
+            redirect_uri: "https://example.com/retour?état=prêt&next=my page#top",
+            initiated_secs_ago: 4,
+        },
+        AuthenticationCase {
+            name: "a session raised 30 seconds ago, inside the documented minute",
+            session_id: "66666666-7777-4888-8999-aaaaaaaaaaaa",
+            authorize_endpoint: "https://pool-6.auth.us-east-2.amazoncognito.com/oauth2/authorize",
+            client_id: "6example23456789abcdefghij",
+            scopes: &["openid"],
+            redirect_uri: "https://example.com/late",
+            initiated_secs_ago: 30,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_initiated_authentication_session_reports_its_cognito_sign_in_url() {
+    let harness = router();
+    let participant_token = "participant-token-authentication";
+    let connection_token = connect(&harness, participant_token).await;
+    let contact_id = harness.start_chat(participant_token);
+
+    for case in authentication_cases() {
+        // `SessionId` is modelled `length 36..36`, so every row names one of that length.
+        assert_eq!(
+            case.session_id.len(),
+            36,
+            "case {:?}: a SessionId is 36 characters, got {:?}",
+            case.name,
+            case.session_id
+        );
+        initiate_authentication(
+            &harness,
+            case.session_id,
+            authentication_session(
+                &contact_id,
+                case.authorize_endpoint,
+                case.client_id,
+                case.scopes,
+                case.initiated_secs_ago,
+                false,
+            ),
+        );
+    }
+
+    for case in authentication_cases() {
+        let label = case.name;
+        let (status, body) =
+            get_authentication_url(&harness, &connection_token, case.session_id, case.redirect_uri)
+                .await;
+        assert_eq!(status, 200, "case {label:?}: got {body:?}");
+        let url = body["AuthenticationUrl"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label:?}: no AuthenticationUrl in {body:?}"));
+        // `AuthenticationUrl` is modelled `length 1..2083`.
+        assert!(
+            !url.is_empty() && url.chars().count() <= 2083,
+            "case {label:?}: expected a 1..2083-character AuthenticationUrl, got {} characters",
+            url.chars().count()
+        );
+
+        let endpoint = ::url::Url::parse(case.authorize_endpoint).expect("the authorize endpoint");
+        let composed = ::url::Url::parse(url)
+            .unwrap_or_else(|error| panic!("case {label:?}: {url:?} is not a URL: {error}"));
+        assert_eq!(
+            (composed.scheme(), composed.host_str(), composed.path()),
+            (endpoint.scheme(), endpoint.host_str(), endpoint.path()),
+            "case {label:?}: expected the stored authorize endpoint, got {url:?}"
+        );
+
+        let pairs = query_pairs(label, url);
+        assert_eq!(
+            query_value(&pairs, "response_type"),
+            Some("code"),
+            "case {label:?}: got {pairs:?}"
+        );
+        assert_eq!(
+            query_value(&pairs, "client_id"),
+            Some(case.client_id),
+            "case {label:?}: got {pairs:?}"
+        );
+        assert_eq!(
+            query_value(&pairs, "redirect_uri"),
+            Some(case.redirect_uri),
+            "case {label:?}: expected the RedirectUri the request named, got {pairs:?}"
+        );
+        assert_eq!(
+            query_value(&pairs, "state"),
+            Some(case.session_id),
+            "case {label:?}: expected the SessionId as the OAuth state, got {pairs:?}"
+        );
+        let expected_scope = (!case.scopes.is_empty()).then(|| case.scopes.join(" "));
+        assert_eq!(
+            query_value(&pairs, "scope").map(str::to_string),
+            expected_scope,
+            "case {label:?}: got {pairs:?}"
+        );
+        // A query the endpoint already carried is still there: the parameters are added
+        // to it rather than replacing it.
+        for (name, value) in endpoint.query_pairs() {
+            assert_eq!(
+                query_value(&pairs, &name),
+                Some(value.as_ref()),
+                "case {label:?}: expected the endpoint's own {name}={value}, got {pairs:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn reporting_an_authentication_url_leaves_what_a_later_caller_sees_unchanged() {
+    let harness = router();
+    let participant_token = "participant-token-reread-authentication";
+    let connection_token = connect(&harness, participant_token).await;
+    let contact_id = harness.start_chat(participant_token);
+    let case = authentication_cases()
+        .into_iter()
+        .next()
+        .expect("at least one authentication case");
+    initiate_authentication(
+        &harness,
+        case.session_id,
+        authentication_session(
+            &contact_id,
+            case.authorize_endpoint,
+            case.client_id,
+            case.scopes,
+            case.initiated_secs_ago,
+            false,
+        ),
+    );
+
+    let (first_status, first) =
+        get_authentication_url(&harness, &connection_token, case.session_id, case.redirect_uri)
+            .await;
+    assert_eq!(first_status, 200, "case first read: got {first:?}");
+    let (second_status, second) =
+        get_authentication_url(&harness, &connection_token, case.session_id, case.redirect_uri)
+            .await;
+    assert_eq!(second_status, 200, "case second read: got {second:?}");
+    assert_eq!(
+        first, second,
+        "case repeated read: expected {first:?}, got {second:?}"
+    );
+
+    // The read consumed nothing: the session is still there, still not cancelled.
+    {
+        let store = harness.store();
+        let state = store.lock();
+        let session = state
+            .authentication_sessions
+            .get(case.session_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case repeated read: the session must still be stored, got {:?}",
+                    state.authentication_sessions.keys().collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            !session.cancelled,
+            "case repeated read: reporting a URL must not cancel the session"
+        );
+    }
+
+    // Cancelling it is what closes it: the opted-out branch is taken, and no URL is
+    // reported for that session again — including to a second cancel.
+    let (status, body) =
+        cancel_participant_authentication(&harness, &connection_token, case.session_id).await;
+    assert_eq!(status, 200, "case cancel: got {body:?}");
+    assert!(
+        harness
+            .store()
+            .lock()
+            .authentication_sessions
+            .get(case.session_id)
+            .is_some_and(|session| session.cancelled),
+        "case cancel: expected the stored session to be cancelled"
+    );
+
+    for (label, (status, body)) in [
+        (
+            "a URL for a cancelled session",
+            get_authentication_url(&harness, &connection_token, case.session_id, case.redirect_uri)
+                .await,
+        ),
+        (
+            "a second cancel of the same session",
+            cancel_participant_authentication(&harness, &connection_token, case.session_id).await,
+        ),
+    ] {
+        assert_eq!(status, 400, "case {label:?}: got {body:?}");
+        assert_eq!(
+            error_type(&body),
+            "ValidationException",
+            "case {label:?}: got {body:?}"
+        );
+        assert_eq!(
+            body["Message"].as_str(),
+            Some(no_such_session_message(case.session_id).as_str()),
+            "case {label:?}: got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_session_id_that_names_no_current_authentication_session_is_refused() {
+    let harness = router();
+    let my_token = "participant-token-authentication-mine";
+    let their_token = "participant-token-authentication-theirs";
+    let mine = connect(&harness, my_token).await;
+    let theirs = connect(&harness, their_token).await;
+    let my_contact = harness.start_chat(my_token);
+    let their_contact = harness.start_chat(their_token);
+
+    let endpoint = "https://pool-x.auth.us-east-1.amazoncognito.com/oauth2/authorize";
+    // My own current session, which must keep working after every refusal below.
+    let current = "aaaaaaaa-1111-4111-8111-111111111111";
+    initiate_authentication(
+        &harness,
+        current,
+        authentication_session(&my_contact, endpoint, "client-current", &["openid"], 0, false),
+    );
+    // One of my own sessions already cancelled, one past the documented minute, and one
+    // belonging to the other chat.
+    let cancelled = "bbbbbbbb-2222-4222-8222-222222222222";
+    initiate_authentication(
+        &harness,
+        cancelled,
+        authentication_session(&my_contact, endpoint, "client-cancelled", &["openid"], 0, true),
+    );
+    let past_window = "cccccccc-3333-4333-8333-333333333333";
+    initiate_authentication(
+        &harness,
+        past_window,
+        authentication_session(&my_contact, endpoint, "client-late", &["openid"], 61, false),
+    );
+    let other_chats = "dddddddd-4444-4444-8444-444444444444";
+    initiate_authentication(
+        &harness,
+        other_chats,
+        authentication_session(&their_contact, endpoint, "client-other", &["openid"], 0, false),
+    );
+
+    // The rows differ in WHY the id names no current authentication session of this chat.
+    let rows: &[(&str, &str)] = &[
+        ("an id no session was initiated for", "00000000-0000-4000-8000-000000000000"),
+        ("an id shaped like one of ours but unknown", "ffffffff-ffff-4fff-8fff-ffffffffffff"),
+        ("a session already cancelled", cancelled),
+        ("a session past the one-minute window", past_window),
+        ("another chat's authentication session", other_chats),
+    ];
+    for (label, session_id) in rows {
+        for (operation, (status, body)) in [
+            (
+                "GetAuthenticationUrl",
+                get_authentication_url(&harness, &mine, session_id, "https://example.com/cb")
+                    .await,
+            ),
+            (
+                "CancelParticipantAuthentication",
+                cancel_participant_authentication(&harness, &mine, session_id).await,
+            ),
+        ] {
+            let case = format!("{operation} with {label}");
+            assert_eq!(status, 400, "case {case:?}: got {body:?}");
+            assert_eq!(
+                error_type(&body),
+                "ValidationException",
+                "case {case:?}: got {body:?}"
+            );
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(no_such_session_message(session_id).as_str()),
+                "case {case:?}: got {body:?}"
+            );
+        }
+    }
+
+    // None of those refusals touched the session that IS current, or the other chat's.
+    let (status, body) =
+        get_authentication_url(&harness, &mine, current, "https://example.com/cb").await;
+    assert_eq!(status, 200, "case my own current session: got {body:?}");
+    let (status, body) =
+        get_authentication_url(&harness, &theirs, other_chats, "https://example.com/cb").await;
+    assert_eq!(status, 200, "case the other chat's own session: got {body:?}");
+}
+
 /// An event this service has no conversation item for is acknowledged with an `Id` and an
 /// `AbsoluteTime` and recorded nowhere: the transcript holds only what the chat retains.
 ///
@@ -1600,4 +2061,205 @@ async fn a_reused_client_token_is_judged_on_the_content_it_carries() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_redirect_that_cannot_be_carried_in_the_authentication_url_is_refused() {
+    let harness = router();
+    let participant_token = "participant-token-long-redirect";
+    let connection_token = connect(&harness, participant_token).await;
+    let contact_id = harness.start_chat(participant_token);
+    let session_id = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+    initiate_authentication(
+        &harness,
+        session_id,
+        authentication_session(
+            &contact_id,
+            "https://pool-w.auth.us-east-1.amazoncognito.com/oauth2/authorize",
+            "client-long-redirect",
+            &["openid"],
+            0,
+            false,
+        ),
+    );
+
+    // `RedirectUri` is modelled len 1..1024 and `AuthenticationUrl` len 1..2083, so a
+    // redirect inside its own bound can still be one the answer cannot carry once it is
+    // encoded. The rows differ in how long the ENCODED form of a legal-length redirect is.
+    let rows: &[(&str, String, bool)] = &[
+        (
+            "a redirect at its modelled maximum length",
+            format!("https://example.com/{}", "a".repeat(1004)),
+            true,
+        ),
+        (
+            "a legal-length redirect whose encoded form does not fit the AuthenticationUrl",
+            format!("https://example.com/?q={}", "\"".repeat(1000)),
+            false,
+        ),
+    ];
+    for (case, redirect_uri, expected_served) in rows {
+        // Every row is a RedirectUri the model itself permits.
+        assert!(
+            (1..=1024).contains(&redirect_uri.chars().count()),
+            "case {case:?}: a RedirectUri is 1..1024 characters, got {}",
+            redirect_uri.chars().count()
+        );
+        let (status, body) =
+            get_authentication_url(&harness, &connection_token, session_id, redirect_uri).await;
+        if *expected_served {
+            assert_eq!(status, 200, "case {case:?}: got {body:?}");
+            let url = body["AuthenticationUrl"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no AuthenticationUrl in {body:?}"));
+            let pairs = query_pairs(case, url);
+            assert_eq!(
+                query_value(&pairs, "redirect_uri"),
+                Some(redirect_uri.as_str()),
+                "case {case:?}: expected the RedirectUri back, got {pairs:?}"
+            );
+            continue;
+        }
+        assert_eq!(status, 400, "case {case:?}: got {body:?}");
+        assert_eq!(
+            error_type(&body),
+            "ValidationException",
+            "case {case:?}: got {body:?}"
+        );
+        // The refusal reports the COMPOSED length and the modelled maximum: the fixed text
+        // is asserted exactly, and the length it carries must be one past that maximum.
+        let message = error_message(&body);
+        let prefix =
+            "The AuthenticationUrl for this session, with the RedirectUri this request named, is ";
+        let suffix = " characters long and exceeds its 2083 character maximum";
+        let reported = message
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .unwrap_or_else(|| panic!("case {case:?}: unexpected refusal message {message:?}"));
+        let reported: usize = reported
+            .parse()
+            .unwrap_or_else(|_| panic!("case {case:?}: {reported:?} is not a length"));
+        assert!(
+            reported > 2083,
+            "case {case:?}: expected a composed length past the 2083 maximum, got {reported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_authentication_call_with_a_token_that_authenticates_nobody_is_access_denied() {
+    let harness = router();
+    let live_token = "participant-token-authentication-denied";
+    let live = connect(&harness, live_token).await;
+    let contact_id = harness.start_chat(live_token);
+    let session_id = "eeeeeeee-5555-4555-8555-555555555555";
+    initiate_authentication(
+        &harness,
+        session_id,
+        authentication_session(
+            &contact_id,
+            "https://pool-y.auth.us-east-1.amazoncognito.com/oauth2/authorize",
+            "client-denied",
+            &["openid"],
+            0,
+            false,
+        ),
+    );
+
+    // A token of a participant that has left: valid once, and never again.
+    let gone = connect(&harness, "participant-token-authentication-left").await;
+    let (status, body) = post(&harness, "/participant/disconnect", Some(&gone), &json!({})).await;
+    assert_eq!(status, 200, "DisconnectParticipant: got {body:?}");
+
+    // The rows differ in WHICH token fails to authenticate a connected participant.
+    let rows: &[(&str, &str)] = &[
+        ("an unknown connection token", "bogus-connection-token"),
+        (
+            "a token shaped like one we mint",
+            "00000000-0000-4000-8000-000000000000",
+        ),
+        ("a disconnected participant's token", &gone),
+    ];
+    for (label, token) in rows {
+        for (operation, (status, body)) in [
+            (
+                "GetAuthenticationUrl",
+                get_authentication_url(&harness, token, session_id, "https://example.com/cb")
+                    .await,
+            ),
+            (
+                "CancelParticipantAuthentication",
+                cancel_participant_authentication(&harness, token, session_id).await,
+            ),
+        ] {
+            let case = format!("{operation} with {label}");
+            assert_eq!(status, 403, "case {case:?}: got {body:?}");
+            assert_eq!(
+                error_type(&body),
+                "AccessDeniedException",
+                "case {case:?}: got {body:?}"
+            );
+            assert_eq!(
+                body["Message"].as_str(),
+                Some("Access denied"),
+                "case {case:?}: got {body:?}"
+            );
+        }
+    }
+
+    // The refusals took nothing away: the session the live token reaches still reports.
+    let (status, body) =
+        get_authentication_url(&harness, &live, session_id, "https://example.com/cb").await;
+    assert_eq!(status, 200, "case the live token: got {body:?}");
+}
+
+#[tokio::test]
+async fn an_authentication_session_is_current_for_exactly_the_documented_minute() {
+    // `GetAuthenticationUrl`: "This API can only be called within one minute of receiving
+    // the authenticationInitiated event." Driven off a fixed instant rather than the wall
+    // clock, so the bound itself is what is checked.
+    let initiated_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let session = participant::state::AuthenticationSession {
+        contact_id: "contact-window".to_string(),
+        initiated_at,
+        authorize_endpoint: "https://pool-z.auth.us-east-1.amazoncognito.com/oauth2/authorize"
+            .to_string(),
+        client_id: "client-window".to_string(),
+        scopes: vec!["openid".to_string()],
+        cancelled: false,
+    };
+    // The rows are the instant the session is judged at, around the published bound.
+    let rows: &[(&str, std::time::Duration, bool)] = &[
+        ("the instant it was initiated", std::time::Duration::ZERO, true),
+        ("half a minute in", std::time::Duration::from_secs(30), true),
+        (
+            "a millisecond before the minute",
+            std::time::Duration::from_millis(59_999),
+            true,
+        ),
+        ("the minute itself", std::time::Duration::from_secs(60), false),
+        (
+            "a millisecond past the minute",
+            std::time::Duration::from_millis(60_001),
+            false,
+        ),
+    ];
+    for (case, elapsed, expected) in rows {
+        assert_eq!(
+            session.is_current(initiated_at + *elapsed),
+            *expected,
+            "case {case:?}: expected is_current == {expected}, got {}",
+            session.is_current(initiated_at + *elapsed)
+        );
+    }
+
+    // A cancelled session is not current even inside the window.
+    let cancelled = participant::state::AuthenticationSession {
+        cancelled: true,
+        ..session
+    };
+    assert!(
+        !cancelled.is_current(initiated_at),
+        "case a cancelled session: expected is_current == false, got true"
+    );
 }
