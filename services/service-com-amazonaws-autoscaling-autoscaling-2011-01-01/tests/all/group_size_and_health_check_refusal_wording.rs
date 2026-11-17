@@ -11,7 +11,9 @@
 //! * the three sizes describe ONE group, so a desired capacity outside the bounds the
 //!   request leaves the group with is refused `Desired capacity:<DesiredCapacity> must be
 //!   between the specified min size:<MinSize> and max size:<MaxSize>` — the three values
-//!   being the only variable parts;
+//!   being the only variable parts. The window is the one THAT request establishes, so a
+//!   bound the same request raises or lowers counts, and the refusal applies no field at
+//!   all;
 //! * `HealthCheckType` is "one or more comma-separated health check types"
 //!   (`smithy_query(query="doc",shape="AutoScalingGroup",member="HealthCheckType")`), a
 //!   free string the service validates itself, so the refusal is the one machine-readable
@@ -246,6 +248,176 @@ async fn the_update_path_states_the_bounds_it_leaves_the_group_with() {
             "case {case:?}: a refused update leaves the group's bounds alone, got {described}"
         );
     }
+}
+
+/// One row of the combined table: the bounds the group is created with, and the three sizes
+/// ONE update request carries together. The window the refusal must name is the one that
+/// request establishes — `update_min`..`update_max` — whichever way each bound moved.
+struct CombinedRow {
+    case: &'static str,
+    created_min: i32,
+    created_max: i32,
+    update_min: i32,
+    update_max: i32,
+    /// Outside `update_min`..`update_max`, so the request is refused.
+    refused_desired: i32,
+    /// Inside that same window, so the follow-up request is applied whole.
+    accepted_desired: i32,
+}
+
+#[tokio::test]
+async fn the_window_is_the_one_the_same_request_establishes() {
+    let rows = [
+        CombinedRow {
+            case: "one above a maximum the same request raises",
+            created_min: 0,
+            created_max: 1,
+            update_min: 0,
+            update_max: 3,
+            refused_desired: 4,
+            accepted_desired: 3,
+        },
+        CombinedRow {
+            case: "below a minimum the same request raises, under a maximum it also raises",
+            created_min: 0,
+            created_max: 1,
+            update_min: 2,
+            update_max: 5,
+            refused_desired: 1,
+            accepted_desired: 2,
+        },
+        CombinedRow {
+            case: "above a maximum the same request lowers while raising the minimum",
+            created_min: 0,
+            created_max: 6,
+            update_min: 2,
+            update_max: 4,
+            refused_desired: 5,
+            accepted_desired: 3,
+        },
+        CombinedRow {
+            case: "far above a maximum the same request raises",
+            created_min: 0,
+            created_max: 1,
+            update_min: 0,
+            update_max: 4,
+            refused_desired: 9,
+            accepted_desired: 0,
+        },
+        CombinedRow {
+            case: "below equal bounds the same request sets",
+            created_min: 0,
+            created_max: 3,
+            update_min: 3,
+            update_max: 3,
+            refused_desired: 0,
+            accepted_desired: 3,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let engine = crate::support::new_engine();
+        let router = crate::support::router_with(engine);
+        let name = format!("combined-bounds-{index}");
+        let case = row.case;
+        let created = [
+            p("AutoScalingGroupName", name.clone()),
+            p(LAUNCH_SOURCE.0, LAUNCH_SOURCE.1),
+            p(ZONE.0, ZONE.1),
+            p("MinSize", row.created_min.to_string()),
+            p("MaxSize", row.created_max.to_string()),
+            p("DesiredCapacity", row.created_min.to_string()),
+        ];
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&created)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateAutoScalingGroup expected 200, got {status}: {body}"
+        );
+
+        let refused = [
+            p("AutoScalingGroupName", name.clone()),
+            p("MinSize", row.update_min.to_string()),
+            p("MaxSize", row.update_max.to_string()),
+            p("DesiredCapacity", row.refused_desired.to_string()),
+        ];
+        let (status, body) = query(&router, "UpdateAutoScalingGroup", &borrowed(&refused)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the update to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            refusal(&body),
+            (
+                "ValidationError".to_string(),
+                expected_bounds_sentence(row.refused_desired, row.update_min, row.update_max)
+            ),
+            "case {case:?}: expected the bounds refusal naming the window this request \
+             establishes, got {body}"
+        );
+
+        // The refusal applies NO field of that request: all three sizes are the ones the
+        // create left behind.
+        let (status, described) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", name.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAutoScalingGroups expected 200, got {status}: {described}"
+        );
+        assert_eq!(
+            sizes_of(&described),
+            (
+                row.created_min.to_string(),
+                row.created_max.to_string(),
+                row.created_min.to_string()
+            ),
+            "case {case:?}: a refused update applies no field, got {described}"
+        );
+
+        // The same window, with a capacity inside it, is applied whole.
+        let accepted = [
+            p("AutoScalingGroupName", name.clone()),
+            p("MinSize", row.update_min.to_string()),
+            p("MaxSize", row.update_max.to_string()),
+            p("DesiredCapacity", row.accepted_desired.to_string()),
+        ];
+        let (status, body) = query(&router, "UpdateAutoScalingGroup", &borrowed(&accepted)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the in-window update to be applied, got {status}: {body}"
+        );
+        let (status, described) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", name.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAutoScalingGroups expected 200, got {status}: {described}"
+        );
+        assert_eq!(
+            sizes_of(&described),
+            (
+                row.update_min.to_string(),
+                row.update_max.to_string(),
+                row.accepted_desired.to_string()
+            ),
+            "case {case:?}: expected the in-window sizes to be read back, got {described}"
+        );
+    }
+}
+
+/// The `(MinSize, MaxSize, DesiredCapacity)` a described group reports.
+fn sizes_of(described: &str) -> (String, String, String) {
+    (
+        tag_value(described, "MinSize"),
+        tag_value(described, "MaxSize"),
+        tag_value(described, "DesiredCapacity"),
+    )
 }
 
 /// One row of the health check table: the value named, and whether the service accepts it.
