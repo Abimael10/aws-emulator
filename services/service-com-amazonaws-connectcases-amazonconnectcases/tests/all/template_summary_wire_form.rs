@@ -18,6 +18,11 @@
 //! `TagPropagationResourceType` it names, which `TemplateStatus` the template
 //! carries (including the one it takes when the create names none), and the
 //! region the caller signs for — which is what the ARN is scoped to.
+//!
+//! A second table writes each template twice: the projection reports the record
+//! as it is stored NOW, so an update that adds, replaces or empties the
+//! tag-propagation list — or that moves the other members a summary reports —
+//! shows up in the next listing, an emptied list still as `[]`.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
@@ -305,6 +310,155 @@ async fn every_summary_member_is_projected_from_the_stored_template() {
                 row.tag_propagation_configurations
             );
         }
+    }
+}
+
+/// One row of the update table: what the template is created with, the update
+/// written over it, and the stored template a summary must report afterwards.
+///
+/// The rows differ along what the rule generalises over once a template has
+/// been written twice: whether the update adds, replaces, clears or leaves
+/// alone the tag-propagation list, and whether it touches the members a summary
+/// reports beside it.
+struct UpdateRow {
+    case: &'static str,
+    created_with: Vec<Value>,
+    /// The `UpdateTemplate` body, minus the rename the flag below asks for.
+    update: Value,
+    /// Whether the update also renames the template, which a summary reports.
+    renames: bool,
+    expected_status: &'static str,
+    expected_configurations: Vec<Value>,
+}
+
+/// One tag-propagation configuration naming `resource_type`, with `entries` tags.
+fn configuration(resource_type: &str, entries: usize) -> Value {
+    json!({ "resourceType": resource_type, "tagMap": tag_map(entries) })
+}
+
+/// The update table: every shape an update gives a stored template's
+/// tag-propagation list, plus one update that leaves the list alone while
+/// moving the other members a summary reports.
+fn update_rows() -> Vec<UpdateRow> {
+    let first = TAG_PROPAGATION_RESOURCE_TYPE_VALUES[0];
+    let last = TAG_PROPAGATION_RESOURCE_TYPE_VALUES[TAG_PROPAGATION_RESOURCE_TYPE_VALUES.len() - 1];
+    vec![
+        UpdateRow {
+            case: "tag propagation added to a template created without any",
+            created_with: Vec::new(),
+            update: json!({ "tagPropagationConfigurations": [configuration(first, 1)] }),
+            renames: false,
+            expected_status: TEMPLATE_STATUS_VALUES[0],
+            expected_configurations: vec![configuration(first, 1)],
+        },
+        UpdateRow {
+            case: "tag propagation cleared back to an empty list",
+            created_with: vec![configuration(first, 3)],
+            update: json!({ "tagPropagationConfigurations": [] }),
+            renames: false,
+            expected_status: TEMPLATE_STATUS_VALUES[0],
+            expected_configurations: Vec::new(),
+        },
+        UpdateRow {
+            case: "the configuration replaced by one with as many tags as a tagMap holds",
+            created_with: vec![configuration(first, 1)],
+            update: json!({
+                "tagPropagationConfigurations": [configuration(last, MAX_TAG_MAP_ENTRIES)],
+            }),
+            renames: false,
+            expected_status: TEMPLATE_STATUS_VALUES[0],
+            expected_configurations: vec![configuration(last, MAX_TAG_MAP_ENTRIES)],
+        },
+        UpdateRow {
+            case: "renamed and moved to another status, the tag propagation left alone",
+            created_with: vec![configuration(first, 2)],
+            update: json!({ "status": TEMPLATE_STATUS_VALUES[1] }),
+            renames: true,
+            expected_status: TEMPLATE_STATUS_VALUES[1],
+            expected_configurations: vec![configuration(first, 2)],
+        },
+    ]
+}
+
+/// A summary is projected from the template as it is STORED NOW, not as it was
+/// created: after an update the listing reports the updated members, the
+/// identity still agrees under both names it is reported by, and a
+/// tag-propagation list the update emptied is reported as `[]` rather than
+/// dropped.
+#[tokio::test]
+async fn a_summary_reports_the_stored_template_after_an_update() {
+    let emulator = Emulator::new();
+    let domain_id = domain(&emulator, "summary-after-update").await;
+
+    for (index, row) in update_rows().iter().enumerate() {
+        let created_name = format!("updated-template-{index:03}");
+        let created = Row {
+            case: row.case,
+            status: Some(TEMPLATE_STATUS_VALUES[0]),
+            tag_propagation_configurations: row.created_with.clone(),
+        };
+        let (template_id, template_arn) =
+            create(&emulator, row.case, &domain_id, &created_name, &created).await;
+
+        let expected_name = if row.renames {
+            format!("renamed-template-{index:03}")
+        } else {
+            created_name.clone()
+        };
+        let mut body = row.update.clone();
+        if row.renames {
+            body["name"] = json!(expected_name);
+        }
+        emulator
+            .ok(
+                row.case,
+                "PUT",
+                &format!("/domains/{domain_id}/templates/{template_id}"),
+                body,
+            )
+            .await;
+
+        let answer = list(&emulator, row.case, &domain_id, "").await;
+        let summary = summary_of(row.case, &answer, &template_id);
+        let stored = Stored {
+            region: "us-east-1",
+            domain_id: &domain_id,
+            template_id: &template_id,
+            name: &expected_name,
+            status: row.expected_status,
+            tag_propagation_configurations: &row.expected_configurations,
+        };
+        assert_summary(row.case, &summary, &stored);
+        // An update mints no new identity, so the summary still reports the one
+        // the create handed out — under both names.
+        assert_eq!(
+            string_at(&summary, "arn", row.case),
+            template_arn,
+            "case {:?}: an update must not change the ARN the create reported ({template_arn})",
+            row.case
+        );
+
+        // The single-resource read of the same stored record agrees.
+        let record = get_template(&emulator, row.case, &domain_id, &template_id).await;
+        assert_eq!(
+            string_at(&record, "name", row.case),
+            expected_name,
+            "case {:?}: GetTemplate must report the updated name, got {record:?}",
+            row.case
+        );
+        assert_eq!(
+            string_at(&record, "status", row.case),
+            row.expected_status,
+            "case {:?}: GetTemplate must report the updated status, got {record:?}",
+            row.case
+        );
+        let read = tag_propagation_configurations(row.case, "GetTemplate", &record);
+        assert_eq!(
+            read, row.expected_configurations,
+            "case {:?}: GetTemplate must report the tag-propagation configurations the update \
+             left stored ({:?}), got {read:?}",
+            row.case, row.expected_configurations
+        );
     }
 }
 
