@@ -156,6 +156,27 @@ use super::types::*;
 /// (`PutCompositeAlarm` documentation)
 const MAX_RULE_ALARMS: usize = 100;
 
+/// How CloudWatch refuses a rule that references more alarms than one may include.
+///
+/// Wholly fixed text: it names the member, that there are too many of what the rule holds, and
+/// the maximum — which is a constant OF THE RULE ([`MAX_RULE_ALARMS`]) rather than a value of
+/// the request, so a caller branching on the message reads the same sentence however many
+/// alarms its rule referenced.
+fn too_many_children_refusal() -> String {
+    format!("Too many children in AlarmRule, maximum is {MAX_RULE_ALARMS}")
+}
+
+/// The largest number of composite alarms one account may hold in a Region: CloudWatch's
+/// published composite-alarm quota, which is counted separately from the alarm quota as a whole
+/// ([`MAX_ALARMS`]) because a composite alarm is evaluated over the states of the alarms its
+/// rule references rather than over a metric.
+const MAX_COMPOSITE_ALARMS: usize = 500;
+
+/// The largest number of composite alarms one alarm may be a child of: "Any single alarm can
+/// be included in the rule expressions of as many as 150 composite alarms."
+/// (`PutCompositeAlarm` documentation)
+const MAX_RULE_PARENTS: usize = 150;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -260,11 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alarms." (`PutCompositeAlarm`)
         let children = crate::state::alarm_rule_child_names(&rule);
         if children.len() > MAX_RULE_ALARMS {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "AlarmRule references {} alarms, which is more than the {MAX_RULE_ALARMS} a \
-                 composite alarm's rule can include",
-                children.len()
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                too_many_children_refusal(),
+            ));
         }
 
         // "WaitPeriod is required only when ActionsSuppressor is specified." / "ExtensionPeriod
@@ -379,6 +398,44 @@ fn write_composite_alarm(
         )));
     }
 
+    // "The actions suppressor alarm is specified by its ARN or name"
+    // (`PutCompositeAlarmInput$ActionsSuppressor`) — suppression is decided from that alarm's
+    // own STATE, so an alarm that does not exist has no state to read and the composite alarm
+    // is refused rather than stored with a suppressor that could never suppress anything. The
+    // same rule as for the alarms the rule references, worded for the one member it names: the
+    // alarm is named by its ARN, built from the name the request carried and the Region and
+    // account this call was made in, whichever of the two forms the request used.
+    if let Some(suppressor) = input.actions_suppressor.as_deref() {
+        let named = crate::state::alarm_rule_reference_name(suppressor);
+        if store.alarm_kind(named).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Could not save the composite alarm as the actions suppressor alarm [{}] does \
+                 not exist",
+                crate::state::alarm_arn(region, named)
+            )));
+        }
+    }
+
+    // "Any single alarm can be included in the rule expressions of as many as 150 composite
+    // alarms." (`PutCompositeAlarm`) — a published quota on the alarm a rule REFERENCES rather
+    // than on the rule itself, so it is counted per child: the composite alarms that already
+    // reference the child, less this one when this call replaces a composite alarm that
+    // referenced it, since rewriting a parent adds none.
+    for child in &children {
+        let parents = store
+            .composite_alarm_parents(child)
+            .into_iter()
+            .filter(|parent| parent != &input.alarm_name)
+            .count();
+        if parents >= MAX_RULE_PARENTS {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Alarm {} references too many parents. Maximum allowed referenced parent count \
+                 is {MAX_RULE_PARENTS} per alarm.",
+                crate::state::alarm_arn(region, child)
+            )));
+        }
+    }
+
     // "When you update an existing alarm, its state is left unchanged, but the update
     // completely overwrites the previous configuration of the alarm." — the alarm this
     // call replaces, when it replaces one: its state carries over (below) and its
@@ -395,10 +452,21 @@ fn write_composite_alarm(
     if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
         return Err(PutCompositeAlarmErrorModeled::LimitExceededFault(
             LimitExceededFault {
-                message: Some(format!(
-                    "the quota of {} alarms has already been reached",
-                    crate::state::MAX_ALARMS
-                )),
+                message: Some(crate::state::ALARM_QUOTA_REACHED.to_string()),
+            },
+        )
+        .into());
+    }
+    // A composite alarm counts against the quota for alarms of ITS kind as well
+    // ([`MAX_COMPOSITE_ALARMS`]), which is the one a caller creating nothing but composite
+    // alarms reaches first. Counted over the composite alarms alone, and only for a create:
+    // rewriting one adds none. The class and the sentence are the alarm quota's
+    // ([`crate::state::ALARM_QUOTA_REACHED`], the modelled fault's own text): both say a quota
+    // for this account's alarms is full.
+    if !is_update && store.composite_alarms.len() >= MAX_COMPOSITE_ALARMS {
+        return Err(PutCompositeAlarmErrorModeled::LimitExceededFault(
+            LimitExceededFault {
+                message: Some(crate::state::ALARM_QUOTA_REACHED.to_string()),
             },
         )
         .into());

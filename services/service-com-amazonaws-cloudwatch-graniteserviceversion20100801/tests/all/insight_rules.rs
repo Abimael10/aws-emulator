@@ -94,8 +94,8 @@ async fn every_rule_form_round_trips_through_describe_insight_rules() {
             false,
         ),
         (
-            "a one-character name, explicitly enabled",
-            "r".to_string(),
+            "a two-character name, explicitly enabled",
+            "r1".to_string(),
             definition(json!({"LogGroupNames": ["one", "two", "three"]})),
             json!({"RuleState": "ENABLED"}),
             "ENABLED",
@@ -111,7 +111,7 @@ async fn every_rule_form_round_trips_through_describe_insight_rules() {
         ),
         (
             "a name with the punctuation a rule name admits",
-            "My_rule(v2)/high-cardinality".to_string(),
+            "My_rule.v2-high_cardinality".to_string(),
             definition(json!({
                 "LogFormat": "CLF",
                 "Fields": {"4": "IpAddress", "7": "StatusCode"},

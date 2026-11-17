@@ -1450,20 +1450,6 @@ async fn refusals_carry_the_modelled_status_and_code() {
             "InvalidParameterValueException",
         ),
         (
-            "a NextToken this service never issued",
-            "DescribeAlarms",
-            json!({"NextToken": "not-a-token"}),
-            400,
-            "InvalidNextToken",
-        ),
-        (
-            "a bogus NextToken on the children-of path too",
-            "DescribeAlarms",
-            json!({"ChildrenOfAlarmName": "known", "NextToken": "not-a-token"}),
-            400,
-            "InvalidNextToken",
-        ),
-        (
             "a ListMetrics NextToken this service never issued",
             "ListMetrics",
             json!({"NextToken": "not-a-token"}),

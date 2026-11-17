@@ -268,21 +268,33 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 ),
             ),
         );
+        overridden.add_operation(
+            "GetInsightRuleReport",
+            served(
+                &engine,
+                JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::get_insight_rule_report::GetInsightRuleReport::new(Arc::clone(
+                        &engine,
+                    )),
+                    report_member_fault,
+                ),
+            ),
+        );
         // The three BATCH rule operations report one entry of `Failures` per rule name they
         // could not act on, so they are served through the same wrapper for its OTHER
         // decision: a `RuleNames` entry whose characters or length the member's own constraints
         // do not admit is a per-entry outcome of the batch ([`is_unenforced_constraint`]),
         // judged inside the handler's walk, so the request is SERVED — the rest of the batch
-        // takes effect and the offending entry comes back classified. Every refusal they do
-        // make keeps the service-wide wording ([`the_service_wide_refusal`]), so an absent
-        // `RuleNames` reads exactly as before.
+        // takes effect and the offending entry comes back classified. The refusal they DO make
+        // about one request member is the Contributor Insights coded form every other rule
+        // operation states one in ([`coded_member_fault`]).
         overridden.add_operation(
             "EnableInsightRules",
             served(
                 &engine,
                 JudgingTheValuesThisServiceEnforces::new(
                     crate::ops::enable_insight_rules::EnableInsightRules::new(Arc::clone(&engine)),
-                    the_service_wide_refusal,
+                    coded_member_fault,
                 ),
             ),
         );
@@ -294,7 +306,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     crate::ops::disable_insight_rules::DisableInsightRules::new(Arc::clone(
                         &engine,
                     )),
-                    the_service_wide_refusal,
+                    coded_member_fault,
                 ),
             ),
         );
@@ -304,7 +316,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 &engine,
                 JudgingTheValuesThisServiceEnforces::new(
                     crate::ops::delete_insight_rules::DeleteInsightRules::new(Arc::clone(&engine)),
-                    the_service_wide_refusal,
+                    coded_member_fault,
                 ),
             ),
         );
@@ -383,6 +395,15 @@ fn served<Eng: Send + Sync + 'static, O: ErasedOperation + 'static>(
 /// LENGTH or range bound is what this service is recorded answering `ValidationException`
 /// for, and a code a client branches on is not changed without a recording that shows it.
 ///
+/// A required member the request OMITTED is one of those others, and deliberately so: the
+/// request-validation layer in front of the service judges the SHAPE of a request before the
+/// service reads any of its values, so a request that names a member no value at all is
+/// refused there, under the request-validation class — where a member the request DID carry,
+/// with no characters in it, is a value the service read and found unusable. Only an
+/// operation whose own refusals are recorded naming the missing-parameter fault states that
+/// class for an omitted member, and it does so where the operation is known
+/// ([`parameter_fault_for`], [`coded_member_fault`]).
+///
 /// This seam cannot see WHICH operation was called, and which validator answers a value
 /// outside an enumerated type is an operation's property: the read whose model declares the
 /// parameter faults answers one of THEM rather than the code above, so it is served through
@@ -395,7 +416,6 @@ fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
         .iter()
         .find_map(collection_cap_refusal)
         .or_else(|| violations.iter().find_map(empty_required_value_refusal))
-        .or_else(|| violations.iter().find_map(omitted_required_member_refusal))
         .or_else(|| violations.iter().find_map(list_element_enum_refusal))
         .or_else(|| scalar_enum_refusal(violations))
 }
@@ -438,9 +458,13 @@ fn empty_required_value_refusal(
 /// ([`empty_required_value_refusal`]): CloudWatch answers the missing-parameter fault naming the
 /// request member path the value was looked for at, and a member the request left out and one it
 /// carried with no characters are both parameters it supplied no value for. Keyed on the CLASS of
-/// violation alone, so it holds for every required member of every operation whose refusals this
-/// service words, at any depth — the `Name` of a dimension FILTER a metric listing is narrowed
+/// violation alone, so it holds for every required member of the operations mounted with a policy
+/// that reaches it, at any depth — the `Name` of a dimension FILTER a metric listing is narrowed
 /// by is the recorded case.
+///
+/// WHICH operations those are is the point: an operation recorded answering the
+/// request-validation class for a member it was not given reaches no policy that words this, and
+/// its refusal stays the one the layer in front of the service makes ([`parameter_fault`]).
 fn omitted_required_member_refusal(
     violation: &aws_smithy_schema_server::Violation,
 ) -> Option<Refused> {
@@ -471,6 +495,7 @@ fn listing_value_fault(violations: &[aws_smithy_schema_server::Violation]) -> Op
     violations
         .iter()
         .find_map(unusable_filter_value_refusal)
+        .or_else(|| violations.iter().find_map(omitted_required_member_refusal))
         .or_else(|| {
             violations.iter().find_map(|violation| {
                 let aws_smithy_schema_server::ViolationKind::EnumValue(_) = violation.kind else {
@@ -569,6 +594,37 @@ fn coded_member_fault(violations: &[aws_smithy_schema_server::Violation]) -> Opt
         .iter()
         .find_map(non_positive_page_size_refusal)
         .or_else(|| violations.iter().find_map(missing_required_member_refusal))
+}
+
+/// The refusal policy of the Contributor Insights REPORT read: a page size below the published
+/// minimum of the member that asks for one, exactly as the rule operations state it
+/// ([`non_positive_page_size_refusal`]), and a required member the request did not supply at
+/// all, worded as the SERVICE-WIDE missing-parameter sentence
+/// ([`crate::state::INPUT_MISSING_REQUIRED_PARAMETER`]) rather than in the rule operations'
+/// coded per-member form.
+///
+/// Which sentence a missing member earns is a property of the OPERATION: the coded form names
+/// the member, which is what the operations that act on rules BY NAME state, while this read
+/// answers the one sentence CloudWatch states for a request short of a parameter — the same
+/// sentence the detector writers' recorded refusal carries.
+fn report_member_fault(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    violations
+        .iter()
+        .find_map(non_positive_page_size_refusal)
+        .or_else(|| {
+            violations
+                .iter()
+                .find_map(|violation| {
+                    matches!(
+                        violation.kind,
+                        aws_smithy_schema_server::ViolationKind::MissingRequiredMember
+                    )
+                    .then(|| Refused {
+                        code: MISSING_PARAMETER.shape_name.to_string(),
+                        message: crate::state::INPUT_MISSING_REQUIRED_PARAMETER.to_string(),
+                    })
+                })
+        })
 }
 
 /// The refusal of a page size below the published minimum of the member that asks for one, or
@@ -1033,7 +1089,8 @@ enum Judgement {
 ///   `Service::override_refusal` is handed the violations alone, with no way to tell which
 ///   operation was called. So the choice is made here, where the operation is known, by the
 ///   `refusal` policy this wrapper is mounted with ([`parameter_fault_for`], or
-///   [`the_service_wide_refusal`] for an operation that keeps the service-wide wording).
+///   [`coded_member_fault`] for an operation that words a refusal about one request member in
+///   the Contributor Insights coded form).
 ///
 /// Nothing else is re-implemented: a request with nothing to decide is handed to the generated
 /// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
@@ -1205,16 +1262,6 @@ fn judgement(
 /// this file words ahead of the framework's sequence cannot drift apart.
 fn the_service_wide_wording(refusal: &Refusal) -> Option<Refused> {
     parameter_fault(refusal).or_else(|| unanchored_pattern_refusal(refusal))
-}
-
-/// The refusal policy of an operation that keeps this service's SERVICE-WIDE wording for a
-/// boundary refusal ([`the_service_wide_wording`]): it words nothing of its own.
-///
-/// Mounted on an operation that is served through [`JudgingTheValuesThisServiceEnforces`] for
-/// the other decision that wrapper makes — serving a request past a constraint this service
-/// does not enforce — so that wrapping it changes nothing about how its refusals read.
-fn the_service_wide_refusal(_: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
-    None
 }
 
 /// One modelled operation, served so that this service's own PARAMETER-VALUE rules are

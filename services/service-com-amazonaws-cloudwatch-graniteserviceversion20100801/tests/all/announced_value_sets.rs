@@ -86,10 +86,6 @@ pub fn unit_in_set_message(parameter: &str) -> String {
 /// and 60", `MetricDatum$StorageResolution`): inside padded brackets.
 const ANNOUNCED_RESOLUTIONS: &str = "[ 1, 60 ]";
 
-/// The sub-minute granularities a metric is readable at as the service announces them
-/// (`GetMetricStatisticsInput$Period`): inside bare brackets.
-const ANNOUNCED_PERIODS: &str = "[1, 5, 10, 20, 30]";
-
 /// The statistic names as the service announces them: the order `Statistic` declares them in,
 /// inside bare brackets.
 fn announced_statistics() -> String {
@@ -228,20 +224,11 @@ async fn a_value_outside_a_set_is_refused_with_that_set_as_the_service_announces
         });
     }
 
-    // The readable granularities, announced inside bare brackets: the SUB-MINUTE set is what a
-    // period shorter than a minute had to come from, so the rows are either side of a published
-    // sub-minute value and one just under a minute. A period OVER a minute had to be a whole
-    // number of minutes instead, and is refused against that requirement rather than against a
-    // set (`crate::period_refusal_message` tables both halves).
-    for period in [2, 7, 59] {
-        rows.push(Row {
-            case: "a period outside the granularities a metric is readable at",
-            operation: "GetMetricStatistics",
-            request: read(json!({"Period": period})),
-            code: INVALID_PARAMETER_VALUE_SHAPE,
-            message: in_set_message("Period", ANNOUNCED_PERIODS),
-        });
-    }
+    // A `Period` outside the granularities a metric is readable at is NOT announced as a set:
+    // the sub-minute values are the additional periods a high-resolution metric admits, so a
+    // period that is none of them broke the rule every metric is read under — the multiple a
+    // period has to be of — and is refused against that requirement
+    // (`crate::period_refusal_message` tables it).
 
     for Row {
         case,

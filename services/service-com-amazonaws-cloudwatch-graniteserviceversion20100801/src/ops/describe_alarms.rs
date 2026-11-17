@@ -209,16 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A `NextToken` is refused on EVERY path, including the relationship paths below,
-        // so whether a bogus token is rejected never depends on which filter was used.
-        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
-            None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                DescribeAlarmsErrorModeled::InvalidNextToken(InvalidNextToken {
-                    message: Some("NextToken is not a token this service issued".into()),
-                })
-            })?),
-        };
+        // A `NextToken` this listing cannot read names no page of this enumeration, and this
+        // listing answers that with the page such a request asks for: the FIRST one. A value
+        // carrying no cursor is treated exactly as a request that offered no token at all
+        // ([`crate::state::resumable_page`]), which is what lets a caller resume a listing
+        // from a token that travelled through a store or a log without a hard refusal.
+        let start_at = crate::state::resumable_page(input.next_token.as_deref());
 
         // One page size for every path below, so paging behaves the same whichever filter
         // was used.

@@ -324,12 +324,12 @@ async fn deleting_a_rule_that_is_not_there_reports_no_failure_while_moving_its_s
             &["ghost-one", "held", "ghost-two"],
         ),
         delete_row("the same unknown name twice", &[], &["ghost", "ghost"]),
-        delete_row("a one-character unknown name", &["held"], &["x"]),
+        delete_row("a two-character unknown name", &["held"], &["x1"]),
         delete_row("a 128-character unknown name", &[], &[long_name.as_str()]),
         delete_row(
             "an unknown name with the punctuation a rule name admits",
             &[],
-            &["My_rule(v2)/high-cardinality"],
+            &["My_rule.v2-high_cardinality"],
         ),
         delete_row("every named rule held", &["alpha"], &["alpha"]),
     ];

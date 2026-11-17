@@ -374,10 +374,7 @@ fn write_alarm(
     // adds none, so it is never refused.
     if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
         return Err(PutLogAlarmErrorModeled::LimitExceededFault(LimitExceededFault {
-            message: Some(format!(
-                "the quota of {} alarms has already been reached",
-                crate::state::MAX_ALARMS
-            )),
+            message: Some(crate::state::ALARM_QUOTA_REACHED.to_string()),
         })
         .into());
     }

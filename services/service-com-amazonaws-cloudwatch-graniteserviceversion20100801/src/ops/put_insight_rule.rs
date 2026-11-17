@@ -196,10 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if existing.is_none() && store.insight_rules.len() >= crate::state::MAX_INSIGHT_RULES {
             return Err(PutInsightRuleErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "this emulator holds at most {} Contributor Insights rules",
-                        crate::state::MAX_INSIGHT_RULES
-                    )),
+                    message: Some(crate::state::insight_rule_quota_message()),
                 },
             )
             .into());
@@ -342,6 +339,16 @@ const MAX_CONTRIBUTION_FILTERS: usize = 4;
 /// rule.
 const UNPARSEABLE_RULE_BODY: &str = "INVALID_RULE_BODY: The RuleBody could not be parsed.";
 
+/// How CloudWatch states that a rule body left out a key the rule syntax requires: the same
+/// reason code as any other unusable body, then the condition and the KEY that is missing.
+///
+/// The key is the one variable part — it is what the client has to add — and it is the key's
+/// own name in the rule syntax, whether it sits at the top of the body or inside the
+/// contribution, because that is the name the body spells it with.
+fn missing_rule_body_key(key: &str) -> String {
+    format!("INVALID_RULE_BODY: MissingKey encountered at {key} in the RuleBody.")
+}
+
 /// Refuse a `RuleDefinition` that is not a Contributor Insights rule.
 ///
 /// "The definition of the rule, as a JSON object. The definition contains the keywords used
@@ -353,30 +360,40 @@ const UNPARSEABLE_RULE_BODY: &str = "INVALID_RULE_BODY: The RuleBody could not b
 /// syntax does not define are left alone, so a definition carrying more than the rule needs
 /// is still a rule.
 fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
-    if reads_as_a_rule(definition) {
-        Ok(())
-    } else {
-        Err(invalid_parameter_value(UNPARSEABLE_RULE_BODY.to_string()))
+    match rule_body_fault(definition) {
+        None => Ok(()),
+        Some(message) => Err(invalid_parameter_value(message)),
     }
 }
 
-/// Whether the rule body reads as a Contributor Insights rule definition: a JSON object
-/// carrying the schema, the log groups, the log format, the contribution and the aggregation
-/// the rule syntax defines.
-fn reads_as_a_rule(definition: &str) -> bool {
+/// Why the rule body is not a Contributor Insights rule definition, or `None` when it is one.
+///
+/// Two classes of fault, which a client repairs differently: a key the syntax REQUIRES that
+/// the body does not carry at all is named ([`missing_rule_body_key`]), so the client knows
+/// what to add; anything else — a body that is no JSON object, or a key carrying a value the
+/// syntax does not admit — is the one unparseable-body class ([`UNPARSEABLE_RULE_BODY`]).
+///
+/// The keys the body is asked for in the order a client has to supply them in: the schema that
+/// says what kind of rule it is, the contribution that says what a contributor IS, and then the
+/// log groups and the format the rule reads them from — so a body short of several of them is
+/// told about the first one.
+fn rule_body_fault(definition: &str) -> Option<String> {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
-        return false;
+        return Some(UNPARSEABLE_RULE_BODY.to_string());
     };
     let Some(rule) = parsed.as_object() else {
-        return false;
+        return Some(UNPARSEABLE_RULE_BODY.to_string());
     };
+    let unparseable = || Some(UNPARSEABLE_RULE_BODY.to_string());
 
     // "For rules that you create, this is always {"Name": "CloudWatchLogRule", "Version": 1}"
     // (`InsightRule$Schema`) — so both members are required to be exactly that, which is what
     // lets the stored rule report that schema back.
-    let names_the_schema = rule
-        .get("Schema")
-        .and_then(::serde_json::Value::as_object)
+    let Some(schema) = rule.get("Schema") else {
+        return Some(missing_rule_body_key("Schema"));
+    };
+    let names_the_schema = schema
+        .as_object()
         .is_some_and(|schema| {
             schema.get("Name").and_then(::serde_json::Value::as_str)
                 == Some(crate::state::INSIGHT_RULE_SCHEMA_NAME)
@@ -384,35 +401,52 @@ fn reads_as_a_rule(definition: &str) -> bool {
                     == Some(crate::state::INSIGHT_RULE_SCHEMA_VERSION)
         });
     if !names_the_schema {
-        return false;
+        return unparseable();
+    }
+
+    // A contribution carries the `Keys` a contributor is identified by, so a body without one —
+    // and a contribution without them — identifies nothing to attribute a contribution to.
+    // Either way the missing key is located at the CONTRIBUTION, the node the body is short of
+    // a key at, which is the node a client has to repair.
+    let Some(contribution) = rule.get("Contribution") else {
+        return Some(missing_rule_body_key(CONTRIBUTION));
+    };
+    let contribution = contribution.as_object();
+    if contribution.is_none() {
+        return unparseable();
+    }
+    if !contribution.is_some_and(|object| object.contains_key("Keys")) {
+        return Some(missing_rule_body_key(CONTRIBUTION));
+    }
+    if !contribution_classifies_a_contributor(rule.get("Contribution")) {
+        return unparseable();
     }
 
     // The log groups the rule evaluates, named either by name or by ARN. A rule that selects
-    // no log group has no log events to find contributors in.
-    let selects_log_groups = ["LogGroupNames", "LogGroupARNArray"]
+    // no log group has no log events to find contributors in, and a body carrying neither
+    // member carries neither way of naming them.
+    let names_log_groups = LOG_GROUP_MEMBERS
         .into_iter()
-        .any(|member| {
-            rule.get(member)
-                .and_then(::serde_json::Value::as_array)
-                .is_some_and(|names| {
-                    !names.is_empty() && names.iter().all(::serde_json::Value::is_string)
-                })
-        });
+        .any(|member| rule.contains_key(member));
+    if !names_log_groups {
+        return Some(missing_rule_body_key(LOG_GROUP_MEMBERS[0]));
+    }
+    let selects_log_groups = LOG_GROUP_MEMBERS.into_iter().any(|member| {
+        rule.get(member)
+            .and_then(::serde_json::Value::as_array)
+            .is_some_and(|names| {
+                !names.is_empty() && names.iter().all(::serde_json::Value::is_string)
+            })
+    });
     if !selects_log_groups {
-        return false;
+        return unparseable();
     }
 
-    let log_format = rule
-        .get("LogFormat")
-        .and_then(::serde_json::Value::as_str)
-        .unwrap_or_default();
-    if !LOG_FORMATS.contains(&log_format) {
-        return false;
-    }
-
-    let contribution = rule.get("Contribution");
-    if !contribution_classifies_a_contributor(contribution) {
-        return false;
+    let Some(log_format) = rule.get("LogFormat") else {
+        return Some(missing_rule_body_key("LogFormat"));
+    };
+    if !LOG_FORMATS.contains(&log_format.as_str().unwrap_or_default()) {
+        return unparseable();
     }
 
     // Whether the rule aggregates contributor data by count of occurrences or by the sum of
@@ -421,21 +455,26 @@ fn reads_as_a_rule(definition: &str) -> bool {
     if let Some(aggregate_on) = rule.get("AggregateOn") {
         let named = aggregate_on.as_str().unwrap_or_default();
         if !AGGREGATE_ON.contains(&named) {
-            return false;
+            return unparseable();
         }
-        let sums = named == AGGREGATE_ON_SUM;
         let names_a_value = contribution
-            .and_then(::serde_json::Value::as_object)
             .and_then(|object| object.get("ValueOf"))
             .and_then(::serde_json::Value::as_str)
             .is_some_and(|value_of| !value_of.is_empty());
-        if sums && !names_a_value {
-            return false;
+        if named == AGGREGATE_ON_SUM && !names_a_value {
+            return Some(missing_rule_body_key(CONTRIBUTION));
         }
     }
 
-    true
+    None
 }
+
+/// The body key a contribution arrives on, as a refusal names it.
+const CONTRIBUTION: &str = "Contribution";
+
+/// The two members a rule body may name the log groups it reads with, in the order the rule
+/// syntax declares them: by name, or by ARN.
+const LOG_GROUP_MEMBERS: [&str; 2] = ["LogGroupNames", "LogGroupARNArray"];
 
 /// Whether a `Contribution` classifies a contributor.
 ///

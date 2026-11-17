@@ -128,6 +128,20 @@ impl From<DescribeAnomalyDetectorsErrorModeled> for DescribeAnomalyDetectorsErro
     }
 }
 
+/// How this listing refuses a request that both names models by identifier and filters over
+/// metrics.
+///
+/// "If you specify this parameter, you cannot also specify the Namespace, MetricName,
+/// Dimensions, or AnomalyDetectorTypes metric filters."
+/// (`DescribeAnomalyDetectorsInput$AnomalyDetectorIds`) — wholly fixed text: it names the two
+/// ways of selecting models, every filter that belongs to the second, and that one request
+/// chooses one of them, so nothing of the request shows through and a caller branching on the
+/// message reads the same sentence whichever filter it combined.
+const IDS_WITH_METRIC_FILTERS: &str = "AnomalyDetectorIds cannot be combined with metric \
+     filters (Namespace, MetricName, Dimensions, AnomalyDetectorTypes, or \
+     AnomalyDetectorSearchTerms). Provide either AnomalyDetectorIds for a direct lookup, or \
+     metric filters to list, but not both.";
+
 /// The `DescribeAnomalyDetectors` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -185,12 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeAnomalyDetectorsErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
-                        message: Some(
-                            "When using AnomalyDetectorIds, you cannot also specify the \
-                             Namespace, MetricName, Dimensions, or AnomalyDetectorTypes metric \
-                             filters"
-                                .into(),
-                        ),
+                        message: Some(IDS_WITH_METRIC_FILTERS.into()),
                     },
                 )
                 .into(),

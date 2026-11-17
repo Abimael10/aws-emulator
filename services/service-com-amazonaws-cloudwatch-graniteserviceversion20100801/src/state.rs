@@ -899,30 +899,24 @@ fn upper_camel(segment: &str) -> String {
 /// `range min 1`) and so do the members above. Stated here as well, so the rule the windows
 /// are built on does not depend on the boundary validator having run.
 ///
-/// The REQUIREMENT a period broke is what CloudWatch states, and which of the three it is
-/// depends on where the period sits. "For metrics with regular resolution, a period can be as
-/// short as one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […]
-/// the period can be 1, 5, 10, 20, 30, 60, or any multiple of 60" (`MetricStat$Period`) — so a
-/// period SHORTER than a minute had to be one of the sub-minute divisions of one, stated as the
-/// value outside the set its member accepts ([`value_in_set_message`]), while a longer one had
-/// to be a whole number of minutes, stated as the multiple it was not. A period at or below zero
-/// is neither: a granularity is a span of seconds, so a value naming no span at all is stated
-/// against the bound it broke ([`non_positive_period_message`]) rather than against a set of
-/// granularities it could never have come from.
+/// The REQUIREMENT a period broke is what CloudWatch states, and which of the two it is depends
+/// on where the period sits. "For metrics with regular resolution, a period can be as short as
+/// one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […] the
+/// period can be 1, 5, 10, 20, 30, 60, or any multiple of 60" (`MetricStat$Period`) — the
+/// sub-minute granularities are the ADDITIONAL periods a high-resolution metric admits, so a
+/// value that is none of them broke the rule every metric is read under, which is the multiple
+/// a period has to be of. A period at or below zero is not that: a granularity is a span of
+/// seconds, so a value naming no span at all is stated against the bound it broke
+/// ([`non_positive_period_message`]) rather than against a step it could never have been a
+/// multiple of.
 pub fn period_error(period: i32) -> Option<String> {
     let documented = period >= SHORTEST_PERIOD_SECS
-        && (SUB_MINUTE_PERIODS.contains(&period) || period % 60 == 0);
+        && (SUB_MINUTE_PERIODS.contains(&period) || period % REGULAR_PERIOD_SECS == 0);
     if documented {
         return None;
     }
     if period < SHORTEST_PERIOD_SECS {
         return Some(non_positive_period_message());
-    }
-    if period < REGULAR_PERIOD_SECS {
-        // The set the sentence enumerates is the sub-minute granularities, the values a caller
-        // cannot reach by multiplying a minute; nothing of the submitted value is stated.
-        let allowed: Vec<String> = SUB_MINUTE_PERIODS.iter().map(i32::to_string).collect();
-        return Some(value_in_set_message(PERIOD_PARAMETER, &allowed));
     }
     Some(format!(
         "The parameter {PERIOD_PARAMETER} must be a multiple of {REGULAR_PERIOD_SECS}."
@@ -1691,8 +1685,39 @@ pub enum AnomalyDetectorFormError {
     Combination(String),
     /// A parameter the detector cannot be identified without is missing, reported as the
     /// missing-parameter fault both detector writers model.
-    Missing(String),
+    ///
+    /// It carries no sentence: what a caller is told about a request that named no detector is
+    /// the OPERATION's — a write states that its input is short of a required parameter
+    /// ([`NO_DETECTOR_NAMED`]), while the delete states which identifications would have named
+    /// the model to remove ([`NO_DETECTOR_TO_DELETE`]) — so each writes its own, and the rule
+    /// that FINDS the condition is shared.
+    Missing,
 }
+
+/// How a WRITE of an anomaly detection model states that the request named no model at all.
+///
+/// A write builds the model from the metric or the queries the request carries, so a request
+/// carrying neither is short of a parameter the operation cannot proceed without, which is the
+/// service-wide sentence for that ([`INPUT_MISSING_REQUIRED_PARAMETER`]) — it names no member,
+/// because any of the accepted identifications would have satisfied it.
+pub const NO_DETECTOR_NAMED: &str = INPUT_MISSING_REQUIRED_PARAMETER;
+
+/// How CloudWatch states that a request is short of a parameter the operation cannot proceed
+/// without: wholly fixed text, naming neither the member nor the operation.
+///
+/// The sentence the missing-parameter fault carries where the operation states nothing more
+/// specific about the member it was not given — the Contributor Insights rule operations are
+/// the ones that do, in their coded per-member form ([`missing_parameter_message`]).
+pub const INPUT_MISSING_REQUIRED_PARAMETER: &str = "Input missing required parameter.";
+
+/// How the DELETE states it: the two ways a request may identify the model to remove.
+///
+/// The delete acts on a model that already exists, so what it is short of is an
+/// IDENTIFICATION — "If you specify this parameter, you do not need to specify a metric to
+/// identify the detector." (`DeleteAnomalyDetectorInput$AnomalyDetectorId`) — and the sentence
+/// names both ways of giving one and what it is needed for.
+pub const NO_DETECTOR_TO_DELETE: &str = "Either an AnomalyDetectorId or a metric definition \
+     must be provided to identify the anomaly detector to delete.";
 
 /// Which detector a request names, or why it names none.
 ///
@@ -1716,9 +1741,7 @@ pub fn anomaly_detector_form(
         found.push(METRIC_MATH_FORM);
     }
     match (found.len(), single, math) {
-        (0, _, _) => Err(AnomalyDetectorFormError::Missing(format!(
-            "Either {FLAT_METRIC_FORM}, {SINGLE_METRIC_FORM} or {METRIC_MATH_FORM} must be set."
-        ))),
+        (0, _, _) => Err(AnomalyDetectorFormError::Missing),
         (1, Some(single), _) => Ok(AnomalyDetectorForm::SingleMetric(single.clone())),
         (1, _, Some(math)) => Ok(AnomalyDetectorForm::MetricMath(math.clone())),
         // The deprecated spelling of a single-metric detector: the flat members are the
@@ -1744,14 +1767,47 @@ pub const METRIC_MATH_FORM: &str = "MetricMathAnomalyDetector";
 pub const DETECTOR_ID_FORM: &str = "AnomalyDetectorId";
 
 /// CloudWatch's wording for a request that names a detector more than one way: the three forms
-/// one of which may be set, and then the ones the request was found carrying, in that order.
+/// one of which may be set, and then the ones the request was found carrying.
+///
+/// The forms it was found carrying are listed in ONE fixed order ([`in_one_order`]), not in the
+/// order the request named them: the sentence reports WHICH forms clashed, and two requests
+/// that mix the same forms describe the same clash, so neither the order the members arrived in
+/// nor the order a handler happened to test them in may show through.
 pub fn one_detector_form_message(found: &[&str]) -> String {
     format!(
         "Either {FLAT_METRIC_FORM}, {SINGLE_METRIC_FORM} or {METRIC_MATH_FORM} can be set, \
          found {}.",
-        found.join(", ")
+        in_one_order(found).join(", ")
     )
 }
+
+/// `forms` in the one order such a sentence lists them in, whichever order the request named
+/// them in and whichever operation refused it ([`THE_ORDER_FORMS_ARE_LISTED_IN`]).
+///
+/// A form the order does not name keeps the position it arrived at, after the ones it does, so
+/// a form added to the rule later is still reported.
+#[must_use]
+pub fn in_one_order<'a>(forms: &[&'a str]) -> Vec<&'a str> {
+    let mut ordered = forms.to_vec();
+    ordered.sort_by_key(|form| {
+        THE_ORDER_FORMS_ARE_LISTED_IN
+            .iter()
+            .position(|listed| listed == form)
+            .unwrap_or(THE_ORDER_FORMS_ARE_LISTED_IN.len())
+    });
+    ordered
+}
+
+/// The order a refusal lists the forms a request was found carrying in: the identifier that
+/// names a model on its own, then the two structures — the metric-math one before the
+/// single-metric one, which is the order the recorded refusal of a request carrying both lists
+/// them in — and the deprecated flat spelling of the single-metric structure last.
+const THE_ORDER_FORMS_ARE_LISTED_IN: [&str; 4] = [
+    DETECTOR_ID_FORM,
+    METRIC_MATH_FORM,
+    SINGLE_METRIC_FORM,
+    FLAT_METRIC_FORM,
+];
 
 /// Why the detector `form` names cannot be identified, or `None` when it can.
 ///
@@ -2115,52 +2171,68 @@ pub fn dashboard_name_error(field: &str, value: &str) -> Option<String> {
              equal to {MIN_DASHBOARD_NAME_LEN}.\n"
         ));
     }
-    dashboard_name_characters_error(field, value, false)
+    dashboard_field_error(field, value)
 }
 
 /// Why `value` is not a dashboard name PREFIX, or `None` when it is one.
 ///
-/// "The maximum length is 255, and valid characters are A-Z, a-z, 0-9, \".\", \"-\", and
-/// \"_\"." (`ListDashboardsInput$DashboardNamePrefix`) — the same rule as a name's, widened by
-/// the "." the prefix also allows, and satisfied by the empty prefix, which selects every
-/// dashboard.
+/// The same rule as a dashboard NAME's, satisfied by the empty prefix, which selects every
+/// dashboard: a prefix is the opening characters of a name, so a value carrying a character no
+/// name may carry is the prefix of no name at all and is refused in the same sentence.
+///
+/// The member's own documentation lists the "." beside the dash and the underscore
+/// (`ListDashboardsInput$DashboardNamePrefix`), and the SERVICE is narrower than that: the
+/// sentence it refuses a prefix with names the set it accepts, and that set is the
+/// alphanumerics, the dash and the underscore — so a prefix carrying a "." is refused like any
+/// other character outside it, and this is the one rule both members are judged by.
 pub fn dashboard_name_prefix_error(field: &str, value: &str) -> Option<String> {
-    dashboard_name_characters_error(field, value, true)
+    dashboard_field_error(field, value)
 }
 
-/// The length and character rule both dashboard-name members state, with the "." only the
-/// prefix allows.
+/// How CloudWatch refuses a LIST field holding more elements than it may carry: fixed text
+/// naming the field and the cap, closed by the newline every field refusal of the dashboard
+/// operations closes with.
 ///
-/// Both refusals are worded the way CloudWatch words a field whose value breaks its rule:
-/// "The value for field `<field>` is too long. It must have length less than or equal to
-/// `<max>`." and "The value for field `<field>` contains invalid characters. It can only
-/// contain alphanumerics, dash (-) and underscore (_).", each closed by a newline, so every
-/// field holding a dashboard name reports its rule the same way.
-fn dashboard_name_characters_error(field: &str, value: &str, allow_dot: bool) -> Option<String> {
-    if value.chars().count() > MAX_DASHBOARD_NAME_LEN {
+/// A list over its cap is stated against the number of ELEMENTS it may hold, which is what
+/// tells a caller to shorten the batch rather than the values in it; a VALUE over its own
+/// length is stated as the length it broke ([`dashboard_field_error`]).
+pub fn field_element_cap_message(field: &str, cap: usize) -> String {
+    format!("Field {field} can contain up to {cap} elements.\n")
+}
+
+/// The same sentence for a LIST field holding fewer elements than it must: the field, that it
+/// is required, and the floor it did not reach.
+pub fn field_element_floor_message(field: &str, floor: usize) -> String {
+    format!("Field {field} is required and has to contain at least {floor} element.\n")
+}
+
+/// The length and character rule every dashboard-name member states.
+///
+/// Both are worded the way CloudWatch words a field whose VALUE breaks its rule: "The value
+/// for field `<field>` contains invalid characters. It can only contain alphanumerics, dash
+/// (-) and underscore (_)." and "The value for field `<field>` is too long. It must have
+/// length less than or equal to `<max>`.", each closed by a newline, so every field holding a
+/// dashboard name reports its rule the same way.
+///
+/// The CHARACTERS are judged first: what a value is built from is what makes it a name at all,
+/// so a value outside the set is told about that whether or not it is also longer than a name
+/// may be.
+fn dashboard_field_error(field: &str, value: &str) -> Option<String> {
+    let admitted = value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if !admitted {
         return Some(format!(
-            "The value for field {field} is too long. It must have length less than or equal \
-             to {MAX_DASHBOARD_NAME_LEN}.\n"
+            "The value for field {field} contains invalid characters. It can only contain \
+             alphanumerics, dash (-) and underscore (_).\n"
         ));
     }
-    let valid = value.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-            || character == '-'
-            || character == '_'
-            || (allow_dot && character == '.')
-    });
-    if valid {
-        return None;
-    }
-    let characters = if allow_dot {
-        "alphanumerics, dash (-), underscore (_) and period (.)"
-    } else {
-        "alphanumerics, dash (-) and underscore (_)"
-    };
-    Some(format!(
-        "The value for field {field} contains invalid characters. It can only contain \
-         {characters}.\n"
-    ))
+    (value.chars().count() > MAX_DASHBOARD_NAME_LEN).then(|| {
+        format!(
+            "The value for field {field} is too long. It must have length less than or equal \
+             to {MAX_DASHBOARD_NAME_LEN}.\n"
+        )
+    })
 }
 
 /// How many dashboards one `ListDashboards` page holds: "ListDashboards returns up to 1000
@@ -2529,6 +2601,43 @@ pub fn requested_page(token: Option<&str>) -> Option<&str> {
     token.filter(|token| !token.is_empty())
 }
 
+/// The cursor a listing that TOLERATES an unusable `NextToken` resumes from: the key the token
+/// carries, or `None` — the first page — for a value that carries none.
+///
+/// Two conditions answer the same way here, and that is the whole point: a request that offered
+/// no token and a request whose token this service cannot read both name the first page of the
+/// enumeration. A listing whose recordings show it serving a page for a token it could not read
+/// resumes through this helper, where one that refuses such a token reads the cursor itself and
+/// words the refusal its own model declares ([`invalid_next_token_message`]).
+#[must_use]
+pub fn resumable_page(token: Option<&str>) -> Option<String> {
+    requested_page(token).and_then(decode_page_token)
+}
+
+/// How a listing of this service's ALARM HISTORY refuses a `NextToken` it cannot resume from:
+/// the fixed text of the class, then the value the request carried.
+///
+/// The token is the one VARIABLE part of the sentence — it is the value at fault, and quoting it
+/// is what tells a caller which of the tokens it is holding was not accepted — so the sentence is
+/// built from the request rather than written out per operation.
+///
+/// WHICH listings state it this way is a property of the operation, and three of this service's
+/// listings state the same class WITHOUT the token: the metric-stream listing, the alarm mute
+/// rule listing and the alarm contributor listing each carry the bare sentence their own
+/// recordings show (`crate::ops::list_metric_streams`,
+/// `crate::ops::list_alarm_mute_rules`, `crate::ops::describe_alarm_contributors`), the
+/// Contributor Insights listings their coded one
+/// ([`insight_rule_records::invalid_page_token_message`]), and the alarm listing none at all
+/// because it serves the first page instead ([`resumable_page`]). So this is the sentence of
+/// the listings recorded quoting the token, not a fourth wording of one class.
+#[must_use]
+pub fn invalid_next_token_message(token: &str) -> String {
+    format!("{INVALID_NEXT_TOKEN}{token}")
+}
+
+/// The fixed half of that sentence, up to and including the separator the value follows.
+const INVALID_NEXT_TOKEN: &str = "Invalid NextToken : ";
+
 /// The largest number of distinct time series this in-memory store holds.
 ///
 /// A capacity bound, not an AWS quota: the store lives in this process's memory, so the
@@ -2571,10 +2680,47 @@ pub fn datapoint_cap_exceeded(requested: f64, cap: f64) -> String {
     )
 }
 
+/// How CloudWatch states that an alarm quota is full, which is the modelled fault's own
+/// sentence: "The quota for alarms for this customer has already been reached."
+/// (`LimitExceededFault`) — wholly fixed text, naming neither the quota it is nor the value
+/// that reached it, so every alarm quota reports the same sentence under the same code.
+pub const ALARM_QUOTA_REACHED: &str =
+    "The quota for alarms for this customer has already been reached.";
+
 /// CloudWatch's published alarm quota: 5,000 alarms per Region per account — which is also
 /// what `LimitExceededFault` ("The quota for alarms for this customer has already been
 /// reached") reports on `PutMetricAlarm`.
 pub const MAX_ALARMS: usize = 5_000;
+
+/// CloudWatch's published quota for the alarms that watch a Metrics Insights QUERY: 200 per
+/// Region per account, a ceiling of its own well under the alarm quota as a whole
+/// ([`MAX_ALARMS`]), because each such alarm re-runs a query over the metric catalogue every
+/// time it is evaluated rather than reading one stored series.
+///
+/// Reaching it is the same CLASS and the same sentence as reaching the alarm quota
+/// ([`ALARM_QUOTA_REACHED`], the modelled fault's own text): both say a quota for this
+/// account's alarms is full.
+pub const MAX_METRICS_INSIGHTS_ALARMS: usize = 200;
+
+/// Whether any query of `queries` states a Metrics Insights query as its expression.
+///
+/// "This field can contain either a Metrics Insights query, or a metric math expression."
+/// (`MetricDataQuery$Expression`) — read through the one reading of that member this crate has
+/// ([`metric_math::is_metrics_insights_query`]). The ONE place that decides it, so the array a
+/// write carries and the array a stored alarm holds are judged by one rule and the quota's
+/// counting axis cannot drift.
+pub fn queries_a_metrics_insights_query(queries: &[MetricDataQuery]) -> bool {
+    queries
+        .iter()
+        .filter_map(|query| query.expression.as_deref())
+        .any(metric_math::is_metrics_insights_query)
+}
+
+/// Whether `alarm` watches a Metrics Insights query: whether any query of its `Metrics` array
+/// states one ([`queries_a_metrics_insights_query`]).
+pub fn watches_a_metrics_insights_query(alarm: &MetricAlarm) -> bool {
+    queries_a_metrics_insights_query(alarm.metrics.as_deref().unwrap_or_default())
+}
 
 /// An alarm's action list as the stored alarm carries it, and so as every reader of an alarm
 /// reports it: the actions the request configured, and the EMPTY list when it configured none.
@@ -2722,6 +2868,66 @@ pub fn tag_count_error(resource: &str, tags: Option<&[Tag]>) -> Option<String> {
         )
     })
 }
+
+/// The characters a tag KEY carries beyond letters and digits: "The following basic
+/// restrictions apply to tags: […] Allowed characters are letters, numbers, spaces
+/// representable in UTF-8, and the following characters: + - = . _ : / @" (the tag
+/// restrictions every AWS service's tags are subject to, which the model states no pattern
+/// for).
+const TAG_KEY_PUNCTUATION: [char; 8] = ['+', '-', '=', '.', '_', ':', '/', '@'];
+
+/// The prefix AWS reserves for the tags its OWN services write: "Do not use the aws: prefix in
+/// your tag names or values because it is reserved for AWS use. You can't edit or delete tag
+/// names or values with this prefix."
+///
+/// Matched without regard to case, because the prefix is reserved as a NAME rather than as
+/// those three bytes: a key spelled in any case of it is a key the caller could neither edit
+/// nor delete through the same API.
+const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// Why `tags` carries a key this service will not store, or `None` when every key is one it
+/// will.
+///
+/// A property of the KEY alone: a key built from a character outside the set tags are
+/// restricted to ([`TAG_KEY_PUNCTUATION`]) is a value the service cannot hold. CloudWatch
+/// answers that with its parameter-value CODE alone and no sentence, which is why this is a
+/// predicate rather than a message: the caller renders the class, and the member at fault is
+/// not stated.
+///
+/// The LENGTH of a key and of a value are the model's own constraints (`TagKey` 1..128,
+/// `TagValue` 0..256) and are not re-checked here.
+pub fn names_an_unusable_tag_key(tags: &[Tag]) -> bool {
+    let holds = |key: &str| {
+        !key.is_empty()
+            && key.chars().all(|character| {
+                character.is_alphanumeric()
+                    || character == ' '
+                    || TAG_KEY_PUNCTUATION.contains(&character)
+            })
+    };
+    tags.iter().any(|tag| !holds(tag.key.as_str()))
+}
+
+/// Whether `tags` names a key under the prefix AWS reserves for its own
+/// ([`RESERVED_TAG_PREFIX`]).
+///
+/// A different refusal from the character rule above, and a different CLASS: the prefix is
+/// reserved for the tags AWS's own services write, so writing one is not a value the service
+/// cannot read but an action the caller is not allowed to take — which is the authorization
+/// class, and is why this is reported separately from [`names_an_unusable_tag_key`].
+pub fn names_a_reserved_tag_key(tags: &[Tag]) -> bool {
+    tags.iter().any(|tag| {
+        tag.key
+            .to_ascii_lowercase()
+            .starts_with(RESERVED_TAG_PREFIX)
+    })
+}
+
+/// How CloudWatch states that refusal: the sentence the recorded refusal of such a key
+/// carries, naming the prefix it reserves and that a caller may not write a tag under it in any
+/// case of it. Nothing of the request is part of it.
+pub const RESERVED_TAG_KEY_DENIED: &str =
+    "The provided tag keys must not start with any case of \"aws:\"";
 
 /// The kind of CloudWatch resource an `AmazonResourceName` names, for the operations that
 /// read and write a resource's tags: "Currently, the only CloudWatch resources that can be
@@ -3388,6 +3594,22 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// kind of alarm, so the count every writer checks against [`MAX_ALARMS`] is this one.
     pub fn alarm_count(&self) -> usize {
         self.alarms.len() + self.composite_alarms.len() + self.log_alarms.len()
+    }
+
+    /// How many of the metric alarms this store holds watch a Metrics Insights QUERY.
+    ///
+    /// Such an alarm is quota'd separately from alarms as a whole: a Metrics Insights alarm
+    /// re-runs a query over the whole metric catalogue each time it is evaluated, where an
+    /// ordinary alarm reads one series, so CloudWatch publishes its own ceiling for them
+    /// ([`MAX_METRICS_INSIGHTS_ALARMS`]). An alarm is one of them when any query of its
+    /// `Metrics` array carries an Insights query as its expression
+    /// ([`metric_math::is_metrics_insights_query`]) — the same reading of that member the
+    /// evaluation uses, so an alarm counted here is one evaluated as an Insights alarm.
+    pub fn metrics_insights_alarm_count(&self) -> usize {
+        self.alarms
+            .values()
+            .filter(|stored| watches_a_metrics_insights_query(&stored.alarm))
+            .count()
     }
 
     /// The current `StateValue` of the alarm a rule reference names, whichever kind of alarm

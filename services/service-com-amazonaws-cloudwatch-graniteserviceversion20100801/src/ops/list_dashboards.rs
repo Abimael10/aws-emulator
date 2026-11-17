@@ -157,7 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The maximum length is 255, and valid characters are A-Z, a-z, 0-9, ".", "-", and
         // "_"." (`ListDashboardsInput$DashboardNamePrefix`) — prose the model carries no
-        // constraint for, so a prefix outside it is refused here.
+        // constraint for, so a prefix outside it is refused here. The documentation lists the
+        // "." as well, and the SERVICE does not accept it: its own refusal of a prefix names
+        // the set it does accept, and that set is the alphanumerics, the dash and the
+        // underscore and nothing else — a prefix is the opening characters of a dashboard
+        // NAME, which may carry none of the three either
+        // (`crate::state::dashboard_name_prefix_error`).
         let prefix = input.dashboard_name_prefix.clone().unwrap_or_default();
         if let Some(message) =
             crate::state::dashboard_name_prefix_error("DashboardNamePrefix", &prefix)

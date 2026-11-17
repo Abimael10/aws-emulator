@@ -261,27 +261,25 @@ fn delete_named_alarms(
     }
     // "you can't delete any composite alarm that is part of [a cycle] because there is
     // always still a composite alarm that depends on that alarm that you want to delete"
-    // — generally: an alarm of ANY kind that a composite alarm this call leaves standing
-    // references, through its `AlarmRule` or as its `ActionsSuppressor`, cannot be deleted
-    // while that reference stands, because the composite alarm would be left evaluating a
-    // child that no longer exists. A composite alarm the same call removes takes its
-    // references with it, so it holds nothing back.
+    // — generally: an alarm of ANY kind that a composite alarm references, through its
+    // `AlarmRule` or as its `ActionsSuppressor`, cannot be deleted while that reference
+    // stands, because the composite alarm would be left evaluating a child that no longer
+    // exists. Each name is judged against the references the store holds AT THE TIME OF THE
+    // CALL, which is what the recorded refusal of a batch naming the composite alarm BESIDE
+    // its child shows: a batch does not release its own references, so the reference is
+    // released by the call that removes the composite alarm and the child goes in a call
+    // after it. "You can delete up to 100 alarms in one operation" still holds for alarms
+    // nothing references, which is every batch that deletes leaves rather than parents.
     //
     // Checked before anything is removed, so a refused request leaves the store exactly as
     // it was.
-    let deleting: std::collections::HashSet<&str> =
-        named.iter().map(|name| name.as_str()).collect();
     for name in &named {
         // A name this store holds no alarm for removes nothing, so no reference to it can
         // come to dangle through this call.
         if store.alarm_kind(name).is_none() {
             continue;
         }
-        let held_back = store
-            .composite_alarm_referrers(name)
-            .into_iter()
-            .any(|parent| !deleting.contains(parent.as_str()));
-        if held_back {
+        if !store.composite_alarm_referrers(name).is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "Cannot delete {name} as there are composite alarm(s) depending on it."
             )));

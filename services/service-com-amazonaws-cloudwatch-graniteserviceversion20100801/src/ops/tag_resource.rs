@@ -177,6 +177,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the length of the request. `PutInsightRule` and `PutMetricStream` refuse their own
         // `Tags` the same way.
         validate_tag_count(&input.tags)?;
+        // A tag KEY is judged before anything is written too, in the class each fault belongs
+        // to. A key under the prefix AWS reserves for its own services is not a value the
+        // service could not read but an action this caller may not take, which is the
+        // AUTHORIZATION class: that is the class and the sentence the recorded refusal of such
+        // a key carries ("The provided tag keys must not start with any case of \"aws:\"",
+        // HTTP 403 `AccessDenied`), where a key built from a character outside the set tags
+        // are restricted to is a value this service cannot hold and carries the modelled
+        // parameter-value fault with its CODE ALONE, which is how that refusal is recorded.
+        if crate::state::names_a_reserved_tag_key(&input.tags) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::RESERVED_TAG_KEY_DENIED,
+            ));
+        }
+        if crate::state::names_an_unusable_tag_key(&input.tags) {
+            return Err(TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException { message: None },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
         let held = store

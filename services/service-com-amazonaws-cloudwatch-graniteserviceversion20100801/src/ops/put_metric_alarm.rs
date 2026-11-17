@@ -616,7 +616,32 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
             }
         }
     }
-    unresolvable_metrics(input)
+    unresolvable_metrics(input).or_else(|| anomaly_band_refusal(input))
+}
+
+/// The request member an anomaly-band alarm states its threshold with, as a refusal names it.
+const THRESHOLD_METRIC_ID: &str = "ThresholdMetricId";
+
+/// The request member a static-threshold alarm states its threshold with.
+const THRESHOLD: &str = "Threshold";
+
+/// The refusal of an alarm that states TWO thresholds for one comparison, or `None` when it
+/// states one the evaluation can grade against.
+///
+/// An alarm grades its watched series against exactly ONE threshold, and there are two kinds:
+/// a number (`Threshold`) and the pair of bounds an anomaly detection band computes, named by
+/// the query that computes it — "If this is an alarm based on an anomaly detection model, make
+/// this value match the ID of the `ANOMALY_DETECTION_BAND` function."
+/// (`PutMetricAlarmInput$ThresholdMetricId`) — and `Threshold` "is required for alarms based on
+/// static thresholds, but should not be used for alarms based on anomaly detection models"
+/// (`PutMetricAlarmInput$Threshold`). So a request carrying both names no single threshold to
+/// compare against, which is a relation between two members that the boundary walk cannot see.
+///
+/// Checked whichever form states the series the alarm watches, since the rule speaks about the
+/// threshold rather than the series.
+fn anomaly_band_refusal(input: &PutMetricAlarmInput) -> Option<String> {
+    (input.threshold_metric_id.is_some() && input.threshold.is_some())
+        .then(|| format!("{THRESHOLD} and {THRESHOLD_METRIC_ID} cannot both be set"))
 }
 
 /// The operation a refusal of this alarm write names, as the model declares it.
@@ -636,6 +661,16 @@ fn metrics_exclusive_refusal(member: &str) -> String {
 fn is_alarm_period(period: i32) -> bool {
     HIGH_RESOLUTION_ALARM_PERIODS.contains(&period)
         || (period >= REGULAR_PERIOD_SECS && period % REGULAR_PERIOD_SECS == 0)
+}
+
+/// Whether the alarm this request configures watches a Metrics Insights QUERY.
+///
+/// The ONE reading of that member this crate has
+/// ([`crate::state::queries_a_metrics_insights_query`]), which is also what counts the stored
+/// alarms, so the alarm this call would add and the alarms already counted against the
+/// Insights quota are the same kind of thing.
+fn watches_a_metrics_insights_query(input: &PutMetricAlarmInput) -> bool {
+    crate::state::queries_a_metrics_insights_query(input.metrics.as_deref().unwrap_or_default())
 }
 
 /// The request member a `MetricDataQuery` array arrives on here, as a refusal of one of its
@@ -1023,10 +1058,27 @@ fn write_alarm(
     // add one, so it is never refused here.
     if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
         return Err(PutMetricAlarmErrorModeled::LimitExceededFault(LimitExceededFault {
-            message: Some(format!(
-                "the quota of {} alarms has already been reached",
-                crate::state::MAX_ALARMS
-            )),
+            message: Some(crate::state::ALARM_QUOTA_REACHED.to_string()),
+        })
+        .into());
+    }
+    // An alarm that watches a Metrics Insights QUERY counts against that kind's own published
+    // ceiling as well ([`crate::state::MAX_METRICS_INSIGHTS_ALARMS`]). Counted over the alarms
+    // of that kind alone, and only when this call ADDS one: a write that replaces an Insights
+    // alarm with another leaves the count where it was. The class and the sentence are the
+    // alarm quota's ([`crate::state::ALARM_QUOTA_REACHED`], the modelled fault's own text):
+    // both say a quota for this account's alarms is full.
+    if watches_a_metrics_insights_query(input)
+        && !store
+            .alarms
+            .get(&input.alarm_name)
+            .is_some_and(|stored| {
+                crate::state::watches_a_metrics_insights_query(&stored.alarm)
+            })
+        && store.metrics_insights_alarm_count() >= crate::state::MAX_METRICS_INSIGHTS_ALARMS
+    {
+        return Err(PutMetricAlarmErrorModeled::LimitExceededFault(LimitExceededFault {
+            message: Some(crate::state::ALARM_QUOTA_REACHED.to_string()),
         })
         .into());
     }

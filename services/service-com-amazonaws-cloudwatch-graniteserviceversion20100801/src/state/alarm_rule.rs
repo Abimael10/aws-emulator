@@ -164,9 +164,10 @@ pub struct AlarmRuleError {
 pub(super) const RULE_TERM_TOKENS: &str =
     "'(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA";
 
-/// What this parser states it expected where a rule ends before the term it owes: the refusal
-/// class the diagnosis above has no recorded wording for.
-pub(super) const TERM_EXPECTED: &str = "expected ALARM, OK, INSUFFICIENT_DATA, TRUE, FALSE, NOT or `(`";
+/// How the diagnosis names the position where a rule simply STOPS: the end-of-input marker,
+/// which is the token CloudWatch reports for a rule that ends before it is complete — a
+/// missing closing parenthesis is the recorded case.
+pub(super) const END_OF_RULE: &str = "<EOF>";
 
 /// One diagnosis in the envelope CloudWatch carries an `AlarmRule` refusal in, so a client
 /// that classifies a refusal by its message can tell a rule it could not parse from the two
@@ -199,7 +200,7 @@ pub fn parse_alarm_rule(rule: &str) -> Result<AlarmRule, AlarmRuleError> {
     let parsed = parser.parse_or()?;
     parser.skip_spaces();
     if !parser.rest().is_empty() {
-        return Err(parser.error("expected the end of the rule"));
+        return Err(parser.syntax_error());
     }
     Ok(parsed)
 }
@@ -257,40 +258,74 @@ impl<'a> RuleParser<'a> {
         true
     }
 
-    /// A refusal naming what was expected and where.
-    pub(super) fn error(&self, expected: &str) -> AlarmRuleError {
+    /// A refusal naming a BOUND of this parser that the rule broke, and where: the capacity
+    /// limits below are this emulator's own, not a syntax CloudWatch diagnoses, so they state
+    /// the bound rather than a token.
+    pub(super) fn error(&self, broke: &str) -> AlarmRuleError {
         AlarmRuleError {
-            message: format!("AlarmRule: {expected} at offset {}", self.at),
+            message: format!("AlarmRule: {broke} at offset {}", self.at),
         }
     }
 
-    /// The refusal for a token sitting where the rule can only carry a TERM, or `None` where
-    /// the rule carries no token at that position at all — it simply STOPS before the term it
-    /// owes, which is a different class, and one no recording words for this service.
+    /// The refusal of a rule whose TEXT the parse could not continue through, in the envelope
+    /// CloudWatch carries an `AlarmRule` refusal in.
     ///
-    /// CloudWatch diagnoses a rule that carries such a token by naming the OFFENDING TOKEN and
-    /// WHERE in the rule it sits, together with the tokens that position admits
-    /// ([`RULE_TERM_TOKENS`]) — which is what tells a client it mistyped the expression rather
-    /// than referenced an alarm that does not exist. Both variable parts are read off the rule
-    /// the caller submitted: the token as it appears in it ([`Self::token_here`]) and its offset
-    /// in CHARACTERS from the start of the rule, which is the position a client counts to in the
-    /// string it sent.
-    pub(super) fn unsupported_token(&self) -> Option<AlarmRuleError> {
-        let token = self.token_here();
-        if token.is_empty() {
-            return None;
+    /// One diagnosis for every syntax failure: the offending TOKEN and WHERE in the rule it
+    /// sits ([`Self::diagnosed_token`], [`Self::at_char`]) — which is what tells a client it
+    /// mistyped the expression rather than referenced an alarm that does not exist. Both parts
+    /// are read off the rule the caller submitted, and a rule that simply ENDS before it is
+    /// complete is diagnosed at the end-of-input marker ([`END_OF_RULE`]), which is the token
+    /// there is to name at that position.
+    pub(super) fn syntax_error(&self) -> AlarmRuleError {
+        AlarmRuleError {
+            message: alarm_rule_diagnosis(&format!(
+                "Unsupported token '{}' at char {}",
+                self.diagnosed_token(),
+                self.at_char()
+            )),
         }
-        let at_char = self
-            .text
+    }
+
+    /// The offset the diagnosis states: the position the parse reached, in CHARACTERS from the
+    /// start of the rule, which is the position a client counts to in the string it sent.
+    fn at_char(&self) -> usize {
+        self.text
             .get(..self.at)
             .unwrap_or_default()
             .chars()
-            .count();
-        Some(AlarmRuleError {
+            .count()
+    }
+
+    /// The token the diagnosis names at that position: the one the rule carries there
+    /// ([`Self::token_here`]), or the end-of-input marker where the rule carries none because
+    /// it has ended.
+    fn diagnosed_token(&self) -> &'a str {
+        let token = self.token_here();
+        if token.is_empty() {
+            END_OF_RULE
+        } else {
+            token
+        }
+    }
+
+    /// The refusal for a token sitting where the rule can only carry a TERM.
+    ///
+    /// The same diagnosis every other syntax failure carries ([`Self::syntax_error`]), with the
+    /// tokens that position admits added ([`RULE_TERM_TOKENS`]): this is the one position whose
+    /// admissible set a recording of this service words, so it is the one whose diagnosis
+    /// states a set. A rule that has ENDED here names no token of the rule at all, and is
+    /// diagnosed at the end-of-input marker like any other rule that stops early.
+    pub(super) fn unsupported_term(&self) -> AlarmRuleError {
+        let token = self.token_here();
+        if token.is_empty() {
+            return self.syntax_error();
+        }
+        AlarmRuleError {
             message: alarm_rule_diagnosis(&format!(
-                "Unsupported token '{token}' at char {at_char}, must be: {RULE_TERM_TOKENS}"
+                "Unsupported token '{token}' at char {}, must be: {RULE_TERM_TOKENS}",
+                self.at_char()
             )),
-        })
+        }
     }
 
     /// The token the rule carries at the position this parse reached: the whole WORD where the
@@ -377,7 +412,7 @@ impl<'a> RuleParser<'a> {
             let inner = self.parse_or()?;
             self.ascend();
             if !self.take(')') {
-                return Err(self.error("expected `)`"));
+                return Err(self.syntax_error());
             }
             return Ok(inner);
         }
@@ -396,27 +431,22 @@ impl<'a> RuleParser<'a> {
                 });
             }
         }
-        // Nothing here starts a term. A rule that carries a TOKEN at this position is refused
-        // with CloudWatch's own diagnosis of it — the one parse failure a recording words. A
-        // rule that simply ENDS here carries no token to name, and nothing records how the
-        // service words that, so it keeps this parser's own wording rather than the recorded
-        // template with an empty slot in it.
-        Err(self
-            .unsupported_token()
-            .unwrap_or_else(|| self.error(TERM_EXPECTED)))
+        // Nothing here starts a term, so the rule is diagnosed at the token sitting where one
+        // was owed — or at the end-of-input marker when the rule has simply ended.
+        Err(self.unsupported_term())
     }
 
     /// The alarm a state function names: `("x")` or `(x)`, since a name "can be surrounded
     /// with double-quotes (\"), but do not have to be".
     pub(super) fn parse_reference(&mut self) -> Result<String, AlarmRuleError> {
         if !self.take('(') {
-            return Err(self.error("expected `(` after a rule function"));
+            return Err(self.syntax_error());
         }
         self.skip_spaces();
         let reference = if self.take('"') {
             let rest = self.rest();
             let Some(end) = rest.find('"') else {
-                return Err(self.error("expected a closing double-quote"));
+                return Err(self.syntax_error());
             };
             let name = rest[..end].to_string();
             self.at += end + 1;
@@ -424,17 +454,17 @@ impl<'a> RuleParser<'a> {
         } else {
             let rest = self.rest();
             let Some(end) = rest.find(')') else {
-                return Err(self.error("expected `)` after an alarm reference"));
+                return Err(self.syntax_error());
             };
             let name = rest[..end].trim_end().to_string();
             self.at += end;
             name
         };
         if !self.take(')') {
-            return Err(self.error("expected `)` after an alarm reference"));
+            return Err(self.syntax_error());
         }
         if reference.is_empty() {
-            return Err(self.error("a rule function must name an alarm"));
+            return Err(self.syntax_error());
         }
         Ok(reference)
     }

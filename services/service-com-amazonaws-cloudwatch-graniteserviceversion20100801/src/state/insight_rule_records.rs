@@ -307,12 +307,12 @@ const INVALID_INSIGHT_RULE_NAME_FAILURE_CODE: &str = "INVALID_RULE_NAME";
 ///
 /// This is the SERVICE's own rule-name syntax, which is narrower than the member constraint
 /// `InsightRuleName` declares (`@pattern ^[\x20-\x7E]+$`,
-/// `smithy_query(query="shape",shape="InsightRuleName")`): that pattern admits `\x20`, the
-/// space, and a value carrying one is not a rule name CloudWatch holds a rule under — it is
-/// reported back as the invalid value it is rather than refused by the model's constraint. So
-/// the grammar is the printable-ASCII span the model admits with its first character, the
-/// space, taken out: `!` through `~`.
-const INSIGHT_RULE_NAME_PATTERN: &str = r"^[\x21-\x7E]+$";
+/// `smithy_query(query="shape",shape="InsightRuleName")`): that pattern admits any printable
+/// character, where a name CloudWatch holds a rule under opens and closes on a letter or a
+/// digit and carries only letters, digits, dashes, underscores and dots between them. A value
+/// outside it is not a name this service could hold a rule under — it is reported back as the
+/// invalid value it is, quoting this expression, rather than refused by the model's constraint.
+const INSIGHT_RULE_NAME_PATTERN: &str = r"^[A-Za-z0-9][A-Za-z0-9\-\_\.]{0,126}[A-Za-z0-9]$";
 
 /// How CloudWatch states a rule name carrying no characters at all: wholly fixed text, nothing
 /// of the member interpolated — there is no value to echo.
@@ -320,13 +320,14 @@ pub const EMPTY_INSIGHT_RULE_NAME: &str = "RuleName cannot be an empty string.";
 
 /// Why `rule_name` is not a Contributor Insights rule NAME, or `None` when it is one.
 ///
-/// The legality of a rule name is ONE grammar — 1..128 characters, each of them printable
-/// ASCII and none of them the space ([`INSIGHT_RULE_NAME_PATTERN`]) — so a value outside it is
-/// not a name this service could hold a rule under, whichever member carried it and whichever
-/// operation was called. Each of the three ways a value misses that grammar is stated as the class it is: no
-/// characters at all ([`EMPTY_INSIGHT_RULE_NAME`]), more characters than a name may carry, and
-/// characters the grammar does not admit — the last quoting the expression a client
-/// re-validates against, which is what locates the repair.
+/// The legality of a rule name is ONE grammar — at most 128 characters, opening and closing on
+/// a letter or a digit, with letters, digits, dashes, underscores and dots between them
+/// ([`INSIGHT_RULE_NAME_PATTERN`]) — so a value outside it is not a name this service could
+/// hold a rule under, whichever member carried it and whichever operation was called. Each of
+/// the three ways a value misses that grammar is stated as the class it is: no characters at
+/// all ([`EMPTY_INSIGHT_RULE_NAME`]), more characters than a name may carry, and a value the
+/// grammar does not admit — the last quoting the expression a client re-validates against,
+/// which is what locates the repair.
 #[must_use]
 pub fn insight_rule_name_fault(rule_name: &str) -> Option<String> {
     if rule_name.is_empty() {
@@ -337,7 +338,7 @@ pub fn insight_rule_name_fault(rule_name: &str) -> Option<String> {
             "RuleName cannot be longer than {MAX_INSIGHT_RULE_NAME_LEN} characters."
         ));
     }
-    if !rule_name.chars().all(is_insight_rule_name_character) {
+    if !is_insight_rule_name(rule_name) {
         return Some(format!(
             "RuleName \"{rule_name}\" does not match the pattern: {}",
             ::service_common::validation::unanchored(INSIGHT_RULE_NAME_PATTERN)
@@ -346,11 +347,31 @@ pub fn insight_rule_name_fault(rule_name: &str) -> Option<String> {
     None
 }
 
-/// Whether `character` is one the rule-name grammar admits: printable ASCII other than the
-/// space, which is the span [`INSIGHT_RULE_NAME_PATTERN`] names — `!` through `~`, and nothing
-/// else (no space, no control byte, no character outside ASCII).
+/// Whether `rule_name` matches that grammar as a WHOLE value: a letter or digit at each end,
+/// and between them only the characters the expression's middle class admits — at most the 126
+/// it bounds that class by, which a name no longer than
+/// [`MAX_INSIGHT_RULE_NAME_LEN`] already satisfies.
+///
+/// A value of fewer than two characters matches no such expression: the grammar names a first
+/// and a last character, so the shortest name there is carries both.
+fn is_insight_rule_name(rule_name: &str) -> bool {
+    let characters: Vec<char> = rule_name.chars().collect();
+    let [first, between @ .., last] = characters.as_slice() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && between.len() <= MAX_INSIGHT_RULE_NAME_LEN - 2
+        && between
+            .iter()
+            .all(|character| is_insight_rule_name_character(*character))
+}
+
+/// Whether `character` is one the middle of that grammar admits: a letter, a digit, a dash, an
+/// underscore or a dot, and nothing else (no space, no control byte, no character outside
+/// ASCII).
 fn is_insight_rule_name_character(character: char) -> bool {
-    matches!(character, '\x21'..='\x7E')
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 /// How CloudWatch refuses a request that WRITES a Contributor Insights rule under a value that
@@ -744,13 +765,24 @@ fn names_a_resource_of_its_type(resource: &str) -> bool {
         .is_none_or(|(_, id)| !id.is_empty())
 }
 
-/// The largest number of Contributor Insights rules this in-memory store holds.
+/// CloudWatch's published quota for Contributor Insights rules: 100 per Region per account.
 ///
-/// A capacity bound, not an AWS quota: the rule records live in this process's memory, so
-/// their number has to be finite. `PutInsightRule` answers its modelled `LimitExceededException`
-/// ("The operation exceeded one or more limits.") rather than growing without limit once it is
-/// reached; updating a rule that already exists adds none, so it is unaffected.
-pub const MAX_INSIGHT_RULES: usize = 10_000;
+/// `PutInsightRule` answers its modelled `LimitExceededException` ("The operation exceeded one
+/// or more limits.") once it is reached; updating a rule that already exists adds none, so it
+/// is unaffected. It bounds what this in-memory store holds as well, which is why the rule
+/// records are finite without a capacity bound of their own.
+pub const MAX_INSIGHT_RULES: usize = 100;
+
+/// How CloudWatch states that the rule quota is full: the coded form its Contributor Insights
+/// refusals state a condition in ([`EMPTY_RULE_NAMES`]) — the condition's code, then fixed text
+/// naming the limit the write would have gone past.
+///
+/// The limit is a constant OF THAT RULE ([`MAX_INSIGHT_RULES`]) rather than a value of the
+/// request, and nothing the request carried is part of the sentence.
+#[must_use]
+pub fn insight_rule_quota_message() -> String {
+    format!("TOTAL_RULES_EXCEEDED: Put would exceed the total rule limit of {MAX_INSIGHT_RULES}.")
+}
 
 impl State {
     /// Whether the catalog publishes a template named `template_name` at all — for ANY resource.

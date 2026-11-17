@@ -4,15 +4,15 @@
 //! can be read at, and the granularities it accepts.
 //!
 //! The rule under test: **a `Period` outside the granularities a metric is stored at is refused
-//! `InvalidParameterValue` against the requirement it broke — a period SHORTER than a minute
-//! had to be one of the sub-minute divisions of one, stated as CloudWatch states a value
-//! outside the set its member accepts, and a LONGER one had to be a whole number of minutes,
-//! stated as the multiple it was not — with nothing of the submitted value in either
-//! sentence**, while every documented granularity (the sub-minute divisions of a minute, and
-//! any multiple of 60) is accepted. `GetMetricStatisticsInput$Period` and `MetricStat$Period`
-//! document the same set ("For metrics with regular resolution, a period can be as short as
-//! one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […] the
-//! period can be 1, 5, 10, 20, 30, 60, or any multiple of 60"), so both readers answer alike.
+//! `InvalidParameterValue` against the requirement it broke — the multiple of a minute a period
+//! has to be — with nothing of the submitted value in the sentence**, while every documented
+//! granularity (the sub-minute divisions of a minute, and any multiple of 60) is accepted.
+//! `GetMetricStatisticsInput$Period` and `MetricStat$Period` document the same set ("For
+//! metrics with regular resolution, a period can be as short as one minute (60 seconds) and
+//! must be a multiple of 60. For high-resolution metrics […] the period can be 1, 5, 10, 20,
+//! 30, 60, or any multiple of 60"), so both readers answer alike: the sub-minute values are the
+//! ADDITIONAL periods a high-resolution metric admits, so a period that is none of them broke
+//! the multiple every metric is read under.
 //!
 //! The rows differ along the period itself — each published sub-minute granularity, values on
 //! either side of them, a value just under and just over a minute, and one between two
@@ -23,12 +23,8 @@ use serde_json::{json, Value};
 
 use crate::harness::{build_router, call, error_code, error_message, now_secs, ok};
 
-/// The sentence CloudWatch refuses a period SHORTER than a minute with: the member and the
-/// sub-minute set it had to come from, and nothing of the submitted value.
-const SUB_MINUTE_REFUSAL: &str =
-    "The parameter Period must be a value in the set [1, 5, 10, 20, 30].";
-
-/// The sentence it refuses a LONGER one with: the whole number of minutes it was not.
+/// The sentence CloudWatch refuses a period outside those granularities with: the member and
+/// the whole number of minutes it was not, and nothing of the submitted value.
 const MULTIPLE_REFUSAL: &str = "The parameter Period must be a multiple of 60.";
 
 /// The wire error code of that refusal, as an SDK of this service sees it.
@@ -76,19 +72,19 @@ fn data_request(period: i64) -> Value {
 #[tokio::test]
 async fn a_period_outside_the_readable_granularities_is_refused_with_the_requirement_it_broke() {
     let router = build_router();
-    // (the period, the requirement its refusal states): every period below a minute that no
-    // sub-minute granularity admits is told the set, and every one above it that is not a whole
-    // number of minutes is told the multiple.
-    // Source for the set: `GetMetricStatisticsInput$Period` / `MetricStat$Period`.
+    // (the period, the requirement its refusal states): every period no sub-minute granularity
+    // admits and that is no whole number of minutes is told the multiple it was not, whether it
+    // is shorter than a minute or longer.
+    // Source for the granularities: `GetMetricStatisticsInput$Period` / `MetricStat$Period`.
     let periods: [(i64, &str); 9] = [
-        (2, SUB_MINUTE_REFUSAL),
-        (4, SUB_MINUTE_REFUSAL),
-        (7, SUB_MINUTE_REFUSAL),
-        (11, SUB_MINUTE_REFUSAL),
-        (21, SUB_MINUTE_REFUSAL),
-        (31, SUB_MINUTE_REFUSAL),
-        (45, SUB_MINUTE_REFUSAL),
-        (59, SUB_MINUTE_REFUSAL),
+        (2, MULTIPLE_REFUSAL),
+        (4, MULTIPLE_REFUSAL),
+        (7, MULTIPLE_REFUSAL),
+        (11, MULTIPLE_REFUSAL),
+        (21, MULTIPLE_REFUSAL),
+        (31, MULTIPLE_REFUSAL),
+        (45, MULTIPLE_REFUSAL),
+        (59, MULTIPLE_REFUSAL),
         (61, MULTIPLE_REFUSAL),
     ];
 

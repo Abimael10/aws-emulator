@@ -568,8 +568,10 @@ async fn a_request_naming_no_single_detector_is_refused() {
 
 #[tokio::test]
 async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
-    // Rows differ along WHICH forms were mixed, which is the variable part of the refusal:
-    // the forms the request carried, in the order the sentence lists the three it allows.
+    // Rows differ along WHICH forms were mixed, which is the variable part of the refusal: the
+    // forms the request carried, listed in ONE fixed order whatever order the request named
+    // them in (`crate::state::in_one_order`), so two requests mixing the same forms read the
+    // same sentence.
     let single = json!({
         "Namespace": NAMESPACE,
         "MetricName": "Latency",
@@ -582,17 +584,17 @@ async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
         (
             "the flat members beside the structure",
             json!({"SingleMetricAnomalyDetector": single, "Namespace": NAMESPACE}),
-            format!("{prefix}single metric attributes, SingleMetricAnomalyDetector."),
+            format!("{prefix}SingleMetricAnomalyDetector, single metric attributes."),
         ),
         (
             "the flat members beside the metric-math structure",
             json!({"MetricMathAnomalyDetector": math, "MetricName": "Latency"}),
-            format!("{prefix}single metric attributes, MetricMathAnomalyDetector."),
+            format!("{prefix}MetricMathAnomalyDetector, single metric attributes."),
         ),
         (
             "both structures",
             json!({"SingleMetricAnomalyDetector": single, "MetricMathAnomalyDetector": math}),
-            format!("{prefix}SingleMetricAnomalyDetector, MetricMathAnomalyDetector."),
+            format!("{prefix}MetricMathAnomalyDetector, SingleMetricAnomalyDetector."),
         ),
         (
             "all three forms",
@@ -602,8 +604,8 @@ async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
                 "Stat": "Average",
             }),
             format!(
-                "{prefix}single metric attributes, SingleMetricAnomalyDetector, \
-                 MetricMathAnomalyDetector."
+                "{prefix}MetricMathAnomalyDetector, SingleMetricAnomalyDetector, \
+                 single metric attributes."
             ),
         ),
     ];

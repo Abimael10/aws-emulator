@@ -275,7 +275,9 @@ fn form_refusal(error: crate::state::AnomalyDetectorFormError) -> PutAnomalyDete
             )
             .into()
         }
-        crate::state::AnomalyDetectorFormError::Missing(message) => missing_parameter(message),
+        crate::state::AnomalyDetectorFormError::Missing => {
+            missing_parameter(crate::state::NO_DETECTOR_NAMED.to_string())
+        }
     }
 }
 

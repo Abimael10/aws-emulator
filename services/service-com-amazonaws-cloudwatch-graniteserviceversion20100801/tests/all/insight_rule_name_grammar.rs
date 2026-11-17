@@ -4,11 +4,12 @@
 //! operation of this service that judges one: `DeleteInsightRules`, `EnableInsightRules` and
 //! `DisableInsightRules` per `RuleNames` entry, and `PutInsightRule` on the one name it writes.
 //!
-//! The rule under test: **a Contributor Insights rule name is 1..128 characters of printable
-//! ASCII none of which is the space — narrower than the `@pattern ^[\x20-\x7E]+$` the model's
+//! The rule under test: **a Contributor Insights rule name is at most 128 characters that open
+//! and close on a letter or a digit and carry only letters, digits, dashes, underscores and
+//! dots between them — narrower than the `@pattern ^[\x20-\x7E]+$` the model's
 //! `InsightRuleName` declares (`smithy_query(query="shape",shape="InsightRuleName")`), whose
-//! span opens on `\x20`, the space. A batch rule operation judges each entry on its own and
-//! reports one outside that grammar as that entry's own `Failures` entry of the
+//! span admits every printable character. A batch rule operation judges each entry on its own
+//! and reports one outside that grammar as that entry's own `Failures` entry of the
 //! invalid-parameter class on an HTTP 200 — never as a refusal of the request — while a legal
 //! name is resolved: held, it is acted on, and unknown it follows the operation's own semantics
 //! (nothing to report for a delete, the resource that is not there for a state move). The write
@@ -22,12 +23,12 @@
 //! `InvalidParameterValueException` and `MissingRequiredParameterException`, neither of which
 //! AWS answers this request with).
 //!
-//! Rows differ along what the rule generalises over: which operation is called, WHERE the space
-//! sits in the name (inside, leading, trailing, repeated, the whole name), which other way a
-//! value misses the grammar (no characters, too many characters, a byte outside the printable
-//! span), where in the batch the entry sits, and — on the other side of the same bound — the
-//! shortest, the longest and the punctuation-carrying names that ARE legal, including both ends
-//! of the admitted span.
+//! Rows differ along what the rule generalises over: which operation is called, WHERE the
+//! character the grammar does not admit sits in the name (inside, leading, trailing, repeated,
+//! the whole name), which other way a value misses the grammar (no characters, too many
+//! characters, a byte outside printable ASCII, a name of one character), where in the batch the
+//! entry sits, and — on the other side of the same bound — the shortest, the longest and the
+//! punctuation-carrying names that ARE legal.
 
 use crate::harness::{build_router, call, error_code, error_message, ok};
 use serde_json::{json, Value};
@@ -105,9 +106,9 @@ fn rule_not_found(rule_name: &str) -> Value {
     })
 }
 
-/// The grammar a refusal and a `FailureDescription` quote: the printable-ASCII span the model's
-/// `@pattern` admits with the space, its first character, taken out.
-const RULE_NAME_GRAMMAR: &str = r"[\x21-\x7E]+";
+/// The grammar a refusal and a `FailureDescription` quote: the expression a rule name matches
+/// as a whole value, without the anchors Smithy wraps one in.
+const RULE_NAME_GRAMMAR: &str = r"[A-Za-z0-9][A-Za-z0-9\-\_\.]{0,126}[A-Za-z0-9]";
 
 /// One value that is not a rule name: what the case is, the value, and how the fault is stated.
 struct IllegalName {
@@ -129,8 +130,9 @@ fn outside_the_grammar(case: &'static str, value: &str) -> IllegalName {
     }
 }
 
-/// Every placement of the SPACE the model's pattern admits and the service's grammar does not:
-/// inside the name, at either end, repeated, and the whole name.
+/// Every placement of a character the model's pattern admits and the service's grammar does
+/// not: the space inside the name, at either end, repeated, and the whole name, and the
+/// punctuation only the model's span admits.
 fn names_with_a_space() -> Vec<IllegalName> {
     vec![
         outside_the_grammar("spaces inside the name", "bad rule name"),
@@ -138,13 +140,17 @@ fn names_with_a_space() -> Vec<IllegalName> {
         outside_the_grammar("a leading space", " bad-rule"),
         outside_the_grammar("a trailing space", "bad-rule "),
         outside_the_grammar("two spaces in a row", "bad  rule"),
-        outside_the_grammar("nothing but a space", " "),
+        outside_the_grammar("punctuation outside the set", "99.9%_$#@!"),
+        outside_the_grammar("a slash inside the name", "team/rule"),
+        outside_the_grammar("a dash opening the name", "-bad-rule"),
+        outside_the_grammar("a dot closing the name", "bad-rule."),
+        outside_the_grammar("one character only", "r"),
     ]
 }
 
-/// Every way one value misses the grammar: each placement of a space ([`names_with_a_space`]),
-/// two bytes outside the printable-ASCII span, a value with no characters at all, and one
-/// character more than the 128 the length allows.
+/// Every way one value misses the grammar: each placement of a character outside it
+/// ([`names_with_a_space`]), two bytes outside printable ASCII, a value with no characters at
+/// all, and one character more than the 128 the length allows.
 fn illegal_names() -> Vec<IllegalName> {
     let mut names = names_with_a_space();
     names.extend([
@@ -308,17 +314,16 @@ async fn where_the_unusable_entry_sits_does_not_change_what_is_reported() {
 #[tokio::test]
 async fn a_name_inside_the_grammar_is_resolved_rather_than_reported() {
     // The other side of the same bound: the shortest and the longest name the length admits,
-    // both ends of the admitted span, and punctuation-only names — each one held, so a legal
-    // name must be deleted rather than come back as an entry. A legal name that is NOT held is
-    // reported by nothing either: it already names nothing to delete.
+    // and names carrying each of the characters the grammar's middle admits — each one held, so
+    // a legal name must be deleted rather than come back as an entry. A legal name that is NOT
+    // held is reported by nothing either: it already names nothing to delete.
     let longest = "n".repeat(128);
-    let ends_of_the_span = format!("{}{}", '\u{21}', '\u{7e}');
     let legal_names: Vec<(&str, &str)> = vec![
-        ("one character", "r"),
+        ("two characters, the shortest name", "r1"),
         ("the longest name the length admits", longest.as_str()),
-        ("both ends of the admitted span", ends_of_the_span.as_str()),
-        ("punctuation and digits only", "99.9%_$#@!"),
-        ("a name of several punctuated words", "My_rule(v2)/high-cardinality"),
+        ("every character the middle admits", "a-b_c.d9Z"),
+        ("digits at both ends", "9rule0"),
+        ("a name of several punctuated words", "My_rule.v2-high_cardinality"),
     ];
 
     for (case, name) in &legal_names {

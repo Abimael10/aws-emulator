@@ -179,6 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = crate::state::now_secs();
+        // "Data was not syntactically valid JSON." (`InvalidFormatFault`) — `StateReasonData`
+        // is a JSON document the caller hands this service to carry on the alarm and to
+        // publish with the state-change notification, so a value that is no such document is
+        // refused BEFORE the write: a consumer of that notification could not read it, and a
+        // refusal that had already moved the alarm would leave the state it set behind.
+        if let Some(refusal) = state_reason_data_refusal(input.state_reason_data.as_deref()) {
+            return Err(refusal);
+        }
         // ONE evaluation budget for this write stage, so the composite-alarm passes before and
         // after the write cannot each spend a full one.
         let mut budget = crate::state::alarm_evaluation::EvaluationBudget::for_one_request();
@@ -198,6 +206,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(SetAlarmStateOutput)
     }
+}
+
+/// The refusal `data` earns as this call's `StateReasonData`, or `None` when it carries a
+/// document this service can hold and republish.
+///
+/// `StateReasonData` is "the reason that this alarm is set to this specific state, in JSON
+/// format" (`SetAlarmStateInput$StateReasonData`), and the fault the operation models for it
+/// names the one requirement: "Data was not syntactically valid JSON."
+/// (`InvalidFormatFault`). So the value is PARSED, by the JSON codec this crate already reads
+/// every document with — a value no parse accepts is refused, and so is a parsed value that is
+/// a bare SCALAR, because a JSON document is an object or an array and a number, a string or a
+/// boolean on its own is a value inside one rather than a document a consumer of the
+/// state-change notification could read fields out of.
+///
+/// A member supplied with NO characters carries no document at all, which is what omitting it
+/// does: `StateReasonData` is modelled `length 0..4000`, so the empty value satisfies its own
+/// member and names nothing for a consumer to read.
+///
+/// CloudWatch answers the refusal with its error CODE alone: the fault's documented sentence
+/// describes the class rather than being text the service puts on the wire, and none is sent —
+/// so none is set here, exactly as this operation's not-found refusal carries none.
+fn state_reason_data_refusal(data: Option<&str>) -> Option<SetAlarmStateError> {
+    let data = data.filter(|data| !data.is_empty())?;
+    let reads_as_a_reason_document = serde_json::from_str::<serde_json::Value>(data)
+        .is_ok_and(|document| document.is_object() || document.is_array());
+    (!reads_as_a_reason_document).then(|| {
+        SetAlarmStateErrorModeled::InvalidFormatFault(InvalidFormatFault { message: None }).into()
+    })
 }
 
 /// Force the state of the alarm `input` names, and record the history item for the write.

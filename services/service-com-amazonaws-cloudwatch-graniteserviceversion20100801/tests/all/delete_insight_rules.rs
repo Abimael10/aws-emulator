@@ -127,7 +127,7 @@ async fn every_named_rule_this_service_holds_is_deleted_and_every_other_rule_is_
     // one-character name, a 128-character name and a name carrying the punctuation a rule name
     // admits.
     let long_name = "n".repeat(128);
-    let odd_name = "My_rule(v2)/high-cardinality";
+    let odd_name = "My_rule.v2-high_cardinality";
     let rows: Vec<Row> = vec![
         row("one held rule", &[("one", "ENABLED")], &["one"]),
         row("one held DISABLED rule", &[("off", "DISABLED")], &["off"]),
@@ -165,7 +165,7 @@ async fn every_named_rule_this_service_holds_is_deleted_and_every_other_rule_is_
             &[("held", "ENABLED")],
             &["ghost", "ghost"],
         ),
-        row("a one-character name", &[("r", "ENABLED")], &["r"]),
+        row("a two-character name", &[("r1", "ENABLED")], &["r1"]),
         row(
             "a 128-character name",
             &[(long_name.as_str(), "DISABLED")],

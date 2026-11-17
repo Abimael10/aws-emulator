@@ -148,16 +148,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // "The DashboardNames parameter is required." — an empty array names no dashboard to
+        // delete, so it is a value this operation cannot act on rather than a deletion of
+        // nothing: the member is required, and a list of none satisfies the member without
+        // naming anything. Stated against the number of elements the field has to carry, the
+        // way its cap is ([`crate::state::field_element_cap_message`]).
+        if input.dashboard_names.is_empty() {
+            return Err(invalid_parameter_value(
+                crate::state::field_element_floor_message(DASHBOARD_NAMES_FIELD, 1),
+            ));
+        }
         // "You can specify up to 100 dashboards to delete." (`DeleteDashboards`) — prose the
-        // model carries no `length` for, so the boundary validator cannot refuse it.
+        // model carries no `length` for, so the boundary validator cannot refuse it. The whole
+        // batch is refused, so nothing is deleted: a client repairs the batch and retries it.
         if input.dashboard_names.len() > MAX_NAMES_PER_REQUEST {
-            return Err(invalid_parameter_value(format!(
-                "The value for field DashboardNames is too long. It must have length less than \
-                 or equal to {MAX_NAMES_PER_REQUEST}.\n"
-            )));
+            return Err(invalid_parameter_value(
+                crate::state::field_element_cap_message(
+                    DASHBOARD_NAMES_FIELD,
+                    MAX_NAMES_PER_REQUEST,
+                ),
+            ));
         }
         for name in &input.dashboard_names {
-            if let Some(message) = crate::state::dashboard_name_error("DashboardNames", name) {
+            if let Some(message) =
+                crate::state::dashboard_name_error(DASHBOARD_NAMES_FIELD, name)
+            {
                 return Err(invalid_parameter_value(message));
             }
         }
@@ -178,6 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// How many dashboards one request may name: "You can specify up to 100 dashboards to
 /// delete." (`DeleteDashboards`)
 const MAX_NAMES_PER_REQUEST: usize = 100;
+
+/// The field a refusal about the names this request carries names, as the wire spells it.
+const DASHBOARD_NAMES_FIELD: &str = "DashboardNames";
 
 /// Refuse the request with this operation's modelled `InvalidParameterValueException`
 /// (HTTP 400): "The value of an input parameter is bad or out-of-range."

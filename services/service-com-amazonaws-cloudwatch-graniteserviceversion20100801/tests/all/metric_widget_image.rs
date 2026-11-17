@@ -606,7 +606,7 @@ async fn a_definition_this_service_cannot_render_is_refused() {
         (
             "a granularity no metric is readable at",
             json!({"MetricWidget": widget_over(METRIC, &json!({"period": 7})).to_string()}),
-            "The parameter Period must be a value in the set [1, 5, 10, 20, 30].",
+            "The parameter Period must be a multiple of 60.",
         ),
         (
             "a window that ends where it starts",

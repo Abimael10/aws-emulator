@@ -1228,20 +1228,27 @@ async fn a_window_shorter_than_one_period_is_refused() {
                 (400, "InvalidParameterValueException"),
                 "case {case:?}: expected a 400 InvalidParameterValueException, got {status} {body}"
             );
-            // The window's own refusal names the condition by its code; the ratio's names what
-            // was asked for, the cap it broke and the two remedies.
+            // Which of this operation's two window sentences the row earns: a window whose end
+            // does not come AFTER its start names no range of time at all, where an ordered
+            // window shorter than one period spans no whole period; a window over the
+            // datapoint cap names what was asked for, the cap it broke and the two remedies.
             let message = error_message(&body);
-            let expected_window_refusal = window_secs < period;
-            assert_eq!(
-                message == "INVALID_TIME_RANGE",
-                expected_window_refusal,
-                "case {case:?}: expected the window refusal: {expected_window_refusal}, got \
-                 {message:?} in {body}"
-            );
-            if !expected_window_refusal {
+            let expected = if window_secs <= 0 {
+                "INVALID_TIME_RANGE: The StartTime must precede the EndTime."
+            } else if window_secs < period {
+                "INVALID_TIME_RANGE: The time range must be at least one Period long."
+            } else {
+                ""
+            };
+            if expected.is_empty() {
                 assert!(
                     message.contains("exceeds the limit of"),
                     "case {case:?}: expected the datapoint-cap refusal, got {message:?}"
+                );
+            } else {
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected {expected:?}, got {message:?} in {body}"
                 );
             }
         }

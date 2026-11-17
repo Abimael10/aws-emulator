@@ -265,6 +265,8 @@ mod period_refusal_message;
 mod probe_counts;
 #[path = "all/published_data_is_queryable.rs"]
 mod published_data_is_queryable;
+#[path = "all/published_quotas.rs"]
+mod published_quotas;
 #[path = "all/published_unit_value_refusal.rs"]
 mod published_unit_value_refusal;
 #[path = "all/put_metric_data_validation.rs"]
@@ -281,6 +283,8 @@ mod query_protocol_probe_tmp;
 mod rds_alarm_action_delivery;
 #[path = "all/replay_probe.rs"]
 mod replay_probe;
+#[path = "all/request_refusal_classes.rs"]
+mod request_refusal_classes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sns_action_publish_grant.rs"]

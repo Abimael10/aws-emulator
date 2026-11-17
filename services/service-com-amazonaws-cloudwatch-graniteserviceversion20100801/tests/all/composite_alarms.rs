@@ -119,6 +119,9 @@ fn text(value: &Value, member: &str) -> Option<String> {
 async fn the_composite_alarm_configuration_round_trips_through_describe_alarms() {
     let router = build_router();
     put_metric_alarm(&router, "latency-high").await;
+    // The alarm this one suppresses its actions through has to exist when the composite alarm
+    // is saved: suppression is read from that alarm's own state.
+    put_metric_alarm(&router, "maintenance-window").await;
 
     let put = json!({
         "AlarmName": "service-unhealthy",
@@ -533,14 +536,11 @@ async fn a_composite_alarm_rule_may_reference_another_composite_alarm() {
         (400, "ValidationException"),
         "one call can delete no more than one composite alarm, got {body}"
     );
-    // Deleting the parent first releases the child.
+    // Deleting the parent first releases the child, and the child's own child goes after it:
+    // a batch does not release its own references.
     ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["outer"]})).await;
-    ok(
-        &router,
-        "DeleteAlarms",
-        &json!({"AlarmNames": ["inner", "leaf"]}),
-    )
-    .await;
+    ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["inner"]})).await;
+    ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["leaf"]})).await;
     let left = ok(
         &router,
         "DescribeAlarms",

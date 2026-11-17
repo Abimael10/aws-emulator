@@ -298,45 +298,28 @@ async fn an_alarm_a_live_composite_alarm_references_cannot_be_deleted() {
             "case {case:?}: a refused delete removed an alarm anyway, leaving {remaining:?}"
         );
 
-        // The reference is what holds the delete back, so a call that takes the composite
-        // alarm away with its child — and a call made after the composite alarm is gone —
-        // both go through.
+        // The reference is what holds the delete back, and a batch does not release its own:
+        // a call that names the composite alarm beside its child is refused too, and the
+        // child goes only once the composite alarm that referenced it is gone.
         let together = call(
             &router,
             "DeleteAlarms",
             &json!({"AlarmNames": ["child", "watcher"]}),
         )
         .await;
-        if kind == "metric" {
-            assert_eq!(
-                (together.0, error_code(&together.1).as_str()),
-                (200, ""),
-                "case {case:?}: deleting the composite alarm together with its child leaves no \
-                 reference behind, got {:?}",
-                together
-            );
-            let remaining = remaining_alarm_names(&router).await;
-            assert!(
-                remaining.is_empty(),
-                "case {case:?}: expected both alarms gone, got {remaining:?}"
-            );
-        } else {
-            // Two composite alarms in one call is refused on its own count rule, so the
-            // reference is released by deleting the composite alarm that holds it first.
-            assert_eq!(
-                (together.0, error_code(&together.1).as_str()),
-                (400, "ValidationException"),
-                "case {case:?}: one call can delete no more than one composite alarm, got {:?}",
-                together
-            );
-            ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["watcher"]})).await;
-            ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["child"]})).await;
-            let remaining = remaining_alarm_names(&router).await;
-            assert!(
-                remaining.is_empty(),
-                "case {case:?}: expected both alarms gone, got {remaining:?}"
-            );
-        }
+        assert_eq!(
+            (together.0, error_code(&together.1).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a batch does not release its own reference, got {:?}",
+            together
+        );
+        ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["watcher"]})).await;
+        ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["child"]})).await;
+        let remaining = remaining_alarm_names(&router).await;
+        assert!(
+            remaining.is_empty(),
+            "case {case:?}: expected both alarms gone, got {remaining:?}"
+        );
     }
 }
 

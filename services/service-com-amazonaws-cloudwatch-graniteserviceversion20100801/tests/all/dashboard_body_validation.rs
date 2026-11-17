@@ -273,7 +273,7 @@ fn cases() -> Vec<Case> {
             ],
         ),
         (
-            "a widget of a kind the schema states no rule for",
+            "a widget of a kind the body structure defines no properties rule for",
             json!({"widgets": [{"type": "explorer", "properties": {"metrics": []}}]}),
             vec![],
         ),

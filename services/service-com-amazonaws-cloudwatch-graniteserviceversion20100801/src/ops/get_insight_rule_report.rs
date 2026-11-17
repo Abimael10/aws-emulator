@@ -263,11 +263,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// How CloudWatch states that the window a report was asked over is not one it can report.
 ///
-/// A window shorter than the `Period` its datapoints are aggregated over spans no whole
-/// period, so there is no datapoint in it to report. The refusal names the condition by its
-/// CODE, the way this service's other Contributor Insights refusals do
-/// (`crate::state::EMPTY_RULE_NAMES`), and echoes neither instant.
-const INVALID_TIME_RANGE: &str = "INVALID_TIME_RANGE";
+/// Two conditions, each stated as the coded form this service's Contributor Insights refusals
+/// state a single-member refusal in (`crate::state::EMPTY_RULE_NAMES`): the condition's code,
+/// then fixed text for it, echoing neither instant. A window whose end does not come after its
+/// start names no range of time at all — the bounds are in the wrong order — while one that is
+/// ordered but shorter than the `Period` its datapoints are aggregated over spans no whole
+/// period, so there is no datapoint in it to report.
+const INVERTED_TIME_RANGE: &str = "INVALID_TIME_RANGE: The StartTime must precede the EndTime.";
+
+/// The second of those two sentences.
+const TIME_RANGE_UNDER_ONE_PERIOD: &str =
+    "INVALID_TIME_RANGE: The time range must be at least one Period long.";
 
 /// Refuse the request with this operation's modelled `InvalidParameterValueException`
 /// (HTTP 400): "The value of an input parameter is bad or out-of-range."
@@ -311,8 +317,13 @@ fn report_request(
     #[allow(clippy::cast_precision_loss)]
     let period_width = period_secs as f64;
     let window = end_secs - start_secs;
-    if !window.is_finite() || window < period_width {
-        return Err(invalid_parameter_value(INVALID_TIME_RANGE.to_string()));
+    if !window.is_finite() || window <= 0.0 {
+        return Err(invalid_parameter_value(INVERTED_TIME_RANGE.to_string()));
+    }
+    if window < period_width {
+        return Err(invalid_parameter_value(
+            TIME_RANGE_UNDER_ONE_PERIOD.to_string(),
+        ));
     }
     // How many datapoints the REQUEST asks for: the periods of the window the caller named at
     // the period the caller named, which is the ratio the answer's size is proportional to and

@@ -198,12 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         const SCAN_ASCENDING: &str = "TimestampAscending";
 
         // A `NextToken` this service did not mint is refused before anything is read, so a
-        // bogus token never silently answers the first page.
+        // bogus token never silently answers the first page. The sentence is the one this
+        // service's alarm listings refuse an unusable token in, naming the value at fault
+        // ([`crate::state::invalid_next_token_message`]).
         let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 DescribeAlarmHistoryErrorModeled::InvalidNextToken(InvalidNextToken {
-                    message: Some("NextToken is not a token this service issued".into()),
+                    message: Some(crate::state::invalid_next_token_message(token)),
                 })
             })?),
         };

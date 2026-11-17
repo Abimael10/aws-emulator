@@ -210,7 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        validate_body(&input.dashboard_body)?;
+        let document = validate_body(&input.dashboard_body)?;
+        // The WARNINGS the same walk finds, read off the document the refusal above already
+        // parsed: a widget the schema accepts but whose kind this service does not render is
+        // reported back on the success rather than refused ([`widget_warnings`]).
+        let warnings = widget_warnings(&document);
 
         let now = crate::state::now_secs();
         let mut store = state.lock();
@@ -249,10 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If the input for PutDashboard was correct and the dashboard was successfully
         // created or modified, this result is empty."
-        // (`PutDashboardOutput$DashboardValidationMessages`) — the dashboard was stored, so
-        // there is no warning and no error to report about it.
+        // (`PutDashboardOutput$DashboardValidationMessages`) — so a stored dashboard answers
+        // the empty list, and one stored with a widget the schema warns about answers those
+        // warnings: "If this result includes only warning messages, then the input was valid
+        // enough for the dashboard to be created or modified, but some elements of the
+        // dashboard might not render." (`PutDashboardOutput`)
         Ok(PutDashboardOutput {
-            dashboard_validation_messages: Some(Vec::new()),
+            dashboard_validation_messages: Some(
+                warnings
+                    .into_iter()
+                    .map(|problem| DashboardValidationMessage {
+                        data_path: Some(problem.data_path),
+                        message: Some(problem.message),
+                    })
+                    .collect(),
+            ),
         })
     }
 }
@@ -281,7 +296,10 @@ fn invalid_parameter_value(message: String) -> PutDashboardError {
 /// ([`widget_problems`]), and the problems that schema finds are enumerated — each located by
 /// a JSON pointer to the offending node — so a caller is told what to repair rather than
 /// handed a dashboard that cannot render.
-fn validate_body(body: &str) -> Result<(), PutDashboardError> {
+///
+/// The accepted document is handed BACK, so the warnings the same walk reports on the success
+/// ([`widget_warnings`]) are read off one parse of the caller's body rather than two.
+fn validate_body(body: &str) -> Result<::serde_json::Value, PutDashboardError> {
     let document = ::serde_json::from_str::<::serde_json::Value>(body)
         .ok()
         .filter(::serde_json::Value::is_object)
@@ -293,7 +311,7 @@ fn validate_body(body: &str) -> Result<(), PutDashboardError> {
         })?;
     let problems = widget_problems(&document);
     if problems.is_empty() {
-        return Ok(());
+        return Ok(document);
     }
     Err(invalid_dashboard(problems))
 }
@@ -363,6 +381,68 @@ const DEFINING_PROPERTY: &[(&str, &str)] = &[
 
 /// The widget type whose properties name a data source rather than one required member.
 const METRIC_WIDGET: &str = "metric";
+
+/// The schema's words for a value outside the set it defines: the set, as the schema lists it.
+fn one_of(allowed: &[&str]) -> String {
+    format!(
+        "Should be equal to one of the allowed values [{}]",
+        allowed.join(", ")
+    )
+}
+
+/// Every kind of widget a dashboard body may DECLARE: the types the dashboard body structure
+/// defines (the "Dashboard Body Structure and Syntax" reference
+/// `PutDashboardInput$DashboardBody` points at) — the metric widget, each type
+/// [`DEFINING_PROPERTY`] names with the member its properties must carry, and the metrics
+/// EXPLORER, whose properties this service states no rule for but which the service renders.
+///
+/// A widget of a kind the body structure does not define is not a refusal either: the document
+/// is still a dashboard, and what the caller is told is that this widget might not render
+/// ([`widget_warnings`]).
+fn widget_types() -> Vec<&'static str> {
+    let mut types = vec![METRIC_WIDGET];
+    types.extend(DEFINING_PROPERTY.iter().map(|(named, _)| *named));
+    types.push(EXPLORER_WIDGET);
+    types
+}
+
+/// The widget kind the body structure defines that this service states no properties rule for:
+/// an explorer widget's properties name the resources it explores rather than one required
+/// member, so a document declaring one is stored and rendered without a word about it.
+const EXPLORER_WIDGET: &str = "explorer";
+
+/// Every WARNING the widget schema finds in `document`, in document order.
+///
+/// A warning is what "the input was valid enough for the dashboard to be created or modified,
+/// but some elements of the dashboard might not render" (`PutDashboardOutput`) is reported as:
+/// the document is stored and the caller is told which node of it the service does not
+/// understand.
+///
+/// One per widget whose `type` names no kind of widget this service renders ([`widget_types`]),
+/// located by a JSON pointer to that member, and capped exactly as the refusal's diagnosis is
+/// ([`MAX_VALIDATION_PROBLEMS`]), so the answer does not grow with the number of widgets a
+/// caller submitted. A widget carrying no `type` at all, or one that is not a string, is a
+/// problem the schema REFUSES the body for, so it is not warned about here.
+fn widget_warnings(document: &::serde_json::Value) -> Vec<Problem> {
+    let mut warnings = Vec::new();
+    let Some(widgets) = document.get("widgets").and_then(::serde_json::Value::as_array) else {
+        return warnings;
+    };
+    let rendered = widget_types();
+    for (index, widget) in widgets.iter().enumerate() {
+        if warnings.len() >= MAX_VALIDATION_PROBLEMS {
+            break;
+        }
+        let declared = widget
+            .get("type")
+            .and_then(::serde_json::Value::as_str)
+            .filter(|kind| !rendered.contains(kind));
+        if declared.is_some() {
+            warnings.push(Problem::new(widget_path(index, "/type"), one_of(&rendered)));
+        }
+    }
+    warnings
+}
 
 /// Every problem the widget schema finds in a dashboard document, in document order.
 ///

@@ -309,10 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             failure_resource: Some(origin.template_name.clone()),
                             exception_type: Some("LimitExceededException".into()),
                             failure_code: Some("LimitExceeded".into()),
-                            failure_description: Some(format!(
-                                "this emulator holds at most {} Contributor Insights rules",
-                                crate::state::MAX_INSIGHT_RULES
-                            )),
+                            failure_description: Some(
+                                crate::state::insight_rule_quota_message(),
+                            ),
                         });
                         continue;
                     }

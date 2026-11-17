@@ -155,9 +155,9 @@ async fn a_name_no_rule_answers_to_is_reported_as_the_rule_that_is_not_there() {
             named: vec!["cwprobe-managed-rule-missing".to_string()],
         },
         NameRow {
-            case: "a one-character unknown name",
+            case: "a two-character unknown name",
             held: Vec::new(),
-            named: vec!["x".to_string()],
+            named: vec!["x1".to_string()],
         },
         NameRow {
             case: "a 128-character unknown name",
@@ -167,7 +167,7 @@ async fn a_name_no_rule_answers_to_is_reported_as_the_rule_that_is_not_there() {
         NameRow {
             case: "an unknown name carrying the punctuation a rule name admits",
             held: Vec::new(),
-            named: vec!["My_rule(v2)/high-cardinality".to_string()],
+            named: vec!["My_rule.v2-high_cardinality".to_string()],
         },
         NameRow {
             case: "an unknown name differing from a held rule only in case",

@@ -1,0 +1,556 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The CLASS and the TEXT this service refuses a request with, across the operations whose
+//! refusals belong to one rule each.
+//!
+//! Five rules, each asserted over a table whose rows differ along what the rule generalises
+//! over rather than repeating one request:
+//!
+//! * **a required member the request did not supply AT ALL is refused by the
+//!   request-validation layer in front of the service** — the class every operation of this
+//!   service answers for the SHAPE of a request — while a member the request DID carry with no
+//!   characters in it, and a member one of the Contributor Insights rule operations was not
+//!   given, are values the service read and are answered under its own parameter faults;
+//! * **a paginated listing answers a `NextToken` it cannot resume from in ITS OWN terms**: the
+//!   alarm HISTORY refuses it naming the value at fault, the Contributor Insights listings
+//!   refuse it with their coded sentence, and the alarm listing serves the FIRST page, because
+//!   a token it cannot read names no page of the enumeration and the first page is the page
+//!   such a request asks for;
+//! * **`SetAlarmState` refuses a `StateReasonData` that is not a JSON document with
+//!   `InvalidFormat` and leaves the alarm's state untouched**, whatever the value is wrong
+//!   about;
+//! * **`TagResource` refuses a tag key outside the character set tags are restricted to as a
+//!   bad parameter VALUE, and a key under the prefix AWS reserves for its own as an action the
+//!   caller may not take**, storing no tag either way;
+//! * **the dashboard operations refuse a field that breaks its own rule naming the field and
+//!   the rule it broke**, and `PutDashboard` STORES a body whose widget kind it does not
+//!   render while reporting that widget back as a validation message.
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{build_router, call, error_code, error_message, ok};
+
+/// A metric alarm a state force and a tag write can be made against.
+async fn given_alarm(router: &MultiServiceRouter, name: &str) {
+    ok(
+        router,
+        "PutMetricAlarm",
+        &json!({
+            "AlarmName": name,
+            "Namespace": "Custom/Refusals",
+            "MetricName": "Latency",
+            "Statistic": "Average",
+            "Period": 60,
+            "EvaluationPeriods": 1,
+            "Threshold": 1.0,
+            "ComparisonOperator": "GreaterThanThreshold",
+        }),
+    )
+    .await;
+}
+
+/// A Contributor Insights rule definition, as `PutInsightRule` takes it.
+fn rule_definition() -> String {
+    json!({
+        "Schema": {"Name": "CloudWatchLogRule", "Version": 1},
+        "LogGroupNames": ["API-Gateway-Access-Logs"],
+        "LogFormat": "JSON",
+        "Contribution": {"Keys": ["$.ip"]},
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_member_the_request_never_supplied_is_the_request_validation_class() {
+    let router = build_router();
+
+    // The rows differ along the operation, the kind of member left out (a name, a list, a
+    // number) and the depth it sits at: every one of them is a request whose SHAPE the layer
+    // in front of the service judges, so every one carries that layer's class.
+    let omitted: Vec<(&str, Value)> = vec![
+        ("DeleteMetricStream", json!({})),
+        ("StartMetricStreams", json!({})),
+        ("StopMetricStreams", json!({})),
+        ("GetDashboard", json!({})),
+        ("DeleteDashboards", json!({})),
+        (
+            "PutLogAlarm",
+            json!({
+                "AlarmName": "no-threshold",
+                "QueryResultsToEvaluate": 3,
+                "QueryResultsToAlarm": 2,
+                "ComparisonOperator": "GreaterThanThreshold",
+                "ScheduledQueryConfiguration": {
+                    "QueryString": "fields @message",
+                    "ScheduledQueryRoleARN":
+                        "arn:aws:iam::000000000000:role/cwl-scheduled-query",
+                    "AggregationExpression": "count(*)",
+                    "ScheduleConfiguration": {
+                        "ScheduleExpression": "rate(5 minutes)",
+                        "StartTimeOffset": 360,
+                    },
+                },
+            }),
+        ),
+        (
+            "PutCompositeAlarm",
+            json!({"AlarmName": "no-rule"}),
+        ),
+    ];
+
+    for (operation, request) in omitted {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {operation:?}: a member the request never supplied is refused by the \
+             request-validation layer, got {status} with {body}"
+        );
+    }
+
+    // The two OTHER classes, so the rule above is about a member the request left out and not
+    // about every refusal: a Contributor Insights rule operation states the member it was not
+    // given in its own coded form under the missing-parameter fault, and a filter the request
+    // DID carry with no characters is a value the service read and could not use.
+    let (status, body) = call(&router, "ListManagedInsightRules", &json!({})).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "MissingRequiredParameterException"),
+        "a Contributor Insights listing names the member it was not given, got {status} with \
+         {body}"
+    );
+    let message = error_message(&body);
+    assert_eq!(
+        message, "MISSING_RESOURCE_ARN: The ResourceARN parameter must be present.",
+        "the coded form names the member, got {message:?}"
+    );
+
+    let (status, body) = call(
+        &router,
+        "ListMetrics",
+        &json!({"Dimensions": [{"Name": "Probe", "Value": ""}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidParameterValueException"),
+        "a filter supplied with no characters is an unusable value, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_own_terms() {
+    let router = build_router();
+    given_alarm(&router, "paged-alarm").await;
+    ok(
+        &router,
+        "PutInsightRule",
+        &json!({"RuleName": "paged-rule", "RuleDefinition": rule_definition()}),
+    )
+    .await;
+
+    // The rows differ along WHAT is wrong with the token: a value no opaque token could be, a
+    // value that reads as a blob but carries no cursor this service minted, and one carrying
+    // text rather than a cursor. None of them is a page of any enumeration.
+    let tokens = [
+        ("a value no token could be", "not-a-real-token"),
+        ("a blob this service did not mint", "c2ltMnJlYWw="),
+        ("a blob of some other service's cursor", "sim2real-behav-not-a-real-token=="),
+    ];
+
+    for (case, token) in tokens {
+        // The alarm HISTORY names the value at fault, so a caller can tell which of the tokens
+        // it holds was refused.
+        let (status, body) = call(
+            &router,
+            "DescribeAlarmHistory",
+            &json!({"NextToken": token}),
+        )
+        .await;
+        let message = error_message(&body);
+        let expected = format!("Invalid NextToken : {token}");
+        assert_eq!(
+            (status, error_code(&body).as_str(), message.as_str()),
+            (400, "InvalidNextToken", expected.as_str()),
+            "case {case:?}: expected the history's own refusal {expected:?}, got {status} with \
+             {body}"
+        );
+
+        // The Contributor Insights listings answer their coded sentence, with nothing of the
+        // token in it.
+        for listing in ["DescribeInsightRules", "ListManagedInsightRules"] {
+            let request = if listing == "ListManagedInsightRules" {
+                json!({"ResourceARN": "arn:aws:logs:us-east-1:000000000000:log-group:/app",
+                       "NextToken": token})
+            } else {
+                json!({"NextToken": token})
+            };
+            let (status, body) = call(&router, listing, &request).await;
+            let message = error_message(&body);
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidNextToken"),
+                "case {case:?} on {listing}: expected the token refused, got {status} with \
+                 {body}"
+            );
+            assert!(
+                message.starts_with("INVALID_TOKEN:") && !message.contains(token),
+                "case {case:?} on {listing}: expected the coded sentence with nothing of the \
+                 token in it, got {message:?}"
+            );
+        }
+
+        // The alarm LISTING serves the page such a request asks for: the first one, exactly as
+        // a request that offered no token at all is served.
+        let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
+        let first = ok(&router, "DescribeAlarms", &json!({})).await;
+        assert_eq!(
+            listed, first,
+            "case {case:?}: a token the alarm listing cannot read must answer the first page, \
+             got {listed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_state_reason_data_that_is_no_json_document_is_refused_and_changes_nothing() {
+    // The rows differ along what is wrong with the value: text that is no JSON at all, a
+    // document that stops before it closes, and each kind of bare JSON scalar — none of them a
+    // document a consumer of the state-change notification could read fields out of.
+    let malformed = [
+        ("text that is no JSON", "not json at all"),
+        ("a document that stops early", "{\"reason\": "),
+        ("a truncated array", "[1, 2"),
+        ("a bare number", "17"),
+        ("a bare string", "\"breaching\""),
+        ("a bare boolean", "true"),
+    ];
+
+    for (case, data) in malformed {
+        let router = build_router();
+        given_alarm(&router, "forced-alarm").await;
+
+        let (status, body) = call(
+            &router,
+            "SetAlarmState",
+            &json!({
+                "AlarmName": "forced-alarm",
+                "StateValue": "ALARM",
+                "StateReason": "testing",
+                "StateReasonData": data,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidFormatFault"),
+            "case {case:?}: expected the modelled format refusal, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            "",
+            "case {case:?}: CloudWatch answers this refusal with its code alone, got {body}"
+        );
+
+        // The refusal left the alarm's state where the write found it.
+        let described = ok(
+            &router,
+            "DescribeAlarms",
+            &json!({"AlarmNames": ["forced-alarm"]}),
+        )
+        .await;
+        let alarm = &described["MetricAlarms"][0];
+        assert_eq!(
+            alarm.get("StateValue").and_then(Value::as_str),
+            Some("INSUFFICIENT_DATA"),
+            "case {case:?}: a refused force must not move the alarm, got {described}"
+        );
+        assert_eq!(
+            alarm.get("StateReasonData"),
+            None,
+            "case {case:?}: a refused force must store no reason data, got {described}"
+        );
+    }
+
+    // The other side of the same rule: a document the member may carry is stored and read back,
+    // whichever JSON document it is.
+    for (case, data) in [
+        ("a reason object", json!({"version": "1.0", "threshold": 1.0}).to_string()),
+        ("a reason array", json!([1, 2, 3]).to_string()),
+    ] {
+        let router = build_router();
+        given_alarm(&router, "forced-alarm").await;
+        ok(
+            &router,
+            "SetAlarmState",
+            &json!({
+                "AlarmName": "forced-alarm",
+                "StateValue": "ALARM",
+                "StateReason": "testing",
+                "StateReasonData": data,
+            }),
+        )
+        .await;
+        let described = ok(
+            &router,
+            "DescribeAlarms",
+            &json!({"AlarmNames": ["forced-alarm"]}),
+        )
+        .await;
+        assert_eq!(
+            described["MetricAlarms"][0]
+                .get("StateReasonData")
+                .and_then(Value::as_str),
+            Some(data.as_str()),
+            "case {case:?}: a document the member may carry round-trips, got {described}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tag_key_this_service_will_not_store_is_refused_in_its_own_class() {
+    let router = build_router();
+    given_alarm(&router, "tagged-alarm").await;
+    let arn = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:tagged-alarm";
+
+    // Rows differ along WHERE the character the set does not admit sits and which character it
+    // is. Source for the set: the tag restrictions every AWS service's tags are subject to —
+    // letters, numbers, spaces, and `+ - = . _ : / @`.
+    let unusable_keys = [
+        ("a hash inside the key", "bad#key"),
+        ("an exclamation mark closing the key", "key!"),
+        ("a bracket opening the key", "(key)"),
+        ("a comma between words", "team,owner"),
+    ];
+    for (case, key) in unusable_keys {
+        let (status, body) = call(
+            &router,
+            "TagResource",
+            &json!({"ResourceARN": arn, "Tags": [{"Key": key, "Value": "v"}]}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {case:?}: a key outside the tag character set is a bad parameter value, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            "",
+            "case {case:?}: CloudWatch answers this refusal with its code alone, got {body}"
+        );
+    }
+
+    // The reserved prefix is a different class: the caller may not write a tag under it, in any
+    // case of it, and wherever in the batch that tag sits.
+    let reserved_keys = [
+        ("the reserved prefix", "aws:cloudformation:stack-name"),
+        ("the reserved prefix in upper case", "AWS:billing"),
+        ("the reserved prefix in mixed case", "Aws:owner"),
+    ];
+    for (case, key) in reserved_keys {
+        let (status, body) = call(
+            &router,
+            "TagResource",
+            &json!({"ResourceARN": arn, "Tags": [
+                {"Key": "team", "Value": "platform"},
+                {"Key": key, "Value": "v"},
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (403, "AccessDenied"),
+            "case {case:?}: a tag under the reserved prefix is refused as an action the caller \
+             may not take, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            "The provided tag keys must not start with any case of \"aws:\"",
+            "case {case:?}: expected CloudWatch's wording for the reserved prefix, got {body}"
+        );
+    }
+
+    // Neither refusal stored anything, including the tag of the same request the rules admit.
+    let listed = ok(&router, "ListTagsForResource", &json!({"ResourceARN": arn})).await;
+    assert_eq!(
+        listed["Tags"],
+        json!([]),
+        "a refused TagResource must store no tag, got {listed}"
+    );
+
+    // The other side of the same rule: every character the set admits is stored and read back.
+    let usable = "env.name_1-2:3/4@5+6=7 8";
+    ok(
+        &router,
+        "TagResource",
+        &json!({"ResourceARN": arn, "Tags": [{"Key": usable, "Value": "v"}]}),
+    )
+    .await;
+    let listed = ok(&router, "ListTagsForResource", &json!({"ResourceARN": arn})).await;
+    assert_eq!(
+        listed["Tags"],
+        json!([{"Key": usable, "Value": "v"}]),
+        "a key built from the characters tags admit is stored, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_dashboard_field_outside_its_rule_names_the_field_and_the_rule() {
+    let router = build_router();
+    ok(
+        &router,
+        "PutDashboard",
+        &json!({"DashboardName": "kept", "DashboardBody": "{}"}),
+    )
+    .await;
+
+    // Rows differ along the field, the way its value breaks the rule (too many elements, none
+    // at all, a character the set does not admit) and the operation that carries it.
+    let names: Vec<String> = (0..101).map(|index| format!("d{index}")).collect();
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "a batch past the element cap",
+            "DeleteDashboards",
+            json!({"DashboardNames": names}),
+            "Field DashboardNames can contain up to 100 elements.\n".to_string(),
+        ),
+        (
+            "a batch naming nothing",
+            "DeleteDashboards",
+            json!({"DashboardNames": []}),
+            "Field DashboardNames is required and has to contain at least 1 element.\n"
+                .to_string(),
+        ),
+        (
+            "a prefix holding a character no name may carry",
+            "ListDashboards",
+            json!({"DashboardNamePrefix": "team/"}),
+            "The value for field DashboardNamePrefix contains invalid characters. It can only \
+             contain alphanumerics, dash (-) and underscore (_).\n"
+                .to_string(),
+        ),
+        (
+            "a prefix holding the period a name may not carry",
+            "ListDashboards",
+            json!({"DashboardNamePrefix": "staging."}),
+            "The value for field DashboardNamePrefix contains invalid characters. It can only \
+             contain alphanumerics, dash (-) and underscore (_).\n"
+                .to_string(),
+        ),
+        (
+            "a name holding a character the set does not admit",
+            "GetDashboard",
+            json!({"DashboardName": "my dashboard"}),
+            "The value for field DashboardName contains invalid characters. It can only \
+             contain alphanumerics, dash (-) and underscore (_).\n"
+                .to_string(),
+        ),
+        (
+            "a name breaking the character set and the length at once",
+            "GetDashboard",
+            json!({"DashboardName": "my dashboard".repeat(40)}),
+            "The value for field DashboardName contains invalid characters. It can only \
+             contain alphanumerics, dash (-) and underscore (_).\n"
+                .to_string(),
+        ),
+    ];
+
+    for (case, operation, request, expected) in rows {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {case:?}: expected the parameter-value fault, got {status} with {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // A refused batch deleted nothing.
+    let listed = ok(&router, "ListDashboards", &json!({})).await;
+    assert_eq!(
+        listed["DashboardEntries"][0]["DashboardName"],
+        json!("kept"),
+        "a refused DeleteDashboards must delete nothing, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_widget_kind_this_service_does_not_render_is_reported_and_the_body_is_stored() {
+    let router = build_router();
+
+    // Rows differ along the kind the widget declares and where in the document it sits: each
+    // one satisfies the widget schema, so the body is STORED and the widget whose kind the
+    // body structure does not define comes back as a validation message naming that widget's
+    // own `type`.
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "one widget of an unknown kind",
+            json!({"widgets": [{"type": "donut", "properties": {"metrics": []}}]}),
+            vec!["/widgets/0/type"],
+        ),
+        (
+            "an unknown kind after a widget the schema renders",
+            json!({"widgets": [
+                {"type": "text", "properties": {"markdown": "hello"}},
+                {"type": "sparkline", "properties": {}},
+            ]}),
+            vec!["/widgets/1/type"],
+        ),
+        (
+            "two widgets of unknown kinds",
+            json!({"widgets": [
+                {"type": "donut", "properties": {}},
+                {"type": "trace-map", "properties": {}},
+            ]}),
+            vec!["/widgets/0/type", "/widgets/1/type"],
+        ),
+        (
+            "every widget of a kind the body structure defines",
+            json!({"widgets": [
+                {"type": "text", "properties": {"markdown": "hello"}},
+                {"type": "explorer", "properties": {"metrics": []}},
+            ]}),
+            vec![],
+        ),
+    ];
+
+    for (index, (case, document, paths)) in rows.into_iter().enumerate() {
+        let name = format!("widget-kind-{index}");
+        let body = document.to_string();
+        let answered = ok(
+            &router,
+            "PutDashboard",
+            &json!({"DashboardName": name, "DashboardBody": body}),
+        )
+        .await;
+        let reported: Vec<&str> = answered["DashboardValidationMessages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| message.get("DataPath").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            reported, paths,
+            "case {case:?}: expected a validation message per widget kind this service does \
+             not render, got {answered}"
+        );
+        // Whatever it warned about, the document was STORED: the dashboard reads back byte for
+        // byte.
+        let got = ok(&router, "GetDashboard", &json!({"DashboardName": name})).await;
+        assert_eq!(
+            got.get("DashboardBody").and_then(Value::as_str),
+            Some(body.as_str()),
+            "case {case:?}: a warned body must still be stored, got {got}"
+        );
+    }
+}

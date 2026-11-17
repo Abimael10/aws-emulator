@@ -4,10 +4,11 @@
 //! rule definition with.
 //!
 //! The rule under test: **a `RuleDefinition` that is not a readable Contributor Insights rule
-//! definition is refused `InvalidParameterValue` with the service's fixed reason-code
-//! sentence for an unreadable rule body — the same sentence whatever part of the syntax the
-//! body gets wrong, carrying neither the rule name nor anything of the submitted body** —
-//! while a body the syntax does allow is accepted and read back. The model constrains
+//! definition is refused `InvalidParameterValue` with the service's reason-code sentence for
+//! what was wrong with the body — the KEY the body is short of, when the syntax requires one it
+//! does not carry, and otherwise the one fixed sentence for a body that could not be parsed —
+//! carrying neither the rule name nor anything of the submitted body** — while a body the
+//! syntax does allow is accepted and read back. The model constrains
 //! `PutInsightRuleInput$RuleDefinition` only as a 1..8192 ASCII string
 //! (`smithy_query(query="operation",operation="PutInsightRule")`), so the body's syntax is
 //! the service's own check, and this is how the service reports the failure of that check.
@@ -27,6 +28,12 @@ use crate::harness::{build_router, call, error_code, error_message, ok};
 /// reason code naming what was wrong with the body, and a fixed sentence for that class with
 /// no variable part.
 const UNPARSEABLE_RULE_BODY: &str = "INVALID_RULE_BODY: The RuleBody could not be parsed.";
+
+/// The sentence it refuses a body that is short of a key the syntax requires with: the same
+/// reason code, then the condition and the key the body does not carry.
+fn missing_key(key: &str) -> String {
+    format!("INVALID_RULE_BODY: MissingKey encountered at {key} in the RuleBody.")
+}
 
 /// The wire error code of that refusal, as an SDK of this service sees it
 /// (`PutInsightRule` errors `InvalidParameterValueException`, awsQueryError
@@ -79,97 +86,124 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
         long_invalid_body.len()
     );
 
-    // Rows: (case, the rule name the request carries, the body it submits).
-    let cases: Vec<(&str, String, String)> = vec![
-        // The minimal JSON object: syntactically valid JSON, no rule definition at all. The
-        // name is the shortest the member admits (1..128), and no character of the fixed
-        // sentence, so a name echoed into the message would show.
-        ("the minimal JSON object", "Q".to_string(), "{}".to_string()),
+    // Rows: (case, the rule name the request carries, the body it submits, the refusal).
+    let cases: Vec<(&str, String, String, String)> = vec![
+        // The minimal JSON object: syntactically valid JSON, no rule definition at all — so the
+        // first key the syntax requires is the one it is told about. The name carries no
+        // character of the sentence, so a name echoed into the message would show.
+        (
+            "the minimal JSON object",
+            "Q1".to_string(),
+            "{}".to_string(),
+            missing_key("Schema"),
+        ),
         (
             "an object with members the syntax does not define",
             "unrelated-members".to_string(),
             json!({"Rule": "contributors", "Version": 1}).to_string(),
+            missing_key("Schema"),
         ),
         (
             "text that is not JSON",
             "not-json".to_string(),
             "not json at all".to_string(),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "JSON that is an array",
             "json-array".to_string(),
             "[]".to_string(),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "JSON that is a string",
             "json-string".to_string(),
             "\"rule\"".to_string(),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "JSON that is a number",
             "json-number".to_string(),
             "17".to_string(),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "truncated JSON",
             "truncated".to_string(),
             "{\"Schema\": {\"Name\": \"CloudWatchLogRule\"".to_string(),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "no schema",
             "no-schema".to_string(),
             definition(json!({"Schema": null})),
+            missing_key("Schema"),
         ),
         (
             "a schema at another version",
             "schema-v99".to_string(),
             definition(json!({"Schema": {"Name": "CloudWatchLogRule", "Version": 99}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "the schema of a managed rule",
             "managed-schema".to_string(),
             definition(json!({"Schema": {"Name": "ServiceLogRule", "Version": 1}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "no log group named",
             "no-log-group".to_string(),
             definition(json!({"LogGroupNames": null})),
+            missing_key("LogGroupNames"),
         ),
         (
             "an empty log group list",
             "empty-log-groups".to_string(),
             definition(json!({"LogGroupNames": []})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "log group names that are not strings",
             "numeric-log-groups".to_string(),
             definition(json!({"LogGroupNames": [7]})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
-        ("a long body", "long-body".to_string(), long_invalid_body),
+        (
+            "a long body",
+            "long-body".to_string(),
+            long_invalid_body,
+            UNPARSEABLE_RULE_BODY.to_string(),
+        ),
         (
             "no log format",
             "no-log-format".to_string(),
             definition(json!({"LogFormat": null})),
+            missing_key("LogFormat"),
         ),
         (
             "a log format the syntax does not name",
             "text-log-format".to_string(),
             definition(json!({"LogFormat": "TEXT"})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "no contribution",
             "no-contribution".to_string(),
             definition(json!({"Contribution": null})),
+            missing_key("Contribution"),
         ),
         (
             "a contribution with no keys",
             "no-keys".to_string(),
             definition(json!({"Contribution": {"ValueOf": "$.bytes"}})),
+            missing_key("Contribution"),
         ),
         (
             "a contribution with five keys",
             "five-keys".to_string(),
             definition(json!({"Contribution": {"Keys": ["a", "b", "c", "d", "e"]}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "a contribution with five filters",
@@ -181,16 +215,19 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
                     {"Match": "$.d"}, {"Match": "$.e"},
                 ],
             }})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "filters that are not a list",
             "string-filters".to_string(),
             definition(json!({"Contribution": {"Keys": ["$.ip"], "Filters": "none"}})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "an aggregation the syntax does not name",
             "averaged".to_string(),
             definition(json!({"AggregateOn": "Average"})),
+            UNPARSEABLE_RULE_BODY.to_string(),
         ),
         (
             "summing with no field to sum",
@@ -198,10 +235,11 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
             // whatever name the request carries.
             "n".repeat(128),
             definition(json!({"AggregateOn": "Sum"})),
+            missing_key("Contribution"),
         ),
     ];
 
-    for (case, name, body) in cases {
+    for (case, name, body, expected) in cases {
         let router = build_router();
         let (status, response) = call(
             &router,
@@ -220,12 +258,11 @@ async fn every_unreadable_rule_body_is_refused_with_the_one_reason_code_sentence
         );
         let message = error_message(&response);
         assert_eq!(
-            message, UNPARSEABLE_RULE_BODY,
-            "case {case:?}: expected the fixed sentence {UNPARSEABLE_RULE_BODY:?}, got \
-             {message:?}"
+            message, expected,
+            "case {case:?}: expected the sentence {expected:?}, got {message:?}"
         );
-        // The sentence has no variable part: neither the rule name nor the body it rejected
-        // appears in it.
+        // The sentence carries no value from the request: neither the rule name nor the body
+        // it rejected appears in it.
         assert!(
             !message.contains(name.as_str()) && !message.contains(&body),
             "case {case:?}: the refusal must echo neither the rule name nor the body, got \

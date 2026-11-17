@@ -68,19 +68,29 @@ impl NameVerdict {
     fn message(self, field: &str) -> Option<String> {
         match self {
             Self::Allowed => None,
-            Self::TooLong => Some(format!(
-                "The value for field {field} is too long. It must have length less than or \
-                 equal to {MAX_NAME_LEN}.\n"
-            )),
+            Self::TooLong => Some(Self::over_the_cap(field)),
             Self::TooShort => Some(format!(
                 "The value for field {field} is too short. It must have length greater than or \
                  equal to 1.\n"
             )),
-            Self::BadCharacters => Some(format!(
-                "The value for field {field} contains invalid characters. It can only contain \
-                 alphanumerics, dash (-) and underscore (_).\n"
-            )),
+            Self::BadCharacters => Some(Self::outside_the_set(field)),
         }
+    }
+
+    /// The sentence for a value longer than the field may carry.
+    fn over_the_cap(field: &str) -> String {
+        format!(
+            "The value for field {field} is too long. It must have length less than or equal \
+             to {MAX_NAME_LEN}.\n"
+        )
+    }
+
+    /// The sentence for a value built from a character the field does not admit.
+    fn outside_the_set(field: &str) -> String {
+        format!(
+            "The value for field {field} contains invalid characters. It can only contain \
+             alphanumerics, dash (-) and underscore (_).\n"
+        )
     }
 }
 
@@ -140,9 +150,9 @@ fn name_cases() -> Vec<(&'static str, String, NameVerdict)> {
             NameVerdict::BadCharacters,
         ),
         (
-            "256 non-ASCII characters, so the length is refused first",
+            "256 non-ASCII characters, judged by what they are before how many",
             "ü".repeat(MAX_NAME_LEN + 1),
-            NameVerdict::TooLong,
+            NameVerdict::BadCharacters,
         ),
     ]
 }

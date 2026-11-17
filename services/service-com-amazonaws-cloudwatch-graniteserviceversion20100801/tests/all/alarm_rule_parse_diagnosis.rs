@@ -17,8 +17,9 @@
 //! after `NOT`, inside a group), WHAT it looks like (a word, a single punctuation character, a
 //! misspelled function), and whether the text before it is ASCII — because the index is
 //! counted in characters, not bytes. The recorded case, a rule with a duplicated `AND`, is one
-//! row. A rule that simply ENDS where a term is owed carries no token to name, so it is still
-//! refused under the same code but is NOT given the diagnosis with an empty token in it.
+//! row. A rule that simply ENDS before it is complete carries no token of its own at that
+//! position and is diagnosed at the END-OF-INPUT marker instead, at the character the rule ran
+//! out at.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -199,30 +200,43 @@ async fn the_parse_diagnosis_is_told_apart_from_the_other_refusals_of_the_same_c
         "the existence refusal must say so, got {message:?}"
     );
 
-    // A rule that ENDS where it owes a term carries no token to name, so it is refused under
-    // the same code without the diagnosis above: a message naming the empty string as the
-    // token the rule carries would be a variant of the service's wording that nothing records.
-    let (status, body) = call(
-        &router,
-        "PutCompositeAlarm",
-        &json!({"AlarmName": "truncated", "AlarmRule": format!("ALARM(\"{CHILD}\") AND")}),
-    )
-    .await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (400, "ValidationException"),
-        "a rule that ends before the term it owes is refused, got {status} with {body}"
-    );
-    let message = error_message(&body);
-    assert!(
-        !message.contains("Unsupported token ''"),
-        "a rule with no token at the position it stopped at must not be diagnosed as carrying \
-         one, got {message:?}"
-    );
-    let stored = composite_alarms(&router, "truncated").await;
-    assert_eq!(
-        stored,
-        json!([]),
-        "the truncated rule must store no composite alarm, got {stored}"
-    );
+    // A rule that ENDS before it is complete is diagnosed at the END-OF-INPUT marker: the
+    // token there is to name at that position, at the character the rule ran out at. The rows
+    // differ along WHAT the rule still owed — a term after an operator, the parenthesis closing
+    // a reference, the parenthesis closing a group — and each one's offset is the rule's own
+    // length, which is where the parse stopped.
+    for (case, rule) in [
+        ("a rule ending after an operator", format!("ALARM(\"{CHILD}\") AND")),
+        ("a reference left unclosed", format!("ALARM(\"{CHILD}\"")),
+        ("a group left unclosed", format!("(ALARM(\"{CHILD}\")")),
+        ("a rule that is nothing but an operator", "NOT".to_string()),
+    ] {
+        let (status, body) = call(
+            &router,
+            "PutCompositeAlarm",
+            &json!({"AlarmName": "truncated", "AlarmRule": rule}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a rule that ends before it is complete is refused, got {status} \
+             with {body}"
+        );
+        let message = error_message(&body);
+        let expected = format!(
+            "Error in AlarmRule [Unsupported token '<EOF>' at char {}]",
+            rule.chars().count()
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?} for {rule:?}, got {message:?}"
+        );
+        let stored = composite_alarms(&router, "truncated").await;
+        assert_eq!(
+            stored,
+            json!([]),
+            "case {case:?}: the truncated rule must store no composite alarm, got {stored}"
+        );
+    }
 }

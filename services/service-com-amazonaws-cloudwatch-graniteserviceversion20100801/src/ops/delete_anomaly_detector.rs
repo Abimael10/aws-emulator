@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::FLAT_METRIC_FORM,
                         crate::state::SINGLE_METRIC_FORM,
                         crate::state::METRIC_MATH_FORM,
-                        found.join(", ")
+                        crate::state::in_one_order(&found).join(", ")
                     )));
                 }
                 named.to_string()
@@ -252,7 +252,9 @@ fn form_refusal(error: crate::state::AnomalyDetectorFormError) -> DeleteAnomalyD
         crate::state::AnomalyDetectorFormError::Combination(message) => {
             invalid_combination(message)
         }
-        crate::state::AnomalyDetectorFormError::Missing(message) => missing_parameter(message),
+        crate::state::AnomalyDetectorFormError::Missing => {
+            missing_parameter(crate::state::NO_DETECTOR_TO_DELETE.to_string())
+        }
     }
 }
 

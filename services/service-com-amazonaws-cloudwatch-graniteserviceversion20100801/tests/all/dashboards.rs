@@ -479,8 +479,8 @@ async fn list_dashboards_reports_the_dashboards_a_prefix_selects_in_name_order()
     }
 
     // Rows differ in what the prefix selects: everything (omitted and empty), a prefix
-    // several dashboards share, a whole name, a prefix that is case-sensitive, a prefix
-    // holding the "." the member allows, and one nothing starts with.
+    // several dashboards share, a whole name, a prefix that is case-sensitive, and one nothing
+    // starts with.
     let cases: Vec<(&str, Option<&str>, Vec<&str>)> = vec![
         (
             "no prefix at all",
@@ -495,9 +495,6 @@ async fn list_dashboards_reports_the_dashboards_a_prefix_selects_in_name_order()
         ("a shared prefix", Some("prod-"), vec!["prod-api", "prod-web"]),
         ("a whole name", Some("dev_api"), vec!["dev_api"]),
         ("a prefix in another case", Some("Prod"), vec!["Prod-Legacy"]),
-        // The prefix member allows the "." no dashboard NAME may hold, so such a prefix is
-        // accepted and selects nothing.
-        ("a prefix holding a dot", Some("staging."), vec![]),
         ("a prefix nothing starts with", Some("zzz"), vec![]),
     ];
 
@@ -536,12 +533,16 @@ async fn list_dashboards_refuses_a_prefix_or_token_outside_the_documented_rule()
     ok(&router, "PutDashboard", &put_request("listed", "{}")).await;
 
     // "The maximum length is 255, and valid characters are A-Z, a-z, 0-9, ".", "-", and "_"."
-    // (`ListDashboardsInput$DashboardNamePrefix`) — rows span the published bound, one past
-    // it, and characters inside and outside the set, which is the name's set plus ".".
+    // (`ListDashboardsInput$DashboardNamePrefix`) — the documentation lists the "." as well,
+    // but the service accepts a prefix only out of the set a dashboard NAME is built from, and
+    // its refusal names that set: a prefix is the opening characters of a name, so a character
+    // no name may carry is the prefix of no name at all. Rows span the published bound, one
+    // past it, and characters inside and outside the set.
     let prefixes: Vec<(&str, String, bool)> = vec![
         ("255 characters, the documented maximum", "n".repeat(255), true),
         ("256 characters, one past the maximum", "n".repeat(256), false),
-        ("every documented character", "aZ9-_.".to_string(), true),
+        ("every character a name is built from", "aZ9-_".to_string(), true),
+        ("a prefix holding a period", "team.".to_string(), false),
         ("a prefix holding a space", "my dash".to_string(), false),
         ("a prefix holding a slash", "team/".to_string(), false),
         ("a prefix holding non-ASCII letters", "ü".to_string(), false),
@@ -822,11 +823,6 @@ async fn delete_dashboards_removes_every_dashboard_it_names() {
             vec!["beta", "beta"],
             vec!["alpha", "gamma"],
         ),
-        (
-            "no names at all",
-            vec![],
-            vec!["alpha", "beta", "gamma"],
-        ),
     ];
 
     for (case, deleted, expected) in cases {
@@ -879,6 +875,7 @@ async fn delete_dashboards_refuses_a_request_outside_the_documented_rule() {
         ("one name", vec!["kept".to_string()], true),
         ("100 names, the documented maximum", hundred, true),
         ("101 names, one past the maximum", hundred_and_one, false),
+        ("no name at all", vec![], false),
         (
             "a name over the length rule",
             vec!["n".repeat(256)],
