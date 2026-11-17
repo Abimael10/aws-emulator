@@ -113,7 +113,11 @@ fn bucket_arns(name: &str) -> Vec<String> {
 
 /// A function declaration whose `Policies` is `policies`, spelled exactly as the row states
 /// it (a list, or the single value the property also accepts).
-fn function_with_policies(logical_id: &str, policies: &str) -> String {
+///
+/// `pub(crate)` because the suite over what an EXECUTED change set deploys
+/// (`sam_deployed_resources.rs`) declares its functions the same way, and a declaration this
+/// crate's suites deploy is spelled once.
+pub(crate) fn function_with_policies(logical_id: &str, policies: &str) -> String {
     format!(
         r#""{logical_id}":{{"Type":"AWS::Serverless::Function","Properties":{{
              "Handler":"index.handler","Runtime":"python3.12",

@@ -33,18 +33,33 @@
 //! The recorded trace this suite was written for is ONE row of the table: an explicit
 //! `AWS::Serverless::Api`, a function routed to it and a `AWS::Serverless::SimpleTable`,
 //! beside CloudWatch and CloudWatch Logs resources the macro leaves alone.
+//!
+//! The second half of the rule is the DEPLOYMENT PATH: the macro's output is what the stack
+//! deploys whichever operation deployed the template, so a `CREATE` change set over a
+//! transform-declaring template executes the EXPANSION — every expanded resource is created
+//! in the service that owns it and the stack completes, rather than failing and rolling back.
+//! [`an_executed_change_set_deploys_the_expansion_into_the_owning_services`] holds that half,
+//! over the `sam deploy` path (`CreateChangeSet` + `ExecuteChangeSet`), and reads each
+//! expanded resource back through the wire of the service that owns it.
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::change_set_lifecycle::settle_the_store;
-use crate::stack_lifecycle::{
-    call, create_stack, iam, kv, member, router_with_engine, xml_blocks, xml_text,
+use crate::change_set_lifecycle::{
+    create_change_set, describe_change_set, execute_change_set, settle_the_store,
 };
+use crate::dynamodb_table_resources::{describe_table, failure_reasons};
+use crate::hotswapped_function_code::lambda;
+use crate::iam_identity_resources::xml_policy_document;
+use crate::stack_lifecycle::{
+    call, create_stack, iam, kv, member, router_with_engine, xml_blocks, xml_text, xml_texts,
+};
+use crate::sam_policies_shorthand::function_with_policies;
 use crate::sam_transform::sam_template;
-use crate::stack_resources::wire_resources;
-use crate::stack_resource_provisioning::stage_code_objects;
+use crate::stack_resources::{wire_resources, WireResource};
+use crate::stack_resource_provisioning::{s3, stage_code_objects};
 
 /// The namespace a SAM resource type lives under: no resource of a DEPLOYED stack may
 /// carry it, because the macro consumed every such declaration.
@@ -490,4 +505,490 @@ async fn get_template_answers_the_submitted_body_and_the_processed_one() {
             row.case
         );
     }
+}
+
+/// An AWS managed policy ARN a `Policies` entry can name, which is ATTACHED to the generated
+/// role and embeds nothing — so a row carrying one has fewer inline policies than entries.
+const MANAGED_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess";
+
+/// One row of the change-set table: a SAM template deployed the way `sam deploy` deploys one
+/// — a `CREATE` change set over the template, acknowledged for IAM and for the transform,
+/// then `ExecuteChangeSet`.
+struct Executed {
+    case: &'static str,
+    stack: &'static str,
+    change_set: &'static str,
+    template: String,
+    /// Each function declaration the row reads: its logical id, and how many INLINE policies
+    /// its `Policies` asks for on the role the transform generates for it (`<id>Role`).
+    functions: Vec<(&'static str, usize)>,
+    /// The logical ids of the tables the row declares, which Amazon DynamoDB must hold.
+    tables: Vec<&'static str>,
+    /// The logical ids of the buckets the row declares, which Amazon S3 must hold.
+    buckets: Vec<&'static str>,
+}
+
+/// The rows: the class is any template whose `Transform` the request acknowledges, deployed
+/// through a change set. They differ along what the rule generalises over — which serverless
+/// and plain types the template declares beside the function, how the function's `Policies`
+/// are spelled (a list of templates, the single-value form, a managed ARN beside a template)
+/// and how the parameters they carry are stated (a `Ref` to a resource of the same template
+/// and a literal name), how MANY functions the template declares, whether the function's
+/// events make the transform add an API of its own, and whether the body is JSON or YAML.
+///
+/// The first row is the recorded trace's own shape: one function whose shorthand policies
+/// name the table and the bucket declared beside it.
+fn executed_rows() -> Vec<Executed> {
+    vec![
+        Executed {
+            case: "a function whose shorthand policies name the table and the bucket \
+                   declared beside it",
+            stack: "sam-executed-shorthand",
+            change_set: "sam-executed-shorthand-set",
+            template: sam_template(&format!(
+                r#"{{"Items":{{"Type":"AWS::Serverless::SimpleTable",
+                     "Properties":{{"PrimaryKey":{{"Name":"itemId","Type":"String"}}}}}},
+                   "Reports":{{"Type":"AWS::S3::Bucket"}},
+                   {}}}"#,
+                function_with_policies(
+                    "Probe",
+                    r#"[{"DynamoDBCrudPolicy":{"TableName":{"Ref":"Items"}}},
+                        {"S3ReadPolicy":{"BucketName":{"Ref":"Reports"}}}]"#
+                )
+            )),
+            functions: vec![("Probe", 2)],
+            tables: vec!["Items"],
+            buckets: vec!["Reports"],
+        },
+        Executed {
+            case: "the single-value spelling of Policies over a literally named bucket, \
+                   beside a plain DynamoDB table",
+            stack: "sam-executed-literal",
+            change_set: "sam-executed-literal-set",
+            template: sam_template(&format!(
+                r#"{{"Carts":{{"Type":"AWS::DynamoDB::Table","Properties":{{
+                     "TableName":"sam-executed-carts",
+                     "KeySchema":[{{"AttributeName":"cartId","KeyType":"HASH"}}],
+                     "AttributeDefinitions":[{{"AttributeName":"cartId",
+                       "AttributeType":"S"}}],
+                     "BillingMode":"PAY_PER_REQUEST"}}}},
+                   "Assets":{{"Type":"AWS::S3::Bucket",
+                     "Properties":{{"BucketName":"sam-executed-assets"}}}},
+                   {}}}"#,
+                function_with_policies(
+                    "Writer",
+                    r#"{"S3CrudPolicy":{"BucketName":"sam-executed-assets"}}"#
+                )
+            )),
+            functions: vec![("Writer", 1)],
+            tables: vec!["Carts"],
+            buckets: vec!["Assets"],
+        },
+        Executed {
+            case: "two functions sharing one table, one of them naming a managed policy \
+                   beside its template entry",
+            stack: "sam-executed-two-functions",
+            change_set: "sam-executed-two-functions-set",
+            template: sam_template(&format!(
+                r#"{{"Ledger":{{"Type":"AWS::Serverless::SimpleTable"}},{},{}}}"#,
+                function_with_policies(
+                    "Reader",
+                    r#"[{"DynamoDBReadPolicy":{"TableName":{"Ref":"Ledger"}}}]"#
+                ),
+                function_with_policies(
+                    "Appender",
+                    &format!(
+                        r#"["{MANAGED_POLICY_ARN}",
+                            {{"DynamoDBWritePolicy":{{"TableName":{{"Ref":"Ledger"}}}}}}]"#
+                    )
+                )
+            )),
+            // The managed ARN is attached rather than embedded, so the second function's
+            // role carries ONE inline policy for its two entries.
+            functions: vec![("Reader", 1), ("Appender", 1)],
+            tables: vec!["Ledger"],
+            buckets: vec![],
+        },
+        Executed {
+            case: "the YAML spelling, whose function's Api event makes the transform add an \
+                   API of its own",
+            stack: "sam-executed-yaml",
+            change_set: "sam-executed-yaml-set",
+            template: [
+                "Transform: AWS::Serverless-2016-10-31",
+                "Resources:",
+                "  Visits:",
+                "    Type: AWS::Serverless::SimpleTable",
+                "  Greeter:",
+                "    Type: AWS::Serverless::Function",
+                "    Properties:",
+                "      Handler: index.handler",
+                "      Runtime: python3.12",
+                "      CodeUri: s3://code-bucket/greeter.zip",
+                "      Policies:",
+                "        - DynamoDBReadPolicy:",
+                "            TableName: !Ref Visits",
+                "      Events:",
+                "        Hello:",
+                "          Type: Api",
+                "          Properties:",
+                "            Path: /hello",
+                "            Method: get",
+                "",
+            ]
+            .join("\n"),
+            functions: vec![("Greeter", 1)],
+            tables: vec!["Visits"],
+            buckets: vec![],
+        },
+    ]
+}
+
+/// Deploy one row through a `CREATE` change set and answer the resources the settled stack
+/// reports.
+///
+/// Every assertion on the way is part of the rule: the change set must PLAN (reach
+/// `CREATE_COMPLETE`), executing it must be accepted, and the stack must then complete rather
+/// than fail and roll back — which is why the status assertion reports the resource failure
+/// reasons the stack recorded.
+async fn execute_a_change_set(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    row: &Executed,
+) -> Vec<WireResource> {
+    let case = row.case;
+    stage_code_objects(router, case, &row.template).await;
+    let (code, body) = create_change_set(
+        router,
+        row.stack,
+        row.change_set,
+        &[
+            member("ChangeSetType", "CREATE"),
+            member("TemplateBody", &row.template),
+            member("Capabilities.member.1", "CAPABILITY_IAM"),
+            member("Capabilities.member.2", "CAPABILITY_AUTO_EXPAND"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected CreateChangeSet to be accepted, got {code} {body}"
+    );
+    settle_the_store(router, engine).await;
+
+    let (code, body) = describe_change_set(router, row.change_set, Some(row.stack)).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected DescribeChangeSet to answer, got {code} {body}"
+    );
+    let planned = xml_text(&body, "Status");
+    assert_eq!(
+        planned.as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the change set to plan the expansion, got {planned:?} \
+         because {:?}",
+        xml_text(&body, "StatusReason")
+    );
+
+    let (code, body) = execute_change_set(router, row.change_set, Some(row.stack)).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected ExecuteChangeSet to be accepted, got {code} {body}"
+    );
+    settle_the_store(router, engine).await;
+
+    let (code, described) = call(router, "DescribeStacks", &[member("StackName", row.stack)]).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected DescribeStacks to answer, got {code} {described}"
+    );
+    let deployed = xml_text(&described, "StackStatus");
+    assert_eq!(
+        deployed.as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the executed change set to create every resource the \
+         transform expanded, got {deployed:?} because {:?}",
+        failure_reasons(router, row.stack).await
+    );
+
+    let (code, body) = call(
+        router,
+        "DescribeStackResources",
+        &[member("StackName", row.stack)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected DescribeStackResources to answer, got {code} {body}"
+    );
+    wire_resources(&body)
+}
+
+/// The physical resource id the settled stack reports for one logical id.
+fn physical_of(case: &str, deployed: &[WireResource], logical_id: &str) -> String {
+    let found = deployed
+        .iter()
+        .find(|resource| resource.logical_id.as_deref() == Some(logical_id));
+    let resource = found.unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: expected the deployed stack to carry {logical_id}, got {:?}",
+            deployed
+                .iter()
+                .map(|resource| resource.logical_id.clone())
+                .collect::<Vec<_>>()
+        )
+    });
+    resource.physical_id.clone().unwrap_or_else(|| {
+        panic!("case {case:?}: expected a physical id for {logical_id}, got none")
+    })
+}
+
+/// RULE (the deployment-path half): the macro's output is what the stack deploys whichever
+/// operation deployed the template, so executing a `CREATE` change set over a
+/// transform-declaring template creates every EXPANDED resource in the service that owns it
+/// and completes the stack — the generated execution role with the inline policies the
+/// declaration's `Policies` asked for, the table, the bucket and the function — rather than
+/// failing one of them and rolling the stack back.
+#[tokio::test]
+async fn an_executed_change_set_deploys_the_expansion_into_the_owning_services() {
+    let (router, engine) = router_with_engine();
+    for row in executed_rows() {
+        let case = row.case;
+        let deployed = execute_a_change_set(&router, &engine, &row).await;
+
+        // Nothing of the expansion is left failed, unidentified, or still a macro input
+        // type.
+        for resource in &deployed {
+            let logical_id = resource.logical_id.clone().unwrap_or_default();
+            assert_eq!(
+                resource.status.as_deref(),
+                Some("CREATE_COMPLETE"),
+                "case {case:?}: expected {logical_id} to be created, got {resource:?}"
+            );
+            assert!(
+                resource
+                    .physical_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty()),
+                "case {case:?}: expected a physical id for {logical_id}, got {resource:?}"
+            );
+            let resource_type = resource.resource_type.clone().unwrap_or_default();
+            assert!(
+                !resource_type.starts_with(SERVERLESS_TYPE_PREFIX),
+                "case {case:?}: expected no {SERVERLESS_TYPE_PREFIX}* type in the deployed \
+                 stack, got {logical_id} as a {resource_type}"
+            );
+        }
+
+        for (function, inline) in &row.functions {
+            // AWS Lambda holds the function the declaration expanded to, under the name the
+            // stack published for it.
+            let name = physical_of(case, &deployed, function);
+            let answer = lambda(
+                &router,
+                "GET",
+                &format!("/2015-03-31/functions/{name}/configuration"),
+                b"",
+                &[],
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected AWS Lambda to hold the function {name:?} the stack \
+                 published, got {} {:?}",
+                answer.status, answer.body
+            );
+
+            // And IAM holds the execution role the transform generated for it, carrying one
+            // inline policy per embedded `Policies` entry.
+            let role = physical_of(case, &deployed, &format!("{function}Role"));
+            let (code, body) = iam(&router, "GetRole", &[("RoleName", &role)]).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: expected IAM to hold the generated role {role:?}, got {code} \
+                 {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "RoleName").as_deref(),
+                Some(role.as_str()),
+                "case {case:?}: expected the role read back to be the published one, got \
+                 {body}"
+            );
+            let (code, body) = iam(&router, "ListRolePolicies", &[("RoleName", &role)]).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: expected ListRolePolicies({role:?}) to answer, got {code} \
+                 {body}"
+            );
+            let names = xml_texts(&body, "member");
+            assert_eq!(
+                names.len(),
+                *inline,
+                "case {case:?}: expected {inline} inline policies on {role:?}, got {names:?}"
+            );
+        }
+
+        for table in &row.tables {
+            let name = physical_of(case, &deployed, table);
+            let held = describe_table(&router, &name).await;
+            assert_eq!(
+                held.as_ref()
+                    .and_then(|table| table.get("TableStatus"))
+                    .and_then(Value::as_str),
+                Some("ACTIVE"),
+                "case {case:?}: expected Amazon DynamoDB to hold the table {name:?} the \
+                 executed change set created, got {held:?}"
+            );
+        }
+
+        for bucket in &row.buckets {
+            let name = physical_of(case, &deployed, bucket);
+            let answer = s3(&router, "HEAD", &format!("/{name}"), b"").await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected Amazon S3 to hold the bucket {name:?} the executed \
+                 change set created, got {} {}",
+                answer.status, answer.body
+            );
+        }
+    }
+}
+
+/// RULE (the same half, over an UPDATE change set): a change set over a stack that already
+/// exists executes the macro's output too, so a template whose serverless declaration has
+/// grown a policy entry and a bucket updates the generated role and creates the new resource,
+/// and the stack completes.
+#[tokio::test]
+async fn an_executed_update_change_set_applies_the_expansion_it_planned() {
+    let case = "a deployed SAM stack whose function gains a policy entry and a bucket";
+    let (router, engine) = router_with_engine();
+    let row = Executed {
+        case,
+        stack: "sam-executed-update",
+        change_set: "sam-executed-update-create",
+        template: sam_template(&format!(
+            r#"{{"Orders":{{"Type":"AWS::Serverless::SimpleTable"}},{}}}"#,
+            function_with_policies(
+                "Handler",
+                r#"[{"DynamoDBReadPolicy":{"TableName":{"Ref":"Orders"}}}]"#
+            )
+        )),
+        functions: vec![("Handler", 1)],
+        tables: vec!["Orders"],
+        buckets: vec![],
+    };
+    let _ = execute_a_change_set(&router, &engine, &row).await;
+
+    // The same application, one declaration richer: a bucket, and the entry that grants the
+    // function access to it.
+    let grown = sam_template(&format!(
+        r#"{{"Orders":{{"Type":"AWS::Serverless::SimpleTable"}},
+           "Archive":{{"Type":"AWS::S3::Bucket"}},
+           {}}}"#,
+        function_with_policies(
+            "Handler",
+            r#"[{"DynamoDBReadPolicy":{"TableName":{"Ref":"Orders"}}},
+                {"S3WritePolicy":{"BucketName":{"Ref":"Archive"}}}]"#
+        )
+    ));
+    stage_code_objects(&router, case, &grown).await;
+    let change_set = "sam-executed-update-grow";
+    let (code, body) = create_change_set(
+        &router,
+        row.stack,
+        change_set,
+        &[
+            member("ChangeSetType", "UPDATE"),
+            member("TemplateBody", &grown),
+            member("Capabilities.member.1", "CAPABILITY_IAM"),
+            member("Capabilities.member.2", "CAPABILITY_AUTO_EXPAND"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected CreateChangeSet to be accepted, got {code} {body}"
+    );
+    settle_the_store(&router, &engine).await;
+    let (code, body) = execute_change_set(&router, change_set, Some(row.stack)).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected ExecuteChangeSet to be accepted, got {code} {body}"
+    );
+    settle_the_store(&router, &engine).await;
+
+    let (code, described) = call(
+        &router,
+        "DescribeStacks",
+        &[member("StackName", row.stack)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected DescribeStacks to answer, got {code} {described}"
+    );
+    let updated = xml_text(&described, "StackStatus");
+    assert_eq!(
+        updated.as_deref(),
+        Some("UPDATE_COMPLETE"),
+        "case {case:?}: expected the executed change set to apply the expansion it planned, \
+         got {updated:?} because {:?}",
+        failure_reasons(&router, row.stack).await
+    );
+
+    let (code, body) = call(
+        &router,
+        "DescribeStackResources",
+        &[member("StackName", row.stack)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected DescribeStackResources to answer, got {code} {body}"
+    );
+    let deployed = wire_resources(&body);
+
+    // The bucket the grown template declares exists in Amazon S3 now.
+    let bucket = physical_of(case, &deployed, "Archive");
+    let answer = s3(&router, "HEAD", &format!("/{bucket}"), b"").await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected Amazon S3 to hold the bucket the update created, got {} {}",
+        answer.status, answer.body
+    );
+
+    // And the generated role carries one inline policy per entry the grown declaration
+    // states, so the update really re-expanded the shorthand.
+    let role = physical_of(case, &deployed, "HandlerRole");
+    let (code, body) = iam(&router, "ListRolePolicies", &[("RoleName", &role)]).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected ListRolePolicies({role:?}) to answer, got {code} {body}"
+    );
+    let names = xml_texts(&body, "member");
+    assert_eq!(
+        names.len(),
+        2,
+        "case {case:?}: expected the role to carry one inline policy per entry of the grown \
+         declaration, got {names:?}"
+    );
+    let (code, body) = iam(
+        &router,
+        "GetRolePolicy",
+        &[("RoleName", &role), ("PolicyName", "HandlerRolePolicy1")],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: expected the entry the update added to be embedded as \
+         HandlerRolePolicy1, got {code} {body}"
+    );
+    let document = xml_policy_document(&body, "PolicyDocument").unwrap_or_else(|| {
+        panic!("case {case:?}: expected a document for HandlerRolePolicy1, got {body}")
+    });
+    assert!(
+        document.contains("s3:PutObject"),
+        "case {case:?}: expected the added entry's document to grant what its template \
+         grants, got {document:?}"
+    );
 }
