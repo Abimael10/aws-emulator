@@ -640,7 +640,8 @@ pub fn configuration_set_vdm_options(
 }
 
 /// `definition` once every enum-valued member in it carries one of the model's own
-/// values for that member, and the message naming the offending member otherwise.
+/// values for that member, and every destination object it carries names a resource this
+/// service can publish to at all, and the message naming the offending member otherwise.
 ///
 /// One check for every operation that takes an `EventDestinationDefinition`, so the
 /// create of a destination and an update of the same destination cannot accept
@@ -649,6 +650,18 @@ pub fn configuration_set_vdm_options(
 pub fn checked_event_destination_definition(
     definition: crate::ops::types::EventDestinationDefinition,
 ) -> Result<crate::ops::types::EventDestinationDefinition, String> {
+    // An EventBridge destination names the bus the set's events are published onto, and
+    // this service publishes them onto the account's DEFAULT bus alone, so a destination
+    // naming any other bus is one no event could ever arrive on and the request is refused
+    // before anything is stored. The bus rule itself lives with that destination kind
+    // ([`super::event_publication::event_bridge`]).
+    if let Some(refusal) = definition
+        .event_bridge_destination
+        .as_ref()
+        .and_then(super::event_publication::event_bridge::unsupported_bus_refusal)
+    {
+        return Err(refusal.to_string());
+    }
     let matching_event_types = match definition.matching_event_types {
         Some(event_types) => Some(
             event_types

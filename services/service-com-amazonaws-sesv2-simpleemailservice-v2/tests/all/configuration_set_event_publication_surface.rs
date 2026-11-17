@@ -16,13 +16,18 @@
 //! created by name is addressable by that name, an event destination under it is
 //! attachable and then UPDATABLE in place, where the definition an update carries
 //! becomes that destination's whole configuration, and the account report is readable
-//! without having configured anything.
+//! without having configured anything. A destination the service could publish nothing
+//! to is refused instead of established, and a refused call writes nothing: an
+//! EventBridge destination is established only on the account's DEFAULT event bus, which
+//! is the only bus `EventBridgeDestination$EventBusArn` supports.
 //!
 //! The tables below span what the rule generalises over: the form of the configuration
 //! set name, which option objects a create carries, which member of a destination an
 //! update changes (its enabled flag, how many event types it matches, which service it
 //! publishes to, the identity of that service's resource), an update that changes
-//! nothing, and the refusal legs of each operation — a set the account does not hold, a
+//! nothing, which bus an EventBridge destination names (the default bus, with the
+//! partition, Region and account around it varied, and the ways a value names another
+//! bus), and the refusal legs of each operation — a set the account does not hold, a
 //! destination the set does not hold, a name outside the documented character rule and
 //! an enum value outside its modelled value set.
 
@@ -779,4 +784,185 @@ async fn an_update_of_a_resource_the_account_does_not_hold_is_refused_as_not_fou
         after, before,
         "a refused update must change nothing: the destination was {before:?}, then {after:?}"
     );
+}
+
+/// The account's default event bus, in the Region and account these cases call in: the
+/// one bus `EventBridgeDestination$EventBusArn` supports ("Only the default bus is
+/// supported").
+const DEFAULT_BUS: &str = "arn:aws:events:us-east-1:123456789012:event-bus/default";
+
+/// How SES words the refusal of an EventBridge destination naming any other bus: fixed
+/// text, with no variable part.
+const NOT_THE_DEFAULT_BUS: &str = "Invalid Event Bridge destination, must be default bus.";
+
+/// An EventBridge destination publishing to the bus `bus_arn` names.
+fn event_bridge(bus_arn: &str) -> Value {
+    json!({"EventBusArn": bus_arn})
+}
+
+/// One row of the event-bus table: the bus an EventBridge destination names, and whether
+/// a destination naming it is established at all.
+struct EventBusCase {
+    case: &'static str,
+    bus_arn: String,
+    established: bool,
+}
+
+/// The buses the rule is asserted over.
+///
+/// The rows span what it generalises over: for the bus that IS supported, the partition,
+/// the Region and the account the ARN carries around it, none of which decide which bus
+/// it is; and for a value that names another bus, a bus of a client's own name, one
+/// differing from the default bus only in case, one the default bus's name is a prefix
+/// of, one with no name at all, an ARN naming another EventBridge resource type, an ARN
+/// of another vendor, and a value that is no ARN.
+fn event_bus_cases() -> Vec<EventBusCase> {
+    vec![
+        EventBusCase {
+            case: "the default bus of the Region and account the call is made in",
+            bus_arn: DEFAULT_BUS.to_string(),
+            established: true,
+        },
+        EventBusCase {
+            case: "the default bus of another Region",
+            bus_arn: "arn:aws:events:eu-west-2:123456789012:event-bus/default".to_string(),
+            established: true,
+        },
+        EventBusCase {
+            case: "the default bus of another account",
+            bus_arn: "arn:aws:events:us-east-1:111122223333:event-bus/default".to_string(),
+            established: true,
+        },
+        EventBusCase {
+            case: "the default bus of another partition",
+            bus_arn: "arn:aws-us-gov:events:us-gov-west-1:123456789012:event-bus/default"
+                .to_string(),
+            established: true,
+        },
+        EventBusCase {
+            case: "a bus of the client's own name",
+            bus_arn: "arn:aws:events:us-east-1:123456789012:event-bus/email-events".to_string(),
+            established: false,
+        },
+        EventBusCase {
+            case: "a bus named like the default one but in another case",
+            bus_arn: "arn:aws:events:us-east-1:123456789012:event-bus/Default".to_string(),
+            established: false,
+        },
+        EventBusCase {
+            case: "a bus whose name the default bus's name is a prefix of",
+            bus_arn: "arn:aws:events:us-east-1:123456789012:event-bus/default-2".to_string(),
+            established: false,
+        },
+        EventBusCase {
+            case: "an event-bus ARN carrying no bus name",
+            bus_arn: "arn:aws:events:us-east-1:123456789012:event-bus/".to_string(),
+            established: false,
+        },
+        EventBusCase {
+            case: "an EventBridge ARN naming another resource type",
+            bus_arn: "arn:aws:events:us-east-1:123456789012:rule/default".to_string(),
+            established: false,
+        },
+        EventBusCase {
+            case: "an ARN of another vendor",
+            bus_arn: "arn:aws:sqs:us-east-1:123456789012:event-bus/default".to_string(),
+            established: false,
+        },
+        EventBusCase {
+            case: "the bare name of the default bus, which is no ARN",
+            bus_arn: "default".to_string(),
+            established: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_event_bridge_destination_is_established_only_on_the_default_bus() {
+    for EventBusCase {
+        case,
+        bus_arn,
+        established,
+    } in event_bus_cases()
+    {
+        let ses = Ses::new();
+        let set = "bus-set";
+        assert_eq!(
+            ses.create_set(json!({"ConfigurationSetName": set}))
+                .await
+                .status,
+            200,
+            "case {case:?}: creating the configuration set must answer 200"
+        );
+
+        // A destination already on the default bus: what a refused update has to be left
+        // on, and what an accepted one moves off.
+        let control = json!({
+            "Enabled": true,
+            "MatchingEventTypes": ["DELIVERY", "SEND"],
+            "EventBridgeDestination": event_bridge(DEFAULT_BUS),
+        });
+        let attached = ses.create_destination(set, "control", control).await;
+        assert_modelled(
+            &format!("{case}: attaching the control destination"),
+            &attached,
+            &Expected::Success,
+        );
+        let before = destination(&ses, set, "control").await;
+
+        let candidate = json!({
+            "Enabled": true,
+            "MatchingEventTypes": ["SEND"],
+            "EventBridgeDestination": event_bridge(&bus_arn),
+        });
+        let created = ses
+            .create_destination(set, "under-test", candidate.clone())
+            .await;
+        let updated = ses.update_destination(set, "control", candidate).await;
+
+        if established {
+            for (leg, reply) in [("create", &created), ("update", &updated)] {
+                assert_modelled(&format!("{case} ({leg})"), reply, &Expected::Success);
+            }
+            let reported = destination(&ses, set, "under-test").await;
+            assert_eq!(
+                member(&reported, "EventBridgeDestination"),
+                event_bridge(&bus_arn),
+                "case {case:?}: the created destination must report the bus it was created on, \
+                 got {reported:?}"
+            );
+            let control_now = destination(&ses, set, "control").await;
+            assert_eq!(
+                member(&control_now, "EventBridgeDestination"),
+                event_bridge(&bus_arn),
+                "case {case:?}: the updated destination must report the bus the update named, \
+                 got {control_now:?}"
+            );
+        } else {
+            for (leg, reply) in [("create", &created), ("update", &updated)] {
+                assert_modelled(
+                    &format!("{case} ({leg})"),
+                    reply,
+                    &Expected::Refusal(400, "BadRequestException"),
+                );
+                assert_eq!(
+                    reply.message(),
+                    NOT_THE_DEFAULT_BUS,
+                    "case {case:?} ({leg}): expected the message {NOT_THE_DEFAULT_BUS:?}, got {:?}",
+                    reply.message()
+                );
+            }
+            let reported = reported_destination(&ses, set, "under-test").await;
+            assert!(
+                reported.is_none(),
+                "case {case:?}: a refused create must add no destination, got {reported:?}"
+            );
+            let after = destination(&ses, set, "control").await;
+            assert_eq!(
+                after, before,
+                "case {case:?}: a refused update must leave the destination on the bus it was on \
+                 with its other members untouched: it was {before:?}, then {after:?}"
+            );
+        }
+    }
 }
