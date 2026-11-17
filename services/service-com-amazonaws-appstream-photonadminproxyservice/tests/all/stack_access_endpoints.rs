@@ -18,6 +18,12 @@
 //! (one just minted, one minted and then deleted, a well-formed id nothing minted, a value
 //! that is no endpoint id, and no id at all) — asserted through BOTH write paths.
 //!
+//! The reference is resolved WHERE IT IS WRITTEN and nowhere else, which is the second
+//! class driven here: a reference already stored stays on the stack whatever becomes of the
+//! endpoint afterwards — `DescribeStacks` keeps reporting it, and an update that names other
+//! members keeps it — while every write that names an id the account no longer holds is
+//! refused, so the endpoint a stack references is replaced by writing a live one.
+//!
 //! A VPC endpoint is an Amazon EC2 resource, so EC2 is mounted beside this service on ONE
 //! engine and every id a row references was MINTED by it through its own front door: no
 //! identifier written here can pass itself off as one the account holds. Nothing reaches
@@ -259,7 +265,6 @@ async fn rows(emulator: &Emulator) -> Vec<Row> {
         .await
         .expect("EC2 must delete the endpoint this row references");
 
-    let streaming_entry = |vpce_id: &str| json!([{ "EndpointType": "STREAMING", "VpceId": vpce_id }]);
     vec![
         Row {
             case: "an endpoint to the AppStream streaming service".to_string(),
@@ -453,7 +458,7 @@ async fn a_write_is_served_where_the_owner_of_vpc_endpoints_cannot_be_asked() {
     // property of the ENDPOINT rather than of the id's text.
     let single_service = crate::stack_fleet_lifecycle::Emulator::new();
     let case = "an unresolvable endpoint id, with no owner of VPC endpoints mounted";
-    let access_endpoints = json!([{ "EndpointType": "STREAMING", "VpceId": NEVER_MINTED }]);
+    let access_endpoints = streaming_entry(NEVER_MINTED);
     let created = single_service
         .ok(
             case,
@@ -468,6 +473,254 @@ async fn a_write_is_served_where_the_owner_of_vpc_endpoints_cannot_be_asked() {
     );
 }
 
+/// Which `VpceId` a SECOND write names, once a stack already references an endpoint EC2
+/// minted — and, with it, what the row does to the account's endpoints in between.
+#[derive(Clone, Copy)]
+enum Written {
+    /// The endpoint the stack references, which the account still holds.
+    StillHeld,
+    /// The endpoint the stack references, after the account deleted it.
+    Deleted,
+    /// An endpoint minted after the one the stack references was deleted.
+    MintedAfterTheDelete,
+    /// The deleted endpoint, while the account holds a freshly minted one as well — so the
+    /// refusal is about the id's own resolution and not about the account holding none.
+    DeletedBesideAFreshOne,
+    /// A well-formed endpoint id the account never minted.
+    NeverMinted,
+}
+
+/// The rows of the stale-reference class: which id the second write names, and whether the
+/// account holds an endpoint under it at that instant (which is also whether the write is
+/// accepted).
+const STALE_ROWS: [(Written, &str, bool); 5] = [
+    (
+        Written::StillHeld,
+        "the endpoint the stack references, still held by the account",
+        true,
+    ),
+    (
+        Written::Deleted,
+        "the endpoint the stack references, after the account deleted it",
+        false,
+    ),
+    (
+        Written::MintedAfterTheDelete,
+        "an endpoint minted after the one the stack references was deleted",
+        true,
+    ),
+    (
+        Written::DeletedBesideAFreshOne,
+        "the deleted endpoint, while the account holds a freshly minted one",
+        false,
+    ),
+    (
+        Written::NeverMinted,
+        "a well-formed endpoint id the account never minted",
+        false,
+    ),
+];
+
+/// The code the owner of VPC endpoints answers a read naming an endpoint id it holds none
+/// for — the one failure [`resolves`] reads as "the account does not hold it"; any other is
+/// the read itself going wrong, which is no answer about the endpoint.
+const ENDPOINT_ID_NOT_FOUND: &str = "InvalidVpcEndpointId.NotFound";
+
+/// Whether the account still holds a VPC endpoint under `endpoint_id`, asked of the service
+/// that owns endpoints BY ID — the read that answers not-found for an id nothing holds,
+/// which is how a client learns a reference has gone stale.
+async fn resolves(case: &str, ec2: &::aws_sdk_ec2::Client, endpoint_id: &str) -> bool {
+    match ec2
+        .describe_vpc_endpoints()
+        .vpc_endpoint_ids(endpoint_id)
+        .send()
+        .await
+    {
+        Ok(described) => described
+            .vpc_endpoints()
+            .iter()
+            .any(|endpoint| endpoint.vpc_endpoint_id() == Some(endpoint_id)),
+        Err(error) => {
+            let code = ::aws_sdk_ec2::error::ProvideErrorMetadata::code(&error)
+                .unwrap_or("<no code>")
+                .to_string();
+            assert_eq!(
+                code, ENDPOINT_ID_NOT_FOUND,
+                "case {case:?}: the read of {endpoint_id:?} must either answer or report the \
+                 id as unheld, got {code:?}"
+            );
+            false
+        }
+    }
+}
+
+/// One `AccessEndpoints` list referencing `vpce_id` for streaming — the only
+/// `AccessEndpointType` the model declares.
+fn streaming_entry(vpce_id: &str) -> Value {
+    json!([{ "EndpointType": "STREAMING", "VpceId": vpce_id }])
+}
+
+#[tokio::test]
+async fn a_stored_endpoint_reference_lingers_while_every_write_of_a_stale_one_is_refused() {
+    for (written, case, held) in STALE_ROWS {
+        let emulator = Emulator::new();
+        let ec2 = emulator.ec2();
+        let vpc = network(&ec2).await;
+        // The endpoint the stack is created against, and the reference it therefore stores.
+        let referenced = endpoint(&ec2, &vpc, "appstream.streaming").await;
+        let stack = "references-an-endpoint";
+        let attached = streaming_entry(&referenced);
+        emulator
+            .ok(
+                case,
+                "CreateStack",
+                json!({ "Name": stack, "AccessEndpoints": &attached }),
+            )
+            .await;
+
+        // What the row does to the account's endpoints between the two writes.
+        if matches!(
+            written,
+            Written::Deleted | Written::MintedAfterTheDelete | Written::DeletedBesideAFreshOne
+        ) {
+            let deleted = ec2
+                .delete_vpc_endpoints()
+                .vpc_endpoint_ids(&referenced)
+                .send()
+                .await
+                .expect("EC2 must answer the delete of the endpoint the stack references");
+            assert!(
+                deleted.unsuccessful().is_empty(),
+                "case {case:?}: EC2 must delete {referenced:?}, got {:?}",
+                deleted.unsuccessful()
+            );
+        }
+        let fresh = match written {
+            Written::MintedAfterTheDelete | Written::DeletedBesideAFreshOne => {
+                Some(endpoint(&ec2, &vpc, "appstream.streaming").await)
+            }
+            _ => None,
+        };
+        let target = match written {
+            Written::StillHeld | Written::Deleted | Written::DeletedBesideAFreshOne => {
+                referenced.clone()
+            }
+            Written::MintedAfterTheDelete => {
+                fresh.clone().expect("this row minted a fresh endpoint")
+            }
+            Written::NeverMinted => NEVER_MINTED.to_string(),
+        };
+
+        // The premise every row turns on, read the way a client reads it: the account
+        // resolves an endpoint it holds BY ID, and resolves no id it deleted or never minted.
+        let resolved = resolves(case, &ec2, &target).await;
+        assert_eq!(
+            resolved, held,
+            "case {case:?}: the account must {} hold an endpoint under {target:?}, EC2 \
+             resolved it: {resolved}",
+            if held { "" } else { "not" }
+        );
+
+        // The reference ALREADY stored is not resolved again: the stack keeps reporting the
+        // endpoint it was created against, whatever became of that endpoint.
+        assert_eq!(
+            reported_endpoints(&emulator, case, stack).await,
+            attached,
+            "case {case:?}: the stack must keep reporting the endpoint it was created \
+             against"
+        );
+
+        // Nor does a write that names OTHER members resolve it: it is served, and the stored
+        // reference survives it.
+        emulator
+            .ok(
+                case,
+                "UpdateStack",
+                json!({ "Name": stack, "Description": "an update that names no endpoints" }),
+            )
+            .await;
+        assert_eq!(
+            reported_endpoints(&emulator, case, stack).await,
+            attached,
+            "case {case:?}: an update that names no endpoints must leave the stored \
+             reference in place"
+        );
+
+        // A create that WRITES the row's reference resolves it at that instant.
+        let created_name = "created-from-the-reference";
+        let entry = streaming_entry(&target);
+        let create = json!({ "Name": created_name, "AccessEndpoints": &entry });
+        if held {
+            let created = emulator.ok(case, "CreateStack", create).await;
+            assert_eq!(
+                created["Stack"]["AccessEndpoints"], entry,
+                "case {case:?}: the create must report the endpoint it accepted, got \
+                 {created}"
+            );
+            assert_eq!(
+                reported_endpoints(&emulator, case, created_name).await,
+                entry,
+                "case {case:?}: the created stack must report the endpoint the create \
+                 accepted"
+            );
+        } else {
+            refused(
+                &emulator,
+                case,
+                "CreateStack",
+                create,
+                &not_valid_sentence(&target),
+            )
+            .await;
+            let (status, payload) = emulator
+                .call("DescribeStacks", json!({ "Names": [created_name] }))
+                .await;
+            assert_eq!(
+                status, NOT_FOUND_STATUS,
+                "case {case:?}: a refused create must leave {created_name:?} unknown, got \
+                 {status} {payload}"
+            );
+            assert_eq!(
+                error_message(&payload),
+                not_found_sentence(STACK_KIND, created_name),
+                "case {case:?}: the read of {created_name:?} must report it as missing, got \
+                 {payload}"
+            );
+        }
+
+        // And an update that REATTACHES it resolves it the same way: a live endpoint
+        // replaces the stored reference, a stale one is refused and replaces nothing.
+        let update = json!({ "Name": stack, "AccessEndpoints": &entry });
+        if held {
+            let updated = emulator.ok(case, "UpdateStack", update).await;
+            assert_eq!(
+                updated["Stack"]["AccessEndpoints"], entry,
+                "case {case:?}: the update must report the endpoint it attached, got \
+                 {updated}"
+            );
+            assert_eq!(
+                reported_endpoints(&emulator, case, stack).await,
+                entry,
+                "case {case:?}: the stack must report the endpoint the update attached"
+            );
+        } else {
+            refused(
+                &emulator,
+                case,
+                "UpdateStack",
+                update,
+                &not_valid_sentence(&target),
+            )
+            .await;
+            assert_eq!(
+                reported_endpoints(&emulator, case, stack).await,
+                attached,
+                "case {case:?}: a refused reattach must leave the stored reference in place"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_stack_may_reference_an_endpoint_that_is_still_coming_up() {
     // The rule resolves the REFERENCE, not the endpoint's lifecycle: an endpoint the
@@ -479,7 +732,7 @@ async fn a_stack_may_reference_an_endpoint_that_is_still_coming_up() {
     let just_minted = endpoint(&ec2, &vpc, "appstream.streaming").await;
 
     let case = "an endpoint minted in the same breath as the stack";
-    let access_endpoints = json!([{ "EndpointType": "STREAMING", "VpceId": &just_minted }]);
+    let access_endpoints = streaming_entry(&just_minted);
     let created = emulator
         .ok(
             case,
