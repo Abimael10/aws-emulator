@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, error_code, filters};
+use super::ec2_query::{call, element, error_code, tag_report, tagging, DescribedTag};
 
 /// The Region every call here is signed for.
 const REGION: &str = "us-west-2";
@@ -34,9 +34,6 @@ const REGION: &str = "us-west-2";
 fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
 }
-
-/// One request's form parameters, as the ec2Query harness takes them.
-type Params = Vec<(String, String)>;
 
 fn emulator() -> MultiServiceRouter {
     super::ec2_query::emulator().0
@@ -268,60 +265,6 @@ async fn described_tags(
     reported_tags(case, &body)
 }
 
-/// One row of a `DescribeTags` report: the resource, the kind it is reported under, and the
-/// tag.
-type Described = (String, String, String, String);
-
-/// What `DescribeTags` reports for `resource_id`, as a set — "the order of the elements in
-/// the response … might vary" (`DescribeTags`), so nothing here depends on it.
-async fn tag_report(
-    router: &MultiServiceRouter,
-    case: &str,
-    resource_id: &str,
-) -> BTreeSet<Described> {
-    let params = filters(&[("resource-id", &[resource_id])]);
-    let (status, body) = call(router, REGION, "DescribeTags", &params).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: DescribeTags must succeed, got {status}: {body}"
-    );
-    let document = roxmltree::Document::parse(&body)
-        .unwrap_or_else(|error| panic!("case {case:?}: the body must be XML ({error}): {body}"));
-    document
-        .descendants()
-        .filter(|node| node.is_element() && node.tag_name().name() == "tagSet")
-        .flat_map(|set| {
-            set.children()
-                .filter(|node| node.is_element() && node.tag_name().name() == "item")
-                .collect::<Vec<_>>()
-        })
-        .map(|item| {
-            let text = |name: &str| {
-                item.children()
-                    .find(|node| node.is_element() && node.tag_name().name() == name)
-                    .map(|node| node.text().unwrap_or_default().to_string())
-                    .unwrap_or_default()
-            };
-            (
-                text("resourceId"),
-                text("resourceType"),
-                text("key"),
-                text("value"),
-            )
-        })
-        .collect()
-}
-
-/// The `ResourceId.1` and `Tag.N.*` fields of a tagging request.
-fn tagging(resource_id: &str, tags: &[(&str, &str)]) -> Params {
-    let mut params = vec![p("ResourceId.1", resource_id)];
-    for (index, (key, value)) in tags.iter().enumerate() {
-        params.push(p(&format!("Tag.{}.Key", index + 1), *key));
-        params.push(p(&format!("Tag.{}.Value", index + 1), *value));
-    }
-    params
-}
-
 /// Rule 1: a resource of any kind this account holds is tagged, reports its tags through
 /// its own describe and through `DescribeTags`, has a value overwritten by a second write,
 /// and is untagged by `DeleteTags`.
@@ -355,7 +298,7 @@ async fn tags_round_trip_through_every_taggable_resource_kind() {
             kind.name
         );
 
-        let expected_report: BTreeSet<Described> = expected
+        let expected_report: BTreeSet<DescribedTag> = expected
             .iter()
             .map(|(key, value)| {
                 (
@@ -366,7 +309,7 @@ async fn tags_round_trip_through_every_taggable_resource_kind() {
                 )
             })
             .collect();
-        let actual_report = tag_report(&router, &case, &resource_id).await;
+        let actual_report = tag_report(&router, REGION, &case, &resource_id).await;
         assert_eq!(
             actual_report, expected_report,
             "case {case:?}: expected the tag report {expected_report:?}, got {actual_report:?}"

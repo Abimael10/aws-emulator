@@ -415,3 +415,81 @@ pub fn unescaped(xml_text: &str) -> String {
 pub fn error_message(xml: &str) -> String {
     unescaped(&element(xml, "Message").unwrap_or_default())
 }
+
+/// The `ResourceId.N` and `Tag.N.*` form fields of a tagging request (`CreateTags` and
+/// `DeleteTags`), as ec2Query flattens the `Resources` and `Tags` lists into indexed keys.
+///
+/// Lives here, beside the plumbing every suite shares, because more than one suite drives the
+/// tag plane: both halves of it are asked for the one way rather than once per suite.
+pub fn tagging(resource_id: &str, tags: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut params = vec![("ResourceId.1".to_string(), resource_id.to_string())];
+    for (position, (key, value)) in tags.iter().enumerate() {
+        params.push((format!("Tag.{}.Key", position + 1), (*key).to_string()));
+        params.push((format!("Tag.{}.Value", position + 1), (*value).to_string()));
+    }
+    params
+}
+
+/// One row of a `DescribeTags` report: the resource, the kind it is reported under, and the
+/// tag — `(resourceId, resourceType, key, value)`.
+pub type DescribedTag = (String, String, String, String);
+
+/// The `TagSpecification.1.*` form fields that assign `tags` to the one resource of
+/// `resource_type` a create mints, and nothing at all for a create that assigns none.
+///
+/// Beside the tag-plane plumbing above, so a suite that seeds a resource's tags at its create
+/// and a suite that writes them afterwards ask for them the same way.
+pub fn tag_specification(resource_type: &str, tags: &[(&str, &str)]) -> Vec<(String, String)> {
+    if tags.is_empty() {
+        return Vec::new();
+    }
+    let mut params = vec![(
+        "TagSpecification.1.ResourceType".to_string(),
+        resource_type.to_string(),
+    )];
+    for (position, (key, value)) in tags.iter().enumerate() {
+        params.push((
+            format!("TagSpecification.1.Tag.{}.Key", position + 1),
+            (*key).to_string(),
+        ));
+        params.push((
+            format!("TagSpecification.1.Tag.{}.Value", position + 1),
+            (*value).to_string(),
+        ));
+    }
+    params
+}
+
+/// What `DescribeTags` reports for `resource_id`, as a set — "the order of the elements in the
+/// response … might vary" (`DescribeTags`), so nothing a suite asserts depends on it.
+pub async fn tag_report(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    resource_id: &str,
+) -> std::collections::BTreeSet<DescribedTag> {
+    let (status, body) = call(
+        router,
+        region,
+        "DescribeTags",
+        &filters(&[("resource-id", &[resource_id])]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeTags must succeed, got {status} with body {body}"
+    );
+    let parsed = super::wire::document(case, &body);
+    super::wire::set_items(parsed.root_element(), "tagSet")
+        .into_iter()
+        .map(|item| {
+            let text = |name: &str| super::wire::child_text(item, name).unwrap_or_default();
+            (
+                text("resourceId"),
+                text("resourceType"),
+                text("key"),
+                text("value"),
+            )
+        })
+        .collect()
+}
