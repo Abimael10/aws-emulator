@@ -1737,3 +1737,228 @@ async fn the_cluster_ceiling_is_enforced_at_its_bound() {
         "ValidationException",
     );
 }
+
+// ---------------------------------------------------------------------------
+// SetVisibleToAllUsers
+// ---------------------------------------------------------------------------
+
+/// What `DescribeCluster` reports for `VisibleToAllUsers` on `cluster_id`, failing the
+/// case rather than comparing against an absent member: a described cluster always states
+/// the value it holds.
+async fn visible_to_all_users(emr: &Emr, case: &str, cluster_id: &str) -> bool {
+    let cluster = emr.describe_cluster(cluster_id).await;
+    cluster["VisibleToAllUsers"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("case {case:?}: DescribeCluster must state it, got {cluster}"))
+}
+
+/// THE RULE: `SetVisibleToAllUsers` writes the value it was given on every cluster its
+/// `JobFlowIds` batch resolves — "sets the Cluster$VisibleToAllUsers value for an Amazon
+/// EMR cluster" — so a later `DescribeCluster` reports exactly that value, whatever the
+/// shape of the batch, and a cluster the batch does not name keeps the value it held.
+///
+/// The table's rows differ along what the rule generalises over: the value asked for, the
+/// size of the batch, which clusters it names, the order they are named in, whether an id
+/// repeats, and whether the value asked for is the one the cluster already holds — up to
+/// a batch at the cap this member takes.
+#[tokio::test]
+async fn set_visible_to_all_users_writes_the_value_on_every_cluster_it_names() {
+    let emr = Emr::new();
+    let first = emr.run_job_flow(kept_alive_request("first")).await;
+    let second = emr.run_job_flow(kept_alive_request("second")).await;
+    let unnamed = emr.run_job_flow(kept_alive_request("unnamed")).await;
+
+    // A batch at the cap, naming both clusters, so the widest accepted request is a row
+    // of the table too.
+    let at_the_cap: Vec<String> = (0..crate::emr_control_plane::MAX_JOB_FLOW_IDS_PER_REQUEST)
+        .map(|index| {
+            if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            }
+        })
+        .collect();
+
+    // (the case, the batch, the value asked for, what each of the two clusters holds after)
+    let cases: Vec<(&str, Vec<String>, bool, bool, bool)> = vec![
+        ("the first cluster, false", vec![first.clone()], false, false, true),
+        (
+            "the second cluster, false",
+            vec![second.clone()],
+            false,
+            false,
+            false,
+        ),
+        (
+            "both clusters, true",
+            vec![first.clone(), second.clone()],
+            true,
+            true,
+            true,
+        ),
+        (
+            "both clusters, false, named the other way round",
+            vec![second.clone(), first.clone()],
+            false,
+            false,
+            false,
+        ),
+        (
+            "the first cluster twice, true",
+            vec![first.clone(), first.clone()],
+            true,
+            true,
+            false,
+        ),
+        (
+            "the first cluster again, true: the value it already holds",
+            vec![first.clone()],
+            true,
+            true,
+            false,
+        ),
+        ("a batch at the cap, true", at_the_cap, true, true, true),
+    ];
+
+    for (case, ids, asked, expected_first, expected_second) in cases {
+        emr.ok(
+            "SetVisibleToAllUsers",
+            json!({ "JobFlowIds": &ids, "VisibleToAllUsers": asked }),
+        )
+        .await;
+
+        let said = visible_to_all_users(&emr, case, &first).await;
+        assert_eq!(
+            said, expected_first,
+            "case {case:?}: the first cluster must report {expected_first}, got {said}"
+        );
+        let said = visible_to_all_users(&emr, case, &second).await;
+        assert_eq!(
+            said, expected_second,
+            "case {case:?}: the second cluster must report {expected_second}, got {said}"
+        );
+        let said = visible_to_all_users(&emr, case, &unnamed).await;
+        assert!(
+            said,
+            "case {case:?}: a cluster the batch did not name keeps its launch value, got \
+             {said}"
+        );
+    }
+}
+
+/// THE RULE on the refusal: a batch carrying an id the service resolves no cluster for is
+/// refused through the 400 `ValidationException` channel — this operation models no client
+/// error — with the legacy job-flow surface's CONSTANT sentence, and writes nothing,
+/// wherever the unresolvable id sits in the batch and whichever value the call asked for.
+#[tokio::test]
+async fn set_visible_to_all_users_refuses_a_batch_naming_an_unknown_job_flow() {
+    let emr = Emr::new();
+    let known = emr.run_job_flow(kept_alive_request("known")).await;
+
+    // A value the launch does not leave behind, so a refused batch that wrote anything
+    // would show up as a change.
+    emr.ok(
+        "SetVisibleToAllUsers",
+        json!({ "JobFlowIds": [&known], "VisibleToAllUsers": false }),
+    )
+    .await;
+
+    for unknown in crate::emr_control_plane::UNKNOWN_CLUSTER_IDS {
+        let batches: Vec<(&str, Vec<&str>)> = vec![
+            ("the unresolvable id alone", vec![unknown]),
+            (
+                "the unresolvable id after a known one",
+                vec![known.as_str(), unknown],
+            ),
+            (
+                "the unresolvable id before a known one",
+                vec![unknown, known.as_str()],
+            ),
+            ("the same unresolvable id twice", vec![unknown, unknown]),
+        ];
+        for (label, ids) in batches {
+            for asked in [true, false] {
+                let case = format!("{label} ({unknown:?}), VisibleToAllUsers {asked}");
+                let (status, payload) = emr
+                    .call(
+                        "SetVisibleToAllUsers",
+                        json!({ "JobFlowIds": &ids, "VisibleToAllUsers": asked }),
+                    )
+                    .await;
+                assert_refused(&case, status, &payload, "ValidationException");
+                let said = crate::refusal_messages::message(&case, &payload);
+                assert_eq!(
+                    said,
+                    crate::refusal_wording::JOB_FLOW_SENTENCE,
+                    "case {case:?}: expected {:?}, got {payload}",
+                    crate::refusal_wording::JOB_FLOW_SENTENCE
+                );
+
+                let reported = visible_to_all_users(&emr, &case, &known).await;
+                assert!(
+                    !reported,
+                    "case {case:?}: a refused batch must write nothing, got {reported}"
+                );
+            }
+        }
+    }
+
+    // The control: the same call on the id it DOES resolve is served, so every refusal
+    // above was a lookup rather than a blanket refusal of the operation.
+    emr.ok(
+        "SetVisibleToAllUsers",
+        json!({ "JobFlowIds": [&known], "VisibleToAllUsers": true }),
+    )
+    .await;
+    let reported = visible_to_all_users(&emr, "the resolvable id", &known).await;
+    assert!(
+        reported,
+        "case \"the resolvable id\": the write must be reported back, got {reported}"
+    );
+}
+
+/// A batch of job flow ids is capped at the number `TerminateJobFlows` publishes for the
+/// identical member ("The maximum number of clusters allowed is 10"), since this
+/// operation's own model publishes none: a batch AT the bound is applied and one past it
+/// is refused before any cluster is touched.
+#[tokio::test]
+async fn set_visible_to_all_users_caps_the_batch_of_job_flow_ids() {
+    let emr = Emr::new();
+    let cluster_id = emr.run_job_flow(kept_alive_request("batched")).await;
+
+    let at_the_bound: Vec<&String> = (0..crate::emr_control_plane::MAX_JOB_FLOW_IDS_PER_REQUEST)
+        .map(|_| &cluster_id)
+        .collect();
+    emr.ok(
+        "SetVisibleToAllUsers",
+        json!({ "JobFlowIds": at_the_bound, "VisibleToAllUsers": false }),
+    )
+    .await;
+    let reported = visible_to_all_users(&emr, "at the maximum", &cluster_id).await;
+    assert!(
+        !reported,
+        "case \"at the maximum\": the batch must be applied, got {reported}"
+    );
+
+    let past_the_bound: Vec<&String> = (0..=crate::emr_control_plane::MAX_JOB_FLOW_IDS_PER_REQUEST)
+        .map(|_| &cluster_id)
+        .collect();
+    let (status, payload) = emr
+        .call(
+            "SetVisibleToAllUsers",
+            json!({ "JobFlowIds": past_the_bound, "VisibleToAllUsers": true }),
+        )
+        .await;
+    assert_refused(
+        "one job flow id past the maximum",
+        status,
+        &payload,
+        "ValidationException",
+    );
+    let reported = visible_to_all_users(&emr, "past the maximum", &cluster_id).await;
+    assert!(
+        !reported,
+        "case \"past the maximum\": a refused batch must change nothing, got {reported}"
+    );
+}
