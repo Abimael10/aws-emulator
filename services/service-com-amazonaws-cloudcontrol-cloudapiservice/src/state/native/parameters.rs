@@ -21,7 +21,11 @@
 //! * `Name`, the parameter's own name, which is its primary identifier;
 //! * `Type` and `Value`, the two the schema declares `required`;
 //! * `Description`, `Tier` and `DataType`, each a member `PutParameter` takes under the
-//!   same name and each carried by the version the owning store holds;
+//!   same name and each carried by the version the owning store holds — of which
+//!   `Description` and `Tier` are among the properties the schema declares write-only, so
+//!   the model this API REPORTS carries neither ([`crate::state::reported_model`]): they
+//!   take effect on the parameter, and the owning service's own reads are what report
+//!   them;
 //! * `Tags`, which this type publishes as a MAP of tag key to tag value rather than as the
 //!   `[{ Key, Value }]` list most types declare — so the tag set is read and reported here
 //!   rather than through the shared list reading the other providers use;
@@ -32,7 +36,7 @@
 //!
 //! The schema's remaining properties are ones THIS path cannot apply, so a model that asks
 //! for one is refused rather than accepted and dropped — a property a caller sets has to be
-//! one a later read reports:
+//! one the owning service then holds:
 //!
 //! * `AllowedPattern`, because it is "a regular expression used to validate the parameter
 //!   value" that the owning service evaluates against the value of every write it accepts,
@@ -41,9 +45,12 @@
 //! * `Policies`, because a policy document is one the owning service validates, admits only
 //!   on an advanced parameter and then enforces on a schedule of its own.
 //!
-//! A model may still CARRY either of them with the value the parameter already holds —
-//! every read reports them, so a model a client round-trips carries them — which is what
-//! lets an update patch something else on a parameter that has one.
+//! A model may still CARRY either of them with the value the parameter already holds — the
+//! owning service's own read reports them, so a model assembled from there carries them —
+//! which is what lets an update patch something else on a parameter that has one. Carrying
+//! one unchanged asks for nothing, and a parameter keeps the pattern and the policies it
+//! holds across every write here ([`DesiredModel::version`]), so a model that names
+//! neither — which is every model this API reports — asks for nothing either.
 //!
 //! Two further rules of the owning service hold of every answer here:
 //!
@@ -92,8 +99,8 @@ const TIER: &str = "Tier";
 const DATA_TYPE: &str = "DataType";
 
 /// The regular expression the owning service validates the value against
-/// (`AllowedPattern`) — reported by a read, and applied by nothing here (see this module's
-/// header).
+/// (`AllowedPattern`) — one of the schema's write-only properties, and applied by nothing
+/// here (see this module's header).
 const ALLOWED_PATTERN: &str = "AllowedPattern";
 
 /// The parameter policies the owning service holds on the parameter (`Policies`), applied
@@ -325,6 +332,11 @@ fn parameters_quota_message() -> String {
 /// and no tags carries none of those properties, the same way the owning service's own
 /// reader reports none.
 ///
+/// This is the model of the parameter AS IT IS, which is what a patch is applied to; what
+/// a client is REPORTED is this model projected as the type's schema serialises it, so the
+/// properties the schema declares write-only reach no response
+/// ([`crate::state::reported_model`]).
+///
 /// `None` for a record carrying no version at all, which the owning store never holds: a
 /// parameter IS its versions, so there would be no value, type or tier to report.
 fn model(record: &ssm::ParameterRecord) -> Option<Value> {
@@ -489,10 +501,10 @@ impl DesiredModel {
     /// Read `properties` as the model of the parameter `name`, which the owning service
     /// holds `held` for — or state why that service would not take it.
     ///
-    /// The identity and every property this path does not apply may be CARRIED (a read
-    /// reports them, so a model a client round-trips carries them) but only with the value
-    /// the parameter already holds: a value accepted here and never applied would be one no
-    /// later read reports.
+    /// The identity and every property this path does not apply may be CARRIED (the
+    /// parameter's own reads report them, so a model assembled from there carries them) but
+    /// only with the value the parameter already holds: a value accepted here and never
+    /// applied would be one nothing ever reports.
     fn read(name: &str, properties: &Value, held: &Held) -> Result<Self, NativeRefusal> {
         let Some(model) = properties.as_object() else {
             return Err(NativeRefusal::Invalid(format!(

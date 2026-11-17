@@ -334,7 +334,8 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
         };
         record.pending = None;
         record.retry_after = None;
-        record.resource_model = model.map(|model| super::rendered_properties(&model));
+        record.resource_model =
+            model.map(|model| super::rendered_properties(&record.type_name, &model));
         record.operation_status = STATUS_SUCCESS.to_string();
     }
 

@@ -608,11 +608,11 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                     properties, region, ..
                 } => provider
                     .create(&region, &identifier, &properties, now)
-                    .map(|model| Some(rendered_properties(&model)))
+                    .map(|model| Some(rendered_properties(&record.type_name, &model)))
                     .map_err(EffectFailure::from),
                 ResourceEffect::Update { properties, region } => provider
                     .update(&region, &identifier, &properties, now)
-                    .map(|model| Some(rendered_properties(&model)))
+                    .map(|model| Some(rendered_properties(&record.type_name, &model)))
                     .map_err(EffectFailure::from),
                 ResourceEffect::Delete { region } => provider
                     .delete(&region, &identifier, now)
@@ -636,7 +636,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 if self.resources.contains_key(&key) {
                     return Err(EffectFailure::ResourceExists);
                 }
-                let model = rendered_properties(&properties);
+                let model = rendered_properties(&record.type_name, &properties);
                 self.resources.insert(
                     key,
                     StoredResource {
@@ -661,7 +661,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                     .ok_or(EffectFailure::ResourceGone)?;
                 stored.properties = properties;
                 stored.updated_at = now;
-                Ok(Some(rendered_properties(&stored.properties)))
+                Ok(Some(rendered_properties(&record.type_name, &stored.properties)))
             }
             ResourceEffect::Delete { .. } => {
                 // A delete is accepted before the resource is looked for — the existence
@@ -1236,11 +1236,12 @@ pub fn parse_properties(member: &str, desired_state: &str) -> Result<Value, Stri
     Ok(parsed)
 }
 
-/// One resource model as the wire carries it: a JSON string of each property and its
-/// current value.
-pub fn rendered_properties(properties: &Value) -> String {
+/// One resource model of `type_name` as the wire carries it: a JSON string of each property
+/// this service REPORTS for the resource and its current value — the model projected as the
+/// type's schema serialises it ([`reported_model`]).
+pub fn rendered_properties(type_name: &str, properties: &Value) -> String {
     // `Value`'s own rendering is infallible, so a resource model is never unreportable.
-    properties.to_string()
+    reported_model(type_name, properties).to_string()
 }
 
 /// The most operations one `PatchDocument` may carry.
@@ -2232,6 +2233,36 @@ pub fn write_only_message(properties: &[&str]) -> String {
     )
 }
 
+/// One resource model of `type_name` as this service REPORTS it: the properties the
+/// resource carries, WITHOUT any the type's registry schema declares
+/// `writeOnlyProperties` ([`write_only_properties`]).
+///
+/// A resource model is serialised from the resource type's schema, and a write-only
+/// property is one a caller SETS that the type's READ handler does not report — so it is
+/// part of no model this service reports, neither the `Properties` of a
+/// `ResourceDescription` nor the `ResourceModel` of a `ProgressEvent`. A client that
+/// round-trips a reported model into a later request, or diffs one against a desired state,
+/// therefore never sees a property no read of the resource would answer with, and a value
+/// the schema keeps out of the model is reported by nothing here.
+///
+/// The value itself is untouched where the resource LIVES: it was applied, and the owning
+/// service's own API is what reports it. A property is matched by the name the schema
+/// spells it with, which is the name a model carries it under, and a type whose schema
+/// declares no write-only property is reported exactly as it is.
+pub fn reported_model(type_name: &str, properties: &Value) -> Value {
+    let write_only = write_only_properties(type_name);
+    let Some(model) = properties.as_object().filter(|_| !write_only.is_empty()) else {
+        return properties.clone();
+    };
+    Value::Object(
+        model
+            .iter()
+            .filter(|(property, _)| !write_only.contains(&property.as_str()))
+            .map(|(property, value)| (property.clone(), value.clone()))
+            .collect(),
+    )
+}
+
 /// How a mutating operation words a `PatchDocument` its reader would not take, with the
 /// prefix Cloud Control API states such a refusal behind.
 pub fn invalid_patch_document_message(detail: &str) -> String {
@@ -2383,7 +2414,7 @@ pub fn resource_description(
 ) -> crate::ops::types::ResourceDescription {
     crate::ops::types::ResourceDescription {
         identifier: Some(resolved.identifier.clone()),
-        properties: Some(rendered_properties(&resolved.properties)),
+        properties: Some(rendered_properties(&resolved.type_name, &resolved.properties)),
     }
 }
 

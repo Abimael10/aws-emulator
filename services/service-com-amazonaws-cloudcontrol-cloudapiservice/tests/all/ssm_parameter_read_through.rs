@@ -21,6 +21,13 @@
 //! the same rule for the `AWS::SNS::*`, `AWS::SQS::*` and `AWS::Logs::*` types, so what is
 //! asserted across the suites is where a resource LIVES rather than anything about one
 //! owning service.
+//!
+//! The last two cases here hold the service to a second rule, about WHICH properties such a
+//! model carries: **a resource model this service reports is serialised from the resource
+//! type's schema without the properties that schema declares `writeOnlyProperties`, so a
+//! property a caller only ever SETS is in no `ResourceDescription.Properties` and no
+//! `ProgressEvent.ResourceModel`** — it takes effect on the resource, and the owning
+//! service's own reads are what report it.
 
 use serde_json::{json, Value};
 
@@ -31,6 +38,21 @@ use super::refusal_wording::{assert_handler_not_found, generic_not_found};
 
 /// The type whose resources live in the Systems Manager service's own store.
 const PARAMETER: &str = "AWS::SSM::Parameter";
+
+/// The properties of this type a caller SETS and no read of the resource reports.
+///
+/// Catalog source: the `writeOnlyProperties` of the `AWS::SSM::Parameter` resource provider
+/// schema, with the `/properties/` prefix of each pointer dropped. The emulator's own
+/// catalogue of that list is pinned to this one below, so a case here holds the service to
+/// the schema rather than to the catalogue.
+const WRITE_ONLY: [&str; 4] = ["AllowedPattern", "Description", "Policies", "Tier"];
+
+/// The properties of this type every model reported for a parameter carries: its identity,
+/// the two the schema declares required, and the data type the owning service resolved.
+///
+/// Catalog source: the same schema's `properties`, less the write-only ones above, less the
+/// optional `Tags` a parameter need not carry.
+const READABLE: [&str; 5] = ["Name", "Arn", "Type", "Value", "DataType"];
 
 /// The ARN of the parameter called `name`, built by the OWNING service's own ARN builder so
 /// a case pins the ARN Cloud Control API reported to the one that service holds rather than
@@ -103,7 +125,6 @@ fn native_rows() -> [NativeRow<'static>; 4] {
                 "Arn": parameter_arn("native-original"),
                 "Type": "String",
                 "Value": "native-original-value",
-                "Tier": "Standard",
                 "DataType": "text",
                 "Tags": { "owner": "platform" },
             }),
@@ -117,14 +138,14 @@ fn native_rows() -> [NativeRow<'static>; 4] {
                 "Type": "String",
                 "Description": "where the database listens",
             }),
+            // Neither the description the put carried nor the tier the owning service
+            // resolved is in the model: both are write-only properties of this type.
             json!({
                 "Name": "/app/db/url",
                 "Arn": parameter_arn("/app/db/url"),
                 "Type": "String",
                 "Value": "postgres://db.internal:5432",
-                "Tier": "Standard",
                 "DataType": "text",
-                "Description": "where the database listens",
             }),
         ),
         (
@@ -140,7 +161,6 @@ fn native_rows() -> [NativeRow<'static>; 4] {
                 "Arn": parameter_arn("/app/db/hosts"),
                 "Type": "StringList",
                 "Value": "one.internal,two.internal,three.internal",
-                "Tier": "Standard",
                 "DataType": "text",
             }),
         ),
@@ -159,7 +179,6 @@ fn native_rows() -> [NativeRow<'static>; 4] {
                 "Arn": parameter_arn("advanced-image"),
                 "Type": "String",
                 "Value": "ami-0123456789abcdef0",
-                "Tier": "Advanced",
                 "DataType": "aws:ec2:image",
             }),
         ),
@@ -385,9 +404,18 @@ async fn a_parameter_created_through_cloud_control_is_the_parameter_systems_mana
         );
 
         // And Cloud Control API reads back the model that service holds: the desired state
-        // plus the tier and data type the owning service resolved for it.
+        // without the properties the schema declares write-only, plus the data type the
+        // owning service resolved for it.
         let (_, model) = resolved(&emulator, case, name).await;
         for (property, expected) in desired.as_object().expect("an object of properties") {
+            if WRITE_ONLY.contains(&property.as_str()) {
+                assert!(
+                    model.get(property).is_none(),
+                    "case {case:?} ({property}): a write-only property must be reported by \
+                     nothing, got {model:?}"
+                );
+                continue;
+            }
             assert_eq!(
                 &model[property], expected,
                 "case {case:?} ({property}): expected {expected:?}, got {:?}",
@@ -400,13 +428,10 @@ async fn a_parameter_created_through_cloud_control_is_the_parameter_systems_mana
             "case {case:?}: expected the owning service's own default data type, got \
              {model:?}"
         );
-        assert_eq!(
-            model["Tier"],
-            desired
-                .get("Tier")
-                .cloned()
-                .unwrap_or_else(|| json!("Standard")),
-            "case {case:?}: expected the tier the owning service resolved, got {model:?}"
+        assert!(
+            model.get("Tier").is_none(),
+            "case {case:?}: the tier is write-only, so no reported model carries it, got \
+             {model:?}"
         );
         assert_eq!(
             model["Arn"],
@@ -599,4 +624,232 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
              body {body:?}"
         );
     }
+}
+
+/// The `ParameterMetadata` the OWNING service's own describe reports for `name`, required
+/// to be answered — the read that reports the properties this type declares write-only.
+async fn described(emulator: &Emulator, case: &str, name: &str) -> Value {
+    let reported = emulator
+        .ssm_ok(
+            "DescribeParameters",
+            json!({
+                "ParameterFilters": [{ "Key": "Name", "Option": "Equals", "Values": [name] }],
+            }),
+        )
+        .await;
+    reported["Parameters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|parameter| parameter["Name"] == json!(name))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: ssm:DescribeParameters must report the parameter {name:?}, got \
+                 {reported:?}"
+            )
+        })
+}
+
+/// The resource model `ListResources` reports for the parameter `name`, required to be in
+/// the type's inventory.
+async fn listed(emulator: &Emulator, case: &str, name: &str) -> Value {
+    let page = emulator.list(PARAMETER, None, None).await;
+    let found = descriptions(&page)
+        .into_iter()
+        .find(|description| text(description, "Identifier") == name)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: ListResources must report the parameter {name:?}, got {page:?}")
+        });
+    properties_of(&found)
+}
+
+/// Assert that `model` carries no property the type's schema declares write-only, and every
+/// property a read of a parameter reports.
+fn assert_projection(model: &Value, case: &str, source: &str) {
+    for property in WRITE_ONLY {
+        assert!(
+            model.get(property).is_none(),
+            "case {case:?} ({source}, {property}): a write-only property is in no resource \
+             model this service reports, got {model:?}"
+        );
+    }
+    for property in READABLE {
+        assert!(
+            model.get(property).is_some(),
+            "case {case:?} ({source}, {property}): a readable property must be reported, got \
+             {model:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_write_only_property_is_in_no_resource_model_this_service_reports() {
+    // The list the service projects a reported model through is the schema's own, so the
+    // cases below hold this service to the resource type's schema rather than to a
+    // catalogue of its own.
+    let catalogued = service_com_amazonaws_cloudcontrol_cloudapiservice::state::write_only_properties(
+        PARAMETER,
+    );
+    assert_eq!(
+        catalogued, WRITE_ONLY,
+        "expected the schema's writeOnlyProperties, got {catalogued:?}"
+    );
+
+    let emulator = Emulator::with_ssm();
+    // The rows differ along WHICH of the type's write-only properties the parameter
+    // carries, and how many: the tier every parameter is served in and nothing else, a
+    // description beside it, a pattern beside that, and all four at once on an advanced
+    // parameter. Every put is the OWNING service's own, so each of these properties did
+    // take effect on the parameter it names.
+    let rows: [(&str, &str, Value); 4] = [
+        (
+            "no write-only property beyond the tier every parameter has",
+            "/write-only/bare",
+            json!({ "Name": "/write-only/bare", "Type": "StringList", "Value": "one,two" }),
+        ),
+        (
+            "a description",
+            "/write-only/described",
+            json!({
+                "Name": "/write-only/described",
+                "Type": "String",
+                "Value": "abc123",
+                "Description": "desc-v1",
+            }),
+        ),
+        (
+            "a description and the pattern the value is validated against",
+            "/write-only/patterned",
+            json!({
+                "Name": "/write-only/patterned",
+                "Type": "String",
+                "Value": "42",
+                "Description": "digits only",
+                "AllowedPattern": "^[0-9]+$",
+            }),
+        ),
+        (
+            "every write-only property at once, on an advanced parameter",
+            "/write-only/advanced",
+            json!({
+                "Name": "/write-only/advanced",
+                "Type": "String",
+                "Value": "abc123",
+                "Description": "desc-v1",
+                "AllowedPattern": "^[a-zA-Z0-9]+$",
+                "Tier": "Advanced",
+                "Policies": "[{\"Type\":\"Expiration\",\"Version\":\"1.0\"}]",
+            }),
+        ),
+    ];
+
+    for (case, name, put) in rows {
+        emulator.ssm_ok("PutParameter", put.clone()).await;
+        let metadata = described(&emulator, case, name).await;
+        // Each write-only property the put carried is one the OWNING service reports...
+        for property in WRITE_ONLY {
+            let Some(sent) = put.get(property).and_then(Value::as_str) else {
+                continue;
+            };
+            if property == "Policies" {
+                // Reported as the policy list the document parsed to rather than as the
+                // document, so what is pinned here is that the parameter carries policies.
+                assert!(
+                    metadata[property]
+                        .as_array()
+                        .is_some_and(|policies| !policies.is_empty()),
+                    "case {case:?}: the owning service must report the policies the put \
+                     carried, got {metadata:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                metadata[property],
+                json!(sent),
+                "case {case:?} ({property}): expected the owning service to report {sent:?}, \
+                 got {metadata:?}"
+            );
+        }
+        // ...the tier included, which that service resolves for every parameter whether a
+        // write names one or not.
+        assert!(
+            metadata["Tier"]
+                .as_str()
+                .is_some_and(|tier| !tier.is_empty()),
+            "case {case:?}: the owning service must report the tier it resolved, got \
+             {metadata:?}"
+        );
+
+        // ...and one no model THIS service reports carries, whichever read reports it.
+        for (source, model) in [
+            ("GetResource", resolved(&emulator, case, name).await.1),
+            ("ListResources", listed(&emulator, case, name).await),
+        ] {
+            assert_projection(&model, case, source);
+            assert_eq!(
+                model["Value"], put["Value"],
+                "case {case:?} ({source}): expected the value the parameter holds, got \
+                 {model:?}"
+            );
+        }
+    }
+}
+
+/// Assert that the resource model `event` reports is projected as the schema serialises it,
+/// while the OWNING service reports the write-only values the request applied: the
+/// `description` it set, and the tier it is served in.
+async fn assert_settled_model(emulator: &Emulator, case: &str, event: &Value, description: &str) {
+    let model: Value = serde_json::from_str(&text(event, "ResourceModel"))
+        .unwrap_or_else(|_| panic!("case {case:?}: expected a resource model, got {event:?}"));
+    assert_projection(&model, case, "ProgressEvent.ResourceModel");
+    // What the model leaves out is a value that DID take effect: the owning service reports
+    // the description the request applied, and the tier the resource is served in.
+    let name = text(event, "Identifier");
+    let metadata = described(emulator, case, &name).await;
+    assert_eq!(
+        metadata["Description"],
+        json!(description),
+        "case {case:?}: expected the owning service to report the description the request \
+         applied, got {metadata:?}"
+    );
+    assert_eq!(
+        metadata["Tier"],
+        json!("Advanced"),
+        "case {case:?}: expected the owning service to report the tier the create asked for, \
+         got {metadata:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_model_a_mutating_request_leaves_behind_carries_no_write_only_property() {
+    let emulator = Emulator::with_ssm();
+    let name = "/write-only/progress";
+    // The two requests differ along WHICH one leaves the model behind: a create whose
+    // desired state carries two of the type's write-only properties, and the one patch
+    // operation a write-only property may be named by.
+    let created = emulator
+        .create_ok(
+            PARAMETER,
+            &json!({
+                "Name": name,
+                "Type": "String",
+                "Value": "v1",
+                "Description": "set by the create",
+                "Tier": "Advanced",
+            }),
+            None,
+        )
+        .await;
+    let created = emulator.settled(&text(&created, "RequestToken")).await;
+    assert_settled_model(&emulator, "the create", &created, "set by the create").await;
+
+    let patched = emulator
+        .update_and_settle(
+            PARAMETER,
+            name,
+            &json!([{ "op": "add", "path": "/Description", "value": "set by the patch" }]),
+        )
+        .await;
+    assert_settled_model(&emulator, "the patch", &patched, "set by the patch").await;
 }
