@@ -8,6 +8,13 @@
 //! nothing to it, a create replayed under one `clientToken` contributes ONE entry, and
 //! `ListBrowsers`'s `type` filter selects between the browsers this account created and
 //! the browser tool the SERVICE provides in every account.
+//!
+//! `ListConfigurationBundles` is `@paginated`, so the same rule holds one page at a time:
+//! a page holds at most the caller's `maxResults` summaries in ascending `bundleId` order
+//! and hands back a `nextToken` that resumes strictly after the entry it was issued for,
+//! so the pages of any size concatenate to every bundle the account holds, reported
+//! exactly once; a `maxResults` outside the modelled range, and a `nextToken` this service
+//! never issued, are the modelled 400.
 
 use std::sync::Arc;
 
@@ -75,7 +82,30 @@ async fn list_browsers(router: &MultiServiceRouter, kind: Option<&str>) -> (u16,
 
 /// `ListConfigurationBundles`: `POST /configuration-bundles`.
 async fn list_bundles(router: &MultiServiceRouter) -> (u16, Value) {
-    send(router, "POST", "/configuration-bundles", Some(&json!({}))).await
+    list_bundles_paged(router, None, None).await
+}
+
+/// `ListConfigurationBundles` with `maxResults` and `nextToken` on the query string, where
+/// the model binds them (`smithy_query(query="operation",
+/// operation="ListConfigurationBundles")`).
+async fn list_bundles_paged(
+    router: &MultiServiceRouter,
+    max_results: Option<i64>,
+    next_token: Option<&str>,
+) -> (u16, Value) {
+    let mut query = Vec::new();
+    if let Some(max) = max_results {
+        query.push(format!("maxResults={max}"));
+    }
+    if let Some(token) = next_token {
+        query.push(format!("nextToken={token}"));
+    }
+    let uri = if query.is_empty() {
+        "/configuration-bundles".to_string()
+    } else {
+        format!("/configuration-bundles?{}", query.join("&"))
+    };
+    send(router, "POST", &uri, Some(&json!({}))).await
 }
 
 /// The error code `restJson1` puts in `__type` / `x-amzn-errortype`.
@@ -350,5 +380,330 @@ async fn a_bundle_create_replayed_under_one_token_holds_one_bundle() {
             ]
         ),
         "the listing reports every bundle once, got {status} ({listed})"
+    );
+}
+
+/// The modelled bounds of `ListConfigurationBundles`' `maxResults` (range 1..100, from
+/// `smithy_query(query="operation", operation="ListConfigurationBundles")`). The model
+/// states no other ceiling and no default for it, so a caller naming none gets a page of
+/// that modelled maximum.
+const MAX_RESULTS_MIN: i64 = 1;
+const MAX_RESULTS_MAX: i64 = 100;
+
+/// How many bundles the paging tests seed: more than every page size they ask for below
+/// the modelled maximum, so each of those rows has something left over to resume from.
+const PAGED_BUNDLES: usize = 7;
+
+/// `CreateConfigurationBundle`: `POST /configuration-bundles/create`, answering HTTP 201.
+/// Hands back the `bundleId` the create minted.
+///
+/// `bundleName` is `^[a-zA-Z][a-zA-Z0-9_]{0,99}$` and `description` is 1..500 characters
+/// (`smithy_query(query="operation", operation="CreateConfigurationBundle")`), so every
+/// value built here is inside both.
+async fn create_bundle(
+    router: &MultiServiceRouter,
+    name: &str,
+    description: Option<&str>,
+) -> String {
+    let mut body = json!({
+        "bundleName": name,
+        "components": {"runtime": {"configuration": {"model": "a-model"}}},
+    });
+    if let Some(description) = description {
+        body["description"] = json!(description);
+    }
+    let (status, created) =
+        send(router, "POST", "/configuration-bundles/create", Some(&body)).await;
+    assert_eq!(
+        status, 201,
+        "case {name:?}: expected HTTP 201 from CreateConfigurationBundle, got {status} \
+         ({created})"
+    );
+    created["bundleId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {name:?}: the create reported no bundleId ({created})"))
+        .to_string()
+}
+
+/// The `bundleId`s a listing reported, in the order it reported them.
+fn listed_bundle_ids(body: &Value) -> Vec<String> {
+    body["bundles"]
+        .as_array()
+        .map(|bundles| {
+            bundles
+                .iter()
+                .map(|bundle| bundle["bundleId"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Create `count` bundles under `prefix` and hand back every `bundleId` the account then
+/// holds, in the ascending order a listing reports them.
+async fn seed_bundles(router: &MultiServiceRouter, prefix: &str, count: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    for index in 1..=count {
+        ids.push(create_bundle(router, &format!("{prefix}{index:02}"), None).await);
+    }
+    ids.sort();
+    ids
+}
+
+/// Walk the bundle listing from its first page to its last, following the `nextToken` each
+/// page hands back, and report the ids in the order the pages reported them together with
+/// how many pages the walk took. `held` is how many bundles the account holds, which
+/// bounds how many pages even the smallest page size can take.
+async fn walk_bundles(
+    router: &MultiServiceRouter,
+    case: &str,
+    max_results: Option<i64>,
+    held: usize,
+) -> (Vec<String>, usize) {
+    let allowed = usize::try_from(max_results.unwrap_or(MAX_RESULTS_MAX)).unwrap_or(1);
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0_usize;
+    loop {
+        let (status, page) = list_bundles_paged(router, max_results, token.as_deref()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} (page {pages}): expected HTTP 200 from ListConfigurationBundles, got \
+             {status} ({page})"
+        );
+        let ids = listed_bundle_ids(&page);
+        assert!(
+            ids.len() <= allowed,
+            "case {case:?} (page {pages}): a page holds at most {allowed} summaries, got {} \
+             ({page})",
+            ids.len()
+        );
+        walked.extend(ids);
+        pages += 1;
+        // The smallest page the model admits is one entry, so even that walk cannot take
+        // more pages than the account holds bundles, plus the empty page a cursor sitting
+        // exactly on the last of them would answer.
+        assert!(
+            pages <= held + 2,
+            "case {case:?}: the walk must terminate, got {pages} pages and {walked:?}"
+        );
+        match page["nextToken"].as_str() {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    (walked, pages)
+}
+
+/// For every page size the modelled range admits, the pages of `ListConfigurationBundles`
+/// concatenate to the whole listing: each bundle once, in ascending `bundleId` order, with
+/// no page holding more than `maxResults` summaries.
+///
+/// The rows differ along the page size, which is what paging generalises over: one entry
+/// per page, a size that leaves a part-full last page, the size that ends exactly on the
+/// last bundle, one past the number held, each modelled bound, and no `maxResults` at all.
+#[tokio::test]
+async fn bundle_pages_of_every_size_concatenate_to_the_whole_listing() {
+    let router = router();
+    let held = seed_bundles(&router, "PagedBundle", PAGED_BUNDLES).await;
+    let count = i64::try_from(held.len()).unwrap_or(i64::MAX);
+
+    // (case, maxResults)
+    let rows: [(&str, Option<i64>); 7] = [
+        (
+            "the modelled minimum, one bundle per page",
+            Some(MAX_RESULTS_MIN),
+        ),
+        ("two bundles per page", Some(2)),
+        ("a size leaving a part-full last page", Some(3)),
+        ("exactly as many as the account holds", Some(count)),
+        ("one more than the account holds", Some(count + 1)),
+        ("the modelled maximum", Some(MAX_RESULTS_MAX)),
+        ("no maxResults at all", None),
+    ];
+
+    for (case, max_results) in rows {
+        let (walked, pages) = walk_bundles(&router, case, max_results, held.len()).await;
+        assert_eq!(
+            walked, held,
+            "case {case:?}: the pages must concatenate to the whole listing {held:?}, got \
+             {walked:?}"
+        );
+        // A page is as full as the caller asked for until the bundles run out, so the walk
+        // takes exactly as many pages as that page size divides the account into.
+        let page_size = usize::try_from(max_results.unwrap_or(MAX_RESULTS_MAX)).unwrap_or(1);
+        let expected_pages = held.len().div_ceil(page_size).max(1);
+        assert_eq!(
+            pages, expected_pages,
+            "case {case:?}: expected {expected_pages} pages for a page size of {page_size}, got \
+             {pages}"
+        );
+    }
+}
+
+/// A bundle listing reports every bundle from the same record a read of that bundle
+/// answers from: one summary per bundle, carrying the identity, the description of the
+/// bundle's latest commit and the instant `GetConfigurationBundle` reports.
+///
+/// The rows differ along the description a bundle carries, which the summary declares as
+/// an optional member: none at all, a short one, and a long one.
+#[tokio::test]
+async fn a_bundle_listing_reports_the_same_record_a_read_answers_from() {
+    let router = router();
+
+    // (case, bundleName, the description the create carries)
+    let rows: [(&str, &str, Option<&str>); 3] = [
+        ("a bundle carrying no description", "PlainBundle", None),
+        ("a bundle described in one word", "ShortBundle", Some("one")),
+        (
+            "a bundle with a sentence for a description",
+            "WordyBundle",
+            Some("the configuration this account's agents share, as a commit carries it"),
+        ),
+    ];
+
+    let mut created = Vec::new();
+    for (case, name, description) in rows {
+        created.push((case, create_bundle(&router, name, description).await, name, description));
+    }
+
+    let (status, listed) = list_bundles_paged(&router, Some(MAX_RESULTS_MAX), None).await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from ListConfigurationBundles, got {status} ({listed})"
+    );
+    assert_eq!(
+        listed_bundle_ids(&listed).len(),
+        created.len(),
+        "the listing reports exactly the {} bundles this account created, got {listed}",
+        created.len()
+    );
+
+    for (case, bundle_id, name, description) in &created {
+        let summary = listed["bundles"]
+            .as_array()
+            .and_then(|bundles| {
+                bundles
+                    .iter()
+                    .find(|bundle| bundle["bundleId"] == json!(bundle_id))
+            })
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the listing reports no bundle {bundle_id}, got {listed}")
+            });
+        let expected_description = description.map_or(Value::Null, |text| json!(text));
+        assert_eq!(
+            (summary["bundleName"].clone(), summary["description"].clone()),
+            (json!(name), expected_description),
+            "case {case:?}: unexpected summary, got {summary}"
+        );
+
+        let (status, read) = send(
+            &router,
+            "GET",
+            &format!("/configuration-bundles/{bundle_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from GetConfigurationBundle, got {status} ({read})"
+        );
+        assert_eq!(
+            (
+                read["bundleId"].clone(),
+                read["bundleName"].clone(),
+                read["bundleArn"].clone(),
+                read["description"].clone(),
+                read["createdAt"].clone()
+            ),
+            (
+                summary["bundleId"].clone(),
+                summary["bundleName"].clone(),
+                summary["bundleArn"].clone(),
+                summary["description"].clone(),
+                summary["createdAt"].clone()
+            ),
+            "case {case:?}: the listing and the read report one bundle alike, got {read} against \
+             {summary}"
+        );
+    }
+}
+
+/// `maxResults` outside its modelled range (1..100) is refused with the modelled 400, each
+/// modelled bound itself is served, and a `nextToken` this service did not issue is the
+/// modelled 400 naming that member — while one its own codec could have issued, resuming
+/// past every bundle held, is an empty page rather than a refusal.
+#[tokio::test]
+async fn a_bundle_listing_refuses_a_page_outside_the_modelled_range() {
+    let router = router();
+    let held = seed_bundles(&router, "BoundedBundle", 3).await;
+
+    // (case, maxResults, expected status, how many summaries a served page holds)
+    let rows: [(&str, i64, u16, usize); 4] = [
+        ("one below the modelled minimum", MAX_RESULTS_MIN - 1, 400, 0),
+        ("the modelled minimum", MAX_RESULTS_MIN, 200, 1),
+        ("the modelled maximum", MAX_RESULTS_MAX, 200, held.len()),
+        ("one above the modelled maximum", MAX_RESULTS_MAX + 1, 400, 0),
+    ];
+
+    for (case, max_results, expected_status, expected_len) in rows {
+        let (status, answered) = list_bundles_paged(&router, Some(max_results), None).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} for maxResults={max_results}, got \
+             {status} ({answered})"
+        );
+        if expected_status == 200 {
+            assert_eq!(
+                listed_bundle_ids(&answered),
+                held[..expected_len].to_vec(),
+                "case {case:?}: expected the first {expected_len} bundles held, got {answered}"
+            );
+        } else {
+            assert_eq!(
+                error_code(&answered),
+                "ValidationException",
+                "case {case:?}: expected the modelled ValidationException, got {answered}"
+            );
+        }
+    }
+
+    for (case, token) in [
+        ("a word outside the token's alphabet", "notatoken"),
+        ("a pair of characters outside it", "zz"),
+        ("a token truncated to an odd length", "616"),
+        ("a bundleId handed over unencoded", held[0].as_str()),
+    ] {
+        let (status, answered) = list_bundles_paged(&router, None, Some(token)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for nextToken={token:?}, got {status} ({answered})"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}: expected the modelled ValidationException, got {answered}"
+        );
+        assert_eq!(
+            answered["fieldList"][0]["name"],
+            json!("nextToken"),
+            "case {case:?}: expected the refusal to name nextToken, got {}",
+            answered["fieldList"]
+        );
+    }
+
+    // `7a7a7a7a` is the token form this service issues (the hex of the store key a page
+    // ended on) for the key `zzzz`, which sorts after every bundleId the account holds — so
+    // it resumes past the last of them.
+    let (status, beyond) = list_bundles_paged(&router, None, Some("7a7a7a7a")).await;
+    assert_eq!(
+        (status, listed_bundle_ids(&beyond)),
+        (200, Vec::<String>::new()),
+        "case \"a token that resumes past every bundle\": expected the required bundles member \
+         present and empty, got {beyond}"
+    );
+    assert!(
+        beyond["nextToken"].is_null(),
+        "case \"a token that resumes past every bundle\": nothing is left over, got {}",
+        beyond["nextToken"]
     );
 }
