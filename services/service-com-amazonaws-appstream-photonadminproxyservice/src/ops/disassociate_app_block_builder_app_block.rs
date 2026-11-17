@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateAppBlockBuilderAppBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateAppBlockBuilderAppBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateAppBlockBuilderAppBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the `(AppBlockBuilderName, AppBlockArn)` edge this service's store
+//! holds once both endpoints exist, so the matching
+//! `DescribeAppBlockBuilderAppBlockAssociations` no longer reports it, the app block is no
+//! longer held by the builder, and the builder's single app block slot is free for
+//! `AssociateAppBlockBuilderAppBlock` again. An edge the store does not hold leaves it
+//! exactly as it was: the pair is not associated either way, which is what the call asked
+//! for.
 //!
 //! ## Shape of an operation
 //!
@@ -140,20 +138,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateAppBlockBuilderAppBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateAppBlockBuilderAppBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateAppBlockBuilderAppBlock"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DisassociateAppBlockBuilderAppBlock")
+        })?;
+        let mut state = state.lock();
+
+        // Both endpoints are resolved before anything is removed — this operation MODELS
+        // the not-found refusal, so a call naming a builder this account holds none under,
+        // or an ARN that addresses no app block of this account, names a resource that was
+        // not found rather than an edge to drop.
+        if !state
+            .app_block_builders
+            .contains_key(&input.app_block_builder_name)
+        {
+            return Err(
+                DisassociateAppBlockBuilderAppBlockErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::APP_BLOCK_BUILDER_KIND,
+                            &input.app_block_builder_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state.app_block_by_arn(&input.app_block_arn).is_none() {
+            return Err(
+                DisassociateAppBlockBuilderAppBlockErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::app_block_not_found_message(
+                            &input.app_block_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The outcome the call asks for — this builder not holding this app block — holds
+        // whether or not the edge was there, so removing one the store does not hold
+        // changes nothing and is answered the same way.
+        state
+            .app_block_builder_app_block_associations
+            .remove(&(input.app_block_builder_name, input.app_block_arn));
+
+        // The modelled result carries no members: what is left is read back through
+        // `DescribeAppBlockBuilderAppBlockAssociations`.
+        Ok(DisassociateAppBlockBuilderAppBlockOutput {})
     }
 }

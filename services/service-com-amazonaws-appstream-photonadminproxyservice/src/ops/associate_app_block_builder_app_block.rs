@@ -2,9 +2,10 @@
 
 //! @op AssociateAppBlockBuilderAppBlock
 //! IMPLEMENTED: records the `(AppBlockBuilderName, AppBlockArn)` edge in this service's
-//! store once both endpoints exist and the app block's packaging is one an app block
-//! builder produces, and returns the modelled `AppBlockBuilderAppBlockAssociation` for
-//! that edge. `DescribeAppBlockBuilderAppBlockAssociations` reports the stored edges.
+//! store once both endpoints exist, the app block's packaging is one an app block
+//! builder produces and the builder's single app block slot is free, and returns the
+//! modelled `AppBlockBuilderAppBlockAssociation` for that edge.
+//! `DescribeAppBlockBuilderAppBlockAssociations` reports the stored edges.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +202,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::app_block_association_not_supported_message(),
             )
             .into());
+        }
+
+        // The slot gate: an app block builder builds the application package of ONE app
+        // block, so a builder that already holds one has no room for a second and a
+        // request naming a DIFFERENT app block is refused with nothing written. The gate
+        // reads the edges the store holds right now, so it is a live check rather than a
+        // permanent ban: `DisassociateAppBlockBuilderAppBlock` frees the slot and the same
+        // request then succeeds.
+        if state
+            .app_block_of_builder(&input.app_block_builder_name)
+            .is_some_and(|associated| *associated != input.app_block_arn)
+        {
+            return Err(
+                AssociateAppBlockBuilderAppBlockErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: Some(
+                            crate::state::app_block_builder_app_block_slot_taken_message(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
 
         // The store must not grow per request without a ceiling, so an edge past it is

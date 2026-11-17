@@ -15,6 +15,14 @@
 //!   `InvalidParameterValueException` (400) carrying AWS's sentence and records NO
 //!   association, while a builder-packaged one associates with HTTP 200 and is then
 //!   reported from either endpoint;
+//! * an app block builder holds AT MOST ONE app block: while one is associated, a request
+//!   naming a DIFFERENT app block is refused `OperationNotPermittedException` (400)
+//!   carrying AWS's sentence and records nothing, the same pair again is answered as the
+//!   association it already is, and disassociating frees the slot so the refused request
+//!   then succeeds — while one app block may fill the slot of any number of builders;
+//! * a disassociation removes exactly the edge it names, however often it is repeated, and
+//!   either endpoint this account does not hold is refused `ResourceNotFoundException`
+//!   with nothing removed;
 //! * either endpoint this account does not hold is refused `ResourceNotFoundException`
 //!   (400) with AWS's sentence for that resource kind, and records nothing;
 //! * `MaxResults` sizes a page of the read so that following `NextToken` reports every
@@ -410,30 +418,34 @@ async fn max_results_sizes_the_page_and_the_token_walks_every_association_once()
     /// `AppBlockBuilderAppBlockAssociationsList` at 25 members.
     const PUBLISHED_PAGE: usize = 25;
 
-    let case = "paging one builder's associations";
+    // One app block, one builder each: a builder holds at most one app block, so the
+    // endpoint with more than a page of edges is the app block, and the read is sized and
+    // walked from its side.
+    let case = "paging one app block's associations";
     let emulator = Emulator::in_region(REGION);
-    create_builder(&emulator, case, "paging-builder").await;
+    let arn = create_app_block(
+        &emulator,
+        case,
+        "paging-block",
+        Some(BUILDER_PACKAGED),
+        Some("disks/app.vhd"),
+    )
+    .await;
     let stored: BTreeSet<String> = {
-        let mut arns = BTreeSet::new();
+        let mut builders = BTreeSet::new();
         for index in 0..30 {
-            let arn = create_app_block(
-                &emulator,
-                case,
-                &format!("paging-block-{index:02}"),
-                Some(BUILDER_PACKAGED),
-                Some("disks/app.vhd"),
-            )
-            .await;
+            let builder = format!("paging-builder-{index:02}");
+            create_builder(&emulator, case, &builder).await;
             emulator
                 .ok(
                     case,
                     "AssociateAppBlockBuilderAppBlock",
-                    json!({ "AppBlockBuilderName": "paging-builder", "AppBlockArn": arn }),
+                    json!({ "AppBlockBuilderName": builder, "AppBlockArn": arn }),
                 )
                 .await;
-            arns.insert(arn);
+            builders.insert(builder);
         }
-        arns
+        builders
     };
 
     // Rows: each published bound of `MaxResults`, one past the upper bound, a size in
@@ -443,7 +455,7 @@ async fn max_results_sizes_the_page_and_the_token_walks_every_association_once()
         let mut walked: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
-            let mut request = json!({ "AppBlockBuilderName": "paging-builder" });
+            let mut request = json!({ "AppBlockArn": arn });
             if let Some(max_results) = max_results {
                 request["MaxResults"] = json!(max_results);
             }
@@ -483,7 +495,7 @@ async fn max_results_sizes_the_page_and_the_token_walks_every_association_once()
                 );
             }
             walked.extend(reported.iter().map(|entry| {
-                entry["AppBlockArn"]
+                entry["AppBlockBuilderName"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string()
@@ -723,9 +735,10 @@ async fn the_gate_turns_on_the_stored_packaging_and_on_nothing_else() {
 
 #[tokio::test]
 async fn a_refused_association_leaves_the_admitted_edges_untouched() {
-    // Rows: how many associations the builder already holds when the refused request
-    // arrives, from none to several — the refusal is a no-op whatever the store holds, and
-    // repeating it is answered the same way every time.
+    // Rows: how many associations the store already holds when the refused request
+    // arrives, from none to several — one per builder, because a builder holds at most one
+    // app block. The refusal is a no-op whatever the store holds, and repeating it is
+    // answered the same way every time.
     for admitted in 0..=3_usize {
         let case = format!("a refusal against {admitted} admitted association(s)");
         let emulator = Emulator::in_region(REGION);
@@ -733,6 +746,8 @@ async fn a_refused_association_leaves_the_admitted_edges_untouched() {
 
         let mut expected: Vec<Value> = Vec::new();
         for index in 0..admitted {
+            let builder = format!("admitted-builder-{index}");
+            create_builder(&emulator, &case, &builder).await;
             let arn = create_app_block(
                 &emulator,
                 &case,
@@ -745,11 +760,11 @@ async fn a_refused_association_leaves_the_admitted_edges_untouched() {
                 .ok(
                     &case,
                     "AssociateAppBlockBuilderAppBlock",
-                    json!({ "AppBlockBuilderName": "untouched-builder", "AppBlockArn": arn }),
+                    json!({ "AppBlockBuilderName": builder, "AppBlockArn": arn }),
                 )
                 .await;
             expected.push(json!({
-                "AppBlockBuilderName": "untouched-builder",
+                "AppBlockBuilderName": builder,
                 "AppBlockArn": arn,
             }));
         }
@@ -778,12 +793,7 @@ async fn a_refused_association_leaves_the_admitted_edges_untouched() {
                 "case {case:?} (attempt {attempt}): unexpected sentence {message:?}"
             );
 
-            let reported = associated(
-                &emulator,
-                &case,
-                json!({ "AppBlockBuilderName": "untouched-builder" }),
-            )
-            .await;
+            let reported = associated(&emulator, &case, json!({})).await;
             assert_eq!(
                 reported, expected,
                 "case {case:?} (attempt {attempt}): the refusal must leave the admitted \
@@ -798,4 +808,348 @@ async fn a_refused_association_leaves_the_admitted_edges_untouched() {
             );
         }
     }
+}
+
+/// The wire code AWS answers a request the service does not permit with
+/// (`OperationNotPermittedException`, `httpError` 400 —
+/// `smithy_query(query="operation", operation="AssociateAppBlockBuilderAppBlock")`).
+const NOT_PERMITTED_CODE: &str = "OperationNotPermittedException";
+
+/// The sentence the service states for an app block builder whose one app block slot is
+/// already taken, read from the crate so the test tracks the wording rather than a copy of
+/// it.
+fn slot_taken_sentence() -> String {
+    service_com_amazonaws_appstream_photonadminproxyservice::state::app_block_builder_app_block_slot_taken_message()
+}
+
+/// Associate `builder` with `app_block_arn` and answer the association the result carries.
+async fn associate(emulator: &Emulator, case: &str, builder: &str, app_block_arn: &str) -> Value {
+    emulator
+        .ok(
+            case,
+            "AssociateAppBlockBuilderAppBlock",
+            json!({ "AppBlockBuilderName": builder, "AppBlockArn": app_block_arn }),
+        )
+        .await
+}
+
+/// A builder-packaged app block of `name`, carrying an application package already.
+async fn create_associable_app_block(emulator: &Emulator, case: &str, name: &str) -> String {
+    create_app_block(
+        emulator,
+        case,
+        name,
+        Some(BUILDER_PACKAGED),
+        Some("disks/app.vhd"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_builder_holds_at_most_one_app_block() {
+    // Rows: how many FURTHER app blocks are offered to a builder that already holds one,
+    // crossed with the name shapes the `Name` pattern admits — the verdict turns on the
+    // slot being taken, never on how many app blocks are offered or how anything is named.
+    for (index, shape) in name_shapes().into_iter().enumerate() {
+        let further = index + 1;
+        let case = format!("{further} further app block(s) offered to builder {shape:?}");
+        let emulator = Emulator::in_region(REGION);
+        create_builder(&emulator, &case, &shape).await;
+        let held = create_associable_app_block(&emulator, &case, "held-block").await;
+        associate(&emulator, &case, &shape, &held).await;
+        let expected = vec![json!({ "AppBlockBuilderName": shape, "AppBlockArn": held })];
+
+        for offer in 0..further {
+            let offered =
+                create_associable_app_block(&emulator, &case, &format!("offered-block-{offer}"))
+                    .await;
+            // Twice: the refusal is repeatable and records nothing either time.
+            for attempt in 1..=2_usize {
+                let message = refusal(
+                    &emulator,
+                    &case,
+                    "AssociateAppBlockBuilderAppBlock",
+                    json!({ "AppBlockBuilderName": shape, "AppBlockArn": offered }),
+                    400,
+                    NOT_PERMITTED_CODE,
+                )
+                .await;
+                assert_eq!(
+                    message,
+                    slot_taken_sentence(),
+                    "case {case:?} (offer {offer}, attempt {attempt}): the refusal must state \
+                     that the builder takes no additional app block, got {message:?}"
+                );
+                // The sentence states the rule about the app block builder that was
+                // selected, so it takes no part from the request or from state.
+                assert!(
+                    !message.contains(shape.as_str())
+                        && !message.contains(held.as_str())
+                        && !message.contains(offered.as_str()),
+                    "case {case:?} (offer {offer}, attempt {attempt}): the refusal must echo \
+                     neither the builder's name nor either ARN, got {message:?}"
+                );
+
+                let reported = associated(
+                    &emulator,
+                    &case,
+                    json!({ "AppBlockBuilderName": shape.clone() }),
+                )
+                .await;
+                assert_eq!(
+                    reported, expected,
+                    "case {case:?} (offer {offer}, attempt {attempt}): the builder must still \
+                     hold exactly the app block it held, got {reported:?}"
+                );
+                let from_the_offered =
+                    associated(&emulator, &case, json!({ "AppBlockArn": offered })).await;
+                assert!(
+                    from_the_offered.is_empty(),
+                    "case {case:?} (offer {offer}, attempt {attempt}): the refused app block \
+                     must be associated with nothing, got {from_the_offered:?}"
+                );
+            }
+        }
+
+        // The app block the builder already holds is no additional app block: the identical
+        // request is answered as the association it already is.
+        let answer = associate(&emulator, &case, &shape, &held).await;
+        assert_eq!(
+            answer,
+            json!({
+                "AppBlockBuilderAppBlockAssociation": {
+                    "AppBlockBuilderName": shape,
+                    "AppBlockArn": held,
+                }
+            }),
+            "case {case:?}: re-associating the same pair must answer the association it \
+             already is, got {answer}"
+        );
+        let reported = associated(&emulator, &case, json!({})).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: the pair must be associated exactly once, got {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn disassociating_frees_the_builders_slot() {
+    // Rows: how many times the disassociation is repeated before the freed slot is used —
+    // removing an edge the store no longer holds changes nothing, so every count leaves the
+    // same store behind.
+    for repeats in 1..=3_usize {
+        let case = format!("disassociating {repeats} time(s)");
+        let emulator = Emulator::in_region(REGION);
+        create_builder(&emulator, &case, "slot-builder").await;
+        let first = create_associable_app_block(&emulator, &case, "first-block").await;
+        let second = create_associable_app_block(&emulator, &case, "second-block").await;
+        associate(&emulator, &case, "slot-builder", &first).await;
+
+        // While the first app block fills the slot, the second is not permitted.
+        let request = json!({ "AppBlockBuilderName": "slot-builder", "AppBlockArn": second });
+        let message = refusal(
+            &emulator,
+            &case,
+            "AssociateAppBlockBuilderAppBlock",
+            request.clone(),
+            400,
+            NOT_PERMITTED_CODE,
+        )
+        .await;
+        assert_eq!(
+            message,
+            slot_taken_sentence(),
+            "case {case:?}: unexpected sentence {message:?}"
+        );
+
+        for attempt in 1..=repeats {
+            let answer = emulator
+                .ok(
+                    &case,
+                    "DisassociateAppBlockBuilderAppBlock",
+                    json!({ "AppBlockBuilderName": "slot-builder", "AppBlockArn": first }),
+                )
+                .await;
+            assert_eq!(
+                answer,
+                json!({}),
+                "case {case:?} (attempt {attempt}): the result carries no members, got {answer}"
+            );
+            let reported = associated(&emulator, &case, json!({})).await;
+            assert!(
+                reported.is_empty(),
+                "case {case:?} (attempt {attempt}): the disassociated builder must hold \
+                 nothing, got {reported:?}"
+            );
+        }
+
+        // The IDENTICAL request that was refused now succeeds: the gate is a live check on
+        // what the store holds, not a ban on the pair.
+        let answer = emulator
+            .ok(&case, "AssociateAppBlockBuilderAppBlock", request)
+            .await;
+        let edge = json!({ "AppBlockBuilderName": "slot-builder", "AppBlockArn": second });
+        assert_eq!(
+            answer,
+            json!({ "AppBlockBuilderAppBlockAssociation": edge }),
+            "case {case:?}: the freed slot must take the app block that was refused, got \
+             {answer}"
+        );
+        for selector in [
+            json!({ "AppBlockBuilderName": "slot-builder" }),
+            json!({ "AppBlockArn": second }),
+            json!({}),
+        ] {
+            let reported = associated(&emulator, &case, selector.clone()).await;
+            assert_eq!(
+                reported,
+                vec![edge.clone()],
+                "case {case:?}: the read of {selector} must report the app block the builder \
+                 now holds, got {reported:?}"
+            );
+        }
+
+        // The slot is taken again, so the app block that was just disassociated is now the
+        // one with no room — the rule follows the slot rather than either app block.
+        let message = refusal(
+            &emulator,
+            &case,
+            "AssociateAppBlockBuilderAppBlock",
+            json!({ "AppBlockBuilderName": "slot-builder", "AppBlockArn": first }),
+            400,
+            NOT_PERMITTED_CODE,
+        )
+        .await;
+        assert_eq!(
+            message,
+            slot_taken_sentence(),
+            "case {case:?}: unexpected sentence {message:?}"
+        );
+
+        // Removing a pair the store does not hold leaves the edge it does hold alone.
+        emulator
+            .ok(
+                &case,
+                "DisassociateAppBlockBuilderAppBlock",
+                json!({ "AppBlockBuilderName": "slot-builder", "AppBlockArn": first }),
+            )
+            .await;
+        let reported = associated(&emulator, &case, json!({})).await;
+        assert_eq!(
+            reported,
+            vec![edge],
+            "case {case:?}: removing an edge the store does not hold must change nothing, got \
+             {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_app_block_may_fill_the_slot_of_several_builders() {
+    // Rows: how many builders the one app block is associated with. The slot is the
+    // BUILDER's, so the app block's side of the association takes any number of edges.
+    for builders in 1..=3_usize {
+        let case = format!("one app block across {builders} builder(s)");
+        let emulator = Emulator::in_region(REGION);
+        let arn = create_associable_app_block(&emulator, &case, "shared-block").await;
+
+        let mut expected: Vec<Value> = Vec::new();
+        for index in 0..builders {
+            let builder = format!("sharing-builder-{index}");
+            create_builder(&emulator, &case, &builder).await;
+            associate(&emulator, &case, &builder, &arn).await;
+            expected.push(json!({ "AppBlockBuilderName": builder, "AppBlockArn": arn }));
+
+            // Each builder reads back holding that one app block, and no other.
+            let reported = associated(
+                &emulator,
+                &case,
+                json!({ "AppBlockBuilderName": builder.clone() }),
+            )
+            .await;
+            assert_eq!(
+                reported,
+                vec![json!({ "AppBlockBuilderName": builder, "AppBlockArn": arn })],
+                "case {case:?}: builder {builder:?} must hold the shared app block, got \
+                 {reported:?}"
+            );
+        }
+
+        let reported = associated(&emulator, &case, json!({ "AppBlockArn": arn })).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: the app block's side must report every builder that holds it, got \
+             {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn disassociating_an_endpoint_this_account_does_not_hold_is_not_found() {
+    let case = "disassociating an endpoint that does not exist";
+    let emulator = Emulator::in_region(REGION);
+    create_builder(&emulator, case, "stored-builder").await;
+    let stored = create_associable_app_block(&emulator, case, "stored-block").await;
+    associate(&emulator, case, "stored-builder", &stored).await;
+    let expected = vec![json!({
+        "AppBlockBuilderName": "stored-builder",
+        "AppBlockArn": stored,
+    })];
+
+    // Rows: builder names nothing was created under, spanning length, character classes and
+    // case — the sentence names the kind, the name the REQUEST asked for and the account
+    // that was searched.
+    for builder in [
+        "absent".to_string(),
+        "Mixed.Case_builder-9".to_string(),
+        "0123456789".to_string(),
+        format!("b{}", "7".repeat(100)),
+    ] {
+        let message = refusal(
+            &emulator,
+            case,
+            "DisassociateAppBlockBuilderAppBlock",
+            json!({ "AppBlockBuilderName": builder, "AppBlockArn": stored }),
+            400,
+            "ResourceNotFoundException",
+        )
+        .await;
+        assert_eq!(
+            message,
+            not_found_sentence(BUILDER_KIND, &builder),
+            "case {case:?} ({builder:?}): unexpected sentence {message:?}"
+        );
+    }
+
+    // Rows: ARNs wrong in the name, the Region, the account and the resource type, so the
+    // lookup matches the stored ARN in full.
+    for arn in [
+        app_block_arn("absent-block"),
+        format!("arn:aws:appstream:eu-west-1:{ACCOUNT}:app-block/stored-block"),
+        format!("arn:aws:appstream:{REGION}:210987654321:app-block/stored-block"),
+        format!("arn:aws:appstream:{REGION}:{ACCOUNT}:application/stored-block"),
+    ] {
+        let message = refusal(
+            &emulator,
+            case,
+            "DisassociateAppBlockBuilderAppBlock",
+            json!({ "AppBlockBuilderName": "stored-builder", "AppBlockArn": arn }),
+            400,
+            "ResourceNotFoundException",
+        )
+        .await;
+        assert_eq!(
+            message,
+            app_block_not_found_sentence(&arn),
+            "case {case:?} ({arn}): unexpected sentence {message:?}"
+        );
+    }
+
+    // None of those refusals removed the edge the store holds.
+    let reported = associated(&emulator, case, json!({})).await;
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: a refused disassociation removes nothing, got {reported:?}"
+    );
 }

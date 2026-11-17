@@ -21,7 +21,9 @@
 //! `DescribeAppBlockBuilders` renders the stored records back, a page at a time. Which app
 //! blocks a builder packages applications into lives here too:
 //! `AssociateAppBlockBuilderAppBlock` writes the `(builder, app block)` edge once the app
-//! block's packaging is one a builder produces, and
+//! block's packaging is one a builder produces and the builder's single app block slot is
+//! free ([`ComAmazonawsAppstreamPhotonadminproxyserviceState::app_block_of_builder`]),
+//! `DisassociateAppBlockBuilderAppBlock` removes that edge and frees the slot again, and
 //! `DescribeAppBlockBuilderAppBlockAssociations` reports the edges of one endpoint, a page
 //! at a time. An app block a builder still holds is in use, which is what `DeleteAppBlock`
 //! refuses on.
@@ -1097,6 +1099,16 @@ pub fn app_block_association_not_supported_message() -> String {
     "The selected App block does not support the association operation".to_string()
 }
 
+/// The sentence a request refused for attaching an app block to an app block builder that
+/// already holds one carries.
+///
+/// AWS states the rule about the app block builder that was selected and echoes nothing of
+/// the request, so the sentence has no variable part — not the builder's name, not either
+/// app block's ARN.
+pub fn app_block_builder_app_block_slot_taken_message() -> String {
+    "The selected App block builder can not be associated with additional App block".to_string()
+}
+
 /// A persisted AppStream app block — the virtual hard disk an elastic fleet's
 /// applications are served from, written by `CreateAppBlock` and rendered back by
 /// `DescribeAppBlocks`.
@@ -1843,6 +1855,20 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
             .then(|| self.app_blocks.get(&name))
             .flatten()
             .filter(|record| record.arn == arn)
+    }
+
+    /// The ARN of the app block an app block builder is associated with; `None` for a
+    /// builder that holds none.
+    ///
+    /// An app block builder builds the application package of ONE app block at a time, so
+    /// the edges of a builder are at most one and this answers a single ARN. It is the
+    /// lookup the association gate turns on, so the gate reads the same stored edges a
+    /// `Describe` of that builder reports.
+    pub fn app_block_of_builder(&self, app_block_builder_name: &str) -> Option<&String> {
+        self.app_block_builder_app_block_associations
+            .iter()
+            .find(|(builder, _)| builder == app_block_builder_name)
+            .map(|(_, app_block_arn)| app_block_arn)
     }
 
     /// The application stored under the ARN asked about; `None` when this service holds
