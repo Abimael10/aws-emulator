@@ -27,6 +27,8 @@ mod build_artifacts_destination;
 mod build_batch_configuration_source;
 #[path = "all/build_batch_fan_out.rs"]
 mod build_batch_fan_out;
+#[path = "all/build_batch_override_configuration.rs"]
+mod build_batch_override_configuration;
 #[path = "all/build_batch_projection.rs"]
 mod build_batch_projection;
 #[path = "all/build_image.rs"]
