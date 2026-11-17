@@ -7,8 +7,10 @@
 //! wording the service words that resource class's miss with, never a message this
 //! emulator invented — the profile operations report the resource by the ARN its id names
 //! in the request's Region and account ("The item doesn't exist. arn: <arn> ; aborting."),
-//! while the trust-anchor operations report the wholly fixed "TrustAnchor not found", with
-//! no id interpolated. The status (404) and the error code are the same on every path.
+//! while the trust-anchor operations report wholly fixed text, with no id interpolated:
+//! the tail "TrustAnchor not found", prefixed with the operation's own scope phrase on the
+//! one path the service scopes to the operation (`DisableTrustAnchor`). The status (404)
+//! and the error code are the same on every path.
 //!
 //! Each table's rows differ along what the rule generalises over: WHICH id fails to
 //! resolve and why (never minted, deleted a moment ago, an id minted for another resource
@@ -182,6 +184,11 @@ impl Client {
         self.send_in_region("DELETE", &format!("/trustanchor/{id}"), None, region)
             .await
     }
+
+    async fn disable_trust_anchor_in_region(&self, id: &str, region: &str) -> Answer {
+        self.send_in_region("POST", &format!("/trustanchor/{id}/disable"), None, region)
+            .await
+    }
 }
 
 /// The ARN a profile id carries in `region`, which is the ARN a refusal naming that id
@@ -199,6 +206,11 @@ fn arn_not_found_message(resource_arn: &str) -> String {
 
 /// The wholly fixed wording a trust anchor addressed by `trustAnchorId` misses with.
 const TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str = "TrustAnchor not found";
+
+/// The wording `DisableTrustAnchor` misses with: the same fixed tail, prefixed with that
+/// operation's own scope phrase, which is the whole message — nothing is interpolated.
+const DISABLE_TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str =
+    "Error disabling TrustAnchor. TrustAnchor not found";
 
 /// Create a trust anchor and answer its id.
 async fn trust_anchor_id(client: &Client, name: &str) -> String {
@@ -387,4 +399,61 @@ async fn trust_anchor_not_found_refusals_carry_the_fixed_wording() {
         "case \"sibling-survives-the-refusals\": expected GetTrustAnchor 200, got \
          {still_there:?}"
     );
+}
+
+/// `DisableTrustAnchor` refuses an id that resolves to no stored trust anchor with the
+/// SAME fixed tail, scoped to the operation: `Error disabling TrustAnchor. ` followed by
+/// that tail. The whole message is fixed — no id, ARN or Region reaches it — and the
+/// scoping is per operation, so the read of the very same id still answers the bare tail.
+///
+/// The table spans the same dimensions as the sibling tables above: why the id does not
+/// resolve (never minted, minted for a profile, deleted a moment ago) and the Region the
+/// request is signed for.
+#[tokio::test]
+async fn disabling_an_unknown_trust_anchor_scopes_the_fixed_wording_to_the_operation() {
+    let client = Client::new();
+
+    let profile = profile_id(&client, "sibling-profile", REGION).await;
+    let deleted = trust_anchor_id(&client, "deleted-anchor").await;
+    let removed = client.delete_trust_anchor_in_region(&deleted, REGION).await;
+    assert_eq!(
+        removed.status, 200,
+        "case \"delete-the-deleted-fixture\": expected DeleteTrustAnchor 200, got {removed:?}"
+    );
+
+    let mut cases: Vec<(String, String, &str)> = Vec::new();
+    for (label, id) in UNMINTED_IDS {
+        cases.push((format!("unminted-{label}"), id.to_string(), REGION));
+    }
+    cases.push(("profile-id-as-trust-anchor-id".to_string(), profile, REGION));
+    cases.push(("deleted-trust-anchor-id".to_string(), deleted, REGION));
+    for region in ["eu-central-1", "ap-southeast-2", "us-east-1"] {
+        cases.push((
+            format!("unminted-in-{region}"),
+            UNMINTED_IDS[0].1.to_string(),
+            region,
+        ));
+    }
+
+    for (case, id, region) in cases {
+        let labelled = format!("DisableTrustAnchor/{case}");
+        let answer = client.disable_trust_anchor_in_region(&id, region).await;
+        assert_not_found(&labelled, &answer, DISABLE_TRUST_ANCHOR_NOT_FOUND_MESSAGE);
+
+        let message = answer.message().unwrap_or_default();
+        assert!(
+            !message.contains(&id) && !message.contains(region) && !message.contains("arn:"),
+            "case {labelled:?}: the wording is fixed, so no id, Region or ARN may appear, got \
+             {message:?}"
+        );
+
+        // The scope phrase belongs to this operation alone: the read of the same id
+        // answers the bare tail, so the refusal says WHICH call failed.
+        let read = client.get_trust_anchor_in_region(&id, region).await;
+        assert_not_found(
+            &format!("GetTrustAnchor/{case}"),
+            &read,
+            TRUST_ANCHOR_NOT_FOUND_MESSAGE,
+        );
+    }
 }

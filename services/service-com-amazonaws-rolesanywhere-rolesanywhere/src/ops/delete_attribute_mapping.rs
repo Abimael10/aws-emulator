@@ -159,19 +159,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An id no stored profile carries — never created, or already deleted — is a 404:
-        // there are no mapping rules to delete from. The refusal names the profile by the
-        // ARN the id carries in this request's Region, the wording this service words an
-        // ARN-keyed miss with.
-        let region = crate::state::request_region(ctx.parts());
-        let record = store.profiles.get_mut(&input.profile_id).ok_or_else(|| {
+        // there are no mapping rules to delete from. `ResourceNotFoundException$message` is
+        // optional (`smithy_query(query="shape", shape="ResourceNotFoundException")`) and
+        // this path sends none, so the refusal discloses nothing about a profile that does
+        // not exist — not even the ARN its id would carry.
+        let record = store.profiles.get_mut(&input.profile_id).ok_or(
             DeleteAttributeMappingErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::arn_not_found_message(
-                        &crate::state::profile_arn(&region, &input.profile_id),
-                    )),
-                },
-            )
-        })?;
+                ResourceNotFoundException { message: None },
+            ),
+        )?;
 
         crate::state::delete_attribute_mapping(
             &mut record.attribute_mappings,

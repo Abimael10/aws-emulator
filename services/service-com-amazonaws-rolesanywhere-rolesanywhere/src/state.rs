@@ -584,15 +584,32 @@ pub fn trust_anchor_not_found_message(trust_anchor_id: &str) -> String {
     format!("Unable to find Trust Anchor with ID {trust_anchor_id}.")
 }
 
+/// The tail every refusal for a trust anchor ADDRESSED by `trustAnchorId` ends in: the
+/// fixed wording this service words such a miss with, carrying no part of the request —
+/// the id is already the resource the request named.
+const ADDRESSED_TRUST_ANCHOR_NOT_FOUND_TAIL: &str = "TrustAnchor not found";
+
 /// The `message` a refusal carries when the trust anchor a request ADDRESSES by
 /// `trustAnchorId` is not stored.
 ///
-/// Wholly fixed text, with no variable part: the id is already the resource the request
-/// named, and this is the wording the service is recorded answering such a miss with —
-/// unlike the ARN-reference wording above, which belongs to an operation that names a
-/// trust anchor while addressing something else.
+/// Wholly fixed text, with no variable part — unlike the ARN-reference wording above,
+/// which belongs to an operation that names a trust anchor while addressing something
+/// else. This is the wording of every addressed miss the service does not scope to the
+/// operation that answered it; the scoped form is
+/// [`scoped_addressed_trust_anchor_not_found_message`].
 pub fn addressed_trust_anchor_not_found_message() -> String {
-    "TrustAnchor not found".to_string()
+    ADDRESSED_TRUST_ANCHOR_NOT_FOUND_TAIL.to_string()
+}
+
+/// The same addressed-miss wording, scoped to the operation that answered it: the fixed
+/// tail prefixed with `Error <gerund> TrustAnchor. `, where `operation_gerund` names what
+/// the operation was doing (`"disabling"`).
+///
+/// Still wholly fixed text — the prefix comes from the operation, never from the request —
+/// and used only where the service scopes the refusal to the operation, so a failed write
+/// reads differently from a failed read of the same missing anchor.
+pub fn scoped_addressed_trust_anchor_not_found_message(operation_gerund: &str) -> String {
+    format!("Error {operation_gerund} TrustAnchor. {ADDRESSED_TRUST_ANCHOR_NOT_FOUND_TAIL}")
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; an

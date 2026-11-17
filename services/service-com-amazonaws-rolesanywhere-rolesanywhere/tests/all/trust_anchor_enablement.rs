@@ -47,10 +47,10 @@ const TRUST_ANCHOR_TYPES: [&str; 3] = [
     "SELF_SIGNED_REPOSITORY",
 ];
 
-/// The wording a refusal carries when the trust anchor a request ADDRESSES by
-/// `trustAnchorId` is not stored: wholly fixed text, the same every trust-anchor
-/// operation that addresses one answers a miss with.
-const TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str = "TrustAnchor not found";
+/// The wording `DisableTrustAnchor` refuses an id no stored trust anchor carries with:
+/// wholly fixed text, this operation's own scope phrase followed by the fixed trust-anchor
+/// miss tail the service words such a miss with. No part of it comes from the request.
+const TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str = "Error disabling TrustAnchor. TrustAnchor not found";
 
 /// Every `TrustAnchorDetail` member that a call clearing the flag must leave exactly as
 /// the record held it (`smithy_query(query="shape", shape="TrustAnchorDetail")` lists

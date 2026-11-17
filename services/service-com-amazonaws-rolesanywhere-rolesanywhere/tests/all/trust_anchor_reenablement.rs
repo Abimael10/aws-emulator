@@ -13,7 +13,10 @@
 //! (`smithy_query(query="operation", operation="EnableTrustAnchor")`: input
 //! `trustAnchorId` bound to `POST /trustanchor/{trustAnchorId}/enable`, output the
 //! required `trustAnchor`, errors `AccessDeniedException` 403 and
-//! `ResourceNotFoundException` 404).
+//! `ResourceNotFoundException` 404). Because the flag is stored rather than derived, the
+//! receipt `DeleteTrustAnchor` answers with reports the value the last write before the
+//! delete left (`smithy_query(query="operation", operation="DeleteTrustAnchor")`: the same
+//! required `trustAnchor` output), which the last table below pins.
 //!
 //! The tables below therefore differ along what the rule generalises over: the
 //! `sourceType` the stored anchor carries (every value the modelled `TrustAnchorType`
@@ -50,9 +53,9 @@ const TRUST_ANCHOR_TYPES: [&str; 3] = [
     "SELF_SIGNED_REPOSITORY",
 ];
 
-/// The wording a refusal carries when the trust anchor a request ADDRESSES by
-/// `trustAnchorId` is not stored: wholly fixed text, the same every trust-anchor
-/// operation that addresses one answers a miss with.
+/// The wording a refusal carries when the trust anchor `EnableTrustAnchor` ADDRESSES by
+/// `trustAnchorId` is not stored: wholly fixed text, the tail this service words an
+/// addressed trust-anchor miss with.
 const TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str = "TrustAnchor not found";
 
 /// Every `TrustAnchorDetail` member that a call setting the flag must leave exactly as
@@ -509,6 +512,96 @@ async fn the_enabled_flag_survives_alternating_writes() {
                  got {read_back:?}"
             );
         }
+    }
+}
+
+/// The deletion receipt reports the record as it stood when the delete was accepted: the
+/// `enabled` flag the LAST write before the delete left, whichever write that was, and the
+/// id resolves to nothing afterwards.
+///
+/// The rows differ along what the rule generalises over: the flag the create carried and
+/// the sequence of flag writes that followed it (none, one, several, ending on each value).
+#[tokio::test]
+async fn deleting_a_trust_anchor_reports_the_flag_the_last_write_left() {
+    let client = Client::new();
+
+    // Each row is the `enabled` member the create carried and the writes that follow, as
+    // the flag each write sets; the expectation is the last of them, or the created value
+    // when a row writes nothing.
+    let rows: [(&str, Option<bool>, &[bool]); 7] = [
+        ("created-enabled-no-writes", Some(true), &[]),
+        ("created-disabled-no-writes", Some(false), &[]),
+        ("created-without-the-member-no-writes", None, &[]),
+        ("disabled-then-enabled", Some(true), &[false, true]),
+        ("enabled-then-disabled", Some(false), &[true, false]),
+        ("enabled-twice", Some(false), &[true, true]),
+        (
+            "driven-back-and-forth",
+            Some(true),
+            &[false, true, false, true],
+        ),
+    ];
+
+    for (case, created_enabled, writes) in rows {
+        let created = anchor_of(
+            case,
+            201,
+            &client
+                .create_trust_anchor(create_body(
+                    &format!("{case} anchor"),
+                    "CERTIFICATE_BUNDLE",
+                    created_enabled,
+                ))
+                .await,
+        );
+        let id = id_of(case, &created);
+
+        for (index, write) in writes.iter().enumerate() {
+            let answer = if *write {
+                client.enable_trust_anchor(&id).await
+            } else {
+                client.disable_trust_anchor(&id).await
+            };
+            let written = anchor_of(case, 200, &answer);
+            assert_eq!(
+                enabled_of(case, &written),
+                *write,
+                "case {case:?}: write {index} must report enabled {write}, got {written:?}"
+            );
+        }
+
+        let expected = writes
+            .last()
+            .copied()
+            .unwrap_or_else(|| created_enabled.unwrap_or(true));
+
+        // What the read reports a moment before the delete is what the delete must echo.
+        let before = anchor_of(case, 200, &client.get_trust_anchor(&id).await);
+        assert_eq!(
+            enabled_of(case, &before),
+            expected,
+            "case {case:?}: the stored anchor must hold enabled {expected} before the delete, \
+             got {before:?}"
+        );
+
+        let receipt = anchor_of(case, 200, &client.delete_trust_anchor(&id).await);
+        assert_eq!(
+            enabled_of(case, &receipt),
+            expected,
+            "case {case:?}: the delete must report the anchor's state at delete time \
+             (enabled {expected}), got {receipt:?}"
+        );
+        assert_eq!(
+            receipt, before,
+            "case {case:?}: the delete must echo the record as the read reported it \
+             ({before:?}), got {receipt:?}"
+        );
+
+        let gone = client.get_trust_anchor(&id).await;
+        assert_eq!(
+            gone.status, 404,
+            "case {case:?}: the deleted id must resolve to nothing, got {gone:?}"
+        );
     }
 }
 

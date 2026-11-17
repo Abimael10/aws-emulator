@@ -156,14 +156,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An id no stored trust anchor carries — never created, or already deleted — is
-        // a 404, never a disable that lands nowhere.
+        // a 404, never a disable that lands nowhere. This path's refusal is scoped to the
+        // operation: the service prefixes the fixed trust-anchor miss wording with what it
+        // was doing, so a failed disable reads differently from a failed read of the same
+        // missing anchor.
         let record = store
             .trust_anchors
             .get_mut(&input.trust_anchor_id)
             .ok_or_else(|| {
                 DisableTrustAnchorErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::addressed_trust_anchor_not_found_message()),
+                        message: Some(
+                            crate::state::scoped_addressed_trust_anchor_not_found_message(
+                                "disabling",
+                            ),
+                        ),
                     },
                 )
             })?;

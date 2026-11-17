@@ -160,17 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An id no stored profile carries — never created, or already deleted — is a 404:
-        // there is no profile whose mapping rules the submitted specifiers could join. The
-        // refusal names the profile by the ARN the id carries in this request's Region,
-        // the wording this service words an ARN-keyed miss with.
-        let region = crate::state::request_region(ctx.parts());
-        let record = store.profiles.get_mut(&input.profile_id).ok_or_else(|| {
+        // there is no profile whose mapping rules the submitted specifiers could join.
+        // `ResourceNotFoundException$message` is optional
+        // (`smithy_query(query="shape", shape="ResourceNotFoundException")`) and the
+        // attribute-mapping writes send none, so the refusal discloses nothing about a
+        // profile that does not exist — not even the ARN its id would carry.
+        let record = store.profiles.get_mut(&input.profile_id).ok_or(
             PutAttributeMappingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::arn_not_found_message(
-                    &crate::state::profile_arn(&region, &input.profile_id),
-                )),
-            })
-        })?;
+                message: None,
+            }),
+        )?;
 
         // How many specifiers the field would map afterwards, bounded by
         // `MAX_MAPPING_RULES_PER_CERTIFICATE_FIELD`. Judged BEFORE the write, so a refused

@@ -12,7 +12,9 @@
 //! "specifies a certificate field and one or more specifiers"
 //! (`smithy_query(query="doc", shape="PutAttributeMapping")`). Both writes answer with the
 //! stored profile, so the next read agrees with them, and both refuse an id that resolves
-//! to no profile with this service's ARN-keyed 404 rather than writing anything.
+//! to no profile with the modelled 404 rather than writing anything, carrying no `message`
+//! member at all, which the model allows because `ResourceNotFoundException$message` is
+//! optional (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
 //!
 //! Every expectation below is the rule applied to the mappings the profile held BEFORE the
 //! call, read back over the wire — never a literal list of mappings — so the suite states
@@ -810,12 +812,14 @@ async fn a_put_past_the_specifier_ceiling_is_refused_and_stores_nothing() {
     );
 }
 
-/// Both writes refuse an id that resolves to no stored profile with this service's
-/// ARN-keyed 404, and nothing in the store changes.
+/// Both writes refuse an id that resolves to no stored profile with the modelled 404, and
+/// nothing in the store changes. The refusal's BODY carries no `message` member at all, so
+/// it discloses nothing — not even the ARN the id would carry — about a profile that does
+/// not exist.
 ///
 /// The table spans why the id does not resolve (never minted, minted for a profile that was
-/// deleted) and the Region the request is signed for, because the ARN in the wording follows
-/// the request.
+/// deleted) and the Region the request is signed for, because an ARN-keyed wording would
+/// follow the request: none of it may reach the body.
 #[tokio::test]
 async fn attribute_mapping_writes_refuse_an_unknown_profile() {
     let client = Client::new();
@@ -851,7 +855,6 @@ async fn attribute_mapping_writes_refuse_an_unknown_profile() {
     }
 
     for (case, id, region) in cases {
-        let expected = arn_not_found_message(&profile_arn(region, &id));
         for (path, answer) in [
             (
                 "PutAttributeMapping",
@@ -876,11 +879,31 @@ async fn attribute_mapping_writes_refuse_an_unknown_profile() {
                 "case {labelled:?}: expected ResourceNotFoundException, got {:?}",
                 answer.error_code
             );
+            // Absence is the requirement: no `message` member on the wire, so the refusal
+            // carries no ARN for a profile that does not exist.
             assert_eq!(
                 answer.message(),
-                Some(expected.as_str()),
-                "case {labelled:?}: expected message {expected:?}, got {:?}",
+                None,
+                "case {labelled:?}: the refusal must carry no message member, got {:?}",
                 answer.message()
+            );
+            assert!(
+                answer.body.get("message").is_none(),
+                "case {labelled:?}: the refusal must carry no message member, got {:?}",
+                answer.body
+            );
+            let rendered = answer.body.to_string();
+            // Not even the ARN-keyed wording the profile READ paths answer a miss with:
+            // the body carries no message, so nothing about the absent profile is
+            // disclosed.
+            let withheld = arn_not_found_message(&profile_arn(region, &id));
+            assert!(
+                !rendered.contains(&withheld)
+                    && !rendered.contains("arn:")
+                    && !rendered.contains(&id)
+                    && !rendered.contains(region),
+                "case {labelled:?}: the refusal must disclose no ARN, id or Region, got \
+                 {rendered:?}"
             );
         }
 

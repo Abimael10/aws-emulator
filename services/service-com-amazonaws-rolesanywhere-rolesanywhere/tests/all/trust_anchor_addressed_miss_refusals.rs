@@ -6,8 +6,10 @@
 //! The rule under test: an operation that addresses a trust anchor resolves the id
 //! against this service's stored state — a stored id is served from that record, and an
 //! id no stored anchor carries is the operation's modelled `ResourceNotFoundException`
-//! (HTTP 404) carrying the fixed wording this service answers an addressed miss with. No
-//! such operation may answer a resolvable request with the scaffold's HTTP 501
+//! (HTTP 404) carrying wholly fixed wording: this service's trust-anchor miss tail,
+//! prefixed with the operation's own scope phrase on the one path the service scopes to
+//! the operation (`DisableTrustAnchor`). No part of either wording comes from the request.
+//! No such operation may answer a resolvable request with the scaffold's HTTP 501
 //! `NotImplemented`, which is in no operation's modelled error set.
 //!
 //! The sibling suites each pin ONE operation; this table's rows differ along the
@@ -37,9 +39,15 @@ const CERTIFICATE_BUNDLE_PEM: &str =
 const REGION: &str = "ap-southeast-2";
 
 /// The wording a refusal carries when the trust anchor a request ADDRESSES by
-/// `trustAnchorId` is not stored: wholly fixed text, the same for every operation that
-/// addresses one.
+/// `trustAnchorId` is not stored: wholly fixed text, the same for every operation whose
+/// refusal the service does not scope to the operation itself (`DisableTrustAnchor`, which
+/// does, carries its own scoped wording in [`ADDRESSED_OPERATIONS`]).
 const TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str = "TrustAnchor not found";
+
+/// The wording `DisableTrustAnchor` scopes that miss to itself with: its own scope phrase
+/// followed by the fixed tail above.
+const DISABLE_TRUST_ANCHOR_NOT_FOUND_MESSAGE: &str =
+    "Error disabling TrustAnchor. TrustAnchor not found";
 
 /// One operation that addresses a trust anchor by `trustAnchorId`.
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +64,9 @@ struct Addressed {
     /// The `enabled` flag the operation WRITES, when writing it is the operation's whole
     /// effect; `None` for an operation that leaves the flag as the record held it.
     writes_enabled: Option<bool>,
+    /// The wholly fixed `message` this operation refuses an addressed miss with: the
+    /// service's tail, scoped to the operation where the operation scopes it.
+    not_found_message: &'static str,
 }
 
 /// Every operation whose input carries `trustAnchorId`, with the binding and the smallest
@@ -72,6 +83,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
         uri: "/trustanchor/{id}",
         body: None,
         writes_enabled: None,
+        not_found_message: TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
     Addressed {
         name: "EnableTrustAnchor",
@@ -79,6 +91,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
         uri: "/trustanchor/{id}/enable",
         body: None,
         writes_enabled: Some(true),
+        not_found_message: TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
     Addressed {
         name: "DisableTrustAnchor",
@@ -86,6 +99,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
         uri: "/trustanchor/{id}/disable",
         body: None,
         writes_enabled: Some(false),
+        not_found_message: DISABLE_TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
     Addressed {
         name: "UpdateTrustAnchor",
@@ -93,6 +107,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
         uri: "/trustanchor/{id}",
         body: Some(r#"{"name": "renamed by the addressed-miss suite"}"#),
         writes_enabled: None,
+        not_found_message: TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
     Addressed {
         name: "PutNotificationSettings",
@@ -105,6 +120,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
                 ]}"#,
         ),
         writes_enabled: None,
+        not_found_message: TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
     Addressed {
         name: "ResetNotificationSettings",
@@ -115,6 +131,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
                 "notificationSettingKeys": [{"event": "CA_CERTIFICATE_EXPIRY"}]}"#,
         ),
         writes_enabled: None,
+        not_found_message: TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
     // Last in the table only for readability: each case runs against its own anchor, so
     // the delete never takes an anchor another row needs.
@@ -124,6 +141,7 @@ const ADDRESSED_OPERATIONS: [Addressed; 7] = [
         uri: "/trustanchor/{id}",
         body: None,
         writes_enabled: None,
+        not_found_message: TRUST_ANCHOR_NOT_FOUND_MESSAGE,
     },
 ];
 
@@ -321,9 +339,17 @@ async fn every_operation_addressing_a_trust_anchor_refuses_an_unknown_id_as_not_
             );
             assert_eq!(
                 message_of(&answer),
-                TRUST_ANCHOR_NOT_FOUND_MESSAGE,
-                "case {case:?}: the refusal must carry the wording this service answers an \
+                operation.not_found_message,
+                "case {case:?}: the refusal must carry the wording this operation answers an \
                  addressed miss with, got {answer:?}"
+            );
+            // The wording is fixed whichever operation answers it: nothing from the
+            // request — not the id, not the Region — reaches the message.
+            let message = message_of(&answer);
+            assert!(
+                !message.contains(id.as_str()) && !message.contains(REGION),
+                "case {case:?}: the wording is fixed, so neither the requested id nor the \
+                 Region may appear, got {message:?}"
             );
 
             // The refusal landed nowhere: the id still resolves to nothing.
