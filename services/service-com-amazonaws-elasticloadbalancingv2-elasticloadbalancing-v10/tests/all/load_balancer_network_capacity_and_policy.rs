@@ -21,9 +21,9 @@
 //!   modelled `OperationNotPermittedException`, because reserving capacity is a capability
 //!   this account does not have, and serves a reset; `DescribeCapacityReservation` reports
 //!   the reservation the store holds.
-//! * `GetResourcePolicy` answers the policy attached to the trust store the ARN names, and
-//!   refuses an ARN that names no such policy with the modelled
-//!   `ResourceNotFoundException`.
+//! * `GetResourcePolicy` answers the policy attached to the trust store the ARN names, or
+//!   the empty policy document for one no policy is attached to, and refuses an ARN it
+//!   resolves no trust store from with the modelled `ResourceNotFoundException`.
 //!
 //! The wire harness (`emulator`, `call`, `action`, `p`, `members`, `first_text`) and the
 //! trust-store seeding come from `provisioning_loop`; the load balancer creator from
@@ -36,6 +36,7 @@ use crate::provisioning_loop::{
 };
 use crate::target_group_attributes_and_modification::unescaped;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState;
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::EMPTY_RESOURCE_POLICY;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
@@ -1067,13 +1068,12 @@ async fn the_capacity_reservation_a_read_reports_is_the_one_the_store_holds() {
 /// `GetResourcePolicy` answers the policy attached to the trust store the ARN names, and
 /// refuses every other ARN — each for its own reason: a value that is no ARN is refused
 /// for its form, a resource type this API reads no policy for is refused for its type,
-/// and a trust store ARN that resolves to no policy is the modelled `ResourceNotFound`
-/// naming the ARN the request carried.
+/// and a trust store ARN this store holds no trust store under is the modelled
+/// `ResourceNotFound` naming the ARN the request carried.
 ///
-/// The rows span the shapes of a value that resolves to no policy: a trust store this
-/// store does not hold, a trust store that holds no policy, two kinds of this service's
-/// own resource that carry no resource policy, an ARN of another service, and three
-/// values that are no ARN.
+/// The rows span the shapes of a value that resolves to nothing: a trust store this store
+/// does not hold, two kinds of this service's own resource that carry no resource policy,
+/// an ARN of another service, and three values that are no ARN.
 #[tokio::test]
 async fn get_resource_policy_answers_the_policy_the_store_holds() {
     let (router, engine) = emulator();
@@ -1117,6 +1117,22 @@ async fn get_resource_policy_answers_the_policy_the_store_holds() {
         reply.body
     );
 
+    // A trust store this store HOLDS and no policy is attached to is reported, not
+    // refused: the absence of a policy is in the body. Spanned over every shape of an
+    // attached and unattached policy by
+    // `get_resource_policy_reports_an_unattached_policy_as_the_empty_document` below.
+    let mut form = action("GetResourcePolicy");
+    form.push(p("ResourceArn", &unshared));
+    let reply = call(&router, &form).await;
+    assert_eq!(
+        (reply.status, reply.text("Policy").map(|text| unescaped(&text))),
+        (200, Some(EMPTY_RESOURCE_POLICY.to_string())),
+        "case a trust store no policy is attached to: expected 200 and the empty policy \
+         document, got {} body {}",
+        reply.status,
+        reply.body
+    );
+
     let load_balancer = create_load_balancer(&router, "lb-policy-probe", &[]).await;
     let absent_trust_store = format!(
         "arn:aws:elasticloadbalancing:{REGION}:{}:truststore/not-here/0123456789abcdef",
@@ -1127,11 +1143,12 @@ async fn get_resource_policy_answers_the_policy_the_store_holds() {
         account()
     );
 
-    // A trust store ARN that resolves to no policy: the modelled refusal, naming the ARN.
-    let not_found: Vec<(&str, String)> = vec![
-        ("a trust store this store does not hold", absent_trust_store),
-        ("a trust store no policy is attached to", unshared),
-    ];
+    // A trust store ARN this store holds no trust store under: the modelled refusal,
+    // naming the ARN.
+    let not_found: Vec<(&str, String)> = vec![(
+        "a trust store this store does not hold",
+        absent_trust_store,
+    )];
     for (case, arn) in &not_found {
         let mut form = action("GetResourcePolicy");
         form.push(p("ResourceArn", arn));
@@ -1217,4 +1234,111 @@ fn attach_policy(engine: &Arc<engine::InMemoryEngine>, arn: &str, policy: &str) 
         .get_mut(arn)
         .expect("the trust store seeded above")
         .resource_policy = Some(policy.to_string());
+}
+
+/// What a policy read reports for a trust store this store HOLDS: the document attached to
+/// it, or the empty policy document for one nothing attached a policy to.
+///
+/// Whether a policy is attached is a fact about the BODY, never a reason to refuse — the
+/// modelled `ResourceNotFound` is reserved for an ARN this store resolves no trust store
+/// from, which is the row at the end. The served rows differ along what the rule
+/// generalises over: whether a policy is attached at all, the document attached (the empty
+/// object, one statement, several statements, a document carrying the characters awsQuery
+/// XML has to escape), and whether the clock still owes the trust store its move to
+/// `ACTIVE` — a trust store inside its settling span exists, so its policy reads back too.
+///
+/// The read reports and writes nothing, so every row is read TWICE and must answer the
+/// same both times: a first read must not turn an unattached policy into a stored one.
+#[tokio::test]
+async fn get_resource_policy_reports_an_unattached_policy_as_the_empty_document() {
+    let (router, engine) = emulator();
+
+    // Each row: the case, whether the clock has settled the trust store, and the policy a
+    // share attached to it — `None` for a trust store that was never shared.
+    let rows: Vec<(&str, bool, Option<&str>)> = vec![
+        ("no policy attached, settled", true, None),
+        ("no policy attached, still CREATING", false, None),
+        (
+            "a policy with no statements attached",
+            true,
+            Some(r#"{"Version":"2012-10-17","Statement":[]}"#),
+        ),
+        (
+            "a policy with one statement attached",
+            true,
+            Some(
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"210987654321"},"Action":"elasticloadbalancing:*","Resource":"*"}]}"#,
+            ),
+        ),
+        (
+            "a policy with several statements attached",
+            true,
+            Some(
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"210987654321"},"Action":"elasticloadbalancing:DescribeTrustStores","Resource":"*"},{"Effect":"Deny","Principal":{"AWS":"310987654321"},"Action":"elasticloadbalancing:*","Resource":"*"}]}"#,
+            ),
+        ),
+        (
+            "a policy carrying characters XML escapes",
+            true,
+            Some(r#"{"Comment":"a & b <c> \"d\"","Statement":[]}"#),
+        ),
+        (
+            "the empty policy document attached outright",
+            true,
+            Some(EMPTY_RESOURCE_POLICY),
+        ),
+    ];
+
+    for (index, (case, settled, attached)) in rows.iter().enumerate() {
+        let arn = seed_trust_store(
+            &engine,
+            index,
+            &TrustStoreSeed {
+                name: &format!("policy-row-{index}"),
+                settled: *settled,
+                ..TrustStoreSeed::default()
+            },
+        );
+        if let Some(policy) = attached {
+            attach_policy(&engine, &arn, policy);
+        }
+        let expected = attached.unwrap_or(EMPTY_RESOURCE_POLICY).to_string();
+        for read in ["the first read", "the read after it"] {
+            let mut form = action("GetResourcePolicy");
+            form.push(p("ResourceArn", &arn));
+            let reply = call(&router, &form).await;
+            assert_eq!(
+                (
+                    reply.status,
+                    reply.text("Policy").map(|text| unescaped(&text))
+                ),
+                (200, Some(expected.clone())),
+                "case {case:?} on {read}: expected 200 and {expected:?}, got {} body {}",
+                reply.status,
+                reply.body
+            );
+        }
+    }
+
+    // The one case the read resolves nothing from: an ARN of the form this service mints
+    // that no trust store of this store carries.
+    let absent = format!(
+        "arn:aws:elasticloadbalancing:{REGION}:{}:truststore/never-created/00000000000000ff",
+        account()
+    );
+    let mut form = action("GetResourcePolicy");
+    form.push(p("ResourceArn", &absent));
+    let reply = call(&router, &form).await;
+    assert_refused(
+        "a trust store this store holds none under",
+        &reply,
+        RESOURCE_NOT_FOUND,
+        &absent,
+    );
+    assert_eq!(
+        reply.text("Message").map(|text| unescaped(&text)),
+        Some(format!("Trust store ARN '{absent}' not found")),
+        "case a trust store this store holds none under: unexpected message in {}",
+        reply.body
+    );
 }

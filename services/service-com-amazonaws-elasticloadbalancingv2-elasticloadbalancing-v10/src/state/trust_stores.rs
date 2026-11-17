@@ -79,9 +79,37 @@ pub fn delete_association_same_account_message(
     resource_arn: &str,
 ) -> String {
     format!(
-        "Cannot remove the association because the trust store ARN '{trust_store_arn}' and the \
-         resource ARN '{resource_arn}' are in the same account"
+        "Cannot remove the association because the trust store ARN '{trust_store_arn}' and \
+         resource ARN '{resource_arn}' belong to the same account"
     )
+}
+
+/// What a resource-policy read reports for a resource NO policy is attached to: the empty
+/// JSON document.
+///
+/// Elastic Load Balancing attaches a resource policy to a trust store when that trust store
+/// is SHARED, so a trust store that was never shared carries no statement — and that absence
+/// is reported in the body as a policy document with no statements in it, not as a refusal.
+/// It also satisfies `GetResourcePolicyOutput$Policy`'s `@length` minimum of 1.
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
+
+impl State {
+    /// The resource policy a read reports for the trust store `arn` names, or `None` when
+    /// this store holds no trust store under that ARN.
+    ///
+    /// EXISTENCE of the resource is what decides whether there is a policy to report: a
+    /// trust store that is held but was never shared has no policy attached to it, which is
+    /// reported as [`EMPTY_RESOURCE_POLICY`], while an ARN naming no held trust store is the
+    /// one case the read has nothing to resolve and refuses.
+    pub fn reported_resource_policy(&self, arn: &str) -> Option<String> {
+        let trust_store = self.trust_stores.get(arn)?;
+        Some(
+            trust_store
+                .resource_policy
+                .clone()
+                .unwrap_or_else(|| EMPTY_RESOURCE_POLICY.to_string()),
+        )
+    }
 }
 
 /// The message a `DeleteSharedTrustStoreAssociation` naming a resource that is not

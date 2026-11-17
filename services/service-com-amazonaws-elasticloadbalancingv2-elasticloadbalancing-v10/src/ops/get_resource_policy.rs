@@ -19,9 +19,14 @@
 //!   Balancing resource, or another vendor's — states a resource TYPE that has no resource
 //!   policy at all, which is a request this API cannot answer for any account:
 //!   `ValidationError` again, naming that.
-//! * A trust store ARN that resolves to no policy — this store holds no such trust store,
-//!   or holds one no policy is attached to — is the modelled `ResourceNotFoundException`,
-//!   the ONE error this operation declares.
+//! * A trust store ARN that this store holds no trust store under is the modelled
+//!   `ResourceNotFoundException`, the ONE error this operation declares.
+//!
+//! Whether a policy is ATTACHED decides nothing about which of those it is: a trust store
+//! this store holds is reported, carrying the policy attached to it or — for one that was
+//! never shared, so nothing attached a policy to it — the empty policy document
+//! (`crate::state::EMPTY_RESOURCE_POLICY`). A read is how a caller decides whether to
+//! attach, so "no policy here" is an answer, not a failure.
 //!
 //! A reporting operation: it reads the store and writes nothing to it.
 //!
@@ -183,13 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UNSUPPORTED_RESOURCE_TYPE,
             ));
         }
-        // A trust store this store holds, and a policy attached to it: either one missing
-        // leaves no policy at this ARN to report.
-        let policy = guard
-            .trust_stores
-            .get(&input.resource_arn)
-            .and_then(|trust_store| trust_store.resource_policy.clone());
-        let Some(policy) = policy else {
+        // A trust store this store holds has a policy to report: the one attached to it, or
+        // the empty policy document when nothing attached one. Only an ARN under which this
+        // store holds no trust store leaves nothing to resolve, which is what the one
+        // modelled refusal is for.
+        let Some(policy) = guard.reported_resource_policy(&input.resource_arn) else {
             return Err(
                 GetResourcePolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

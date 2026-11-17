@@ -135,7 +135,7 @@ pub use trust_stores::{
     delete_association_same_account_message, duplicate_trust_store_name_message,
     too_many_trust_stores_message, trust_store_active_at, trust_store_arn_not_found_message,
     trust_store_association_not_found_message, trust_store_in_use_message,
-    trust_store_name_not_found_message, TRUST_STORE_QUOTA,
+    trust_store_name_not_found_message, EMPTY_RESOURCE_POLICY, TRUST_STORE_QUOTA,
 };
 
 /// Where a trust store's CA certificates come from: the Amazon S3 object a create or a
@@ -2523,14 +2523,14 @@ pub fn availability_zone_records(
 }
 
 /// The message Elastic Load Balancing answers a `ResourceNotFound` with for a policy read
-/// whose `ResourceArn` names no policy to report.
+/// whose `ResourceArn` names no resource to read a policy of.
 ///
 /// Built from the request: the ARN it names is the only thing the caller can act on, and
-/// what the caller has to fix is that ARN — whether it named a trust store this account
-/// does not have, one no policy is attached to, or a resource that carries no resource
-/// policy at all. It is the same sentence every refusal about a trust store ADDRESSED BY
-/// ARN carries ([`trust_store_arn_not_found_message`]), read from there rather than spelled
-/// again, so one endpoint cannot word that one fact two ways.
+/// what the caller has to fix is that ARN — it named a trust store this account does not
+/// have, a trust store it does have carrying no policy being reported rather than refused
+/// ([`EMPTY_RESOURCE_POLICY`]). It is the same sentence every refusal about a trust store
+/// ADDRESSED BY ARN carries ([`trust_store_arn_not_found_message`]), read from there rather
+/// than spelled again, so one endpoint cannot word that one fact two ways.
 pub fn trust_store_policy_not_found_message(arn: &str) -> String {
     trust_store_arn_not_found_message(arn)
 }

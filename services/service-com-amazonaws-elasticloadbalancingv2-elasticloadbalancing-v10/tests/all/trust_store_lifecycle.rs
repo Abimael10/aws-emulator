@@ -30,8 +30,9 @@
 //!    `TrustStoreNotFound` naming that ARN, and a read by a name it holds none under names
 //!    the NAME;
 //! 7. a shared association is one with a resource of ANOTHER account: a resource of the
-//!    trust store's own account is `DeleteAssociationSameAccount`, and one of an account
-//!    this emulator holds no resource for is `AssociationNotFound`.
+//!    trust store's own account is `DeleteAssociationSameAccount`, worded as AWS words it
+//!    with both ARNs quoted from the request, and one of an account this emulator holds no
+//!    resource for is `AssociationNotFound`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1132,6 +1133,12 @@ async fn a_shared_association_is_one_with_another_accounts_resource() {
             "case {case:?}: expected the resource in the message, got {}",
             refused.body
         );
+        assert_eq!(
+            message(&refused),
+            same_account_message(&trust_store, &resource),
+            "case {case:?}: unexpected wording in {}",
+            refused.body
+        );
     }
 
     // A resource of ANOTHER account: this emulator holds no resource of another account, so
@@ -1168,5 +1175,113 @@ async fn a_shared_association_is_one_with_another_accounts_resource() {
             "case {case:?}: expected the pair in the message, got {}",
             refused.body
         );
+    }
+}
+
+/// The sentence Elastic Load Balancing refuses a same-account
+/// `DeleteSharedTrustStoreAssociation` with, as AWS words it: fixed text with the two ARNs
+/// the request carried quoted into it, the trust store first.
+///
+/// Written out here, beside the assertions, so the suite pins the wording independently of
+/// the handler that produces it.
+fn same_account_message(trust_store_arn: &str, resource_arn: &str) -> String {
+    format!(
+        "Cannot remove the association because the trust store ARN '{trust_store_arn}' and \
+         resource ARN '{resource_arn}' belong to the same account"
+    )
+}
+
+/// The same-account refusal's message is AWS's fixed sentence with the request's own
+/// `TrustStoreArn` and `ResourceArn` quoted into it — nothing else, whatever pair the
+/// request names.
+///
+/// The rows differ along what the message substitutes over: WHICH trust store of the
+/// account is addressed, and which kind of same-account resource is named (a listener, the
+/// load balancer carrying it, a target group, a listener rule, a resource in another Region
+/// of the same account, and the trust store itself) — none of which changes a character of
+/// the fixed text, because the two ARNs are echoed from the request.
+#[tokio::test]
+async fn the_same_account_refusal_quotes_both_arns_into_aws_wording() {
+    let (router, engine) = crate::provisioning_loop::emulator();
+    let first = crate::provisioning_loop::seed_trust_store(
+        &engine,
+        0,
+        &crate::provisioning_loop::TrustStoreSeed {
+            name: "ts-same-account-first",
+            settled: true,
+            ..Default::default()
+        },
+    );
+    let second = crate::provisioning_loop::seed_trust_store(
+        &engine,
+        1,
+        &crate::provisioning_loop::TrustStoreSeed {
+            name: "ts-same-account-second",
+            settled: true,
+            ..Default::default()
+        },
+    );
+
+    let held = account();
+    let resources: Vec<(&str, String)> = vec![
+        (
+            "a listener",
+            format!(
+                "arn:aws:elasticloadbalancing:{REGION}:{held}:listener/app/our-lb/\
+                 0123456789abcdef/fedcba9876543210"
+            ),
+        ),
+        (
+            "a load balancer",
+            format!(
+                "arn:aws:elasticloadbalancing:{REGION}:{held}:loadbalancer/app/our-lb/\
+                 0123456789abcdef"
+            ),
+        ),
+        (
+            "a target group",
+            format!(
+                "arn:aws:elasticloadbalancing:{REGION}:{held}:targetgroup/our-tg/\
+                 0123456789abcdef"
+            ),
+        ),
+        (
+            "a listener rule",
+            format!(
+                "arn:aws:elasticloadbalancing:{REGION}:{held}:listener-rule/app/our-lb/\
+                 0123456789abcdef/fedcba9876543210/00112233445566aa"
+            ),
+        ),
+        (
+            "a listener in another Region of the same account",
+            format!(
+                "arn:aws:elasticloadbalancing:eu-west-1:{held}:listener/app/our-lb/\
+                 0123456789abcdef/fedcba9876543210"
+            ),
+        ),
+    ];
+
+    for trust_store in [&first, &second] {
+        let mut rows = resources.clone();
+        rows.push(("the trust store itself", trust_store.clone()));
+        for (case, resource) in &rows {
+            let mut form = action("DeleteSharedTrustStoreAssociation");
+            form.push(p("TrustStoreArn", trust_store));
+            form.push(p("ResourceArn", resource));
+            let refused = call(&router, &form).await;
+            assert_eq!(
+                (refused.status, refused.error_code().as_str()),
+                (400, SAME_ACCOUNT),
+                "case {case:?} on {trust_store}: expected 400 {SAME_ACCOUNT}, got {} body {}",
+                refused.status,
+                refused.body
+            );
+            assert_eq!(
+                message(&refused),
+                same_account_message(trust_store, resource),
+                "case {case:?} on {trust_store}: unexpected wording in {}",
+                refused.body
+            );
+        }
     }
 }
