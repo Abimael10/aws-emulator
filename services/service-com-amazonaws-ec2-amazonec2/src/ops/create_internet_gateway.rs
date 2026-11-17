@@ -8,6 +8,11 @@
 //! — so its attachment set comes back EMPTY, and it carries the tags the request's
 //! `TagSpecifications` assign to it.
 //!
+//! The gateway reaches the wire with one element beyond the modelled record — its
+//! `association`, present and empty because nothing has associated it — which is written for
+//! every answer that reports an internet gateway rather than from here
+//! ([`crate::service::recorded_response_members`]).
+//!
 //! The request names nothing else: this operation takes no `ClientToken`, so a repeat of it
 //! is a second gateway rather than a replay of the first.
 //!

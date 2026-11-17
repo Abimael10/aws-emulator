@@ -9,7 +9,9 @@
 //! modelled member list does not mention. A recorded `DescribeVpcs` answers every VPC with
 //! `<dhcpOptionsSource>`, every operation that reports a Verified Access instance
 //! answers it with `<verifiedAccessInstanceTransitGatewayAttachmentSet>` — present and
-//! empty for an instance with no transit-gateway attachment — and a recorded
+//! empty for an instance with no transit-gateway attachment — a recorded
+//! `CreateInternetGateway` answers its gateway with `<association>`, present and empty for a
+//! gateway no association has been made for, and a recorded
 //! `DescribeInstanceTypes` answers every instance type with `<cpuBurstModel>` and every
 //! `networkInfo` with `<trafficMirroringSupport>`, and a recorded `DescribeSubnets` answers
 //! every subnet with the `<dhcpOptionsId>` it inherits from its VPC and the
@@ -25,13 +27,15 @@
 //! way the envelope's own `<return>` flag is: a member schema built by hand, written after
 //! the shape's modelled members. The rule is the PROTOCOL's — "an element the live wire
 //! renders on this shape is written whichever operation reports the shape" — so it reaches
-//! every operation that answers with a VPC or a Verified Access instance (a create, a
-//! modify, a describe, a delete) rather than being restated per handler.
+//! every operation that answers with a VPC, an internet gateway or a Verified Access
+//! instance (a create, a modify, a describe, a delete) rather than being restated per
+//! handler.
 //!
 //! Nothing here invents a value: each element is derived from the record being reported —
 //! the VPC's own DHCP option set association ([`WrittenMembers::dhcp_options_id`]), the
 //! transit-gateway attachments a Verified Access instance of this store holds, of which
-//! there are none, no operation of this service attaching one, the Availability Zone a
+//! there are none, no operation of this service attaching one, the association an internet
+//! gateway of this store is under, of which there is likewise none, the Availability Zone a
 //! reported volume's attachment sits in, which is the zone of the VOLUME the attachment was
 //! written under ([`EnclosingRecord`]) — a volume and the instance it is attached to are always
 //! in one zone, which is what "the volume must be in the same Availability Zone as the
@@ -123,6 +127,12 @@ fn held_subnet_dhcp_options(subnet_id: &str) -> Option<String> {
 /// The Smithy member name a Verified Access instance's own id is written under, which is
 /// what says the structure being walked IS such an instance.
 const VERIFIED_ACCESS_INSTANCE_ID_MEMBER: &str = "VerifiedAccessInstanceId";
+
+/// The Smithy member name an internet gateway's own id is written under, which is what says
+/// the structure being walked IS a reported internet gateway rather than a shape whose
+/// member merely shares the name (`Explanation$InternetGateway` targets an analysis
+/// component).
+const INTERNET_GATEWAY_ID_MEMBER: &str = "InternetGatewayId";
 
 /// `InstanceMetadataProtocolState`'s `enabled`, the state of the IPv4 metadata endpoint on
 /// every instance: IMDS has always served IPv4 and no operation of this service turns it
@@ -302,6 +312,35 @@ static VERIFIED_ACCESS_INSTANCE_TRANSIT_GATEWAY_ATTACHMENT_SET: Schema = Schema:
     0,
 );
 
+/// `<association>` on a reported internet gateway — a member schema for the same reason as
+/// [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#InternetGateway` declares only
+/// `attachmentSet`, `internetGatewayId`, `ownerId` and `tagSet`.
+///
+/// The element the live wire renders is a CONTAINER naming the association rather than a
+/// value of its own, so it is written as a structure ([`NoAssociation`]) — the same reading
+/// the always-empty attachment set above takes of its collection, rather than an element
+/// that happens to render the same bytes while claiming to be text.
+static INTERNET_GATEWAY_ASSOCIATION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#InternetGateway$association",
+        EC2_NAMESPACE,
+        "association",
+    ),
+    ShapeType::Structure,
+    "association",
+    0,
+);
+
+/// The content of the `association` element of a gateway no association has been made for:
+/// no member at all, which is what makes the element present and empty.
+struct NoAssociation;
+
+impl SerializableStruct for NoAssociation {
+    fn serialize_members(&self, _s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        Ok(())
+    }
+}
+
 /// One BORROWED structure serialized with the recorded elements of every shape under it.
 ///
 /// The entry point: a service that renders its own protocol envelope reaches its output as a
@@ -399,6 +438,9 @@ struct WrittenMembers {
     /// Whether the structure wrote a Verified Access instance id of its own, which is the
     /// id the attachment set below belongs to.
     verified_access_instance_id: bool,
+    /// Whether the structure wrote an internet gateway id of its own, which is what makes a
+    /// structure named after an internet gateway one.
+    internet_gateway_id: bool,
     /// Whether the structure wrote a volume id of its own, which is what makes a structure
     /// named after a volume attachment one.
     volume_id: bool,
@@ -446,6 +488,7 @@ fn recorded_writer_for(schema: &Schema) -> Option<RecordedWriter> {
         "Vpc" => Some(write_vpc_recorded_members),
         "Subnet" => Some(write_subnet_recorded_members),
         "VerifiedAccessInstance" => Some(write_verified_access_instance_recorded_members),
+        "InternetGateway" => Some(write_internet_gateway_recorded_members),
         "VolumeAttachment" => Some(write_volume_attachment_recorded_members),
         "InstanceTypeInfo" => Some(write_instance_type_recorded_members),
         "NetworkInfo" => Some(write_network_info_recorded_members),
@@ -667,6 +710,38 @@ fn write_verified_access_instance_recorded_members(
     )
 }
 
+/// A reported INTERNET GATEWAY's recorded elements: the association it is under.
+///
+/// Always EMPTY, and present: an association is not a thing any operation of this service
+/// makes — what a caller does with a new gateway is "attach it to a VPC using
+/// AttachInternetGateway" (`CreateInternetGateway`), which is the record's own
+/// `attachmentSet` member — so a gateway of this store is under none, and the element says so
+/// by being there and carrying nothing. That is the whole difference it closes for a client
+/// that reads it to decide whether a gateway is already associated: absent reads as "this
+/// answer does not say", present and empty as "nothing".
+///
+/// Written only for a structure that reported an internet gateway id of its own, which is
+/// what makes it one of these gateways rather than a shape whose member shares the name — so
+/// it reaches the create's `internetGateway` and every item of a describe's
+/// `internetGatewaySet` alike, the rule being the protocol's rather than one handler's.
+///
+/// The element is empty because the STORE holds no association for any gateway, not because
+/// the element is a constant: the day an operation that associates one is implemented, the
+/// association it writes belongs on the gateway's record in
+/// [`crate::state::ComAmazonawsEc2Amazonec2State::internet_gateways`], and this writer reads
+/// it from there the way [`write_subnet_recorded_members`] reads what its projection
+/// resolved.
+fn write_internet_gateway_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    if !written.internet_gateway_id {
+        return Ok(());
+    }
+    s.write_struct(&INTERNET_GATEWAY_ASSOCIATION, &NoAssociation)
+}
+
 /// One structure, serialized as its modelled members followed by the recorded elements its
 /// shape renders on the live wire.
 struct WithRecordedMembers<'a> {
@@ -827,7 +902,8 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
 
     /// The leaves this notes as it forwards: the DHCP option set id a VPC reports, which is
     /// what [`write_vpc_recorded_members`] names the scope of, the id a Verified Access
-    /// instance reports, which is what identifies it as one, the volume id that identifies a
+    /// instance reports, which is what identifies it as one, the id an internet gateway
+    /// reports, which identifies it the same way, the volume id that identifies a
     /// volume attachment, the zone a record reports for itself, which is the zone the
     /// records nested under it are in
     /// ([`write_volume_attachment_recorded_members`]), and the instance type name and
@@ -841,6 +917,7 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
                     VERIFIED_ACCESS_INSTANCE_ID_MEMBER => {
                         written.verified_access_instance_id = true;
                     }
+                    INTERNET_GATEWAY_ID_MEMBER => written.internet_gateway_id = true,
                     VOLUME_ID_MEMBER => written.volume_id = true,
                     HTTP_TOKENS_MEMBER => written.http_tokens = true,
                     AVAILABILITY_ZONE_MEMBER => {
