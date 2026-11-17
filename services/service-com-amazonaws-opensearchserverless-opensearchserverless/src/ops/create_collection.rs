@@ -238,6 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A tag key and a tag value are built from the tag character set, which `TagKey` and
+        // `TagValue` state no `@pattern` for: a tag the tagging plane would refuse is not one
+        // a create stores either, so no collection is created.
+        if let Err(message) = crate::state::validate_tags(input.tags.iter().flatten()) {
+            return Err(CreateCollectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let stored = Self::store_collection(&state, input, &region, ctx)?;
 
         // Publish the ADDRESS this emulator answers the collection's OpenSearch REST

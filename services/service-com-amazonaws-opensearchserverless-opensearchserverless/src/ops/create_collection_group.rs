@@ -236,6 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A tag key and a tag value are built from the tag character set, which `TagKey` and
+        // `TagValue` state no `@pattern` for: a tag the tagging plane would refuse is not one
+        // a create stores either, so no group is created.
+        if let Err(message) = crate::state::validate_tags(input.tags.iter().flatten()) {
+            return Err(CreateCollectionGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the group, so it

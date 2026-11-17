@@ -995,11 +995,11 @@ async fn a_collection_group_update_refuses_what_it_cannot_apply_and_writes_nothi
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
             // `UpdateCollectionGroup` models no `ResourceNotFoundException`, so an id that
-            // addresses no group is refused with the only client error it does model.
+            // addresses no group is the state conflict `ConflictException` describes.
             "an id that addresses no group",
             json!({ "id": "zzz999zzz", "description": "nothing to write" }),
             400,
-            "ValidationException",
+            "ConflictException",
         ),
         (
             "an indexing floor above its own ceiling",

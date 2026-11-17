@@ -18,6 +18,11 @@
 //! * a precondition that never clears by retrying the same request is `ValidationException`
 //!   (400), not the `ConflictException` (409) a client retries: a consumed
 //!   policy/configuration version, and a collection group that still holds collections;
+//! * a refusal carries the class the ADDRESSED operation models for its condition: a
+//!   mutation of a resource that is not there reports the state conflict when its model
+//!   declares no not-found error, and the not-found error when it does;
+//! * a tag key and a tag value are built from the tag character set, on every operation
+//!   that accepts tags, and a tag outside it is refused and stored nowhere;
 //! * the tagging plane addresses a RESOURCE, so it resolves every kind of taggable
 //!   resource this service stores, not only collections;
 //! * a limit past a quota, and a policy document whose statement names an empty required
@@ -414,7 +419,10 @@ async fn the_tagging_plane_resolves_every_taggable_resource_kind() {
     ];
     let values: Vec<(&str, &str)> = vec![
         ("plain ASCII", "search"),
-        ("multi-byte UTF-8", "ベクトル検索 🌐 — naïve"),
+        // Letters of three scripts and a space — multi-byte text built only from the
+        // characters a tag may carry, so what is under test is that it survives byte for
+        // byte and not whether the character set admits it.
+        ("multi-byte UTF-8", "ベクトル検索 naïve αβγ"),
         ("the empty value", ""),
     ];
 
@@ -894,7 +902,7 @@ async fn a_capacity_limit_past_the_account_quota_is_refused_and_stores_nothing()
             format!(
                 "The requested total {word} capacity of {asked}.0 OCUs exceeds your maximum \
                  {word} capacity service quota limit of {quota} OCUs. Current settings: \
-                 {current} OCUs for collections that are not part of any collection group, 0 \
+                 {current} OCUs for collections that are not part of any collection group, 0.0 \
                  OCUs for collection groups. New request of {asked} OCUs would bring total to \
                  {asked}.0 OCUs."
             ),
@@ -972,8 +980,8 @@ async fn the_account_quota_counts_the_capacity_the_collection_groups_commit() {
         format!(
             "The requested total indexing capacity of {asked}.0 OCUs exceeds your maximum \
              indexing capacity service quota limit of {quota} OCUs. Current settings: {} OCUs \
-             for collections that are not part of any collection group, {committed_ocu} OCUs for \
-             collection groups. New request of {asked} OCUs would bring total to {}.0 OCUs.",
+             for collections that are not part of any collection group, {committed_ocu}.0 OCUs \
+             for collection groups. New request of {asked} OCUs would bring total to {}.0 OCUs.",
             before.0.unwrap_or_default(),
             asked + committed_ocu
         ),
@@ -1291,4 +1299,473 @@ async fn an_impossible_capacity_range_names_the_members_and_their_float_values()
         &accepted_limits,
         "case the group after the refusals: only the accepted write may have landed, got {read}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// UpdateCollectionGroup: an `id` that addresses no stored collection group.
+// ---------------------------------------------------------------------------
+
+/// How this service words a collection group a MUTATION addressed and did not find, on the
+/// operation whose model declares no `ResourceNotFoundException`
+/// (`smithy_query(query="operation", operation="UpdateCollectionGroup")` -> errors
+/// `ConflictException`, `InternalServerException`, `ServiceQuotaExceededException`,
+/// `ValidationException`).
+fn group_absent_conflict(id: &str) -> String {
+    format!("The CollectionGroup withId {id}, does not exist")
+}
+
+/// How the operations that DO model `ResourceNotFoundException` word the same absence.
+fn group_absent_not_found(id: &str) -> String {
+    format!("CollectionGroup with ID '{id}' cannot be found.")
+}
+
+#[tokio::test]
+async fn a_collection_group_mutation_reports_an_absent_group_in_the_class_its_model_declares() {
+    let router = emulator();
+
+    // One group is stored throughout, so no refusal below is about an empty account.
+    let kept = create_group(
+        &router,
+        json!({ "name": "kept-mutable-group", "standbyReplicas": "ENABLED" }),
+    )
+    .await;
+    let kept_id = text(&kept, "id");
+
+    // An id that DID address a group until it was deleted — the way a client reaches this
+    // refusal after its own delete — beside ids nothing ever minted.
+    let doomed = create_group(
+        &router,
+        json!({ "name": "doomed-mutable-group", "standbyReplicas": "DISABLED" }),
+    )
+    .await;
+    let doomed_id = text(&doomed, "id");
+    let (status, code, answer) = call(
+        &router,
+        "DeleteCollectionGroup",
+        json!({ "id": &doomed_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the delete of {doomed_id}: expected 200, got {status} {code} with {answer}"
+    );
+
+    // Every row satisfies `CollectionGroupId`'s own `@length(min: 3, max: 40)` and
+    // `^[a-z0-9]{3,40}$`, so each reaches the handler rather than the boundary validator:
+    // both published length bounds, one of digits alone, and the deleted id.
+    let longest = "q7".repeat(20);
+    let ids: Vec<(&str, String)> = vec![
+        ("an id at the minimum length of three", "abc".to_string()),
+        ("an id at the maximum length of 40", longest),
+        ("an id of digits alone", "00000000000000000000".to_string()),
+        ("the id of a group that was deleted", doomed_id.clone()),
+    ];
+
+    // The members the write carries differ per row: the group's absence is what the refusal
+    // is about, not what the write asked for.
+    let writes: Vec<(&str, Value)> = vec![
+        (
+            "a description alone",
+            json!({ "description": "a probe at a group that is not there" }),
+        ),
+        (
+            "capacity limits alone",
+            json!({ "capacityLimits": { "maxIndexingCapacityInOCU": 8.0 } }),
+        ),
+        (
+            "a description, limits and a clientToken",
+            json!({
+                "description": "",
+                "capacityLimits": { "minSearchCapacityInOCU": 0.0, "maxSearchCapacityInOCU": 2.0 },
+                "clientToken": "a-token-spent-on-nothing",
+            }),
+        ),
+    ];
+
+    for (id_case, id) in &ids {
+        for (write_case, members) in &writes {
+            let case = format!("{id_case}, {write_case}");
+            let mut request = members.clone();
+            request["id"] = json!(id);
+            let (status, code, answer) = call(&router, "UpdateCollectionGroup", request).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (CLIENT_ERROR, "ConflictException"),
+                "case UpdateCollectionGroup({case}): expected {CLIENT_ERROR} ConflictException, \
+                 got {status} {code} with {answer}"
+            );
+            assert_eq!(
+                message(&answer),
+                group_absent_conflict(id),
+                "case UpdateCollectionGroup({case}): the refusal must name the group kind and \
+                 the id the request carried, got {answer}"
+            );
+        }
+
+        // The SAME absence, on the operation that models `ResourceNotFoundException`, is
+        // that class with its own wording: the class each refusal carries is the one the
+        // addressed operation models, not one class for the condition.
+        let (status, code, answer) =
+            call(&router, "DeleteCollectionGroup", json!({ "id": id })).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case DeleteCollectionGroup({id_case}): expected {CLIENT_ERROR} \
+             ResourceNotFoundException, got {status} {code} with {answer}"
+        );
+        assert_eq!(
+            message(&answer),
+            group_absent_not_found(id),
+            "case DeleteCollectionGroup({id_case}): the refusal must carry that operation's \
+             own wording, got {answer}"
+        );
+    }
+
+    // The stored group is untouched by all of it: the update refused for an absent id is
+    // applied for the id that addresses one.
+    let (status, code, answer) = call(
+        &router,
+        "UpdateCollectionGroup",
+        json!({ "id": &kept_id, "description": "still here" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the stored group after every refusal: expected 200, got {status} {code} with \
+         {answer}"
+    );
+    assert_eq!(
+        text(&answer, "updateCollectionGroupDetail.description"),
+        "still here",
+        "case the stored group after every refusal: expected the update to be applied, got \
+         {answer}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The tag character set: what a tag key or value may be built from, on every
+// operation that accepts tags.
+// ---------------------------------------------------------------------------
+
+/// The one sentence every out-of-charset tag refusal carries: entirely fixed text, naming
+/// the special characters a tag may carry beside letters, numbers and spaces.
+const TAG_CHARSET_MESSAGE: &str = "Tags can only contain letters, numbers, spaces, and the \
+                                   following special characters: _ . : / = + - @";
+
+/// Every request of this service that models a `tags` member: `CreateCollectionRequest`,
+/// `CreateCollectionGroupRequest` and `TagResourceRequest`
+/// (`smithy_query(query="shape", shape="CreateAccessPolicyRequest,CreateSecurityPolicyRequest,CreateLifecyclePolicyRequest,CreateSecurityConfigRequest,CreateVpcEndpointRequest")`
+/// shows the policy, configuration and endpoint creates model none).
+const TAG_WRITERS: [&str; 3] = ["CreateCollection", "CreateCollectionGroup", "TagResource"];
+
+/// The request `operation` takes to write `tags`: a create names a new resource, the tagging
+/// plane's write names a stored one by `resourceArn`.
+fn tag_write_request(operation: &str, name: &str, arn: &str, tags: Value) -> Value {
+    match operation {
+        // A collection's encryption setting has to come from somewhere, and this suite is
+        // about the tags rather than about where it came from.
+        "CreateCollection" => json!({
+            "name": name,
+            "encryptionConfig": { "aWSOwnedKey": true },
+            "tags": tags,
+        }),
+        "CreateCollectionGroup" => json!({
+            "name": name,
+            "standbyReplicas": "ENABLED",
+            "tags": tags,
+        }),
+        _ => json!({ "resourceArn": arn, "tags": tags }),
+    }
+}
+
+/// The ARN the accepted write above stored its tags under: the created resource's own, or
+/// the one the tagging plane was pointed at.
+fn written_arn(operation: &str, answer: &Value, arn: &str) -> String {
+    match operation {
+        "CreateCollection" => text(answer, "createCollectionDetail.arn"),
+        "CreateCollectionGroup" => text(answer, "createCollectionGroupDetail.arn"),
+        _ => arn.to_string(),
+    }
+}
+
+/// A resource name for row `index` of `operation`'s table, inside `CollectionName`'s and
+/// `CollectionGroupName`'s shared `^[a-z][a-z0-9-]+$`.
+fn charset_name(operation: &str, index: usize) -> String {
+    let kind = match operation {
+        "CreateCollection" => "coll",
+        "CreateCollectionGroup" => "group",
+        _ => "tagged",
+    };
+    format!("charset-{kind}-{index}")
+}
+
+#[tokio::test]
+async fn a_tag_outside_the_character_set_is_refused_by_every_operation_that_accepts_tags() {
+    let router = emulator();
+
+    // The stored resource the tagging plane's rows address, which carries no tags yet.
+    let group = create_group(
+        &router,
+        json!({ "name": "charset-target-group", "standbyReplicas": "ENABLED" }),
+    )
+    .await;
+    let arn = text(&group, "arn");
+
+    // (case, key, value). The rows differ along which HALF of the tag carries the character
+    // outside the set and along the KIND of character it is: a pictograph, a dash that is not
+    // the hyphen-minus the set names, a line break, a currency symbol, and punctuation the
+    // set does not list.
+    let refused: Vec<(&str, String, String)> = vec![
+        (
+            "a pictograph in the value",
+            "launch".to_string(),
+            "\u{1F389}-party-2024".to_string(),
+        ),
+        (
+            "a pictograph in the key",
+            "launch\u{1F680}".to_string(),
+            "ready".to_string(),
+        ),
+        (
+            "an em dash in the value",
+            "note".to_string(),
+            "search \u{2014} fast".to_string(),
+        ),
+        (
+            "a line break in the value",
+            "note".to_string(),
+            "two\nlines".to_string(),
+        ),
+        (
+            "a currency symbol in the value",
+            "budget".to_string(),
+            "\u{20AC}20".to_string(),
+        ),
+        (
+            "brackets in the key",
+            "team[1]".to_string(),
+            "search".to_string(),
+        ),
+        (
+            "an asterisk in the value",
+            "glob".to_string(),
+            "index/*".to_string(),
+        ),
+        (
+            "a number sign in the value",
+            "ticket".to_string(),
+            "#1".to_string(),
+        ),
+    ];
+
+    for operation in TAG_WRITERS {
+        for (index, (row, key, value)) in refused.iter().enumerate() {
+            let case = format!("{operation}({row})");
+            let name = charset_name(operation, index);
+            let tags = json!([{ "key": key, "value": value }]);
+            let (status, code, answer) = call(
+                &router,
+                operation,
+                tag_write_request(operation, &name, &arn, tags),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (CLIENT_ERROR, "ValidationException"),
+                "case {case}: expected {CLIENT_ERROR} ValidationException, got {status} {code} \
+                 with {answer}"
+            );
+            assert_eq!(
+                message(&answer),
+                TAG_CHARSET_MESSAGE,
+                "case {case}: the refusal is one fixed sentence naming the character set, got \
+                 {answer}"
+            );
+
+            // A refused write stores nothing: the tagging plane's target still carries no
+            // tag, and a create's name is still free, which the accepted write below proves
+            // by taking it.
+            assert_eq!(
+                listed_tags(&router, &arn).await,
+                Vec::new(),
+                "case {case}: a refused tag write must leave the stored tag set empty"
+            );
+            let accepted = json!([{ "key": "team", "value": "search" }]);
+            let (status, code, answer) = call(
+                &router,
+                operation,
+                tag_write_request(operation, &name, &arn, accepted),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: the same request with a tag inside the set must be accepted, got \
+                 {status} {code} with {answer}"
+            );
+            let stored = written_arn(operation, &answer, &arn);
+            assert_eq!(
+                listed_tags(&router, &stored).await,
+                vec![("team".to_string(), "search".to_string())],
+                "case {case}: only the accepted write may have stored a tag"
+            );
+            if operation == "TagResource" {
+                // The shared target is left as it was found for the next row.
+                let (status, code, answer) = call(
+                    &router,
+                    "UntagResource",
+                    json!({ "resourceArn": &arn, "tagKeys": ["team"] }),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected the removal to be accepted, got {status} {code} with \
+                     {answer}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_tag_built_from_the_character_set_is_stored_byte_for_byte_by_every_tag_writer() {
+    let router = emulator();
+
+    let group = create_group(
+        &router,
+        json!({ "name": "accepted-charset-group", "standbyReplicas": "ENABLED" }),
+    )
+    .await;
+    let arn = text(&group, "arn");
+
+    // (case, key, value). The rows span the set itself: every special character it names,
+    // letters of several scripts, digits and spaces, the empty value `TagValue`'s
+    // `@length(min: 0)` admits, and a value at that member's published maximum of 256.
+    let longest = "x".repeat(256);
+    let accepted: Vec<(&str, String, String)> = vec![
+        (
+            "every special character the set names",
+            "a_b.c:d/e=f+g-h@i".to_string(),
+            "_ . : / = + - @".to_string(),
+        ),
+        (
+            "letters of several scripts",
+            "owner".to_string(),
+            "ベクトル検索 naïve \u{3B1}\u{3B2}\u{3B3}".to_string(),
+        ),
+        (
+            "digits and spaces",
+            "cost center 42".to_string(),
+            "0123456789".to_string(),
+        ),
+        ("the empty value", "team".to_string(), String::new()),
+        (
+            "a value at the modelled maximum length",
+            "long".to_string(),
+            longest,
+        ),
+    ];
+
+    for operation in TAG_WRITERS {
+        for (index, (row, key, value)) in accepted.iter().enumerate() {
+            let case = format!("{operation}({row})");
+            let name = charset_name(operation, index);
+            let tags = json!([{ "key": key, "value": value }]);
+            let (status, code, answer) = call(
+                &router,
+                operation,
+                tag_write_request(operation, &name, &arn, tags),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected 200, got {status} {code} with {answer}"
+            );
+            let stored = written_arn(operation, &answer, &arn);
+            let listed = listed_tags(&router, &stored).await;
+            assert!(
+                listed.contains(&(key.clone(), value.clone())),
+                "case {case}: expected the stored tags to carry {key:?} = {value:?} byte for \
+                 byte, got {listed:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpdateAccountSettings: how the quota refusal RENDERS the collection groups'
+// committed capacity.
+// ---------------------------------------------------------------------------
+
+/// The TOTAL the quota refusal names, as a figure computed from the collection groups'
+/// `float` capacity is rendered: a whole number of OCUs still carries a fractional part.
+fn rendered_ocu_figure(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+#[tokio::test]
+async fn the_quota_refusal_renders_the_collection_groups_committed_capacity_as_a_float() {
+    let router = emulator();
+
+    let quota = i64::from(MAX_ACCOUNT_CAPACITY_IN_OCU);
+    let current = stored_limits(&router).await.0.unwrap_or_default();
+
+    // Each row adds one group, so the committed figure the message renders differs along
+    // what the rule generalises over: a fraction, a sum of fractions that comes out whole,
+    // and a whole ceiling. `CollectionGroupCapacityLimits` members are modelled `float`
+    // (`smithy_query(query="shape", shape="CollectionGroupCapacityLimits")`), so every
+    // collection-group figure is rendered with a fractional part.
+    let rows: Vec<(&str, f64, &str)> = vec![
+        ("a fractional ceiling", 1.5, "1.5"),
+        ("fractions summing to a whole", 2.5, "4.0"),
+        ("a whole ceiling on top", 100.0, "104.0"),
+    ];
+
+    for (index, (case, ceiling, committed)) in rows.into_iter().enumerate() {
+        create_group(
+            &router,
+            json!({
+                "name": format!("committing-group-{index}"),
+                "standbyReplicas": "ENABLED",
+                "capacityLimits": { "maxIndexingCapacityInOCU": ceiling },
+            }),
+        )
+        .await;
+
+        // The request asks for the whole quota, which the groups' committed capacity then
+        // takes past it, so the refusal is the one that names both figures.
+        let (status, code, answer) = call(
+            &router,
+            "UpdateAccountSettings",
+            json!({ "capacityLimits": { "maxIndexingCapacityInOCU": quota } }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (CLIENT_ERROR, "ServiceQuotaExceededException"),
+            "case {case}: expected {CLIENT_ERROR} ServiceQuotaExceededException, got {status} \
+             {code} with {answer}"
+        );
+        let total = rendered_ocu_figure(
+            committed
+                .parse::<f64>()
+                .expect("the expected committed figure parses")
+                + quota as f64,
+        );
+        assert_eq!(
+            message(&answer),
+            format!(
+                "The requested total indexing capacity of {quota}.0 OCUs exceeds your maximum \
+                 indexing capacity service quota limit of {quota} OCUs. Current settings: \
+                 {current} OCUs for collections that are not part of any collection group, \
+                 {committed} OCUs for collection groups. New request of {quota} OCUs would \
+                 bring total to {total} OCUs."
+            ),
+            "case {case}: the collection-group figure and the total must be rendered as the \
+             floats they are, got {answer}"
+        );
+    }
 }

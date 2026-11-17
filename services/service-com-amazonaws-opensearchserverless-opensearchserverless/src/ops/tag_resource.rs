@@ -9,8 +9,9 @@
 //! `ValidationException` before any lookup, one that names no resource this
 //! account holds — including a collection whose deletion has been accepted — with
 //! `ResourceNotFoundException`, a write that would take the resource past the
-//! documented 50-tag quota with `ServiceQuotaExceededException`, and a `tags` that names
-//! one key twice with `ValidationException`.
+//! documented 50-tag quota with `ServiceQuotaExceededException`, a `tags` that names
+//! one key twice with `ValidationException`, and a tag key or value carrying a character
+//! outside the tag character set with `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +162,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(crate::state::repeated_element_message("tags", &repeated)),
+                },
+            )
+            .into());
+        }
+
+        // A tag key and a tag value are built from the tag character set, which `TagKey` and
+        // `TagValue` state no `@pattern` for: the boundary validator bounds their LENGTH only,
+        // so the set is held here, before anything is looked up or stored.
+        if let Err(message) = crate::state::validate_tags(input.tags.iter()) {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
                 },
             )
             .into());

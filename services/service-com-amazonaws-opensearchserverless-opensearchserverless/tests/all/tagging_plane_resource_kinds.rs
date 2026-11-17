@@ -194,7 +194,9 @@ async fn tags_of_every_taggable_kind_are_read_written_and_removed_through_the_ta
             "two tags, one with a multi-byte value",
             Some(json!([
                 { "key": "team", "value": "search" },
-                { "key": "owner", "value": "ベクトル検索 🌐 — naïve" },
+                // Letters of three scripts and the space the tag character set admits, so
+                // the value survives byte for byte without reaching outside that set.
+                { "key": "owner", "value": "ベクトル検索 naïve αβγ" },
             ])),
         ),
         ("an empty tag list", Some(json!([]))),

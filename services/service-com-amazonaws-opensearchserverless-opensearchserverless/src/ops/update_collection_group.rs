@@ -4,7 +4,8 @@
 //! IMPLEMENTED: writes the description and the capacity limits this request names into the
 //! `CollectionGroupRecord` its `id` addresses, stamps `lastModifiedDate`, and answers from
 //! the record it wrote — so a following `BatchGetCollectionGroup` reports exactly what this
-//! call stored.
+//! call stored. An `id` that addresses no stored group is refused `ConflictException`, the
+//! state conflict this operation's own model declares for it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,20 +191,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let written_at = crate::state::now_epoch_millis();
-        // This operation models no `ResourceNotFoundException`, so an `id` that addresses
-        // no stored group is refused as the invalid input it is — `ValidationException`,
-        // the only client refusal the model declares for a request this handler can
-        // neither apply nor conflict with.
+        // This operation models no `ResourceNotFoundException` (its errors are
+        // `ConflictException`, `InternalServerException`, `ServiceQuotaExceededException` and
+        // `ValidationException`), so an `id` that addresses no stored group is reported as the
+        // resource-state conflict `ConflictException` describes — the request is well formed,
+        // it is the group's existence that contradicts it — rather than as the malformed input
+        // a client must never retry. `UpdateVpcEndpoint`, the other id-addressed mutation whose
+        // model omits a not-found error, reports its own resource the same way.
         let Some(record) = store.collection_groups.get_mut(&input.id) else {
-            return Err(UpdateCollectionGroupErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "id {} does not identify a collection group in this account",
-                        input.id
+            return Err(
+                UpdateCollectionGroupErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::collection_group_absent_conflict_message(
+                        &input.id,
                     )),
-                },
-            )
-            .into());
+                })
+                .into(),
+            );
         };
         record.apply_update(input.description, input.capacity_limits, written_at);
         // Rendered from the record that is now STORED, so the update cannot report anything

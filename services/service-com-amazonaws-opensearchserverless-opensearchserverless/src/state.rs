@@ -2887,6 +2887,17 @@ pub fn collection_group_name_not_found_message(name: &str) -> String {
     format!("Collection group with name {name} is not found")
 }
 
+/// How a MUTATION of a collection group words an `id` that addresses no stored group, on an
+/// operation whose model declares no `ResourceNotFoundException`: as the resource-state
+/// conflict it reports instead, naming the kind as one word and the id the request carried.
+///
+/// The counterpart of [`vpc_endpoint_absent_conflict_message`] for the other resource whose
+/// update models no not-found error, so the two read alike: the operations that DO model
+/// `ResourceNotFoundException` keep [`collection_group_not_found_message`].
+pub fn collection_group_absent_conflict_message(id: &str) -> String {
+    format!("The CollectionGroup withId {id}, does not exist")
+}
+
 /// Hold an `IndexName` to the rule `CreateIndexRequest$indexName` documents: "Index names
 /// must be lowercase and can't begin with underscores (_) or hyphens (-)".
 ///
@@ -2955,6 +2966,49 @@ pub fn repeated_element_message(member: &str, element: &str) -> String {
     // One violation always renders; the bare clause is the same sentence without the
     // envelope's count prefix.
     envelope(::std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
+}
+
+/// The characters a tag key or value may carry BESIDE letters, numbers and separators, in
+/// the order the refusal that names them states them ([`TAG_CHARACTER_SET_MESSAGE`]).
+const TAG_SPECIAL_CHARACTERS: [char; 8] = ['_', '.', ':', '/', '=', '+', '-', '@'];
+
+/// How this service words a tag whose key or value carries a character the tag character set
+/// does not admit: entirely fixed text — neither the offending tag nor the character it
+/// carried appears — naming the special characters in [`TAG_SPECIAL_CHARACTERS`]' own order.
+pub const TAG_CHARACTER_SET_MESSAGE: &str = "Tags can only contain letters, numbers, spaces, \
+                                             and the following special characters: _ . : / = + - @";
+
+/// Whether `c` is a character a tag key or value may be built from: a LETTER or a NUMBER of
+/// any script, a separator (the space characters), or one of
+/// [`TAG_SPECIAL_CHARACTERS`].
+///
+/// `TagKey` and `TagValue` carry a `@length` and no `@pattern`
+/// (`smithy_query(query="shape", shape="Tag")`), so the boundary validator narrows the
+/// CONTENT of neither and the character set is held here. Letters of every script are
+/// admitted — only the categories the set names are — so a symbol, a pictograph or a dash
+/// that is not a hyphen-minus is not a tag character.
+fn is_tag_character(c: char) -> bool {
+    c.is_alphanumeric()
+        // The separator characters: whitespace that separates rather than controls, so a
+        // line break or a tab is not one of them.
+        || (c.is_whitespace() && !c.is_control())
+        || TAG_SPECIAL_CHARACTERS.contains(&c)
+}
+
+/// Hold every tag a request carries to the tag character set, answering the
+/// `ValidationException` message for the first key or value outside it. `Ok(())` for a tag
+/// set every element of which is inside it.
+///
+/// Every operation that ACCEPTS tags applies this — the two creates that model `tags` and
+/// the tagging plane's write — so one character set decides what the account can hold,
+/// whichever call wrote it, and a refused write stores nothing.
+pub fn validate_tags<'tags>(tags: impl IntoIterator<Item = &'tags Tag>) -> Result<(), String> {
+    for tag in tags {
+        if !tag.key.chars().all(is_tag_character) || !tag.value.chars().all(is_tag_character) {
+            return Err(TAG_CHARACTER_SET_MESSAGE.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// The kind of resource a `resourceArn` addresses — the tag-bearing resources this slice
@@ -3657,10 +3711,14 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
                 "The requested total {word} capacity of {} OCUs exceeds your maximum {word} \
                  capacity service quota limit of {MAX_ACCOUNT_CAPACITY_IN_OCU} OCUs. Current \
                  settings: {} OCUs for collections that are not part of any collection group, \
-                 {committed} OCUs for collection groups. New request of {asked} OCUs would bring \
+                 {} OCUs for collection groups. New request of {asked} OCUs would bring \
                  total to {} OCUs.",
                 rendered_ocu_total(f64::from(asked)),
                 self.account_settings.limit(kind),
+                // The collection groups' committed capacity is summed from the groups' own
+                // `float` ceilings, so it is rendered as the float quantity it is — not as
+                // the integer the account's own settings are.
+                rendered_ocu(committed),
                 rendered_ocu_total(total),
             ))
         })
