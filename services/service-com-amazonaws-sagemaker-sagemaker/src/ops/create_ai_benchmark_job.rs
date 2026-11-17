@@ -7,10 +7,16 @@
 //! `DescribeAIBenchmarkJob` replays what is stored here; this is the ONLY file to touch
 //! for this operation.
 //!
-//! The job RUNS AS the `RoleArn` the request names, so a role this account's IAM answers
-//! SageMaker cannot assume is refused with 400 `ValidationException` and nothing is stored
-//! (see [`crate::state::admission`]). The `BenchmarkTarget`'s endpoint is resolved the same
-//! way, before anything is stored: a benchmark drives traffic at that endpoint, so a target
+//! The `AIWorkloadConfigIdentifier` reference is resolved FIRST, against this service's own
+//! store: a configuration the account does not hold is answered with the modelled
+//! `ResourceNotFound` naming the identifier the request sent, rather than with any refusal
+//! this operation's model does not declare.
+//!
+//! Only a request whose reference resolves goes on to the identity: the job RUNS AS the
+//! `RoleArn` the request names, so a role this account's IAM answers SageMaker cannot assume
+//! is refused with 400 `ValidationException` and nothing is stored (see
+//! [`crate::state::admission`]). The `BenchmarkTarget`'s endpoint is resolved the same way,
+//! before anything is stored: a benchmark drives traffic at that endpoint, so a target
 //! naming one the account does not hold is refused rather than accepted
 //! ([`crate::state::benchmark_endpoint_not_found`]).
 //!
@@ -177,14 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        // The job RUNS AS the role the request names, so the role is settled before
-        // anything is stored and before the store is locked: only what the emulator's OWN
-        // IAM ANSWERED is refused (see `crate::state::admission`).
-        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::admission::ROLE_CANNOT_BE_ASSUMED,
-            ));
-        }
         let arn = crate::state::resource_arn(
             &region,
             crate::state::AI_BENCHMARK_JOB_KIND,
@@ -195,6 +193,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // keyed by the configuration's name, so an ARN is reduced to the name it carries.
         let workload_config_name =
             crate::state::name_from_arn_or_name(&input.ai_workload_config_identifier).to_string();
+
+        // The reference the request makes to this family's OWN entity is resolved FIRST,
+        // before the identity the job would run as: a benchmark job runs the workload the
+        // referenced configuration defines, so a configuration that does not exist leaves
+        // nothing to run, and `ResourceNotFound` — the missing-reference failure this
+        // operation MODELS (and the one `CreateAIWorkloadConfig` does not model, because it
+        // creates rather than resolves) — is what the caller is told. Resolving the role
+        // first would answer a reference nothing holds with the role's refusal instead, and
+        // that refusal is not even a modelled error of this operation, so a client branching
+        // on the error code would never see the missing configuration at all.
+        //
+        // The guard lives in a block of its own: the role is resolved by awaiting another
+        // service, and no store guard is ever held across an await.
+        let workload_config_held = {
+            let store = state.lock();
+            store.ai_workload_configs.contains_key(&workload_config_name)
+        };
+        if !workload_config_held {
+            return Err(CreateAIBenchmarkJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                // The reference as the REQUEST named it (a name or the configuration's
+                // ARN), in the sentence a create of this family words: the caller expected
+                // the account it signed for to hold it.
+                message: Some(crate::state::ai_workload_config_not_found_for_account(
+                    &input.ai_workload_config_identifier,
+                )),
+            })
+            .into());
+        }
+        // The job RUNS AS the role the request names, so the role is settled before
+        // anything is stored and with no store guard held: only what the emulator's OWN
+        // IAM ANSWERED is refused (see `crate::state::admission`).
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::admission::ROLE_CANNOT_BE_ASSUMED,
+            ));
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -209,22 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The service's one in-use sentence, stated in `crate::state` so every
                 // create that models `ResourceInUse` refuses with the same wording.
                 message: Some(crate::state::RESOURCE_IN_USE_MESSAGE.to_string()),
-            })
-            .into());
-        }
-        // A benchmark job runs the workload the referenced configuration defines, so a
-        // configuration that does not exist leaves nothing to run: `ResourceNotFound` is
-        // the missing-reference failure this operation models (and the one
-        // `CreateAIWorkloadConfig` does not model, because it creates rather than
-        // resolves).
-        if !store.ai_workload_configs.contains_key(&workload_config_name) {
-            return Err(CreateAIBenchmarkJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                // The reference as the REQUEST named it (a name or the configuration's
-                // ARN), in the sentence a create of this family words: the caller expected
-                // the account it signed for to hold it.
-                message: Some(crate::state::ai_workload_config_not_found_for_account(
-                    &input.ai_workload_config_identifier,
-                )),
             })
             .into());
         }
