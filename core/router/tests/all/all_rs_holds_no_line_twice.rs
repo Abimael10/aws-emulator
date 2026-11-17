@@ -8,22 +8,10 @@
 //! subject here and the workspace-wide siblings read it for every crate that does keep a
 //! hand-maintained root.
 //!
-//! [`super::all_rs_carries_one_header_block`] reads the header — the block ahead of the first
-//! item, where the module's own prose belongs — and stops there on purpose: past that item a
-//! line belongs to the list, which is a different rule's region. This suite reads that region,
-//! against the whole file: a line of the list that repeats a header line, or an earlier list
-//! line, is a COPY, and a copy of the header is what a landing branch leaves behind when it
-//! appends its paragraph to the end of the root instead of inserting its `#[path]`/`mod` pair
-//! into the sorted list. This root's tail had reached hundreds of such lines, each re-typed,
-//! re-worded or merged from the last, and one of them merged as `//!` is `E0753`, which
-//! compiles no suite of this target at all.
-//!
-//! [`super::all_rs_is_a_canonical_declaration_list`] reports such a line too — for not being
-//! half of a declaration pair — and that is the rule that keeps the list clean. What this one
-//! adds is where the line came from: the earlier line it copies, which is the line that
-//! invited it, and which no report about pair shape names. A copy is reported here wherever it
-//! stands in the list, whether or not it is also past the last pair
-//! ([`super::declaration_roots_end_with_their_last_declaration`]).
+//! A declaration root is appended to by every landing branch, and the header ahead of its first
+//! item is the region the sibling [`super::all_rs_carries_one_header_block`] reads. Past that
+//! item every line belongs to the LIST, and a line standing there that the file already said is
+//! what a branch leaves behind when it appends its note, or its own pair, a second time.
 //!
 //! Both halves of the root are answered here, the header one through the sibling's own reader,
 //! so the two cannot disagree about what a repeat is: a line that says nothing — a blank line,

@@ -51,6 +51,8 @@ mod flow_in_use_guards;
 mod flow_lifecycle;
 #[path = "all/flow_preparation.rs"]
 mod flow_preparation;
+#[path = "all/flow_version_definition_fidelity.rs"]
+mod flow_version_definition_fidelity;
 #[path = "all/flow_version_deletion.rs"]
 mod flow_version_deletion;
 #[path = "all/flow_version_listing.rs"]
