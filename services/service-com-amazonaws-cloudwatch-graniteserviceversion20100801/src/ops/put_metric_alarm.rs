@@ -16,7 +16,8 @@
 //! array that does not designate exactly one query as the single time series an alarm
 //! watches, a `TreatMissingData` or `EvaluateLowSampleCountPercentile` naming no policy the
 //! evaluation implements, a `DatapointsToAlarm` asking for more breaching datapoints than
-//! there are `EvaluationPeriods` to grade, and an action
+//! there are `EvaluationPeriods` to grade, a dimension set naming the same dimension twice,
+//! and an action
 //! naming a Region other than the alarm's own (CloudWatch executes an alarm's actions in the
 //! alarm's Region). An `ExtendedStatistic` naming no statistic this service can compute is a
 //! parameter VALUE it cannot serve, so that one is answered as the modelled
@@ -515,6 +516,12 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
             }
         }
     }
+    // A dimension NAME identifies one coordinate of the metric the alarm watches, so a
+    // dimension set that names the same one twice names no single metric — see
+    // [`duplicate_dimension_refusal`].
+    if let Some(message) = duplicate_dimension_refusal(input) {
+        return Some(message);
+    }
     // "For an alarm based on a metric, you must specify either Statistic or ExtendedStatistic
     // but not both." (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Statistic")`)
     // — one statistic is what the alarm folds each of its windows by, so a request naming a basic
@@ -654,6 +661,58 @@ const ALARM_WRITE: &str = "PutMetricAlarm";
 /// of it, since what has to change is that the member is there at all.
 fn metrics_exclusive_refusal(member: &str) -> String {
     format!("{member} should not be set if list of Metrics is set.")
+}
+
+/// The refusal of a request whose dimension set names the same dimension twice, or `None` when
+/// every dimension set it carries names each dimension at most once.
+///
+/// A dimension "is a name/value pair that is part of the identity of a metric. Because
+/// dimensions are part of the unique identifier for a metric, whenever you add a unique
+/// name/value pair to one of your metrics, you are creating a new variation of that metric."
+/// (`smithy_query(query="doc",shape="Dimension")`) — so a dimension NAME is one coordinate of
+/// that identity and carries ONE value. A set repeating a
+/// name therefore states two values for one coordinate and identifies no single metric, so
+/// CloudWatch refuses the request instead of keeping one of the two values and binding the
+/// alarm to a metric identity the caller never named.
+///
+/// It is a relation BETWEEN the entries of a collection, which the modelled constraints cannot
+/// express (`Dimensions` declares only its length), so it is checked here — for every dimension
+/// set the request CONFIGURES, whichever form states the series the alarm watches: the
+/// request's own `Dimensions` with the single-metric form, and each metric a `Metrics` query
+/// array retrieves. The name reported is the first one the set repeats, in request order, which
+/// is the one a caller reading its own request finds first.
+fn duplicate_dimension_refusal(input: &PutMetricAlarmInput) -> Option<String> {
+    let retrieved = input
+        .metrics
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|query| query.metric_stat.as_ref())
+        .filter_map(|stat| stat.metric.dimensions.as_deref());
+    std::iter::once(input.dimensions.as_deref().unwrap_or_default())
+        .chain(retrieved)
+        .find_map(repeated_dimension_name)
+        .map(duplicate_dimension_message)
+}
+
+/// The first dimension name `dimensions` carries twice, in the order the request stated them,
+/// or `None` when each name appears once.
+fn repeated_dimension_name(dimensions: &[Dimension]) -> Option<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    dimensions
+        .iter()
+        .find(|dimension| !seen.insert(dimension.name.as_str()))
+        .map(|dimension| dimension.name.as_str())
+}
+
+/// How CloudWatch states a dimension set that repeats a name: the requirement, and the name
+/// that was repeated.
+///
+/// Fixed text apart from that name, which is the only part of the request the sentence carries
+/// — the repeated name is what tells a caller which coordinate of its dimension set to repair,
+/// while neither value it gave that name is part of what has to change.
+fn duplicate_dimension_message(name: &str) -> String {
+    format!("Dimension names must be unique (duplicate: {name})")
 }
 
 /// Whether `period` is a cadence an alarm is evaluated at

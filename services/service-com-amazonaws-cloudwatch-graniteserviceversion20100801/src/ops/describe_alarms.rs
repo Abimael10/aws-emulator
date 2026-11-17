@@ -201,6 +201,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         const MAX_RECORDS_CAP: i32 = 100;
 
         let names: &[String] = input.alarm_names.as_deref().unwrap_or_default();
+
+        // "If you specify ChildrenOfAlarmName, you cannot specify any other parameters in
+        // the request except for MaxRecords and NextToken" — likewise ParentsOfAlarmName.
+        let relationship = input
+            .children_of_alarm_name
+            .as_deref()
+            .map(|_| "ChildrenOfAlarmName")
+            .or_else(|| {
+                input
+                    .parents_of_alarm_name
+                    .as_deref()
+                    .map(|_| "ParentsOfAlarmName")
+            });
+        // A relationship request's exclusivity speaks about EVERY other parameter, so it is
+        // judged before the rule that relates two of those parameters to each other below: a
+        // request carrying a relationship member is one no selector may stand in, whichever
+        // selectors it combined.
+        if let Some(member) = relationship {
+            let others = excluded_selectors(&input, names)
+                .into_iter()
+                .any(|(_, carried)| carried)
+                || (input.children_of_alarm_name.is_some()
+                    && input.parents_of_alarm_name.is_some());
+            if others {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    relationship_exclusivity_refusal(member, &input, names),
+                ));
+            }
+        }
+
         if !names.is_empty() && input.alarm_name_prefix.is_some() {
             // "If this parameter is specified, you cannot specify AlarmNames."
             // (DescribeAlarmsInput$AlarmNamePrefix)
@@ -239,32 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
         let store = state.lock();
 
-        // "If you specify ChildrenOfAlarmName, you cannot specify any other parameters in
-        // the request except for MaxRecords and NextToken" — likewise ParentsOfAlarmName.
-        let relationship = input
-            .children_of_alarm_name
-            .as_deref()
-            .map(|_| "ChildrenOfAlarmName")
-            .or_else(|| {
-                input
-                    .parents_of_alarm_name
-                    .as_deref()
-                    .map(|_| "ParentsOfAlarmName")
-            });
-        if let Some(member) = relationship {
-            let others = !names.is_empty()
-                || input.alarm_name_prefix.is_some()
-                || input.alarm_types.is_some()
-                || input.state_value.is_some()
-                || input.action_prefix.is_some()
-                || (input.children_of_alarm_name.is_some()
-                    && input.parents_of_alarm_name.is_some());
-            if others {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "{member} cannot be combined with any parameter other than MaxRecords and \
-                     NextToken"
-                )));
-            }
+        // The relationship paths themselves: the exclusivity above has already refused a
+        // relationship request carrying anything else.
+        if relationship.is_some() {
             // Both members describe composite-alarm relationships, which are carried by a
             // composite alarm's `AlarmRule`: its children are the alarms the rule
             // references, and an alarm's parents are the composite alarms whose rule
@@ -455,6 +462,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// Each SELECTOR a relationship request may not carry, as the wire spells it and in the order
+/// a refusal lists them, paired with whether THIS request carried it.
+///
+/// "If you specify `ChildrenOfAlarmName`, you cannot specify any other parameters in the
+/// request except for `MaxRecords` and `NextToken`. If you do so, you receive a validation
+/// error." (`smithy_query(query="doc",shape="DescribeAlarmsInput",member="ChildrenOfAlarmName")`,
+/// and the same sentence on `ParentsOfAlarmName`) — so every input member of this read other
+/// than the two paging members and the two relationship members themselves is excluded, which
+/// is exactly the list below ([`smithy_query(query="operation",operation="DescribeAlarms")`]).
+///
+/// The decision and the WORDING are read off this one list, so the refusal can never name a
+/// parameter the check does not look at, or look at one it does not name.
+fn excluded_selectors(
+    input: &DescribeAlarmsInput,
+    names: &[String],
+) -> [(&'static str, bool); EXCLUDED_SELECTOR_COUNT] {
+    [
+        ("ActionPrefix", input.action_prefix.is_some()),
+        ("AlarmNamePrefix", input.alarm_name_prefix.is_some()),
+        ("AlarmNames", !names.is_empty()),
+        ("AlarmTypes", input.alarm_types.is_some()),
+        ("StateValue", input.state_value.is_some()),
+    ]
+}
+
+/// How many selectors a relationship request excludes ([`excluded_selectors`]).
+const EXCLUDED_SELECTOR_COUNT: usize = 5;
+
+/// How CloudWatch refuses a relationship request that carries a selector too: the relationship
+/// member the request actually used, and the WHOLE list of selectors such a request excludes.
+///
+/// The list is fixed and alphabetical — it is the set the rule excludes, not the subset this
+/// request happened to carry, so a caller is told every parameter it has to drop rather than
+/// only the first one that collided; the only part built from the request is which of the two
+/// relationship members it used. Nothing of any selector's VALUE is echoed: what has to change
+/// is that the parameter is there at all.
+fn relationship_exclusivity_refusal(
+    member: &str,
+    input: &DescribeAlarmsInput,
+    names: &[String],
+) -> String {
+    let excluded: Vec<&str> = excluded_selectors(input, names)
+        .into_iter()
+        .map(|(selector, _)| selector)
+        .collect();
+    format!(
+        "{member} requests cannot be used with the following parameters: {}",
+        excluded.join(", ")
+    )
 }
 
 /// One alarm this operation may report, whichever store holds it.
