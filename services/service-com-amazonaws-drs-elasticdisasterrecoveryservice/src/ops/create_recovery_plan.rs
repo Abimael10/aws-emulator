@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRecoveryPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRecoveryPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRecoveryPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `recoveryPlanID` and the plan's ARN, stores the name, description and tags
+//! the request supplied under that id with both of the plan's timestamps set to the
+//! instant of the call, and answers 201 with the STORED plan — so a following
+//! `GetRecoveryPlan` reads back exactly what was created.
+//!
+//! A create that repeats a `clientToken` an earlier create carried reports THAT plan
+//! again rather than minting a second one: the token is modelled `@idempotencyToken`,
+//! so it identifies the REQUEST, and a repeat of one request is the plan it already
+//! made. The token alone decides that — a repeat whose other members differ is still
+//! that same request retried, and is answered with the plan the token minted rather
+//! than with a second plan or a refusal, because the recorded surface of this
+//! operation shows no parameter-mismatch refusal and the model's `ConflictException`
+//! is not documented for one. A caller that means to change a plan updates it.
+//!
+//! A plan is created holding no steps, so it reports the status the model documents
+//! for a plan with no `SERVER` step (see `crate::state::recovery_plans`).
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +166,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRecoveryPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRecoveryPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRecoveryPlan"))
+        // The ARN a plan is addressed by carries the Region the caller signed for, so
+        // it is read before the id it is built from is minted.
+        let region = crate::state::request_region(ctx.parts());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRecoveryPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `clientToken` is modelled `@idempotencyToken`: a create carrying one a
+        // stored plan was minted with IS that create, so it reports that plan and
+        // mints nothing. The member's length starts at 0, and an empty token names no
+        // request, so it is read as no token at all.
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+        if let Some(token) = client_token {
+            if let Some(already) = store
+                .recovery_plans
+                .values()
+                .find(|plan| plan.client_token.as_deref() == Some(token))
+            {
+                return Ok(CreateRecoveryPlanOutput {
+                    recovery_plan: already.to_wire(),
+                });
+            }
+        }
+
+        // The emulator's own bound on this store: without it a caller that can reach
+        // the port could loop this call until the host is out of memory. The refusal
+        // is the modelled `ServiceQuotaExceededException` (402), so a client sees a
+        // DRS error rather than a dead emulator.
+        if store.recovery_plans.len() >= crate::state::recovery_plans::QUOTA {
+            return Err(CreateRecoveryPlanErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Cannot create more than {} recovery plans",
+                        crate::state::recovery_plans::QUOTA
+                    )),
+                    code: None,
+                    resource_id: None,
+                    resource_type: Some(crate::state::recovery_plans::RESOURCE_TYPE.to_string()),
+                    service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        // The id is minted first because the ARN is derived from it. Both timestamps
+        // are the instant of THIS call: a plan nothing has changed yet was last
+        // updated when it was created.
+        let id = store.next_id(crate::state::recovery_plans::ID_PREFIX);
+        let now = crate::state::recovery_plans::now();
+        let record = crate::state::recovery_plans::RecoveryPlanRecord {
+            arn: crate::state::recovery_plans::arn(&region, &id),
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            // A plan carries a tag set whether or not the request named one, so a
+            // create that named none stores an empty set — and that is what the 201
+            // reports.
+            tags: input.tags.unwrap_or_default(),
+            created_at: now.clone(),
+            updated_at: now,
+            client_token: client_token.map(std::string::ToString::to_string),
+            // A plan is created holding no steps, which is what makes its status
+            // report a plan that cannot be executed until a `SERVER` step is added.
+            steps: Vec::new(),
+        };
+
+        // Insert, then report the plan as it now stands IN the store, so a 201 can
+        // only describe what was persisted — never the request echoed past a failed
+        // write. The id was just minted, so the entry is always vacant; `or_insert`
+        // is how one step both writes the record and hands back the stored one.
+        let stored = store.recovery_plans.entry(id).or_insert(record).to_wire();
+
+        Ok(CreateRecoveryPlanOutput {
+            recovery_plan: stored,
+        })
     }
 }

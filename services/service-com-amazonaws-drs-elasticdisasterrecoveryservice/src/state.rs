@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 pub mod ec2_subnets;
+pub mod recovery_plans;
 
 use crate::ops::types::{
     CreateReplicationConfigurationTemplateOutput, DisconnectSourceServerOutput,
@@ -29,6 +30,12 @@ pub struct ComAmazonawsDrsElasticdisasterrecoveryserviceState {
     /// the map's key order IS creation order.
     pub replication_configuration_templates:
         BTreeMap<String, ReplicationConfigurationTemplateRecord>,
+    /// Recovery Plans, keyed by `recoveryPlanID`.
+    ///
+    /// A [`BTreeMap`] for the same reason as the templates above: `ListRecoveryPlans`
+    /// is `@paginated`, and the ids this service mints ascend with creation (see
+    /// [`Self::next_id`]), so the map's key order IS creation order.
+    pub recovery_plans: BTreeMap<String, recovery_plans::RecoveryPlanRecord>,
     /// Source servers, keyed by `sourceServerID`. Registered by the replication
     /// agent, which this emulator does not model yet, so the map is empty — but
     /// `DescribeSourceServers` reads it rather than returning a canned empty list.

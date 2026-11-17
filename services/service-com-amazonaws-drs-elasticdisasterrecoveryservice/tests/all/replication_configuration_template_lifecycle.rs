@@ -61,11 +61,12 @@ pub(crate) fn drs() -> MultiServiceRouter {
     drs_with_engine().0
 }
 
-/// The same router, with the engine handed back so a test can seed state that no
-/// implemented operation can create yet: a source server is registered by the
+/// The same router, with the engine handed back so a test can read or seed state no
+/// implemented operation reaches yet: a source server is registered by the
 /// replication agent, which this slice does not model, so `DescribeSourceServers`'
-/// filters can only be exercised over a store written directly.
-fn drs_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+/// filters can only be exercised over a store written directly — and the plans a
+/// create stored can only be COUNTED there while `ListRecoveryPlans` is a stub.
+pub(crate) fn drs_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are verified by the emulator, not by the service; this suite is
@@ -75,10 +76,23 @@ fn drs_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
-/// `POST /<operation>` with `body`, routed by the SigV4 credential scope exactly as
-/// an AWS SDK client routes it.
+/// `POST /<operation>` with `body`, signed for [`REGION`].
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
-    let host = format!("drs.{REGION}.amazonaws.com");
+    call_in(router, REGION, operation, body).await
+}
+
+/// `POST /<operation>` with `body`, routed by the SigV4 credential scope exactly as
+/// an AWS SDK client configured for `region` routes it.
+///
+/// The Region is a parameter because a resource's ARN carries the Region the caller
+/// signed for, so a suite pinning that can only do it by signing for more than one.
+pub(crate) async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Answer {
+    let host = format!("drs.{region}.amazonaws.com");
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://{host}/{operation}"))
@@ -87,7 +101,7 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Va
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/drs/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/drs/aws4_request, \
                  SignedHeaders=host, Signature=0"
             ),
         )
