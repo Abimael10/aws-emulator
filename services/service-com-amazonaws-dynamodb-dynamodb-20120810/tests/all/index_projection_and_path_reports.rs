@@ -19,6 +19,10 @@
 //!   for it, and a container is the same container when the same STEP addresses it — so
 //!   paths through one list index merge into one element and a list reports one element
 //!   per index named, in index order;
+//! * a reported list is therefore DENSE and re-indexed from zero: it carries exactly one
+//!   element per index the projection matched, in ascending index order, with no
+//!   placeholder standing in for a position no path named — at every depth a document path
+//!   reaches, and whichever reader reports it;
 //! * the legacy `AttributesToGet` is a list of attribute NAMES, so a name it repeats is a
 //!   duplicate value in that list rather than two paths addressing one location, and an
 //!   overlapping `ProjectionExpression` is the defect a request is refused for even when
@@ -28,8 +32,9 @@
 //!
 //! Each suite checks its rule over a TABLE of inputs: every projection type on both
 //! index kinds crossed with `Query` and `Scan`, the projection and the filter surfaces,
-//! the path forms that share a container and the ones that do not, and each key-schema
-//! width with the comparison counts around its bound.
+//! the path forms that share a container and the ones that do not, the index positions and
+//! nesting depths a projected list element is named at, and each key-schema width with the
+//! comparison counts around its bound.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -870,5 +875,307 @@ async fn a_key_condition_states_no_more_comparisons_than_the_schema_has_key_attr
             row.case,
             row.refusal
         );
+    }
+}
+
+// ===========================================================================
+// 5. A projection that names list elements reports a DENSE, re-indexed list
+// ===========================================================================
+
+/// The table this section reads: its own, and its own item, so the rows below vary nothing
+/// but the depth a projected list sits at and the indexes the projection names it at.
+const DENSE_TABLE: &str = "DenseProjectedLists";
+
+/// The key of the one item every row of this section projects out of.
+fn dense_key() -> Value {
+    json!({"pk": {"S": "dense"}})
+}
+
+/// The item the rows project.
+///
+/// Four list attributes, one per depth a document path reaches a list at: `grid` is a
+/// top-level list of maps, `labels` a top-level list of scalars of two types, `bundle.cells`
+/// a list reached THROUGH a map, and `boxes[*].slots` a list inside a map inside a list —
+/// two index steps in one path.
+fn dense_item() -> Value {
+    json!({
+        "pk": {"S": "dense"},
+        "grid": {"L": [
+            {"M": {"a": {"S": "a0"}, "b": {"S": "b0"}}},
+            {"M": {"a": {"S": "a1"}, "b": {"S": "b1"}}},
+            {"M": {"a": {"S": "a2"}, "b": {"S": "b2"}}},
+            {"M": {"a": {"S": "a3"}, "b": {"S": "b3"}}},
+        ]},
+        "labels": {"L": [{"S": "z0"}, {"N": "1"}, {"S": "z2"}]},
+        "bundle": {"M": {"cells": {"L": [
+            {"M": {"x": {"S": "x0"}, "y": {"S": "y0"}}},
+            {"M": {"x": {"S": "x1"}, "y": {"S": "y1"}}},
+            {"M": {"x": {"S": "x2"}, "y": {"S": "y2"}}},
+        ]}}},
+        "boxes": {"L": [
+            {"M": {"slots": {"L": [{"M": {"p": {"S": "p00"}}},
+                                   {"M": {"p": {"S": "p01"}}},
+                                   {"M": {"p": {"S": "p02"}}}]}}},
+            {"M": {"slots": {"L": [{"M": {"p": {"S": "p10"}}},
+                                   {"M": {"p": {"S": "p11"}}},
+                                   {"M": {"p": {"S": "p12"}}}]}}},
+        ]},
+    })
+}
+
+/// An emulator holding [`DENSE_TABLE`], active, with [`dense_item`] written to it.
+async fn dense_seeded() -> MultiServiceRouter {
+    let router = emulator();
+    ok(
+        &router,
+        "CreateTable",
+        json!({
+            "TableName": DENSE_TABLE,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    describe_when_active(&router, "seed the dense projection table", DENSE_TABLE).await;
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": DENSE_TABLE, "Item": dense_item()}),
+    )
+    .await;
+    router
+}
+
+/// The readers that report a `ProjectionExpression` of this service, so the rule is pinned
+/// on the reporter rather than on one operation's handler.
+const DENSE_READERS: [&str; 5] = [
+    "GetItem",
+    "Query",
+    "Scan",
+    "BatchGetItem",
+    "TransactGetItems",
+];
+
+/// The request `operation` carries to project `expression` out of [`dense_key`].
+fn dense_request(operation: &str, expression: &str) -> Value {
+    match operation {
+        "GetItem" => json!({"TableName": DENSE_TABLE, "Key": dense_key(),
+                            "ProjectionExpression": expression}),
+        "Query" => json!({"TableName": DENSE_TABLE, "ProjectionExpression": expression,
+                          "KeyConditionExpression": "pk = :p",
+                          "ExpressionAttributeValues": {":p": {"S": "dense"}}}),
+        "Scan" => json!({"TableName": DENSE_TABLE, "ProjectionExpression": expression}),
+        "BatchGetItem" => json!({"RequestItems": {DENSE_TABLE: {
+            "Keys": [dense_key()], "ProjectionExpression": expression}}}),
+        "TransactGetItems" => json!({"TransactItems": [{"Get": {
+            "TableName": DENSE_TABLE, "Key": dense_key(),
+            "ProjectionExpression": expression}}]}),
+        other => panic!("case {other}: not one of the readers this section drives"),
+    }
+}
+
+/// What `operation` reported of [`dense_key`] for `expression` — the empty map where the
+/// projection matched no location at all, however that reader spells reporting nothing.
+async fn dense_reported(router: &MultiServiceRouter, operation: &str, expression: &str) -> Value {
+    let answered = ok(router, operation, dense_request(operation, expression)).await;
+    let reported = match operation {
+        "GetItem" => answered.get("Item").cloned(),
+        "Query" | "Scan" => answered["Items"]
+            .as_array()
+            .and_then(|items| items.first().cloned()),
+        "BatchGetItem" => answered["Responses"][DENSE_TABLE]
+            .as_array()
+            .and_then(|items| items.first().cloned()),
+        _ => answered["Responses"][0].get("Item").cloned(),
+    };
+    reported.unwrap_or_else(|| json!({}))
+}
+
+/// One row: the projection and the item every reader must report for it.
+struct DenseRow {
+    case: &'static str,
+    expression: &'static str,
+    reported: Value,
+}
+
+/// The rows, spanning what the rule generalises over: WHICH index of a list a path names
+/// (the first, a middle one, the last, one past the end), HOW MANY it names (one, two,
+/// three), the ORDER the expression listed them in, WHAT the element contributes (one
+/// member, several, a whole element, a scalar), and the DEPTH the list sits at (top level,
+/// through a map, through a list into a map into a list).
+fn dense_rows() -> Vec<DenseRow> {
+    vec![
+        DenseRow {
+            case: "a member of the FIRST element of a top-level list",
+            expression: "grid[0].b",
+            reported: json!({"grid": {"L": [{"M": {"b": {"S": "b0"}}}]}}),
+        },
+        DenseRow {
+            case: "a member of a MIDDLE element, which reports at index 0",
+            expression: "grid[1].b",
+            reported: json!({"grid": {"L": [{"M": {"b": {"S": "b1"}}}]}}),
+        },
+        DenseRow {
+            case: "a member of the LAST element, which reports at index 0",
+            expression: "grid[3].a",
+            reported: json!({"grid": {"L": [{"M": {"a": {"S": "a3"}}}]}}),
+        },
+        DenseRow {
+            case: "a WHOLE element at a non-zero index",
+            expression: "grid[2]",
+            reported: json!({"grid": {"L": [{"M": {"a": {"S": "a2"}, "b": {"S": "b2"}}}]}}),
+        },
+        DenseRow {
+            case: "a scalar element of a list of scalars",
+            expression: "labels[2]",
+            reported: json!({"labels": {"L": [{"S": "z2"}]}}),
+        },
+        DenseRow {
+            case: "a scalar element of another type, at another index",
+            expression: "labels[1]",
+            reported: json!({"labels": {"L": [{"N": "1"}]}}),
+        },
+        DenseRow {
+            case: "two NON-ADJACENT indexes, which report as two adjacent elements",
+            expression: "grid[1].b, grid[3].a",
+            reported: json!({"grid": {"L": [{"M": {"b": {"S": "b1"}}},
+                                            {"M": {"a": {"S": "a3"}}}]}}),
+        },
+        DenseRow {
+            case: "the same two indexes named largest-first",
+            expression: "grid[3].a, grid[1].b",
+            reported: json!({"grid": {"L": [{"M": {"b": {"S": "b1"}}},
+                                            {"M": {"a": {"S": "a3"}}}]}}),
+        },
+        DenseRow {
+            case: "three paths over two indexes, the second carrying both its members",
+            expression: "grid[0].a, grid[2].b, grid[2].a",
+            reported: json!({"grid": {"L": [{"M": {"a": {"S": "a0"}}},
+                                            {"M": {"a": {"S": "a2"}, "b": {"S": "b2"}}}]}}),
+        },
+        DenseRow {
+            case: "an index past the end of the stored list, which reports nothing",
+            expression: "grid[9].a",
+            reported: json!({}),
+        },
+        DenseRow {
+            case: "an index past the end beside one in range, which reports only the match",
+            expression: "grid[9].a, grid[2].b",
+            reported: json!({"grid": {"L": [{"M": {"b": {"S": "b2"}}}]}}),
+        },
+        DenseRow {
+            case: "a member of an element of a list reached THROUGH a map",
+            expression: "bundle.cells[1].y",
+            reported: json!({"bundle": {"M": {"cells": {"L": [{"M": {"y": {"S": "y1"}}}]}}}}),
+        },
+        DenseRow {
+            case: "a whole element of a list reached through a map",
+            expression: "bundle.cells[2]",
+            reported: json!({"bundle": {"M": {"cells": {"L": [
+                {"M": {"x": {"S": "x2"}, "y": {"S": "y2"}}}]}}}}),
+        },
+        DenseRow {
+            case: "two indexes of a list reached through a map, named largest-first",
+            expression: "bundle.cells[2].x, bundle.cells[1].y",
+            reported: json!({"bundle": {"M": {"cells": {"L": [{"M": {"y": {"S": "y1"}}},
+                                                            {"M": {"x": {"S": "x2"}}}]}}}}),
+        },
+        DenseRow {
+            case: "an index past the end of a list reached through a map",
+            expression: "bundle.cells[7].y",
+            reported: json!({}),
+        },
+        DenseRow {
+            case: "two index steps in one path: BOTH lists report re-indexed from zero",
+            expression: "boxes[1].slots[2].p",
+            reported: json!({"boxes": {"L": [{"M": {"slots": {"L": [
+                {"M": {"p": {"S": "p12"}}}]}}}]}}),
+        },
+        DenseRow {
+            case: "two outer indexes, each naming one index of its own nested list",
+            expression: "boxes[0].slots[1].p, boxes[1].slots[2].p",
+            reported: json!({"boxes": {"L": [
+                {"M": {"slots": {"L": [{"M": {"p": {"S": "p01"}}}]}}},
+                {"M": {"slots": {"L": [{"M": {"p": {"S": "p12"}}}]}}}]}}),
+        },
+        DenseRow {
+            // The rule is about paths that name an INDEX: a path that stops at the
+            // attribute reports the list exactly as it is stored, every element included.
+            case: "the whole list attribute, which no index step narrows",
+            expression: "grid",
+            reported: json!({"grid": dense_item()["grid"].clone()}),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_projected_list_element_reports_in_a_dense_list_re_indexed_from_zero() {
+    let router = dense_seeded().await;
+
+    for row in dense_rows() {
+        for reader in DENSE_READERS {
+            let got = dense_reported(&router, reader, row.expression).await;
+            assert_eq!(
+                got, row.reported,
+                "case {:?} projecting {:?} through {reader}: expected {}, got {got}",
+                row.case, row.expression, row.reported
+            );
+        }
+    }
+
+    // Every call above was a read: the item still carries every element it was written
+    // with, so the next caller sees the whole list and not a narrowed one.
+    let whole = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": DENSE_TABLE, "Key": dense_key()}),
+    )
+    .await;
+    assert_eq!(
+        whole["Item"],
+        dense_item(),
+        "the projected reads must leave the stored item whole: expected {}, got {whole}",
+        dense_item()
+    );
+}
+
+/// The indexes [`dense_item`]'s `grid` holds elements at — the generator axis of the
+/// invariant below, which spans every non-empty subset of them.
+const DENSE_GRID_INDEXES: usize = 4;
+
+#[tokio::test]
+async fn a_projected_list_carries_one_element_per_index_named_in_index_order() {
+    let router = dense_seeded().await;
+
+    // Every non-empty subset of the stored indexes, each named smallest-first and then
+    // largest-first: neither how many indexes a projection names, which ones they are, nor
+    // the order it lists them in changes that the report carries exactly one element per
+    // named index, in ascending index order.
+    for subset in 1u8..(1 << DENSE_GRID_INDEXES) {
+        let ascending: Vec<usize> = (0..DENSE_GRID_INDEXES)
+            .filter(|index| subset & (1u8 << index) != 0)
+            .collect();
+        let mut descending = ascending.clone();
+        descending.reverse();
+        let expected = json!({"grid": {"L": ascending
+            .iter()
+            .map(|index| json!({"M": {"a": {"S": format!("a{index}")}}}))
+            .collect::<Vec<Value>>()}});
+
+        for named in [&ascending, &descending] {
+            let expression = named
+                .iter()
+                .map(|index| format!("grid[{index}].a"))
+                .collect::<Vec<String>>()
+                .join(", ");
+            let got = dense_reported(&router, "GetItem", &expression).await;
+            assert_eq!(
+                got, expected,
+                "case projecting {expression:?}: expected {} element(s) in index order, \
+                 {expected}, got {got}",
+                ascending.len()
+            );
+        }
     }
 }
