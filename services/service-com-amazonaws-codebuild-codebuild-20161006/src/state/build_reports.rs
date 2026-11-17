@@ -40,7 +40,8 @@ use super::{
     StoredReportGroup, MAX_REPORT_GROUPS, REPORT_GROUP_ACTIVE_STATUS,
 };
 use crate::ops::types::{
-    CodeCoverageReportSummary, Report, ReportExportConfig, ReportGroup, TestReportSummary,
+    CodeCoverageReportSummary, Report, ReportExportConfig, ReportGroup, TestCase,
+    TestCaseFilter, TestReportSummary,
 };
 
 /// What ONE coverage file counted, and how a coverage file is read.
@@ -212,18 +213,42 @@ pub struct ReportRun {
     /// The test cases read, summarised — `None` for a run that is not of test cases, or one
     /// whose files held none.
     pub test_summary: Option<TestReportSummary>,
+    /// The test cases read, each as the file stated it — empty for a run that is not of test
+    /// cases, or one whose files held none. They are what `DescribeTestCases` reports for
+    /// the report this run mints.
+    pub test_cases: Vec<TestResult>,
     /// The coverage counted — `None` for a run that is not of code coverage, or one whose
     /// files counted nothing.
     pub code_coverage_summary: Option<CodeCoverageReportSummary>,
 }
 
-/// One test case as a report run counts it: the status it ended in and how long it took.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TestResult {
+/// One test case as a report run counts it: the status it ended in, how long it took, the
+/// identity the result file gave it and what that file said about it.
+///
+/// The members beside the status and the span are what `TestCase` reports for one case:
+/// `name` is the case's own, `prefix` is "a string that is applied to a series of related
+/// test cases" (the class or feature the document groups it under), `testSuiteName` is the
+/// suite it was stated inside and `message` is "a message associated with a test case. For
+/// example, an error message or stack trace". A member the document stated nothing for is
+/// absent rather than empty: nothing is invented for a case the file did not describe.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TestResult {
     /// One of the five statuses `TestCase$status` names ([`STATUS_SUCCEEDED`]).
-    pub(super) status: &'static str,
+    pub status: &'static str,
     /// How long the case took, in the unit `TestCase$durationInNanoSeconds` reports.
-    pub(super) duration_nanos: i64,
+    pub duration_nanos: i64,
+    /// The case's own name, as the document states it.
+    pub name: Option<String>,
+    /// The series of related cases this one belongs to.
+    pub prefix: Option<String>,
+    /// The suite the document stated the case inside.
+    pub suite_name: Option<String>,
+    /// What the document said about a case that did not pass.
+    pub message: Option<String>,
+    /// The file of the build's working tree the case was read from, which is what
+    /// `TestCase$testRawDataPath` reports — filled in by the run that read the file rather
+    /// than by the reading of the document itself.
+    pub raw_data_path: Option<String>,
 }
 
 /// The status one of the five `TestCase$status` values a framework's own outcome word means.
@@ -290,13 +315,19 @@ fn read_run(group: &str, format: ReportFormat, files: &[(String, String)]) -> Re
         status: REPORT_STATUS_INCOMPLETE,
         truncated: false,
         test_summary: None,
+        test_cases: Vec::new(),
         code_coverage_summary: None,
     };
     let read_from = files.iter().take(MAX_REPORT_FILES);
     if report_type == REPORT_TYPE_TEST {
         let mut cases: Vec<TestResult> = Vec::new();
-        for (_, contents) in read_from {
+        for (path, contents) in read_from {
             let mut held = test_cases(format, contents);
+            // The file a case was read from is the raw data of the run, which is what the
+            // case reports as its own `testRawDataPath`.
+            for case in &mut held {
+                case.raw_data_path = Some(path.clone());
+            }
             if cases.len() + held.len() > MAX_TEST_CASES {
                 held.truncate(MAX_TEST_CASES.saturating_sub(cases.len()));
                 run.truncated = true;
@@ -320,6 +351,7 @@ fn read_run(group: &str, format: ReportFormat, files: &[(String, String)]) -> Re
             REPORT_STATUS_SUCCEEDED
         };
         run.test_summary = Some(test_summary(&cases));
+        run.test_cases = cases;
         return run;
     }
     let mut tally = code_coverage::CoverageTally::default();
@@ -491,11 +523,64 @@ pub fn record_build_reports(
             test_summary: run.test_summary.clone(),
             code_coverage_summary: run.code_coverage_summary.clone(),
         };
-        state.reports.insert(arn.clone(), report);
+        let expired = report.expired;
+        state.reports.insert(
+            arn.clone(),
+            StoredReport {
+                report,
+                // The cases this run was read from, each as the report that holds them
+                // reports it: they are written once, by the build that minted the run, and
+                // never again.
+                test_cases: run
+                    .test_cases
+                    .iter()
+                    .map(|case| test_case(case, &arn, expired))
+                    .collect(),
+            },
+        );
         written.push(arn);
     }
     enforce_report_ceiling(state);
     written
+}
+
+/// One report run as the store holds it: the report a reader reports, and the test cases
+/// `DescribeTestCases` lists for it.
+///
+/// The cases live with the report rather than in a map beside it, because they are the
+/// report's own data: a run is minted with them by the build that produced it, and evicting
+/// or deleting the report takes them with it.
+#[derive(Debug, Clone)]
+pub struct StoredReport {
+    /// The report itself, as every reader of a report reports it.
+    pub report: Report,
+    /// The cases the run was read from, in the order the files stated them — empty for a
+    /// run of code coverage, and for one whose files held no case.
+    pub test_cases: Vec<TestCase>,
+}
+
+/// One read case as `TestCase` reports it, for the report `report_arn`.
+///
+/// `reportArn` is the report the case belongs to and `expired` is that report's own expiry —
+/// the case is part of the run's raw data, so it is readable for exactly as long as the run
+/// is. Every other member is what the result file stated ([`TestResult`]); one it stated
+/// nothing for is absent.
+fn test_case(
+    read: &TestResult,
+    report_arn: &str,
+    expired: Option<::aws_smithy_types::DateTime>,
+) -> TestCase {
+    TestCase {
+        report_arn: Some(report_arn.to_string()),
+        test_raw_data_path: read.raw_data_path.clone(),
+        prefix: read.prefix.clone(),
+        name: read.name.clone(),
+        status: Some(read.status.to_string()),
+        duration_in_nano_seconds: Some(read.duration_nanos),
+        message: read.message.clone(),
+        expired,
+        test_suite_name: read.suite_name.clone(),
+    }
 }
 
 /// The report group one run belongs to, as the parts a report states of it.
@@ -594,9 +679,9 @@ fn enforce_report_ceiling(state: &mut CodeBuildState) {
         let oldest = state
             .reports
             .iter()
-            .min_by_key(|(arn, report)| {
+            .min_by_key(|(arn, stored)| {
                 (
-                    report.created.as_ref().map_or(i64::MIN, |created| {
+                    stored.report.created.as_ref().map_or(i64::MIN, |created| {
                         created.secs()
                     }),
                     (*arn).clone(),
@@ -606,6 +691,72 @@ fn enforce_report_ceiling(state: &mut CodeBuildState) {
         let Some(arn) = oldest else { break };
         state.reports.remove(&arn);
     }
+}
+
+/// What CodeBuild states as the reason the ARN a read of ONE report's contents names
+/// addresses no report of this account, carried by the modelled
+/// `ResourceNotFoundException`.
+///
+/// Wholly fixed text — recorded behaviour, as the model states no message for the error:
+/// the sentence names the absent resource and the one state a held report is unreadable in,
+/// and quotes neither the ARN the request sent nor the member it arrived on, so every
+/// unresolvable report ARN is refused with the same words and a client can key on them.
+pub const REPORT_NOT_FOUND_MESSAGE: &str = "Report does not exist or is in DELETING status";
+
+/// The cases of one report `filter` selects, in the order the report holds them.
+///
+/// `TestCaseFilter` is "a filter used to return specific types of test cases. In order to
+/// pass the filter, the report must meet ALL of the filter properties": `status` keeps the
+/// cases of that status — one of the five fixed words `TestCase$status` names, so it is
+/// matched exactly — and `keyword` keeps those "where the keyword is a substring of the
+/// `name` or the `prefix`". A member the filter does not state constrains nothing, and a
+/// filter stating neither selects every case.
+#[must_use]
+pub fn filtered_test_cases<'a>(
+    cases: &'a [TestCase],
+    filter: Option<&TestCaseFilter>,
+) -> Vec<&'a TestCase> {
+    let status = filter.and_then(|filter| filter.status.as_deref());
+    let keyword = filter.and_then(|filter| filter.keyword.as_deref());
+    cases
+        .iter()
+        .filter(|case| status.is_none_or(|status| case.status.as_deref() == Some(status)))
+        .filter(|case| {
+            keyword.is_none_or(|keyword| {
+                [case.name.as_deref(), case.prefix.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|held| held.contains(keyword))
+            })
+        })
+        .collect()
+}
+
+/// One page of `cases`, resuming where `next_token` left off, and the token of the page
+/// after it — `None` for a token that opens no page of this report's cases, which is a
+/// refusable request rather than an empty page.
+///
+/// A test case has no id of its own to resume by, so what a token names is the case's
+/// ORDINAL within the report: a report's cases are written ONCE, by the build that minted the
+/// run, and never change, so nothing can be inserted before the entry a token names. The cut
+/// itself is this service's one pager ([`super::page_limited`]), so the page size a request
+/// may ask for, and the refusal of a token that opens no page, are decided in one place for
+/// every paginated operation.
+#[must_use]
+pub fn page_of_test_cases(
+    cases: &[&TestCase],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Option<(Vec<TestCase>, Option<String>)> {
+    let ordinals: Vec<String> = (0..cases.len()).map(|at| at.to_string()).collect();
+    let (page, next_token) = super::page_limited(&ordinals, next_token, max_results)?;
+    let page: Vec<TestCase> = page
+        .iter()
+        .filter_map(|ordinal| ordinal.parse::<usize>().ok())
+        .filter_map(|at| cases.get(at))
+        .map(|case| (*case).clone())
+        .collect();
+    Some((page, next_token))
 }
 
 #[cfg(test)]

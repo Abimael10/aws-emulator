@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTestCases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTestCases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTestCases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the test cases [`crate::state`] holds for the report the request named, filtered
+//! and paged as the request asks, and refuses a value that is not a report ARN at all: this
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,23 +143,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DESCRIBE_TEST_CASES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the test cases of the report the request names, one page at a time.
+    ///
+    /// A test case is part of the raw data a REPORT was read from, so the cases a report
+    /// holds are the ones the build that minted it wrote
+    /// (`crate::state::build_reports`): the runs the clock owes are produced before this
+    /// read reports anything — the same settle every reader of a build makes, and the only
+    /// write this read performs — and a report this account does not hold has no case to
+    /// list, so the call is refused with the modelled not-found error rather than answered
+    /// with an empty page.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTestCases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTestCasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTestCases"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeTestCases (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        // The ARN's own FIELDS are read first, and in order, exactly as
+        // `crate::ops::batch_get_reports` reads them: a region field that cannot be a Region
+        // is the first one at fault, so it is what the refusal names, and the resource
+        // behind it is never read.
+        if let Some(message) = crate::state::arn_region_violation(&input.report_arn) {
+            return Err(DescribeTestCasesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // `reportArn` targets a plain `String`, so any text reaches this handler. A value
+        // that is not a report ARN of this service addresses no report at all — there is no
+        // account, region or store in which it could name one — so the call is refused with
+        // the operation's own input error rather than reported as a report that merely is
+        // not held, which is what the not-found error below means.
+        if crate::state::report_ids_from_arn(&input.report_arn).is_none() {
+            return Err(DescribeTestCasesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_REPORT_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The runs the clock owes are produced BEFORE this read reports anything: a build
+        // reads its source and writes its output through the account's object store, so it
+        // is run from here, where that store can be reached
+        // (`crate::state::build_run::settle_due_builds`).
+        crate::state::settle_due_builds(
+            ctx.callback(),
+            &*self.engine,
+            &state,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .await;
+
+        let guard = state.lock();
+        // The ARN is the report's whole identity, so a report this account does not hold —
+        // including one an ARN of another partition, region, account or resource type names
+        // — has no case to report.
+        let Some(held) = guard.test_cases_of_report(&input.report_arn) else {
+            drop(guard);
+            return Err(DescribeTestCasesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::REPORT_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        let selected = crate::state::filtered_test_cases(held, input.filter.as_ref());
+        let paged = crate::state::page_of_test_cases(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        );
+        drop(guard);
+        let Some((test_cases, next_token)) = paged else {
+            return Err(DescribeTestCasesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeTestCasesOutput {
+            // Always serialized, `[]` when the report holds no case the filter selected: a
+            // paginator must read a list either way.
+            test_cases: Some(test_cases),
+            next_token,
+        })
     }
 }

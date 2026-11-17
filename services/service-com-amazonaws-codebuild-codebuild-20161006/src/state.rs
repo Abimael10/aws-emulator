@@ -44,7 +44,7 @@ use crate::ops::types::{
     Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, CommandExecution,
     EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ProjectCache,
     ProjectEnvironment, ProjectSource, Report, ReportExportConfig, ReportGroup, ResolvedArtifact,
-    SSMSession, Sandbox, SandboxSession, SandboxSessionPhase, SourceCredentialsInfo,
+    SSMSession, Sandbox, SandboxSession, SandboxSessionPhase, SourceCredentialsInfo, TestCase,
 };
 
 /// The FIELDS of an ARN an ARN-addressed operation is handed, and the first one at fault.
@@ -947,7 +947,7 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// declared ([`build_reports`]), so no operation mints a report directly and the report
     /// readers answer from what the builds of this account produced. Bounded at that growth
     /// site by [`MAX_REPORTS`].
-    pub reports: BTreeMap<String, Report>,
+    pub reports: BTreeMap<String, StoredReport>,
     /// Resource-based policies, keyed by the ARN of the project or report group
     /// each one is attached to.
     ///
@@ -2069,7 +2069,18 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// key IS the ARN, so an ARN for another partition, region, account or resource type
     /// is simply a key nothing is stored under and resolves to no local record.
     pub fn report_by_arn(&self, arn: &str) -> Option<&Report> {
-        self.reports.get(arn)
+        self.reports.get(arn).map(|stored| &stored.report)
+    }
+
+    /// The test cases of the report `arn` names, if this account holds that report.
+    ///
+    /// A report's cases are the raw data the run was read from, held with the run itself
+    /// ([`StoredReport`]), so they resolve through the very ARN the report is keyed by and a
+    /// report that holds none answers an empty slice.
+    pub fn test_cases_of_report(&self, arn: &str) -> Option<&[TestCase]> {
+        self.reports
+            .get(arn)
+            .map(|stored| stored.test_cases.as_slice())
     }
 
     /// Every report of the report group `report_group_arn`, MOST RECENT FIRST.
@@ -2090,6 +2101,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         let mut reports: Vec<&Report> = self
             .reports
             .values()
+            .map(|stored| &stored.report)
             .filter(|report| report.report_group_arn.as_deref() == Some(report_group_arn))
             .collect();
         reports.sort_by(|left, right| {
@@ -2300,6 +2312,11 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         region: &str,
         recorded: build_run::RecordedRun,
     ) -> Option<CompletedBuild> {
+        // The reports the build produced go in first: they are what its own commands wrote,
+        // read in the format its buildspec declared, and the build REPORTS the ARN of each
+        // one that was written ([`Build::report_arns`]).
+        let report_arns =
+            build_reports::record_build_reports(self, claimed, region, &recorded.reports);
         let mut completed = None;
         if let Some(stored) = self.builds.get_mut(&claimed.id) {
             let was_complete = stored.build.build_complete;
@@ -2307,6 +2324,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 recorded.run,
                 recorded.artifacts,
                 &recorded.secondary_artifacts,
+                report_arns,
             );
             if !was_complete && stored.build.build_complete {
                 completed = Some(stored.completed_build(
@@ -2315,9 +2333,6 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 ));
             }
         }
-        // The reports the build produced go in with it: they are what its own commands
-        // wrote, read in the format its buildspec declared.
-        build_reports::record_build_reports(self, claimed, region, &recorded.reports);
         if let Some(saved) = recorded.cache_saved_millis {
             if let Some(project) = self.projects.get_mut(&claimed.project_name) {
                 project.cache_saved_millis = Some(saved);
@@ -2864,9 +2879,17 @@ impl StoredBuild {
         run: BuildRun,
         artifacts: Option<BuildArtifacts>,
         secondary_artifacts: &[(String, BuildArtifacts)],
+        report_arns: Vec<String>,
     ) {
         if self.build.build_complete {
             return;
+        }
+        // "An array of the ARNs associated with this build's reports": the runs this build
+        // minted for the groups its buildspec declared
+        // ([`build_reports::record_build_reports`]). A build that declared none, or whose
+        // declarations minted nothing, is associated with no report and states none.
+        if !report_arns.is_empty() {
+            self.build.report_arns = Some(report_arns);
         }
         self.build.build_status = Some(run.status);
         self.build.current_phase = Some("COMPLETED".to_string());

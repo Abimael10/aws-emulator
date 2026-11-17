@@ -240,7 +240,15 @@ fn seed(engine: &Arc<engine::InMemoryEngine>, runs: Vec<Report>) {
     let mut guard = handle.lock();
     for report in runs {
         let arn = report.arn.clone().expect("a seeded run carries its ARN");
-        guard.reports.insert(arn, report);
+        guard.reports.insert(
+            arn,
+            state::StoredReport {
+                report,
+                // A seeded run stands for one whose files held no case to read: what this
+                // suite reads is the trend over the runs themselves.
+                test_cases: Vec::new(),
+            },
+        );
     }
 }
 

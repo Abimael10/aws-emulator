@@ -380,7 +380,7 @@ mod tests {
                 Some(("out-bucket", "team/out/build", false)),
             ),
             (
-                "the build id in the namespace",
+                "the build id in the namespace, which is the build's uuid alone",
                 artifacts(
                     "out-bucket",
                     Some("MyArtifacts"),

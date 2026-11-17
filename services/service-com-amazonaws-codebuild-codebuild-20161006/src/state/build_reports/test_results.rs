@@ -6,7 +6,9 @@
 //!
 //! A test report's data is the test cases the files the buildspec declared hold, in the
 //! format it declared them in: every case the file states, with the status that case ended
-//! in and how long it took. `TestCase$status` fixes the statuses a case is reported as —
+//! in, how long it took, the identity the document gives it (its own name, the series it
+//! belongs to and the suite it was stated inside) and the message the document states for a
+//! case that did not pass. `TestCase$status` fixes the statuses a case is reported as —
 //! "Valid statuses are `SUCCEEDED`, `FAILED`, `ERROR`, `SKIPPED`, and `UNKNOWN`" — so what
 //! the framework wrote is mapped onto those and onto nothing else.
 //!
@@ -24,6 +26,19 @@ use super::{
 /// the outcome of a case that did not simply pass: `<testcase name= classname= time=>` with
 /// `<failure>`, `<error>` or `<skipped>` inside it.
 const JUNIT_CASE: &str = "testcase";
+/// See [`JUNIT_CASE`]: the element a JUnit document groups its cases in, whose `name` is the
+/// suite the cases inside it were stated in.
+const JUNIT_SUITE: &str = "testsuite";
+/// The attribute a JUnit, NUnit 3 or TestNG document states the SERIES a case belongs to in
+/// — the class the test method lives on, which is the prefix CodeBuild applies to a series
+/// of related cases.
+const CLASSNAME_ATTRIBUTE: &str = "classname";
+/// The attribute every schema read here states a case's own name in, bar Visual Studio's.
+const NAME_ATTRIBUTE: &str = "name";
+/// The attribute a JUnit document states the message of a case's outcome in
+/// (`<failure message="...">`), and the element NUnit, TestNG and Visual Studio state the
+/// same message in.
+const MESSAGE: &str = "message";
 /// See [`JUNIT_CASE`].
 const JUNIT_FAILURE: &str = "failure";
 /// See [`JUNIT_CASE`].
@@ -36,6 +51,8 @@ const SECONDS_ATTRIBUTE: &str = "time";
 /// The element an NUnit document states one test case in — `<test-case>` in both the
 /// version 2 and the version 3 schema.
 const NUNIT_CASE: &str = "test-case";
+/// See [`NUNIT_CASE`]: the element NUnit groups its cases in, in both schemas.
+const NUNIT_SUITE: &str = "test-suite";
 /// The attribute NUnit 3 states a case's outcome in (`result="Passed"`), and NUnit 2 the
 /// same where it states one.
 const RESULT_ATTRIBUTE: &str = "result";
@@ -51,6 +68,11 @@ const NUNIT3_DURATION: &str = "duration";
 /// case's outcome and its span of MILLISECONDS in: `<test-method status="PASS"
 /// duration-ms="12">`.
 const TESTNG_CASE: &str = "test-method";
+/// See [`TESTNG_CASE`]: the element TestNG states the class a method lives on in
+/// (`<class name="C">`), and the one it groups a run's classes in (`<suite name="S">`).
+const TESTNG_CLASS: &str = "class";
+/// See [`TESTNG_CASE`].
+const TESTNG_SUITE: &str = "suite";
 /// See [`TESTNG_CASE`].
 const TESTNG_STATUS: &str = "status";
 /// See [`TESTNG_CASE`].
@@ -60,6 +82,11 @@ const TESTNG_DURATION_MILLIS: &str = "duration-ms";
 /// attributes carrying its outcome and its span: `<UnitTestResult outcome="Passed"
 /// duration="00:00:00.1234567">`.
 const TRX_CASE: &str = "UnitTestResult";
+/// See [`TRX_CASE`]: the attribute it states the case's own name in.
+const TRX_NAME: &str = "testName";
+/// See [`TRX_CASE`]: the element it states the message of a case that did not pass in
+/// (`<Output><ErrorInfo><Message>`).
+const TRX_MESSAGE: &str = "Message";
 /// See [`TRX_CASE`].
 const TRX_OUTCOME: &str = "outcome";
 /// See [`TRX_CASE`]: a `HH:MM:SS.fffffff` span rather than a number of seconds.
@@ -77,23 +104,39 @@ const CUCUMBER_RESULT: &str = "result";
 const CUCUMBER_STATUS: &str = "status";
 /// See [`CUCUMBER_ELEMENTS`].
 const CUCUMBER_DURATION_NANOS: &str = "duration";
+/// See [`CUCUMBER_ELEMENTS`]: the member naming a feature or a scenario, and the one a step's
+/// result states the message of a step that did not pass in.
+const CUCUMBER_NAME: &str = "name";
+/// See [`CUCUMBER_ELEMENTS`].
+const CUCUMBER_ERROR_MESSAGE: &str = "error_message";
 
 /// The test cases a JUnit XML document holds.
 ///
 /// A case's outcome is the child element the schema puts inside `<testcase>` for it, and a
-/// case with none of them passed; the span is its `time`, in seconds.
+/// case with none of them passed; the span is its `time`, in seconds. The case's identity is
+/// its own `name`, the `classname` the method lives on as the series it belongs to, and the
+/// `<testsuite>` it was stated inside; a case that did not pass carries the message its
+/// outcome element states.
 pub(super) fn junit(document: &str) -> Vec<TestResult> {
-    read_xml(document, JUNIT_CASE, |case| TestResult {
-        status: if has_child(case, JUNIT_FAILURE) {
-            STATUS_FAILED
-        } else if has_child(case, JUNIT_ERROR) {
-            STATUS_ERROR
-        } else if has_child(case, JUNIT_SKIPPED) {
-            STATUS_SKIPPED
-        } else {
-            STATUS_SUCCEEDED
-        },
-        duration_nanos: duration_nanos_of_seconds(case.attribute(SECONDS_ATTRIBUTE)),
+    read_xml(document, JUNIT_CASE, |case| {
+        let outcome = [
+            (JUNIT_FAILURE, STATUS_FAILED),
+            (JUNIT_ERROR, STATUS_ERROR),
+            (JUNIT_SKIPPED, STATUS_SKIPPED),
+        ]
+        .into_iter()
+        .find_map(|(element, status)| child(case, element).map(|held| (held, status)));
+        TestResult {
+            status: outcome.map_or(STATUS_SUCCEEDED, |(_, status)| status),
+            duration_nanos: duration_nanos_of_seconds(case.attribute(SECONDS_ATTRIBUTE)),
+            name: stated(case.attribute(NAME_ATTRIBUTE)),
+            prefix: stated(case.attribute(CLASSNAME_ATTRIBUTE)),
+            suite_name: stated(
+                enclosing(case, JUNIT_SUITE).and_then(|suite| suite.attribute(NAME_ATTRIBUTE)),
+            ),
+            message: outcome.and_then(|(held, _)| outcome_message(held)),
+            ..TestResult::default()
+        }
     })
 }
 
@@ -128,6 +171,13 @@ pub(super) fn nunit(document: &str) -> Vec<TestResult> {
             case.attribute(NUNIT3_DURATION)
                 .or_else(|| case.attribute(SECONDS_ATTRIBUTE)),
         ),
+        name: stated(case.attribute(NAME_ATTRIBUTE)),
+        prefix: stated(case.attribute(CLASSNAME_ATTRIBUTE)),
+        suite_name: stated(
+            enclosing(case, NUNIT_SUITE).and_then(|suite| suite.attribute(NAME_ATTRIBUTE)),
+        ),
+        message: descendant_text(case, MESSAGE),
+        ..TestResult::default()
     })
 }
 
@@ -142,6 +192,19 @@ pub(super) fn testng(document: &str) -> Vec<TestResult> {
             .attribute(TESTNG_DURATION_MILLIS)
             .and_then(|millis| millis.trim().parse::<f64>().ok())
             .map_or(0, |millis| (millis * 1_000_000.0) as i64),
+        name: stated(case.attribute(NAME_ATTRIBUTE)),
+        // TestNG states the class a method lives on as the element it nests the method in,
+        // rather than as an attribute of the method.
+        prefix: stated(
+            enclosing(case, TESTNG_CLASS)
+                .and_then(|class| class.attribute(NAME_ATTRIBUTE))
+                .or_else(|| case.attribute(CLASSNAME_ATTRIBUTE)),
+        ),
+        suite_name: stated(
+            enclosing(case, TESTNG_SUITE).and_then(|suite| suite.attribute(NAME_ATTRIBUTE)),
+        ),
+        message: descendant_text(case, MESSAGE),
+        ..TestResult::default()
     })
 }
 
@@ -153,6 +216,9 @@ pub(super) fn visual_studio(document: &str) -> Vec<TestResult> {
             .attribute(TRX_OUTCOME)
             .map_or(STATUS_UNKNOWN, outcome_status),
         duration_nanos: timespan_nanos(case.attribute(TRX_DURATION)),
+        name: stated(case.attribute(TRX_NAME)),
+        message: descendant_text(case, TRX_MESSAGE),
+        ..TestResult::default()
     })
 }
 
@@ -162,7 +228,8 @@ pub(super) fn visual_studio(document: &str) -> Vec<TestResult> {
 /// A scenario is the case a framework-agnostic report is of, so its outcome is read off the
 /// steps it is made of: a scenario with a failing step failed, one with a step that did not
 /// run was skipped, and one whose every step passed passed. Each step's `result/duration` is
-/// already stated in nanoseconds.
+/// already stated in nanoseconds. The case is named for the scenario and belongs to the
+/// feature's series, and its message is what the first step that did not pass stated.
 pub(super) fn cucumber(document: &str) -> Vec<TestResult> {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
         return Vec::new();
@@ -185,6 +252,7 @@ pub(super) fn cucumber(document: &str) -> Vec<TestResult> {
                 .unwrap_or_default();
             let mut status = STATUS_SUCCEEDED;
             let mut duration_nanos: i64 = 0;
+            let mut message: Option<String> = None;
             for step in steps {
                 let result = step.get(CUCUMBER_RESULT);
                 let stated = result
@@ -197,6 +265,12 @@ pub(super) fn cucumber(document: &str) -> Vec<TestResult> {
                         .and_then(::serde_json::Value::as_i64)
                         .unwrap_or_default(),
                 );
+                if message.is_none() && stated != STATUS_SUCCEEDED {
+                    message = result
+                        .and_then(|result| result.get(CUCUMBER_ERROR_MESSAGE))
+                        .and_then(::serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
                 // The step that is furthest from having passed is what the scenario came
                 // to: a failure or an error outranks a skip, which outranks a pass.
                 if severity(stated) > severity(status) {
@@ -206,6 +280,18 @@ pub(super) fn cucumber(document: &str) -> Vec<TestResult> {
             cases.push(TestResult {
                 status,
                 duration_nanos,
+                name: stated(
+                    scenario
+                        .get(CUCUMBER_NAME)
+                        .and_then(::serde_json::Value::as_str),
+                ),
+                prefix: stated(
+                    feature
+                        .get(CUCUMBER_NAME)
+                        .and_then(::serde_json::Value::as_str),
+                ),
+                message,
+                ..TestResult::default()
             });
         }
     }
@@ -241,10 +327,48 @@ fn read_xml(
         .collect()
 }
 
-/// Whether `case` holds a child element named `element`.
-fn has_child(case: ::roxmltree::Node<'_, '_>, element: &str) -> bool {
+/// The child element of `case` named `element`, when it holds one.
+fn child<'a, 'input>(
+    case: ::roxmltree::Node<'a, 'input>,
+    element: &str,
+) -> Option<::roxmltree::Node<'a, 'input>> {
     case.children()
-        .any(|child| child.is_element() && child.has_tag_name(element))
+        .find(|child| child.is_element() && child.has_tag_name(element))
+}
+
+/// The nearest element ENCLOSING `case` that is named `element`, when the document nests it
+/// in one — which is how every schema read here states the suite, and TestNG the class.
+fn enclosing<'a, 'input>(
+    case: ::roxmltree::Node<'a, 'input>,
+    element: &str,
+) -> Option<::roxmltree::Node<'a, 'input>> {
+    case.ancestors()
+        .find(|ancestor| ancestor.is_element() && ancestor.has_tag_name(element))
+}
+
+/// The message one outcome element states: its `message` attribute, and otherwise the text
+/// of the element itself — a JUnit `<failure message="..."/>` states the first, and a
+/// `<failure>stack trace</failure>` the second.
+fn outcome_message(outcome: ::roxmltree::Node<'_, '_>) -> Option<String> {
+    stated(outcome.attribute(MESSAGE)).or_else(|| stated(outcome.text()))
+}
+
+/// The text of the first element named `element` ANYWHERE under `case`, which is where NUnit,
+/// TestNG and Visual Studio each state the message of a case that did not pass.
+fn descendant_text(case: ::roxmltree::Node<'_, '_>, element: &str) -> Option<String> {
+    case.descendants()
+        .find(|node| node.is_element() && node.has_tag_name(element))
+        .and_then(|node| stated(node.text()))
+}
+
+/// A value a document STATED: trimmed, and `None` for one that states nothing — so a member
+/// an attribute was absent for and one it was empty for are both absent, rather than a value
+/// of no characters.
+fn stated(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// The nanoseconds a `HH:MM:SS.fffffff` span states, or none for a value that is not one.

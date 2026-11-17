@@ -10,10 +10,13 @@
 //! build-SYSTEM failure, so it is not what a build whose own commands failed reports.
 //! Each phase's `phaseStatus` is the same answer for that phase's commands, and a phase
 //! whose failure aborts the build is the last COMMAND phase the build reports — the phases
-//! after it never ran, so none is reported. A phase whose `on-failure` is `CONTINUE` does
-//! not abort, however many phases have already failed. A phase's `finally` block runs
-//! after its commands whatever they answered, and an `exit` that ended the commands block
-//! does not end it.
+//! after it never ran, so none is reported. WHICH of the two a failing phase does is the
+//! `on-failure` of that phase and nothing else: `CONTINUE` goes on to the next phase,
+//! however the failure came about and however many phases have already failed, while the
+//! failed phase keeps its own `FAILED` status and the build is `FAILED` either way. A
+//! phase's `finally` block runs after its commands whatever they answered, and an `exit`
+//! ends the command BLOCK it was performed in — CodeBuild runs each block in its own shell
+//! instance — so it ends neither the `finally` block after it nor the phases after that.
 //!
 //! A build that ran its commands then does its own finishing work whether they succeeded
 //! or failed: what it produced is put where its artifacts say and the build reports an
@@ -723,12 +726,12 @@ pub fn run_commands(
             aborted = true;
             break;
         }
-        // `exit` ended the build's session: a non-zero status already failed the phase
-        // above (so the build was aborted there), and a zero status is a build that ran
-        // to success with the phases after it left unrun.
-        if shell.exit_status().is_some() {
-            break;
-        }
+        // `exit` ended the command block of the phase that just ran, not the build: the
+        // next phase's commands are their own program, so the session they run in has not
+        // exited, and whether the build reaches them is the question the `on-failure` above
+        // already answered. Forgotten here exactly as it is before a `finally` block
+        // ([`run_phase`]).
+        shell.clear_exit();
     }
 
     CommandRun {

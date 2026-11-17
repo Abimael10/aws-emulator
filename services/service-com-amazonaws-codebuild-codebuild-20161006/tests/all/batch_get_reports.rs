@@ -106,7 +106,15 @@ fn engine_holding(reports: Vec<Report>) -> Arc<engine::InMemoryEngine> {
     let mut guard = handle.lock();
     for report in reports {
         let arn = report.arn.clone().expect("a seeded report carries its ARN");
-        guard.reports.insert(arn, report);
+        guard.reports.insert(
+            arn,
+            state::StoredReport {
+                report,
+                // The cases a run was read from are the build's own; a seeded run stands
+                // for one that holds none, which is what this suite reads reports about.
+                test_cases: Vec::new(),
+            },
+        );
     }
     drop(guard);
     engine

@@ -153,6 +153,114 @@ async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
     }
 }
 
+/// RULE: whether the build runs the phase AFTER one that failed is decided by that phase's
+/// own `on-failure` and by nothing else — `CONTINUE` runs the later phases, each reported
+/// with its own outcome and the upload among them, however the failing command came to fail
+/// — while the failed phase keeps its `FAILED` status and the build is `FAILED` either way.
+///
+/// The rows differ along what the rule generalises over: WHICH phase fails and continues, and
+/// the FORM its failing command takes — a command that exits non-zero of its own accord, and
+/// one that ends its shell with an explicit `exit`, which ends that command's own program and
+/// not the build's phase sequence.
+#[tokio::test]
+async fn a_phase_that_continues_past_its_failure_runs_the_later_phases() {
+    let router = emulator();
+
+    /// One row: the case, the buildspec, and the `(phaseType, phaseStatus)` pairs the build
+    /// must report for the phases the rule is about.
+    type Row = (&'static str, String, Vec<(&'static str, &'static str)>);
+
+    /// A buildspec declaring all four command phases, `phase`'s own command being `command`
+    /// and its `on-failure` `CONTINUE`, with every other phase echoing.
+    fn continuing(phase: &str, command: &str) -> String {
+        let mut spec = String::from("version: 0.2\nphases:\n");
+        for declared in ["install", "pre_build", "build", "post_build"] {
+            spec.push_str(&format!("  {declared}:\n"));
+            if declared == phase {
+                spec.push_str("    on-failure: CONTINUE\n");
+            }
+            let line = if declared == phase { command } else { "echo ran" };
+            spec.push_str(&format!("    commands:\n      - {line}\n"));
+        }
+        spec
+    }
+
+    let rows: Vec<Row> = vec![
+        (
+            "pre_build fails with a command that exits non-zero",
+            continuing("pre_build", "false"),
+            vec![
+                ("INSTALL", "SUCCEEDED"),
+                ("PRE_BUILD", "FAILED"),
+                ("BUILD", "SUCCEEDED"),
+                ("POST_BUILD", "SUCCEEDED"),
+                ("UPLOAD_ARTIFACTS", "SUCCEEDED"),
+                ("FINALIZING", "SUCCEEDED"),
+            ],
+        ),
+        (
+            "pre_build fails with an explicit non-zero exit",
+            continuing("pre_build", "exit 7"),
+            vec![
+                ("INSTALL", "SUCCEEDED"),
+                ("PRE_BUILD", "FAILED"),
+                ("BUILD", "SUCCEEDED"),
+                ("POST_BUILD", "SUCCEEDED"),
+                ("UPLOAD_ARTIFACTS", "SUCCEEDED"),
+                ("FINALIZING", "SUCCEEDED"),
+            ],
+        ),
+        (
+            "install fails with an explicit non-zero exit",
+            continuing("install", "exit 1"),
+            vec![
+                ("INSTALL", "FAILED"),
+                ("PRE_BUILD", "SUCCEEDED"),
+                ("BUILD", "SUCCEEDED"),
+                ("POST_BUILD", "SUCCEEDED"),
+                ("UPLOAD_ARTIFACTS", "SUCCEEDED"),
+                ("FINALIZING", "SUCCEEDED"),
+            ],
+        ),
+        (
+            "build fails with an explicit non-zero exit",
+            continuing("build", "exit 2"),
+            vec![
+                ("INSTALL", "SUCCEEDED"),
+                ("PRE_BUILD", "SUCCEEDED"),
+                ("BUILD", "FAILED"),
+                ("POST_BUILD", "SUCCEEDED"),
+                ("UPLOAD_ARTIFACTS", "SUCCEEDED"),
+                ("FINALIZING", "SUCCEEDED"),
+            ],
+        ),
+    ];
+
+    for (index, (case, spec, expected)) in rows.iter().enumerate() {
+        let project = format!("continue-form-proj-{index}");
+        create_project(&router, &project, source_with(spec)).await;
+        let build = settled_build(&router, &project, json!({})).await;
+        let pairs = phase_pairs(&build);
+
+        assert_eq!(
+            build["buildStatus"],
+            json!("FAILED"),
+            "case {case:?}: a phase that failed fails the build, got {build}"
+        );
+        for (phase, status) in expected {
+            let reported = pairs
+                .iter()
+                .find(|(reported, _)| reported == phase)
+                .and_then(|(_, status)| status.clone());
+            assert_eq!(
+                reported,
+                Some((*status).to_string()),
+                "case {case:?}: expected {phase} to be reported {status}, got {pairs:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_failure_the_phase_continues_past_still_reports_the_upload() {
     let router = emulator();
