@@ -202,11 +202,52 @@ pub fn selection_reference(reference: &str) -> Option<(SelectionNamespace, &str)
     None
 }
 
+/// The value a reference into a JSON document names, read out of `document` at the dotted
+/// `path` — the ONE reading of such a path in this service.
+///
+/// A reference into the body of a call names a PATH rather than one member of its top level:
+/// the name is a sequence of MEMBER NAMES separated by [`BODY_PATH_SEPARATOR`]
+/// (`$request.body.action` names the `action` member of the message, `$request.body.meta.kind`
+/// the `kind` member of its `meta` object), so it is resolved member by member from the top of
+/// the document. Each name is matched exactly, because a JSON member name is case-sensitive,
+/// and a name reached against an ARRAY indexes it by position, which is how a path reaches
+/// into a list the document carries.
+///
+/// `None` — the reference has no value for this call, so the expression carrying it selects
+/// nothing — when any name along the path is absent, when a name along it is reached through
+/// a value that holds no such member, and when the value it reaches is `null`. A value that
+/// is not a string is read as the JSON it is written as, which is what lets a key carried as
+/// a number or a boolean select a route, and what makes a path naming a whole document usable
+/// for a parameter whose own content is one.
+///
+/// Shared by the WebSocket data plane's selection expressions and the HTTP data plane's
+/// parameter mapping, so the route a message selects, the template a call selects and the
+/// parameter a mapping fills read the same reference the same way.
+pub fn selected_body_value(document: &::serde_json::Value, path: &str) -> Option<String> {
+    let mut selected = document;
+    for member in path.split(BODY_PATH_SEPARATOR) {
+        selected = match selected {
+            ::serde_json::Value::Array(entries) => entries.get(member.parse::<usize>().ok()?)?,
+            other => other.get(member)?,
+        };
+    }
+    match selected {
+        ::serde_json::Value::String(text) => Some(text.clone()),
+        ::serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// What separates the member names of a path into a document, which is the same character
+/// that separates a reference's namespace from the name inside it.
+const BODY_PATH_SEPARATOR: char = '.';
+
 /// The part of a call a variable reference names ([`selection_reference`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionNamespace {
-    /// A FIELD of the request body, which is what a WebSocket api's expressions read
-    /// ([`WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`]).
+    /// A PATH into the request body, which is what a WebSocket api's expressions read
+    /// ([`WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`], resolved by
+    /// [`selected_body_value`]).
     RequestBody,
     /// A `$context` member the gateway reports about the call.
     Context,
@@ -243,13 +284,15 @@ pub fn validate_selection_expression(expression: &str) -> Result<(), String> {
 }
 
 /// The variable reference a WEBSOCKET api's `RouteSelectionExpression` selects a route
-/// key with, lowercased for comparison: a FIELD of the request body.
+/// key with, lowercased for comparison: a PATH into the request body.
 ///
 /// A WebSocket api matches each inbound message against its routes by evaluating this
 /// expression over that message — `$request.body.action` is the expression AWS documents
-/// for a message carrying an `action` property — so the reference has to name a field
-/// INSIDE the body. The whole body (`$request.body`, no field selector) selects no key
-/// a route could carry, and neither does a part of the request a frame does not have.
+/// for a message carrying an `action` property, and `$request.body.meta.kind` names the
+/// same member one level deeper — so the reference has to name a path INSIDE the body,
+/// which [`selected_body_value`] resolves member by member. The whole body
+/// (`$request.body`, no member after it) selects no key a route could carry, and neither
+/// does a part of the request a frame does not have.
 pub const WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX: &str = "request.body.";
 
 /// `Ok(())`, or why this `RouteSelectionExpression` cannot be stored on an api of this
@@ -333,6 +376,40 @@ mod tests {
             assert_eq!(
                 read, *expected,
                 "case {reference:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_reference_names_a_path_resolved_member_by_member() {
+        let body: ::serde_json::Value = ::serde_json::json!({
+            "action": "send",
+            "meta": { "kind": "alpha", "depth": { "leaf": "deep" }, "count": 3, "on": true },
+            "empty": null,
+            "list": ["first"],
+            "text": "plain"
+        });
+        // Rows differ along the DEPTH of the path, the TYPE of the value it reaches, and
+        // every way a path reaches no value at all.
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("a member of the message itself", "action", Some("send")),
+            ("one level deeper", "meta.kind", Some("alpha")),
+            ("two levels deeper", "meta.depth.leaf", Some("deep")),
+            ("a number, read as the JSON it is", "meta.count", Some("3")),
+            ("a boolean", "meta.on", Some("true")),
+            ("a member the message does not carry", "absent", None),
+            ("a path past a member it does not carry", "meta.absent.leaf", None),
+            ("a path through a value that is no object", "text.kind", None),
+            ("a path through an array, which indexes it", "list.0", Some("first")),
+            ("a member whose value is null", "empty", None),
+            ("the casing of a member name, which is exact", "Action", None),
+        ];
+        for (case, path, expected) in cases {
+            let read = selected_body_value(&body, path);
+            assert_eq!(
+                read.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?} for {path:?}, got {read:?}"
             );
         }
     }

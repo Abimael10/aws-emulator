@@ -20,6 +20,16 @@
 //! > addresses: a `PostToConnection` to it is DELIVERED over that socket, and once the
 //! > client closes, each of the three `@connections` operations answers `GoneException`.
 //!
+//! The selection itself is the one slice stated separately, because it is a rule about the
+//! EXPRESSION rather than about the socket:
+//!
+//! > The `RouteSelectionExpression` of a WEBSOCKET api names a PATH into each message —
+//! > `$request.body.<member>[.<member>…]` — and the key a frame is routed by is the value
+//! > that path reaches, resolved member by member from the top of the message; a path the
+//! > frame carries no value for selects nothing, which is what `$default` serves. The api's
+//! > CURRENT expression is the one a deployed stage selects by, so a frame sent after the
+//! > expression was changed and the stage redeployed is routed by the new path.
+//!
 //! The rows span what the rule generalises over: the stage's state (deployed, not deployed,
 //! absent), the `$connect` route's integration (absent, a MOCK that selects a `2xx`, a MOCK
 //! that selects nothing, one fronting a backend), the selecting status (`200`, `404`, a
@@ -57,12 +67,16 @@ const SWITCHING_PROTOCOLS: u16 = 101;
 const FORBIDDEN: u16 = 403;
 const INTERNAL_SERVER_ERROR: u16 = 500;
 
-/// A WebSocket api whose messages select a route by their `action` member.
-fn websocket_api(name: &str) -> Value {
+/// The expression AWS documents for a WebSocket api whose messages carry an `action`
+/// property, which is the one every api below selects routes by unless a case names another.
+pub(crate) const ACTION_SELECTION_EXPRESSION: &str = "$request.body.action";
+
+/// A WebSocket api whose messages select a route by `expression`.
+fn websocket_api(name: &str, expression: &str) -> Value {
     json!({
         "name": name,
         "protocolType": "WEBSOCKET",
-        "routeSelectionExpression": "$request.body.action"
+        "routeSelectionExpression": expression
     })
 }
 
@@ -74,9 +88,26 @@ pub(crate) struct Api {
     pub(crate) authority: String,
 }
 
-/// Create a WEBSOCKET api and read the socket address it announces.
+/// Create a WEBSOCKET api selecting routes by the documented `action` expression, and read
+/// the socket address it announces.
 pub(crate) async fn create_api(emulator: &MultiServiceRouter, case: &str, name: &str) -> Api {
-    let (status, created) = call(emulator, "POST", "/v2/apis", Some(websocket_api(name))).await;
+    create_selecting_api(emulator, case, name, ACTION_SELECTION_EXPRESSION).await
+}
+
+/// [`create_api`] for an api selecting routes by `expression`.
+pub(crate) async fn create_selecting_api(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    expression: &str,
+) -> Api {
+    let (status, created) = call(
+        emulator,
+        "POST",
+        "/v2/apis",
+        Some(websocket_api(name, expression)),
+    )
+    .await;
     assert_eq!(
         status, 201,
         "case {case:?}: CreateApi must answer 201, got {created}"
@@ -938,3 +969,260 @@ async fn a_carried_connection_is_posted_to_and_then_gone_after_the_client_closes
 /// The status `GoneException` carries: "The connection with the provided id no longer
 /// exists".
 const GONE: u16 = 410;
+
+/// The stage every selection case below deploys and dials.
+const SELECTION_STAGE: &str = "prod";
+
+/// The route key that serves a message the expression selects no route for.
+const DEFAULT_ROUTE_KEY: &str = "$default";
+
+/// What the `$default` route's own reply NAMES it: a mapping template reads `$` as the start
+/// of a variable reference, so the name a template renders carries no `$`.
+fn served_by(route_key: &str) -> &str {
+    route_key.trim_start_matches('$')
+}
+
+/// Create an api selecting routes by `expression`, hold one TWO-WAY route per key in
+/// `route_keys`, and release a deployment to [`SELECTION_STAGE`].
+///
+/// Each route's MOCK integration renders `{"picked":"<route key>"}`, so the reply a client
+/// reads back NAMES the route the frame was dispatched to — which is what a selection case
+/// asserts on.
+async fn selecting_api(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    expression: &str,
+    route_keys: &[&str],
+) -> Api {
+    let api = create_selecting_api(emulator, case, "selection-api", expression).await;
+    for route_key in route_keys {
+        let name = served_by(route_key);
+        let integration = create_integration(
+            emulator,
+            case,
+            &api.api_id,
+            json!({
+                "integrationType": "MOCK",
+                "requestTemplates": { "$default": "{\"statusCode\": 200}" }
+            }),
+        )
+        .await;
+        create_integration_response(
+            emulator,
+            case,
+            &api.api_id,
+            &integration,
+            json!({
+                "integrationResponseKey": "$default",
+                "responseTemplates": {
+                    "$default": format!("{{\"picked\":\"{name}\"}}")
+                }
+            }),
+        )
+        .await;
+        create_route(emulator, case, &api.api_id, route_key, &integration, true).await;
+    }
+    create_stage(emulator, case, &api.api_id, SELECTION_STAGE, true).await;
+    api
+}
+
+/// The route key the reply NAMES — which route the frame was dispatched to.
+fn picked(case: &str, answered: Option<String>) -> String {
+    let frame = answered
+        .unwrap_or_else(|| panic!("case {case:?}: the api must answer the frame, got nothing"));
+    let parsed: Value = serde_json::from_str(&frame).unwrap_or_else(|error| {
+        panic!("case {case:?}: expected a JSON frame, got {frame:?} ({error})")
+    });
+    parsed["picked"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the serving route named, got {parsed}")
+        })
+        .to_string()
+}
+
+/// A frame is routed by the value the api's expression PATH reaches in it, however deep that
+/// path goes, and by `$default` when it reaches none.
+#[tokio::test]
+async fn a_frame_selects_its_route_by_the_path_its_apis_expression_names() {
+    /// One row: the api's expression, the frame sent, and the route key that must serve it.
+    struct Row {
+        case: &'static str,
+        expression: &'static str,
+        frame: &'static str,
+        expected: &'static str,
+    }
+
+    // The rows differ along what the rule generalises over: the DEPTH of the path (the one
+    // member AWS documents, two members, three), the spelling of the reference (bare and
+    // braced), and every way a path reaches no key — an absent member, a member reached
+    // through a value that is no object, a value that is no route key, and a frame that is no
+    // JSON object at all.
+    let rows = [
+        Row {
+            case: "the one-member path AWS documents",
+            expression: ACTION_SELECTION_EXPRESSION,
+            frame: r#"{"action":"alpha"}"#,
+            expected: "alpha",
+        },
+        Row {
+            case: "a path one member deeper",
+            expression: "$request.body.meta.kind",
+            frame: r#"{"meta":{"kind":"beta"},"text":"hello"}"#,
+            expected: "beta",
+        },
+        Row {
+            case: "a path three members deep",
+            expression: "$request.body.outer.inner.kind",
+            frame: r#"{"outer":{"inner":{"kind":"alpha"}}}"#,
+            expected: "alpha",
+        },
+        Row {
+            case: "the braced spelling of a nested path",
+            expression: "${request.body.meta.kind}",
+            frame: r#"{"meta":{"kind":"beta"}}"#,
+            expected: "beta",
+        },
+        Row {
+            case: "a nested path the frame carries no value for",
+            expression: "$request.body.meta.kind",
+            frame: r#"{"meta":{"other":"beta"}}"#,
+            expected: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "a nested path reached through a value that is no object",
+            expression: "$request.body.meta.kind",
+            frame: r#"{"meta":"beta"}"#,
+            expected: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "a nested path reaching a key no route of the api carries",
+            expression: "$request.body.meta.kind",
+            frame: r#"{"meta":{"kind":"gamma"}}"#,
+            expected: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "a path stopping at an object, which names no route key",
+            expression: "$request.body.meta",
+            frame: r#"{"meta":{"kind":"beta"}}"#,
+            expected: DEFAULT_ROUTE_KEY,
+        },
+        Row {
+            case: "a frame that is no JSON object",
+            expression: "$request.body.meta.kind",
+            frame: "not json at all",
+            expected: DEFAULT_ROUTE_KEY,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let emulator = emulator();
+        let api = selecting_api(
+            &emulator,
+            case,
+            row.expression,
+            &["alpha", "beta", DEFAULT_ROUTE_KEY],
+        )
+        .await;
+        let mut socket = handshake(case, &api.authority, SELECTION_STAGE)
+            .await
+            .unwrap_or_else(|status| {
+                panic!("case {case:?}: the handshake must complete, got {status}")
+            });
+        let served = picked(case, exchange(case, &mut socket, row.frame).await);
+        assert_eq!(
+            served,
+            served_by(row.expected),
+            "case {case:?}: expected {:?} to be served by {:?} under {:?}, got {served:?}",
+            row.frame,
+            row.expected,
+            row.expression
+        );
+    }
+}
+
+/// An api whose `RouteSelectionExpression` is changed and whose stage is redeployed selects
+/// routes by the NEW expression for the frames that follow.
+#[tokio::test]
+async fn a_redeployed_stage_selects_routes_by_the_apis_updated_expression() {
+    let case = "the api's RouteSelectionExpression is replaced and the stage redeployed";
+    let emulator = emulator();
+    let api = selecting_api(
+        &emulator,
+        case,
+        ACTION_SELECTION_EXPRESSION,
+        &["alpha", "beta", DEFAULT_ROUTE_KEY],
+    )
+    .await;
+    let mut socket = handshake(case, &api.authority, SELECTION_STAGE)
+        .await
+        .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
+
+    // The expression the api was created with routes the first frame.
+    let served = picked(case, exchange(case, &mut socket, r#"{"action":"beta"}"#).await);
+    assert_eq!(
+        served,
+        served_by("beta"),
+        "case {case:?}: expected the created expression to route the frame to \"beta\", got \
+         {served:?}"
+    );
+
+    let updated_expression = "$request.body.meta.kind";
+    let (status, updated) = call(
+        &emulator,
+        "PATCH",
+        &format!("/v2/apis/{}", api.api_id),
+        Some(json!({ "routeSelectionExpression": updated_expression })),
+    )
+    .await;
+    // The status a patch of an api answers here is the one `mutating_success_status.rs` owns.
+    assert_eq!(
+        status, 201,
+        "case {case:?}: UpdateApi must answer 201, got {status} {updated}"
+    );
+    assert_eq!(
+        updated["routeSelectionExpression"].as_str(),
+        Some(updated_expression),
+        "case {case:?}: the api must report the expression it now carries, got {updated}"
+    );
+    let (status, deployment) = call(
+        &emulator,
+        "POST",
+        &format!("/v2/apis/{}/deployments", api.api_id),
+        Some(json!({ "stageName": SELECTION_STAGE })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: CreateDeployment must answer 201, got {status} {deployment}"
+    );
+
+    // The rows span what the new expression changes: each route reached under the new path,
+    // and a frame keyed the old way, which the new path finds nothing in.
+    for (label, frame, expected) in [
+        (
+            "a frame keyed by the new path reaches that route",
+            r#"{"meta":{"kind":"beta"},"text":"hello"}"#,
+            "beta",
+        ),
+        (
+            "another route under the same new path",
+            r#"{"meta":{"kind":"alpha"}}"#,
+            "alpha",
+        ),
+        (
+            "a frame keyed the way the old expression named",
+            r#"{"action":"beta"}"#,
+            DEFAULT_ROUTE_KEY,
+        ),
+    ] {
+        let served = picked(label, exchange(label, &mut socket, frame).await);
+        assert_eq!(
+            served,
+            served_by(expected),
+            "case {label:?}: expected {frame:?} served by {expected:?} under \
+             {updated_expression:?}, got {served:?}"
+        );
+    }
+}

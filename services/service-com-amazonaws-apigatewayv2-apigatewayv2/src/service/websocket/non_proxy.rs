@@ -239,11 +239,9 @@ fn selected_value(
 ) -> Option<String> {
     let (namespace, name) = crate::state::selection_reference(reference)?;
     match namespace {
-        crate::state::SelectionNamespace::RequestBody => match frame?.get(name)? {
-            ::serde_json::Value::String(text) => Some(text.clone()),
-            ::serde_json::Value::Null => None,
-            other => Some(other.to_string()),
-        },
+        crate::state::SelectionNamespace::RequestBody => {
+            crate::state::selected_body_value(frame?, name)
+        }
         crate::state::SelectionNamespace::Context => context.get(name).cloned(),
         crate::state::SelectionNamespace::StageVariables => stage_variables.get(name).cloned(),
     }

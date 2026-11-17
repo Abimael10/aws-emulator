@@ -407,20 +407,14 @@ impl Sources<'_> {
 
 /// The member `member_path` names, selected out of `document`.
 ///
-/// A member no document holds names no value. A selected value that is not itself a string is
-/// carried as the JSON it is, which is what makes `$request.body.detail` usable for a
-/// parameter whose own content is a document.
+/// The reading is the service's ONE reading of a dotted path into a document
+/// (`crate::state::selected_body_value`), which is also how a WebSocket selection expression
+/// reads a reference into the message: a member no document holds names no value, an array is
+/// indexed by position, and a selected value that is not itself a string is carried as the
+/// JSON it is — which is what makes `$request.body.detail` usable for a parameter whose own
+/// content is a document.
 fn selected_member(document: &Value, member_path: &str) -> Option<String> {
-    let mut selected = document;
-    for member in member_path.split(PART_SEPARATOR) {
-        selected = match selected {
-            // An array is indexed by position, which is how a member path reaches into a
-            // list the document carries.
-            Value::Array(entries) => entries.get(member.parse::<usize>().ok()?)?,
-            _ => selected.get(member)?,
-        };
-    }
-    text_of(selected)
+    crate::state::selected_body_value(document, member_path)
 }
 
 /// The value a `$context.…` expression selects out of the stated context.

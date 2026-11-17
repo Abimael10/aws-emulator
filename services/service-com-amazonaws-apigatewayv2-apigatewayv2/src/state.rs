@@ -4732,6 +4732,10 @@ pub use selection_expression::evaluated_selection_expression;
 /// [`selection_expression::selection_reference`].
 pub use selection_expression::{selection_reference, SelectionNamespace};
 
+/// The value a reference into the message body names — see
+/// [`selection_expression::selected_body_value`].
+pub use selection_expression::selected_body_value;
+
 /// The sentence a selection expression naming an unevaluated variable is refused with —
 /// see [`selection_expression::unexpected_selection_variable_message`].
 pub use selection_expression::unexpected_selection_variable_message;

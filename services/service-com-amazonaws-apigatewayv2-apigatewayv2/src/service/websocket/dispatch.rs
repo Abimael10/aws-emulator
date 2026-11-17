@@ -246,33 +246,32 @@ pub fn is_success_status(status: Option<&str>) -> bool {
 /// The route key the api's `RouteSelectionExpression` selects for `body`, or `None` when the
 /// expression selects nothing in this message.
 ///
-/// A WEBSOCKET api's expression names a FIELD OF THE MESSAGE BODY
+/// A WEBSOCKET api's expression names a PATH INTO THE MESSAGE BODY
 /// (`crate::state::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`, the rule every writer of the
-/// member is held to), so the key is that field's value: `$request.body.action` selects the
-/// value of `action`. A message that is not a JSON object, or that carries no such field,
-/// selects nothing — which is the "route selection expression cannot be evaluated" case
-/// `$default` exists for.
+/// member is held to), so the key is the value that path reaches: `$request.body.action`
+/// selects the value of `action`, and `$request.body.meta.kind` the value of `kind` inside
+/// `meta`. A message that is not a JSON object, or that carries no such value, selects
+/// nothing — which is the "route selection expression cannot be evaluated" case `$default`
+/// exists for.
 pub fn selected_route_key(api: &Api, body: &str) -> Option<String> {
     let reference = crate::state::selection_expression_references(&api.route_selection_expression)
         .into_iter()
         .next()?;
     // WHICH part of the call the reference names is the one reading of that set
     // (`crate::state::selection_reference`): the namespace is read case-insensitively, the
-    // way the writer of the member reads it, and the FIELD exactly as written, because a JSON
-    // member name is case-sensitive. A WEBSOCKET api's expression names a field of the BODY
+    // way the writer of the member reads it, and the PATH exactly as written, because a JSON
+    // member name is case-sensitive. A WEBSOCKET api's expression names a path into the BODY
     // (`crate::state::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`, the rule every writer of
     // the member is held to), so a reference naming anything else selects nothing.
-    let (namespace, field) = crate::state::selection_reference(&reference)?;
+    let (namespace, path) = crate::state::selection_reference(&reference)?;
     if namespace != crate::state::SelectionNamespace::RequestBody {
         return None;
     }
     let document: ::serde_json::Value = ::serde_json::from_str(body).ok()?;
-    let value = document.get(field)?;
-    match value {
-        ::serde_json::Value::String(text) => Some(text.clone()),
-        ::serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    }
+    // The path is resolved by the service's ONE reader of a body reference
+    // (`crate::state::selected_body_value`), so the route a message selects and the template
+    // a call selects read the same reference the same way.
+    crate::state::selected_body_value(&document, path)
 }
 
 /// The route of this deployment that serves the message `body`: the one whose `RouteKey` the
