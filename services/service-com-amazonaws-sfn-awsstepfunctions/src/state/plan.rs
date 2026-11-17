@@ -103,7 +103,44 @@ pub fn plan_redrive(
         EXECUTION_SETTLE_DELAY,
         tasks,
     );
-    plan_from_run(run, start, EXECUTION_SETTLE_DELAY, Some(opening), previous_event_id)
+    let mut planned =
+        plan_from_run(run, start, EXECUTION_SETTLE_DELAY, Some(opening), previous_event_id);
+    // "Step Functions preserves the results and execution history of the successful
+    // steps, and doesn't rerun these steps": the step this attempt resumes was ENTERED
+    // by the attempt being redriven and is not entered again, so the first event this
+    // attempt writes FOR THAT STEP continues the causal chain from the preserved event
+    // that entered it — not from the event the attempt opened with, which is what an
+    // attempt that walks the definition from its `StartAt` (and therefore enters its
+    // first state again) follows. `previousEventId` is "the id of the previous event",
+    // the one that really precedes an event in that chain, which is what a reader
+    // walking back from a failure to the state it happened in follows.
+    if let (Some(entered_at), Some(first)) = (entered_at, first_resumed_step_event_mut(&mut planned))
+    {
+        first.previous_event_id = entered_at;
+    }
+    planned
+}
+
+/// The first event the WALK of a redriven attempt wrote FOR THE STEP it resumed: the event
+/// after the one the attempt opened its history with, wherever this plan holds it — among
+/// the events that have already happened, else among the ones its terminal outcome is owed
+/// with.
+///
+/// `None` where the walk wrote no event of that step at all: an attempt that resumed a
+/// state which ended the execution outright appends its own terminal event and nothing
+/// else, and that event is the EXECUTION's rather than the step's, so it follows the event
+/// the attempt opened with like any other event of the attempt.
+fn first_resumed_step_event_mut(planned: &mut Planned) -> Option<&mut HistoryEvent> {
+    if planned.opening.len() > 1 {
+        return planned.opening.get_mut(1);
+    }
+    let events = &mut planned.pending.as_mut()?.events;
+    // The LAST of the events an outcome is owed with is the execution's own terminal
+    // event, which no step of the walk wrote.
+    if events.len() > 1 {
+        return events.first_mut();
+    }
+    None
 }
 
 /// What one planned run of a definition left for the store to record.

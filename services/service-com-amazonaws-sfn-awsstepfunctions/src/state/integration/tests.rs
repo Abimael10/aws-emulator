@@ -1837,10 +1837,20 @@ fn a_served_invocation_whose_function_errored_is_a_failed_task() {
         cause,
     } in rows
     {
+        // The bytes the answer arrived as, which is what the invocation ANSWERED: a
+        // `Resource` that named the function reports its failure document as those bytes
+        // carried it (see [`function_error`]), so the reading is given them here.
+        let answered: Vec<u8> = answer
+            .get("Payload")
+            .map(|payload| match payload {
+                Value::String(text) => text.clone().into_bytes(),
+                document => document.to_string().into_bytes(),
+            })
+            .unwrap_or_default();
         // Both forms of a `Resource` that invokes a function read the same signal:
         // the work either names is the function's RUN.
         for call in [&optimized, &named_function] {
-            let read = function_error(call, &answer);
+            let read = function_error(call, &answer, &answered);
             assert_eq!(
                 read.as_ref().map(|failed| failed.error.as_str()),
                 error,
@@ -1883,7 +1893,7 @@ fn a_served_invocation_whose_function_errored_is_a_failed_task() {
         "FunctionError": "Unhandled",
         "Payload": {"errorType": "CustomBoomError"},
     });
-    let read = function_error(&elsewhere, &answer);
+    let read = function_error(&elsewhere, &answer, &[]);
     assert!(
         read.is_none(),
         "case \"another operation's answer\": expected no failure, got {read:?}"

@@ -235,18 +235,19 @@ async fn a_function_timeout_is_a_failed_task_and_not_the_states_own_timeout() {
             message.contains(&stated),
             "case {case:?}: expected the message to state {stated:?}, got {message:?}"
         );
-        // The members the PLATFORM's own error document carries, and no others: the
-        // sandbox ended the run, so no runtime serialized an exception for it and the
-        // document a `Catch` or an operator parses names neither the invocation's id nor
-        // a stack.
+        // The members the PLATFORM's own error document carries, in the order it writes
+        // them and no others: the sandbox ended the run, so no runtime serialized an
+        // exception for it and the document a `Catch` or an operator parses names the class
+        // first and neither the invocation's id nor a stack at all.
         let members: Vec<&str> = document
             .as_object()
             .map(|members| members.keys().map(String::as_str).collect())
             .unwrap_or_default();
         assert_eq!(
             members,
-            vec!["errorMessage", "errorType"],
-            "case {case:?}: expected the platform's own two members, got {document}"
+            vec!["errorType", "errorMessage"],
+            "case {case:?}: expected the platform's own two members, in the order it writes \
+             them, got {document}"
         );
     }
 }

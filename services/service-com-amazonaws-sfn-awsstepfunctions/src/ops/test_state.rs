@@ -191,6 +191,15 @@ fn invalid_definition_sentence(sentence: &str) -> TestStateError {
     .into()
 }
 
+/// What this operation answers for a `stateName` the submitted definition declares no
+/// state of.
+///
+/// RECORDED text, and the WHOLE message: the refusal is one fixed sentence, with no part
+/// of it taken from the request — the name that was asked for is not interpolated into
+/// it, so a client matching on the text reads the same sentence whichever state name it
+/// asked about.
+const STATE_NOT_FOUND: &str = "State not found in definition";
+
 /// What this operation answers for a `definition` that is not JSON.
 ///
 /// RECORDED text, and a FIXED sentence: `TestState` names the thing it was given —
@@ -509,9 +518,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(Value::as_object)
                     .and_then(|states| states.get(state_name));
                 let Some(state) = state else {
-                    return Err(refuse(format!(
-                        "stateName '{state_name}' names no state the definition declares"
-                    )));
+                    return Err(refuse(STATE_NOT_FOUND.to_string()));
                 };
                 (state_name, state)
             }

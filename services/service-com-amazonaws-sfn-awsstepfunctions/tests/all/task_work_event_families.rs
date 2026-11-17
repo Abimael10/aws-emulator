@@ -579,9 +579,17 @@ async fn each_lifecycle_transition_is_its_own_event_and_a_redrive_continues_the_
         "ExecutionFailed",
     ]);
     let events = history(&chain, case, &execution, json!({})).await;
+    // The step the redrive resumed was ENTERED by the attempt being redriven and is not
+    // entered again, so the first event the new attempt writes for that step follows that
+    // preserved entry — the `TaskStateEntered` the first attempt wrote, event 2 — rather
+    // than the boundary event the attempt opened with.
+    let preserved_entry = 2;
+    let resumed = first.len() + 1;
+    let mut expected = expected_numbering(&whole);
+    expected[resumed].2 = preserved_entry;
     assert_eq!(
         numbered(&events),
-        expected_numbering(&whole),
+        expected,
         "case {case:?}: expected the redriven attempt to continue the numbering, got {events:?}"
     );
     // The boundary names how many times the execution had been redriven when it was
@@ -599,7 +607,7 @@ async fn each_lifecycle_transition_is_its_own_event_and_a_redrive_continues_the_
     // Read from the END, the same events in reverse: the page a client that wants the
     // latest first asks for opens on the terminal event of the redriven attempt.
     let reversed = history(&chain, case, &execution, json!({ "reverseOrder": true })).await;
-    let mut backwards = expected_numbering(&whole);
+    let mut backwards = expected;
     backwards.reverse();
     assert_eq!(
         numbered(&reversed),

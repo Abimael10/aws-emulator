@@ -1252,7 +1252,16 @@ fn reports_request_id(engine: Engine) -> bool {
 }
 
 /// The error payload an invocation that failed answers with: the members the function's
-/// own runtime reports for a handler that raised.
+/// own runtime reports for a handler that raised, written as that runtime's own JSON
+/// serializer writes them.
+///
+/// It is the TEXT of a document a runtime produced, not a document this process produced:
+/// what reads it back — a caller of `Invoke`, and a Step Functions `Task` state whose
+/// `Resource` named the function, which reports these very bytes as the failure's cause —
+/// reads the member order and the separators the runtime wrote ([`separators`]), so both
+/// are stated here rather than left to this process's own JSON library. The order is the
+/// runtime's: the message, the class, the invocation the run answered where that runtime
+/// names it, then the handler's stack.
 fn error_document(
     message: &str,
     error_type: Option<&str>,
@@ -1260,33 +1269,74 @@ fn error_document(
     stack_trace: &[String],
     engine: Engine,
 ) -> Vec<u8> {
-    let mut document = ::serde_json::Map::new();
-    document.insert(
-        "errorMessage".to_string(),
+    let frames: Vec<::serde_json::Value> = stack_trace
+        .iter()
+        .map(|frame| ::serde_json::Value::String(frame.clone()))
+        .collect();
+    let mut members: Vec<(&str, ::serde_json::Value)> = vec![(
+        "errorMessage",
         ::serde_json::Value::String(message.to_string()),
-    );
+    )];
     if let Some(error_type) = error_type {
-        document.insert(
-            "errorType".to_string(),
+        members.push((
+            "errorType",
             ::serde_json::Value::String(error_type.to_string()),
-        );
+        ));
     }
     if reports_request_id(engine) {
-        document.insert(
-            "requestId".to_string(),
+        members.push((
+            "requestId",
             ::serde_json::Value::String(request_id.to_string()),
-        );
+        ));
     }
-    document.insert(
-        stack_trace_member(engine).to_string(),
-        ::serde_json::Value::Array(
-            stack_trace
-                .iter()
-                .map(|frame| ::serde_json::Value::String(frame.clone()))
-                .collect(),
-        ),
-    );
-    ::serde_json::Value::Object(document).to_string().into_bytes()
+    members.push((
+        stack_trace_member(engine),
+        ::serde_json::Value::Array(frames),
+    ));
+    object_text(&members, separators(engine)).into_bytes()
+}
+
+/// How a runtime's own JSON serializer writes the two separators of a document: what it
+/// puts between two members, and what it puts between a member's name and its value.
+///
+/// The error document an invocation answers with is TEXT the function's runtime wrote, so
+/// it is written here the way that runtime's serializer writes it rather than the way this
+/// process's happens to: a Python runtime marshals a document through the standard
+/// library's own JSON encoder, whose separators carry a space (`", "` and `": "`), while a
+/// node runtime marshals it through `JSON.stringify`, which writes neither.
+fn separators(engine: Engine) -> (&'static str, &'static str) {
+    match engine {
+        Engine::Python => (", ", ": "),
+        Engine::Node => (",", ":"),
+    }
+}
+
+/// `members`, in the order given, as ONE JSON object's text, with `between` between two
+/// members and `after_name` after each member's name.
+///
+/// The member ORDER and the separators are facts of whoever wrote the document, so the
+/// text is assembled here rather than left to a `Map`'s own ordering — which is the
+/// ordering of this process's JSON library rather than of the writer being emulated.
+/// Each value is rendered by that library, because the ESCAPING of a value is the same
+/// in every JSON writer.
+fn object_text(members: &[(&str, ::serde_json::Value)], separators: (&str, &str)) -> String {
+    let (between, after_name) = separators;
+    let rendered: Vec<String> = members
+        .iter()
+        .map(|(name, value)| {
+            let name = ::serde_json::Value::String((*name).to_string());
+            let value = match value {
+                ::serde_json::Value::Array(elements) => {
+                    let elements: Vec<String> =
+                        elements.iter().map(::std::string::ToString::to_string).collect();
+                    format!("[{}]", elements.join(between))
+                }
+                value => value.to_string(),
+            };
+            format!("{name}{after_name}{value}")
+        })
+        .collect();
+    format!("{{{}}}", rendered.join(between))
 }
 
 /// The error payload an invocation the SANDBOX ended answers with: the message and the
@@ -1300,11 +1350,20 @@ fn error_document(
 /// platform states what happened in the message and what class of failure it was, and
 /// there is no handler frame to report because no handler raised.
 fn sandbox_error_document(message: &str, error_type: &str) -> Vec<u8> {
-    let document = ::serde_json::json!({
-        "errorMessage": message,
-        "errorType": error_type,
-    });
-    document.to_string().into_bytes()
+    let members: Vec<(&str, ::serde_json::Value)> = vec![
+        (
+            "errorType",
+            ::serde_json::Value::String(error_type.to_string()),
+        ),
+        (
+            "errorMessage",
+            ::serde_json::Value::String(message.to_string()),
+        ),
+    ];
+    // The platform writes its own document, naming the CLASS of the failure before the
+    // sentence about it, and writes it compactly — it is not marshalled by the runtime
+    // the function is configured for, so no runtime's separators are used for it.
+    object_text(&members, (",", ":")).into_bytes()
 }
 
 /// The LOG of one run, as Lambda writes it: the invocation's start and end lines around
@@ -1915,11 +1974,12 @@ mod tests {
         }
     }
 
-    /// A run the SANDBOX ended carries exactly two members: the message and the class of
-    /// the failure. No runtime serialized the failure, so the document names neither the
-    /// request id nor the stack a runtime's own error payload reports beside them — one
-    /// row per bound a run can be stopped by, per engine, so the member set is neither
-    /// one bound's nor one runtime's.
+    /// A run the SANDBOX ended carries exactly two members: the class of the failure and
+    /// the message about it, in that order — the platform writes its own document and
+    /// names the class first. No runtime serialized the failure, so the document names
+    /// neither the request id nor the stack a runtime's own error payload reports beside
+    /// them — one row per bound a run can be stopped by, per engine, so the member set is
+    /// neither one bound's nor one runtime's.
     #[test]
     fn a_sandbox_ended_runs_document_carries_only_the_message_and_the_class() {
         let request_id = "11111111-2222-3333-4444-555555555555";
@@ -1958,8 +2018,9 @@ mod tests {
                     .unwrap_or_default();
                 assert_eq!(
                     members,
-                    vec!["errorMessage", "errorType"],
-                    "case {case}: expected the platform's own two members, got {parsed}"
+                    vec!["errorType", "errorMessage"],
+                    "case {case}: expected the platform's own two members, in the order it \
+                     writes them, got {parsed}"
                 );
                 assert_eq!(
                     parsed.get("errorType").and_then(::serde_json::Value::as_str),

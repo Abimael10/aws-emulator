@@ -4171,7 +4171,7 @@ pub async fn call_api(
                 // An invocation Lambda SERVED whose function ERRORED is not a result:
                 // the unit of work this task is failed, so it is read as the failure it
                 // is before any result is built out of the answer.
-                Ok(document) => match function_error(call, &document) {
+                Ok(document) => match function_error(call, &document, &answered.payload) {
                     Some(failed) => Err(failed),
                     None if call.invokes.is_some() => Ok(invocation_payload(call, &document)),
                     None if call.sdk_envelope => Ok(with_sdk_envelope(
@@ -4232,10 +4232,16 @@ fn invocation_payload(call: &Call, document: &Value) -> Value {
 /// unattributable Lambda error is reported by ([`LAMBDA_UNKNOWN_ERROR`]).
 ///
 /// The cause is the error document ITSELF, as the run produced it, so the message and the
-/// trace the handler raised reach the client rather than a sentence written here.
+/// trace the handler raised reach the client rather than a sentence written here. WHICH
+/// rendering of it the state reads is the integration's own: a `Resource` that named the
+/// FUNCTION makes the invocation's answer the task's, so the document reaches the state as
+/// the run answered it — `answered`, the response body's bytes, text and member order and
+/// separators included — while the optimized integration's result is the SDK response,
+/// whose `Payload` is a member this emulator read as a document, so there the state reads
+/// that document as the integration renders it.
 ///
 /// Pure, so the reading of every answer form is pinned by this module's own tests.
-fn function_error(call: &Call, document: &Value) -> Option<Failed> {
+fn function_error(call: &Call, document: &Value, answered: &[u8]) -> Option<Failed> {
     if call.api.namespace != LAMBDA_NAMESPACE || call.operation != LAMBDA_INVOKE_OPERATION {
         return None;
     }
@@ -4256,6 +4262,15 @@ fn function_error(call: &Call, document: &Value) -> Option<Failed> {
         .to_string();
     let cause = match payload {
         Some(Value::String(text)) => text.clone(),
+        // A `Resource` that named the FUNCTION makes the invocation's own answer the
+        // task's, so the document it reports is the one the run ANSWERED, text and all:
+        // the body's bytes as they came back, which is what the function's runtime wrote.
+        // The optimized integration reports the SDK response instead, whose `Payload` is
+        // a member this emulator read as a document — so what it reports is that document
+        // as the integration renders it, which is the text below.
+        Some(_) if call.invokes.is_some() && !answered.is_empty() => {
+            String::from_utf8_lossy(answered).to_string()
+        }
         Some(document) => document.to_string(),
         None => format!(
             "{} reported a '{signal}' function error for this invocation, and the run produced \

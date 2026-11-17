@@ -562,11 +562,12 @@ async fn a_refused_sns_publish_task_reports_the_modelled_exception_and_its_messa
             status: 403,
         },
         Refused {
-            // The other way the documents in force withhold the publish: a role that
-            // carries no policy document at all, which allows nothing.
-            case: "a publish by a role carrying no policy at all",
-            machine: "relay-no-policy",
-            granted: None,
+            // The other way the documents in force withhold the publish: a role whose
+            // document names another action of the SAME service on the very topic, which
+            // allows that action and nothing else.
+            case: "a publish by a role granted another action of the service",
+            machine: "relay-other-action",
+            granted: Some(&["SNS:ListTopics"]),
             attributes: &[],
             real_topic: true,
             caught: false,
@@ -641,15 +642,22 @@ async fn a_refused_sns_publish_task_reports_the_modelled_exception_and_its_messa
 
         // The sentence the cause opens with is the invoked service's own: the publish's
         // refusal of the attribute names it, and a refusal of the CALL names the session
-        // of the execution role, the action SNS publishes and the topic addressed.
-        let sentence = match row.granted.is_none_or(<[&str]>::is_empty) {
-            true => format!(
+        // of the execution role, the action SNS publishes and the topic addressed. Which
+        // of the two a row gets is decided by whether the documents in force on its role
+        // name the PUBLISH at all.
+        let grants_publish = row.granted.is_some_and(|actions| {
+            actions
+                .iter()
+                .any(|action| action.eq_ignore_ascii_case("SNS:Publish"))
+        });
+        let sentence = match grants_publish {
+            false => format!(
                 "User: {} is not authorized to perform: SNS:Publish on resource: {} because no \
                  identity-based policy allows the SNS:Publish action",
                 session_principal(&role_arn, &cause),
                 addressed
             ),
-            false => match row.attributes.first() {
+            true => match row.attributes.first() {
                 Some((name, _, _)) => {
                     format!("Could not cast message attribute '{name}' value to number.")
                 }
@@ -724,13 +732,18 @@ async fn a_publish_task_is_refused_once_its_grant_is_withdrawn() {
         "case \"granted\": expected exactly one delivery, got {delivered:?}"
     );
 
-    // The grant is withdrawn, and nothing else changes.
+    // The grant is withdrawn, and nothing else changes: the role's own document is
+    // replaced by one that no longer names the publish, which is what the store holds
+    // about a role whose capability was taken away — the policies in force are read at
+    // the moment of the next call, so the same state machine is decided against that
+    // document.
     chain
         .iam(
-            "DeleteRolePolicy",
+            "PutRolePolicy",
             &[
                 ("RoleName", role_name.to_string()),
                 ("PolicyName", "inline".to_string()),
+                ("PolicyDocument", policy(&[], &topic).to_string()),
             ],
         )
         .await;
