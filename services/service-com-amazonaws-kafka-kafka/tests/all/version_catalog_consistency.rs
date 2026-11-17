@@ -117,7 +117,8 @@ fn rows(reply: &Reply) -> Vec<(String, Vec<String>)> {
 
 /// RULE: both read paths answer from one catalog — every source the matrix reports
 /// is a version the listing publishes, every target is one the listing reports as
-/// still offered, and the matrix covers every published entry.
+/// still offered, and the matrix publishes one source per published ROW, in
+/// published order.
 #[tokio::test]
 async fn the_matrix_is_derived_from_the_published_catalog() {
     let emulator = Emulator::new();
@@ -145,23 +146,45 @@ async fn the_matrix_is_derived_from_the_published_catalog() {
             );
         }
     }
-    // Every published version is a source the matrix answers for, so a client
-    // choosing an upgrade finds the row for whatever its cluster runs — and
-    // answers for it ONCE, however many rows the catalog publishes it under: the
-    // matrix answers about versions, not about catalog rows.
-    let sources: BTreeSet<&String> = matrix.iter().map(|(source, _)| source).collect();
+    // Every published ROW is a row the matrix publishes a source for, in the same
+    // order: the matrix is the published table of that catalog, so a client
+    // choosing an upgrade finds the row for whatever its cluster runs, and a
+    // version the catalog publishes twice is a source twice.
+    let sources: Vec<&String> = matrix.iter().map(|(source, _)| source).collect();
     for version in catalog.keys() {
         assert!(
-            sources.contains(version),
+            sources.contains(&version),
             "case version={version:?}: the matrix must answer for every published version, \
              got {sources:?}"
         );
     }
+    let published_rows = published_sequence(&list_versions(&emulator).await);
     assert_eq!(
-        sources.len(),
-        matrix.len(),
-        "every published version must be a source exactly once, got {matrix:?}"
+        sources
+            .iter()
+            .map(|source| (*source).clone())
+            .collect::<Vec<String>>(),
+        published_rows,
+        "the matrix must publish one source per published catalog row, in published order, \
+         got {matrix:?}"
     );
+}
+
+/// The version of every ROW the catalog publishes, in published order — a version
+/// published on more than one row appearing once per row.
+fn published_sequence(reply: &Reply) -> Vec<String> {
+    reply
+        .at("/kafkaVersions")
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a kafkaVersions list, got {}", reply.body))
+        .iter()
+        .map(|entry| {
+            entry["version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry without a version: {entry}"))
+                .to_string()
+        })
+        .collect()
 }
 
 /// RULE: the matrix is a per-source upgrade GRAPH, not one blanket list: each

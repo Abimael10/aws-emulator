@@ -137,10 +137,12 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
 /// published row appears.
 ///
 /// This is the version SET every version-aware answer is computed over — the
-/// compatibility matrix's sources and targets, the create and update gates and
-/// the valid-value lists their refusals carry — because a question about a
-/// version is about the version, not about the row it was read from
-/// ([`KAFKA_VERSION_CATALOG`]).
+/// compatibility matrix's targets, the create and update gates and the
+/// valid-value lists their refusals carry — because a question about a version is
+/// about the version, not about the row it was read from
+/// ([`KAFKA_VERSION_CATALOG`]). The SOURCES the matrix publishes a row for are
+/// the catalog's rows instead ([`published_kafka_versions`]), because that matrix
+/// is a published table rather than an answer about one version.
 ///
 /// A derived CONSTANT of that catalog, so it is computed once rather than on
 /// every call: the matrix answers one row per source and each row reads it.
@@ -155,6 +157,29 @@ pub fn catalogued_kafka_versions() -> &'static [&'static str] {
         versions
     });
     &CATALOGUED
+}
+
+/// The version of every ROW the catalog publishes, in published order — a version
+/// published on more than one row appearing once PER ROW.
+///
+/// This is the sequence the published upgrade-compatibility matrix is a table of
+/// (`GetCompatibleKafkaVersions` with no `ClusterArn`): that answer publishes one
+/// row per (source version -> target versions) pair the service publishes, so a
+/// version the catalog publishes twice is a source twice, exactly as
+/// `ListKafkaVersions` pages that version's two rows. It is NOT the version set
+/// ([`catalogued_kafka_versions`]), which is what every answer ABOUT a version
+/// reads.
+///
+/// Derived from the catalog once, like [`catalogued_kafka_versions`]: both
+/// factors are constants.
+pub fn published_kafka_versions() -> &'static [&'static str] {
+    static PUBLISHED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        KAFKA_VERSION_CATALOG
+            .iter()
+            .map(|entry| entry.version)
+            .collect()
+    });
+    &PUBLISHED
 }
 
 /// The release of the FINAL ZooKeeper-mode version the service still offers: the

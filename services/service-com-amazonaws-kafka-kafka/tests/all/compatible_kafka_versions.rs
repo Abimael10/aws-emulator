@@ -14,7 +14,9 @@
 //! has deprecated, and never moves a cluster between builds of the broker, so a
 //! source with nothing newer on its line is TERMINAL and reports an empty list.
 //! With a `ClusterArn` the single source version is the one the STORED cluster
-//! runs; without one, every version the catalog publishes is a source, once.
+//! runs; without one, the answer is the published TABLE — one row per ROW the
+//! catalog publishes, in published order, which is the sequence
+//! `ListKafkaVersions` pages.
 //!
 //! Each suite asserts that rule over a TABLE whose rows differ along what the rule
 //! generalises over: where the source sits in the catalog (oldest, deprecated, the
@@ -340,11 +342,10 @@ async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
     }
 }
 
-/// RULE: with no `ClusterArn` the answer is the whole matrix — one entry per
-/// version the catalog publishes, each published version ONCE and in the catalog's
-/// published order, each carrying the upgrades the catalog permits from it, so a
-/// client reading the matrix is offered a per-source subset rather than one blanket
-/// list.
+/// RULE: with no `ClusterArn` the answer is the whole published matrix — one entry
+/// per ROW the catalog publishes, in the catalog's published order, each carrying
+/// the upgrades the catalog permits from that source, so a client reading the
+/// matrix is offered a per-source subset rather than one blanket list.
 #[tokio::test]
 async fn the_matrix_covers_every_catalogued_source_version() {
     let emulator = Emulator::new();
@@ -355,25 +356,36 @@ async fn the_matrix_covers_every_catalogued_source_version() {
         reply.status, reply.body
     );
     let answered = entries(&reply);
-    let catalogued = catalogued();
+    let published: Vec<&'static str> = KAFKA_VERSION_CATALOG
+        .iter()
+        .map(|entry| entry.version)
+        .collect();
     assert_eq!(
         answered.len(),
-        catalogued.len(),
-        "expected one entry per published version ({}), got {}",
-        catalogued.len(),
+        published.len(),
+        "expected one entry per published row ({}), got {}",
+        published.len(),
         answered.len()
     );
-    for (entry, catalogued) in answered.iter().zip(catalogued.iter()) {
+    for (entry, published) in answered.iter().zip(published.iter()) {
         let (source, targets) = entry;
         assert_eq!(
-            source, catalogued,
-            "case source={source:?}: expected the catalog order, {catalogued} comes here"
+            source, published,
+            "case source={source:?}: expected the catalog order, {published} comes here"
         );
         assert_eq!(
             targets,
             &targets_from_catalog(source),
             "case source={source:?}: expected {:?}, got {targets:?}",
             targets_from_catalog(source)
+        );
+    }
+    // Every version the catalog publishes is a source, whatever number of rows it
+    // is published under.
+    for version in catalogued() {
+        assert!(
+            answered.iter().any(|(source, _)| source == version),
+            "case version={version:?}: the matrix must publish a row for it, got {answered:?}"
         );
     }
     // The matrix is a per-source graph, not one shared list: a terminal version
@@ -510,5 +522,131 @@ async fn reporting_compatible_versions_changes_nothing() {
                 before.body
             );
         }
+    }
+}
+
+/// `ListKafkaVersions`, which the model binds to `GET /v1/kafka-versions`;
+/// `query` is the whole query string including its `?`, or empty.
+async fn list_versions(emulator: &Emulator, query: &str) -> Reply {
+    let reply = emulator
+        .call("GET", &format!("/v1/kafka-versions{query}"), None)
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "expected 200 from ListKafkaVersions, got {} {}",
+        reply.status, reply.body
+    );
+    reply
+}
+
+/// The version of every ROW a page reports, in reported order.
+fn page_versions(reply: &Reply) -> Vec<String> {
+    reply
+        .at("/kafkaVersions")
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a kafkaVersions list, got {}", reply.body))
+        .iter()
+        .map(|entry| {
+            entry["version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry without a version: {entry}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// RULE: the table this operation publishes without a `ClusterArn` IS the
+/// published catalog, row for row and in published order — so its source sequence
+/// is exactly the version sequence `ListKafkaVersions` publishes, and a version
+/// the catalog publishes on N rows is a source on N rows. Asserted from the WIRE
+/// alone, so a table derived from a second, drifting list would fail here.
+#[tokio::test]
+async fn the_published_table_is_the_published_catalog_row_for_row() {
+    let emulator = Emulator::new();
+    let published = page_versions(&list_versions(&emulator, "").await);
+    let answered = entries(&compatible_matrix(&emulator).await);
+    let sources: Vec<String> = answered.iter().map(|(source, _)| source.clone()).collect();
+    assert_eq!(
+        sources, published,
+        "the matrix must publish one source per published catalog row, in published order"
+    );
+
+    // Spelled out per version as well as a sequence, so a row the table drops or
+    // doubles names the version it happened to.
+    let mut rows_per_version: std::collections::BTreeMap<&String, usize> = Default::default();
+    for version in &published {
+        *rows_per_version.entry(version).or_default() += 1;
+    }
+    for (version, rows) in &rows_per_version {
+        let answered = sources.iter().filter(|source| source == version).count();
+        assert_eq!(
+            answered, *rows,
+            "case version={version:?}: the catalog publishes {rows} row(s) for it, so the \
+             matrix must publish {rows}, got {answered}"
+        );
+    }
+    // Both classes of row the catalog has are covered: a version published once,
+    // and a version published more than once.
+    assert!(
+        rows_per_version.values().any(|rows| *rows == 1),
+        "the catalog must publish some version on one row, got {rows_per_version:?}"
+    );
+    assert!(
+        rows_per_version.values().any(|rows| *rows > 1),
+        "the catalog must publish some version on more than one row, got {rows_per_version:?}"
+    );
+
+    // Every row of one version carries the same upgrade set: the targets are an
+    // answer ABOUT the version, so publishing the version twice cannot offer two
+    // different ladders from it.
+    let mut targets_per_version: std::collections::BTreeMap<&String, &Vec<String>> =
+        Default::default();
+    for (source, targets) in &answered {
+        let first = targets_per_version.entry(source).or_insert(targets);
+        assert_eq!(
+            *first, targets,
+            "case version={source:?}: every published row of a version must carry the same \
+             upgrade set, got {first:?} and {targets:?}"
+        );
+    }
+}
+
+/// RULE: that agreement holds however the catalog is READ — a walk of
+/// `ListKafkaVersions` at any page size reports the same row sequence the table
+/// publishes, so neither read path can drift from the other.
+#[tokio::test]
+async fn the_published_table_agrees_with_a_paged_walk_of_the_catalog() {
+    let emulator = Emulator::new();
+    let sources: Vec<String> = entries(&compatible_matrix(&emulator).await)
+        .into_iter()
+        .map(|(source, _)| source)
+        .collect();
+
+    // Rows: the page sizes a client reads the catalog at — one row at a time, a
+    // size that divides the catalog unevenly, and one page for the lot.
+    for page_size in [1, 7, sources.len()] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut query = format!("?maxResults={page_size}");
+        loop {
+            let page = list_versions(&emulator, &query).await;
+            let versions = page_versions(&page);
+            assert!(
+                versions.len() <= page_size,
+                "case maxResults={page_size}: a page must not exceed the size asked for, got \
+                 {} rows",
+                versions.len()
+            );
+            walked.extend(versions);
+            match page.body.get("nextToken").and_then(Value::as_str) {
+                Some(token) => {
+                    query = format!("?maxResults={page_size}&nextToken={}", pct(token));
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, sources,
+            "case maxResults={page_size}: the walked catalog must be the table's source sequence"
+        );
     }
 }

@@ -10,18 +10,17 @@
 //!   the catalog permits FROM that version
 //!   ([`crate::state::compatible_target_versions`]) — a per-source subset, empty
 //!   for a terminal version, never one blanket list shared by every source.
-//! * Without `ClusterArn` (the member is optional in the model): the whole matrix,
-//!   one entry per version the catalog publishes
-//!   ([`crate::state::catalogued_kafka_versions`] — each published version once,
-//!   whatever number of rows the catalog publishes it under), each with its own
-//!   target list.
+//! * Without `ClusterArn` (the member is optional in the model): the whole
+//!   published matrix — one entry per ROW the catalog publishes
+//!   ([`crate::state::published_kafka_versions`]), in published order, each
+//!   carrying that source's own target list.
 //!
-//! That the matrix names each version ONCE while `ListKafkaVersions` serves the
-//! catalog's repeated rows is not an inconsistency: the listing PUBLISHES the
-//! catalog, so a row it drops is a row a client never sees, while this operation
-//! answers a question about a VERSION — which upgrades a cluster running it may
-//! take — and that answer does not depend on how many rows the catalog publishes
-//! the version under.
+//! Without a cluster this call PUBLISHES a table rather than answering about one
+//! version, and the table the service publishes is a sequence of (source version
+//! -> target versions) rows: a version the catalog publishes on more than one row
+//! is therefore a source on as many rows here, exactly as `ListKafkaVersions`
+//! pages that version's rows. The two read paths are one catalog seen twice, so a
+//! row either of them gains or loses is gained or lost in both.
 //!
 //! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
 //! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
@@ -249,7 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 vec![cluster.kafka_version.clone()]
             }
-            None => crate::state::catalogued_kafka_versions()
+            // The published table: one row per row the catalog publishes, in the
+            // order it publishes them, so this answer and the catalog listing
+            // report the same sequence of versions.
+            None => crate::state::published_kafka_versions()
                 .iter()
                 .map(ToString::to_string)
                 .collect(),

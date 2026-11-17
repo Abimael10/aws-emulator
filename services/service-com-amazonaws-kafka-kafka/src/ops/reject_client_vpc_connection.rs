@@ -23,6 +23,17 @@
 //! the rejection it carries ([`crate::state::VpcConnection::reject`]), and the
 //! same empty 200 is answered.
 //!
+//! The CLUSTER-scoped authorization decision is taken on the `ClusterArn` as
+//! submitted, before anything the request names is resolved and before the rest
+//! of the request is read: this operation CHANGES the cluster's client
+//! connectivity, and the model gives it no channel for reporting that the
+//! cluster is absent, so a well-formed cluster ARN this endpoint holds no
+//! cluster for is refused as unauthorized — a cluster that is not there carries
+//! no resource-based policy for the action to be granted by
+//! ([`crate::state::authorization::authorize_registered_cluster`]) — rather than
+//! reported as an unusable parameter. That keeps "you may not" and "it is not
+//! there" one answer here, and discloses nothing of what the registry holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -164,18 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Self::NAME,
             &input.cluster_arn,
         )?;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                RejectClientVpcConnectionErrorModeled::InternalServerErrorException(
-                    InternalServerErrorException {
-                        invalid_parameter: None,
-                        message: Some("the kafka service state is unavailable".to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let region = crate::state::request_region(ctx.parts());
 
         // The shape checks depend on the request alone, so they run before the
         // state lock is taken. This is a cluster's client-VPC-connection
@@ -189,6 +188,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The rest of the cluster-scoped decision, still over the ARN as
+        // submitted and still before anything is resolved: this operation models
+        // no way to report that the cluster is absent, and a cluster this
+        // endpoint holds no record of carries no resource-based policy for the
+        // action to be granted by, so such a call is refused as unauthorized
+        // rather than answered about either reference — the one answer that keeps
+        // "you may not" and "it is not there" indistinguishable here. See
+        // [`crate::state::authorization::authorize_registered_cluster`].
+        crate::state::authorization::authorize_registered_cluster(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+            &region,
+        )?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RejectClientVpcConnectionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
         if !crate::state::is_vpc_connection_arn(&input.vpc_connection_arn) {
             return Err(RejectClientVpcConnectionErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::VPC_CONNECTION_ARN_MEMBER),
@@ -207,9 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // THAT cluster, which were due at the same instant whether or not
         // anybody called.
         let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
-            return Err(bad_request(
-                crate::state::CLUSTER_ARN_MEMBER,
-                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+            // The decision above already found a cluster under this ARN, so
+            // reaching here means it was removed between that decision and this
+            // guard. The answer is the decision's own: nothing grants the action
+            // on a cluster the registry no longer holds.
+            return Err(crate::state::authorization::no_resource_policy_for_cluster(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &input.cluster_arn,
             ));
         };
         // The cluster's OWN ARN, as the registry stores it on every connection
@@ -257,10 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The modelled 400 for a request member this operation cannot act on, naming
 /// the member at fault by its wire name.
 ///
-/// This operation models no `NotFoundException`, so a reference it cannot
-/// resolve is a bad PARAMETER here, in the service's one fixed sentence for one
-/// — exactly as `ListClientVpcConnections` and `CreateVpcConnection` refuse an
-/// unresolved cluster.
+/// This operation models no `NotFoundException`, so a CONNECTION reference it
+/// cannot resolve is a bad PARAMETER here, in the service's one fixed sentence
+/// for one — exactly as `ListClientVpcConnections` and `CreateVpcConnection`
+/// refuse an unusable reference. The CLUSTER the action applies to is not
+/// answered this way: nothing grants the action on a cluster the registry does
+/// not hold, so that is the authorization refusal above
+/// ([`crate::state::authorization::authorize_registered_cluster`]).
 fn bad_request(parameter: &str, message: String) -> RejectClientVpcConnectionError {
     RejectClientVpcConnectionErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: Some(parameter.to_string()),

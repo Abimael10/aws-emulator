@@ -166,15 +166,18 @@ async fn a_version_published_under_two_statuses_is_served_on_both_rows() {
 /// RULE: a second row for a version changes no answer ABOUT that version: the
 /// version set is de-duplicated, so a version the catalog publishes an `ACTIVE`
 /// row for is offered exactly once wherever the service answers about versions —
-/// the upgrade matrix's sources, the valid-value list a refusal carries — and a
-/// create naming it is accepted.
+/// the upgrade matrix's target lists, the valid-value list a refusal carries — and
+/// a create naming it is accepted. The matrix's SOURCES are the catalog's rows
+/// instead: that answer publishes the table rather than answering about one
+/// version, so a version published twice is a source twice.
 #[tokio::test]
 async fn a_second_row_changes_no_answer_about_the_version() {
     let emulator = Emulator::new();
     let catalog = published_rows(&emulator).await;
     let versions = distinct_versions(&catalog);
 
-    // The upgrade matrix answers one entry per published VERSION, not per row.
+    // The upgrade matrix publishes one entry per published ROW, in published
+    // order.
     let matrix = emulator
         .call("GET", "/v1/compatible-kafka-versions", None)
         .await;
@@ -195,15 +198,18 @@ async fn a_second_row_changes_no_answer_about_the_version() {
                 .to_string()
         })
         .collect();
+    let published: Vec<String> = catalog.iter().map(|(version, _)| version.clone()).collect();
     assert_eq!(
-        sources, versions,
-        "the matrix must answer one entry per published version, in published order"
+        sources, published,
+        "the matrix must publish one entry per published row, in published order"
     );
     for version in &versions {
+        let rows = published.iter().filter(|row| *row == version).count();
         let occurrences = sources.iter().filter(|source| *source == version).count();
         assert_eq!(
-            occurrences, 1,
-            "case version={version:?}: expected one matrix entry, got {occurrences}"
+            occurrences, rows,
+            "case version={version:?}: expected one matrix entry per published row ({rows}), \
+             got {occurrences}"
         );
     }
 
