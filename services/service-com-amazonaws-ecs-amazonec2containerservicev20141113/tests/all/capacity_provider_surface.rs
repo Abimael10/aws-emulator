@@ -21,7 +21,16 @@
 //!   below one — which asks for no page at all — is refused; and
 //! * `autoScalingGroupProvider` names a group of the CALLER's, so a create whose reference
 //!   resolves to no Auto Scaling group of the account in the Region the request was signed
-//!   for is refused with `ClientException` and stores nothing.
+//!   for is refused with `ClientException` and stores nothing; and
+//! * a provider over an Auto Scaling group of the caller's is a resource of the account from
+//!   the moment its create is answered, so EVERY lookup that names one resolves it against
+//!   those stored records — `DescribeCapacityProviders` by either of the two forms its own
+//!   member documents, and the members documented as taking the provider's SHORT NAME (a
+//!   cluster create's `capacityProviders` and `defaultCapacityProviderStrategy`, a
+//!   placement's and a service update's `capacityProviderStrategy`) — so each of those calls
+//!   is SERVED, and each operation's modelled refusals stay reserved for what they state: a
+//!   provider the account holds none of, a cluster it holds none of, and a provider whose
+//!   capacity holds no container instance.
 //!
 //! Every case goes through the same front door a client uses — including the Auto Scaling
 //! groups, which are created through that service's own API — so nothing reaches into a
@@ -32,8 +41,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::capacity_providers::{group_arn, managed_instances};
 use crate::ecs_wire::{
-    create_auto_scaling_group, create_auto_scaling_group_in, create_cluster, list, ok, refusal,
-    service, string, ACCOUNT, SIGNED_REGION,
+    auto_scaling_group_arn, caller_principal, count, create_auto_scaling_group,
+    create_auto_scaling_group_in, create_cluster, list, ok, refusal, register_capacity,
+    register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// The capacity providers Amazon ECS holds for every account, in every Region
@@ -519,6 +529,597 @@ async fn a_provider_over_an_auto_scaling_group_the_account_does_not_hold_is_refu
             described, expected,
             "case {case:?}: a provider exists exactly when its create was accepted, got \
              {body}"
+        );
+    }
+}
+
+/// `InvalidParameterException$message` for an association that names a capacity provider
+/// this account holds none of: one fixed sentence that names no provider.
+const PROVIDER_NOT_FOUND: &str = "The specified capacity provider was not found. Specify a \
+                                  valid capacity provider and try again.";
+
+/// `ClusterNotFoundException$message`, the whole of what that error states ("The specified
+/// cluster wasn't found"), which is the refusal reserved for a cluster the account does not
+/// hold.
+const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
+
+/// `Failure$reason` for an identifier that names nothing, from the API failure reasons:
+/// "MISSING - the described resource could not be found".
+const MISSING: &str = "MISSING";
+
+/// `Deployment$rolloutState`'s whole value set (`smithy_query(query="shape",
+/// shape="com.amazonaws.ecs#DeploymentRolloutState")` -> COMPLETED, FAILED, IN_PROGRESS).
+const ROLLOUT_STATES: [&str; 3] = ["COMPLETED", "FAILED", "IN_PROGRESS"];
+
+/// The whole sentence a placement through a capacity provider whose capacity holds no
+/// container instance is refused with. Built from the request: the provider the strategy
+/// named is the one whose Auto Scaling group has to grow, and a cluster can carry several.
+fn no_container_instances(provider: &str) -> String {
+    format!("The specified capacity provider '{provider}' contains no container instances.")
+}
+
+/// The ARN of the cluster `name` in the signed Region.
+fn cluster_arn(name: &str) -> String {
+    format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:cluster/{name}")
+}
+
+/// A `capacityProviderStrategy` (or a cluster's `defaultCapacityProviderStrategy`) as the
+/// three values each entry carries, so a strategy is compared whether or not the answer
+/// spells out the `base` the request left at its modelled default.
+fn strategy_entries(body: &Value, member: &str, case: &str) -> Vec<(String, i64, i64)> {
+    list(body, member, case)
+        .iter()
+        .map(|item| {
+            (
+                string(item, "capacityProvider", case),
+                count(item, "weight", case),
+                count(item, "base", case),
+            )
+        })
+        .collect()
+}
+
+/// One row of the EC2-capacity bootstrap table: a capacity provider over an Auto Scaling
+/// group of the caller's, plus the names the row's own cluster and service take.
+struct BootstrapRow {
+    case: &'static str,
+    provider: &'static str,
+    group: &'static str,
+    cluster: &'static str,
+    /// The `managedScaling` block the create carries, or `None` for a create that leaves the
+    /// whole block to Amazon ECS.
+    managed_scaling: Option<Value>,
+    /// The `managedScaling` block the stored provider must then report.
+    expect_scaling: Value,
+}
+
+/// The `scalingApproach` a managed-scaling block is reported with: Amazon ECS "manages a
+/// target tracking scaling policy" for the group (`ManagedScaling`'s own doc), which is the
+/// value the recorded answers of the real service carry.
+const SCALING_POLICY: &str = "SCALING_POLICY";
+
+/// The rows every bootstrap test below walks.
+///
+/// They differ along how much of the Auto Scaling group binding the create spells out —
+/// nothing but the group, the whole block at the value each member's own doc publishes as its
+/// default, and a block that sizes its scaling steps and target capacity itself — because the
+/// provider has to be resolvable whatever its binding says. Managed scaling is OFF in every
+/// row (absent is the documented default), so the only capacity behind each provider is what
+/// its group registers into the cluster.
+fn bootstrap_rows() -> Vec<BootstrapRow> {
+    // The members Amazon ECS fills in for a create that names none, each from its own
+    // member doc: "If this parameter is omitted, the default value of 1 is used"
+    // (minimumScalingStepSize), "of 10000" (maximumScalingStepSize), "of 300 seconds"
+    // (instanceWarmupPeriod), and "The default value of 100 percent" (targetCapacity).
+    let filled_in = json!({
+        "scalingApproach": SCALING_POLICY,
+        "targetCapacity": 100,
+        "minimumScalingStepSize": 1,
+        "maximumScalingStepSize": 10_000,
+        "instanceWarmupPeriod": 300,
+    });
+    let turned_off = json!({
+        "scalingApproach": SCALING_POLICY,
+        "status": "DISABLED",
+        "targetCapacity": 100,
+        "minimumScalingStepSize": 1,
+        "maximumScalingStepSize": 10_000,
+        "instanceWarmupPeriod": 300,
+    });
+    // A block whose steps and target capacity are the caller's own, inside the ranges the
+    // members declare (`targetCapacity` 1..100, either step size 1..10000, the warmup
+    // period 0..10000).
+    let sized = json!({
+        "scalingApproach": SCALING_POLICY,
+        "status": "DISABLED",
+        "targetCapacity": 75,
+        "minimumScalingStepSize": 2,
+        "maximumScalingStepSize": 20,
+        "instanceWarmupPeriod": 120,
+    });
+    vec![
+        BootstrapRow {
+            case: "a provider whose create names nothing but its group",
+            provider: "bootdefault",
+            group: "asg-bootdefault",
+            cluster: "bootdefault",
+            managed_scaling: None,
+            expect_scaling: filled_in,
+        },
+        BootstrapRow {
+            case: "a provider whose create turns managed scaling off",
+            provider: "bootoff",
+            group: "asg-bootoff",
+            cluster: "bootoff",
+            managed_scaling: Some(turned_off.clone()),
+            expect_scaling: turned_off,
+        },
+        BootstrapRow {
+            case: "a provider whose create sizes its own scaling steps",
+            provider: "bootsized",
+            group: "asg-bootsized",
+            cluster: "bootsized",
+            managed_scaling: Some(sized.clone()),
+            expect_scaling: sized,
+        },
+    ]
+}
+
+/// Create the row's Auto Scaling group — through that service's OWN API — and the capacity
+/// provider bound onto it, and answer the provider the create reported.
+async fn create_group_provider(router: &MultiServiceRouter, row: &BootstrapRow) -> Value {
+    create_auto_scaling_group(router, row.group, row.case).await;
+    let mut binding = json!({ "autoScalingGroupArn": row.group });
+    if let Some(scaling) = row.managed_scaling.clone() {
+        binding["managedScaling"] = scaling;
+    }
+    let created = ok(
+        router,
+        "CreateCapacityProvider",
+        json!({ "name": row.provider, "autoScalingGroupProvider": binding }),
+        row.case,
+    )
+    .await;
+    created["capacityProvider"].clone()
+}
+
+/// Create the row's cluster, associating the row's provider with it and defaulting over it,
+/// and answer the cluster the create reported.
+async fn create_associated_cluster(router: &MultiServiceRouter, row: &BootstrapRow) -> Value {
+    let created = ok(
+        router,
+        "CreateCluster",
+        json!({
+            "clusterName": row.cluster,
+            "capacityProviders": [row.provider],
+            "defaultCapacityProviderStrategy": [
+                { "capacityProvider": row.provider, "weight": 1 },
+            ],
+        }),
+        row.case,
+    )
+    .await;
+    created["cluster"].clone()
+}
+
+/// The `capacityProviderStrategy` the row's placements and service updates are made with:
+/// one entry over the row's own provider, named by the SHORT NAME
+/// `CapacityProviderStrategyItem$capacityProvider` documents.
+fn row_strategy(row: &BootstrapRow) -> Value {
+    json!([{ "capacityProvider": row.provider, "weight": 1 }])
+}
+
+#[tokio::test]
+async fn a_group_provider_is_described_and_associable_from_its_create_on() {
+    let router = service();
+
+    for row in bootstrap_rows() {
+        let case = row.case;
+        let created = create_group_provider(&router, &row).await;
+        // The group's identity comes from the service that OWNS the group, so the binding is
+        // compared against what Amazon EC2 Auto Scaling minted rather than an ARN composed
+        // here.
+        let group = auto_scaling_group_arn(&router, row.group, case).await;
+
+        // "Only capacity providers in an ACTIVE state can be used in a cluster": a provider
+        // over a group the caller ALREADY has is usable from this answer on.
+        assert_eq!(
+            (
+                created["status"].as_str(),
+                created["type"].as_str(),
+                created["capacityProviderArn"].as_str(),
+            ),
+            (
+                Some("ACTIVE"),
+                Some("EC2_AUTOSCALING"),
+                Some(provider_arn(row.provider).as_str()),
+            ),
+            "case {case:?}: unexpected provider from the create, got {created}"
+        );
+
+        // The provider resolves under BOTH forms its own member documents ("The short name
+        // or full Amazon Resource Name (ARN) of one or more capacity providers"), and each
+        // answer is the stored record rather than one the create made up.
+        for (spelling, reference) in [
+            ("its short name", row.provider.to_string()),
+            ("its full ARN", provider_arn(row.provider)),
+        ] {
+            let case = &format!("{case}, described by {spelling}");
+            let body = describe(&router, &[reference], true, case).await;
+            assert_eq!(
+                body["failures"],
+                json!([]),
+                "case {case:?}: a provider the account holds is no failure, got {body}"
+            );
+            let described = list(&body, "capacityProviders", case);
+            assert_eq!(
+                described.len(),
+                1,
+                "case {case:?}: expected exactly the provider named, got {body}"
+            );
+            let provider = &described[0];
+            assert_eq!(
+                (
+                    provider["name"].as_str(),
+                    provider["capacityProviderArn"].as_str(),
+                    provider["status"].as_str(),
+                    provider["type"].as_str(),
+                    provider["tags"].clone(),
+                ),
+                (
+                    Some(row.provider),
+                    Some(provider_arn(row.provider).as_str()),
+                    Some("ACTIVE"),
+                    Some("EC2_AUTOSCALING"),
+                    json!([]),
+                ),
+                "case {case:?}: unexpected projection of the provider, got {provider}"
+            );
+            // "The Auto Scaling group settings for the capacity provider": the group it was
+            // bound onto, the managed-scaling block it was created with, and the draining
+            // option Amazon ECS applies when the create names none.
+            let binding = &provider["autoScalingGroupProvider"];
+            assert_eq!(
+                (
+                    binding["autoScalingGroupArn"].as_str(),
+                    binding["managedDraining"].as_str(),
+                ),
+                (Some(group.as_str()), Some("ENABLED")),
+                "case {case:?}: unexpected binding read back, got {provider}"
+            );
+            assert_eq!(
+                binding["managedScaling"], row.expect_scaling,
+                "case {case:?}: expected the managed scaling the provider was created \
+                 with, got {provider}"
+            );
+            assert_eq!(
+                *binding, created["autoScalingGroupProvider"],
+                "case {case:?}: the read reports the binding the create stored, got \
+                 {provider}"
+            );
+        }
+
+        // "A capacity provider must be associated with a cluster before it can be included
+        // as part of the default capacity provider strategy of the cluster": the create that
+        // associates it is ANSWERED, with the cluster carrying both lists.
+        let cluster = create_associated_cluster(&router, &row).await;
+        assert_eq!(
+            (
+                cluster["status"].as_str(),
+                cluster["clusterArn"].as_str(),
+                list(&cluster, "capacityProviders", case),
+            ),
+            (
+                Some("ACTIVE"),
+                Some(cluster_arn(row.cluster).as_str()),
+                vec![json!(row.provider)],
+            ),
+            "case {case:?}: unexpected cluster from the create, got {cluster}"
+        );
+        assert_eq!(
+            strategy_entries(&cluster, "defaultCapacityProviderStrategy", case),
+            vec![(row.provider.to_string(), 1, 0)],
+            "case {case:?}: expected the default strategy the create named, got {cluster}"
+        );
+
+        // And the association READS back, so it was persisted rather than echoed.
+        let body = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": [row.cluster] }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            body["failures"],
+            json!([]),
+            "case {case:?}: a cluster this account holds is no failure, got {body}"
+        );
+        let described = list(&body, "clusters", case);
+        assert_eq!(
+            described.len(),
+            1,
+            "case {case:?}: expected the cluster back, got {body}"
+        );
+        assert_eq!(
+            (
+                list(&described[0], "capacityProviders", case),
+                strategy_entries(&described[0], "defaultCapacityProviderStrategy", case),
+            ),
+            (
+                vec![json!(row.provider)],
+                vec![(row.provider.to_string(), 1, 0)],
+            ),
+            "case {case:?}: expected the stored association read back, got {body}"
+        );
+    }
+
+    // The control: an association naming a provider the account holds NONE of is the one
+    // thing this refusal is for, and it creates no cluster.
+    let case = "a cluster create naming a provider nothing holds";
+    let (code, message) = refusal(
+        &router,
+        "CreateCluster",
+        json!({
+            "clusterName": "bootghost",
+            "capacityProviders": ["ghostprovider"],
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("InvalidParameterException", PROVIDER_NOT_FOUND),
+        "case {case:?}: expected the unknown-provider refusal, got {code:?} with {message:?}"
+    );
+    let body = ok(
+        &router,
+        "DescribeClusters",
+        json!({ "clusters": ["bootghost"] }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (
+            list(&body, "clusters", case),
+            list(&body, "failures", case),
+        ),
+        (
+            Vec::new(),
+            vec![json!({ "arn": cluster_arn("bootghost"), "reason": MISSING })],
+        ),
+        "case {case:?}: a refused create leaves no cluster behind, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_placement_on_the_provider_is_refused_for_its_capacity_and_served_once_it_has_some() {
+    let router = service();
+    let family = "bootapp";
+    register_definition(&router, family, "setup").await;
+
+    for row in bootstrap_rows() {
+        let case = row.case;
+        create_group_provider(&router, &row).await;
+        create_associated_cluster(&router, &row).await;
+
+        let request = json!({
+            "cluster": row.cluster,
+            "taskDefinition": family,
+            "capacityProviderStrategy": row_strategy(&row),
+        });
+
+        // The cluster EXISTS and the strategy resolves, so the one thing missing is the
+        // capacity behind the provider — and that is what the refusal states, naming the
+        // provider the placement went through.
+        let (code, message) = refusal(&router, "RunTask", request.clone(), case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "InvalidParameterException",
+                no_container_instances(row.provider).as_str(),
+            ),
+            "case {case:?}: expected the empty-provider refusal, got {code:?} with {message:?}"
+        );
+        // A refused run places nothing.
+        let body = ok(
+            &router,
+            "ListTasks",
+            json!({ "cluster": row.cluster }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            list(&body, "taskArns", case),
+            Vec::<Value>::new(),
+            "case {case:?}: a refused RunTask runs no task, got {body}"
+        );
+
+        // `ClusterNotFoundException` stays reserved for a cluster the account does not
+        // hold, which is a refusal about another resource entirely.
+        let absent = "nosuchbootcluster";
+        let (code, message) = refusal(
+            &router,
+            "RunTask",
+            json!({
+                "cluster": absent,
+                "taskDefinition": family,
+                "capacityProviderStrategy": row_strategy(&row),
+            }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("ClusterNotFoundException", CLUSTER_NOT_FOUND),
+            "case {case:?}: expected the absent-cluster refusal, got {code:?} with {message:?}"
+        );
+
+        // Register capacity into the cluster and the SAME request is served: the refusal
+        // above was about the capacity, not about an identifier the emulator could not
+        // resolve.
+        register_capacity(&router, row.cluster, case).await;
+        let body = ok(&router, "RunTask", request, case).await;
+        assert_eq!(
+            body["failures"],
+            json!([]),
+            "case {case:?}: a served run fails nothing, got {body}"
+        );
+        let tasks = list(&body, "tasks", case);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "case {case:?}: expected the task to be placed, got {body}"
+        );
+        assert_eq!(
+            string(&tasks[0], "capacityProviderName", case),
+            row.provider,
+            "case {case:?}: the task names the provider that placed it, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_onto_the_providers_strategy_answers_the_updated_service() {
+    let router = service();
+    let family = "bootsvcapp";
+    register_definition(&router, family, "setup").await;
+
+    for row in bootstrap_rows() {
+        let case = row.case;
+        create_group_provider(&router, &row).await;
+        create_associated_cluster(&router, &row).await;
+        let service_name = format!("{}svc", row.provider);
+
+        // The configuration the repair takes the service OFF: a launch type, which is the
+        // other placement `CreateService` offers.
+        ok(
+            &router,
+            "CreateService",
+            json!({
+                "cluster": row.cluster,
+                "serviceName": service_name,
+                "taskDefinition": family,
+                "desiredCount": 0,
+                "launchType": "EC2",
+            }),
+            case,
+        )
+        .await;
+
+        let strategy = row_strategy(&row);
+        let expected = vec![(row.provider.to_string(), 1, 0)];
+        // The repair, and the identical re-issue of it: the tasks a service already runs
+        // were placed under the configuration it is being taken off, so the switch carries
+        // the new deployment that replaces them.
+        let request = json!({
+            "cluster": row.cluster,
+            "service": service_name,
+            "capacityProviderStrategy": strategy,
+            "forceNewDeployment": true,
+        });
+        for attempt in ["the repair", "the identical re-issue"] {
+            let case = &format!("{case}, {attempt}");
+            let body = ok(&router, "UpdateService", request.clone(), case).await;
+            let updated = &body["service"];
+            assert_eq!(
+                strategy_entries(updated, "capacityProviderStrategy", case),
+                expected,
+                "case {case:?}: expected the strategy now in force, got {updated}"
+            );
+            assert_eq!(
+                (
+                    updated["serviceName"].as_str(),
+                    updated["clusterArn"].as_str(),
+                    updated["createdBy"].as_str(),
+                    updated["deploymentController"]["type"].as_str(),
+                ),
+                (
+                    Some(service_name.as_str()),
+                    Some(cluster_arn(row.cluster).as_str()),
+                    Some(caller_principal().as_str()),
+                    Some("ECS"),
+                ),
+                "case {case:?}: unexpected service element, got {updated}"
+            );
+            assert!(
+                !updated["createdAt"].is_null(),
+                "case {case:?}: expected the service's creation instant, got {updated}"
+            );
+            let configuration = &updated["deploymentConfiguration"];
+            assert_eq!(
+                (
+                    configuration["strategy"].as_str(),
+                    count(configuration, "maximumPercent", case),
+                    count(configuration, "minimumHealthyPercent", case),
+                ),
+                (Some("ROLLING"), 200, 100),
+                "case {case:?}: expected the rolling update the service runs under, got \
+                 {updated}"
+            );
+            // The rollout the repair started: the current deployment, placing its tasks
+            // under the strategy now in force.
+            let deployments = list(updated, "deployments", case);
+            let deployment = deployments
+                .first()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a deployment, got {updated}"));
+            assert_eq!(
+                (
+                    deployment["status"].as_str(),
+                    deployment["taskDefinition"].as_str(),
+                ),
+                (Some("PRIMARY"), updated["taskDefinition"].as_str()),
+                "case {case:?}: expected the current deployment of the service's revision, \
+                 got {deployment}"
+            );
+            assert_eq!(
+                strategy_entries(deployment, "capacityProviderStrategy", case),
+                expected,
+                "case {case:?}: expected the rollout's own strategy, got {deployment}"
+            );
+            let rollout = string(deployment, "rolloutState", case);
+            assert!(
+                ROLLOUT_STATES.contains(&rollout.as_str()),
+                "case {case:?}: {rollout:?} is no DeploymentRolloutState, got {deployment}"
+            );
+            assert!(
+                !deployment["stabilityStatus"].is_null(),
+                "case {case:?}: expected the rollout's stability status, got {deployment}"
+            );
+            // "The list of the service revisions": the one this rollout is on, and the one
+            // each deployment it is still replacing rolled out — every entry named by its
+            // own ARN.
+            let revisions = list(updated, "currentServiceRevisions", case);
+            assert!(
+                !revisions.is_empty(),
+                "case {case:?}: expected the revision this rollout is on, got {updated}"
+            );
+            for revision in &revisions {
+                assert!(
+                    !revision["arn"].is_null(),
+                    "case {case:?}: expected the revision's ARN, got {revision}"
+                );
+            }
+        }
+
+        // The strategy is in force on the stored service, not only in the update's answer.
+        let body = ok(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": row.cluster, "services": [service_name] }),
+            case,
+        )
+        .await;
+        let described = list(&body, "services", case);
+        assert_eq!(
+            described.len(),
+            1,
+            "case {case:?}: expected the service back, got {body}"
+        );
+        assert_eq!(
+            strategy_entries(&described[0], "capacityProviderStrategy", case),
+            expected,
+            "case {case:?}: expected the repaired strategy read back, got {body}"
         );
     }
 }
