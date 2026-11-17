@@ -20,10 +20,11 @@
 //!   one for is refused with the deliberately NON-COMMITTAL sentence, which does not
 //!   disclose whether a domain of that name exists — asserted over a table of names, on
 //!   both operations, with the sentence checked to carry no part of the name;
-//! * an upgrade the published relation does not offer states the target as its BARE
-//!   release, with the engine prefix the `VersionString` carries stripped, while the
-//!   version the domain runs keeps the prefix its record declares it with — asserted over
-//!   targets of both engine lines.
+//! * an upgrade the published relation does not offer states each version in the service's
+//!   LEGACY engine-version form: an Elasticsearch version by its bare release, with the
+//!   engine name the `VersionString` carries dropped, and an OpenSearch version with that
+//!   name kept, while the version the domain runs is stated as its record declares it —
+//!   asserted over targets of both engine lines.
 
 use serde_json::json;
 
@@ -298,7 +299,7 @@ async fn vpc_endpoint_access_on_a_domain_it_cannot_serve_states_the_non_committa
 }
 
 #[tokio::test]
-async fn an_unsupported_upgrade_states_the_target_as_its_bare_release() {
+async fn an_unsupported_upgrade_states_the_target_in_the_legacy_engine_version_form() {
     let emulator = Emulator::new();
     let source = "OpenSearch_2.11";
     let name = "upgrade-bare-target";
@@ -307,19 +308,21 @@ async fn an_unsupported_upgrade_states_the_target_as_its_bare_release() {
     // One row per engine line a target can name, and per shape of its release numbers: a
     // one-digit Elasticsearch major with a two-digit minor, a one-digit OpenSearch
     // release, and a two-digit OpenSearch major — every one of them a version this domain
-    // cannot be upgraded to, so each is answered by the same refusal.
-    // (the requested TargetVersion, the release the sentence states)
-    for (target, release) in [
+    // cannot be upgraded to, so each is answered by the same refusal. The legacy form
+    // drops the engine name from an Elasticsearch version and keeps it on an OpenSearch
+    // one, because `X.Y` alone would not say which engine it names.
+    // (the requested TargetVersion, the version the sentence states)
+    for (target, stated) in [
         ("Elasticsearch_7.10", "7.10"),
         ("Elasticsearch_5.1", "5.1"),
-        ("OpenSearch_1.3", "1.3"),
-        ("OpenSearch_10.0", "10.0"),
+        ("OpenSearch_1.3", "OpenSearch_1.3"),
+        ("OpenSearch_10.0", "OpenSearch_10.0"),
     ] {
         for check_only in [true, false] {
             let case = format!("{source} -> {target} (PerformCheckOnly {check_only})");
             let answer = upgrade(&emulator, name, target, check_only).await;
             let expected =
-                format!("Failed to submit upgrade. Upgrade from {source} to {release} not supported.");
+                format!("Failed to submit upgrade. Upgrade from {source} to {stated} not supported.");
             assert_eq!(
                 (answer.status, error_code(&answer).as_str()),
                 (400, "BaseException"),
@@ -333,13 +336,7 @@ async fn an_unsupported_upgrade_states_the_target_as_its_bare_release() {
                 "case {case}: expected {expected:?}, got {:?}",
                 answer.body
             );
-            // The target is stated WITHOUT its engine prefix, while the source keeps the
-            // one its record declares.
-            assert!(
-                !message(&answer).contains(target),
-                "case {case}: expected the target's engine prefix to be stripped, got {:?}",
-                answer.body
-            );
+            // The domain's own version is stated as its record declares it.
             assert!(
                 message(&answer).contains(source),
                 "case {case}: expected the domain's own version as it is declared, got {:?}",

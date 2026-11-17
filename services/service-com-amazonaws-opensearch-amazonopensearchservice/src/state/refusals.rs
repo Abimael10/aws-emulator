@@ -631,17 +631,16 @@ pub fn informational_insight_details(
 /// domain runs, read from its stored record, and the version the request asked for.
 /// Nothing else of the request is named and nothing of the domain's state moves.
 ///
-/// The two are rendered as the service renders them, which is NOT the same form: the
-/// domain's version keeps the engine prefix its record declares it with, while the
-/// target is stated as its bare release ([`bare_engine_release`]) — the release the
-/// caller asked for, without the engine name the `VersionString` pattern puts in front
-/// of it.
+/// The domain's version is stated as its record declares it, and the target the caller
+/// asked for in the service's legacy engine-version form ([`legacy_engine_version`]): an
+/// Elasticsearch target as its bare release, an OpenSearch target with the engine name
+/// its `VersionString` carries.
 pub fn incompatible_target_version(source_version: &str, target_version: &str) -> BaseException {
     BaseException {
         message: Some(format!(
             "Failed to submit upgrade. Upgrade from {source_version} to {} \
              not supported.",
-            bare_engine_release(target_version)
+            legacy_engine_version(target_version)
         )),
     }
 }

@@ -368,8 +368,10 @@ impl PublishedPackage {
     /// packages reports.
     ///
     /// `Version` is the plugin's version, which for a plugin of the engine
-    /// distribution is the release it is built against, stated as the bare release the
-    /// rest of this crate states one as ([`bare_engine_release`]).
+    /// distribution is the release it is built against, stated as that release ALONE
+    /// ([`bare_engine_release`]): the member carries a version value rather than a
+    /// sentence, so it names no engine — unlike the rendering a sentence states a
+    /// version in ([`super::legacy_engine_version`]).
     fn plugin_properties(&self, engine_version: &str) -> PluginProperties {
         PluginProperties {
             name: Some(self.name.to_string()),

@@ -26,6 +26,12 @@
 //!   reach, and a pattern-valid release the catalog does not publish at all), over
 //!   source versions in the middle of a line, at the end of a line and at the end of
 //!   the newest line, and with and without `PerformCheckOnly`;
+//! * that sentence states each version in the service's LEGACY engine-version form: an
+//!   Elasticsearch version by its bare `X.Y` release and an OpenSearch version with the
+//!   `OpenSearch_` its `VersionString` carries, while the version read from the domain's
+//!   own record is stated as that record declares it — asserted over both engine lines,
+//!   both digit shapes of a release, published and unpublished releases, and from a
+//!   source version of each engine;
 //! * that eligibility is decided from the request and the version the domain runs
 //!   alone, so it is answered the same way whatever the domain is busy with — while
 //!   the activity gates still answer an ELIGIBLE target in a busy domain in their own
@@ -68,15 +74,27 @@ const SOURCES: [&str; 3] = ["OpenSearch_2.11", "Elasticsearch_7.10", "OpenSearch
 /// than taken from the crate, so a change to either one fails this suite.
 const PACKAGE_NOT_ASSOCIATED: &str = "Package is not associated to this domain.";
 
+/// `engine_version` in the LEGACY engine-version form the service states a version in
+/// inside a sentence — written here rather than taken from the crate, so the expectation
+/// is the rule and not whatever the implementation computes: the engine name is dropped
+/// from an Elasticsearch version and kept on an OpenSearch one, because `X.Y` alone would
+/// not say which engine it names.
+fn legacy_form(engine_version: &str) -> &str {
+    engine_version
+        .strip_prefix("Elasticsearch_")
+        .unwrap_or(engine_version)
+}
+
 /// The message the service states an ineligible target with: the two versions the
 /// eligibility was decided from, and nothing else of the request.
 ///
-/// The two are rendered differently, as the service renders them: the version the domain
-/// RUNS keeps the engine prefix its record declares it with, while the target is stated as
-/// its bare release — the `X.Y` part of the `VersionString` the request carried.
+/// The version the domain RUNS is stated as its record declares it, and the target in the
+/// service's legacy form ([`legacy_form`]).
 fn not_supported(source: &str, target: &str) -> String {
-    let bare = target.split_once('_').map_or(target, |(_, release)| release);
-    format!("Failed to submit upgrade. Upgrade from {source} to {bare} not supported.")
+    format!(
+        "Failed to submit upgrade. Upgrade from {source} to {} not supported.",
+        legacy_form(target)
+    )
 }
 
 /// The `EngineVersion` `DescribeDomain` reports for `name`.
@@ -143,6 +161,116 @@ fn assert_refusal(answer: &Answer, status: u16, code: &str, message: &str, case:
         "case {case}: expected the service's wording {message:?}, got {:?}",
         answer.body
     );
+}
+
+/// The source versions the RENDERING of the sentence is asserted from: a release in the
+/// middle of the OpenSearch line and one in the middle of the Elasticsearch line, so the
+/// sentence is asserted with a source of each engine and each source still has somewhere
+/// to go for the positive control.
+const RENDERING_SOURCES: [&str; 2] = ["OpenSearch_2.11", "Elasticsearch_6.3"];
+
+/// The targets the rendering is asserted over: both engine prefixes, a one-digit and a
+/// two-digit major, a one-digit and a two-digit minor, and releases the catalog publishes
+/// (`SUPPORTED_ENGINE_VERSIONS`) as well as releases it does not — each inside
+/// `VersionString`'s `@pattern` and its `@length(min: 14, max: 18)`, so it is the
+/// eligibility rule that refuses them and not the request boundary.
+///
+/// Every one of them is a release at or below both sources above, or one the catalog does
+/// not publish at all, so none is a version either source can be upgraded to — asserted
+/// against `GetCompatibleVersions` in the case itself rather than assumed.
+const RENDERING_TARGETS: [&str; 6] = [
+    "Elasticsearch_1.5",
+    "Elasticsearch_5.1",
+    "Elasticsearch_9.9",
+    "OpenSearch_1.0",
+    "OpenSearch_1.3",
+    "OpenSearch_99.9",
+];
+
+#[tokio::test]
+async fn an_unsupported_upgrade_states_each_version_in_the_services_legacy_form() {
+    let emulator = Emulator::new();
+
+    for (index, source) in RENDERING_SOURCES.iter().enumerate() {
+        let name = format!("upgrade-version-form-{index}");
+        let created = emulator
+            .create(json!({ "DomainName": name, "EngineVersion": source }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case CreateDomain({name:?}, {source:?}): expected HTTP 200, got {} with {:?}",
+            created.status, created.body
+        );
+        // Wait for the CONDITION the provisioning span owes, so an upgrade is judged
+        // against a settled record however fast the host runs.
+        super::domain_lifecycle::settled_domain(&emulator, &name).await;
+        let offered = advertised(&emulator, &name, source).await;
+
+        for target in RENDERING_TARGETS {
+            assert!(
+                !offered.iter().any(|candidate| candidate == target),
+                "case {source} -> {target}: the row is about a target the relation does not \
+                 offer, but it advertises {offered:?}"
+            );
+            for check_only in [true, false] {
+                let case = format!("{source} -> {target} (PerformCheckOnly {check_only})");
+                let answer = upgrade(&emulator, &name, target, check_only).await;
+                assert_refusal(
+                    &answer,
+                    400,
+                    "BaseException",
+                    &not_supported(source, target),
+                    &case,
+                );
+                // The halves of the rule, stated apart from the sentence above: the target
+                // is named with the `OpenSearch_` its `VersionString` carries where it
+                // names that engine and by its release alone where it names the legacy one,
+                // and the domain's own version as its record declares it.
+                let stated = answer.body["message"].as_str().unwrap_or_default().to_owned();
+                let (_, after) = stated.rsplit_once(" to ").unwrap_or_else(|| {
+                    panic!("case {case}: expected the two versions in {stated:?}")
+                });
+                assert_eq!(
+                    after.starts_with("OpenSearch_"),
+                    target.starts_with("OpenSearch_"),
+                    "case {case}: expected the OpenSearch engine kept and the Elasticsearch one \
+                     dropped, got {stated:?}"
+                );
+                assert!(
+                    stated.contains(&format!("from {source} to ")),
+                    "case {case}: expected the domain's version as its record declares it, got \
+                     {stated:?}"
+                );
+                // A refused upgrade starts nothing, so the version the domain runs is the
+                // one it was created on however many targets were refused.
+                assert_eq!(
+                    engine_version(&emulator, &name, &case).await,
+                    *source,
+                    "case {case}: a refused upgrade leaves the domain's EngineVersion alone"
+                );
+            }
+        }
+
+        // The boundary of the same rule: a target the relation DOES offer is accepted, and
+        // what it echoes is the whole `VersionString` the request carried — the rendering
+        // above belongs to the refusal sentence, not to the wire members.
+        let eligible = offered
+            .first()
+            .unwrap_or_else(|| panic!("case {source}: the source of this row has somewhere to go"));
+        let case = format!("{source} -> {eligible} (offered)");
+        let accepted = upgrade(&emulator, &name, eligible, true).await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case}: expected the offered target to be accepted, got {} with {:?}",
+            accepted.status, accepted.body
+        );
+        assert_eq!(
+            string_member(&accepted.body, "TargetVersion", &case),
+            *eligible,
+            "case {case}: expected the requested TargetVersion echoed, got {:?}",
+            accepted.body
+        );
+    }
 }
 
 #[tokio::test]

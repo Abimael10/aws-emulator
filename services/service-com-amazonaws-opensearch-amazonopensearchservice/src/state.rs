@@ -506,6 +506,23 @@ pub fn bare_engine_release(engine_version: &str) -> &str {
         .map_or(engine_version, |(_, release)| release)
 }
 
+/// `engine_version` in the service's LEGACY engine-version form — the rendering it
+/// states an engine version in inside a sentence.
+///
+/// That form predates the OpenSearch engine, when a version was a release of the ONE
+/// engine the service ran: an Elasticsearch version is stated as its bare release
+/// ([`bare_engine_release`]), with the engine name dropped, while an OpenSearch version
+/// keeps the `OpenSearch_` its `VersionString` carries, because the release alone would
+/// not say which engine it names. A value naming neither engine ([`engine_type_of`]) is
+/// stated as it was given.
+pub fn legacy_engine_version(engine_version: &str) -> &str {
+    if engine_type_of(engine_version) == Some(ENGINE_TYPE_ELASTICSEARCH) {
+        bare_engine_release(engine_version)
+    } else {
+        engine_version
+    }
+}
+
 /// The oldest release the service still offers an UPGRADE from, which is the floor of
 /// the published upgrade table: a release older than this one is still supported to run
 /// — [`SUPPORTED_ENGINE_VERSIONS`] publishes it and a domain can be created on it — but
