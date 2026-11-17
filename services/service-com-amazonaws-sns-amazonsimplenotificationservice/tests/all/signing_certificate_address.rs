@@ -516,6 +516,86 @@ def lambda_handler(event, context):
     return {"fetched": status}
 "#;
 
+/// An address on Amazon SNS's own endpoint whose file name is an id THIS PROCESS holds no
+/// certificate for, which the certificate endpoint answers as the document it does not hold
+/// ([`the_certificate_address_admits_a_caller_with_no_credential`]).
+///
+/// What the warm-up invocation below hands the handler: it names an address rather than a
+/// document, because the warm-up is about standing the handler's execution environment up and
+/// states nothing about any certificate — the delivery under test is what fetches one.
+const NO_CERTIFICATE_HELD_URL: &str =
+    "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-00000000.pem";
+
+/// How many times the capture queue is read while it keeps yielding what the warm-up's own run
+/// wrote: that run makes ONE report, and one read answers up to ten messages, so this is far
+/// above the rounds taking it off can need.
+const DRAIN_ROUNDS: usize = 16;
+
+/// Run the handler of `function` ONCE, directly, so the execution environment its next
+/// invocation is served in is already STANDING — and take the report that run wrote off
+/// `capture_url` for good, leaving the queue as empty as it found it.
+///
+/// WHY: an invocation that finds no execution environment standing builds one, and that
+/// INIT phase — the interpreter this emulator embeds, the managed runtime inside it and the
+/// handler module's own imports — is seconds of this process's own work, while the handler's
+/// run that follows it is milliseconds ("Lambda maintains the execution environment for some
+/// time", and an invocation that finds one is the handler's run alone). The chain under test
+/// is bounded by what the LAMBDA SERVICE allows one delivery attempt, and an attempt the host
+/// gives up on is not retried, so leaving that build inside the attempt makes the test's
+/// outcome a measurement of how much of this host the other suites running beside it are
+/// using. Paying it HERE, before the publish, leaves the attempt the handler's own run with
+/// the whole of that allowance to spare.
+///
+/// Best effort by design: whatever this invocation comes to, the publish below drives exactly
+/// the same chain — a run that could not be made here only leaves the delivery to pay the
+/// initialization, as it did before.
+///
+/// Nothing here waits out a span: the invocation is answered once its handler has run, so what
+/// that run wrote is already on the queue when the reads below ask for it.
+async fn given_a_standing_environment(
+    emulator: &crate::lambda_subscription_delivery::Emulator,
+    function: &str,
+    capture_url: &str,
+) {
+    use crate::lambda_subscription_delivery::{lambda, sqs as delivery_sqs};
+
+    let _answered = lambda(
+        emulator,
+        "POST",
+        &format!("/2015-03-31/functions/{function}/invocations"),
+        json!({"Records": [{"Sns": {"SigningCertUrl": NO_CERTIFICATE_HELD_URL}}]}),
+    )
+    .await;
+    // The invocation is answered after the handler has run, so whatever that run wrote is on
+    // the queue by now: the queue is read while it keeps yielding messages, and each one is
+    // DELETED rather than left in flight, so none of it can come back while the delivery's
+    // own report is being waited for. The rounds are bounded ([`DRAIN_ROUNDS`]) because this
+    // helper states nothing the test asserts and must always end.
+    for _round in 0..DRAIN_ROUNDS {
+        let received = delivery_sqs(
+            emulator,
+            "ReceiveMessage",
+            &json!({"QueueUrl": capture_url, "MaxNumberOfMessages": 10}),
+        )
+        .await;
+        let messages = received["Messages"].as_array().cloned().unwrap_or_default();
+        if messages.is_empty() {
+            return;
+        }
+        for message in messages {
+            delivery_sqs(
+                emulator,
+                "DeleteMessage",
+                &json!({
+                    "QueueUrl": capture_url,
+                    "ReceiptHandle": message["ReceiptHandle"].as_str().unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+    }
+}
+
 /// A SUBSCRIBER that follows the address reaches the certificate: the handler of a subscribed
 /// function fetches the URL the record handed it — with no credential of its own, over its
 /// own HTTP client — and is answered the PEM document, which is what lets it verify the
@@ -538,6 +618,10 @@ async fn a_subscriber_reaches_the_certificate_at_the_address_it_was_given() {
         &VERIFYING_HANDLER.replace("{queue_url}", &capture_url),
     )
     .await;
+    // The handler's execution environment is stood up HERE rather than inside the delivery
+    // attempt the publish below sets off, so that attempt is the handler's own run and nothing
+    // besides ([`given_a_standing_environment`]).
+    given_a_standing_environment(&emulator, function, &capture_url).await;
     let topic = delivery_element(
         &delivery_sns(&emulator, "CreateTopic", &[("Name", "certificate-topic")]).await,
         "TopicArn",
