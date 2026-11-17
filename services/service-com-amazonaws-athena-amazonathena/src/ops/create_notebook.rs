@@ -222,12 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let payload = crate::state::EMPTY_IPYNB.to_string();
         if store.notebooks.would_exceed_capacity(payload.len()) {
-            return Err(invalid_request(format!(
-                "Cannot create another notebook: this emulator holds at most {} notebooks \
-                 and {} bytes of notebook content.",
-                crate::state::MAX_NOTEBOOKS,
-                crate::state::MAX_NOTEBOOK_BYTES_TOTAL
-            )));
+            return Err(invalid_request(crate::state::notebook_capacity_exhausted()));
         }
 
         // Athena hands back a notebook that can already be read, so there is no transition

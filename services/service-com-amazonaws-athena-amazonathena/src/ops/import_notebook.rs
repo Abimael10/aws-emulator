@@ -253,12 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.notebooks.would_exceed_capacity(payload.len()) {
-            return Err(invalid_request(format!(
-                "Cannot import another notebook: this emulator holds at most {} notebooks \
-                 and {} bytes of notebook content.",
-                crate::state::MAX_NOTEBOOKS,
-                crate::state::MAX_NOTEBOOK_BYTES_TOTAL
-            )));
+            return Err(invalid_request(crate::state::notebook_capacity_exhausted()));
         }
 
         // Athena hands back a notebook that can already be exported, so there is no

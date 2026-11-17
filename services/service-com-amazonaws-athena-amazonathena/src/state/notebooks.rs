@@ -5,11 +5,13 @@
 //! `ImportNotebook` writes a [`NotebookRecord`] into the [`NotebookRegistry`] on this
 //! service's store and `ExportNotebook` answers out of that same record, so the content a
 //! read reports is the content an earlier import persisted, byte for byte, rather than
-//! anything derived from the reading request.
+//! anything derived from the reading request. `CreateNotebook` writes the same record
+//! through the same registry, for the one notebook whose content no request carried: the
+//! empty ipynb document ([`EMPTY_IPYNB`]) it creates in the workgroup.
 //!
-//! A notebook has no lifecycle the clock owes: Athena answers an import with the notebook
-//! already readable, so the record is stored complete and no read has to materialise a
-//! pending transition.
+//! A notebook has no lifecycle the clock owes: Athena answers a create or an import with
+//! the notebook already readable, so the record is stored complete and no read has to
+//! materialise a pending transition.
 //!
 //! The content a request did not carry inline is read from the ONE object store this
 //! emulator has ([`notebook_file_at`]): a notebook imported from an Amazon S3 location is
@@ -139,7 +141,9 @@ impl NotebookRegistry {
     /// Whether `work_group` already holds a notebook called `name`.
     ///
     /// `ImportNotebook` documents the rule this answers: "If an ipynb file with the same
-    /// name already exists in the workgroup, throws an error" — so the name is unique
+    /// name already exists in the workgroup, throws an error", and `CreateNotebook` the
+    /// same rule for a create ("Throws an error if a file in the workgroup with the same
+    /// name already exists") — so the name is unique
     /// within ONE workgroup, and the same name in another workgroup names another
     /// notebook. Case-sensitive, as `NotebookName` is.
     pub fn holds_name(&self, work_group: &str, name: &str) -> bool {
@@ -165,7 +169,7 @@ impl NotebookRegistry {
     /// Remove every notebook `work_group` holds, as a recursive delete of that workgroup
     /// does, and answer with how many were removed.
     ///
-    /// Any import token that named one goes with it: a token whose notebook is gone cannot
+    /// Any request token that named one goes with it: a token whose notebook is gone cannot
     /// answer with the same id, so it is not kept pointing at nothing.
     pub fn remove_work_group(&mut self, work_group: &str) -> usize {
         let removed: Vec<String> = self
@@ -266,9 +270,9 @@ pub fn notebook_not_found(notebook_id: &str) -> String {
     format!("Notebook {notebook_id} was not found")
 }
 
-/// The message an import into a workgroup that already holds a notebook of that name is
-/// refused with: the error `ImportNotebook` documents for it ("If an ipynb file with the
-/// same name already exists in the workgroup, throws an error").
+/// The message a create or an import into a workgroup that already holds a notebook of
+/// that name is refused with: the error both operations document for it ("If an ipynb file
+/// with the same name already exists in the workgroup, throws an error").
 pub fn notebook_name_exists(work_group: &str, name: &str) -> String {
     format!("Notebook {name} already exists in WorkGroup {work_group}.")
 }
@@ -288,6 +292,18 @@ pub fn work_group_not_spark_enabled(name: &str) -> String {
 /// specified, an InvalidRequestException occurs."
 pub const NOTEBOOK_SOURCE_REQUIRED: &str =
     "Either Payload or NotebookS3LocationUri must be specified, but not both.";
+
+/// The message a notebook this emulator has no room left for is refused with.
+///
+/// The EMULATOR's own bound rather than one Athena publishes ([`MAX_NOTEBOOKS`] and
+/// [`MAX_NOTEBOOK_BYTES_TOTAL`]), so it is worded once here and stated the same way
+/// whichever operation would have stored the notebook.
+pub fn notebook_capacity_exhausted() -> String {
+    format!(
+        "Cannot store another notebook: this emulator holds at most {MAX_NOTEBOOKS} notebooks \
+         and {MAX_NOTEBOOK_BYTES_TOTAL} bytes of notebook content."
+    )
+}
 
 /// The message an import whose ipynb file is larger than Athena accepts is refused with:
 /// the limit `ImportNotebook` publishes (see [`MAX_NOTEBOOK_PAYLOAD_BYTES`]), stated with
