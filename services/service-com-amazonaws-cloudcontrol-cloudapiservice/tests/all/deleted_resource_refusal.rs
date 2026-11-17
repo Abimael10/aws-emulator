@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How a refusal names a resource a Cloud Control DELETE has already removed.
+//! How a refusal names a resource that has already been removed.
 //!
 //! The rule every case here holds the service to: **the resource named inside a
 //! not-found handler diagnostic is rendered as the HANDLER that owns the resource type
@@ -17,9 +17,11 @@
 //! is PER TYPE and a case about one type says nothing about another.
 //!
 //! The rows differ along what the rule generalises over: the resource type, where its
-//! resources live (another service's store, this service's own), the shape of the
-//! identifier (a plain name, a path-shaped name, a name carrying dots, a URL the owning
-//! service assigns), and which operation refuses.
+//! resources live (another service's store, this service's own), which API created the
+//! resource and which API removed it (Cloud Control API's own operations, the owning
+//! service's own wire), the shape of the identifier (a plain name, a path-shaped name, a
+//! name carrying dots, a URL the owning service assigns), which of the references the type
+//! answers to addressed the refused call, and which operation refuses.
 
 use serde_json::{json, Value};
 
@@ -27,6 +29,10 @@ use super::emulator::{code, message, progress, text, Emulator, STATUS_FAILED};
 use super::refusal_wording::{
     assert_handler_not_found, handler_rendered_not_found, inert_patch, rendered_identifier,
 };
+// The url and ARN shape of the queue type are the ones `sqs_queue_read_through` already
+// states, and so is the create over the owning service's own wire — one spelling for every
+// suite that drives a queue, so they cannot drift apart.
+use super::sqs_queue_read_through::{create_native, queue_arn};
 
 /// The type whose resources live in the CloudWatch Logs service's own store, and whose
 /// handler names the resource as the type's primary-identifier object.
@@ -188,6 +194,114 @@ async fn the_rendering_is_per_type_so_a_type_named_by_its_identifier_keeps_that_
 
         let identifier = if by_url { url } else { name };
         assert_every_refusal_names_the_resource(&emulator, QUEUE, &identifier, case).await;
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_after_the_owning_services_own_delete_names_the_queue_as_it_was_addressed() {
+    // The service that OWNS the type is mounted beside this one, so the rows create and
+    // remove the queue through that service's own API and Cloud Control API never hears of
+    // either call — the way a cross-service caller reconciles the url it holds.
+    let emulator = Emulator::with_sqs();
+
+    // The rows differ along the kind of queue and along the shape of its name, because
+    // neither is what decides the rendering.
+    let rows: [(&str, &str, Value); 2] = [
+        ("a standard queue", "native-delete-standard", json!({})),
+        (
+            "a FIFO queue, whose name carries the suffix its own service requires",
+            "native-delete-ordered.fifo",
+            // On the owning service's own wire an attribute value is text.
+            json!({ "FifoQueue": "true" }),
+        ),
+    ];
+
+    for (case, name, attributes) in rows {
+        let url = create_native(&emulator, name, &attributes).await;
+        let (status, body) = emulator.get(QUEUE, &url).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the natively created queue must read back, got {status} with body \
+             {body:?}"
+        );
+
+        // Removed through the OWNING service's own API, so what the refusals below report is
+        // a queue that service no longer holds.
+        emulator
+            .sqs_ok("DeleteQueue", json!({ "QueueUrl": url.clone() }))
+            .await;
+
+        // Every reference of the type is refused the same way, naming the resource by the
+        // reference the request carried.
+        let references = [
+            ("by the url the owning service assigned", url.clone()),
+            ("by the ARN it also answers to", queue_arn(name)),
+            ("by its own name", name.to_string()),
+        ];
+        for (addressed, identifier) in references {
+            let case = format!("{case} {addressed}");
+            assert_every_refusal_names_the_resource(&emulator, QUEUE, &identifier, &case).await;
+
+            // Read back out of the refusal the service composed: the identifier slot holds
+            // the reference the request sent, not a schema object keyed on the type's
+            // primary-identifier pointer.
+            let (_, body) = emulator.get(QUEUE, &identifier).await;
+            let stated = message(&body);
+            let rendered = rendered_identifier(&stated, QUEUE, &case);
+            assert_eq!(
+                rendered, identifier,
+                "case {case:?}: expected the identifier the request carried, got {rendered:?} \
+                 in {stated:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_after_the_owning_services_own_delete_renders_the_groups_schema_object() {
+    // The same rule for a type whose handler DOES name the resource as the type's
+    // primary-identifier object: the rendering is per type, so one half of this pair says
+    // nothing about the other.
+    let emulator = Emulator::with_cloudwatch_logs();
+
+    // The rows differ along the shape of the name the caller chose, which is the value the
+    // rendered object carries.
+    let rows = [
+        ("a plain name", "native-delete-group"),
+        ("a path-shaped name", "/aws-emulator/native-delete/group"),
+        ("a name carrying dots", "native-delete.group.v2"),
+    ];
+
+    for (case, name) in rows {
+        emulator
+            .logs_ok("CreateLogGroup", json!({ "logGroupName": name }))
+            .await;
+        let (status, body) = emulator.get(LOG_GROUP, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the natively created group must read back, got {status} with body \
+             {body:?}"
+        );
+
+        emulator
+            .logs_ok("DeleteLogGroup", json!({ "logGroupName": name }))
+            .await;
+
+        assert_every_refusal_names_the_resource(&emulator, LOG_GROUP, name, case).await;
+
+        // And the rendering is the schema's own object, which is why the pair of tests
+        // pins a per-type rule rather than one form for every type.
+        let (_, body) = emulator.get(LOG_GROUP, name).await;
+        let stated = message(&body);
+        let rendered = rendered_identifier(&stated, LOG_GROUP, case);
+        let parsed: Value = serde_json::from_str(&rendered).unwrap_or_else(|_| {
+            panic!("case {case:?}: expected the identifier as JSON, got {rendered:?}")
+        });
+        assert_eq!(
+            parsed,
+            json!({ "/properties/LogGroupName": name }),
+            "case {case:?}: unexpected identifier object in {stated:?}"
+        );
     }
 }
 
