@@ -103,9 +103,15 @@
 //! value the service configures itself, stated once in its own module
 //! ([`stack_defaults`]) and written into the record by the create, so the create response
 //! and every later read project one stored configuration.
+//!
+//! One thing an `UpdateStack` can ask for twice — setting a stack attribute's
+//! configuration while naming that same attribute in `AttributesToDelete` — is refused
+//! with the sentence AWS states for that attribute, worded once in its own module
+//! ([`stack_attribute_conflicts`]).
 
 mod access_endpoints;
 mod images;
+mod stack_attribute_conflicts;
 mod stack_defaults;
 mod theme_branding;
 mod vpc_access_endpoints;
@@ -113,6 +119,7 @@ mod wire_refusals;
 
 pub use access_endpoints::*;
 pub use images::*;
+pub use stack_attribute_conflicts::*;
 pub use stack_defaults::*;
 pub use theme_branding::*;
 pub use vpc_access_endpoints::*;

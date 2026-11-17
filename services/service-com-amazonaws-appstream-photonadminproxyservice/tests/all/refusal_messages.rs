@@ -16,7 +16,13 @@
 //!   same two variable parts;
 //! * a refusal because a fleet/stack association still exists states what blocks the
 //!   delete and how to clear it, and names NONE of the resources on the other side of
-//!   the association, however many there are.
+//!   the association, however many there are;
+//! * a refusal of an `UpdateStack` that both sets a stack attribute's configuration and
+//!   names that attribute in `AttributesToDelete` states AWS's sentence for that
+//!   attribute, which names the configuration in prose;
+//! * a clause refusing a LIST member for its modelled `@length` QUOTES the list the
+//!   request carried — `[]` for an empty one, and one printed element per element
+//!   otherwise — rather than a count of its elements.
 
 use serde_json::{json, Value};
 
@@ -403,5 +409,265 @@ async fn deleting_a_stack_with_fleets_is_refused_without_naming_the_fleets() {
                 .await;
         }
     }
+}
+
+/// One `UpdateStack` that asks for two outcomes for one attribute: the attribute it
+/// deletes, the member that sets the same configuration, the value that member carries,
+/// and the configuration AWS's sentence names in prose.
+struct SetAndDeleted {
+    attribute: &'static str,
+    member: &'static str,
+    value: fn() -> Value,
+    prose: &'static str,
+}
+
+/// Attributes spanning the class: the one whose configuration AWS names other than after
+/// the attribute (the interface VPC endpoints a stack is reached through), a scalar, a
+/// list of structures, a list of strings, a structure, and one of the per-connector-type
+/// attributes — so the rows differ along the kind of configuration the attribute clears
+/// and along how many words name it.
+fn set_and_deleted_rows() -> Vec<SetAndDeleted> {
+    vec![
+        SetAndDeleted {
+            attribute: "ACCESS_ENDPOINTS",
+            member: "AccessEndpoints",
+            value: || json!([{ "EndpointType": "STREAMING", "VpceId": "vpce-0a1b2c3d4e5f60718" }]),
+            prose: "vpc endpoints",
+        },
+        SetAndDeleted {
+            attribute: "REDIRECT_URL",
+            member: "RedirectURL",
+            value: || json!("https://example.invalid/after"),
+            prose: "redirect url",
+        },
+        SetAndDeleted {
+            attribute: "USER_SETTINGS",
+            member: "UserSettings",
+            value: || json!([{ "Action": "FILE_DOWNLOAD", "Permission": "DISABLED" }]),
+            prose: "user settings",
+        },
+        SetAndDeleted {
+            attribute: "EMBED_HOST_DOMAINS",
+            member: "EmbedHostDomains",
+            value: || json!(["embed.example.invalid"]),
+            prose: "embed host domains",
+        },
+        SetAndDeleted {
+            attribute: "STREAMING_EXPERIENCE_SETTINGS",
+            member: "StreamingExperienceSettings",
+            value: || json!({ "PreferredProtocol": "UDP" }),
+            prose: "streaming experience settings",
+        },
+        SetAndDeleted {
+            attribute: "STORAGE_CONNECTOR_HOMEFOLDERS",
+            member: "StorageConnectors",
+            value: || json!([{ "ConnectorType": "HOMEFOLDERS" }]),
+            prose: "storage connector homefolders",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn setting_and_deleting_one_stack_attribute_states_aws_sentence_for_it() {
+    let emulator = Emulator::new();
+    let stack = "conflicting";
+    let created = emulator
+        .ok("setup", "CreateStack", json!({ "Name": stack }))
+        .await;
+
+    for row in set_and_deleted_rows() {
+        let case = format!("{} set and {} deleted at once", row.member, row.attribute);
+        let mut request = json!({ "Name": stack, "AttributesToDelete": [row.attribute] });
+        request[row.member] = (row.value)();
+        let message = refusal(
+            &emulator,
+            &case,
+            "UpdateStack",
+            request,
+            400,
+            "InvalidParameterCombinationException",
+        )
+        .await;
+
+        // The apostrophe is the right single quotation mark AWS's own sentence carries.
+        let expected = format!("You can’t update and delete {} at the same time.", row.prose);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
+        );
+
+        // A refused request changes nothing, so the stack still reports what it was
+        // created with.
+        let described = emulator
+            .ok(&case, "DescribeStacks", json!({ "Names": [stack] }))
+            .await;
+        assert_eq!(
+            described["Stacks"][0], created["Stack"],
+            "case {case:?}: the refused update must leave the stack alone, got {described}"
+        );
+    }
+
+    // The control: the delete on its own is accepted, so the refusal was about the
+    // combination and not about the attribute.
+    emulator
+        .ok(
+            "the delete on its own",
+            "UpdateStack",
+            json!({ "Name": stack, "AttributesToDelete": ["ACCESS_ENDPOINTS"] }),
+        )
+        .await;
+}
+
+/// One `AccessEndpoints` entry; the model admits at most four of them
+/// (`smithy_query(query="shape", shape="AccessEndpointList")`).
+fn access_endpoint(index: usize) -> Value {
+    json!({ "EndpointType": "STREAMING", "VpceId": format!("vpce-0a1b2c3d4e5f6071{index}") })
+}
+
+/// `message` with each printed element of the list it quotes replaced by `<entry>`, after
+/// checking that each really is a printed element of `shape`: the class the validation
+/// layer prints, then the identity of the object it held that element in.
+///
+/// The identity is a handle on an object of ONE run — AWS's own is the JVM's — so it is
+/// masked rather than asserted on; the per-element rendering and the element COUNT are what
+/// the clause states.
+fn with_entries_masked(case: &str, message: &str, shape: &str) -> String {
+    let (head, rest) = message
+        .split_once("Value '[")
+        .unwrap_or_else(|| panic!("case {case:?}: the clause must quote a list, got {message:?}"));
+    let (value, tail) = rest
+        .split_once("]' at ")
+        .unwrap_or_else(|| panic!("case {case:?}: the clause must quote a list, got {message:?}"));
+    let class = format!("com.amazonaws.photon.{shape}@");
+    let printed: Vec<&str> = if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split(", ").collect()
+    };
+    let masked: Vec<&str> = printed
+        .iter()
+        .map(|entry| {
+            let identity = entry.strip_prefix(class.as_str()).unwrap_or_else(|| {
+                panic!("case {case:?}: expected a printed {shape}, got {entry:?}")
+            });
+            assert!(
+                !identity.is_empty() && identity.chars().all(|digit| digit.is_ascii_hexdigit()),
+                "case {case:?}: expected an object identity, got {entry:?}"
+            );
+            "<entry>"
+        })
+        .collect();
+    format!("{head}Value '[{}]' at {tail}", masked.join(", "))
+}
+
+/// One list a write must refuse for its modelled `@length`: the write path it arrives on,
+/// the member it arrives under, the path a clause names that member at, the shape its
+/// elements are, the elements themselves and the requirement the list broke.
+struct OverLength {
+    case: &'static str,
+    operation: &'static str,
+    member: &'static str,
+    path: &'static str,
+    shape: &'static str,
+    entries: Vec<Value>,
+    requirement: &'static str,
+}
+
+/// Lists spanning the class: the bound that was broken (the maximum of four endpoints, the
+/// minimum of one user setting), how many elements the request carried past it, and the
+/// write path the list arrived on.
+fn over_length_rows() -> Vec<OverLength> {
+    let over_the_maximum = "Member must have length less than or equal to 4";
+    vec![
+        OverLength {
+            case: "a create one entry over the endpoint maximum",
+            operation: "CreateStack",
+            member: "AccessEndpoints",
+            path: "accessEndpoints",
+            shape: "AccessEndpoint",
+            entries: (0..5).map(access_endpoint).collect(),
+            requirement: over_the_maximum,
+        },
+        OverLength {
+            case: "a create far over the endpoint maximum",
+            operation: "CreateStack",
+            member: "AccessEndpoints",
+            path: "accessEndpoints",
+            shape: "AccessEndpoint",
+            entries: (0..7).map(access_endpoint).collect(),
+            requirement: over_the_maximum,
+        },
+        OverLength {
+            case: "an update one entry over the endpoint maximum",
+            operation: "UpdateStack",
+            member: "AccessEndpoints",
+            path: "accessEndpoints",
+            shape: "AccessEndpoint",
+            entries: (0..5).map(access_endpoint).collect(),
+            requirement: over_the_maximum,
+        },
+        OverLength {
+            case: "a create whose user settings carry no entry",
+            operation: "CreateStack",
+            member: "UserSettings",
+            path: "userSettings",
+            shape: "UserSetting",
+            entries: Vec::new(),
+            requirement: "Member must have length greater than or equal to 1",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_list_outside_its_modelled_length_is_refused_quoting_the_list() {
+    let emulator = Emulator::new();
+    emulator
+        .ok("setup", "CreateStack", json!({ "Name": "stored" }))
+        .await;
+
+    for row in over_length_rows() {
+        let count = row.entries.len();
+        let mut request = json!({ "Name": "stored" });
+        request[row.member] = Value::Array(row.entries);
+        let message = refusal(
+            &emulator,
+            row.case,
+            row.operation,
+            request,
+            400,
+            "ValidationException",
+        )
+        .await;
+
+        let masked = with_entries_masked(row.case, &message, row.shape);
+        let quoted = vec!["<entry>"; count].join(", ");
+        let expected = format!(
+            "1 validation error detected: Value '[{quoted}]' at '{}' failed to satisfy \
+             constraint: {}",
+            row.path, row.requirement
+        );
+        assert_eq!(
+            masked, expected,
+            "case {:?}: expected message {expected:?}, got {masked:?} (raw {message:?})",
+            row.case
+        );
+    }
+
+    // The controls: a list INSIDE its bounds is accepted, so the clauses above reported
+    // the bound rather than the member. One endpoint, because the model declares a single
+    // `AccessEndpointType` and a list may name each type once
+    // (`src/state/access_endpoints.rs`), and one user setting, which is the minimum the
+    // empty row broke.
+    emulator
+        .ok(
+            "a create inside both bounds",
+            "CreateStack",
+            json!({
+                "Name": "inside-the-bounds",
+                "AccessEndpoints": [access_endpoint(0)],
+                "UserSettings": [{ "Action": "FILE_DOWNLOAD", "Permission": "DISABLED" }],
+            }),
+        )
+        .await;
 }
 

@@ -25,8 +25,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. EDITED HERE: a clause about a LIST member that broke its
+//!   modelled `@length` quotes the list the request carried rather than a count of
+//!   its elements ([`list_length_clause`]); every other refusal keeps the framework's
+//!   wording.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -51,6 +53,8 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 pub mod streaming_session;
+
+mod list_length_clause;
 
 use streaming_session::{Serves, StreamingSessionRoute};
 
@@ -154,16 +158,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The ONE rewording this service makes is the value half of a clause
+        // about a LIST member that broke its modelled `@length`: the walk has only a
+        // count of the elements to state there, and AWS quotes the list
+        // ([`list_length_clause`]). Every other clause, the requirement, the member
+        // path, the envelope and the status stay the framework's, and a refusal with no
+        // such clause keeps the framework's wording entirely.
+        list_length_clause::refused(refusal)
     }
 
     fn override_routing_error(

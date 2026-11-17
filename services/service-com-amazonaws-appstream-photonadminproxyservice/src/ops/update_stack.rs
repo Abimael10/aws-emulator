@@ -24,6 +24,11 @@
 //! refused `InvalidParameterValueException` (HTTP 400) and leaves the stored endpoints
 //! exactly as they were.
 //!
+//! `UpdateStack`'s own `AttributesToDelete` cannot ask for a field this request also SETS:
+//! that asks for two outcomes for one configuration, and is refused
+//! `InvalidParameterCombinationException` (HTTP 400) with AWS's sentence for the attribute
+//! both halves name ([`crate::state::stack_attribute_conflicts`]), storing nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -238,13 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Setting a field and deleting it in one request asks for two different
             // outcomes for the same field, which is an incorrect combination of
-            // parameters.
-            if let Some(member) = supplied_member(&input, attribute) {
+            // parameters, refused with AWS's sentence for the attribute both halves name
+            // ([`crate::state::stack_attribute_conflicts`]).
+            if supplied_member(&input, attribute).is_some() {
                 return Err(UpdateStackErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
-                        message: Some(format!(
-                            "{member} cannot be specified while AttributesToDelete \
-                             contains {attribute}"
+                        message: Some(crate::state::attribute_set_and_deleted_message(
+                            attribute,
                         )),
                     },
                 )
