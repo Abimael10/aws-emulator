@@ -23,6 +23,11 @@
 //! log configuration, a tenant or connection-mode setting) stays absent, which the
 //! `absent` column of each row pins.
 //!
+//! The last two sections carry the same rule over the two members the SERVICE itself
+//! settles rather than echoes: the `ViewerCertificate` settings CloudFront's own
+//! certificate decides, and the `TenantConfig$ParameterDefinitions` a configuration
+//! declares. Each states the rule it asserts where it begins.
+//!
 //! The table spans what the rule generalises over: the kind of origin (custom, S3), how a
 //! behaviour states its cache key (the legacy `ForwardedValues` or a cache policy), how
 //! many ordered cache behaviours and custom error responses there are, whether trusted key
@@ -30,19 +35,33 @@
 //! otherwise supply at all. Every row is asserted on the create answer, on the read, on
 //! the update answer and on the read after it — so resolution is also shown to be
 //! IDEMPOTENT: re-submitting a configuration does not resolve it twice.
+//!
+//! The certificate rule has a second half — what a distribution on a CUSTOM certificate
+//! reports — which the [`settled_members`] submodule asserts.
 
+use crate::connection_mode_immutable::get_distribution_config;
 use crate::distribution_lifecycle::{
     create_distribution, emulator, get_distribution, update_distribution, Answer, Node,
     API_VERSION,
 };
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::S_S_L_SUPPORT_METHOD_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
+    CERTIFICATE_SOURCE_ACM, CERTIFICATE_SOURCE_IAM,
     DEFAULT_CONNECTION_ATTEMPTS, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_DEFAULT_TTL,
     DEFAULT_ERROR_CACHING_MIN_TTL, DEFAULT_HTTP_VERSION, DEFAULT_MAX_TTL, DEFAULT_MIN_TTL,
     DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT, DEFAULT_ORIGIN_READ_TIMEOUT, DEFAULT_PRICE_CLASS,
     MAX_CACHE_BEHAVIORS, MAX_TRUSTED_KEY_GROUPS, MAX_TRUSTED_SIGNERS,
     MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE, SERVICE_ENDPOINT, SSL_SUPPORT_METHOD_SNI_ONLY,
 };
+/// The other half of the certificate rule the table below asserts: what a distribution on
+/// a CUSTOM certificate reports. A SUBMODULE so this file keeps one concern per section,
+/// and it reads this one's helpers through `use super::*` rather than copying them.
+///
+/// This file is itself declared with a `#[path]` (every suite of the one `all` target is),
+/// so a child module of it carries one too: without it the module would be looked for
+/// beside this file rather than under it.
+#[path = "distribution_config_defaults/settled_members.rs"]
+mod settled_members;
 
 /// A SigV4 credential scope naming this service's signing name, which routes a request
 /// here.
