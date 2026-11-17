@@ -69,7 +69,13 @@ const ACTION_PREFIX: &str = "scn";
 /// requirement, so a drift in the constant the handler answers from fails this suite
 /// instead of travelling with it.
 const INSTANCE_NOT_FOUND_SENTENCE: &str = "Instance not found.";
-const NAMESPACE_NOT_FOUND_SENTENCE: &str = "Namespace not found.";
+
+/// The namespace half of that family names the namespace the request addressed: its SOURCE
+/// is the recorded wire response of a namespace read, whose fixed text is "Namespace " /
+/// " not exist" with the name from the request.
+fn namespace_not_found_sentence(name: &str) -> String {
+    format!("Namespace {name} not exist")
+}
 
 /// This service beside the IAM and STS services on one shared engine, so the policies and
 /// the session a case seeds are the ones those services hold.
@@ -659,16 +665,16 @@ async fn an_arn_naming_no_stored_resource_is_a_not_found() {
     // Rows differ along WHICH part of the ARN names nothing: the instance, the namespace
     // under a live instance, the dataset under a namespace it has, and an ARN of another
     // account. Each carries the sentence this service answers a read of THAT resource with.
-    let rows: Vec<(&str, String, &str)> = vec![
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "an instance no store holds",
             instance_arn(absent_instance),
-            INSTANCE_NOT_FOUND_SENTENCE,
+            INSTANCE_NOT_FOUND_SENTENCE.to_string(),
         ),
         (
             "a namespace that was never created",
             format!("{}/namespaces/never_created", instance_arn(&instance_id)),
-            NAMESPACE_NOT_FOUND_SENTENCE,
+            namespace_not_found_sentence("never_created"),
         ),
         (
             "a dataset that was never created",
@@ -676,12 +682,12 @@ async fn an_arn_naming_no_stored_resource_is_a_not_found() {
                 "{}/namespaces/default/datasets/never_created",
                 instance_arn(&instance_id)
             ),
-            "Dataset never_created not exist in namespace default",
+            "Dataset never_created not exist in namespace default".to_string(),
         ),
         (
             "an instance ARN of another account",
             format!("arn:aws:{ACTION_PREFIX}:{REGION}:123456789012:instance/{instance_id}"),
-            "Resource not found.",
+            "Resource not found.".to_string(),
         ),
     ];
 

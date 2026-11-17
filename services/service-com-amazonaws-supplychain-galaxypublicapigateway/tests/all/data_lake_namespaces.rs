@@ -45,9 +45,14 @@ const REGION: &str = "us-east-1";
 const RESERVED_NAME_SENTENCE: &str =
     "Cannot create namespace with name starting with asc, default, scn, aws, amazon, amzn";
 
-/// The sentence a namespace read refuses a name the instance's data lake does not hold
-/// with — fixed, and echoing nothing of the request.
-const NAMESPACE_NOT_FOUND_SENTENCE: &str = "Namespace not found.";
+/// The sentence a namespace operation refuses a name the instance's data lake does not
+/// hold with, written out HERE rather than read from the crate: the wording is the
+/// requirement, so a drift in the function the handler answers from fails this suite
+/// instead of travelling with it. Its SOURCE is the recorded wire response of such a
+/// read, which names the namespace the request addressed and nothing else of it.
+fn namespace_not_found_sentence(name: &str) -> String {
+    format!("Namespace {name} not exist")
+}
 
 /// How long a poll loop waits for the condition it is about before giving up, and how long
 /// it waits between looks.
@@ -575,13 +580,14 @@ async fn reading_an_absent_namespace_is_a_not_found() {
             "case {name:?}: expected a ResourceNotFoundException envelope, got {body}"
         );
         let message = error_message(name, &body);
+        let expected = namespace_not_found_sentence(name);
         assert_eq!(
-            message, NAMESPACE_NOT_FOUND_SENTENCE,
-            "case {name:?}: expected {NAMESPACE_NOT_FOUND_SENTENCE:?}, got {message:?}"
+            message, expected,
+            "case {name:?}: expected {expected:?}, got {message:?}"
         );
         assert!(
-            !message.contains(name) && !message.contains(instance.as_str()),
-            "case {name:?}: the sentence must state nothing of the request: {message:?}"
+            !message.contains(instance.as_str()),
+            "case {name:?}: the sentence must not carry the instanceId: {message:?}"
         );
     }
 }

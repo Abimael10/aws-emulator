@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataLakeNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataLakeNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the data-lake namespace its URI addresses from the
+//! shared store ([`crate::state`]) and answers with the instance and name it removed, so
+//! `GetDataLakeNamespace` stops reporting it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataLakeNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A namespace that still holds datasets is NOT removed: the datasets are addressed
+//! through it, so the delete is refused and both the namespace and its datasets are left
+//! exactly as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataLakeNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataLakeNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataLakeNamespace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDataLakeNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data lake store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // ONE lock for the whole check-then-remove, so concurrent deletes of the same
+        // namespace serialize: exactly one of them removes the record, and every other
+        // one finds nothing and is refused as a not-found.
+        let mut store = state.lock();
+        // The transition the clock owed at `now`, which was due whether or not anybody
+        // called this operation.
+        store.materialize_due_transitions(now);
+
+        // The gateway authorizes an instance-scoped call against the instance BEFORE it
+        // looks the addressed resource up, so an `instanceId` naming no instance of this
+        // account is an authorization failure rather than a not-found.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(DeleteDataLakeNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A namespace the instance comes with is not a caller's to remove — the `name`
+        // member documents that those go only with the instance — so such a delete is a
+        // bad request rather than a removal or a not-found.
+        if crate::state::is_predefined_namespace(&input.name) {
+            return Err(DeleteDataLakeNamespaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::predefined_namespace_delete_message(
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A name this instance's data lake holds no namespace under names no namespace at
+        // all — including the name of one an earlier delete already removed, which is why
+        // the `@idempotent` trait does not make a repeat delete succeed.
+        if store.namespace(&input.instance_id, &input.name).is_none() {
+            return Err(
+                DeleteDataLakeNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::namespace_not_found_message(&input.name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every dataset of this namespace is addressed THROUGH it, so a namespace that
+        // still holds one cannot be removed: the delete is refused and the caller is told
+        // to remove the datasets first. Nothing is written on this path, so the namespace
+        // and its datasets stay readable exactly as they were.
+        if store.namespace_dataset_count(&input.instance_id, &input.name) > 0 {
+            return Err(DeleteDataLakeNamespaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::namespace_not_empty_message(&input.name)),
+                },
+            )
+            .into());
+        }
+
+        store
+            .namespaces
+            .remove(&crate::state::namespace_key(&input.instance_id, &input.name));
+
+        // The response names the namespace this call removed, from the pair that
+        // addressed it.
+        Ok(DeleteDataLakeNamespaceOutput {
+            instance_id: input.instance_id,
+            name: input.name,
+        })
     }
 }

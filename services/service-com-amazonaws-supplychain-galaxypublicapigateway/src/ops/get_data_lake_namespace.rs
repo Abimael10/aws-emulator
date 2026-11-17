@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetDataLakeNamespaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::NAMESPACE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::namespace_not_found_message(&input.name)),
                 },
             )
             .into()),

@@ -17,6 +17,8 @@ mod bill_of_materials_import_jobs;
 mod constraint_refusal_wording;
 #[path = "all/data_integration_event_sends.rs"]
 mod data_integration_event_sends;
+#[path = "all/data_integration_event_send.rs"]
+mod data_integration_event_send;
 #[path = "all/data_integration_events.rs"]
 mod data_integration_events;
 #[path = "all/data_integration_flows.rs"]
@@ -27,6 +29,8 @@ mod data_lake_dataset_listing;
 mod data_lake_dataset_refusal_wording;
 #[path = "all/data_lake_datasets.rs"]
 mod data_lake_datasets;
+#[path = "all/data_lake_namespace_deletion.rs"]
+mod data_lake_namespace_deletion;
 #[path = "all/data_lake_namespace_listing.rs"]
 mod data_lake_namespace_listing;
 #[path = "all/data_lake_namespaces.rs"]

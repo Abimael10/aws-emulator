@@ -708,7 +708,7 @@ async fn an_unknown_instance_or_namespace_is_refused_rather_than_answered_as_an_
         );
         assert_eq!(
             error_message(case, &body),
-            "Namespace not found.",
+            format!("Namespace {namespace} not exist"),
             "case {case:?}: the refusal must carry the service's not-found sentence"
         );
     }

@@ -55,9 +55,10 @@ pub const INSTANCE_STATE_DELETING: &str = "Deleting";
 ///
 /// Its SOURCE is the recorded wire response of such a call: the sentence is FIXED — it
 /// names the resource kind and nothing else, and in particular does not echo the
-/// `instanceId` the request asked about, the same way the service's other recorded
-/// not-found sentences carry no request value ([`NAMESPACE_NOT_FOUND_MESSAGE`],
-/// [`FLOW_NOT_FOUND_MESSAGE`]). Stated once, here, so no instance-scoped handler can
+/// `instanceId` the request asked about, as the flow read ([`FLOW_NOT_FOUND_MESSAGE`])
+/// answers too. (The namespace and dataset refusals are recorded NAMING their resource —
+/// see [`namespace_not_found_message`] — so this family is read from each recording
+/// rather than assumed uniform.) Stated once, here, so no instance-scoped handler can
 /// drift into a sentence of its own for this one refusal.
 pub const INSTANCE_NOT_FOUND_MESSAGE: &str = "Instance not found.";
 
@@ -346,13 +347,35 @@ pub fn instance_authorization_failure_message(instance_id: &str) -> String {
     )
 }
 
-/// How a namespace read refuses a name this instance's data lake does not hold.
+/// How a namespace operation refuses a name this instance's data lake does not hold
+/// (`ResourceNotFoundException`, HTTP 404).
 ///
-/// Its SOURCE is the recorded wire response of this service's not-found refusals, which
-/// carry a FIXED sentence and echo nothing from the request (the instance reads answer
-/// "Instance not found." the same way). Stated once, here, so the namespace operations
-/// cannot drift into several sentences for one refusal.
-pub const NAMESPACE_NOT_FOUND_MESSAGE: &str = "Namespace not found.";
+/// Its SOURCE is the recorded wire response of a namespace read and of a namespace delete
+/// addressed to a name the data lake does not hold: the FIXED text is "Namespace " and
+/// " not exist" — the service capitalises the resource noun and writes the uninflected
+/// "not exist", exactly as the sibling dataset refusal ([`dataset_not_found_message`])
+/// does — and the only interpolated part is the namespace name, the `name` `@httpLabel`
+/// of the namespace URI. The `instanceId`, though part of the resource identity, is NOT
+/// part of the sentence. Stated once, here, so the namespace operations cannot drift into
+/// several sentences for one refusal.
+pub fn namespace_not_found_message(name: &str) -> String {
+    format!("Namespace {name} not exist")
+}
+
+/// How a namespace delete refuses a namespace that still holds at least one dataset
+/// (`ValidationException`, HTTP 400).
+///
+/// Its SOURCE is the recorded wire response of such a delete: the namespace and its
+/// datasets are left untouched and the caller is told both what blocks the delete and
+/// what to do about it. The FIXED text is "Datasets found under the namespace " and
+/// ". Please delete them before deleting the namespace"; the only interpolated part is the
+/// namespace name from the request.
+pub fn namespace_not_empty_message(name: &str) -> String {
+    format!(
+        "Datasets found under the namespace {name}. Please delete them before deleting the \
+         namespace"
+    )
+}
 
 /// How a paginated read of this service refuses a `nextToken` it did not issue.
 ///
@@ -494,6 +517,22 @@ pub const PREDEFINED_NAMESPACES: [&str; 2] = ["asc", "default"];
 /// Whether `namespace` is one an instance comes with ([`PREDEFINED_NAMESPACES`]).
 pub fn is_predefined_namespace(namespace: &str) -> bool {
     PREDEFINED_NAMESPACES.contains(&namespace)
+}
+
+/// The sentence a delete addressed to a namespace the instance comes with is refused
+/// with (`ValidationException`, HTTP 400) — one of [`PREDEFINED_NAMESPACES`], which is
+/// what [`is_predefined_namespace`] decides, so the refusal and the rule cannot drift
+/// apart.
+///
+/// SOURCE: the `name` member of `DeleteDataLakeNamespaceRequest` — "Noted you cannot
+/// delete pre-defined namespace like asc, default which are only deleted through instance
+/// deletion" — which is why such a delete is a bad request rather than a not-found: the
+/// namespace exists, it is just not a caller's to remove. The namespace the request
+/// addressed is the only interpolated part, as it is in this service's other namespace
+/// refusals. No recording fixes AWS's own wording for this one, so a later reader
+/// re-verifies it against one.
+pub fn predefined_namespace_delete_message(name: &str) -> String {
+    format!("Cannot delete pre-defined namespace {name}")
 }
 
 /// How a dataset operation refuses a dataset this instance's data lake does not hold
@@ -670,8 +709,8 @@ impl DataIntegrationEventRecord {
 ///
 /// No recording fixes this sentence, so its FORM is this service's recorded not-found
 /// family — one fixed sentence naming the resource and echoing nothing from the request, as
-/// the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) and the namespace read
-/// ([`NAMESPACE_NOT_FOUND_MESSAGE`]) answer. Stated once, here, and re-verified against a
+/// the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) and the flow read
+/// ([`FLOW_NOT_FOUND_MESSAGE`]) answer. Stated once, here, and re-verified against a
 /// recording when one covers this read.
 pub const EVENT_NOT_FOUND_MESSAGE: &str = "Event not found.";
 
@@ -806,8 +845,8 @@ pub fn flow_configuration_problem(
 ///
 /// No recording fixes this sentence, so its FORM is this service's recorded not-found
 /// family — one fixed sentence naming the resource and echoing nothing from the request,
-/// as the recorded instance read ("Instance not found.") and the namespace read
-/// ([`NAMESPACE_NOT_FOUND_MESSAGE`]) both answer; the flow CONFLICT sentence
+/// as the recorded instance read ("Instance not found.") answers; the flow CONFLICT
+/// sentence
 /// ([`flow_conflict_message`]) is worded by its own class, which is why it is not the
 /// model for this one. Stated once, here, so the flow operations cannot drift into
 /// several sentences for one refusal, and re-verified against a recording when one
@@ -879,10 +918,9 @@ impl DataIntegrationFlowRecord {
 ///
 /// No recording fixes this sentence, so its FORM is this service's recorded not-found
 /// family — one fixed sentence naming the resource and echoing nothing from the request,
-/// as the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]), the namespace read
-/// ([`NAMESPACE_NOT_FOUND_MESSAGE`]) and the flow read ([`FLOW_NOT_FOUND_MESSAGE`]) all
-/// answer. Stated once, here, and re-verified against a recording when one covers this
-/// read.
+/// as the instance read ([`INSTANCE_NOT_FOUND_MESSAGE`]) and the flow read
+/// ([`FLOW_NOT_FOUND_MESSAGE`]) answer. Stated once, here, and re-verified against a
+/// recording when one covers this read.
 pub const FLOW_EXECUTION_NOT_FOUND_MESSAGE: &str = "Flow execution not found.";
 
 /// The key one flow execution is stored under: its instance, its flow's name, then its
@@ -1026,7 +1064,7 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// The sentence is the one this service answers a read of THAT KIND of resource with, so a
 /// tag call and a read of the same resource report one not-found rather than two: an
 /// instance ARN gets [`INSTANCE_NOT_FOUND_MESSAGE`], a namespace ARN
-/// [`NAMESPACE_NOT_FOUND_MESSAGE`], a dataset ARN [`dataset_not_found_message`]. An ARN
+/// [`namespace_not_found_message`], a dataset ARN [`dataset_not_found_message`]. An ARN
 /// whose resource portion names no resource kind this service mints
 /// ([`tagged_resource`] reads none) gets the same sentence stated for the resource it
 /// failed to name, which keeps the family's form — a fixed sentence naming the resource and
@@ -1034,7 +1072,7 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 pub fn resource_not_found_message(arn: &str) -> String {
     match tagged_resource(arn) {
         Some(TaggedResource::Instance(_)) => INSTANCE_NOT_FOUND_MESSAGE.to_string(),
-        Some(TaggedResource::Namespace(_)) => NAMESPACE_NOT_FOUND_MESSAGE.to_string(),
+        Some(TaggedResource::Namespace((_, name))) => namespace_not_found_message(&name),
         Some(TaggedResource::Dataset((_, namespace, name))) => {
             dataset_not_found_message(&name, &namespace)
         }
@@ -1236,6 +1274,13 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
             .map(|(_, record)| record)
     }
 
+    /// How many datasets `instance_id` holds under the namespace `namespace` — the length
+    /// of the span [`Self::namespace_datasets_from`] walks, which is what a namespace
+    /// delete has to find empty.
+    pub fn namespace_dataset_count(&self, instance_id: &str, namespace: &str) -> usize {
+        self.namespace_datasets_from(instance_id, namespace, "").count()
+    }
+
     /// Drop every dataset of `instance_id`: a dataset is addressed by its instance, so
     /// none of them outlives the instance whose deletion removed it.
     pub fn drop_instance_datasets(&mut self, instance_id: &str) {
@@ -1271,7 +1316,9 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// Drop every data-integration event of `instance_id`: an event is addressed by its
     /// instance (and by nothing else), so none of them outlives the instance whose
     /// deletion removed it — the same rule, and the same reason, as
-    /// [`Self::drop_instance_datasets`] and [`Self::drop_instance_namespaces`].
+    /// [`Self::drop_instance_datasets`] and [`Self::drop_instance_namespaces`]. The
+    /// idempotency entries naming those events go with them, so a token cannot outlive
+    /// the event it names.
     pub fn drop_instance_events(&mut self, instance_id: &str) {
         self.events
             .retain(|(instance, _), _| instance != instance_id);
