@@ -9,14 +9,14 @@
 //! reached from [`crate::service`]'s `override_refusal`, the one seam that sees a refusal
 //! taken before dispatch.
 //!
-//! Five rules distinguish this service's wording from the framework's default. Two are keyed
+//! Six rules distinguish this service's wording from the framework's default. Two are keyed
 //! to the OPERATION as well as to what was refused — the references this service resolves
 //! itself, one half of which is a reference only on an operation acting on a resource that
 //! already exists, and the rule-group type, which is a parameter of its own only on an
 //! operation that writes a rule group — and the next two are keyed to nothing at all, so each
-//! of those holds for every constrained member of every operation of this service; rule 3 is
-//! keyed to the SHAPE a member targets, since what a requirement states about a shape is a
-//! property of that shape:
+//! of those holds for every constrained member of every operation of this service; rules 3 and
+//! 5 are keyed to the SHAPE a member targets, since what a requirement states about a shape is
+//! a property of that shape:
 //!
 //! 0. a value in a member that carries a RESOURCE REFERENCE this service resolves itself
 //!    ([`REFERENCE_ARN_MEMBERS`], [`REFERENCE_NAME_MEMBERS`]), refused because it is outside
@@ -58,6 +58,13 @@
 //!    refused with: such a request never reaches the operation, so it is answered with that
 //!    constraint's clause alone. On every operation that takes the same member to pick which
 //!    rule groups to act on, a refused value keeps the clause rule 3 states it in.
+//! 5. a member the request OMITTED, whose target is a NUMBER, is stated as the requirement the
+//!    ZERO a numeric slot defaults to breaks — the `@range` bound the model declares on that
+//!    member, below which that zero sits ([`NUMBER_VALUED_SHAPES`]) — because the boundary
+//!    reads such a member into a slot that already holds zero, so an omitted number and a
+//!    submitted zero are one value to it. A member whose own range ADMITS zero, and one whose
+//!    target is no number at all (a string, a list, a structure — each read into a slot that
+//!    holds nothing), break no bound by being absent and keep the absent-member clause.
 //!
 //! Rules 1 and 2 are AWS's own wording rather than this service's, and both are implemented
 //! once for the fleet in `service_common::validation_message`, which this module DELEGATES to
@@ -67,8 +74,8 @@
 //! sentence stay the framework's and that module's. So does the `@pattern` rendering rule 3
 //! names: `service_common::validation` carries one function per dialect the fleet's
 //! recordings show, and this service states WHICH of them it is recorded in. Rules 0 and 4, the
-//! value sets of rule 3, and that choice are the only wording this service owns, because what
-//! each states is a fact about THIS service.
+//! value sets of rule 3, the zero-default reading of rule 5, and that choice are the only
+//! wording this service owns, because what each states is a fact about THIS service.
 //!
 //! One limit of that shared rendering, which it states too: an element set is read off the
 //! operation input schemas codegen derives from the model, and a member schema carries its own
@@ -77,7 +84,7 @@
 //! requirement its element broke.
 
 use ::aws_smithy_schema::Schema;
-use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use ::aws_smithy_schema_server::constraints::{path, RangeTrait, Violation, ViolationKind};
 use ::smithy_server_runtime::{Refusal, Refused};
 
 /// The ARN members that carry a RESOURCE REFERENCE this service resolves itself, as a
@@ -335,9 +342,13 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
             message: crate::state::INVALID_RULE_GROUP_TYPE_MESSAGE.to_owned(),
         });
     }
-    // Rule 3 is applied to the violations BEFORE the clauses are rendered, so the clause
-    // itself, its member path and the words around the value set stay the framework's.
-    let stated: Vec<Violation> = declared.iter().map(in_service_value_set).collect();
+    // Rules 3 and 5 are applied to the violations BEFORE the clauses are rendered, so the
+    // clause itself, its member path and the words around the requirement stay the framework's.
+    let stated: Vec<Violation> = declared
+        .iter()
+        .map(in_service_value_set)
+        .map(|violation| as_the_zero_default_breaks(&violation))
+        .collect();
     service_common::validation_message::aws_validation_refusal_over_elements_withholding(
         &Refusal::Invalid(stated),
         INPUT_SCHEMAS,
@@ -432,6 +443,116 @@ fn in_service_value_set(violation: &Violation) -> Violation {
     Violation {
         kind: ViolationKind::EnumValue(stated_value_set(declared)),
         ..violation.clone()
+    }
+}
+
+/// The structures of this service's request documents that declare a NUMBER-valued member,
+/// as the schemas codegen derives from the Smithy model.
+///
+/// What they are read for: rule 5 states what the zero a numeric slot defaults to breaks, and
+/// the bound it breaks is a property of the MODEL rather than of one request — a refusal for an
+/// absent member carries no bound at all. Reading each bound off the member's own schema is
+/// what keeps the number in the clause the model's: nothing here spells one out.
+///
+/// The set is every structure a request can carry a number in whose member the model marks
+/// `@required`, so the rule is stated wherever it holds rather than for the one member a
+/// recording named (`smithy_query(query="closure",operation="CreateFirewallPolicy,CreateRuleGroup")`:
+/// `StatelessRuleGroupReference$Priority` and `StatelessRule$Priority` target `Priority`,
+/// `@range` 1..65535; `PortRange$FromPort` and `$ToPort` target `PortRangeBound`, `@range`
+/// 0..65535 — whose own bound ADMITS zero, so an absent one keeps the absent-member clause).
+/// Every other number a request of this service can carry sits in an OPTIONAL member — the
+/// proxy rule and rule-group positions (`ProxyRulePriority$NewPosition`,
+/// `ProxyRuleGroupPriority$NewPosition`), a page size, a flow age, an idle timeout — and an
+/// optional member is never reported absent, so no other structure of a request document
+/// declares one of the member names above under a bound of its own.
+const NUMBER_VALUED_SHAPES: &[&Schema] = {
+    use crate::ops::types;
+
+    &[
+        types::STATELESS_RULE_GROUP_REFERENCE_SCHEMA,
+        types::STATELESS_RULE_SCHEMA,
+        types::PORT_RANGE_SCHEMA,
+    ]
+};
+
+/// Rule 5: `violation` stated as the constraint the ZERO a numeric slot defaults to breaks,
+/// and unchanged wherever that zero breaks nothing.
+///
+/// Only an ABSENT member is restated, and only when it is a number whose `@range` does not
+/// admit zero: the member path, the constraint class and the clause's words all keep coming
+/// from the one place that writes them, and so does the bound, read off the model
+/// ([`NUMBER_VALUED_SHAPES`]).
+fn as_the_zero_default_breaks(violation: &Violation) -> Violation {
+    if !matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+        return violation.clone();
+    }
+    let Some(range) = declared_range(member_at(&violation.path)) else {
+        return violation.clone();
+    };
+    // The value under test is the zero a numeric slot holds before anything is read into it,
+    // so the bound it breaks is the minimum when zero sits below it and the maximum when zero
+    // sits above it; a range that admits zero breaks nothing.
+    let kind = match (range.min, range.max) {
+        (Some(min), _) if ZERO < min => ViolationKind::MinValue(bound(min)),
+        (_, Some(max)) if ZERO > max => ViolationKind::MaxValue(bound(max)),
+        _ => return violation.clone(),
+    };
+    Violation {
+        kind,
+        ..violation.clone()
+    }
+}
+
+/// The value a numeric member holds when the request carried none.
+const ZERO: f64 = 0.0;
+
+/// The member a violation PATH is about: its last segment, which a path ends on whichever
+/// collection or structure the member sits inside.
+fn member_at(path: &str) -> &str {
+    path.rsplit('.').next().unwrap_or(path)
+}
+
+/// The `@range` the model declares on the member spelled `member` (lowerCamel, as a violation
+/// path spells it), when every structure declaring that member declares the same one; `None`
+/// for a member no [`NUMBER_VALUED_SHAPES`] entry declares, for one carrying no `@range`, and
+/// for one whose shapes disagree — where no single bound is this service's to state.
+fn declared_range(member: &str) -> Option<RangeTrait> {
+    let mut found: Option<RangeTrait> = None;
+    for shape in NUMBER_VALUED_SHAPES {
+        for declared in shape.members() {
+            if declared.member_name().map(path::member).as_deref() != Some(member) {
+                continue;
+            }
+            let Some(range) = range_of(declared) else {
+                continue;
+            };
+            match found {
+                Some(carried) if carried != range => return None,
+                _ => found = Some(range),
+            }
+        }
+    }
+    found
+}
+
+/// The `@range` carried on one member's schema, when the model declares one on it.
+fn range_of(member: &Schema) -> Option<RangeTrait> {
+    member
+        .traits()?
+        .get(&RangeTrait::TRAIT_ID)?
+        .as_any()
+        .downcast_ref::<RangeTrait>()
+        .copied()
+}
+
+/// A `@range` bound as a requirement states it — an integral bound with no trailing `.0` —
+/// which is the rendering the framework gives the same bound when the walk reports the
+/// violation itself.
+fn bound(value: f64) -> String {
+    if value.is_finite() && value.fract() == ZERO {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
     }
 }
 
@@ -602,5 +723,125 @@ mod tests {
                 "case {kind:?}: expected the violation unchanged, got {stated:?}"
             );
         }
+    }
+
+    /// RULE: an ABSENT member is stated as the requirement the zero a numeric slot defaults
+    /// to breaks, and left alone wherever that zero breaks nothing.
+    ///
+    /// The rows span: the two members whose target's range excludes zero, each at the path a
+    /// different structure and element position gives it; a required number whose own range
+    /// admits zero; a required member that is no number; and a member name no shape of this
+    /// service declares. The bounds come from the model through [`declared_range`], so no row
+    /// states one.
+    #[test]
+    fn an_absent_number_takes_the_requirement_its_zero_default_breaks() {
+        // (case, the violation path, the class stated for it)
+        let rows: &[(&str, &str, ViolationKind)] = &[
+            (
+                "a reference's priority inside a policy document",
+                "firewallPolicy.statelessRuleGroupReferences.1.member.priority",
+                ViolationKind::MinValue("1".to_owned()),
+            ),
+            (
+                "a reference's priority at another element position",
+                "firewallPolicy.statelessRuleGroupReferences.7.member.priority",
+                ViolationKind::MinValue("1".to_owned()),
+            ),
+            (
+                "a stateless rule's priority inside a rule-group document",
+                "ruleGroup.rulesSource.statelessRulesAndCustomActions.statelessRules.1.member.\
+                 priority",
+                ViolationKind::MinValue("1".to_owned()),
+            ),
+            (
+                "a port-range bound, whose range admits zero",
+                "ruleGroup.rulesSource.statelessRulesAndCustomActions.statelessRules.1.member.\
+                 ruleDefinition.matchAttributes.sourcePorts.1.member.fromPort",
+                ViolationKind::MissingRequiredMember,
+            ),
+            (
+                "a rule-group capacity, a number with no declared range",
+                "capacity",
+                ViolationKind::MissingRequiredMember,
+            ),
+            (
+                "a required string",
+                "firewallPolicyArn",
+                ViolationKind::MissingRequiredMember,
+            ),
+            (
+                "a member no shape of this service declares",
+                "somethingElse",
+                ViolationKind::MissingRequiredMember,
+            ),
+        ];
+        for (case, path, expected) in rows {
+            let violation = Violation {
+                path: (*path).to_owned(),
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+                sensitive: false,
+            };
+            let stated = as_the_zero_default_breaks(&violation);
+            assert_eq!(
+                &stated.kind, expected,
+                "case {case}: expected {expected:?}, got {:?}",
+                stated.kind
+            );
+            assert_eq!(
+                stated.path, violation.path,
+                "case {case}: expected the member path kept, got {:?}",
+                stated.path
+            );
+        }
+    }
+
+    /// RULE: only an ABSENT member is restated this way; a violation of any other class
+    /// reaches the shared rendering exactly as the walk reported it, whatever member it names.
+    #[test]
+    fn no_other_violation_class_takes_the_zero_default_reading() {
+        for kind in [
+            ViolationKind::MinValue("1".to_owned()),
+            ViolationKind::MaxValue("65535".to_owned()),
+            ViolationKind::MinLength(1),
+            ViolationKind::Pattern("^arn:aws".to_owned()),
+            ViolationKind::EnumValue(vec!["STRICT_ORDER".to_owned()]),
+            ViolationKind::UniqueItems,
+        ] {
+            let violation = Violation {
+                path: "firewallPolicy.statelessRuleGroupReferences.1.member.priority".to_owned(),
+                kind: kind.clone(),
+                value: Some("0".to_owned()),
+                sensitive: false,
+            };
+            let stated = as_the_zero_default_breaks(&violation);
+            assert_eq!(
+                stated, violation,
+                "case {kind:?}: expected the violation unchanged, got {stated:?}"
+            );
+        }
+    }
+
+    /// The bound a requirement states is READ OFF the model, so the two members whose target
+    /// is the priority shape carry the same one and a member of another numeric shape carries
+    /// its own.
+    #[test]
+    fn a_declared_range_comes_from_the_members_own_schema() {
+        let priority = declared_range("priority").expect("the priority members declare a range");
+        assert_eq!(
+            (priority.min, priority.max),
+            (Some(1.0), Some(65535.0)),
+            "case priority: expected the modelled range, got {priority:?}"
+        );
+        let from_port = declared_range("fromPort").expect("a port-range bound declares a range");
+        assert_eq!(
+            (from_port.min, from_port.max),
+            (Some(0.0), Some(65535.0)),
+            "case fromPort: expected the modelled range, got {from_port:?}"
+        );
+        assert!(
+            declared_range("resourceArn").is_none(),
+            "case resourceArn: expected no range on a member that is no number"
+        );
     }
 }

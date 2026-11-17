@@ -4,7 +4,7 @@
 //! runs: which error class the refusal names, which body member carries its text, and how
 //! that text quotes the constraint.
 //!
-//! Four rules, each a property of the MEMBER or of the CONSTRAINT rather than of one request,
+//! Five rules, each a property of the MEMBER or of the CONSTRAINT rather than of one request,
 //! so every test below is a TABLE whose rows span the class its rule covers:
 //!
 //! * a value in a member an operation uses to IDENTIFY a resource that already exists — the
@@ -24,7 +24,11 @@
 //!   pagination token, and the model's own text — anchors and all — for every other shape;
 //! * a requirement enumerating an enumerated type's value set states the set in the order
 //!   this service states it, which for the generated-rules type of a domain-list rule group
-//!   is not the model's declaration order.
+//!   is not the model's declaration order;
+//! * a value outside a `@range` is stated as the range violation it is, and a member the
+//!   request OMITTED is stated as the requirement the zero a numeric slot defaults to breaks —
+//!   so an absent number whose range excludes zero reads as that range's bound, while a member
+//!   whose absence breaks no declared bound keeps the absent-member requirement.
 //!
 //! Every test drives the service the way a client does, through the shared [`Harness`] in
 //! `crate::harness`: an awsJson1_0 `POST /` with
@@ -463,10 +467,10 @@ async fn an_enumerated_value_set_is_stated_in_the_order_the_service_states_it() 
 /// supplied integer below the minimum is not an absent member, however small it is.
 ///
 /// The rows differ along where the integer sits (inside a structure element of a list, at the
-/// top level), which end of the range it broke, and the operation; and the last row supplies
-/// the same member correctly, so the request is served rather than refused. The bounds are
-/// the model's, read with
-/// `smithy_query(query="shape",shape="Priority,PaginationMaxResults")`.
+/// top level), which end of the range it broke, and the operation. The bounds are the model's,
+/// read with `smithy_query(query="shape",shape="Priority,PaginationMaxResults")`. What an
+/// OMITTED number is stated as is the companion rule, pinned by
+/// [`an_absent_number_is_stated_as_the_bound_its_zero_default_breaks`].
 #[tokio::test]
 async fn a_supplied_integer_below_the_minimum_is_a_range_violation() {
     let harness = Harness::new();
@@ -526,36 +530,151 @@ async fn a_supplied_integer_below_the_minimum_is_a_range_violation() {
             "case {case}: expected the message {expected:?}, got {actual:?}"
         );
     }
+}
 
-    // The member is absent, not out of range: that one IS the required-member refusal, so
-    // the two readings are told apart in both directions.
-    let absent = json!({
-        "FirewallPolicyName": "p-four",
-        "FirewallPolicy": {
+/// RULE: a member the request OMITTED whose target is a NUMBER is stated as the requirement
+/// the zero a numeric slot defaults to breaks — the `@range` bound the model declares on that
+/// member — and the absent-member requirement is stated for a member whose absence breaks no
+/// declared bound: a number whose own range admits zero, a number the model gives no range,
+/// and a member that is no number at all.
+///
+/// The rows differ along what the rule generalises over: which structure the absent member
+/// sits in and how deep (a reference inside a policy document, a rule inside a rule-group
+/// document, a port range nested three structures below that), the ELEMENT position the
+/// structure holds, the operation (two creates and an update), and, for the other side of the
+/// rule, the target's own kind and bound. The bounds are the model's, read with
+/// `smithy_query(query="closure",operation="CreateFirewallPolicy,CreateRuleGroup")`:
+/// `Priority` is `@range` 1..65535, `PortRangeBound` is 0..65535 and `RuleCapacity` carries no
+/// range at all.
+#[tokio::test]
+async fn an_absent_number_is_stated_as_the_bound_its_zero_default_breaks() {
+    let harness = Harness::new();
+    let reference = |priority: Option<i64>| match priority {
+        Some(priority) => {
+            json!({ "ResourceArn": stateless_rule_group_arn("rg-one"), "Priority": priority })
+        }
+        None => json!({ "ResourceArn": stateless_rule_group_arn("rg-one") }),
+    };
+    let policy = |references: Value| {
+        json!({
             "StatelessDefaultActions": ["aws:forward_to_sfe"],
             "StatelessFragmentDefaultActions": ["aws:forward_to_sfe"],
-            "StatelessRuleGroupReferences": [
-                { "ResourceArn": stateless_rule_group_arn("rg-one") },
-            ],
-        },
-    });
-    let expected = one_error(&clause(
-        "firewallPolicy.statelessRuleGroupReferences.1.member.priority",
-        "Member must not be null",
-    ));
-    let (status, parsed) = harness.call("CreateFirewallPolicy", &absent).await;
-    assert_eq!(
-        (status, error_code(&parsed).as_str()),
-        (400, VALIDATION_EXCEPTION),
-        "case an absent priority: expected 400 {VALIDATION_EXCEPTION}, got {status} with body \
-         {parsed:?}"
-    );
-    let actual = rendered_message(&parsed);
-    assert_eq!(
-        actual,
-        Some(expected.as_str()),
-        "case an absent priority: expected the message {expected:?}, got {actual:?}"
-    );
+            "StatelessRuleGroupReferences": references,
+        })
+    };
+    // A stateless rule group document whose one rule carries `rule`, so a row can leave a
+    // member off the rule itself or off a port range nested under it.
+    let stateless_group = |rule: Value| {
+        json!({
+            "RuleGroupName": "rg-one",
+            "Type": "STATELESS",
+            "Capacity": 10,
+            "RuleGroup": { "RulesSource": { "StatelessRulesAndCustomActions": {
+                "StatelessRules": [rule],
+            }}},
+        })
+    };
+    let rule_definition = |ports: Value| {
+        json!({ "Actions": ["aws:pass"], "MatchAttributes": { "SourcePorts": ports } })
+    };
+    // (case, operation, request body, member path, the requirement expected)
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "an absent priority on a reference inside a policy document",
+            "CreateFirewallPolicy",
+            json!({ "FirewallPolicyName": "p-one", "FirewallPolicy": policy(json!([reference(None)])) }),
+            "firewallPolicy.statelessRuleGroupReferences.1.member.priority",
+            "Member must have value greater than or equal to 1",
+        ),
+        (
+            "an absent priority on the second reference, beside one that carries it",
+            "CreateFirewallPolicy",
+            json!({
+                "FirewallPolicyName": "p-two",
+                "FirewallPolicy": policy(json!([reference(Some(1)), reference(None)])),
+            }),
+            "firewallPolicy.statelessRuleGroupReferences.2.member.priority",
+            "Member must have value greater than or equal to 1",
+        ),
+        (
+            "an absent priority on the update of a policy",
+            "UpdateFirewallPolicy",
+            json!({
+                "FirewallPolicyName": "p-three",
+                "UpdateToken": "00000000-0000-0000-0000-000000000000",
+                "FirewallPolicy": policy(json!([reference(None)])),
+            }),
+            "firewallPolicy.statelessRuleGroupReferences.1.member.priority",
+            "Member must have value greater than or equal to 1",
+        ),
+        (
+            "an absent priority on a rule inside a rule-group document",
+            "CreateRuleGroup",
+            stateless_group(json!({ "RuleDefinition": rule_definition(json!([])) })),
+            "ruleGroup.rulesSource.statelessRulesAndCustomActions.statelessRules.1.member.priority",
+            "Member must have value greater than or equal to 1",
+        ),
+        (
+            // The other side of the rule: a required number whose own range ADMITS the zero,
+            // so being absent breaks no bound and the absent-member requirement stands.
+            "an absent port-range bound, whose range admits zero",
+            "CreateRuleGroup",
+            stateless_group(json!({
+                "Priority": 1,
+                "RuleDefinition": rule_definition(json!([{ "ToPort": 80 }])),
+            })),
+            "ruleGroup.rulesSource.statelessRulesAndCustomActions.statelessRules.1.member.\
+             ruleDefinition.matchAttributes.sourcePorts.1.member.fromPort",
+            "Member must not be null",
+        ),
+        (
+            // A required number the model gives no range at all.
+            "an absent rule-group capacity, a number with no declared range",
+            "CreateRuleGroup",
+            json!({
+                "RuleGroupName": "rg-two",
+                "Type": "STATEFUL",
+                "RuleGroup": { "RulesSource": { "RulesString": "pass tcp any any -> any any (sid:1;)" } },
+            }),
+            "capacity",
+            "Member must not be null",
+        ),
+        (
+            // A required member that is no number: its slot holds nothing, not a zero.
+            "an absent policy reference on the create of a firewall, a required string",
+            "CreateFirewall",
+            json!({ "FirewallName": "fw-one", "VpcId": "vpc-0123abcd" }),
+            "firewallPolicyArn",
+            "Member must not be null",
+        ),
+        (
+            // One more non-number: a required list.
+            "an absent default-action list inside a policy document",
+            "CreateFirewallPolicy",
+            json!({
+                "FirewallPolicyName": "p-four",
+                "FirewallPolicy": { "StatelessDefaultActions": ["aws:forward_to_sfe"] },
+            }),
+            "firewallPolicy.statelessFragmentDefaultActions",
+            "Member must not be null",
+        ),
+    ];
+
+    for (case, target, body, member, requirement) in rows {
+        let expected = one_error(&clause(member, requirement));
+        let (status, parsed) = harness.call(target, &body).await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, VALIDATION_EXCEPTION),
+            "case {case}: expected 400 {VALIDATION_EXCEPTION}, got {status} with body {parsed:?}"
+        );
+        let actual = rendered_message(&parsed);
+        assert_eq!(
+            actual,
+            Some(expected.as_str()),
+            "case {case}: expected the message {expected:?}, got {actual:?}"
+        );
+    }
 }
 
 /// RULE: these refusal rules replace no part of the request walk — a request inside every
