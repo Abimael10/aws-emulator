@@ -315,6 +315,94 @@ const TEMPLATES: &[PolicyTemplate] = &[
     },
 ];
 
+/// Every policy template the published catalogue NAMES, as the "AWS SAM policy templates"
+/// reference lists them.
+///
+/// The names alone, because a name is what decides whether a `Policies` entry applies a
+/// template at all ([`is_published`], which the transform's validation asks before it reports
+/// an entry as no policy): an entry naming one of these is a template the macro accepts, and
+/// one naming anything else is an entry it can make nothing of. [`TEMPLATES`] is the subset
+/// whose DOCUMENT this module carries, and every one of its names is here — the test below
+/// pins that.
+const PUBLISHED_TEMPLATE_NAMES: &[&str] = &[
+    "AMIDescribePolicy",
+    "AWSSecretsManagerGetSecretValuePolicy",
+    "AWSSecretsManagerRotationPolicy",
+    "AthenaQueryPolicy",
+    "CloudFormationDescribeStacksPolicy",
+    "CloudWatchDashboardPolicy",
+    "CloudWatchDescribeAlarmHistoryPolicy",
+    "CloudWatchPutMetricPolicy",
+    "CodeCommitCrudPolicy",
+    "CodeCommitReadPolicy",
+    "CodePipelineLambdaExecutionPolicy",
+    "CodePipelineReadOnlyPolicy",
+    "ComprehendBasicAccessPolicy",
+    "DynamoDBBackupFullAccessPolicy",
+    "DynamoDBCrudPolicy",
+    "DynamoDBReadPolicy",
+    "DynamoDBReconfigurePolicy",
+    "DynamoDBRestoreFullAccessPolicy",
+    "DynamoDBStreamReadPolicy",
+    "DynamoDBWritePolicy",
+    "EC2CopyImagePolicy",
+    "EC2DescribePolicy",
+    "EKSDescribePolicy",
+    "ElasticMapReduceAddJobFlowStepsPolicy",
+    "ElasticMapReduceCancelStepsPolicy",
+    "ElasticMapReduceModifyInstanceFleetPolicy",
+    "ElasticMapReduceModifyInstanceGroupsPolicy",
+    "ElasticMapReduceSetTerminationProtectionPolicy",
+    "ElasticMapReduceTerminateJobFlowsPolicy",
+    "ElasticsearchHttpPostPolicy",
+    "EventBridgePutEventsPolicy",
+    "FilterLogEventsPolicy",
+    "FirehoseCrudPolicy",
+    "FirehoseWritePolicy",
+    "KMSDecryptPolicy",
+    "KMSEncryptPolicy",
+    "KinesisCrudPolicy",
+    "KinesisStreamReadPolicy",
+    "LambdaInvokePolicy",
+    "MobileAnalyticsWriteOnlyAccessPolicy",
+    "OrganizationsListAccountsPolicy",
+    "PinpointEndpointAccessPolicy",
+    "PollyFullAccessPolicy",
+    "RekognitionDetectOnlyPolicy",
+    "RekognitionFacesManagementPolicy",
+    "RekognitionFacesPolicy",
+    "RekognitionLabelsPolicy",
+    "RekognitionNoDataAccessPolicy",
+    "RekognitionReadPolicy",
+    "RekognitionWriteOnlyAccessPolicy",
+    "Route53ChangeResourceRecordSetsPolicy",
+    "S3CrudPolicy",
+    "S3FullAccessPolicy",
+    "S3ReadPolicy",
+    "S3WritePolicy",
+    "SESBulkTemplatedCrudPolicy",
+    "SESCrudPolicy",
+    "SESEmailTemplateCrudPolicy",
+    "SESSendBouncePolicy",
+    "SNSCrudPolicy",
+    "SNSPublishMessagePolicy",
+    "SQSPollerPolicy",
+    "SQSSendMessagePolicy",
+    "SSMParameterReadPolicy",
+    "SSMParameterWithSlashPrefixReadPolicy",
+    "ServerlessRepoReadWriteAccessPolicy",
+    "StepFunctionsExecutionPolicy",
+    "TextractDetectAnalyzePolicy",
+    "TextractGetResultPolicy",
+    "TextractPolicy",
+    "VPCAccessPolicy",
+];
+
+/// Whether `name` is a policy template the catalogue publishes.
+pub(super) fn is_published(name: &str) -> bool {
+    PUBLISHED_TEMPLATE_NAMES.contains(&name)
+}
+
 /// The policy document the template `name` grants with the parameters `parameters` states,
 /// or `None` when this module carries no template under that name or the declaration leaves
 /// out a parameter one of its ARNs is built from.
@@ -426,6 +514,34 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every template whose DOCUMENT this module carries is a name the published roster
+    /// carries too, and a name outside the roster is published by nothing — the two are read
+    /// together by the transform's validation, which accepts an entry naming a published
+    /// template whether or not this module expands a document for it.
+    #[test]
+    fn every_carried_template_is_a_published_name() {
+        for template in TEMPLATES {
+            assert!(
+                is_published(template.name),
+                "template {:?}: a template this module carries is a published name",
+                template.name
+            );
+        }
+        // An entry of the roster this module carries no document for is still published —
+        // a `Policies` entry naming it is accepted — while a name nothing published is not.
+        for (case, name, published) in [
+            ("a template carried with its document", "S3ReadPolicy", true),
+            ("a published template this module expands nothing for", "AthenaQueryPolicy", true),
+            ("a name nothing published", "NotAPublishedPolicyTemplate", false),
+        ] {
+            assert_eq!(
+                is_published(name),
+                published,
+                "case {case:?}: expected is_published({name:?}) to be {published}"
+            );
         }
     }
 

@@ -3783,7 +3783,11 @@ fn json_value(
 }
 
 /// Whether an object is an intrinsic function: one member, named `Ref` or `Fn::<Name>`.
-fn is_intrinsic(members: &Map<String, Value>) -> bool {
+///
+/// `pub(super)` because the macro's own validation reads the same rule off a `Policies` entry
+/// a template computes ([`super::sam`]): one reading of what an intrinsic LOOKS like, so the
+/// two cannot disagree about a value this service resolves as it deploys.
+pub(super) fn is_intrinsic(members: &Map<String, Value>) -> bool {
     members.len() == 1
         && members
             .keys()

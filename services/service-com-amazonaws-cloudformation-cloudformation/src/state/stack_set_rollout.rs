@@ -145,6 +145,10 @@ pub fn redeploy(
             Some(operation_id.to_string()),
             Some(operation_id.to_string()),
         );
+        // The walk that brings this instance stack's resources into step runs with the store
+        // unlocked ([`apply`]): the update is not due its terminal status until that walk has
+        // reported back ([`super::StoredStack::carrying_out_its_deployment`]).
+        stack.carrying_out_its_deployment();
         if let Some(reason) = cannot_deploy.clone() {
             stack.fail_pending_transition(status::UPDATE_FAILED, reason);
         }

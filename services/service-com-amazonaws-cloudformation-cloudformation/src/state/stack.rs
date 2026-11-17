@@ -1693,6 +1693,13 @@ impl StoredStack {
             // ask for.
             return;
         }
+        if self.still_carrying_out(now) {
+            // The operation is still CARRYING OUT its deployment: its walk over the
+            // resources is running with this store unlocked, so what it is waiting for is
+            // not recorded on the stack yet and nothing above could hold the transition
+            // back. A completion is not owed while the work it reports has not been done.
+            return;
+        }
         if self.owes_a_teardown() {
             // The teardown in flight has not asked about every resource the stack holds
             // yet: it left what a resource still being removed depends on alone, and those
@@ -2037,6 +2044,9 @@ impl StoredStack {
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,
+            // The operation that opens a transition says itself whether it still has work
+            // to carry out ([`Self::carrying_out_its_deployment`]).
+            work_in_flight: false,
         });
         self.wait_conditions = self.opening_barriers(now, in_progress);
         // The create-time waits an EARLIER operation opened belong to that operation: this
@@ -2195,6 +2205,10 @@ impl StoredStack {
         pending: &[provisioning::Stabilising],
         now: SystemTime,
     ) {
+        // The walk has REPORTED BACK — this is its record of what it is waiting for — so
+        // whatever it still owes is now held by the barriers below rather than by the
+        // operation's own hold ([`Self::carrying_out_its_deployment`]).
+        self.deployment_reported();
         if pending.is_empty() {
             return;
         }
@@ -2229,6 +2243,41 @@ impl StoredStack {
         self.stabilisations
             .iter()
             .any(|barrier| !barrier.released())
+    }
+
+    /// Hold the terminal status of the operation in flight back until the deployment that
+    /// operation set off has reported back.
+    ///
+    /// Called by the operation that is about to drive the walk over the stack's resources,
+    /// with this store about to be unlocked: until that walk returns, the stack holds no
+    /// record of the resources it is creating or of what they are waiting for, so nothing
+    /// else would hold the transition — and a reporting call made WHILE the walk runs (a read
+    /// of another stack of the Region, a nested stack's own create, a provider's answer
+    /// landing) would otherwise complete the operation with its resources half created and
+    /// its outputs evaluated as of its start.
+    ///
+    /// Released by [`Self::record_stabilisations`] and [`Self::record_materialised_resources`]
+    /// — the two records every such walk ends with — and, as a belt, by the ceiling this
+    /// service holds any one operation's work at ([`super::MAX_HELD_WAIT`]), so a walk that
+    /// never reports back cannot hold a stack `*_IN_PROGRESS` for ever.
+    pub fn carrying_out_its_deployment(&mut self) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.work_in_flight = true;
+        }
+    }
+
+    /// The walk of the operation in flight has reported back, so its own hold is over.
+    fn deployment_reported(&mut self) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.work_in_flight = false;
+        }
+    }
+
+    /// Whether the operation in flight is still carrying out its deployment at `now`.
+    fn still_carrying_out(&self, now: SystemTime) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.work_in_flight && now < pending.started_at + super::MAX_HELD_WAIT
+        })
     }
 
     /// The resources of the operation in flight whose create or delete is still open, as the
@@ -3089,6 +3138,9 @@ impl StoredStack {
     /// naming rules computed, and an output naming that resource reports what a client can
     /// call that service with.
     pub fn record_materialised_resources(&mut self, resources: Vec<StoredResource>) {
+        // The walk has reported back, exactly as [`Self::record_stabilisations`] records: an
+        // operation whose outcome is installed is one whose work has been carried out.
+        self.deployment_reported();
         if let Some(deployment) = &mut self.pending_deployment {
             deployment.resources = resources;
             self.reevaluate_outputs();
@@ -3758,6 +3810,7 @@ impl StoredStack {
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,
+            work_in_flight: false,
         });
     }
 
@@ -3808,6 +3861,11 @@ impl StoredStack {
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,
+            // The rollback's own calls are made by the pass that takes it
+            // ([`super::settle_due_rollbacks`]), which holds the transition back itself
+            // while they run; until then the stack owes the rollback, which already holds
+            // it ([`Self::settle`]).
+            work_in_flight: false,
         });
     }
 
@@ -3877,6 +3935,10 @@ impl StoredStack {
         self.pending = Some(PendingStatus {
             status: status::UPDATE_ROLLBACK_COMPLETE.to_string(),
             status_reason: None,
+            // The resumption's own walk over the resources runs next, with this store
+            // unlocked: the stack is not due its terminal status until that walk has
+            // reported back.
+            work_in_flight: true,
             started_at: now,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id: Some(operation_id),
@@ -3944,6 +4006,10 @@ impl StoredStack {
                 Some(operation_id),
                 Some(client_request_token),
             );
+            // The caller drives the removals with the store unlocked, so the rollback is not
+            // due its terminal status until it has reported back
+            // ([`Self::carrying_out_its_deployment`]).
+            self.carrying_out_its_deployment();
             return RequestedRollback::Discard(discarded);
         }
         let in_force: Vec<StoredResource> = self
@@ -3970,6 +4036,9 @@ impl StoredStack {
             Some(operation_id),
             Some(client_request_token),
         );
+        // ...and the revert the caller is about to ask the owning services for holds this
+        // rollback's own completion back the same way.
+        self.carrying_out_its_deployment();
         // This rollback is now the outstanding one: whatever an earlier one left unreverted
         // is what it is about to ask for again.
         self.unreverted_rollback = None;

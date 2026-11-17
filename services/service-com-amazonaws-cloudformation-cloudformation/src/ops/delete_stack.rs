@@ -508,6 +508,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(operation_id),
                 Some(client_request_token),
             );
+            // The teardown runs below, with this store unlocked: the deletion is not due its
+            // terminal status until that walk has reported which resources are gone and
+            // which are still being removed
+            // ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+            stack.carrying_out_its_deployment();
             (
                 stack.stack_id.clone(),
                 // The stack's OWN Region, not the one this request was signed for: the

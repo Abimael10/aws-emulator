@@ -103,9 +103,24 @@ use super::template::{declared_transforms, MAX_TEMPLATE_DEPTH, PARTITION};
 /// each one stands for.
 mod policy_templates;
 
+/// What this transform REFUSES: the faults a submitted SAM document carries, and the
+/// diagnostic its failure reports them in.
+mod validation;
+
 /// The OBJECT-EVENT source a function declares (`Events: { <name>: { Type: S3 } }`), which is
 /// written into the BUCKET it names rather than becoming a resource of its own.
 mod object_events;
+
+/// `Some(reason)` for a template body whose declared Serverless transform cannot be applied
+/// to it, worded as the failure the operation that submitted it records; `None` for a body
+/// this macro processes, and for one that does not declare it at all.
+///
+/// The body is read through the crate's one JSON-or-YAML template reader, so a document is
+/// judged the same however it was spelled — and under that reader's own bounds, so nothing
+/// here reads a body no other path would.
+pub fn transform_failure(body: &str) -> Option<String> {
+    validation::failure(&super::template::document(body)?)
+}
 
 /// The macro name the AWS Serverless Application Model is published under, as a template's
 /// `Transform` section names it.

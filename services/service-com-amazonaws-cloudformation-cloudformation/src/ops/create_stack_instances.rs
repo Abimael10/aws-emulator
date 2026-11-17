@@ -579,6 +579,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(operation_id.clone()),
                     Some(operation_id.clone()),
                 );
+                // The walk that creates this instance stack's resources runs below, with the
+                // store unlocked: the create is not due its terminal status until that walk
+                // has reported back
+                // ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+                stack.carrying_out_its_deployment();
                 if let Some(reason) = cannot_deploy.clone() {
                     stack.fail_pending_transition(status::CREATE_FAILED, reason);
                 }

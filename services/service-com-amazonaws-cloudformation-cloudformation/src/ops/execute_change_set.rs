@@ -724,6 +724,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(client_request_token),
                 );
             }
+            // The walk that deploys the plan runs below, with this store unlocked: the
+            // operation is not due its terminal status until that walk has reported back
+            // ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+            stack.carrying_out_its_deployment();
             // A wait condition this deployment CREATES again — the template it carries
             // changed its handle — waits for its own signals: the ones that satisfied the
             // wait condition it replaces belong to the deployment that created that one

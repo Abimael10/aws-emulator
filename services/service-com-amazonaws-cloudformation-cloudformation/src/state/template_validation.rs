@@ -1268,19 +1268,24 @@ const RULES: &str = "Rules";
 /// `Some(reason)` for a template a request may SUBMIT but whose deployment cannot be
 /// carried out, worded as the failure that deployment records.
 ///
-/// Two rules answer here rather than refusing the request, because neither is a question
+/// Three rules answer here rather than refusing the request, because none is a question
 /// about the request's own shape:
 ///
 /// * a `Rules` assertion the parameter values in force do not satisfy ([`rules_failure`]);
 /// * an `Fn::ForEach` in a section the declared transform does not define it for — the
 ///   template is well-formed and the loop IS one of that transform's functions, so what
-///   fails is the transform's own application.
+///   fails is the transform's own application;
+/// * a document the SAM macro cannot process ([`super::sam::transform_failure`]) — the same
+///   case: a transform either processes a template or fails on it, and its failure is the
+///   deployment's, not the request's.
 ///
 /// The operation that reads a failure here answers its caller normally and then ends the
 /// operation it opened in the service's failure state, which for a create is followed by the
 /// rollback that create's `OnFailure` asks for.
 pub fn deployment_failure(body: &str, parameters: &BTreeMap<String, String>) -> Option<String> {
-    for_each_placement_failure(body).or_else(|| rules_failure(body, parameters))
+    for_each_placement_failure(body)
+        .or_else(|| super::sam::transform_failure(body))
+        .or_else(|| rules_failure(body, parameters))
 }
 
 /// `Some(reason)` for an `Fn::ForEach` the declared transform cannot apply where it stands.

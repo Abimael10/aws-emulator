@@ -1292,6 +1292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(operation_id.clone()),
                 Some(client_request_token),
             );
+            // The walk that changes this stack's resources runs below, with this store
+            // unlocked: the update is not due its terminal status until that walk has
+            // reported back ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+            stack.carrying_out_its_deployment();
             // A wait condition this update CREATES again — the template changed its handle —
             // waits for its own signals: the ones that satisfied the wait condition it
             // replaces belong to the deployment that created that one

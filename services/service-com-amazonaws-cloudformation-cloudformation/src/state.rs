@@ -1940,6 +1940,16 @@ pub struct PendingStatus {
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
     pub client_request_token: Option<String>,
+    /// Whether the operation is still CARRYING OUT the work it set off: the walk over the
+    /// stack's resources runs with this store unlocked, and until it has reported back
+    /// ([`StoredStack::record_stabilisations`], [`StoredStack::record_materialised_resources`])
+    /// the stack holds no record of what that walk is waiting for — so the terminal status is
+    /// not owed yet however long ago the call was served ([`StoredStack::settle`]).
+    ///
+    /// Set by the operation that drives the walk
+    /// ([`StoredStack::carrying_out_its_deployment`]); `false` for a transition no walk
+    /// belongs to.
+    pub work_in_flight: bool,
 }
 
 /// The resources and outputs an in-flight stack operation will leave the stack with,
@@ -2472,6 +2482,11 @@ impl ComAmazonawsCloudformationCloudformationState {
             .iter_mut()
             .filter_map(|stack| {
                 let rollback = stack.take_owed_rollback()?;
+                // The caller makes the rollback's calls with this store unlocked, so the
+                // stack's terminal status is held back until it has reported back
+                // ([`StoredStack::carrying_out_its_deployment`]) — the hold the owed
+                // rollback itself gave it ends the moment it is taken.
+                stack.carrying_out_its_deployment();
                 Some(DueRollback {
                     region: stack.region.clone(),
                     stack_id: stack.stack_id.clone(),

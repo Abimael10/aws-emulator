@@ -1026,6 +1026,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(operation_id.clone()),
                 Some(client_request_token.clone()),
             );
+            // The walk that creates this stack's resources runs below, with this store
+            // unlocked: the create is not due its terminal status until that walk has
+            // reported what it made and what it is waiting for
+            // ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+            stack.carrying_out_its_deployment();
             // A pre-deployment validation this create's resources did not pass is reported
             // as the validation result it is: an event about the resource NOTHING was done
             // to, naming the validation, its status and what failed it — which is the detail

@@ -969,6 +969,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `FAILED` with that reason below — the same answer `CreateStack` gives such a
         // template, and never a plan over a document nobody processed.
         let unprocessable = processed_template.unavailable_reason().map(str::to_string);
+        // ...and a document the SAM macro cannot process is the same case reached the other
+        // way: the macro IS applied by this service, so the stage is computed, but the
+        // document it was computed from is one the transform fails on — the change set is
+        // created and settles to `FAILED` with the macro's own diagnostic, with no plan at
+        // all ([`crate::state::sam::transform_failure`]).
+        let transform_failure = crate::state::sam::transform_failure(&template_body);
         let processed_body = processed_template.body(&template_body).map(str::to_string);
         let submitted = match &processed_body {
             Some(body) => {
@@ -1000,7 +1006,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack holds (which is what comparing against an empty declaration set would
         // read as), because nothing was computed from any document — the change set
         // settles to `FAILED` with the reason instead.
-        let mut changes = if unprocessable.is_some() {
+        let mut changes = if unprocessable.is_some() || transform_failure.is_some() {
             Vec::new()
         } else if imports_resources {
             // An IMPORT change set does not compare templates at all: it adopts exactly the
@@ -1368,6 +1374,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 change_set_status::FAILED,
                 execution_status::UNAVAILABLE,
                 too_many_macros.clone(),
+            ),
+            // A document the Serverless macro fails on is failed with the macro's own
+            // diagnostic, verbatim: that sentence IS what the transform reported, so nothing
+            // wraps it further, and the change set offers no plan over a document the macro
+            // never processed.
+            _ if transform_failure.is_some() => (
+                change_set_status::FAILED,
+                execution_status::UNAVAILABLE,
+                transform_failure.clone(),
             ),
             Some(reason) => (
                 change_set_status::FAILED,

@@ -400,6 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         Some(operation_id.clone()),
                         Some(operation_id.clone()),
                     );
+                    // The teardown runs below, with the store unlocked: the deletion is not
+                    // due its terminal status until that walk has reported back
+                    // ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+                    stack.carrying_out_its_deployment();
                     removals.push(Removal {
                         account: account.clone(),
                         region: target_region.clone(),

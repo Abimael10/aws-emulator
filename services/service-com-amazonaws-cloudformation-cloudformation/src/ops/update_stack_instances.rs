@@ -742,6 +742,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         Some(operation_id.clone()),
                         Some(operation_id.clone()),
                     );
+                    // The walk that changes this instance stack's resources runs below, with
+                    // the store unlocked: the update is not due its terminal status until that
+                    // walk has reported back
+                    // ([`crate::state::StoredStack::carrying_out_its_deployment`]).
+                    stack.carrying_out_its_deployment();
                     // A template this service cannot deploy ends the stack's update in the
                     // modelled UPDATE_FAILED with that reason, rather than in an
                     // UPDATE_COMPLETE reporting a deployment nothing performed.
