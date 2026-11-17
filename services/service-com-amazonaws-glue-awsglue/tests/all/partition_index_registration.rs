@@ -50,7 +50,9 @@ use service_com_amazonaws_glue_awsglue::state::{fold_name, messages, ComAmazonaw
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_runs::far_future;
-use crate::partition_indexes::{create_indexed_table, get_indexes, reported, reported_names};
+use crate::partition_indexes::{
+    create_indexed_table, get_indexes, reported, reported_names, ReportedIndex,
+};
 use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID};
 
 /// One row of the registration table: the case, the table's `PartitionKeys`, the keys the
@@ -255,6 +257,46 @@ fn recorded_descriptor(
                 .collect::<Vec<Value>>()
         })
     })
+}
+
+/// EVERY descriptor `table` holds, as the records themselves report them at `at` and in the
+/// order the read reports them: the read path's own projection, taken at an instant of the
+/// test's choosing rather than the wall clock's, for the same reason [`recorded_descriptor`]
+/// takes one — which side of a build's due instant an assertion lands on is then the test's
+/// choice and not the scheduler's.
+fn recorded_descriptors(
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    database: &str,
+    table: &str,
+    at: SystemTime,
+) -> Vec<ReportedIndex> {
+    let indexed_table = {
+        let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+        let store = state.lock();
+        let stored = store
+            .database(ACCOUNT_ID, database)
+            .and_then(|database| database.tables.get(&fold_name(table)))
+            .unwrap_or_else(|| panic!("case {case}: the table was created"));
+        TableIndexKey::of(stored)
+    };
+    engine
+        .state::<PartitionIndexStore>()
+        .lock()
+        .descriptors(&indexed_table, at)
+        .into_iter()
+        .map(|descriptor| {
+            (
+                descriptor.index_name,
+                descriptor
+                    .keys
+                    .into_iter()
+                    .map(|key| (key.name, key.r#type))
+                    .collect(),
+                descriptor.index_status,
+            )
+        })
+        .collect()
 }
 
 /// `errors` as [`reported_backfill`] answers them, for comparing a row's expectation with
@@ -1291,4 +1333,238 @@ async fn a_registered_index_reaches_the_status_its_build_earned() {
             reported_backfill(&descriptor)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Every index a table holds is visible to the read, whichever path registered it
+// ---------------------------------------------------------------------------
+
+/// An index registered on a table the catalog ALREADY holds is OBSERVABLE: the read reports a
+/// descriptor for it carrying the `IndexName` submitted and the keys it named — each with the
+/// type the table declares for that partition key — in the status the service builds an index
+/// in, beside the indexes the table's own create registered, in ONE answer; and that
+/// descriptor stays there, reaching the status its build earns, however often it is read.
+///
+/// The rows differ along what the rule generalises over: how the index reached the table (the
+/// create's `PartitionIndexes`, a registration afterwards), how many of the table's partition
+/// keys it names and in which order, and what type each of those keys declares. The sibling
+/// table of the same database, registered with no index at all, is the control that says an
+/// empty list means that table holds none.
+///
+/// What this asserts beyond the suites above it — which take one registration path at a time
+/// — is the WHOLE of what one read reports for a table both paths registered an index on: the
+/// full descriptors, the absence of a continuation token, the list reaching the status its
+/// builds earn, that reading it changes nothing for the next caller, and that the table beside
+/// it holds none of those indexes.
+///
+/// The status while the builds are still ahead of the clock is asserted on the records' own
+/// projection at an instant this test holds ([`recorded_descriptors`]), so no assertion here
+/// depends on how fast the host served the registrations; the settled status is waited for by
+/// polling the wire for the CONDITION, under a deadline with generous room.
+#[tokio::test]
+async fn every_registered_index_is_visible_to_a_read_until_its_build_settles() {
+    /// How many times the settled list is read: more than once, so a read that changed what
+    /// the next caller reads is caught.
+    const READS: usize = 3;
+
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    // Held before anything is registered, so every build registered after it is still ahead of
+    // it whatever the host's pace: this is the instant the CREATING projection below is taken
+    // at.
+    let before_any_registration = SystemTime::now();
+    let partition_keys = json!([
+        { "Name": "dt", "Type": "string" },
+        { "Name": "hour", "Type": "int" }
+    ]);
+    create_indexed_table(
+        &router,
+        "visible_db",
+        "events",
+        &partition_keys,
+        Some(&json!([ { "IndexName": "a_with_the_table_idx", "Keys": [ "dt" ] } ])),
+    )
+    .await;
+    // A sibling table of the SAME database, partitioned the same way and registered with no
+    // index: an index is a resource of ONE table, so this one holds none of the indexes
+    // registered on the table beside it.
+    let (status, body) = call(
+        &router,
+        "CreateTable",
+        &json!({
+            "DatabaseName": "visible_db",
+            "TableInput": {
+                "Name": "siblings",
+                "StorageDescriptor": {
+                    "Location": "s3://lake/siblings/",
+                    "Columns": [ { "Name": "payload", "Type": "string" } ]
+                },
+                "PartitionKeys": partition_keys.clone()
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the sibling table: its create must be served, got {status} with {body}"
+    );
+
+    // (case, the index registered on the stored table, the keys it names)
+    let registered: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            "one of the table's two partition keys",
+            "b_one_key_idx",
+            vec!["hour"],
+        ),
+        (
+            "both partition keys, in the reverse of the partition-key order",
+            "c_both_keys_idx",
+            vec!["hour", "dt"],
+        ),
+    ];
+    for (case, index_name, keys) in &registered {
+        let (status, body) = register(&router, "visible_db", "events", index_name, keys).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the registration must be served, got {status} with {body}"
+        );
+    }
+    assert_eq!(
+        MAX_INDEXES_PER_TABLE,
+        1 + registered.len(),
+        "the table above is registered with every index a table takes"
+    );
+
+    // What the read must report, in `IndexName` order: the index the create registered and
+    // the ones registered afterwards, each key carrying the type the table declares for it.
+    let expected_keys: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("a_with_the_table_idx", vec![("dt", "string")]),
+        ("b_one_key_idx", vec![("hour", "int")]),
+        ("c_both_keys_idx", vec![("hour", "int"), ("dt", "string")]),
+    ];
+    let expect = |status: &str| -> Vec<ReportedIndex> {
+        expected_keys
+            .iter()
+            .map(|(name, keys)| {
+                (
+                    (*name).to_string(),
+                    keys.iter()
+                        .map(|(key, key_type)| ((*key).to_string(), (*key_type).to_string()))
+                        .collect(),
+                    status.to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // While every build is still ahead of the clock, each index is reported in the status the
+    // service builds one in.
+    let building = "while every build is still ahead of the clock";
+    assert_eq!(
+        recorded_descriptors(
+            &engine,
+            building,
+            "visible_db",
+            "events",
+            before_any_registration
+        ),
+        expect(INDEX_STATUS_CREATING),
+        "case {building}: expected {:?}, got {:?}",
+        expect(INDEX_STATUS_CREATING),
+        recorded_descriptors(
+            &engine,
+            building,
+            "visible_db",
+            "events",
+            before_any_registration
+        )
+    );
+
+    // What a client reads: every registered index is there, under the name it was submitted
+    // with and with the keys it named, whichever side of its build's due instant the host
+    // served this call on.
+    let (status, read) = get_indexes(&router, "visible_db", "events", None).await;
+    assert_eq!(
+        status, 200,
+        "case straight after the registrations: the read must be served, got {status} with \
+         {read}"
+    );
+    let identified = |list: &[ReportedIndex]| -> Vec<(String, Vec<(String, String)>)> {
+        list.iter()
+            .map(|(name, keys, _)| (name.clone(), keys.clone()))
+            .collect()
+    };
+    assert_eq!(
+        identified(&reported(&read)),
+        identified(&expect(INDEX_STATUS_CREATING)),
+        "case straight after the registrations: expected {:?}, got {:?} in {read}",
+        identified(&expect(INDEX_STATUS_CREATING)),
+        identified(&reported(&read))
+    );
+    assert!(
+        read["NextToken"].is_null(),
+        "case straight after the registrations: a table's whole index list fits one page, so no \
+         token may be handed back, got {read}"
+    );
+
+    // Each build is owed one span after its registration, so every one of them is due well
+    // inside this window; a window that closes before they are fails the test rather than
+    // hanging, and nothing here waits a fixed time.
+    let deadline = SystemTime::now() + 20 * PARTITION_INDEX_SETTLES_AFTER;
+    let mut settled = Vec::new();
+    while SystemTime::now() < deadline {
+        let (_, read) = get_indexes(&router, "visible_db", "events", None).await;
+        settled = reported(&read);
+        if settled
+            .iter()
+            .all(|(_, _, status)| status != INDEX_STATUS_CREATING)
+        {
+            break;
+        }
+        tokio::time::sleep(PARTITION_INDEX_SETTLES_AFTER / 10).await;
+    }
+    // The table holds no partitions, so no index has anything to backfill: every build ends
+    // ACTIVE.
+    assert_eq!(
+        settled,
+        expect(INDEX_STATUS_ACTIVE),
+        "case once the builds are due: expected {:?}, got {:?}",
+        expect(INDEX_STATUS_ACTIVE),
+        settled
+    );
+
+    // Reading the settled list leaves it exactly as it is for the next caller.
+    for read_number in 1..=READS {
+        let (_, read) = get_indexes(&router, "visible_db", "events", None).await;
+        assert_eq!(
+            reported(&read),
+            expect(INDEX_STATUS_ACTIVE),
+            "case read {read_number} of the settled list: expected {:?}, got {:?} in {read}",
+            expect(INDEX_STATUS_ACTIVE),
+            reported(&read)
+        );
+        for descriptor in read["PartitionIndexDescriptorList"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+        {
+            assert!(
+                reported_backfill(descriptor).is_empty(),
+                "case read {read_number} of the settled list: a table holding no partition \
+                 backfills nothing, so no BackfillErrors may be reported, got {descriptor}"
+            );
+        }
+    }
+
+    let (status, read) = get_indexes(&router, "visible_db", "siblings", None).await;
+    assert_eq!(
+        status, 200,
+        "case the sibling table: the read must be served, got {status} with {read}"
+    );
+    assert_eq!(
+        reported_names(&read),
+        Vec::<String>::new(),
+        "case the sibling table: a table nothing registered an index on holds none, got {:?} in \
+         {read}",
+        reported_names(&read)
+    );
 }
