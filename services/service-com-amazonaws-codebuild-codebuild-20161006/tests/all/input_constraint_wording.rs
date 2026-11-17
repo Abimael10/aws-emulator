@@ -8,9 +8,9 @@
 //!
 //! * A constraint CodeBuild words ITSELF is answered with CodeBuild's own sentence,
 //!   built per RULE from the request — an empty list of build ids, an input resource
-//!   list longer than the model allows, a build timeout outside the window the model
-//!   pins on it — and every other violation keeps the shared constraint envelope, whose
-//!   enumerated value sets are stated in ascending order.
+//!   list longer than the model allows, a wait it times out set outside the window the
+//!   model pins on it — and every other violation keeps the shared constraint envelope,
+//!   whose enumerated value sets are stated in ascending order.
 //! * A build id has to BE one (`<projectName>:<uuid>`): a value of another shape is
 //!   refused as bad input rather than reported as a build this account does not hold.
 //!
@@ -153,34 +153,91 @@ fn list_request(member: &str, entries: &[String]) -> Value {
     body
 }
 
-/// RULE: a BUILD timeout outside the window the model pins on it is refused with 400
-/// `InvalidInputException` worded `Invalid timeout. Should be between 5 minutes and 36
-/// hours` — the bounds are `BuildTimeOut`'s own (`@range(min: 5, max: 2160)`), stated in
-/// the unit AWS states them in, and the sentence quotes nothing of the request, so it is
-/// the same wherever a build timeout is set.
+/// The sentence CodeBuild states for a value outside the window of the wait a build
+/// spends RUNNING — `BuildTimeOut`'s own bounds (`@range(min: 5, max: 2160)`), the maximum
+/// stated in the whole hours it is.
+const BUILD_TIMEOUT_SENTENCE: &str = "Invalid timeout. Should be between 5 minutes and 36 hours";
+
+/// The sentence CodeBuild states for a value outside the window of the wait a build spends
+/// QUEUED — `TimeOut`'s own bounds (`@range(min: 5, max: 480)`), the maximum stated in the
+/// whole hours it is.
+const QUEUED_TIMEOUT_SENTENCE: &str =
+    "Invalid queued timeout. Should be between 5 minutes and 8 hours";
+
+/// RULE: a wait CodeBuild times out — how long a build may RUN, or how long it may sit
+/// QUEUED — set outside the window the model pins on the member that states it is refused
+/// with 400 `InvalidInputException` worded `Invalid <wait>. Should be between <min> and
+/// <max>`, where the wait is the one the member states, the bounds are that member's own
+/// `@range` stated in the unit AWS states them in (whole hours where the bound is a whole
+/// number of them), and nothing of the request is interpolated — so the sentence is the
+/// same on every operation that sets that wait and on every value outside its window.
 ///
-/// The rows span every operation that takes one (a project's `timeoutInMinutes` on
-/// create and on update, and a build's `timeoutInMinutesOverride`), each published bound
-/// and one past it on each side. A violation of the sibling QUEUED timeout, whose window
-/// is a different one, still states its member and its constraint — the sentence belongs
-/// to the rule, not to every timeout.
+/// The rows span both waits and every operation that sets either (a project's
+/// `timeoutInMinutes` and `queuedTimeoutInMinutes` on create and on update, a build's
+/// `timeoutInMinutesOverride` and `queuedTimeoutInMinutesOverride`, and a batch build's
+/// `buildTimeoutInMinutesOverride` and `queuedTimeoutInMinutesOverride`), each with values
+/// below its minimum and past its own maximum, and with each published bound accepted.
 #[tokio::test]
-async fn a_build_timeout_outside_its_window_is_refused_in_codebuilds_own_words() {
+async fn a_timeout_outside_its_window_is_refused_in_codebuilds_own_words() {
     let router = emulator();
     create_project(&router, "timeout-proj", json!({})).await;
 
-    let expected = "Invalid timeout. Should be between 5 minutes and 36 hours";
-
-    // (operation, the member that carries the timeout) — every operation that sets one.
-    let members: [(&str, &str); 3] = [
-        ("CreateProject", "timeoutInMinutes"),
-        ("UpdateProject", "timeoutInMinutes"),
-        ("StartBuild", "timeoutInMinutesOverride"),
+    // (operation, the member that carries the wait, the sentence it is refused with, the
+    // maximum of that member's own window) — every operation that sets either wait.
+    let waits: [(&str, &str, &str, i64); 8] = [
+        (
+            "CreateProject",
+            "timeoutInMinutes",
+            BUILD_TIMEOUT_SENTENCE,
+            2160,
+        ),
+        (
+            "UpdateProject",
+            "timeoutInMinutes",
+            BUILD_TIMEOUT_SENTENCE,
+            2160,
+        ),
+        (
+            "StartBuild",
+            "timeoutInMinutesOverride",
+            BUILD_TIMEOUT_SENTENCE,
+            2160,
+        ),
+        (
+            "StartBuildBatch",
+            "buildTimeoutInMinutesOverride",
+            BUILD_TIMEOUT_SENTENCE,
+            2160,
+        ),
+        (
+            "CreateProject",
+            "queuedTimeoutInMinutes",
+            QUEUED_TIMEOUT_SENTENCE,
+            480,
+        ),
+        (
+            "UpdateProject",
+            "queuedTimeoutInMinutes",
+            QUEUED_TIMEOUT_SENTENCE,
+            480,
+        ),
+        (
+            "StartBuild",
+            "queuedTimeoutInMinutesOverride",
+            QUEUED_TIMEOUT_SENTENCE,
+            480,
+        ),
+        (
+            "StartBuildBatch",
+            "queuedTimeoutInMinutesOverride",
+            QUEUED_TIMEOUT_SENTENCE,
+            480,
+        ),
     ];
 
-    for (operation, member) in members {
-        // Past the maximum, and below the minimum, in several forms.
-        for minutes in [2161, 100_000, 4, 0, -1] {
+    for (operation, member, expected, maximum) in waits {
+        // Past that member's own maximum, and below the minimum, in several forms.
+        for minutes in [maximum + 1, maximum + 100_000, 4, 0, -1] {
             let case = format!("{operation} with {member} {minutes}");
             let stated = refusal(
                 &router,
@@ -191,12 +248,25 @@ async fn a_build_timeout_outside_its_window_is_refused_in_codebuilds_own_words()
             .await;
             assert_eq!(
                 stated, expected,
-                "case {case:?}: expected CodeBuild's timeout sentence, got {stated:?}"
+                "case {case:?}: expected CodeBuild's sentence for that wait, got {stated:?}"
             );
+            let rejected = minutes.to_string();
+            for leaked in [member, "constraint", rejected.as_str()] {
+                assert!(
+                    !stated.contains(leaked),
+                    "case {case:?}: the sentence must not name {leaked:?}, got {stated:?}"
+                );
+            }
         }
 
-        // Both published bounds are accepted by the same member.
-        for minutes in [5, 2160] {
+        // Both published bounds of that member's own window are accepted. A batch build's
+        // own start is left out: its 200 needs a batch-enabled project and a buildspec
+        // declaring the batch, which is the subject of `start_build_batch_validation` —
+        // the bounds of both windows are accepted here on three other operations.
+        if operation == "StartBuildBatch" {
+            continue;
+        }
+        for minutes in [5, maximum] {
             let case = format!("{operation} with {member} {minutes}");
             let (status, answer) = call(
                 &router,
@@ -210,31 +280,12 @@ async fn a_build_timeout_outside_its_window_is_refused_in_codebuilds_own_words()
             );
         }
     }
-
-    // The queued timeout is a different wait with a window of its own (`TimeOut`,
-    // `@range(min: 5, max: 480)`), so a value past ITS maximum keeps the shared
-    // envelope.
-    let stated = refusal(
-        &router,
-        "CreateProject with queuedTimeoutInMinutes 481",
-        "CreateProject",
-        super::project_build_lifecycle::create_project_body(
-            "queued-timeout",
-            json!({"queuedTimeoutInMinutes": 481}),
-        ),
-    )
-    .await;
-    assert_eq!(
-        stated,
-        "1 validation error detected: Value '481' at 'queuedTimeoutInMinutes' failed to \
-         satisfy constraint: Member must have value less than or equal to 480",
-        "a timeout with a window of its own must still state its member, got {stated:?}"
-    );
 }
 
-/// A request for `operation` that sets its build-timeout `member` to `minutes`, with
-/// whatever else that operation requires — a whole project for the create, the stored
-/// project's name for the update, and the project to build for the start.
+/// A request for `operation` that sets its timeout `member` to `minutes`, with whatever
+/// else that operation requires — a whole project for the create, the stored project's
+/// name for the update, and the project to build for either start. A create names a
+/// project of its own per case, so one accepted bound does not collide with another.
 fn timeout_request(operation: &str, member: &str, minutes: i64) -> Value {
     let mut timeout = json!({});
     if let Value::Object(members) = &mut timeout {
@@ -242,7 +293,7 @@ fn timeout_request(operation: &str, member: &str, minutes: i64) -> Value {
     }
     match operation {
         "CreateProject" => super::project_build_lifecycle::create_project_body(
-            &format!("timeout-{}", minutes.unsigned_abs()),
+            &format!("{member}-{}", minutes.unsigned_abs()),
             timeout,
         ),
         "UpdateProject" => {

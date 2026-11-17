@@ -86,10 +86,11 @@ fn codebuild_sentence(violation: &Violation) -> Option<String> {
                 )
             })
         }
-        // A build timeout outside the window the model pins on it.
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) => {
-            build_timeout_windows().get(&path).map(stated_window)
-        }
+        // A wait CodeBuild times out — how long a build may RUN, or how long it may sit
+        // QUEUED — outside the window the model pins on the member that states it.
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) => timeout_windows()
+            .get(&path)
+            .map(|(wait, window)| stated_window(wait, window)),
         // A resource NAME carrying a character the model's `@pattern` for that kind of
         // name does not allow: CodeBuild states the character set itself. Keyed to the
         // PATTERN rather than to a member name, so a project's name is refused the same
@@ -476,16 +477,20 @@ fn collection_size(violation: &Violation) -> Option<usize> {
 /// How the constraint walk spells the element count of a collection it refused.
 const ITEMS_SUFFIX: &str = " items";
 
-/// The window a build timeout member is held to, as the sentence CodeBuild states for a
-/// value outside it.
+/// The window a timeout member is held to, as the sentence CodeBuild states for a value
+/// outside it: the WAIT the member states, then the bounds of that wait's own window.
 ///
-/// Both bounds come from the `@range` the MODEL puts on the member, and the maximum is
-/// stated in hours exactly when it is a whole number of them — which is how AWS words
-/// the window of `BuildTimeOut` (`@range(min: 5, max: 2160)`): "between 5 minutes and 36
-/// hours". Recorded behaviour — the model states no message for the error.
-fn stated_window(window: &RangeTrait) -> String {
+/// Nothing of the request is interpolated — not the value it carried, not the member it
+/// carried it on — so one wait is refused with one sentence however a request sets it.
+/// `wait` names the wait the way AWS names it ([`TIMEOUT_MEMBERS`]), and both bounds come
+/// from the `@range` the MODEL puts on the member, each stated in hours exactly when it is
+/// a whole number of them — which is how AWS words the window of `BuildTimeOut`
+/// (`@range(min: 5, max: 2160)`): "between 5 minutes and 36 hours", and that of `TimeOut`
+/// (`@range(min: 5, max: 480)`): "between 5 minutes and 8 hours". Recorded behaviour — the
+/// model states no message for the error.
+fn stated_window(wait: &str, window: &RangeTrait) -> String {
     format!(
-        "Invalid timeout. Should be between {} and {}",
+        "Invalid {wait}. Should be between {} and {}",
         window.min.map_or_else(|| "0 minutes".to_string(), minutes),
         window.max.map_or_else(|| "0 minutes".to_string(), minutes),
     )
@@ -503,29 +508,32 @@ fn minutes(minutes: f64) -> String {
     format!("{whole} minutes")
 }
 
-/// The `@range` window of every input member that states a BUILD's timeout, by
-/// validation path.
+/// The wait each input member that states a timeout holds, and the `@range` window the
+/// model pins on it, by validation path.
 ///
 /// Built once from the schemas themselves, so nothing here names a bound: a path is in
-/// this map exactly when the MODEL puts a `@range` on a member whose name is one of
-/// [`BUILD_TIMEOUT_MEMBERS`], and the window stated is that member's own. The queued
-/// timeout is a different wait with a window of its own (`TimeOut`, 5..480) and is not
-/// among them.
-fn build_timeout_windows() -> &'static BTreeMap<String, RangeTrait> {
-    static WINDOWS: LazyLock<BTreeMap<String, RangeTrait>> = LazyLock::new(|| {
+/// this map exactly when the MODEL puts a `@range` on a member [`TIMEOUT_MEMBERS`] names,
+/// and the window stated is that member's own — so every operation whose input carries one
+/// of those members is covered, and a member the model stops bounding leaves the map on
+/// its own.
+fn timeout_windows() -> &'static BTreeMap<String, (&'static str, RangeTrait)> {
+    static WINDOWS: LazyLock<BTreeMap<String, (&'static str, RangeTrait)>> = LazyLock::new(|| {
         let mut windows = BTreeMap::new();
         for input in super::INPUT_SCHEMAS {
             for member in input.members() {
                 let Some(name) = member.member_name() else {
                     continue;
                 };
-                if !BUILD_TIMEOUT_MEMBERS.contains(&name) {
+                let Some((_, wait)) = TIMEOUT_MEMBERS
+                    .iter()
+                    .find(|(member_name, _)| *member_name == name)
+                else {
                     continue;
-                }
+                };
                 if let Some(window) = range_of(member) {
                     windows.insert(
                         aws_smithy_schema_server::constraints::path::member(name),
-                        window,
+                        (*wait, window),
                     );
                 }
             }
@@ -535,11 +543,35 @@ fn build_timeout_windows() -> &'static BTreeMap<String, RangeTrait> {
     &WINDOWS
 }
 
-/// The names the model gives the members that state how long a BUILD may run before
-/// CodeBuild times it out — the member of a project's configuration, and the override a
-/// start takes for one build only. Both target `BuildTimeOut`, whose window AWS words as
-/// "from 5 to 2160 (36 hours)".
-const BUILD_TIMEOUT_MEMBERS: [&str; 2] = ["timeoutInMinutes", "timeoutInMinutesOverride"];
+/// The members that state a wait CodeBuild times out, each with the WAIT it states as AWS
+/// names it in the sentence above.
+///
+/// Two waits, each with a window of its own, and a member states one of them wherever a
+/// request sets it — on the project that holds the setting, and on the override a start
+/// takes for one build or one batch only:
+///
+/// * how long a build may RUN before CodeBuild times it out (`BuildTimeOut`, whose window
+///   AWS words as "from 5 to 2160 (36 hours)");
+/// * how long a build may sit QUEUED before it times out (`TimeOut`, 5..480 minutes).
+///
+/// A member that states some OTHER wait is not here: its window is its own and the words
+/// AWS names it by are not recorded, so it keeps the shared constraint envelope naming the
+/// member and the constraint it failed, rather than a sentence guessed for it.
+const TIMEOUT_MEMBERS: [(&str, &str); 5] = [
+    ("timeoutInMinutes", BUILD_WAIT),
+    ("timeoutInMinutesOverride", BUILD_WAIT),
+    ("buildTimeoutInMinutesOverride", BUILD_WAIT),
+    ("queuedTimeoutInMinutes", QUEUED_WAIT),
+    ("queuedTimeoutInMinutesOverride", QUEUED_WAIT),
+];
+
+/// How AWS names the wait a build spends RUNNING in the sentence that refuses a value
+/// outside its window.
+const BUILD_WAIT: &str = "timeout";
+
+/// How AWS names the wait a build spends QUEUED in that same sentence — a different wait,
+/// named by what it is a timeout OF.
+const QUEUED_WAIT: &str = "queued timeout";
 
 /// The `@range` trait codegen attached to `member`, if the model puts one on it.
 fn range_of(member: &Schema) -> Option<RangeTrait> {
@@ -740,6 +772,86 @@ mod tests {
                 stated,
                 format!("Invalid sortBy type specified: {submitted}"),
                 "case {submitted:?}: expected CodeBuild's sort-key sentence, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: every member a timeout sentence is keyed to is a numeric member the MODEL
+    /// bounds with a `@range` on an input this service validates, and the window the
+    /// sentence states is that member's own — so no sentence can be claimed for a member
+    /// that carries no window, and no bound is spelled here.
+    #[test]
+    fn every_stated_timeout_member_is_one_the_model_bounds() {
+        for (member_name, wait) in TIMEOUT_MEMBERS {
+            let member = super::super::INPUT_SCHEMAS
+                .iter()
+                .copied()
+                .flat_map(|input| input.members().iter().copied())
+                .find(|member| member.member_name() == Some(member_name))
+                .unwrap_or_else(|| {
+                    panic!("case {member_name}: no input of this service declares such a member")
+                });
+            assert_eq!(
+                member.shape_type(),
+                ShapeType::Integer,
+                "case {member_name}: expected a whole number of minutes, got {:?}",
+                member.shape_type()
+            );
+            let window = range_of(member).unwrap_or_else(|| {
+                panic!("case {member_name}: the model puts no @range on this member")
+            });
+            let path = aws_smithy_schema_server::constraints::path::member(member_name);
+            assert_eq!(
+                timeout_windows().get(&path),
+                Some(&(wait, window)),
+                "case {member_name}: expected the wait {wait:?} with the model's own window \
+                 {window:?}, got {:?}",
+                timeout_windows().get(&path)
+            );
+        }
+    }
+
+    /// RULE: the sentence that refuses a wait outside its window names the WAIT and states
+    /// each bound in whole hours exactly when that bound is a whole number of them,
+    /// interpolating nothing of the request.
+    ///
+    /// The rows span both waits this service times out at the windows the model gives them,
+    /// plus a window whose bounds are not whole hours — the unit is decided by the bound,
+    /// not by the wait.
+    #[test]
+    fn the_window_sentence_names_the_wait_and_states_each_bound_in_its_unit() {
+        let windows: [(&str, Option<f64>, Option<f64>, &str); 4] = [
+            (
+                BUILD_WAIT,
+                Some(5.0),
+                Some(2160.0),
+                "Invalid timeout. Should be between 5 minutes and 36 hours",
+            ),
+            (
+                QUEUED_WAIT,
+                Some(5.0),
+                Some(480.0),
+                "Invalid queued timeout. Should be between 5 minutes and 8 hours",
+            ),
+            (
+                QUEUED_WAIT,
+                Some(60.0),
+                Some(90.0),
+                "Invalid queued timeout. Should be between 1 hours and 90 minutes",
+            ),
+            (
+                BUILD_WAIT,
+                None,
+                None,
+                "Invalid timeout. Should be between 0 minutes and 0 minutes",
+            ),
+        ];
+
+        for (wait, min, max, expected) in windows {
+            let stated = stated_window(wait, &RangeTrait::new(min, max));
+            assert_eq!(
+                stated, expected,
+                "case {wait:?} over {min:?}..{max:?}: expected {expected:?}, got {stated:?}"
             );
         }
     }
