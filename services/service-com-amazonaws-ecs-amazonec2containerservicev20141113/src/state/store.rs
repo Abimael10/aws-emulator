@@ -273,6 +273,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        // The tasks the probes have CONDEMNED: a service's task whose essential container
+        // failed its health check is one its scheduler stops and replaces
+        // ([`super::unhealthy_task_replacement`]). Run before the breaker pass below, so the
+        // rollout that placed such a task counts the stop in the same pass that made it.
+        self.stop_unhealthy_service_tasks(now);
         // The deployment circuit breaker's own pass: it counts the launches the current
         // rollout lost, replaces them while it tolerates them, and fails the rollout once it
         // does not — before the rollout's record is advanced, so the rollback that failure
@@ -341,9 +346,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             let tally = self.service_tally(&key.0, &key.1);
             let service = &self.services[&key];
             let rollout = self.deployment_tally(&key.0, &service.deployment_id);
+            // A rollout whose tasks declare a container health check has not reached a
+            // steady state until that check has passed: the scheduler acts on those checks
+            // ([`super::unhealthy_task_replacement`]), so a task still being evaluated is a
+            // task it is still waiting on.
+            let awaits_health = self.rollout_awaits_container_health(service);
             let settled = service.deployment_steady_due_at.filter(|due| {
                 *due <= now
                     && service.places_tasks()
+                    && !awaits_health
                     && rollout.running == service.desired_count
                     && rollout.pending == 0
                     && tally.running == rollout.running

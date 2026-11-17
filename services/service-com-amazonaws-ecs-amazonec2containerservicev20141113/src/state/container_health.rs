@@ -43,6 +43,14 @@
 //! reports as `UNHEALTHY` or `UNKNOWN`" — in the priority order the `HealthCheck` doc gives
 //! (`UNHEALTHY`, then `UNKNOWN`, then `HEALTHY`).
 //!
+//! What the SERVICE SCHEDULER makes of those results is
+//! [`super::unhealthy_task_replacement`]'s: a task of a service whose essential container
+//! reports `UNHEALTHY` is one that scheduler stops and replaces, which is the very thing
+//! `CreateService$healthCheckGracePeriodSeconds` names a period for ("the period of time ...
+//! that the Amazon ECS service scheduler ignores unhealthy ... container health checks after
+//! a task has first started"). Nothing in THIS module moves a task or a container: a probe
+//! reports on the container it ran in.
+//!
 //! # The containers that WAIT
 //!
 //! `ContainerDependency` is the other reader of those results:
@@ -158,6 +166,15 @@ pub struct ContainerHealthRecord {
     pub start_period: Option<Duration>,
     /// The `healthStatus` this container reports now.
     pub status: String,
+    /// WHEN that reading became [`HEALTH_UNHEALTHY`] — the instant the execution that
+    /// exhausted the retries ran at — and `None` whenever the reading is anything else, so
+    /// the two cannot disagree.
+    ///
+    /// What the scheduler's own reaction to a failed check is dated by
+    /// ([`super::unhealthy_task_replacement`]): the reading was reached at that instant
+    /// whether or not anybody called, so the stop it earns is dated there too rather than at
+    /// whichever pass noticed.
+    pub unhealthy_at: Option<SystemTime>,
     /// How many executions have failed since the last one that succeeded.
     pub failures: i32,
     /// Whether any execution has succeeded yet, which is what ends the start period's
@@ -215,6 +232,7 @@ impl ContainerHealthRecord {
             // "UNKNOWN - The container health check is being evaluated": nothing has run
             // yet, so no result is reported.
             status: HEALTH_UNKNOWN.to_string(),
+            unhealthy_at: None,
             failures: 0,
             succeeded: false,
             start_period_ends_at: None,
@@ -261,14 +279,22 @@ impl ContainerHealthRecord {
             self.failures = 0;
             self.succeeded = true;
             self.status = HEALTH_HEALTHY.to_string();
+            // A check that passes clears the failures it counted, so the reading is no
+            // longer a failed one and nothing is owed for it.
+            self.unhealthy_at = None;
         } else if self.suppresses_failure(now) {
             // The grace period: a failure here "count[s] towards" nothing, so the container
             // is still being evaluated rather than unhealthy.
             self.status = HEALTH_UNKNOWN.to_string();
+            self.unhealthy_at = None;
         } else {
             self.failures = self.failures.saturating_add(1);
             if self.failures >= self.retries {
                 self.status = HEALTH_UNHEALTHY.to_string();
+                // Dated at the FIRST execution that made the reading a failed one: a
+                // container that keeps failing has been unhealthy since then, and the
+                // instant does not move with every further execution.
+                self.unhealthy_at = self.unhealthy_at.or(Some(now));
             }
         }
         self.probe_in_flight = false;

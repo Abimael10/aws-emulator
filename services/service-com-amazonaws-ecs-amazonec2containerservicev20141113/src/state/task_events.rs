@@ -225,6 +225,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // instant too: Amazon ECS probes a container every `interval` with no further
             // call from anybody ([`super::container_health`]).
             .chain(self.next_health_probe_due_at())
+            // So is the stop a task whose essential container FAILED that check earns: the
+            // scheduler replaces such a task with no further call from anybody
+            // ([`super::unhealthy_task_replacement`]).
+            .chain(self.next_unhealthy_task_stop_due_at())
             // So is the next step of a DAEMON rollout, and the delete of a daemon that was
             // asked for: each is owed whether or not anybody calls again
             // ([`super::daemon_scheduling`]).

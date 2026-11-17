@@ -1,8 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ecs__logs.ecs-service-connect-client-task-reaches-the-server-service-by-its-discovery-name ecs__logs.svcreplace-deployment-whose-container-never-passes-its-healthcheck-is-rejected-and-rolled-back
-Issue-Key: ecs__logs.ecs-service-connect-client-task-reaches-the-server-service-by-its-discovery-name|_poll_until#21|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: ecs__logs.svcreplace-deployment-whose-container-never-passes-its-healthcheck-is-rejected-and-rolled-back
 Issue-Key: ecs__logs.svcreplace-deployment-whose-container-never-passes-its-healthcheck-is-rejected-and-rolled-back|_poll_until#4|TimeoutError|raise TimeoutError(f"{description}: the run budget ended first; not graded")
 Issue-Commit: dff6e291e5e6489707888b0049fa49b367909ca3
 
@@ -10,13 +9,15 @@ Issue-Commit: dff6e291e5e6489707888b0049fa49b367909ca3
 
 > _Note: this issue was identified against the code base at commit `dff6e291e5e6489707888b0049fa49b367909ca3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: cause 2 of 2 (the container health probe, the task it condemns and the circuit-breaker rollback that consumes it) is FIXED, which is why this report sits here; its `Issue-Key` and `Issue-Trace-Id` stayed with it. Cause 1 of 2 (Service Connect discovery) is UNFIXED and is re-filed as `issues/things-that-do-not-work/20261111T010150Z-ecs-logs-service-connect-discovery-is-never-reachable.md` so it is not recorded as working; its `Issue-Key` and `Issue-Trace-Id` moved with it._
+
 ## Operation
 CreateService
 
 ## Description
 Two distinct root causes, each grounded in its own failing check of this service.
 
-Cause 1 of 2: ECS Service Connect does not deliver traffic: a client task cannot reach the server service by its discoveryName.
+Cause 1 of 2: ECS Service Connect does not deliver traffic: a client task cannot reach the server service by its discoveryName. UNFIXED — re-filed as `issues/things-that-do-not-work/20261111T010150Z-ecs-logs-service-connect-discovery-is-never-reachable.md`, which carries this cause's replay key and the blocker whoever picks it up has to clear.
 AWS: recorded behavior only for the data path (ECS's model exposes CreateService.serviceConnectConfiguration with services[].discoveryName/clientAliases). The recording shows the client task's HTTP request to the discoveryName returning 200 with a body carrying the server's per-run marker, and the server container's own start line present in its awslogs stream — i.e. the response travelled the ECS-injected Service Connect mesh.
 Emulator: the check never reaches a graded state — 'Error: Check timed out after 60.0s'. Neither the server's log line nor a response through the discovery name is ever observable, so Service Connect's injected proxy/DNS is not emulated.
 Why: a client whose microservices address each other only by Service Connect discovery names has no working service-to-service path at all; nothing in a mesh-based deployment can be exercised, and the failure is a silent hang rather than a refusal.

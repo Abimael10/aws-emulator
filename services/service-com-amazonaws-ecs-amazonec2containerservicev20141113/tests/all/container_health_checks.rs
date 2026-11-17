@@ -25,6 +25,24 @@
 //! declared, and whether a health check is declared at all. One recording of one passing
 //! check is one row of it.
 //!
+//! The two tests at the END of this suite are what the SERVICE SCHEDULER makes of those same
+//! readings, which is a rule of its own:
+//!
+//! > A task of a service whose own scheduler places its tasks is STOPPED and REPLACED once an
+//! > essential container of it reports `UNHEALTHY` — the scheduler acts on container health
+//! > checks, which is what `CreateService$healthCheckGracePeriodSeconds` names a period for
+//! > ("the period of time ... that the Amazon ECS service scheduler ignores unhealthy Elastic
+//! > Load Balancing, VPC Lattice, and container health checks after a task has first
+//! > started") and what the `minimumHealthyPercent` doc describes from the other side ("the
+//! > scheduler stops the unhealthy tasks one-by-one ... to clear up capacity to launch
+//! > replacement tasks") — and the ROLLOUT that placed the task counts that stop as one of
+//! > its failed tasks (`Deployment$failedTasks`: "A task is considered a failure if the
+//! > service scheduler can't launch the task, the task doesn't transition to a `RUNNING`
+//! > state, or if it fails any of its defined health checks and is stopped"), so a revision
+//! > whose containers never pass their probe is a rollout the deployment circuit breaker
+//! > fails and rolls back. A STANDALONE task has no scheduler maintaining a count, so it is
+//! > not stopped for an unhealthy container at all — which is what the table above pins.
+//!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, so a status that is not computed from persisted state cannot pass.
 
@@ -33,7 +51,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{cluster_with_capacity, list, ok, service, string};
+use crate::ecs_wire::{cluster_with_capacity, count, list, ok, service, string};
 
 /// The cluster every task below runs in.
 const CLUSTER: &str = "healthchecks";
@@ -56,6 +74,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// first check — with generous margin for a loaded test machine, since what is under test is
 /// WHICH status is reached and not how fast.
 const POLL_BUDGET: Duration = Duration::from_secs(120);
+
+/// How long the SERVICE-side tests at the end of this suite keep trying.
+///
+/// Deeper than the budget above, because a service's verdict is several of those spans per
+/// TASK: the scheduler condemns a task only after `retries` failing executions one `interval`
+/// apart, each replacement starts afresh, and the circuit breaker fires only once as many
+/// tasks as its threshold tolerates have been lost. This suite also runs beside every other
+/// test of the workspace, which can stretch each of those spans, so the deadline is generous
+/// — it is only here so a failure is a failure rather than a hang, and every poll stops the
+/// instant its own condition holds.
+const SERVICE_POLL_BUDGET: Duration = Duration::from_secs(240);
 
 /// How many times an INVARIANT — something the rule says does not change — is looked at
 /// before the case accepts it. Each look is a fresh read through the front door, which
@@ -431,5 +460,483 @@ async fn a_container_that_depends_on_a_healthy_container_waits_for_the_check_to_
         container_health(&started, "db", case),
         "HEALTHY",
         "case {case:?}: the gate opens on the dependency's own HEALTHY reading, got {started}"
+    );
+}
+
+/// The `stopCode` a stop the SERVICE SCHEDULER made carries, from the `TaskStopCode` enum
+/// (`smithy_query(query="shape", shape="TaskStopCode")` -> TaskFailedToStart,
+/// EssentialContainerExited, UserInitiated, ServiceSchedulerInitiated, SpotInterruption,
+/// TerminationNotice, InfrastructureHealth). Spelled out here rather than imported, so a
+/// wrong constant in the implementation cannot make a test pass.
+const SERVICE_SCHEDULER_INITIATED: &str = "ServiceSchedulerInitiated";
+
+/// The `stoppedReason` of a task the scheduler stopped because its health check failed.
+const HEALTH_CHECK_FAILED_REASON: &str = "Task failed container health checks";
+
+/// The failure threshold the breaker in the rollback test is configured with, as a
+/// `ThresholdConfiguration` of type `COUNT`, which "uses `value` directly as the threshold":
+/// ONE lost task, so the test spends one health-check verdict rather than one per task the
+/// default formula would need.
+const THRESHOLD: i64 = 1;
+
+/// Register one revision of `family` with `containers` and answer its ARN.
+async fn register_revision(
+    router: &MultiServiceRouter,
+    family: &str,
+    containers: Value,
+    case: &str,
+) -> String {
+    let body = ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({ "family": family, "containerDefinitions": containers }),
+        case,
+    )
+    .await;
+    string(&body["taskDefinition"], "taskDefinitionArn", case)
+}
+
+/// Create one EC2-launch-type service of ONE task of `definition`, whose deployment
+/// configuration carries `breaker` when the case asks for a circuit breaker. Answers the
+/// service as the create reported it.
+async fn create_service(
+    router: &MultiServiceRouter,
+    name: &str,
+    definition: &str,
+    breaker: Value,
+    case: &str,
+) -> Value {
+    let mut configuration = json!({});
+    if !breaker.is_null() {
+        configuration["deploymentCircuitBreaker"] = breaker;
+    }
+    let body = ok(
+        router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": name,
+            "taskDefinition": definition,
+            "desiredCount": 1,
+            "launchType": "EC2",
+            "deploymentController": { "type": "ECS" },
+            "deploymentConfiguration": configuration,
+        }),
+        case,
+    )
+    .await;
+    body["service"].clone()
+}
+
+/// The ARNs `ListTasks` reports for the service `name` under `desired_status`.
+async fn service_task_arns(
+    router: &MultiServiceRouter,
+    name: &str,
+    desired_status: &str,
+    case: &str,
+) -> Vec<String> {
+    let body = ok(
+        router,
+        "ListTasks",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": name,
+            "desiredStatus": desired_status,
+        }),
+        case,
+    )
+    .await;
+    let mut arns: Vec<String> = list(&body, "taskArns", case)
+        .into_iter()
+        .map(|arn| {
+            arn.as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a task ARN, got {arn}"))
+                .to_string()
+        })
+        .collect();
+    arns.sort();
+    arns
+}
+
+/// Wait until the service `name` holds exactly one task it still wants running, and answer
+/// that task's ARN.
+async fn await_one_running_task(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    loop {
+        let running = service_task_arns(router, name, "RUNNING", case).await;
+        if let [only] = running.as_slice() {
+            let task = describe(router, only, case).await;
+            if task["lastStatus"].as_str() == Some("RUNNING") {
+                return only.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the service to place one running task, got {running:?}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The id segment of a task ARN — what a service event names a task by.
+fn task_id(task_arn: &str) -> &str {
+    task_arn.rsplit('/').next().unwrap_or(task_arn)
+}
+
+/// The service as `DescribeServices` reports it now.
+async fn describe_service(router: &MultiServiceRouter, name: &str, case: &str) -> Value {
+    let body = ok(
+        router,
+        "DescribeServices",
+        json!({ "cluster": CLUSTER, "services": [name] }),
+        case,
+    )
+    .await;
+    list(&body, "services", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the service back, got {body}"))
+}
+
+/// The service's current (`PRIMARY`) deployment, which is the first one it reports.
+fn primary_deployment(service_view: &Value, case: &str) -> Value {
+    list(service_view, "deployments", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a deployment, got {service_view}"))
+}
+
+/// One row of the SERVICE table: the containers a service's revision declares, and whether
+/// the scheduler has to replace the task it placed.
+struct ServiceRow {
+    case: &'static str,
+    /// The task-definition family AND the service name this row uses.
+    name: &'static str,
+    /// The container definitions its revision declares.
+    containers: Value,
+    /// Whether the task the service placed must be stopped and replaced.
+    replaced: bool,
+}
+
+/// The rows, spanning what the rule generalises over: which reading the essential container
+/// produces, how many retries that reading took, whether the failing container is essential
+/// at all, and whether a check is declared.
+fn service_rows() -> Vec<ServiceRow> {
+    let mut essential = container_with("app", Value::Null);
+    essential["essential"] = json!(true);
+    let mut sidecar = container_with("side", health_check(json!(["CMD-SHELL", "exit 1"]), 1, None));
+    sidecar["essential"] = json!(false);
+    vec![
+        ServiceRow {
+            case: "an essential container whose probe fails after one retry",
+            name: "svcfailone",
+            containers: json!([container_with(
+                "app",
+                health_check(json!(["CMD-SHELL", "exit 1"]), 1, None),
+            )]),
+            replaced: true,
+        },
+        ServiceRow {
+            case: "an essential container whose probe fails after two retries",
+            name: "svcfailtwo",
+            containers: json!([container_with(
+                "app",
+                health_check(json!(["CMD", "false"]), 2, None),
+            )]),
+            replaced: true,
+        },
+        ServiceRow {
+            case: "an essential container whose probe passes",
+            name: "svcpass",
+            containers: json!([container_with(
+                "app",
+                health_check(json!(["CMD-SHELL", "exit 0"]), 1, None),
+            )]),
+            replaced: false,
+        },
+        ServiceRow {
+            case: "a NON-essential container whose probe fails",
+            name: "svcsidecar",
+            containers: json!([essential, sidecar]),
+            replaced: false,
+        },
+        ServiceRow {
+            case: "a container that declares no health check at all",
+            name: "svcnocheck",
+            containers: json!([container_with("app", Value::Null)]),
+            replaced: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_service_task_whose_essential_container_fails_its_check_is_stopped_and_replaced() {
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, "the cluster every row's service runs in").await;
+
+    // Every row's service is created up front, so the executions of all of them fall due at
+    // once rather than one row's budget after another's.
+    let rows = service_rows();
+    for row in &rows {
+        let definition =
+            register_revision(&router, row.name, row.containers.clone(), row.case).await;
+        // No circuit breaker: what these rows are about is the REPLACEMENT the scheduler
+        // makes, which a breaker would eventually cut short.
+        create_service(&router, row.name, &definition, Value::Null, row.case).await;
+    }
+    let mut placed = Vec::new();
+    for row in &rows {
+        placed.push(await_one_running_task(&router, row.name, row.case).await);
+    }
+
+    // The rows whose ESSENTIAL container fails its check: that task is stopped — with the
+    // stop code the scheduler's own stops carry and the sentence Amazon ECS words this one in
+    // — and the service places another in its place.
+    for (row, first) in rows.iter().zip(&placed).filter(|(row, _)| row.replaced) {
+        let case = row.case;
+        let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+        let replacement = loop {
+            let stopped = service_task_arns(&router, row.name, "STOPPED", case).await;
+            let running = service_task_arns(&router, row.name, "RUNNING", case).await;
+            let replacement = running.iter().find(|arn| *arn != first).cloned();
+            if stopped.contains(first) {
+                if let Some(replacement) = replacement {
+                    break replacement;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the unhealthy task {first} to be stopped and \
+                 replaced, got stopped {stopped:?} and running {running:?}"
+            );
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        assert_ne!(
+            &replacement, first,
+            "case {case:?}: expected the replacement to be a new task, got {replacement}"
+        );
+        let stopped = describe(&router, first, case).await;
+        assert_eq!(
+            stopped["stopCode"].as_str(),
+            Some(SERVICE_SCHEDULER_INITIATED),
+            "case {case:?}: expected the stop to be the service scheduler's, got {stopped}"
+        );
+        assert_eq!(
+            stopped["stoppedReason"].as_str(),
+            Some(HEALTH_CHECK_FAILED_REASON),
+            "case {case:?}: expected the reason Amazon ECS words a failed health check in, \
+             got {stopped}"
+        );
+        // The scheduler says so on the service's own event stream, naming the task it
+        // stopped.
+        let service_view = describe_service(&router, row.name, case).await;
+        let id = task_id(first);
+        let events = list(&service_view, "events", case);
+        assert!(
+            events.iter().any(|event| {
+                let message = event["message"].as_str().unwrap_or_default();
+                message.contains(id) && message.contains("failed container health checks")
+            }),
+            "case {case:?}: expected an event naming the task {id} that failed its checks, \
+             got {service_view}"
+        );
+    }
+
+    // And the rows where no essential container failed its check keep the very task they
+    // placed. Read AFTER every replacement above, so each of these services has had at least
+    // as long as a replacement takes — and over repeated reads, each of which materialises
+    // whatever the clock owes.
+    for (row, first) in rows.iter().zip(&placed).filter(|(row, _)| !row.replaced) {
+        let case = row.case;
+        for look in 0..LOOKS_FOR_AN_INVARIANT {
+            let running = service_task_arns(&router, row.name, "RUNNING", case).await;
+            let stopped = service_task_arns(&router, row.name, "STOPPED", case).await;
+            assert_eq!(
+                running.as_slice(),
+                ::std::slice::from_ref(first),
+                "case {case:?}: expected the task the service placed to keep running (look \
+                 {look}), got {running:?}"
+            );
+            assert!(
+                stopped.is_empty(),
+                "case {case:?}: expected no task of this service to be stopped (look \
+                 {look}), got {stopped:?}"
+            );
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_rollout_whose_container_never_passes_its_probe_is_failed_and_rolled_back() {
+    let router = service();
+    let case = "a revision whose container never passes its probe";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    let family = "breakerhealth";
+    let name = "breakerhealth";
+
+    // Revision 1 passes its check; revision 2 runs but never passes.
+    let healthy = register_revision(
+        &router,
+        family,
+        json!([container_with(
+            "app",
+            health_check(json!(["CMD-SHELL", "exit 0"]), 1, None),
+        )]),
+        case,
+    )
+    .await;
+    create_service(
+        &router,
+        name,
+        &healthy,
+        // `ThresholdConfiguration$type` COUNT "uses `value` directly as the threshold", so ONE
+        // lost task fires this breaker: what is under test here is the FAILURE a health
+        // check produces and where it leaves the service, not how the threshold is computed
+        // — the formula, including the default that clamps "to a minimum of 3", is the
+        // table in `crate::deployment_circuit_breaker`.
+        json!({
+            "enable": true,
+            "rollback": true,
+            "thresholdConfiguration": { "type": "COUNT", "value": THRESHOLD },
+        }),
+        case,
+    )
+    .await;
+
+    // The first rollout completes once the task is running AND its check has passed: a
+    // rollout whose containers are still being evaluated has reached no steady state.
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    loop {
+        let service_view = describe_service(&router, name, case).await;
+        let deployment = primary_deployment(&service_view, case);
+        if string(&deployment, "rolloutState", case) == "COMPLETED"
+            && count(&service_view, "runningCount", case) == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the first rollout to complete with its task running, \
+             got {service_view}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let first_task = await_one_running_task(&router, name, case).await;
+    let described = describe(&router, &first_task, case).await;
+    assert_eq!(
+        container_health(&described, "app", case),
+        "HEALTHY",
+        "case {case:?}: expected the completed rollout's container to report HEALTHY, got \
+         {described}"
+    );
+
+    // The rollout nothing can make healthy.
+    let failing = register_revision(
+        &router,
+        family,
+        json!([container_with(
+            "app",
+            health_check(json!(["CMD-SHELL", "exit 1"]), 1, None),
+        )]),
+        case,
+    )
+    .await;
+    let updated = ok(
+        &router,
+        "UpdateService",
+        json!({ "cluster": CLUSTER, "service": name, "taskDefinition": failing }),
+        case,
+    )
+    .await;
+    let rollout = string(&updated["service"], "currentServiceDeployment", case);
+
+    // The breaker takes that rollout to the TERMINAL failed state, with the reason that
+    // names the breaker: "If the service fails to reach a steady state and circuit breaker
+    // is turned on, the deployment transitions to a FAILED state."
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    loop {
+        let service_view = describe_service(&router, name, case).await;
+        let failed = list(&service_view, "deployments", case).into_iter().find(
+            |deployment| {
+                deployment["taskDefinition"].as_str() == Some(failing.as_str())
+                    && deployment["rolloutState"].as_str() == Some("FAILED")
+            },
+        );
+        if let Some(failed) = failed {
+            assert_eq!(
+                string(&failed, "rolloutStateReason", case),
+                "ECS deployment circuit breaker: tasks failed to start.",
+                "case {case:?}: expected the reason to name the circuit breaker, got {failed}"
+            );
+            assert!(
+                count(&failed, "failedTasks", case) >= THRESHOLD,
+                "case {case:?}: expected at least the threshold's worth of failed tasks \
+                 counted, got {failed}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the rollout of the unhealthy revision to be failed by \
+             the breaker, got {service_view}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // ... and rolls the service back to the revision that completed, which runs again and
+    // passes its own check.
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    loop {
+        let service_view = describe_service(&router, name, case).await;
+        let deployment = primary_deployment(&service_view, case);
+        if string(&service_view, "taskDefinition", case) == healthy
+            && string(&deployment, "rolloutState", case) == "COMPLETED"
+            && count(&service_view, "runningCount", case) == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the service to be rolled back to the revision that \
+             completed, got {service_view}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let restored = await_one_running_task(&router, name, case).await;
+    let described = describe(&router, &restored, case).await;
+    assert_eq!(
+        container_health(&described, "app", case),
+        "HEALTHY",
+        "case {case:?}: expected the rolled-back revision's container to serve again, got \
+         {described}"
+    );
+
+    // The failed rollout, as a resource of its own: ended rolled back, by the breaker.
+    let body = ok(
+        &router,
+        "DescribeServiceDeployments",
+        json!({ "serviceDeploymentArns": [rollout] }),
+        case,
+    )
+    .await;
+    let record = list(&body, "serviceDeployments", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the rollout back, got {body}"));
+    assert_eq!(
+        string(&record, "status", case),
+        "ROLLBACK_SUCCESSFUL",
+        "case {case:?}: expected the failed rollout to end rolled back, got {record}"
+    );
+    assert_eq!(
+        string(&record["deploymentCircuitBreaker"], "status", case),
+        "TRIGGERED",
+        "case {case:?}: expected the breaker to report that it fired, got {record}"
+    );
+    assert!(
+        count(&record["deploymentCircuitBreaker"], "failureCount", case) >= THRESHOLD,
+        "case {case:?}: expected the breaker to have counted its threshold's worth of \
+         failures, got {record}"
     );
 }

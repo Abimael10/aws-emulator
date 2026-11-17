@@ -347,6 +347,12 @@ pub use container_secrets::*;
 mod container_health;
 pub use container_health::*;
 
+/// What the SERVICE SCHEDULER makes of those readings: the task it stops and replaces
+/// because an essential container failed its check, and the rollout that is still waiting
+/// for one to pass.
+mod unhealthy_task_replacement;
+pub use unhealthy_task_replacement::*;
+
 /// The service scheduler's steady state: the replacement a service's stopped task earns,
 /// and the standalone task that earns none.
 mod service_steady_state;

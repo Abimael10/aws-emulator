@@ -16,12 +16,14 @@
 //! the service scheduler can't launch the task, the task doesn't transition to a `RUNNING`
 //! state, or if it fails any of its defined health checks and is stopped" — and
 //! `DeploymentCircuitBreaker$resetOnHealthyTask`: "a task that reaches a healthy state resets
-//! the failure count to `0`", whose "default is `true`". Two stops answer that description
+//! the failure count to `0`", whose "default is `true`". Three stops answer that description
 //! ([`TaskRecord::failed_for_deployment`]): a launch this emulator cannot make is decided
 //! against the placement it was made into ([`evaluate_image_pulls`]) and the clock then stops
-//! the task it produced ([`TaskRecord::fail_launch`]), and a task whose ESSENTIAL container's
-//! program ends is stopped at the instant it ended ([`super::container_runtime`]). Either way
-//! the count is READ OFF the rollout's own task records
+//! the task it produced ([`TaskRecord::fail_launch`]), a task whose ESSENTIAL container's
+//! program ends is stopped at the instant it ended ([`super::container_runtime`]), and a task
+//! whose essential container failed the health check its definition declares is stopped by
+//! the scheduler that placed it ([`super::unhealthy_task_replacement`]). Either way the count
+//! is READ OFF the rollout's own task records
 //! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::deployment_launch_failures`])
 //! and cannot drift from the tasks that exist.
 //!
@@ -40,9 +42,9 @@
 //! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::roll_back_service_deployment_to`]).
 //!
 //! Every transition here is one the CLOCK owes: the failure falls due at the instant the
-//! launch it counted failed, and the rollback one [`TRANSITION_SPAN`] after the failure that
-//! triggered it — stored and compared, never slept on, so a caller reading in between sees
-//! the rollout `FAILED` before the rollback takes the service back.
+//! launch it counted failed, and the rollback one [`CIRCUIT_BREAKER_ROLLBACK_SPAN`] after the
+//! failure that triggered it — stored and compared, never slept on, so a caller reading in
+//! between sees the rollout `FAILED` before the rollback takes the service back.
 
 use super::*;
 
@@ -66,6 +68,19 @@ pub const CIRCUIT_BREAKER_ROLLED_BACK_REASON: &str =
 /// stands.
 pub const CIRCUIT_BREAKER_STOPPED_REASON: &str =
     "Service deployment stopped because the circuit breaker threshold was exceeded.";
+
+/// How long after FAILING a rollout the breaker's rollback falls due.
+///
+/// EMULATOR-CHOSEN, and deliberately longer than the span every other transition here takes:
+/// `Deployment$rolloutState` makes `FAILED` the END of that rollout ("A deployment in
+/// `FAILED` state doesn't launch any new tasks") and the rollback is a rollout of its own, so
+/// the state the breaker produced is one a client WATCHES for rather than a step on the way
+/// somewhere. The span is what makes it observable: a client polling the rollout at an
+/// ordinary interval — seconds apart, as a client waiting on a deployment polls — reads the
+/// `FAILED` rollout the breaker left before the rollback replaces it, instead of finding the
+/// service already back on the revision it was rolled back to with nothing to say which state
+/// took it there. Stored and compared, never slept on.
+pub const CIRCUIT_BREAKER_ROLLBACK_SPAN: Duration = Duration::from_secs(5);
 
 /// What the circuit breaker has counted for ONE rollout, read off the tasks that rollout
 /// placed.
@@ -109,19 +124,22 @@ impl TaskRecord {
     /// scheduler can't launch the task, the task doesn't transition to a `RUNNING` state, or
     /// if it fails any of its defined health checks and is stopped."
     ///
-    /// Two stops answer that description. The stop a launch Amazon ECS could not make earns
+    /// Three stops answer that description. The stop a launch Amazon ECS could not make earns
     /// ([`STOP_CODE_TASK_FAILED_TO_START`]) is the task that never transitioned to
     /// `RUNNING`. The stop a task whose ESSENTIAL container exited earns
     /// ([`STOP_CODE_ESSENTIAL_CONTAINER_EXITED`]) is a task that did not STAY in that state
     /// for the service to hold, which is why the same note's reset is worded over the tasks
     /// a deployment has "successfully running" rather than over the tasks it started at all.
-    /// A stop the SCHEDULER or a caller asked for is neither: the task was running and
+    /// And the stop a task whose essential container FAILED ITS HEALTH CHECK earns
+    /// ([`TaskRecord::stopped_for_failed_health_check`], [`super::unhealthy_task_replacement`])
+    /// is the third clause of that sentence, word for word. A stop the SCHEDULER made for
+    /// any other reason, or a caller asked for, is none of them: the task was running and
     /// something else wanted it stopped.
     pub fn failed_for_deployment(&self) -> bool {
         matches!(
             self.stop_code.as_deref(),
             Some(STOP_CODE_TASK_FAILED_TO_START) | Some(STOP_CODE_ESSENTIAL_CONTAINER_EXITED)
-        )
+        ) || self.stopped_for_failed_health_check()
     }
 
     /// WHEN the rollout lost it: the instant the stop it earned was recorded at (the task's
@@ -298,7 +316,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         service.deployment_rollout_failure = Some(CIRCUIT_BREAKER_FAILURE_REASON.to_string());
         service.deployment_steady_due_at = None;
         service.deployment_stable_due_at = None;
-        service.deployment_rollback_due_at = rollback.then(|| at + TRANSITION_SPAN);
+        service.deployment_rollback_due_at = rollback.then(|| at + CIRCUIT_BREAKER_ROLLBACK_SPAN);
         service.record_events([event]);
         let Some(record) = deployment_arn.and_then(|arn| self.service_deployments.get_mut(&arn))
         else {

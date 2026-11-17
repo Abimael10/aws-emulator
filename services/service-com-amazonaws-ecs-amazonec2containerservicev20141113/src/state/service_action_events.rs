@@ -178,17 +178,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// The earliest instant in the FUTURE at which this store owes a SERVICE-level
     /// transition, if any — one of the instants the clock pump waits for.
     ///
-    /// The steady state a rollout is owed, the stability a task set is owed and the end of
-    /// the drain a deleted service is in: each is a transition the clock materialises with no
-    /// further call, and each is an action a client watching the bus is waiting on. Only an
-    /// instant still to come is answered, as the scheduler's own next step is
-    /// ([`Self::next_scheduler_step_due_at`]): an instant already past has been offered to
+    /// The steady state a rollout is owed, the ROLLBACK the deployment circuit breaker owes a
+    /// rollout it failed ([`super::circuit_breaker`]), the stability a task set is owed and
+    /// the end of the drain a deleted service is in: each is a transition the clock
+    /// materialises with no further call, and each is an action a client watching the bus is
+    /// waiting on. Only an instant still to come is answered, as the scheduler's own next step
+    /// is ([`Self::next_scheduler_step_due_at`]): an instant already past has been offered to
     /// every pass since it fell due, so waking on it again would materialise nothing while
     /// the records it waits on are not there yet.
     pub(super) fn next_service_transition_due_at(&self, now: SystemTime) -> Option<SystemTime> {
         self.services
             .values()
-            .flat_map(|service| [service.deployment_steady_due_at, service.drain_due_at])
+            .flat_map(|service| {
+                [
+                    service.deployment_steady_due_at,
+                    service.deployment_rollback_due_at,
+                    service.drain_due_at,
+                ]
+            })
             .chain(self.task_sets.values().map(|set| set.stable_due_at))
             .flatten()
             .filter(|due| *due > now)
