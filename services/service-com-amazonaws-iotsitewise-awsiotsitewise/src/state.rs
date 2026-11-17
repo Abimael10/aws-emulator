@@ -2315,7 +2315,8 @@ pub const RESOURCE_ACTION_DEFINITION: &str = "Action Definition";
 /// rather than replaced by whatever the handler resolved. The families whose own
 /// wording the service uses instead each have one function of their own beside
 /// this one ([`asset_not_found_message`],
-/// [`composite_model_not_found_message`], [`alias_not_found_message`],
+/// [`composite_model_not_found_message`], [`property_not_found_message`],
+/// [`alias_not_found_message`],
 /// [`gateway_not_found_message`], [`gateway_not_found_for_update_message`],
 /// [`hierarchy_not_found_message`], [`not_found_arn_message`]).
 pub fn not_found_message(resource: &str, requested: &str) -> String {
@@ -2351,6 +2352,29 @@ pub fn asset_not_found_message(requested: &str) -> String {
 /// cannot word the same absence four ways.
 pub fn composite_model_not_found_message(asset_model: &str, composite_model: &str) -> String {
     format!("CompositeModel: {composite_model} not found for AssetModel: {asset_model}")
+}
+
+/// The message a refusal carries when the `(assetId, propertyId)` pair a
+/// DATA-plane call addressed a time series by resolves to no property.
+///
+/// The data endpoint addresses a stream by that pair and resolves it as ONE
+/// property lookup, so the absence is stated as a property that was not found —
+/// whichever half of the pair is the missing one — and it names both ids, each
+/// echoed as the request supplied it, because the same property id is absent
+/// from every other asset too. The order is the lookup's own: the property
+/// asked for, then the asset it was looked for on.
+///
+/// The control-plane operations that address a property as a SUB-RESOURCE of an
+/// asset (`DescribeAssetProperty`, `UpdateAssetProperty`, the time-series
+/// binding and the time-series read and delete) resolve the asset first and
+/// state its absence as an asset ([`asset_not_found_message`]), so they keep
+/// their own wording; this one is the data endpoint's
+/// ([`crate::service::endpoints`]).
+///
+/// One place, so the four single data-plane reads and the per-entry refusals of
+/// the batch reads and the batch write cannot word the same absence five ways.
+pub fn property_not_found_message(asset_id: &str, property_id: &str) -> String {
+    format!("Property not found (Property Id = {property_id}, Asset Id = {asset_id})")
 }
 
 /// The message a not-found refusal for a data stream addressed by its ALIAS

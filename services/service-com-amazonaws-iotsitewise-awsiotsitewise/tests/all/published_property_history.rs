@@ -758,7 +758,12 @@ async fn a_pair_naming_no_published_property_is_the_modelled_refusal() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("The asset {asset} has no property {property}.").as_str()),
+            // The history read is served by the DATA endpoint, which resolves the
+            // pair as ONE property lookup and names both ids.
+            Some(
+                format!("Property not found (Property Id = {property}, Asset Id = {asset})")
+                    .as_str()
+            ),
             "case {case:?}: unexpected message in {body}"
         );
 

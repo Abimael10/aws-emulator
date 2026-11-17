@@ -2,7 +2,8 @@
 
 //! @op CreateBulkImportJob
 //!
-//! Implemented: the handler below resolves the destination the request names —
+//! Implemented: the handler below checks the CSV column list the request states
+//! describes a usable row, resolves the destination the request names —
 //! the session dataset of a workspace, or the time series outside one the
 //! account's warm or cold tier is the precondition for — records the job, and
 //! answers with the lifecycle the create owes it. `jobName` is "the unique name
@@ -242,6 +243,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The CSV file format a request states must describe a USABLE ROW: the
+        // column list is "the column names specified in the .csv file", and a
+        // bulk import reads each row as one sample of one stream, so the list has
+        // to say which stream the row belongs to, what type its value is, when it
+        // was taken and what it was. A list that does not is refused before
+        // anything about the account's own storage is looked at, because the
+        // defect is in this request rather than in the destination it names
+        // ([`csv_describes_a_row`]).
+        for csv in csv_formats(&input) {
+            if !csv_describes_a_row(csv) {
+                return Err(invalid_request(CSV_MUST_DESCRIBE_A_ROW.to_string()));
+            }
+        }
+
         // The format the JOB states for every file that states none of its own:
         // "contains the configuration information of a job, such as the file format
         // used to save data in Amazon S3".
@@ -460,6 +475,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// if it carries one at all. Source: `smithy_query(query="shape",
 /// shape="DatasetTypeEnum")` — SESSION, CURATED, EXTERNAL.
 const DATASET_TYPE_SESSION: &str = "SESSION";
+
+/// The sentence a CSV column list that describes no usable row is refused with.
+///
+/// The service's own wording for this refusal, grammatical defect included: the
+/// column list has to name an identifier, a data type, a timestamp and a value,
+/// and the sentence carries no variable part — the list it is about is the one
+/// the request sent.
+const CSV_MUST_DESCRIBE_A_ROW: &str =
+    "Provided CSV file format contains must contain an identifier, data type, timestamp, \
+     and value";
+
+/// The `ColumnName` values a usable row is described by, each read off
+/// `smithy_query(query="shape", shape="ColumnName")` — ALIAS, ASSET_ID,
+/// PROPERTY_ID, DATA_TYPE, TIMESTAMP_SECONDS, TIMESTAMP_NANO_OFFSET, QUALITY,
+/// VALUE — and grouped here by the part of a sample each names.
+///
+/// The IDENTIFIER says which stream the row belongs to, and a stream is named
+/// the two ways every data-plane operation of this service names one: by its
+/// alias, or by the `(assetId, propertyId)` pair of the property it is
+/// associated with. `TIMESTAMP_NANO_OFFSET` and `QUALITY` refine a sample the
+/// other columns already describe — an offset within the second, and the
+/// quality a value carries — so neither is part of what makes a row usable.
+const COLUMN_ALIAS: &str = "ALIAS";
+const COLUMN_ASSET_ID: &str = "ASSET_ID";
+const COLUMN_PROPERTY_ID: &str = "PROPERTY_ID";
+const COLUMN_DATA_TYPE: &str = "DATA_TYPE";
+const COLUMN_TIMESTAMP_SECONDS: &str = "TIMESTAMP_SECONDS";
+const COLUMN_VALUE: &str = "VALUE";
+
+/// Every CSV file format this request states: the one the JOB states for every
+/// file that states none of its own, and the one each FILE states for itself.
+///
+/// A file's own format overrides the job's for that file, so both are checked:
+/// a request is refused for whichever CSV column list it carries that describes
+/// no usable row.
+fn csv_formats(input: &CreateBulkImportJobInput) -> impl Iterator<Item = &Csv> {
+    let job = input
+        .job_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.file_format.as_ref());
+    job.into_iter()
+        .chain(input.files.iter().filter_map(|file| file.file_format.as_ref()))
+        .filter_map(|format| format.csv.as_ref())
+}
+
+/// Whether `csv`'s column list describes a usable row: an identifier for the
+/// stream (an alias, or both halves of the asset-property pair), the data type
+/// of the value, the timestamp it was taken at, and the value itself.
+fn csv_describes_a_row(csv: &Csv) -> bool {
+    let names = |column: &str| csv.column_names.iter().any(|named| named == column);
+    let identifier = names(COLUMN_ALIAS) || (names(COLUMN_ASSET_ID) && names(COLUMN_PROPERTY_ID));
+    identifier
+        && names(COLUMN_DATA_TYPE)
+        && names(COLUMN_TIMESTAMP_SECONDS)
+        && names(COLUMN_VALUE)
+}
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.
 fn invalid_request(message: String) -> CreateBulkImportJobError {

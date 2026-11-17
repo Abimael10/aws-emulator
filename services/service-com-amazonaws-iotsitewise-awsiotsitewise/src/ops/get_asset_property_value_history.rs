@@ -230,23 +230,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.property_alias.as_deref(),
         ) {
             (Some(asset_label), Some(property_id), None) => {
-                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                    not_found(crate::state::not_found_message(
-                        crate::state::RESOURCE_ASSET,
-                        asset_label,
-                    ))
-                })?;
                 // The one definition of "the property this pair names": the asset's
                 // own properties and the ones its model's composite models declare
-                // are addressed by the same pair, so both resolve here.
-                let resolved = store
-                    .resolve_asset_property(&asset_id, property_id)
+                // are addressed by the same pair, so both resolve here. The pair is
+                // ONE property lookup, so EITHER half resolving to nothing is the
+                // same absence, stated in the one wording the data endpoint words it
+                // in (`crate::state::property_not_found_message`) and naming both
+                // ids the request supplied.
+                store
+                    .resolve_asset_id(asset_label)
+                    .and_then(|asset_id| {
+                        let property = store.resolve_asset_property(&asset_id, property_id)?;
+                        Some(crate::state::SeriesKey::Property(asset_id, property.id))
+                    })
                     .ok_or_else(|| {
-                        not_found(format!(
-                            "The asset {asset_label} has no property {property_id}."
+                        not_found(crate::state::property_not_found_message(
+                            asset_label,
+                            property_id,
                         ))
-                    })?;
-                crate::state::SeriesKey::Property(asset_id, resolved.id)
+                    })?
             }
             // An alias names ONE data stream, whether an asset property is
             // associated with it or not: a disassociated series keeps the samples it

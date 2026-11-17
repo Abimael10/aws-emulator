@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What the boundary records about the INPUT SHAPE each request is read against, for
-//! the two things this service's refusal states that the violations alone cannot say.
+//! the three things this service's refusal states that the violations alone cannot
+//! say.
 //!
 //! 1. **The `@pattern` the walk declares but cannot apply.** The requirement is
 //!    applied by [`super::unapplied_patterns`], over the expressions recorded here.
@@ -9,6 +10,11 @@
 //!    the constraint that FAILED, and a clause stated at a collection member lists
 //!    the element shape's WHOLE set, so the set has to be read off the model
 //!    ([`element_set`]).
+//! 3. **Which ENDPOINT hosts the operation.** The model hosts this service on three
+//!    endpoints, and the data plane words a constraint refusal differently from the
+//!    other two ([`super::endpoints`]), so the shape being read — which is what names
+//!    the operation at the boundary — decides the dialect
+//!    ([`reading_the_data_endpoint`]).
 //!
 //! Both are read off the member schemas of the input shape, so both are bounded the
 //! same way by what codegen puts on one: a member schema carries its own constraints
@@ -51,6 +57,10 @@ struct Declared {
     /// `(the member path a clause spells, the requirement a clause stated at that
     /// collection member nests)`, one per member whose ELEMENTS carry constraints.
     element_sets: Vec<(String, String)>,
+    /// Whether the operation reading this shape is hosted on the service's DATA
+    /// endpoint, which is what decides the DIALECT its refusal is stated in
+    /// ([`super::endpoints`]).
+    data_endpoint: bool,
 }
 
 thread_local! {
@@ -64,7 +74,15 @@ thread_local! {
 /// Record what `input_schema` declares, as the input shape this thread is now
 /// reading.
 pub(super) fn reading_input(input_schema: &Schema) {
-    let mut declared = Declared::default();
+    // Which endpoint hosts the operation this shape is the input of: the two
+    // frontends word a constraint refusal differently, and the shape being read is
+    // what names the operation at the boundary.
+    let mut declared = Declared {
+        data_endpoint: super::endpoints::serves_the_data_endpoint(
+            input_schema.shape_id().shape_name(),
+        ),
+        ..Declared::default()
+    };
     for member in input_schema.members() {
         let Some(name) = member.member_name() else {
             continue;
@@ -79,7 +97,7 @@ pub(super) fn reading_input(input_schema: &Schema) {
         if let Some(element) =
             constraint::<ElementConstraintsTrait>(traits, &ElementConstraintsTrait::TRAIT_ID)
         {
-            if let Some(stated) = stated_element_set(element.inner()) {
+            if let Some(stated) = stated_element_set(element.inner(), declared.data_endpoint) {
                 declared.element_sets.push((member_path, stated));
             }
         }
@@ -108,7 +126,7 @@ fn constraint<'map, T: 'static>(traits: &'map TraitMap, id: &ShapeId) -> Option<
 ///
 /// `None` when the elements carry no constraint at all, which leaves such a clause the
 /// framework's own.
-fn stated_element_set(elements: &TraitMap) -> Option<String> {
+fn stated_element_set(elements: &TraitMap, data_endpoint: bool) -> Option<String> {
     let mut declared: Vec<ViolationKind> = Vec::new();
     if let Some(length) = constraint::<LengthTrait>(elements, &LengthTrait::TRAIT_ID) {
         if let Some(max) = length.max {
@@ -126,7 +144,7 @@ fn stated_element_set(elements: &TraitMap) -> Option<String> {
     }
     if let Some(pattern) = constraint::<PatternTrait>(elements, &PatternTrait::TRAIT_ID) {
         declared.push(ViolationKind::Pattern(
-            super::validation::published_expression(pattern.regex),
+            super::validation::published_expression_at(data_endpoint, pattern.regex),
         ));
     }
     if let Some(values) = constraint::<EnumTrait>(elements, &EnumTrait::TRAIT_ID) {
@@ -153,6 +171,23 @@ fn bound(declared: f64) -> String {
     } else {
         format!("{declared}")
     }
+}
+
+/// Whether the operation whose input this thread is reading is hosted on the
+/// service's DATA endpoint, which is the dialect its refusal is stated in.
+pub(super) fn reading_the_data_endpoint() -> bool {
+    DECLARED.with(|slot| slot.borrow().data_endpoint)
+}
+
+/// Forget what this thread recorded about the shape being read.
+///
+/// Test-only: every modelled request records a shape of its own before any refusal
+/// of it is worded (the module docs above), so nothing in the serving path needs
+/// this — a unit test of the refusal WORDS does, to state one over no recorded
+/// shape whichever test ran on this thread before it.
+#[cfg(test)]
+pub(super) fn forget() {
+    DECLARED.with(|slot| *slot.borrow_mut() = Declared::default());
 }
 
 /// The requirement a clause stated at the collection member `collection` nests, or

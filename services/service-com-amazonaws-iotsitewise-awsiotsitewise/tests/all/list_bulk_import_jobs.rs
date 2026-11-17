@@ -198,7 +198,12 @@ fn cases() -> Vec<Case> {
                     "versionId": "3HL4kqtJlcpXroDTDmjVBH40Nrjfkd",
                     "alias": "/company/windfarm/3/turbine/7/temperature",
                     "startTime": { "timeInSeconds": 1_760_000_000_i64, "offsetInNanos": 250 },
-                    "fileFormat": { "csv": { "columnNames": ["ASSET_ID", "VALUE"] } },
+                    // The column list has to describe a usable row — an
+                    // identifier, the data type, the timestamp and the value — so
+                    // this file carries the asset-property pair form of one.
+                    "fileFormat": { "csv": { "columnNames": [
+                        "ASSET_ID", "PROPERTY_ID", "DATA_TYPE", "TIMESTAMP_SECONDS", "VALUE",
+                    ] } },
                 }])
             },
             workspace: None,

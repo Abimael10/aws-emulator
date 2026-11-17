@@ -12,9 +12,12 @@
 //! drift per crate. What this module decides is the four things THIS service's
 //! report does differently:
 //!
-//! 1. a clause names the member and the requirement and states NO VALUE — neither
-//!    the value a present member sent nor the `null` the framework writes for a
-//!    member that was not there at all.
+//! 1. a clause of a refusal from the CONTROL plane or the Monitor plane names the
+//!    member and the requirement and states NO VALUE — neither the value a present
+//!    member sent nor the `null` the framework writes for a member that was not
+//!    there at all — while the DATA endpoint's quotes the value it rejected: the
+//!    frontends word this report differently, and which of them answered is read
+//!    off the model ([`super::endpoints`]).
 //! 2. an enumerated type's value set is listed in the order the set's own hash
 //!    table is walked
 //!    (`service_common::validation_message::in_hashed_enum_order`), which is not the
@@ -23,8 +26,8 @@
 //!    to match first (`service_common::validation_message::in_pattern_first_order`):
 //!    the expression is the shape of the value and every other requirement is a
 //!    bound on it.
-//! 4. the expression a `@pattern` requirement quotes is the one this service
-//!    PUBLISHES for the member's shape ([`published_expression`]).
+//! 4. the expression a `@pattern` requirement quotes is the one the ANSWERING
+//!    endpoint publishes for the member's shape ([`published_expression_at`]).
 //!
 //! A fifth thing is not this service's choice but AWS's, and the whole refusal is
 //! handed to the shared home that states it: a constraint one of a COLLECTION's
@@ -46,7 +49,7 @@
 //! ([`super::input_shape::with_unapplied_patterns`]), so a member that broke its
 //! expression and one of its bounds is reported with both.
 
-use ::service_common::validation::unanchored_at_the_close;
+use ::service_common::validation::{unanchored, unanchored_at_the_close};
 use ::service_common::validation_message::{
     aws_validation_refusal_over_elements_stating_withholding, in_hashed_enum_order,
     in_pattern_first_order,
@@ -59,34 +62,53 @@ use ::smithy_server_runtime::{Refusal, Refused, Violation};
 /// for an empty violation list, which carries no member to name.
 const THE_REQUEST_IS_NOT_VALID: &str = "The request isn't valid.";
 
-/// The expressions this service publishes WITHOUT the `$` that CLOSES them, keyed
-/// by the expression, because what is published belongs to the member's SHAPE and so
-/// holds for every member targeting it — in any operation, in whatever binding
-/// carried the value.
+/// The expressions the endpoints OTHER than the data plane publish WITHOUT the `$`
+/// that CLOSES them, keyed by the expression, because what is published belongs to
+/// the member's SHAPE and so holds for every member targeting it — in any operation
+/// of those endpoints, in whatever binding carried the value.
 ///
 /// A `CustomID` reference is published that way: its text is an alternation of two
-/// self-anchored branches, and the service quotes it less the anchor that closes the
-/// second. Every other expression of this model is quoted exactly as the model
-/// declares it, anchors included (`AssetModelVersionFilter`'s `^(LATEST|ACTIVE)$` is
-/// one). Which of the two a shape is published with cannot be read off the text —
-/// both are spelled `^…$` — so it is reference data about the shape; the DROP itself
-/// is the shared home's, called rather than restated.
+/// self-anchored branches, and those endpoints quote it less the anchor that closes
+/// the second. Every other expression of this model is quoted there exactly as the
+/// model declares it, anchors included (`AssetModelVersionFilter`'s
+/// `^(LATEST|ACTIVE)$` is one). Which of the two a shape is published with cannot be
+/// read off the text — both are spelled `^…$` — so it is reference data about the
+/// shape; the DROP itself is the shared home's, called rather than restated. The
+/// DATA endpoint publishes neither anchor of a wrapping pair, which is a rule about
+/// the ENDPOINT rather than about one shape ([`published_expression_at`]).
 const PUBLISHED_UNANCHORED_AT_THE_CLOSE: [&str; 1] = [crate::state::CUSTOM_ID_PATTERN];
 
-/// `regex` as this service PUBLISHES it, which is what a `@pattern` requirement
-/// quotes back.
+/// `regex` as every endpoint OTHER than the data plane publishes it, which is what
+/// a `@pattern` requirement of one of their operations quotes back.
 ///
 /// The CHECK always runs the model's expression as written; only this rendering
 /// decides how it is quoted. Every caller that states such a requirement — the
 /// boundary's report below and the operations that state a reference's syntax
 /// themselves ([`crate::state::custom_id_clause`]) — goes through here, so one
-/// expression cannot be published two ways by one service.
+/// expression cannot be published two ways by one endpoint.
 #[must_use]
 pub fn published_expression(regex: &str) -> String {
     if PUBLISHED_UNANCHORED_AT_THE_CLOSE.contains(&regex) {
         return unanchored_at_the_close(regex);
     }
     regex.to_string()
+}
+
+/// `regex` as the endpoint that ANSWERED publishes it.
+///
+/// The DATA endpoint publishes an expression without the pair of anchors the model
+/// wraps a whole-value expression in — the `^` that opens it and the `$` that
+/// closes it — so what it quotes is the expression itself; the drop is the shared
+/// home's one reading of that pair, called rather than restated. Every other
+/// endpoint publishes what [`published_expression`] states. Which endpoint answered
+/// is the model's own classification of the operation ([`super::endpoints`]), so
+/// this is keyed to no operation, member or value.
+#[must_use]
+pub fn published_expression_at(data_endpoint: bool, regex: &str) -> String {
+    if data_endpoint {
+        return unanchored(regex);
+    }
+    published_expression(regex)
 }
 
 /// The violations one report is stated over, in the order it states them: those the
@@ -115,17 +137,20 @@ fn restated(violations: &[Violation]) -> Vec<Violation> {
 /// `except InvalidRequestException` never fires. An authentication refusal is the
 /// emulator's rather than this service's, and keeps the framework's 403 wording.
 ///
-/// Only the CODE is this service's: the message is the shared home's rendering of
-/// AWS's report over the violations above, which withholds every value (`|_| true`)
-/// and quotes an expression as this service publishes it.
+/// Only the CODE is this service's as a whole: the message is the shared home's
+/// rendering of AWS's report over the violations above, in the dialect of the
+/// ENDPOINT that answered — the control and Monitor planes withhold every value and
+/// quote an expression as they publish one, the data plane states the value and
+/// quotes the expression unanchored.
 pub(super) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
+    let data_endpoint = super::input_shape::reading_the_data_endpoint();
     let message = aws_validation_refusal_over_elements_stating_withholding(
         &Refusal::Invalid(restated(violations)),
-        published_expression,
-        |_| true,
+        |regex| published_expression_at(data_endpoint, regex),
+        |_| !data_endpoint,
         super::input_shape::element_set,
     )
     .map_or_else(
@@ -189,11 +214,69 @@ mod tests {
         }
     }
 
-    /// The message this service states for `violations`.
+    /// The message this service states for `violations`, with nothing recorded about
+    /// the input shape being read — so the dialect is the control plane's, which is
+    /// what every row below is about.
     fn stated(violations: Vec<Violation>) -> String {
+        super::super::input_shape::forget();
         refused(&Refusal::Invalid(violations))
             .expect("a constraint refusal is this service's to word")
             .message
+    }
+
+    /// The message this service states for `violations` with the input shape
+    /// `input_schema` being read, which is what names the endpoint that answered.
+    fn stated_reading(input_schema: &::aws_smithy_schema::Schema, violations: Vec<Violation>) -> String {
+        super::super::input_shape::reading_input(input_schema);
+        refused(&Refusal::Invalid(violations))
+            .expect("a constraint refusal is this service's to word")
+            .message
+    }
+
+    /// RULE: the DATA endpoint states the value it rejected and quotes the member's
+    /// expression without the pair of anchors the model wraps it in, while every
+    /// other endpoint states neither — the one difference between the frontends'
+    /// reports.
+    ///
+    /// Driven over the real input shapes of one operation per endpoint
+    /// (`smithy_query(query="operation", operation="GetAssetPropertyAggregates")` —
+    /// hosted on `data.`, `resolution` carrying `@pattern ^1m|15m|1h|1d$` — and
+    /// `DescribeAssetModel`, hosted on `api.`, `assetModelVersion` carrying
+    /// `^(LATEST|ACTIVE)$`), so which dialect answers is the model's classification
+    /// rather than anything written here.
+    #[test]
+    fn the_endpoint_that_answered_decides_the_dialect() {
+        let data = stated_reading(
+            crate::ops::types::GET_ASSET_PROPERTY_AGGREGATES_INPUT_SCHEMA,
+            vec![violation(
+                "resolution",
+                ViolationKind::Pattern("^1m|15m|1h|1d$".to_string()),
+                Some("2d"),
+            )],
+        );
+        let expected = "1 validation error detected: Value '2d' at 'resolution' failed to \
+                        satisfy constraint: Member must satisfy regular expression pattern: \
+                        1m|15m|1h|1d";
+        assert_eq!(
+            data, expected,
+            "the data endpoint: expected {expected:?}, got {data:?}"
+        );
+
+        let control = stated_reading(
+            crate::ops::types::DESCRIBE_ASSET_MODEL_INPUT_SCHEMA,
+            vec![violation(
+                "assetModelVersion",
+                ViolationKind::Pattern("^(LATEST|ACTIVE)$".to_string()),
+                Some("active"),
+            )],
+        );
+        let expected = "1 validation error detected: Value at 'assetModelVersion' failed to \
+                        satisfy constraint: Member must satisfy regular expression pattern: \
+                        ^(LATEST|ACTIVE)$";
+        assert_eq!(
+            control, expected,
+            "the control plane: expected {expected:?}, got {control:?}"
+        );
     }
 
     /// RULE: a clause states the member and the requirement and no value — not the

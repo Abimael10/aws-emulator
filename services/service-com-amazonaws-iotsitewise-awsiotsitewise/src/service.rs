@@ -52,8 +52,10 @@
 //! constraint set a clause at a collection member lists ([`input_shape`]).
 //!
 //! The WORDS of a constraint refusal are [`validation`]'s, this service's one home
-//! for them.
+//! for them — stated in the dialect of the ENDPOINT hosting the operation the
+//! request named, which is [`endpoints`]'s reading of the model.
 
+pub mod endpoints;
 mod input_shape;
 mod unapplied_patterns;
 mod unset_string_members;

@@ -332,8 +332,13 @@ impl Format {
     fn wire(self) -> Value {
         match self {
             Format::Mp4 => json!({ "mp4": {} }),
-            // `csv` is the one member with a required body of its own.
-            Format::Csv => json!({ "csv": { "columnNames": ["ALIAS", "VALUE"] } }),
+            // `csv` is the one member with a required body of its own, and the
+            // column list it carries has to describe a usable row — an
+            // identifier, the data type, the timestamp and the value — or the
+            // create is refused for the list rather than reaching the import.
+            Format::Csv => json!({
+                "csv": { "columnNames": ["ALIAS", "DATA_TYPE", "TIMESTAMP_SECONDS", "VALUE"] }
+            }),
             Format::Parquet => json!({ "parquet": {} }),
             Format::Annotation => json!({ "annotation": {} }),
         }

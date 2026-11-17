@@ -226,7 +226,16 @@ fn cases() -> Vec<Case> {
                 )])
             },
             job_configuration: Some(json!({
-                "fileFormat": { "csv": { "columnNames": [COLUMN_NAMES[1], COLUMN_NAMES[7]] } }
+                // The smallest column list that still describes a usable row with
+                // the asset-property pair as its identifier: the pair, the data
+                // type, the timestamp and the value.
+                "fileFormat": { "csv": { "columnNames": [
+                    COLUMN_NAMES[1],
+                    COLUMN_NAMES[2],
+                    COLUMN_NAMES[3],
+                    COLUMN_NAMES[4],
+                    COLUMN_NAMES[7],
+                ] } }
             })),
             adaptive_ingestion: Some(true),
             delete_files_after_import: Some(false),
@@ -258,7 +267,14 @@ fn cases() -> Vec<Case> {
                     file(
                         "sitewise-import",
                         "turbines/2026/02.csv",
-                        json!({ "fileFormat": { "csv": { "columnNames": [COLUMN_NAMES[0]] } } })
+                        // The alias-identified form of the same smallest usable
+                        // row: the alias, the data type, the timestamp, the value.
+                        json!({ "fileFormat": { "csv": { "columnNames": [
+                            COLUMN_NAMES[0],
+                            COLUMN_NAMES[3],
+                            COLUMN_NAMES[4],
+                            COLUMN_NAMES[7],
+                        ] } } })
                     ),
                 ])
             },

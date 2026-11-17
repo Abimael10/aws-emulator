@@ -512,13 +512,30 @@ fn resolve_entry(
         entry.property_alias.as_deref(),
     ) {
         (Some(asset_label), Some(property_id), None) => {
-            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                (
-                    "ResourceNotFoundException",
-                    crate::state::asset_not_found_message(asset_label),
-                )
-            })?;
-            crate::state::SeriesKey::Property(asset_id, property_id.to_string())
+            // The pair is ONE property lookup, over the one definition of "the property
+            // this pair names" — the asset's own properties and the ones its model's
+            // composite models declare — so a value written against either lands on that
+            // property's series. EITHER half resolving to nothing is therefore the same
+            // absence, stated in the one wording the data endpoint words it in and naming
+            // the two ids the ENTRY supplied, whichever form they took.
+            let (asset_id, property) = store
+                .resolve_asset_id(asset_label)
+                .filter(|asset_id| store.assets.contains_key(asset_id))
+                .and_then(|asset_id| {
+                    let property = store.resolve_asset_property(&asset_id, property_id)?;
+                    Some((asset_id, property))
+                })
+                .ok_or_else(|| {
+                    (
+                        "ResourceNotFoundException",
+                        crate::state::property_not_found_message(asset_label, property_id),
+                    )
+                })?;
+            let data_type = property.data_type.clone();
+            return Ok((
+                crate::state::SeriesKey::Property(asset_id, property.id),
+                data_type,
+            ));
         }
         // An alias names ONE data stream, whether an asset property is associated
         // with it or not, so ingest addressed by the alias of a disassociated stream
@@ -542,8 +559,10 @@ fn resolve_entry(
         }
     };
 
-    // The stream's data type: the asset property's, for an associated stream, and
-    // the one the disassociated record kept, for a stream no property owns.
+    // The stream's data type, for the ALIAS-addressed entry that reaches here — the
+    // pair-addressed one answered above: the asset property's, for an alias an asset
+    // property is associated with, and the one the disassociated record kept, for a stream
+    // no property owns.
     let (asset_id, property_id) = match &stream {
         crate::state::SeriesKey::Property(asset_id, property_id) => (asset_id, property_id),
         crate::state::SeriesKey::Disassociated(alias) => {
@@ -560,22 +579,16 @@ fn resolve_entry(
             return Ok((stream, data_type));
         }
     };
-    if !store.assets.contains_key(asset_id) {
-        return Err((
-            "ResourceNotFoundException",
-            crate::state::asset_not_found_message(asset_id),
-        ));
-    }
-    // The one definition of "the property this pair names": the asset's own
-    // properties and the ones its model's composite models declare are addressed
-    // by the same pair, so a value written against either lands on that
-    // property's series.
+    // The alias resolved to a property of an asset this store holds, so the same one
+    // definition of "the property this pair names" answers its declared type; an absence
+    // here is stated in the data endpoint's one property wording, over the ids the stream
+    // was resolved to.
     let property = store
         .resolve_asset_property(asset_id, property_id)
         .ok_or_else(|| {
             (
                 "ResourceNotFoundException",
-                format!("The asset {asset_id} has no property {property_id}."),
+                crate::state::property_not_found_message(asset_id, property_id),
             )
         })?;
     let data_type = property.data_type.clone();

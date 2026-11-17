@@ -259,6 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
+            // The derivation walks the stream's stored SAMPLES rather than the windows
+            // the entry's range spans, and a stored series is trimmed to
+            // `crate::state::MAX_SAMPLES_PER_SERIES`, so one entry can materialise at
+            // most one window per stored sample however far apart its `startDate` and
+            // `endDate` are; the entry count is bounded above.
             let aggregated = crate::state::aggregated_values(&store, &stream, &query, now);
             // The first entry of a resumed page starts where the previous one
             // stopped; every later entry starts at its first data point.
@@ -368,27 +373,27 @@ fn resolve_entry<'a>(
         entry.property_alias.as_deref(),
     ) {
         (Some(asset_label), Some(property_id), None) => {
-            // The shared resolver every other handler uses, so one asset is named
-            // one way across the service.
-            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                (
-                    "ResourceNotFoundException",
-                    crate::state::asset_not_found_message(asset_label),
-                )
-            })?;
-            // The property resolves through the one definition of "the property
-            // this pair names", so an entry naming a property one of the asset
-            // model's composite models declares is answered rather than refused:
-            // it is a property of this asset, addressed by the same pair.
-            let resolved = store
-                .resolve_asset_property(&asset_id, property_id)
+            // The shared resolvers every other handler uses, so one asset and one
+            // property are named one way across the service: an entry naming a
+            // property one of the asset model's composite models declares is
+            // answered rather than refused, because it is a property of this
+            // asset, addressed by the same pair. The pair is ONE property lookup,
+            // so EITHER half resolving to nothing is the same absence, stated in
+            // the one wording the data endpoint words it in
+            // (`crate::state::property_not_found_message`) and naming both ids the
+            // entry supplied.
+            store
+                .resolve_asset_id(asset_label)
+                .and_then(|asset_id| {
+                    let property = store.resolve_asset_property(&asset_id, property_id)?;
+                    Some(crate::state::SeriesKey::Property(asset_id, property.id))
+                })
                 .ok_or_else(|| {
                     (
                         "ResourceNotFoundException",
-                        format!("The asset {asset_label} has no property {property_id}."),
+                        crate::state::property_not_found_message(asset_label, property_id),
                     )
-                })?;
-            crate::state::SeriesKey::Property(asset_id, resolved.id)
+                })?
         }
         // An alias names ONE data stream, whether an asset property is associated
         // with it or not: the shared resolver reaches the property's stream, or the

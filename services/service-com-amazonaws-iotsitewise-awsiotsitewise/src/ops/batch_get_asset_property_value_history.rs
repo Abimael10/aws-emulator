@@ -372,26 +372,26 @@ fn resolve_entry<'a>(
         entry.property_alias.as_deref(),
     ) {
         (Some(asset_label), Some(property_id), None) => {
-            // The shared resolver every other handler uses, so one asset is named
-            // one way across the service.
-            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                (
-                    ERROR_NOT_FOUND,
-                    crate::state::asset_not_found_message(asset_label),
-                )
-            })?;
-            // The one definition of "the property this pair names": the asset's
-            // own properties and the ones its model's composite models declare
-            // are addressed by the same pair, so both resolve here.
-            let resolved = store
-                .resolve_asset_property(&asset_id, property_id)
+            // The shared resolvers every other handler uses, so one asset and one
+            // property are named one way across the service: the one definition of
+            // "the property this pair names" covers the asset's own properties and
+            // the ones its model's composite models declare. The pair is ONE
+            // property lookup, so EITHER half resolving to nothing is the same
+            // absence, stated in the one wording the data endpoint words it in
+            // (`crate::state::property_not_found_message`) and naming both ids the
+            // entry supplied.
+            store
+                .resolve_asset_id(asset_label)
+                .and_then(|asset_id| {
+                    let property = store.resolve_asset_property(&asset_id, property_id)?;
+                    Some(crate::state::SeriesKey::Property(asset_id, property.id))
+                })
                 .ok_or_else(|| {
                     (
                         ERROR_NOT_FOUND,
-                        format!("The asset {asset_label} has no property {property_id}."),
+                        crate::state::property_not_found_message(asset_label, property_id),
                     )
-                })?;
-            crate::state::SeriesKey::Property(asset_id, resolved.id)
+                })?
         }
         // An alias names ONE data stream, whether an asset property is associated
         // with it or not: the shared resolver reaches the property's stream, or the

@@ -17,7 +17,10 @@
 //!    resource), an ASSET
 //!    addressed by the `externalId:` selector (reported as an external id that
 //!    does not exist, by the bare external id), a COMPOSITE MODEL of an asset
-//!    model (which names the asset model it was looked for in), a time series
+//!    model (which names the asset model it was looked for in), a PROPERTY
+//!    addressed by the `(assetId, propertyId)` pair at the service's DATA
+//!    endpoint (resolved there as ONE property lookup, so the absence is stated
+//!    as a property that was not found and names both ids), a time series
 //!    addressed by its `alias` (reported as a `dataAlias` absent from the
 //!    account the lookup ran in) and a GATEWAY (whose read and whose update are
 //!    worded differently) — the families the companion suite next door drives
@@ -78,6 +81,14 @@ fn data_alias_absence(alias: &str) -> String {
          alias PropertyAlias(super=PropertyAlias{{value={alias}}}) not found",
         engine::EMULATOR_ACCOUNT_ID
     )
+}
+
+/// The sentence a property addressed by the `(assetId, propertyId)` pair is
+/// reported absent with at the DATA endpoint, written out by hand as the oracle:
+/// the pair is one property lookup, so both ids are named and neither half is
+/// reported as a missing asset.
+fn property_absence(asset_id: &str, property_id: &str) -> String {
+    format!("Property not found (Property Id = {property_id}, Asset Id = {asset_id})")
 }
 
 #[tokio::test]
@@ -255,7 +266,7 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
             "GET",
             format!("/properties/history?assetId={UNKNOWN_ID}&propertyId={OTHER_UNKNOWN_ID}"),
             None,
-            format!("Asset with ID {UNKNOWN_ID} not found"),
+            property_absence(UNKNOWN_ID, OTHER_UNKNOWN_ID),
         ),
         (
             "GetAssetPropertyAggregates, an asset id",
@@ -265,7 +276,7 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
                  &aggregateTypes=COUNT&resolution=1m&{WINDOW}"
             ),
             None,
-            format!("Asset with ID {UNKNOWN_ID} not found"),
+            property_absence(UNKNOWN_ID, OTHER_UNKNOWN_ID),
         ),
         (
             "GetAssetPropertyAggregates, an alias",
@@ -286,7 +297,7 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
                  &quality=GOOD&type=LINEAR_INTERPOLATION"
             ),
             None,
-            format!("Asset with ID {UNKNOWN_ID} not found"),
+            property_absence(UNKNOWN_ID, OTHER_UNKNOWN_ID),
         ),
         (
             "GetInterpolatedAssetPropertyValues, an alias",
@@ -380,7 +391,7 @@ async fn the_batch_readers_word_an_absent_resource_the_same_way_per_entry() {
                 "startDate": 1_767_225_600,
                 "endDate": 1_767_312_000
             }),
-            format!("Asset with ID {UNKNOWN_ID} not found"),
+            property_absence(UNKNOWN_ID, OTHER_UNKNOWN_ID),
         ),
         (
             "an alias no stream stands under",

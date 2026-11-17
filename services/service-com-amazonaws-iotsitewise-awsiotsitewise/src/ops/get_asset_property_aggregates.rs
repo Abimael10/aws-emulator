@@ -320,20 +320,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.property_alias.as_deref(),
         ) {
             (Some(asset_label), Some(property_label), None) => {
-                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                    not_found(crate::state::not_found_message(
-                        crate::state::RESOURCE_ASSET,
-                        asset_label,
-                    ))
-                })?;
-                let resolved = store
-                    .resolve_asset_property(&asset_id, property_label)
+                // The pair is ONE property lookup, so EITHER half resolving to
+                // nothing is the same absence — a property this account does not
+                // hold — stated in the one wording the data endpoint words it in
+                // (`crate::state::property_not_found_message`) and naming both
+                // ids the request supplied.
+                store
+                    .resolve_asset_id(asset_label)
+                    .and_then(|asset_id| {
+                        let property = store.resolve_asset_property(&asset_id, property_label)?;
+                        Some(crate::state::SeriesKey::Property(asset_id, property.id))
+                    })
                     .ok_or_else(|| {
-                        not_found(format!(
-                            "The asset {asset_label} has no property {property_label}."
+                        not_found(crate::state::property_not_found_message(
+                            asset_label,
+                            property_label,
                         ))
-                    })?;
-                crate::state::SeriesKey::Property(asset_id, resolved.id)
+                    })?
             }
             // An alias names ONE data stream, whether an asset property is associated
             // with it or not: the shared resolver reaches the property's stream, or
@@ -376,6 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .join(", ")
             ))
         })?;
+        // The derivation walks the stream's stored SAMPLES, not the windows the
+        // requested range spans: a window is materialised only where a sample of the
+        // filtered quality falls in it, and a stored series is trimmed to
+        // `crate::state::MAX_SAMPLES_PER_SERIES`, so the windows one request can make
+        // this process hold are bounded by the data the store really holds — by at
+        // most one window per stored sample — however far apart `startDate` and
+        // `endDate` are. The range is a FILTER on those samples, not a size the caller
+        // chooses for the answer, so nothing here grows with its width.
         let aggregated = crate::state::aggregated_values(
             &store,
             &stream,
