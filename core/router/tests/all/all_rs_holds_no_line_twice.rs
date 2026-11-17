@@ -13,7 +13,7 @@
 //! item every line belongs to the LIST, and a line standing there that the file already said is
 //! what a branch leaves behind when it appends its note, or its own pair, a second time.
 //!
-//! Both halves of the root are answered here, the header one through the sibling's own reader,
+//! Both halves of a root are answered here, the header one through the sibling's own reader,
 //! so the two cannot disagree about what a repeat is: a line that says nothing — a blank line,
 //! or the bare `//` that separates two paragraphs — is no copy of the next such line, and a
 //! line is read by what it says rather than by how far it is indented, so a copy pasted one
@@ -27,11 +27,7 @@
 
 use std::collections::BTreeMap;
 
-// The declaration root this rule is about, read through the sibling declaration suite rather
-// than opened a second time, and what that sibling states for a crate holding no such root;
-// the header half of the rule and the header boundary come from the siblings that own them.
-use crate::all_rs_carries_one_header_block::repeated_header_lines;
-use crate::all_rs_declares_each_suite_once::all_rs;
+// Where a root's header ends, from the sibling that owns that boundary.
 use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
 
 /// Whether `line` says something a copy of it could repeat: a blank line and a bare `//`
@@ -74,32 +70,6 @@ pub(crate) fn repeated_list_lines(source: &str) -> Vec<String> {
         ));
     }
     reports
-}
-
-#[test]
-fn the_declaration_root_says_nothing_twice() {
-    // No subject where this crate's target declares its suites with `automod` instead of a
-    // hand-maintained root; the workspace-wide siblings read this rule for every crate
-    // that keeps one.
-    let Some(source) = all_rs() else {
-        return;
-    };
-    let mut reports = repeated_header_lines(&source);
-    reports.extend(repeated_list_lines(&source));
-    assert!(
-        reports.is_empty(),
-        "expected tests/all.rs to state its header once and declare each suite once, got {} \
-         copied line(s): {reports:#?}",
-        reports.len()
-    );
-    // Without this, a file the reader could not read — or one whose list had been lost — would
-    // satisfy the report above by holding nothing to break it.
-    let said = source.lines().filter(|line| says_something(line)).count();
-    assert!(
-        said > 200,
-        "expected tests/all.rs to hold its header and the router's declarations, read {said} \
-         line(s) that say anything"
-    );
 }
 
 #[test]

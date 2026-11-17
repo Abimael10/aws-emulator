@@ -32,11 +32,9 @@
 //!
 //! It reads one file; it starts no router and reaches no network.
 
-// The header boundary it is read against, and which lines of that header say something, both
-// taken from the siblings that own them rather than decided or read a second time, and the
-// root it is read for.
+// The header boundary this rule is read against, and which lines of that header say
+// something, both taken from the sibling that owns them rather than decided a second time.
 use crate::all_rs_carries_one_header_block::{header_of, prose_of};
-use crate::all_rs_declares_each_suite_once::all_rs;
 
 /// The prose `line` contributes to the paragraph it stands in, or `None` for a line that
 /// contributes none and so breaks the paragraph: a blank line, a marker with nothing after it,
@@ -99,38 +97,6 @@ fn header_lines_beginning_mid_sentence(source: &str) -> Vec<String> {
         previous = Some(prose);
     }
     reports
-}
-
-/// How many header lines of `source` carry prose, counted so that a file read as having no
-/// header cannot satisfy the rule by holding nothing to break it.
-fn header_prose_lines(source: &str) -> usize {
-    header_of(source)
-        .into_iter()
-        .filter(|line| paragraph_prose_of(line).is_some())
-        .count()
-}
-
-#[test]
-fn the_declaration_root_holds_no_header_fragment() {
-    // No subject where this crate's target declares its suites with `automod` instead of a
-    // hand-maintained root; the workspace-wide siblings read this rule for every crate
-    // that keeps one.
-    let Some(source) = all_rs() else {
-        return;
-    };
-    let reports = header_lines_beginning_mid_sentence(&source);
-    assert!(
-        reports.is_empty(),
-        "expected every line of the tests/all.rs header to open the sentence it starts, got \
-         {} report(s), each a paragraph left half-written: {reports:#?}",
-        reports.len()
-    );
-    let prose = header_prose_lines(&source);
-    assert!(
-        prose > 10,
-        "expected tests/all.rs to open with the header block this rule is read for, read \
-         {prose} line(s) of prose in it"
-    );
 }
 
 #[test]

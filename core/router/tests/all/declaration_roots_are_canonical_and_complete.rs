@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 // rather than from a second copy here: that reader takes a declaration in every spelling the
 // compiler does, so a suite declared in an unusual one is not reported as undeclared.
 use super::all_rs_declares_each_suite_once::{
-    declaration_roots, declared_suite_files, workspace_root,
+    declaration_roots, declared_suite_files, relative, workspace_root,
 };
 
 /// What an entry directly under `tests/all/` is, as far as the rule cares.
@@ -85,24 +85,15 @@ fn directory_modules_under_all(all_dir: &Path) -> BTreeSet<PathBuf> {
     modules
 }
 
-/// The workspace-relative name of `path`, for a report that names the file it is about.
-fn relative(path: &Path) -> String {
-    path.strip_prefix(workspace_root())
-        .unwrap_or(path)
-        .display()
-        .to_string()
-}
-
 #[test]
 fn every_declaration_root_declares_the_module_directories_beside_it() {
-    // The cases are the workspace's declaration roots: this crate's cross-service root and
-    // every service crate's own, differing in how many suites they declare, in how their
+    // The cases are the workspace's declaration roots: one per crate that roots its `all`
+    // target in a `tests/all.rs`, differing in how many suites they declare, in how their
     // declarations are spelled, and in what sits beside them under `tests/all/`.
     let roots = declaration_roots();
     assert!(
         roots.len() > 400,
-        "expected this crate's tests/all.rs and one per service crate under {}, read {} of \
-         them",
+        "expected one tests/all.rs per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()
     );
@@ -211,13 +202,11 @@ fn the_rule_reads_the_entries_a_root_owes_a_declaration() {
 fn the_walk_reads_only_the_top_level_of_a_tests_all_directory() {
     // The rule the walk adds to the classifier: it does not descend, so whatever it reports is
     // the `mod.rs` of a directory directly under `tests/all/` — never a file deeper in, which
-    // the module there declares itself. Read against every root's directory, this crate's own
-    // (the largest in the workspace) included.
+    // the module there declares itself. Read against every root's directory on disk.
     let roots = declaration_roots();
     assert!(
         roots.len() > 400,
-        "expected this crate's tests/all.rs and one per service crate under {}, read {} of \
-         them",
+        "expected one tests/all.rs per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()
     );

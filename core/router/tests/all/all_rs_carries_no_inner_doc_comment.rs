@@ -29,23 +29,17 @@
 //! roots cannot be held to it as written: each one's header IS an inner doc comment, which is
 //! the weaker bet the sibling above reads them under.
 //!
-//! It reads one file; it starts no router and reaches no network.
+//! It reads no file; it starts no router and reaches no network.
 
-use std::fs;
-
-// The root this rule is about, read through the sibling that owns the reader rather than
-// opened a second time, and the line classifier from the sibling that owns the rule about
-// WHERE an inner doc comment may stand, so the two readings cannot drift apart.
-use crate::all_rs_declares_each_suite_once::{all_rs, workspace_root};
 use crate::all_rs_inner_doc_comments_precede_the_first_item::opens_an_inner_doc_comment;
 
 /// One report per line of `source` that opens with an inner doc comment, whatever stands above
 /// it, each naming the line it is on.
 ///
 /// The reading is line-based, as the rule is: a line whose first non-whitespace characters are
-/// `//!` or `/*!` is reported wherever it sits, header included, since this file holds nothing
-/// but ordinary comments and declaration pairs and so can carry neither a nested module's own
-/// doc comment nor a multi-line string literal.
+/// `//!` or `/*!` is reported wherever it sits, header included, since such a root holds
+/// nothing but ordinary comments and declaration pairs and so can carry neither a nested
+/// module's own doc comment nor a multi-line string literal.
 fn inner_doc_comments(source: &str) -> Vec<String> {
     source
         .lines()
@@ -69,47 +63,6 @@ fn declaration_count(source: &str) -> usize {
         .lines()
         .filter(|line| line.starts_with("#[path = \"all/"))
         .count()
-}
-
-/// How many `*.rs` files sit directly under this crate's `tests/all/` — the suites the root
-/// owes a declaration each, counted so the assertion below is bounded by the directory rather
-/// than by a number written here that a shrinking list would still satisfy.
-fn suite_file_count() -> usize {
-    let directory = workspace_root().join("core/router/tests/all");
-    let entries = fs::read_dir(&directory)
-        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.extension().is_some_and(|kind| kind == "rs"))
-        .count()
-}
-
-#[test]
-fn the_declaration_root_carries_no_inner_doc_comment() {
-    // No subject where this crate's target declares its suites with `automod` instead of a
-    // hand-maintained root; the workspace-wide siblings read this rule for every crate
-    // that keeps one.
-    let Some(source) = all_rs() else {
-        return;
-    };
-    let reports = inner_doc_comments(&source);
-    assert!(
-        reports.is_empty(),
-        "expected tests/all.rs to be written with ordinary comments throughout, so that no \
-         appended or merged copy of one of its lines can be an inner doc comment past the \
-         first item, got {} report(s): {reports:#?}",
-        reports.len()
-    );
-    // Without this, a root that had lost its list — or most of it — would satisfy the rule
-    // above by holding nothing to break it.
-    let declared = declaration_count(&source);
-    let on_disk = suite_file_count();
-    assert_eq!(
-        declared, on_disk,
-        "expected tests/all.rs to carry one declaration per suite file under tests/all/, got \
-         {declared} declaration(s) for {on_disk} file(s)"
-    );
 }
 
 #[test]

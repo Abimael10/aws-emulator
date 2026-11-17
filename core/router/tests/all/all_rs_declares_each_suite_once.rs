@@ -6,9 +6,9 @@
 //! `<name>` into a single module namespace: a second declaration of the same name is
 //! `error[E0428]: the name ... is defined multiple times` and the whole `all` target fails
 //! to compile, taking every suite in it down with it. Suites land concurrently and each
-//! appends its own `#[path]`/`mod` pair to this list, so the same name arriving twice — once
-//! in the sorted span beside its own name and once in the appended tail — is the collision
-//! this suite pins.
+//! appends its own `#[path]`/`mod` pair to such a list, so the same name arriving twice —
+//! once in the sorted span beside its own name and once in the appended tail — is the
+//! collision this suite pins.
 //!
 //! It also pins the other half of a declaration: the `#[path]` attribute that points the
 //! module into `tests/all/` (a bare `mod` would resolve to a sibling of `tests/all.rs`,
@@ -25,12 +25,6 @@
 //! namespace.
 //!
 //! It reads files only; it starts no router and reaches no network.
-//!
-//! A crate whose `all` target is rooted at `tests/all/main.rs` declares its suites with
-//! `automod` instead of with such a list, so it holds no declaration root at all — and this
-//! crate is one. Every rule about a declaration list is therefore read for the roots that
-//! EXIST ([`declaration_roots`]), and the rules about this crate's own list stand down when
-//! it has none ([`all_rs`]).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -167,11 +161,11 @@ fn unreachable_declarations(tests: &Path, declared: &[Declaration]) -> Vec<Strin
 /// This crate's declaration root, read from disk, or `None` where this crate has none.
 ///
 /// The router declares the suites of its one integration-test target with `automod` from
-/// the vendored `tests/all/main.rs`, so the hand-maintained root the rules of this suite
-/// are read for need not exist here; where it does not, those rules have no subject in
-/// this crate and the workspace-wide siblings read them for every crate that does have
-/// one. A sibling suite checking another rule of the same file reads it from here rather
-/// than opening it again.
+/// the vendored `tests/all/main.rs`, so the hand-maintained root the rules of the `all_rs_*`
+/// suites are read for does not exist here, and cargo would reject it beside that root as a
+/// second target named `all`. The sibling
+/// [`super::router_test_target_is_automod_rooted`] asserts that absence through this
+/// reader rather than opening the path itself.
 pub(crate) fn all_rs() -> Option<String> {
     let path = tests_dir().join("all.rs");
     match fs::read_to_string(&path) {
@@ -179,43 +173,6 @@ pub(crate) fn all_rs() -> Option<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => panic!("read {}: {error}", path.display()),
     }
-}
-
-#[test]
-fn every_suite_is_declared_exactly_once() {
-    let Some(source) = all_rs() else {
-        return;
-    };
-    let declared = declarations(&source);
-    assert!(
-        declared.len() > 200,
-        "expected tests/all.rs to declare the router's suites, read {} declarations",
-        declared.len()
-    );
-    let reports = repeated_declarations(&declared);
-    assert!(
-        reports.is_empty(),
-        "expected each of the {} suites to be declared once, got {} declared twice, which \
-         fails the `all` target with E0428: {reports:#?}",
-        declared.len(),
-        reports.len()
-    );
-}
-
-#[test]
-fn every_declaration_names_a_suite_file_that_exists() {
-    let Some(source) = all_rs() else {
-        return;
-    };
-    let tests = tests_dir();
-    let declared = declarations(&source);
-    let reports = unreachable_declarations(&tests, &declared);
-    assert!(
-        reports.is_empty(),
-        "expected every declaration to point at a file under tests/all/, got {} that do \
-         not: {reports:#?}",
-        reports.len()
-    );
 }
 
 /// The workspace root: this crate's manifest directory (`core/router`) sits two levels
@@ -228,15 +185,19 @@ pub(crate) fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The workspace-relative name of `path`, for a report that names the file it is about.
+///
+/// Shared with the sibling suites that report on a file of the workspace, rather than
+/// copied into each of them.
+pub(crate) fn relative(path: &Path) -> String {
+    path.strip_prefix(workspace_root())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 /// Every integration-test declaration root in the workspace: one `tests/all.rs` per
 /// service crate that has one, plus this crate's own where it has one.
-///
-/// The rule the test below pins belongs to the single-target layout rather than to any one
-/// crate, and the crate that breaks it cannot pin it itself: a repeated `mod` makes that
-/// crate's own `all` target fail to compile, so no suite inside it is ever run to report
-/// the repetition. This target is the one that links every service crate, so it is where
-/// the rule can be checked for all of them. A sibling suite checking another rule of the
-/// same layout reads the same roots, so this enumerator is shared rather than copied.
 ///
 /// A root is listed only where it is a file: a crate whose target declares its suites
 /// with `automod` keeps no hand-maintained root, and a rule about a root's contents has

@@ -11,10 +11,9 @@
 //!
 //! So the rule read here is the tail: past the last `#[path]`/`mod` pair a root holds no
 //! further line. Prose BETWEEN the pairs is the sibling
-//! [`super::all_rs_is_a_canonical_declaration_list`]'s rule, read for this crate's own root;
-//! this one is read for every root in the workspace, because the crate whose root grows such
-//! a tail cannot report it — a tail that does not compile compiles no suite of that crate
-//! either.
+//! [`super::all_rs_is_a_canonical_declaration_list`]'s rule; this one is read for every root
+//! in the workspace, because the crate whose root grows such a tail cannot report it — a tail
+//! that does not compile compiles no suite of that crate either.
 //!
 //! It reads files only; it writes nothing, starts no router and reaches no network.
 
@@ -63,15 +62,14 @@ fn lines_past_the_last_declaration(source: &str) -> Vec<String> {
 
 #[test]
 fn every_declaration_root_ends_with_its_last_declaration() {
-    // The cases are the workspace's declaration roots: this crate's cross-service root and
-    // every service crate's own, differing in how many suites they declare, in how those
+    // The cases are the workspace's declaration roots: one per crate that roots its `all`
+    // target in a `tests/all.rs`, differing in how many suites they declare, in how those
     // declarations are spelled and in how long a header they open with.
     let root = workspace_root();
     let roots = declaration_roots();
     assert!(
         roots.len() > 400,
-        "expected this crate's tests/all.rs and one per service crate under {}, read {} of \
-         them",
+        "expected one tests/all.rs per service crate under {}, read {} of them",
         root.display(),
         roots.len()
     );

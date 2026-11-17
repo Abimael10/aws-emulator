@@ -48,7 +48,7 @@ fn every_crate_declares_every_suite_file_it_holds() {
     let roots = declaration_roots();
     assert!(
         roots.len() > 100,
-        "expected one tests/all.rs per service crate beside this crate's own, read {} of them",
+        "expected one tests/all.rs per service crate, read {} of them",
         roots.len()
     );
 

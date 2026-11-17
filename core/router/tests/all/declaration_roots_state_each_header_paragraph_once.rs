@@ -4,10 +4,10 @@
 //!
 //! A declaration root is appended to by every landing branch, and the header ahead of its first
 //! item is the one region the list guards skip, so it is where a landing's re-typed copy of the
-//! module's prose accumulates. [`super::all_rs_carries_one_header_block`] reads that damage one
-//! LINE at a time, for this crate's root, and
-//! [`super::declaration_roots_carry_no_duplicated_comment_line`] reads the same lines for the
-//! other roots: a copy is found when a line of it is written twice, character for character.
+//! module's prose accumulates. [`super::all_rs_carries_one_header_block`] owns the reader of
+//! that damage one LINE at a time, and
+//! [`super::declaration_roots_carry_no_duplicated_comment_line`] reads those lines for the
+//! roots on disk: a copy is found when a line of it is written twice, character for character.
 //!
 //! A copy re-wrapped on its way in — the same sentences broken at another column, or re-indented
 //! — shares no line with the paragraph it duplicates, so a line reader passes it and the block
@@ -18,9 +18,9 @@
 //! a comment with nothing after its slashes) carries no prose and an inner attribute is no
 //! sentence of the block, so each of those breaks a paragraph rather than joining one.
 //!
-//! It is read for EVERY root in the workspace, this crate's own included, from the one target
-//! that links them all — the crate whose root breaks the rule cannot report it, because its own
-//! `all` target is what stops compiling.
+//! It is read for EVERY root in the workspace, from the one target that links them all — the
+//! crate whose root breaks the rule cannot report it, because its own `all` target is what
+//! stops compiling.
 //!
 //! It reads files only; it writes nothing, starts no router and reaches no network.
 
@@ -92,8 +92,7 @@ fn every_declaration_root_states_each_header_paragraph_once() {
     let roots = declaration_roots();
     assert!(
         roots.len() > 100,
-        "expected one tests/all.rs per service crate plus this crate's own under {}, read {} of \
-         them",
+        "expected one tests/all.rs per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()
     );

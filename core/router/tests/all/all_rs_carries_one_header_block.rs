@@ -28,9 +28,6 @@
 //!
 //! It reads one file; it starts no router and reaches no network.
 
-// The declaration root this rule is about, read through the sibling declaration suite rather
-// than opened a second time, and what that sibling states for a crate holding no such root.
-use crate::all_rs_declares_each_suite_once::all_rs;
 // Where a root's header ends comes from the sibling that owns that boundary for the other
 // inner construct, so no two suites of this target can disagree about it.
 use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
@@ -40,8 +37,8 @@ use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
 /// A root with no item at all is all header, which is what the sibling guards report; this
 /// reader answers it like any other.
 ///
-/// Shared with the sibling that reads this rule for the OTHER declaration roots of the
-/// workspace, so the two cannot disagree about which lines are a root's header.
+/// Shared with the sibling that reads this rule for the declaration roots on disk, so the two
+/// cannot disagree about which lines are a root's header.
 pub(crate) fn header_of(source: &str) -> Vec<&str> {
     let lines: Vec<&str> = source.lines().collect();
     match first_item_line(source) {
@@ -78,11 +75,10 @@ pub(crate) fn prose_of(line: &str) -> Option<&str> {
 /// paragraphs rather than saying anything, so it is passed over; every other line, an inner
 /// attribute included, is owed exactly one place in the block.
 ///
-/// Shared with the sibling that reads the same rule for the other declaration roots in the
-/// workspace rather than copied there, and with [`super::all_rs_holds_no_line_twice`], which
-/// reads the other half of THIS root — the LIST, where a copy of a header line lands when a
-/// branch appends it instead of inserting its pair — through this reader rather than a second
-/// copy of it.
+/// Shared with the sibling that reads the same rule for the declaration roots on disk rather
+/// than copied there, and with [`super::all_rs_holds_no_line_twice`], which reads the other
+/// half of a root — the LIST, where a copy of a header line lands when a branch appends it
+/// instead of inserting its pair — through this reader rather than a second copy of it.
 pub(crate) fn repeated_header_lines(source: &str) -> Vec<String> {
     let mut seen: Vec<(usize, &str)> = Vec::new();
     let mut reports = Vec::new();
@@ -102,37 +98,6 @@ pub(crate) fn repeated_header_lines(source: &str) -> Vec<String> {
         }
     }
     reports
-}
-
-#[test]
-fn the_declaration_root_carries_one_header_block() {
-    // No subject where this crate's target declares its suites with `automod` instead of a
-    // hand-maintained root; the workspace-wide siblings read this rule for every crate
-    // that keeps one.
-    let Some(source) = all_rs() else {
-        return;
-    };
-    let reports = repeated_header_lines(&source);
-    assert!(
-        reports.is_empty(),
-        "expected the header of tests/all.rs to be written once, got {} report(s): {reports:#?}",
-        reports.len()
-    );
-    // Without this, a root whose header had been emptied — or whose list had been lost, leaving
-    // the whole file unread as a header — would satisfy the rule above by holding nothing to
-    // break it.
-    let header = header_of(&source);
-    assert!(
-        header.iter().any(|line| line.starts_with("//")),
-        "expected tests/all.rs to open with its one header block, read {header:?}"
-    );
-    let first_item = first_item_line(&source);
-    let opens_the_list = first_item.and_then(|line| source.lines().nth(line - 1));
-    assert!(
-        opens_the_list.is_some_and(|line| line.starts_with("#[path = \"all/")),
-        "expected the header of tests/all.rs to end at the first declaration of the list, read \
-         {opens_the_list:?} as its first item"
-    );
 }
 
 #[test]

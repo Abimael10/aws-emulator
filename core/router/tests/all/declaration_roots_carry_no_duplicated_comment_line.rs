@@ -1,34 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every OTHER declaration root whose list is prose-free carries one header block too.
+//! Every declaration root whose list is prose-free carries one header block too.
 //!
-//! The sibling [`super::all_rs_carries_one_header_block`] reads that rule for this crate's own
-//! `tests/all.rs`: the header ahead of the first item is the region every list guard skips, so
-//! it is where each landing's re-typed copy of the module's prose accumulates, until one copy
-//! lands below the first item and the language refuses it — which is how this target came to
-//! compile no suite at all. The rule is a property of a declaration ROOT rather than of one
-//! file, and a service crate's root is appended to by exactly the same branches, so this suite
-//! reads it for every root BESIDE this crate's, from the one target that links them all (the
-//! crate that breaks it cannot report it: its own target no longer compiles).
+//! The sibling [`super::all_rs_carries_one_header_block`] owns the reader for that rule: the
+//! header ahead of the first item is the region every list guard skips, so it is where each
+//! landing's re-typed copy of the module's prose accumulates, until one copy lands below the
+//! first item and the language refuses it — which is how a target comes to compile no suite at
+//! all. The rule is a property of a declaration ROOT rather than of one file, and every
+//! service crate's root is appended to by the same branches, so this suite reads it for every
+//! root on disk, from the one target that links them all (the crate that breaks it cannot
+//! report it: its own target no longer compiles).
 //!
 //! It is read for a root whose declaration LIST is prose-free, the shape
-//! [`super::all_rs_is_a_canonical_declaration_list`] pins for this crate's root. A root that
-//! keeps a note beside each declaration was written by re-typing one sentence per note, and
-//! those sentences stand in its header as well, so its header carries copies by its own style
-//! rather than by a merge: reading the rule there would report how that root is written, not
-//! the hazard this rule is about. Folding those notes into the suites they explain brings such
-//! a root under this rule by itself.
+//! [`super::all_rs_is_a_canonical_declaration_list`] pins. A root that keeps a note beside
+//! each declaration was written by re-typing one sentence per note, and those sentences stand
+//! in its header as well, so its header carries copies by its own style rather than by a
+//! merge: reading the rule there would report how that root is written, not the hazard this
+//! rule is about. Folding those notes into the suites they explain brings such a root under
+//! this rule by itself.
 //!
-//! The reader, and the header boundary it reads a root against, are the sibling's: one rule has
-//! one reading, so the roots cannot be held to a different rule from this crate's own.
+//! The reader, and the header boundary it reads a root against, are the sibling's: one rule
+//! has one reading, so no root is held to a different rule from another's.
 //!
 //! It reads files only; it writes nothing, starts no router and reaches no network.
 
 use std::fs;
-use std::path::Path;
 
 use crate::all_rs_carries_one_header_block::{header_of, repeated_header_lines};
-use crate::all_rs_declares_each_suite_once::{declaration_roots, workspace_root};
+use crate::all_rs_declares_each_suite_once::{declaration_roots, relative, workspace_root};
 use crate::all_rs_inner_doc_comments_precede_the_first_item::first_item_line;
 
 /// Whether the declaration list of `source` — everything from its first item on — holds no
@@ -47,29 +46,16 @@ pub(crate) fn the_list_is_prose_free(source: &str) -> bool {
     })
 }
 
-/// The workspace-relative name of `path`, for a report that names the file it is about.
-fn relative(path: &Path) -> String {
-    path.strip_prefix(workspace_root())
-        .unwrap_or(path)
-        .display()
-        .to_string()
-}
-
 #[test]
-fn every_other_prose_free_declaration_root_carries_one_header_block() {
-    // The cases are the workspace's declaration roots beside this crate's own whose list is
-    // prose-free: they differ in how long their header block is, in whether it is written as an
-    // inner doc comment or as ordinary comments, in how many suites they declare, and in
-    // whether they carry an inner attribute at all.
-    let own = workspace_root().join("core/router/tests/all.rs");
-    let roots: Vec<_> = declaration_roots()
-        .into_iter()
-        .filter(|root| *root != own)
-        .collect();
+fn every_prose_free_declaration_root_carries_one_header_block() {
+    // The cases are the workspace's declaration roots whose list is prose-free: they differ in
+    // how long their header block is, in whether it is written as an inner doc comment or as
+    // ordinary comments, in how many suites they declare, and in whether they carry an inner
+    // attribute at all.
+    let roots = declaration_roots();
     assert!(
         roots.len() > 100,
-        "expected one tests/all.rs per service crate beside this crate's own under {}, read {} \
-         of them",
+        "expected one tests/all.rs per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()
     );
@@ -92,14 +78,14 @@ fn every_other_prose_free_declaration_root_carries_one_header_block() {
     assert!(
         read > 100,
         "expected most service crates to keep a prose-free declaration list, read {read} of the \
-         {} roots beside this crate's own",
+         {} roots on disk",
         roots.len()
     );
     assert!(
         reports.is_empty(),
-        "expected each of the {read} prose-free declaration roots beside this crate's own to \
-         write its header block once, got {} report(s), each a paragraph the next landing has \
-         two places to keep: {reports:#?}",
+        "expected each of the {read} prose-free declaration roots to write its header block \
+         once, got {} report(s), each a paragraph the next landing has two places to keep: \
+         {reports:#?}",
         reports.len()
     );
 }

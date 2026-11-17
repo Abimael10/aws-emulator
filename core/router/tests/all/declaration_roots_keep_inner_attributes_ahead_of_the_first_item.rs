@@ -11,8 +11,8 @@
 //! file, so a lint allowance or a header line it carries is a line a merge can leave below
 //! the list — where it compiles no suite of that target rather than failing one test.
 //!
-//! The rule is about a FILE, so it is read for every declaration root in the workspace: this
-//! crate's cross-service root and each service crate's own. The reader is line-based, like
+//! The rule is about a FILE, so it is read for every declaration root in the workspace: each
+//! crate that roots its one `all` target in a `tests/all.rs`. The reader is line-based, like
 //! the rule, and shares the sibling's reading of where a file's header ends so the two cannot
 //! disagree about which lines are past the first item.
 //!
