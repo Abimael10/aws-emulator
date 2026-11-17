@@ -9,7 +9,9 @@
 //!
 //! A source is identified by the pairing of its name with the resource it represents, so a
 //! put that keeps the name and names a DIFFERENT resource is refused with the
-//! `ConflictException` this operation models rather than re-pointing the stored source. The
+//! `ConflictException` this operation models rather than re-pointing the stored source,
+//! stating that the resource of an existing source cannot be updated
+//! ([`crate::state::DELIVERY_SOURCE_RESOURCE_CHANGE_MESSAGE`]). The
 //! pairing of the RESOURCE with the log type it sends is likewise held by one source only, so
 //! a put that would represent under another name a (resource, log type) pairing an existing
 //! source already represents is refused with the same error
@@ -297,16 +299,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name and names another resource would make every delivery already paired with that
         // source — each of which names it by this name — deliver a different resource's logs,
         // so it is refused as the conflict it is ("This operation attempted to create a
-        // resource that already exists") rather than applied.
+        // resource that already exists") rather than applied. The refusal states the rule it
+        // broke and names nothing of either request
+        // ([`crate::state::DELIVERY_SOURCE_RESOURCE_CHANGE_MESSAGE`]).
         if let Some(stored) = store.delivery_source(&region, &input.name) {
             if !stored.resource_arns.contains(&input.resource_arn) {
                 return Err(PutDeliverySourceErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "A delivery source named {} already exists and represents {}",
-                            input.name,
-                            stored.resource_arns.join(", ")
-                        )),
+                        message: Some(
+                            crate::state::DELIVERY_SOURCE_RESOURCE_CHANGE_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

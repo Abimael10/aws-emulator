@@ -20,13 +20,19 @@
 //! record, typed — counts, ports, protocol number and window instants as JSON numbers, the
 //! identifiers, addresses and status words as JSON strings — and leaves out a field the
 //! record could not compute; the structural processors each apply the one transformation
-//! their model members state.
+//! their model members state. `dateTimeConverter` "converts a datetime string into a format
+//! that you specify": it reads the text at its `source` under its `matchPatterns`, in its
+//! `sourceTimezone` ("if you omit this, the default used is the UTC zone"), and writes it to
+//! its `target` in its `targetTimezone` under its `targetFormat` ("if you omit this, the
+//! default of `yyyy-MM-dd'T'HH:mm:ss.SSS'Z` is used"), so a zone that observes daylight
+//! saving shifts by the offset it is at ON the instant the source names.
 //!
 //! The recorded flow this was derived from configures `[{"parseVPC": {}}]` with a filter
 //! matching everything and reads one full and one unavailable-field record off a Kinesis
 //! stream; those are two rows of the table below. The rows differ along what the rule
 //! generalises over: the processor chain (a vended parser, a parse-and-mutate chain, a
-//! delimited parser), which fields the record supplies, whether the filter applies on
+//! delimited parser, a datetime conversion), which fields the record supplies, the source and
+//! target zones and the target format of a conversion, whether the filter applies on
 //! transformed logs at all, whether the group carries a transformer, and whether the
 //! filter's pattern selects the transformed event.
 
@@ -35,7 +41,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::harness::base_ms;
-use crate::subscription_fan_out::{past_activation, role_arn, stream_arn, Emulator};
+use crate::subscription_fan_out::{role_arn, stream_arn, Emulator};
 
 /// The log stream every case writes to, and the filter every case attaches.
 const LOG_STREAM: &str = "flow-logs";
@@ -258,7 +264,145 @@ fn rows() -> Vec<Row> {
                 "kv_status": "ok",
             })),
         },
+        // A datetime conversion out of a zone that observes daylight saving: the SAME
+        // wall-clock time is a different instant in summer than in winter, so each row shifts
+        // by that zone's offset at the instant its own text names.
+        Row {
+            case: "a datetime conversion out of a daylight-saving zone, in summer",
+            group: "/aws/emulator/datetime-summer",
+            transformer: Some(date_time_converter(
+                Some("America/New_York"),
+                Some("UTC"),
+                Some("yyyy-MM-dd HH:mm:ss"),
+            )),
+            apply_on_transformed_logs: true,
+            pattern: "",
+            message: r#"{"m":"summer","ts":"2024-07-05 09:07:09"}"#,
+            expected: Expected::Document(json!({
+                "m": "summer",
+                "ts": "2024-07-05 09:07:09",
+                // 09:07 in New York is 13:07 UTC while the zone is on summer time.
+                "ts_utc": "2024-07-05 13:07:09",
+            })),
+        },
+        Row {
+            case: "a datetime conversion out of a daylight-saving zone, in winter",
+            group: "/aws/emulator/datetime-winter",
+            transformer: Some(date_time_converter(
+                Some("America/New_York"),
+                Some("UTC"),
+                Some("yyyy-MM-dd HH:mm:ss"),
+            )),
+            apply_on_transformed_logs: true,
+            pattern: "",
+            message: r#"{"m":"winter","ts":"2024-03-05 09:07:09"}"#,
+            expected: Expected::Document(json!({
+                "m": "winter",
+                "ts": "2024-03-05 09:07:09",
+                // The same wall clock is 14:07 UTC while the zone is on standard time.
+                "ts_utc": "2024-03-05 14:07:09",
+            })),
+        },
+        Row {
+            case: "a datetime conversion stating neither zone nor target format",
+            group: "/aws/emulator/datetime-defaults",
+            transformer: Some(date_time_converter(None, None, None)),
+            apply_on_transformed_logs: true,
+            pattern: "",
+            message: r#"{"m":"defaults","ts":"2024-03-05 09:07:09"}"#,
+            expected: Expected::Document(json!({
+                "m": "defaults",
+                "ts": "2024-03-05 09:07:09",
+                // Both zones default to UTC, and the default target format is the ISO-8601
+                // instant to the millisecond.
+                "ts_utc": "2024-03-05T09:07:09.000Z",
+            })),
+        },
+        Row {
+            case: "a datetime conversion into a zone ahead of UTC",
+            group: "/aws/emulator/datetime-target-zone",
+            transformer: Some(date_time_converter(
+                Some("UTC"),
+                Some("Asia/Tokyo"),
+                Some("yyyy-MM-dd HH:mm:ss"),
+            )),
+            apply_on_transformed_logs: true,
+            pattern: "",
+            message: r#"{"m":"tokyo","ts":"2024-03-05 09:07:09"}"#,
+            expected: Expected::Document(json!({
+                "m": "tokyo",
+                "ts": "2024-03-05 09:07:09",
+                // Japan is nine hours ahead of UTC and observes no daylight saving.
+                "ts_utc": "2024-03-05 18:07:09",
+            })),
+        },
+        Row {
+            case: "a datetime whose own text carries the offset",
+            group: "/aws/emulator/datetime-offset",
+            transformer: Some(json!([
+                {"parseJSON": {}},
+                {"dateTimeConverter": {
+                    "source": "ts",
+                    "target": "ts_utc",
+                    "matchPatterns": ["yyyy-MM-dd'T'HH:mm:ssXXX"],
+                    // The offset in the text names the instant, so this zone decides nothing.
+                    "sourceTimezone": "America/New_York",
+                    "targetTimezone": "UTC",
+                    "targetFormat": "yyyy-MM-dd'T'HH:mm:ss",
+                }},
+            ])),
+            apply_on_transformed_logs: true,
+            pattern: "",
+            message: r#"{"m":"offset","ts":"2024-03-05T09:07:09+02:00"}"#,
+            expected: Expected::Document(json!({
+                "m": "offset",
+                "ts": "2024-03-05T09:07:09+02:00",
+                "ts_utc": "2024-03-05T07:07:09",
+            })),
+        },
+        Row {
+            case: "a datetime no match pattern reads",
+            group: "/aws/emulator/datetime-unreadable",
+            transformer: Some(date_time_converter(
+                Some("UTC"),
+                Some("UTC"),
+                Some("yyyy-MM-dd HH:mm:ss"),
+            )),
+            apply_on_transformed_logs: true,
+            pattern: "",
+            message: r#"{"m":"unreadable","ts":"last Tuesday"}"#,
+            expected: Expected::Document(json!({
+                "m": "unreadable",
+                // The conversion writes nothing, so the target field is absent.
+                "ts": "last Tuesday",
+            })),
+        },
     ]
+}
+
+/// A chain that parses the ingested JSON and converts its `ts` field into `ts_utc`, under the
+/// one match pattern the rows below write their timestamps in. The zones and the target
+/// format are the row's, `None` standing for the member the row omits.
+fn date_time_converter(
+    source_timezone: Option<&str>,
+    target_timezone: Option<&str>,
+    target_format: Option<&str>,
+) -> Value {
+    let mut converter = json!({
+        "source": "ts",
+        "target": "ts_utc",
+        "matchPatterns": ["yyyy-MM-dd HH:mm:ss"],
+    });
+    for (member, value) in [
+        ("sourceTimezone", source_timezone),
+        ("targetTimezone", target_timezone),
+        ("targetFormat", target_format),
+    ] {
+        if let Some(value) = value {
+            converter[member] = json!(value);
+        }
+    }
+    json!([{"parseJSON": {}}, {"dateTimeConverter": converter}])
 }
 
 /// The messages each log group's delivered envelopes carry, in the order they arrived.
@@ -290,8 +434,7 @@ fn delivered_by_group(case: &str, records: &[(String, Value)]) -> BTreeMap<Strin
 async fn a_subscription_filter_delivers_the_reading_it_was_applied_to() {
     let emulator = Emulator::new();
     let stream = "transformed-delivery";
-    emulator.create_stream("the destination stream", stream).await;
-    tokio::time::sleep(past_activation()).await;
+    emulator.usable_stream("the destination stream", stream).await;
 
     let rows = rows();
     let at = base_ms();

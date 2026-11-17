@@ -19,7 +19,11 @@
 //! space-delimited pattern), so a fan-out that delivers once per batch rather than once per
 //! filter, or one envelope naming every filter, cannot pass. The second spans the lifecycle
 //! a client drives the quota through, with two destinations so what a refused, a re-attached
-//! and a deleted filter deliver is observed separately.
+//! and a deleted filter deliver is observed separately. The third spans the ACCOUNT-LEVEL
+//! half of the same filter set: "account-level and log-group-level subscription filters are
+//! additive" (`PutAccountPolicy`), so a log group the `selectionCriteria` of a
+//! `SUBSCRIPTION_FILTER_POLICY` select is delivered through that policy as well as through
+//! its own filters, and one the criteria exclude is delivered nothing by it.
 //!
 //! Both drive the real wire path and read the delivered records where a consumer reads them,
 //! through the harness `subscription_fan_out.rs` owns.
@@ -364,5 +368,173 @@ async fn only_the_filters_attached_at_ingest_deliver() {
         vec![(sixth.to_string(), vec![second.to_string()])],
         "case {case}: the re-attached filter carries only what was written after it was \
          attached, got {on_refused:?}"
+    );
+}
+
+/// The ACCOUNT-LEVEL filter set: an account-level subscription filter policy is one more
+/// filter of every log group its `selectionCriteria` select.
+///
+/// "Account-level and log-group-level subscription filters are additive" (`PutAccountPolicy`),
+/// and the only criteria such a policy takes is `LogGroupName NOT IN [...]`, so a batch
+/// ingested into a group the list does not name is delivered through the policy's own
+/// destination — under the policy's name and its own `FilterPattern` — beside whatever the
+/// group's own filters deliver, while a group the list DOES name is delivered nothing by it.
+///
+/// The table spans the three kinds of group the rule distinguishes (excluded, selected with no
+/// filter of its own, selected with one), and the policy's pattern selects one of the two
+/// written lines, so a policy whose pattern is ignored cannot pass either.
+#[tokio::test]
+async fn an_account_level_policy_delivers_from_every_group_it_selects() {
+    let case = "an account-level subscription filter policy";
+    let emulator = Emulator::new();
+    let stream = "account-policy-fanout";
+    emulator.usable_stream(case, stream).await;
+
+    /// The groups the case writes to: the one the policy's criteria exclude, one it selects,
+    /// and one it selects that carries a filter of its own.
+    const EXCLUDED: &str = "/aws/emulator/account-policy-excluded";
+    const SELECTED: &str = "/aws/emulator/account-policy-selected";
+    const SELECTED_WITH_OWN: &str = "/aws/emulator/account-policy-selected-with-own";
+    /// The policy, and the filter the third group carries itself.
+    const POLICY: &str = "account-wide-subscription";
+    const OWN_FILTER: &str = "the-group-s-own";
+    /// The two lines every group is written: the policy's `FilterPattern` selects the first.
+    const SELECTED_LINE: &str = "ERROR disk full";
+    const OTHER_LINE: &str = "INFO all good";
+
+    for group in [EXCLUDED, SELECTED, SELECTED_WITH_OWN] {
+        emulator
+            .logs(case, "CreateLogGroup", &json!({"logGroupName": group}))
+            .await;
+        emulator
+            .logs(
+                case,
+                "CreateLogStream",
+                &json!({"logGroupName": group, "logStreamName": LOG_STREAM}),
+            )
+            .await;
+    }
+    // The third group's OWN filter, which matches everything, so what the policy adds is
+    // observable beside it rather than instead of it.
+    emulator
+        .logs(
+            case,
+            "PutSubscriptionFilter",
+            &json!({
+                "logGroupName": SELECTED_WITH_OWN,
+                "filterName": OWN_FILTER,
+                "filterPattern": "",
+                "destinationArn": stream_arn(stream),
+                "roleArn": role_arn(),
+                "distribution": BY_LOG_STREAM,
+            }),
+        )
+        .await;
+    emulator
+        .logs(
+            case,
+            "PutAccountPolicy",
+            &json!({
+                "policyName": POLICY,
+                "policyType": "SUBSCRIPTION_FILTER_POLICY",
+                "policyDocument": json!({
+                    "DestinationArn": stream_arn(stream),
+                    "RoleArn": role_arn(),
+                    "FilterPattern": "ERROR",
+                    "Distribution": BY_LOG_STREAM,
+                })
+                .to_string(),
+                "selectionCriteria": format!(r#"LogGroupName NOT IN ["{EXCLUDED}"]"#),
+            }),
+        )
+        .await;
+
+    let timestamp = base_ms();
+    for group in [EXCLUDED, SELECTED, SELECTED_WITH_OWN] {
+        emulator
+            .logs(
+                case,
+                "PutLogEvents",
+                &json!({
+                    "logGroupName": group,
+                    "logStreamName": LOG_STREAM,
+                    "logEvents": [
+                        {"timestamp": timestamp, "message": SELECTED_LINE},
+                        {"timestamp": timestamp + 1, "message": OTHER_LINE},
+                    ],
+                }),
+            )
+            .await;
+    }
+
+    // What each group's envelopes name and carry: the filter that owes the delivery, and the
+    // messages it forwarded.
+    let mut delivered: Vec<(String, String, Vec<String>)> = Vec::new();
+    for (_key, envelope) in emulator.delivered(case, stream).await {
+        let group = envelope["logGroup"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: an envelope names its log group, got {envelope}"))
+            .to_string();
+        let filter = envelope["subscriptionFilters"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: an envelope names its filter, got {envelope}"))
+            .to_string();
+        let messages: Vec<String> = envelope["logEvents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|event| event["message"].as_str().unwrap_or_default().to_string())
+            .collect();
+        delivered.push((group, filter, messages));
+    }
+    delivered.sort();
+
+    let mut expected: Vec<(String, String, Vec<String>)> = vec![
+        // The selected group has no filter of its own, so the policy is its only one, and the
+        // policy's pattern selects one of the two lines.
+        (
+            SELECTED.to_string(),
+            POLICY.to_string(),
+            vec![SELECTED_LINE.to_string()],
+        ),
+        // The group that carries its own filter is delivered through BOTH: additive.
+        (
+            SELECTED_WITH_OWN.to_string(),
+            OWN_FILTER.to_string(),
+            vec![SELECTED_LINE.to_string(), OTHER_LINE.to_string()],
+        ),
+        (
+            SELECTED_WITH_OWN.to_string(),
+            POLICY.to_string(),
+            vec![SELECTED_LINE.to_string()],
+        ),
+    ];
+    expected.sort();
+    assert_eq!(
+        delivered, expected,
+        "case {case}: expected {expected:?}, got {delivered:?}"
+    );
+
+    // And the policy is reported as the account's, so what delivered is a policy a reader can
+    // see rather than a filter nothing holds.
+    let described = emulator
+        .logs(
+            case,
+            "DescribeAccountPolicies",
+            &json!({"policyType": "SUBSCRIPTION_FILTER_POLICY"}),
+        )
+        .await;
+    let named: Vec<String> = described["accountPolicies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|policy| policy["policyName"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        named,
+        vec![POLICY.to_string()],
+        "case {case}: the account holds the policy that delivered, got {described}"
     );
 }

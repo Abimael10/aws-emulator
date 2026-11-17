@@ -13,6 +13,11 @@
 //! type, another resource sending the same type, the same pairing in another Region, and a
 //! put re-stating the pairing under its OWN name are all served.
 //!
+//! The other half of the same identity is the source's own: a put re-using a stored source's
+//! NAME for a different resource is refused 400 `ConflictException` too, with the fixed
+//! sentence stating that an existing source's resource cannot be updated — the resource a
+//! source represents is immutable, so a different resource needs a source of its own.
+//!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
 //! response that is not computed from the shared store cannot pass.
@@ -44,6 +49,14 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 /// nor the log type, nor the source that already represents the pairing.
 const RESOURCE_IN_USE_MESSAGE: &str =
     "This ResourceId has already been used in another Delivery Source in this account.";
+
+/// The whole sentence a put that keeps an existing source's NAME and names another resource is
+/// refused with: fixed text too, naming neither the source nor either resource, and stating
+/// the rule instead — a source's resource is not updatable, so another resource's logs need a
+/// source of their own.
+const RESOURCE_CHANGE_MESSAGE: &str =
+    "Update to existing Delivery Source with new ResourceId is not allowed. Please create a \
+     new Delivery Source instead.";
 
 /// A second Region, so the rule's scope — a delivery source is a regional resource — is
 /// exercised rather than assumed. Distinct from [`REGION`].
@@ -254,6 +267,49 @@ async fn a_pairing_already_represented_is_refused_under_another_name() {
         held, expected,
         "case the whole table: expected the account to hold {expected:?}, got {held:?}"
     );
+}
+
+/// A put that keeps a stored source's NAME and names a different resource is refused with the
+/// fixed sentence stating the rule, whichever vendor shape either resource takes, and leaves
+/// the stored source representing the resource it already represented.
+#[tokio::test]
+async fn re_using_a_name_for_another_resource_is_refused() {
+    let logs = Logs::new();
+
+    for (index, sender) in senders().iter().enumerate() {
+        let case = (sender.label, sender.sibling_arn);
+        let name = format!("named-{index}");
+        let held_type = sender.log_types[0];
+        let request = body(&name, sender.resource_arn, held_type);
+        let created = logs.ok(PUT, &request).await;
+        let held = reported(PUT, &request, &created);
+
+        // The same name, another resource: refused, with the sentence that states the rule.
+        let sibling_type = sibling_log_type(sender);
+        let (code, message) = logs
+            .refusal(PUT, &body(&name, sender.sibling_arn, sibling_type))
+            .await;
+        assert_eq!(
+            code, CONFLICT,
+            "case {case:?}: expected {CONFLICT}, got {code} {message:?}"
+        );
+        assert_eq!(
+            message, RESOURCE_CHANGE_MESSAGE,
+            "case {case:?}: expected {RESOURCE_CHANGE_MESSAGE:?}, got {message:?}"
+        );
+
+        // The refusal changed nothing: the source still represents its own resource.
+        let read = get_in_region(&logs, REGION, &name).await;
+        assert_eq!(
+            read, held,
+            "case {case:?}: a refused put leaves the source as it was, expected {held}, got {read}"
+        );
+        assert_eq!(
+            read.get("resourceArns").and_then(Value::as_array),
+            Some(&vec![json!(sender.resource_arn)]),
+            "case {case:?}: the stored source represents its original resource, got {read}"
+        );
+    }
 }
 
 /// The pairing is held by a source, not by the resource: once the holder is DELETED the

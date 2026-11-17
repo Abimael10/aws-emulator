@@ -227,6 +227,16 @@ pub const DELIVERY_NOT_FOUND_MESSAGE: &str = "Requested Delivery does not exist 
 pub const DELIVERY_SOURCE_RESOURCE_IN_USE_MESSAGE: &str =
     "This ResourceId has already been used in another Delivery Source in this account.";
 
+/// The refusal CloudWatch Logs answers a `PutDeliverySource` with when it re-uses the name of
+/// a source the account holds and names a DIFFERENT resource than that source represents.
+///
+/// The sentence is FIXED for that error class: it names neither the source, nor the name, nor
+/// either resource, and it states the rule instead — a source's resource cannot be changed by
+/// an update, so a sender of another resource's logs is a new source of its own.
+pub const DELIVERY_SOURCE_RESOURCE_CHANGE_MESSAGE: &str =
+    "Update to existing Delivery Source with new ResourceId is not allowed. Please create a \
+     new Delivery Source instead.";
+
 /// The refusal the vended-log delivery ENUMERATIONS answer a `nextToken` they cannot resume
 /// from with — one this service never minted, one whose payload it cannot decode, and one
 /// minted for a different enumeration than the request carrying it describes.

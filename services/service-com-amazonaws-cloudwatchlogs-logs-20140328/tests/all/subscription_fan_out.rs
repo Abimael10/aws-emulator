@@ -81,6 +81,13 @@ pub(crate) fn past_activation() -> Duration {
     ACTIVATION_DELAY + Duration::from_millis(400)
 }
 
+/// The status a Kinesis stream reports once it can take a delivery, and how long a case gives
+/// it to report that ([`Emulator::await_active_stream`]) and how often it asks. The deadline
+/// is generous: it is not a limit any case here tests, only room for a loaded host.
+const STREAM_ACTIVE: &str = "ACTIVE";
+const STREAM_ACTIVE_DEADLINE: Duration = Duration::from_secs(60);
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// How long a case waits before treating a deleted Kinesis stream as gone: past the instant
 /// its delete armed the removal for, after which the name is free again.
 pub(crate) fn past_deletion() -> Duration {
@@ -332,6 +339,36 @@ impl Emulator {
             &json!({"StreamName": stream, "ShardCount": 1}),
         )
         .await;
+    }
+
+    /// A Kinesis data stream of one shard, READY: created, then waited for until it reports
+    /// itself usable.
+    pub(crate) async fn usable_stream(&self, case: &str, stream: &str) {
+        self.create_stream(case, stream).await;
+        self.await_active_stream(case, stream).await;
+    }
+
+    /// Wait until `stream` reports itself usable — polled for, because the status it leaves
+    /// `CREATING` for is owed by the clock, and the wait ends as soon as the stream says so.
+    ///
+    /// The deadline is generous: it is not a limit any case tests, only room for a loaded
+    /// host.
+    pub(crate) async fn await_active_stream(&self, case: &str, stream: &str) {
+        let deadline = std::time::Instant::now() + STREAM_ACTIVE_DEADLINE;
+        loop {
+            let summary = self
+                .kinesis(case, "DescribeStreamSummary", &json!({"StreamName": stream}))
+                .await;
+            if summary["StreamDescriptionSummary"]["StreamStatus"] == json!(STREAM_ACTIVE) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case}: expected the stream {stream} to report {STREAM_ACTIVE}, got \
+                 {summary}"
+            );
+            tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+        }
     }
 
     /// A logical destination over the Kinesis stream `stream`, USABLE: `PutDestination`

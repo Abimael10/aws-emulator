@@ -246,6 +246,9 @@ pub mod log_transformer;
 /// The transformation a log group's transformer applies to an ingested log event.
 pub mod transformer;
 
+/// Reading and writing a datetime under the patterns a `dateTimeConverter` processor states.
+pub mod date_time_patterns;
+
 /// The scheduled query CloudWatch manages on a log alarm's behalf.
 pub mod log_alarm_queries;
 

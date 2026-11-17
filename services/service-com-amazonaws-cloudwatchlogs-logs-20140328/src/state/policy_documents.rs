@@ -200,6 +200,52 @@ pub(super) fn check_subscription_filter_policy_document(
     Ok(())
 }
 
+/// What a `SUBSCRIPTION_FILTER_POLICY` document CONFIGURES, read from an accepted document:
+/// the parts the fan-out of an ingested batch acts on ([`super::subscription_delivery`]).
+///
+/// The members are the attributes `PutAccountPolicy$policyDocument` lists for such a policy,
+/// each standing for the `PutSubscriptionFilter` member of the same name
+/// ([`check_subscription_filter_policy_document`]), so one document configures account-wide
+/// exactly what one put configures for one log group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionFilterPolicy {
+    /// "DestinationArn The ARN of the destination to deliver log events to".
+    pub destination_arn: String,
+    /// "RoleArn The ARN of an IAM role that grants CloudWatch Logs permissions to deliver
+    /// ingested log events to the destination stream"; `None` for a document naming none,
+    /// which is the Lambda destination that needs no role.
+    pub role_arn: Option<String>,
+    /// "FilterPattern A filter pattern for subscribing to a filtered stream of log events".
+    /// A document naming none subscribes to the whole stream, which is what the empty
+    /// pattern selects.
+    pub filter_pattern: String,
+    /// "Distribution The method used to distribute log data to the destination", with the
+    /// documented default of a put that names none ([`super::DEFAULT_DISTRIBUTION`]).
+    pub distribution: String,
+}
+
+/// What `document` configures, or `None` when it is no subscription filter policy document at
+/// all — one that names no destination configures no delivery.
+///
+/// A stored document went through [`check_subscription_filter_policy_document`] when it was
+/// put, so this reads the accepted document rather than judging it again.
+pub fn subscription_filter_policy(document: &str) -> Option<SubscriptionFilterPolicy> {
+    let members = policy_object(document).ok()?;
+    let string = |name: &str| {
+        members
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    Some(SubscriptionFilterPolicy {
+        destination_arn: string("DestinationArn")?,
+        role_arn: string("RoleArn"),
+        filter_pattern: string("FilterPattern").unwrap_or_default(),
+        distribution: string("Distribution")
+            .unwrap_or_else(|| super::DEFAULT_DISTRIBUTION.to_string()),
+    })
+}
+
 /// One field index a field index policy document names: the field whose log event values
 /// are indexed, and the type the document gives it.
 ///

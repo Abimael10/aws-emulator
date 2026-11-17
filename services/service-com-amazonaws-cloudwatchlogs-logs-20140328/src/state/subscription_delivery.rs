@@ -76,6 +76,12 @@
 //! destination is validated by its own resource policy instead and is never invoked by the
 //! configuration call ([`CONTROL_MESSAGE_DESTINATIONS`]).
 //!
+//! A log group's filters are its own AND the one an account-level subscription filter policy
+//! configures for it ([`account_level_filter`]): "account-level and log-group-level
+//! subscription filters are additive" (`PutAccountPolicy`), and which log groups such a policy
+//! configures is its `selectionCriteria`, so a batch ingested into a group the policy selects
+//! is fanned out through the policy's destination as well as through the group's own filters.
+//!
 //! Delivery is best effort, as it is for the real service: `PutLogEvents` "always
 //! accepted" the batch, and whether a destination took the envelope is not part of its
 //! answer, so a destination that refuses or does not exist leaves the ingestion standing.
@@ -400,7 +406,12 @@ pub fn health_check(
 }
 
 /// Every envelope the events `PutLogEvents` just stored on `log_stream_name` owe the
-/// subscription filters of `log_group_name`, ingested in `region`.
+/// subscription filters in force on `log_group_name`, ingested in `region`.
+///
+/// The filters in force are the group's own and the one an ACCOUNT-LEVEL subscription filter
+/// policy configures for it ([`account_level_filter`]): "account-level and log-group-level
+/// subscription filters are additive" (`PutAccountPolicy`), so a batch is fanned out through
+/// both and neither suppresses the other.
 ///
 /// Read under the store's own guard, so the filters a batch is fanned out through are the
 /// ones the group held when the batch arrived. A filter whose pattern matches none of the
@@ -418,6 +429,12 @@ pub fn deliveries(
         return Vec::new();
     };
     let owner = ::engine::emulator_account_id();
+    let account_level = account_level_filter(store, group);
+    let filters: Vec<&super::SubscriptionFilterRecord> = group
+        .subscription_filters
+        .values()
+        .chain(account_level.iter())
+        .collect();
     // The TRANSFORMED version of this batch, materialised once and only where some filter
     // asks for it: a filter put with `applyOnTransformedLogs` "will be applied on the
     // transformed version of the log events instead of the original ingested log events", and
@@ -426,9 +443,8 @@ pub fn deliveries(
         .transformer
         .as_ref()
         .filter(|_| {
-            group
-                .subscription_filters
-                .values()
+            filters
+                .iter()
                 .any(|filter| filter.apply_on_transformed_logs && !filter.destination_unhealthy)
         })
         .map(|transformer| {
@@ -445,7 +461,7 @@ pub fn deliveries(
                 .collect()
         });
     let mut deliveries = Vec::new();
-    for filter in group.subscription_filters.values() {
+    for filter in filters {
         if filter.destination_unhealthy {
             continue;
         }
@@ -504,6 +520,48 @@ pub fn deliveries(
         }
     }
     deliveries
+}
+
+/// The filter the account's ACCOUNT-LEVEL subscription filter policy configures for one log
+/// group, and `None` where no such policy applies to it.
+///
+/// An account-level policy "applies to all log groups, a subset of log groups, or a data
+/// source name and type combination in the account", and which of them it applies to is its
+/// `selectionCriteria` ([`super::applicable_account_policy`]) — so a group a
+/// `LogGroupName NOT IN [...]` criteria does not exclude is one the policy delivers from. What
+/// the policy configures is read from its document ([`super::subscription_filter_policy`]) and
+/// delivered through exactly the path a log-group-level filter is: the policy is one filter of
+/// the group's, named by the policy's own name, which is the only name a reader of the
+/// delivered envelope has for it.
+///
+/// It carries no delivery health of its own: nothing re-validates an account-level policy's
+/// destination the way a `PutSubscriptionFilter` re-validates a filter's, so a destination
+/// that refused one batch is attempted again on the next.
+fn account_level_filter(
+    store: &ComAmazonawsCloudwatchlogsLogs20140328State,
+    group: &super::LogGroupRecord,
+) -> Option<super::SubscriptionFilterRecord> {
+    let policy = super::applicable_account_policy(
+        &store.account_policies,
+        super::POLICY_TYPE_SUBSCRIPTION_FILTER,
+        group,
+    )?;
+    let configured = super::subscription_filter_policy(&policy.policy_document)?;
+    Some(super::SubscriptionFilterRecord {
+        filter_name: policy.policy_name.clone(),
+        filter_pattern: configured.filter_pattern,
+        destination_arn: configured.destination_arn,
+        role_arn: configured.role_arn,
+        distribution: configured.distribution,
+        // The attributes an account-level policy's document names are the four
+        // `PutAccountPolicy$policyDocument` lists for one, so nothing in it configures the
+        // members a log-group-level put states beyond them.
+        apply_on_transformed_logs: false,
+        field_selection_criteria: None,
+        emit_system_fields: None,
+        creation_time_ms: policy.last_updated_time_ms,
+        destination_unhealthy: false,
+    })
 }
 
 /// `matched` split into runs small enough that each one's envelope fits a single delivered

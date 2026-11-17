@@ -30,14 +30,14 @@
 //! `parseKeyValue`, `csv`), the vended parsers whose log type's record layout is PUBLISHED
 //! (`parseVPC` and `parseWAF`, which read the VPC flow log record and the WAF vended record
 //! held in [`super::log_transformer`]), and the mutate processors that move, rewrite and
-//! retype the fields a parser produced. The remaining kinds each need a published catalogue
-//! that is not in this model and is not written down beside it — a grok pattern library for
-//! `grok`, the per-source record layout of the other AWS-vended log types for
-//! `parseCloudfront` / `parseRoute53` / `parsePostgres`, the OCSF event mapping for
-//! `parseToOCSF`, and the date-format syntax of
-//! `dateTimeConverter$matchPatterns` — so they leave the event as they found it rather than
-//! inventing fields nothing derived. They are still ACCEPTED by `PutTransformer`, which is
-//! what a client observes of them.
+//! retype the fields a parser produced — `dateTimeConverter` among them, whose patterns are
+//! read as the letter notation they are written in ([`super::date_time_patterns`]). The
+//! remaining kinds each need a published catalogue that is not in this model and is not
+//! written down beside it — a grok pattern library for `grok`, the per-source record layout
+//! of the other AWS-vended log types for `parseCloudfront` / `parseRoute53` /
+//! `parsePostgres`, and the OCSF event mapping for `parseToOCSF` — so they leave the event as
+//! they found it rather than inventing fields nothing derived. They are still ACCEPTED by
+//! `PutTransformer`, which is what a client observes of them.
 //!
 //! What one transformation costs is bounded by the event itself: a key path is followed at
 //! most [`MAX_PATH_SEGMENTS`] segments, and an event holds at most [`MAX_EVENT_FIELDS`] names
@@ -82,6 +82,20 @@ const MAX_EVENT_FIELDS: usize = 1_000;
 /// that clones either.
 const MAX_EVENT_BYTES: usize = crate::state::MAX_LOG_EVENT_BYTES as usize;
 
+/// THE EMULATOR'S OWN CEILING on how many values one event's transformation may VISIT,
+/// beyond the one pass that reads the ingested message in.
+///
+/// The two ceilings above bound what an event HOLDS; this one bounds the WORK of getting
+/// there, because a value already in the event is walked once more whenever a write replaces
+/// it ([`Event::write`] refunds what it replaces) or a removal takes it out. Both the number
+/// of writes a processor makes and the size of what sits at the path it writes come from the
+/// same ingested message, so without this a single message could be shaped to multiply them
+/// against each other. Each walk is charged here, and a transformation that has spent the
+/// budget writes nothing further: the event keeps what it has, and the pipeline costs a
+/// bounded number of visits however the message is shaped. Generous for any transformation
+/// of an event inside [`MAX_EVENT_FIELDS`] names — two orders of magnitude above it.
+const MAX_EVENT_WORK: usize = 100_000;
+
 /// The largest compiled program one caller-supplied regular expression may occupy, the same
 /// explicit clamp this crate compiles every other request-derived expression under (see
 /// `super::filter_pattern` and `super::query_compile`), rather than the regex crate's own
@@ -124,8 +138,9 @@ const TYPE_BOOLEAN: &str = "boolean";
 /// A log group's transformer, PREPARED for the events of one batch: the processors it
 /// applies, in order, with everything derivable from the configuration alone already derived
 /// — the regular expressions its `substituteString` entries state, compiled ONCE here rather
-/// than once per event, because a batch carries up to 10,000 events and the expressions are
-/// a property of the stored transformer rather than of any event.
+/// than once per event, and the conversion its `dateTimeConverter` configures, prepared the
+/// same way ([`super::date_time_patterns::Conversion`]) — because a batch carries up to
+/// 10,000 events and both are properties of the stored transformer rather than of any event.
 #[derive(Debug, Default)]
 pub struct Pipeline {
     /// The processors, in the order the transformer lists them.
@@ -134,6 +149,10 @@ pub struct Pipeline {
     /// in entry order: `None` where the expression does not compile, and empty for a
     /// processor that is no `substituteString`.
     substitutions: Vec<Vec<Option<::regex::Regex>>>,
+    /// One entry per processor, holding the conversion its `dateTimeConverter` configures:
+    /// `None` for a processor that is no `dateTimeConverter`, and for one whose
+    /// configuration converts nothing.
+    conversions: Vec<Option<super::date_time_patterns::Conversion>>,
 }
 
 impl Pipeline {
@@ -161,9 +180,23 @@ impl Pipeline {
                     .unwrap_or_default()
             })
             .collect();
+        let conversions = processors
+            .iter()
+            .map(|processor| {
+                processor.date_time_converter.as_ref().and_then(|converter| {
+                    super::date_time_patterns::Conversion::prepared(
+                        &converter.match_patterns,
+                        converter.source_timezone.as_deref(),
+                        converter.target_timezone.as_deref(),
+                        converter.target_format.as_deref(),
+                    )
+                })
+            })
+            .collect();
         Self {
             processors: processors.to_vec(),
             substitutions,
+            conversions,
         }
     }
 
@@ -181,8 +214,13 @@ impl Pipeline {
             return None;
         }
         let mut event = Event::of(message);
-        for (processor, substitutions) in self.processors.iter().zip(&self.substitutions) {
-            apply(&mut event, processor, substitutions);
+        for ((processor, substitutions), conversion) in self
+            .processors
+            .iter()
+            .zip(&self.substitutions)
+            .zip(&self.conversions)
+        {
+            apply(&mut event, processor, substitutions, conversion.as_ref());
         }
         event.into_message()
     }
@@ -204,6 +242,9 @@ struct Event<'a> {
     /// How many bytes [`Event::fields`] holds, kept the same way: a name is not a size, so
     /// the two ceilings are charged side by side ([`MAX_EVENT_BYTES`]).
     bytes: usize,
+    /// How many values this transformation has VISITED beyond reading the message in: what
+    /// the writes and removals below walked ([`MAX_EVENT_WORK`]).
+    work: usize,
 }
 
 impl<'a> Event<'a> {
@@ -221,7 +262,19 @@ impl<'a> Event<'a> {
             message,
             names,
             bytes,
+            work: 0,
         }
+    }
+
+    /// Whether this transformation has spent its visit budget ([`MAX_EVENT_WORK`]), after
+    /// which nothing more is written or removed and the event keeps what it holds.
+    fn exhausted(&self) -> bool {
+        self.work > MAX_EVENT_WORK
+    }
+
+    /// Charge `visited` values against that budget.
+    fn charge(&mut self, visited: usize) {
+        self.work = self.work.saturating_add(visited);
     }
 
     /// The transformed message: the event's fields as a JSON document, and `None` for an
@@ -261,23 +314,36 @@ impl<'a> Event<'a> {
     /// expanding rewrites can grow the event without bound. Missing parents along the path
     /// are created as nested objects, which is what writing a child key does, and each is
     /// charged too.
+    ///
+    /// What the write WALKS is bounded too: the path a write may not overwrite is answered
+    /// from the lookup alone, before anything is measured, and the one walk over what a write
+    /// does replace is charged against the event's visit budget ([`MAX_EVENT_WORK`]) — so a
+    /// processor writing once per piece of the ingested message cannot re-walk a large stored
+    /// value once per piece.
     fn write(&mut self, path: &str, value: Value, overwrite: bool) -> bool {
         let depth = path.split('.').count();
-        if depth > MAX_PATH_SEGMENTS {
+        if depth > MAX_PATH_SEGMENTS || self.exhausted() {
             return false;
         }
-        let replaced = self
-            .read(path)
-            .map(|replaced| (count_value(replaced), value_bytes(replaced)));
-        if replaced.is_some() && !overwrite {
+        // Whether the path is OCCUPIED decides the write before its size does, so a write the
+        // processor may not overwrite costs the lookup and nothing more.
+        let occupied = self.read(path).is_some();
+        if occupied && !overwrite {
             return false;
         }
         // Charged against both ceilings before anything is written, with the parents the path
         // may have to create counted at their maximum, so neither check depends on how far
         // down the walk below gets.
-        let (refunded_names, refunded_bytes) = replaced.unwrap_or((0, 0));
+        let (refunded_names, refunded_bytes) = match self.read(path) {
+            Some(replaced) => (count_value(replaced), value_bytes(replaced)),
+            None => (0, 0),
+        };
         let names = count_value(&value) + depth - 1;
         let bytes = value_bytes(&value) + path.len();
+        self.charge(refunded_names + names);
+        if self.exhausted() {
+            return false;
+        }
         if self.names.saturating_add(names) > MAX_EVENT_FIELDS.saturating_add(refunded_names) {
             return false;
         }
@@ -319,9 +385,10 @@ impl<'a> Event<'a> {
         true
     }
 
-    /// The value at `path`, removed from the event.
+    /// The value at `path`, removed from the event. The one walk over what it removes is
+    /// charged against the event's visit budget, the way a write's refund is.
     fn take(&mut self, path: &str) -> Option<Value> {
-        if path.split('.').count() > MAX_PATH_SEGMENTS {
+        if path.split('.').count() > MAX_PATH_SEGMENTS || self.exhausted() {
             return None;
         }
         let mut segments: Vec<&str> = path.split('.').collect();
@@ -331,8 +398,10 @@ impl<'a> Event<'a> {
             current = current.get_mut(segment)?.as_object_mut()?;
         }
         let removed = current.remove(last)?;
-        self.names = self.names.saturating_sub(count_value(&removed));
+        let names = count_value(&removed);
+        self.names = self.names.saturating_sub(names);
         self.bytes = self.bytes.saturating_sub(value_bytes(&removed));
+        self.charge(names);
         Some(removed)
     }
 
@@ -402,18 +471,22 @@ fn scalar_text(value: &Value) -> Option<String> {
 }
 
 /// Apply one processor to the event, with the expressions its `substituteString` entries
-/// state already compiled ([`Pipeline`]).
+/// state already compiled and the conversion its `dateTimeConverter` configures already
+/// prepared ([`Pipeline`]).
 ///
 /// Destructured EXHAUSTIVELY — no `..` — so a processor kind the model gains is a COMPILE
 /// error here rather than a transformation this function silently cannot see.
-fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::regex::Regex>]) {
+fn apply(
+    event: &mut Event,
+    processor: &Processor,
+    substitutions: &[Option<::regex::Regex>],
+    conversion: Option<&super::date_time_patterns::Conversion>,
+) {
     let Processor {
         add_keys,
         copy_value,
         csv,
-        // `dateTimeConverter` states its `matchPatterns` in a date-format syntax this model
-        // does not publish, so the conversion it would write is not derivable here.
-        date_time_converter: _,
+        date_time_converter,
         delete_keys,
         // `grok` matches against a named pattern library this model does not publish.
         grok: _,
@@ -488,14 +561,19 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
     // pairs", split on its two delimiters, each key carrying the prefix the processor names.
     if let Some(parse_key_value) = parse_key_value {
         if let Some(text) = event.source_text(parse_key_value.source.as_deref()) {
-            let field_delimiter = parse_key_value
-                .field_delimiter
-                .as_deref()
-                .unwrap_or(DEFAULT_FIELD_DELIMITER);
-            let key_value_delimiter = parse_key_value
-                .key_value_delimiter
-                .as_deref()
-                .unwrap_or(DEFAULT_KEY_VALUE_DELIMITER);
+            // A delimiter is "the field delimiter string" / "the key-value delimiter string"
+            // the pairs are split on, so a configuration that states an EMPTY one states no
+            // delimiter at all and the documented default stands — the empty string separates
+            // nothing, and splitting on it would make one pair of every character of the
+            // source text.
+            let field_delimiter = delimiter(
+                parse_key_value.field_delimiter.as_deref(),
+                DEFAULT_FIELD_DELIMITER,
+            );
+            let key_value_delimiter = delimiter(
+                parse_key_value.key_value_delimiter.as_deref(),
+                DEFAULT_KEY_VALUE_DELIMITER,
+            );
             for pair in text.split(field_delimiter) {
                 // "A value to insert into the value field in the result, when a key-value
                 // pair is not successfully split": a pair carrying no delimiter has a value
@@ -551,6 +629,21 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
                     let target = under(csv.destination.as_deref(), &name);
                     event.write(&target, Value::String(column.to_string()), true);
                 }
+            }
+        }
+    }
+
+    // `dateTimeConverter` "converts a datetime string into a format that you specify": the
+    // text at "the key to apply the date conversion to" is read under the patterns the
+    // processor states, in its source zone, and written to "the JSON field to store the
+    // result in" in its target zone and format — all of which is prepared once per batch
+    // ([`super::date_time_patterns::Conversion`]), so one event costs the parse attempts its
+    // patterns allow and one rendering. Text no pattern reads converts nothing, so the event
+    // keeps the fields it already had.
+    if let (Some(converter), Some(conversion)) = (date_time_converter, conversion) {
+        if let Some(text) = event.source_text(Some(&converter.source)) {
+            if let Some(written) = conversion.applied(&text) {
+                event.write(&converter.target, Value::String(written), true);
             }
         }
     }
@@ -739,6 +832,16 @@ fn first_byte(setting: Option<&str>, fallback: u8) -> u8 {
     setting
         .and_then(|value| value.as_bytes().first().copied())
         .unwrap_or(fallback)
+}
+
+/// The delimiter text a processor's configuration names, or `fallback` where it names none:
+/// an EMPTY delimiter separates nothing, so it is the same as naming none and the documented
+/// default stands.
+fn delimiter<'a>(stated: Option<&'a str>, fallback: &'a str) -> &'a str {
+    match stated {
+        Some(stated) if !stated.is_empty() => stated,
+        _ => fallback,
+    }
 }
 
 /// `text` with `replacement` substituted for every match of `expression`, or `None` when the
