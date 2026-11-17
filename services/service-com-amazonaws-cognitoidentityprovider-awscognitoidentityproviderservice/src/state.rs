@@ -4588,9 +4588,6 @@ pub enum RateRefusal {
     /// The requested rate is above the account's Service Quotas ceiling for
     /// this limit, so provisioning it would need a quota increase first.
     AboveQuotaCeiling { requested: i32, ceiling: i32 },
-    /// The requested rate is the one the limit already reports as in force, so
-    /// there is no adjustment to make.
-    AlreadyProvisioned,
 }
 
 impl RateRefusal {
@@ -4621,13 +4618,6 @@ impl RateRefusal {
             // step for this sentence to name.
             Self::AboveQuotaCeiling { requested, ceiling } => {
                 format!("Requested value {requested} exceeds Service Quota ceiling of {ceiling}")
-            }
-            // A rate the limit already holds names no adjustment, so the
-            // sentence reports that the request asks for the limit in force and
-            // states no rate: both halves — what was asked for and what is
-            // provisioned — are the same value the caller sent.
-            Self::AlreadyProvisioned => {
-                "Requested value is the same as the current provisioned limit".to_string()
             }
         }
     }
@@ -4755,18 +4745,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// Provision `requested` requests per second for `category` and return the
     /// limit as it now stands.
     ///
-    /// Every rate in the account's range is stored but the rate the limit
-    /// already reports as IN FORCE: the range runs from the rate the category
+    /// EVERY rate in the account's range is stored, including one the limit
+    /// already reports as in force: the range runs from the rate the category
     /// includes up to the account's Service Quotas ceiling for that limit
-    /// ([`Self::api_category_quota_ceiling`]), a rate outside it is refused, and
-    /// so is the rate the limit already holds — "use this operation to adjust" a
-    /// limit (`UpdateProvisionedLimit` in this service's model), and a rate
-    /// equal to the one in force adjusts nothing. The rate in force is the one
-    /// every reader reports ([`Self::api_category_limit`]): the rate a previous
-    /// provisioning stored, or the rate the category includes while nothing has
-    /// provisioned it, so asking for the value a read just reported names no
-    /// adjustment either way. A refused call stores nothing, so the limit a
-    /// later read reports is the one that was already in force.
+    /// ([`Self::api_category_quota_ceiling`]) — "the value must be between the
+    /// default limit and your account-level maximum limit in Service Quotas"
+    /// (`UpdateProvisionedLimit` in this service's model) — and only a rate
+    /// OUTSIDE that range is refused. Setting a limit to the rate it already
+    /// holds is the same write made twice, so it stores the same rate again and
+    /// reports it; a caller that re-applies the rate a read just reported
+    /// converges rather than failing. A refused call stores nothing, so the
+    /// limit a later read reports is the one that was already in force.
     pub fn set_api_category_limit(
         &mut self,
         category: &ApiCategory,
@@ -4781,9 +4770,6 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         let ceiling = self.api_category_quota_ceiling(category);
         if requested > ceiling {
             return Err(RateRefusal::AboveQuotaCeiling { requested, ceiling });
-        }
-        if requested == self.api_category_limit(category).provisioned_limit_value {
-            return Err(RateRefusal::AlreadyProvisioned);
         }
         self.provisioned_api_rates
             .insert(category.name.to_string(), requested);

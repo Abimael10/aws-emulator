@@ -10,22 +10,20 @@
 //! `GetProvisionedLimit` reports the rate in force for the identified limit
 //! beside the rate that category includes at no additional cost — the included
 //! rate itself while nothing has adjusted the limit — and changes nothing.
-//! `UpdateProvisionedLimit` stores any rate in the account's range that this
-//! account has not provisioned already, the range running
-//! from the limit's included rate up to the account's Service Quotas ceiling
-//! for that limit, and refuses a rate outside it: below the included rate as a
-//! malformed parameter, above the ceiling as a quota excess naming the rate
-//! asked for and the ceiling it passed. A rate the limit already reports as in
-//! force adjusts nothing and is refused as a malformed parameter too, whether a
-//! previous provisioning stored it or it is the rate the category includes. A
-//! refused request stores nothing.
+//! `UpdateProvisionedLimit` stores EVERY rate in the account's range, the range
+//! running from the limit's included rate up to the account's Service Quotas
+//! ceiling for that limit, and refuses only a rate outside it: below the
+//! included rate as a malformed parameter, above the ceiling as a quota excess
+//! naming the rate asked for and the ceiling it passed. A rate equal to the one
+//! the limit already reports as in force is inside the range, so it is stored
+//! and reported like any other — whether a previous provisioning stored it or it
+//! is the rate the category includes. A refused request stores nothing.
 //!
 //! Stated plainly, because it decides how the tests below reach a provisioned
-//! rate at all: that ceiling is a Service Quotas value of the ACCOUNT, and
-//! while no increase has raised it, it IS the limit's included rate — so no
-//! operation of this service can store a rate DIFFERENT from the one already in
-//! force, and a quota increase is what opens the range. A granted increase is
-//! recorded in this service's own account state
+//! rate DIFFERENT from the one in force: that ceiling is a Service Quotas value
+//! of the ACCOUNT, and while no increase has raised it, it IS the limit's
+//! included rate — so a quota increase is what opens the range above the rate in
+//! force. A granted increase is recorded in this service's own account state
 //! (`State::raise_api_category_quota_ceiling`), which is what the write tests
 //! below do before they provision, so each one really stores a rate the limit
 //! did not hold and reads it back.
@@ -217,58 +215,20 @@ async fn an_adjusted_rate_is_what_every_reader_renders() {
         // The rows differ along where in the account's range the rate sits:
         // both bounds, rates inside it, a release back to the included rate,
         // and — after each stored rate — the SAME rate again, which asks for
-        // the rate this account has already provisioned and so adjusts nothing.
+        // the rate this account has already provisioned and is stored again.
         let midpoint = (limit.included + ceiling) / 2;
-        let rows: Vec<(String, i64, bool)> = vec![
-            (
-                "one above the included rate".to_string(),
-                limit.included + 1,
-                true,
-            ),
-            ("a rate inside the range".to_string(), midpoint, true),
-            ("that same rate again".to_string(), midpoint, false),
-            ("the account's ceiling".to_string(), ceiling, true),
-            (
-                "back down to the included rate".to_string(),
-                limit.included,
-                true,
-            ),
-            ("the included rate again".to_string(), limit.included, false),
+        let rows: Vec<(String, i64)> = vec![
+            ("one above the included rate".to_string(), limit.included + 1),
+            ("a rate inside the range".to_string(), midpoint),
+            ("that same rate again".to_string(), midpoint),
+            ("the account's ceiling".to_string(), ceiling),
+            ("back down to the included rate".to_string(), limit.included),
+            ("the included rate again".to_string(), limit.included),
         ];
 
-        // What the limit held before the row ran, so a row that adjusts nothing
-        // can be asserted to have left it there.
-        let mut in_force = limit.included;
-        for (position, requested, adjusts) in rows {
+        for (position, requested) in rows {
             let case = format!("{} provisioned at {requested} ({position})", limit.category);
             let (status, answered) = provision(&router, limit.category, requested).await;
-            if !adjusts {
-                // A rate this account has already provisioned names no
-                // adjustment, so it is refused as a malformed parameter and the
-                // limit stays put.
-                assert_eq!(
-                    (
-                        status,
-                        error_code(&answered),
-                        error_message(&answered).to_string()
-                    ),
-                    (
-                        400,
-                        "InvalidParameterException",
-                        already_provisioned_message()
-                    ),
-                    "case {case:?}: the rate already provisioned is refused, got {status} \
-                     with {answered}"
-                );
-                let reported = read_back(&router, &case, limit.category).await;
-                assert_eq!(
-                    reported,
-                    rendered(limit, in_force),
-                    "case {case:?}: a refused update must leave the limit at the rate it \
-                     held, got {reported}"
-                );
-                continue;
-            }
             assert_eq!(
                 status, 200,
                 "case {case:?}: a rate inside the account's range is stored, got {status} \
@@ -279,7 +239,6 @@ async fn an_adjusted_rate_is_what_every_reader_renders() {
                 Some(&rendered(limit, requested)),
                 "case {case:?}: the update must answer the limit it stored, got {answered}"
             );
-            in_force = requested;
 
             // The stored rate is what the reader renders, so the adjustment
             // round-trips rather than living in the response alone.
@@ -589,37 +548,33 @@ async fn an_account_with_no_increase_has_the_included_rate_as_its_ceiling() {
 
         // The ceiling itself is not PAST the ceiling, so the refusals above are
         // about passing it rather than about the operation refusing everything:
-        // while no increase has been granted that ceiling is the rate the limit
-        // already reports as in force, so asking for it names no adjustment and
-        // is refused as a malformed parameter rather than as a quota excess.
+        // while no increase has been granted that ceiling is both bounds of the
+        // range at once, and asking for it is accepted.
         let case = format!("{} asked for its ceiling", limit.category);
         let (status, payload) = provision(&router, limit.category, limit.included).await;
         assert_eq!(
-            (
-                status,
-                error_code(&payload),
-                error_message(&payload).to_string()
-            ),
-            (
-                400,
-                "InvalidParameterException",
-                already_provisioned_message()
-            ),
-            "case {case:?}: the rate already provisioned is refused, got {status} \
+            status, 200,
+            "case {case:?}: the rate at both bounds of the range is stored, got {status} \
              with {payload}"
+        );
+        assert_eq!(
+            payload.get("Limit"),
+            Some(&rendered(limit, limit.included)),
+            "case {case:?}: the update must answer the limit it stored, got {payload}"
         );
     }
 }
 
 #[tokio::test]
-async fn the_rate_a_read_reports_is_refused_as_an_adjustment() {
+async fn the_rate_a_read_reports_is_stored_again_when_it_is_re_applied() {
     // The two states a limit reports a rate in force from, which is what the
     // rows vary: one nothing has provisioned, where the rate in force is the
     // rate the category includes, and one a provisioning stored a rate on,
-    // where it is that stored rate. Either way the value a read REPORTS is the
-    // one an update cannot ask for again. Every limit this account holds is
-    // driven through both, so the rule is asserted over categories with
-    // different included rates rather than over one.
+    // where it is that stored rate. Either way the value a read REPORTS is a
+    // rate inside the account's range, so an update may ask for it again and
+    // gets it back. Every limit this account holds is driven through both, so
+    // the rule is asserted over categories with different included rates rather
+    // than over one.
     for provisioned_first in [false, true] {
         let (router, engine) = router_and_engine();
         let state = if provisioned_first {
@@ -651,33 +606,29 @@ async fn the_rate_a_read_reports_is_refused_as_an_adjustment() {
 
             let (status, payload) = provision(&router, limit.category, in_force).await;
             assert_eq!(
-                (
-                    status,
-                    error_code(&payload),
-                    error_message(&payload).to_string()
-                ),
-                (
-                    400,
-                    "InvalidParameterException",
-                    already_provisioned_message()
-                ),
-                "case {case:?}: asking for the reported rate {in_force} adjusts nothing and is \
-                 refused, got {status} with {payload}"
+                status, 200,
+                "case {case:?}: re-applying the reported rate {in_force} is accepted, got \
+                 {status} with {payload}"
+            );
+            assert_eq!(
+                payload.get("Limit"),
+                Some(&reported),
+                "case {case:?}: the re-apply must answer the same limit the read reported, got \
+                 {payload}"
             );
 
-            // The refusal wrote nothing, so the limit still reports the rate it
-            // held.
+            // The re-apply is the same write made twice, so the limit still
+            // reports the rate it held.
             let after = read_back(&router, &case, limit.category).await;
             assert_eq!(
                 after, reported,
-                "case {case:?}: a refused no-op must leave the limit at {in_force}, got {after}"
+                "case {case:?}: re-applying must leave the limit at {in_force}, got {after}"
             );
 
             if provisioned_first {
                 // The next rate up is a rate the limit does NOT hold, and the
-                // increase put it inside the account's range, so the refusal
-                // above is about the request naming the rate in force rather
-                // than about the operation refusing every rate.
+                // increase put it inside the account's range, so the acceptance
+                // above is not the operation accepting only the rate in force.
                 let (status, answered) = provision(&router, limit.category, in_force + 1).await;
                 assert_eq!(
                     status, 200,
@@ -850,13 +801,6 @@ fn below_included_message(requested: i64, included: i64) -> String {
 /// nothing else.
 fn above_ceiling_message(requested: i64, ceiling: i64) -> String {
     format!("Requested value {requested} exceeds Service Quota ceiling of {ceiling}")
-}
-
-/// What a refusal says for a rate this account has already provisioned: fixed
-/// text that states neither the rate nor the limit, both halves being the value
-/// the caller sent.
-fn already_provisioned_message() -> String {
-    "Requested value is the same as the current provisioned limit".to_string()
 }
 
 /// What a refusal says for a category value the service publishes no limit of:
