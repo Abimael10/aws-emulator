@@ -852,10 +852,27 @@ pub fn region_of(parts: &::http::request::Parts) -> String {
 pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
     let arn = slo_arn_of(region, id);
     ResourceNotFoundException {
-        message: format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist."),
+        message: slo_arn_sentence(&arn, SLO_DOES_NOT_EXIST),
         resource_type: SLO_RESOURCE_TYPE.to_string(),
         resource_id: arn,
     }
+}
+
+/// The predicate [`slo_arn_sentence`] states about an SLO this service does not hold.
+const SLO_DOES_NOT_EXIST: &str = "does not exist";
+
+/// The predicate [`slo_arn_sentence`] states about an SLO this service already holds.
+const SLO_ALREADY_EXISTS: &str = "already exists";
+
+/// The ONE sentence this service words a refusal ABOUT ONE PARTICULAR SLO with: the
+/// resource's capitalised type name ([`SLO_RESOURCE_TYPE`]), the ARN that addresses it in
+/// single quotes, and the predicate saying what is wrong with it, closed by a period.
+///
+/// Both halves of that rule are worded here — the SLO an operation cannot find and the SLO a
+/// create cannot mint again — so the fixed text of one cannot drift from the other, and the
+/// only variable part is the ARN of the SLO the refusal is about.
+fn slo_arn_sentence(arn: &str, predicate: &str) -> String {
+    format!("{SLO_RESOURCE_TYPE} with arn '{arn}' {predicate}.")
 }
 
 /// The namespace the work-item layer that serves `UpdateServiceLevelObjective` addresses an
@@ -967,25 +984,19 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
     }
 }
 
-/// The sentence a create that names an SLO already stored is refused with: the identifier
-/// the request sent is taken, stated over the rule and no value of it.
+/// The modelled `ConflictException` for a create that names an SLO already stored, identified
+/// by `stored_arn` — the ARN of the record the store already holds under that name.
 ///
-/// Entirely fixed text, with no trailing period. The identifier at fault is the `Name` the
-/// caller itself sent (`smithy_query(query="operation",
-/// operation="CreateServiceLevelObjective")`: `Name`, `@required`), so the sentence adds
-/// nothing a client does not already hold, and the ARN of the stored record is an identifier
-/// the caller never named.
-const SLO_IDENTIFIER_TAKEN: &str = "A resource with the same identifier already exists";
-
-/// The modelled `ConflictException` for a create that names an SLO already stored.
-///
-/// `ConflictException` carries only `Message`, so the sentence
-/// ([`SLO_IDENTIFIER_TAKEN`]) is the whole body, and it is the same for every conflicting
-/// name: what the caller has to change is the identifier it sent, which the request already
-/// states.
-pub fn slo_already_exists() -> ConflictException {
+/// `ConflictException` carries only `Message` (`smithy_query(query="shape",
+/// shape="ConflictException")`: one `@required` member, and no `Arn`, `Name` or `ResourceId`),
+/// so the sentence is the only place the conflicting resource can be identified — and it
+/// identifies it the way every other refusal about one particular SLO does
+/// ([`slo_arn_sentence`]), by the ARN that addresses it. The ARN is read off the STORED record
+/// rather than re-minted from the request, so it is the identifier the create that won
+/// returned.
+pub fn slo_already_exists(stored_arn: &str) -> ConflictException {
     ConflictException {
-        message: SLO_IDENTIFIER_TAKEN.to_string(),
+        message: slo_arn_sentence(stored_arn, SLO_ALREADY_EXISTS),
     }
 }
 

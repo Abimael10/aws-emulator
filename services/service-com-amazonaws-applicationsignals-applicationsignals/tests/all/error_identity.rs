@@ -7,9 +7,10 @@
 //! 1. An error about a service level objective that cannot be RESOLVED identifies it by its
 //!    ARN, and reports the resource's capitalised type name — never the bare name the
 //!    request happened to send and never the lower-case segment an ARN spells.
-//! 2. A create refused because the identifier it sent is taken states that generically: the
-//!    identifier at fault is the caller's own `Name`, so the conflict names no resource, no
-//!    name and no ARN.
+//! 2. A create refused because the name it sent is already stored identifies the SLO that
+//!    already exists by its ARN — the one identifier a `ConflictException`, which carries
+//!    only `Message`, can report — and that ARN is the stored record's, not one derived from
+//!    the duplicate request.
 //! 3. A constraint-violation message states the member path and the requirement it
 //!    violated, in AWS's `N validation error(s) detected: ` envelope, with no echo of the
 //!    rejected value and with a `@pattern` requirement rendered without the `^`/`$` anchors
@@ -29,9 +30,9 @@ use crate::slo_lifecycle::{
 // The work-item wording the update path answers, asserted over more inputs in the suite that
 // owns that rule.
 use crate::refusal_wording::assert_work_item_wording;
-// The sentence a create whose identifier is already taken is refused with, owned by the suite
+// The sentence a create whose name is already stored is refused with, owned by the suite
 // that holds this service's refusal prose and asserted here over this suite's rows too.
-use crate::refusal_prose::IDENTIFIER_TAKEN;
+use crate::refusal_prose::slo_already_exists;
 
 /// The `ResourceType` every SLO failure reports: the resource's type NAME, capitalised.
 const SLO_RESOURCE_TYPE: &str = "Slo";
@@ -153,19 +154,25 @@ async fn a_missing_slo_is_identified_by_its_arn_on_every_read_write_and_delete()
     }
 }
 
-/// Rule 2: a create under a name already stored is refused with the one generic sentence,
-/// which identifies nothing — not the SLO, not its name and not its ARN.
+/// Rule 2: a create under a name already stored identifies the SLO that already exists by the
+/// ARN the create that won returned, and that ARN resolves to the stored record.
 ///
 /// The rows differ along the name's form and along the rest of the repeated request, which
 /// the wording must not depend on: a different description, the other (mutually
 /// exclusive) SLI config, a goal and burn rates the stored record does not carry.
 #[tokio::test]
-async fn a_repeated_create_conflicts_without_identifying_anything() {
+async fn a_repeated_create_conflicts_and_identifies_the_stored_slo() {
+    // Name forms drawn from the modelled `ServiceLevelObjectiveName` pattern
+    // `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`, including its shortest spelling and
+    // one of its maximum length.
+    let longest = format!("a{}z", "b".repeat(126));
     for name in [
         "conflict-slo",
         "conflict.slo.dotted",
+        "conflict_slo_underscored",
         "conflict slo spaced",
         "7A",
+        longest.as_str(),
     ] {
         let router = router();
         let (status, created) = create(
@@ -202,18 +209,125 @@ async fn a_repeated_create_conflicts_without_identifying_anything() {
                 status, 409,
                 "case {name:?}/{index}: expected HTTP 409 for a repeated name, got {status} with {error}"
             );
+            assert_eq!(
+                error["__type"].as_str(),
+                Some("ConflictException"),
+                "case {name:?}/{index}: expected a ConflictException, got {error}"
+            );
+            let message = error["Message"].as_str().unwrap_or_default();
+            let expected = slo_already_exists(&stored_arn);
+            assert_eq!(
+                message, expected,
+                "case {name:?}/{index}: expected {expected:?}, got {message:?}"
+            );
+        }
+
+        // The ARN the refusal states addresses the record the store really holds: a Get by
+        // that ARN answers the SLO under this name, so the identifier a client extracts from
+        // the message resolves.
+        let (status, fetched) =
+            call(&router, "GET", &format!("/slo/{}", arn_path_segment(name)), None).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the ARN the conflict named to resolve, got {status} with \
+             {fetched}"
+        );
+        assert_eq!(
+            fetched["Slo"]["Arn"].as_str(),
+            Some(stored_arn.as_str()),
+            "case {name:?}: expected the stored record to carry the ARN the conflict named, got \
+             {:?}",
+            fetched["Slo"]["Arn"]
+        );
+    }
+}
+
+/// `POST /slo` with `body`, signed in `region`, so the ARN THIS request would mint carries
+/// `region` rather than the suite's default one.
+async fn create_signed_in(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    region: &str,
+    body: Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://application-signals.{region}.amazonaws.com/slo"
+        ))
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/application-signals/\
+                 aws4_request, SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("serialize the request body"),
+        ))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = response.into_body();
+    let parsed = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
+/// Rule 2, the other half: the ARN a conflict states is the STORED record's, never one
+/// derived from the request that was refused — a duplicate create signed in another region is
+/// refused with the ARN the winning create returned, which carries the region THAT create was
+/// signed in.
+///
+/// The rows differ along the region the duplicate create is signed in, including the region
+/// the stored record itself carries, and along the name's form.
+#[tokio::test]
+async fn a_conflict_states_the_stored_arn_not_one_derived_from_the_refused_request() {
+    for name in ["cross-region-slo", "cross.region slo", "4z"] {
+        let router = router();
+        let (status, created) = create(
+            &router,
+            json!({ "Name": name, "SliConfig": sli_config("checkout", "GET /cart", 100.0) }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the first create to succeed, got {status} with {created}"
+        );
+        let stored_arn = created["Slo"]["Arn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            stored_arn,
+            slo_arn(name),
+            "case {name:?}: expected the first create to mint the ARN of its own credential \
+             scope, got {stored_arn:?}"
+        );
+        let expected = slo_already_exists(&stored_arn);
+
+        for region in [REGION, "us-west-2", "ap-southeast-1"] {
+            let (status, error) = create_signed_in(
+                &router,
+                region,
+                json!({ "Name": name,
+                        "SliConfig": sli_config("checkout", "GET /cart", 100.0) }),
+            )
+            .await;
+            let label = format!("{name:?} / signed in {region:?}");
+            assert_eq!(
+                status, 409,
+                "case {label}: expected HTTP 409 for a name already stored, got {status} with \
+                 {error}"
+            );
             let message = error["Message"].as_str().unwrap_or_default();
             assert_eq!(
-                message, IDENTIFIER_TAKEN,
-                "case {name:?}/{index}: expected {IDENTIFIER_TAKEN:?}, got {message:?}"
+                message, expected,
+                "case {label}: expected {expected:?}, got {message:?}"
             );
-            for identifier in [name, stored_arn.as_str(), SLO_RESOURCE_TYPE] {
-                assert!(
-                    !message.contains(identifier),
-                    "case {name:?}/{index}: the conflict must identify nothing, but it states \
-                     {identifier:?}: {message:?}"
-                );
-            }
         }
     }
 }

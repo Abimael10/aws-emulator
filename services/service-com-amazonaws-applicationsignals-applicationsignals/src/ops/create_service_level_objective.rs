@@ -263,12 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx.parts());
         let mut store = state.lock();
 
-        // A second create under a name already stored is a conflict on the IDENTIFIER the
-        // request sent, which is what its refusal states: the stored record is read only to
-        // learn that there is one.
-        if store.slos.contains_key(input.name.as_str()) {
+        // A second create under a name already stored is a conflict on the stored RESOURCE,
+        // which the refusal identifies by the ARN that addresses it — read off the record the
+        // store already holds, so it is the identifier the create that won returned rather
+        // than one re-minted from this request.
+        if let Some(stored) = store.slos.get(input.name.as_str()) {
             return Err(CreateServiceLevelObjectiveErrorModeled::ConflictException(
-                crate::state::slo_already_exists(),
+                crate::state::slo_already_exists(&stored.arn),
             )
             .into());
         }

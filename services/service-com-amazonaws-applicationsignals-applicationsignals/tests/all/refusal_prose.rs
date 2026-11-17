@@ -9,8 +9,8 @@
 //!   must be populated, and nothing of the rest of the request;
 //! * an update that would change a stored SLO's evaluation kind states the DIRECTION it
 //!   attempted, read off the stored record's kind and the kind of the supplied config;
-//! * a create whose identifier is already taken states that generically, naming neither the
-//!   resource, its name nor its ARN — the identifier at fault is the one the caller sent;
+//! * a create whose name is already stored states the SLO that already exists, by the ARN of
+//!   the record the store holds under that name;
 //! * the TAGGING plane, which addresses every kind of resource by `ResourceArn` alone, names
 //!   the resource generically and echoes the ARN the request carried, whichever kind that ARN
 //!   addresses;
@@ -43,9 +43,12 @@ use crate::tag_attachment::tag_resource;
 pub(crate) const MISSING_SLI_CONFIG: &str =
     "Either SliConfig or RequestBasedSliConfig must be populated";
 
-/// The sentence a create whose `Name` is already stored is refused with: generic, with no
-/// trailing period and naming no identifier.
-pub(crate) const IDENTIFIER_TAKEN: &str = "A resource with the same identifier already exists";
+/// The sentence a create whose `Name` is already stored is refused with: AWS's fixed text
+/// "Slo with arn '" … "' already exists." around the ARN of the SLO that already exists,
+/// which is its only variable part.
+pub(crate) fn slo_already_exists(stored_arn: &str) -> String {
+    format!("Slo with arn '{stored_arn}' already exists.")
+}
 
 /// The sentence a batch delete's per-item failure states for an ARN that names no stored
 /// configuration. One sentence for both ways a configuration goes, which this path does not
@@ -330,14 +333,14 @@ async fn an_update_that_switches_the_evaluation_kind_states_the_direction() {
     }
 }
 
-/// A create under a `Name` already stored is refused 409 `ConflictException` with the one
-/// generic sentence, which identifies nothing.
+/// A create under a `Name` already stored is refused 409 `ConflictException` whose sentence
+/// names the existing SLO by the ARN the create that won returned.
 ///
 /// The rows differ along the name's form — the character classes the modelled
 /// `ServiceLevelObjectiveName` pattern `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$` admits
 /// — including the shortest name it admits and one of its maximum length.
 #[tokio::test]
-async fn a_create_whose_identifier_is_taken_identifies_nothing() {
+async fn a_create_whose_identifier_is_taken_names_the_existing_slo() {
     let longest = format!("a{}z", "b".repeat(126));
     let names = vec![
         "taken-slo".to_string(),
@@ -387,17 +390,11 @@ async fn a_create_whose_identifier_is_taken_identifies_nothing() {
                 "case {label}: expected a ConflictException, got {answer}"
             );
             let message = answer["Message"].as_str().unwrap_or_default();
+            let expected = slo_already_exists(&stored_arn);
             assert_eq!(
-                message, IDENTIFIER_TAKEN,
-                "case {label}: expected {IDENTIFIER_TAKEN:?}, got {message:?}"
+                message, expected,
+                "case {label}: expected {expected:?}, got {message:?}"
             );
-            for identifier in [name.as_str(), stored_arn.as_str(), "arn:"] {
-                assert!(
-                    !message.contains(identifier),
-                    "case {label}: the conflict must identify nothing, but it states \
-                     {identifier:?}: {message:?}"
-                );
-            }
         }
     }
 
