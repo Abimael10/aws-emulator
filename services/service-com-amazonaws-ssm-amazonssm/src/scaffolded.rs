@@ -308,6 +308,99 @@ impl SerializableStruct for InvocationDoesNotExistMessage {
     }
 }
 
+/// The lowercase `message` member of the synthetic resource-policy error shapes below.
+///
+/// A member's own name is what the JSON protocols write, so this renders as `message`;
+/// `with_xml_name("Message")` keeps the XML envelopes' casing the way the shapes above do.
+macro_rules! lowercase_message_member {
+    ($shape:literal) => {
+        Schema::new_member(
+            ShapeId::from_static(
+                concat!("smithy.framework#", $shape, "$message"),
+                "smithy.framework",
+                "message",
+            ),
+            ShapeType::String,
+            "message",
+            0,
+        )
+        .with_xml_name("Message")
+    };
+}
+
+/// See [`RESOURCE_POLICY_NOT_FOUND_SCHEMA`].
+static RESOURCE_POLICY_NOT_FOUND_MESSAGE: Schema =
+    lowercase_message_member!("ResourcePolicyNotFoundException");
+
+/// Schema for the synthetic `ResourcePolicyNotFoundException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: this is
+/// not the shape of that name in any service's model. The modelled one carries a `Message`
+/// member, but the resource-policy plane of this service words this refusal in a lowercase
+/// `message`, so a client reading it finds the text where the service puts it. The wire
+/// `__type` still comes from [`OperationError::shape_name`] below, which answers the
+/// modelled name.
+pub static RESOURCE_POLICY_NOT_FOUND_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ResourcePolicyNotFoundException",
+        "smithy.framework",
+        "ResourcePolicyNotFoundException",
+    ),
+    ShapeType::Structure,
+    &[&RESOURCE_POLICY_NOT_FOUND_MESSAGE],
+);
+
+/// See [`MALFORMED_RESOURCE_POLICY_DOCUMENT_SCHEMA`].
+static MALFORMED_RESOURCE_POLICY_DOCUMENT_MESSAGE: Schema =
+    lowercase_message_member!("MalformedResourcePolicyDocumentException");
+
+/// Schema for the synthetic `MalformedResourcePolicyDocumentException` error shape — the
+/// same case as [`RESOURCE_POLICY_NOT_FOUND_SCHEMA`], for the other refusal that plane
+/// words in a lowercase `message`.
+pub static MALFORMED_RESOURCE_POLICY_DOCUMENT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#MalformedResourcePolicyDocumentException",
+        "smithy.framework",
+        "MalformedResourcePolicyDocumentException",
+    ),
+    ShapeType::Structure,
+    &[&MALFORMED_RESOURCE_POLICY_DOCUMENT_MESSAGE],
+);
+
+/// The payload of a refusal this service's resource-policy plane words in a lowercase
+/// `message`: the modelled error code it answers with, the synthetic shape carrying that
+/// member, and the diagnostic itself.
+///
+/// One payload for both such refusals rather than a copy each: they differ only in the
+/// error code and the shape id, and nothing else about rendering them.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicyRefusal {
+    /// The wire error code: the MODELLED error's own name, which is the class a client
+    /// matches on.
+    code: &'static str,
+    /// The synthetic shape whose one member carries [`Self::message`].
+    shape: &'static Schema,
+    /// That member.
+    member: &'static Schema,
+    /// Why the call was refused.
+    pub message: String,
+}
+
+impl std::fmt::Display for ResourcePolicyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ResourcePolicyRefusal {}
+
+impl SerializableStruct for ResourcePolicyRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(self.member, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -342,6 +435,14 @@ pub enum Scaffolded<E> {
     /// Command words this refusal. Answer it only where the operation models
     /// `InvocationDoesNotExist`.
     InvocationDoesNotExist(InvocationDoesNotExistMessage),
+    /// A refusal of this service's resource-policy plane, rendered as HTTP 400 with the
+    /// modelled error code it carries and the diagnostic in a lowercase `message`.
+    ///
+    /// The modelled shapes declare `Message`, and that plane words these two refusals in
+    /// `message`, which a handler cannot reach through the modelled shape. Answer one only
+    /// where the operation models the error code it carries ([`Scaffolded::resource_policy_not_found`],
+    /// [`Scaffolded::malformed_resource_policy_document`]).
+    ResourcePolicyRefusal(ResourcePolicyRefusal),
 }
 
 impl<E> Scaffolded<E> {
@@ -387,6 +488,34 @@ impl<E> Scaffolded<E> {
     pub fn invocation_does_not_exist(message: impl Into<String>) -> Self {
         Self::InvocationDoesNotExist(InvocationDoesNotExistMessage::new(message))
     }
+
+    /// Refuse a call that names no stored resource policy, with HTTP 400
+    /// `ResourcePolicyNotFoundException` carrying `message` in a lowercase `message`
+    /// member.
+    ///
+    /// Reach for this only where the operation's own model declares
+    /// `ResourcePolicyNotFoundException`: the error code is that modelled refusal's, and
+    /// only the member its text travels in is synthetic.
+    pub fn resource_policy_not_found(message: impl Into<String>) -> Self {
+        Self::ResourcePolicyRefusal(ResourcePolicyRefusal {
+            code: "ResourcePolicyNotFoundException",
+            shape: &RESOURCE_POLICY_NOT_FOUND_SCHEMA,
+            member: &RESOURCE_POLICY_NOT_FOUND_MESSAGE,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse a policy document that cannot be read, with HTTP 400
+    /// `MalformedResourcePolicyDocumentException` carrying `message` in a lowercase
+    /// `message` member. Same scope as [`Self::resource_policy_not_found`].
+    pub fn malformed_resource_policy_document(message: impl Into<String>) -> Self {
+        Self::ResourcePolicyRefusal(ResourcePolicyRefusal {
+            code: "MalformedResourcePolicyDocumentException",
+            shape: &MALFORMED_RESOURCE_POLICY_DOCUMENT_SCHEMA,
+            member: &MALFORMED_RESOURCE_POLICY_DOCUMENT_MESSAGE,
+            message: message.into(),
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -397,6 +526,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidFilterKey(e) => write!(f, "{e}"),
             Self::InvocationDoesNotExist(e) => write!(f, "{e}"),
+            Self::ResourcePolicyRefusal(e) => write!(f, "{e}"),
         }
     }
 }
@@ -411,6 +541,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::ValidationException(e) => e.source(),
             Self::InvalidFilterKey(e) => e.source(),
             Self::InvocationDoesNotExist(e) => e.source(),
+            Self::ResourcePolicyRefusal(e) => e.source(),
         }
     }
 }
@@ -427,6 +558,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(e) => e,
             Self::InvalidFilterKey(e) => e,
             Self::InvocationDoesNotExist(e) => e,
+            Self::ResourcePolicyRefusal(e) => e,
         }
     }
 
@@ -437,6 +569,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidFilterKey(_) => &INVALID_FILTER_KEY_SCHEMA,
             Self::InvocationDoesNotExist(_) => &INVOCATION_DOES_NOT_EXIST_SCHEMA,
+            Self::ResourcePolicyRefusal(e) => e.shape,
         }
     }
 
@@ -451,6 +584,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidFilterKey(_) => "InvalidFilterKey",
             Self::InvocationDoesNotExist(_) => "InvocationDoesNotExist",
+            Self::ResourcePolicyRefusal(e) => e.code,
         }
     }
 
@@ -464,7 +598,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_)
             | Self::InvalidFilterKey(_)
-            | Self::InvocationDoesNotExist(_) => 400,
+            | Self::InvocationDoesNotExist(_)
+            | Self::ResourcePolicyRefusal(_) => 400,
         }
     }
 
@@ -478,7 +613,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shapes carry no `awsQueryError` trait.
             Self::ValidationException(_)
             | Self::InvalidFilterKey(_)
-            | Self::InvocationDoesNotExist(_) => None,
+            | Self::InvocationDoesNotExist(_)
+            | Self::ResourcePolicyRefusal(_) => None,
         }
     }
 }

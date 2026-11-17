@@ -9,7 +9,9 @@
 //! out of the one store that write lands in
 //! ([`crate::state::resource_policies::ResourcePolicyStore`]) and reported with the
 //! `PolicyId` and `PolicyHash` an update or a delete addresses each of them by. A resource
-//! whose policy was deleted — or that never had one — is reported as holding none.
+//! whose policy was deleted — or that never had one — is reported as holding none, while an
+//! ARN naming no resource this account holds is refused `ResourceNotFoundException`: "no
+//! policy attached" and "no such resource" are two different answers.
 //!
 //! This is a REPORT: it writes nothing of its own. The walk is in attachment order and
 //! resumes at the policy the previous page stopped at, so a token this operation did not
@@ -129,6 +131,18 @@ fn invalid_parameter(members: &[&str], message: &str) -> GetResourcePoliciesErro
     .into()
 }
 
+/// The modelled refusal for an ARN that resolves to no resource this endpoint holds,
+/// worded for the kind of resource the ARN names and naming that ARN.
+fn not_found(
+    kind: policies::PolicyResourceKind,
+    resource_arn: &str,
+) -> GetResourcePoliciesError {
+    GetResourcePoliciesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(policies::resource_not_found_message(kind, resource_arn)),
+    })
+    .into()
+}
+
 /// The `GetResourcePolicies` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,12 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         if !resource.is_local(&region) {
-            return Err(GetResourcePoliciesErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(policies::RESOURCE_NOT_FOUND.to_string()),
-                },
-            )
-            .into());
+            return Err(not_found(resource.kind, &input.resource_arn));
         }
 
         // "The maximum number of items to return for this call", at most the modelled
@@ -208,6 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock-owed change can fall due on one.
         let held_under = resource.key(&region);
         let store = state.lock();
+
+        // The policies a resource holds are reported only for a resource that EXISTS: this
+        // read resolves the ARN against the store that owns the resource it names, the
+        // same way the write does ([`policies::resolve_holder`]), so "no policy attached"
+        // and "no such resource" are the two different answers they are.
+        if policies::resolve_holder(&store, &region, &resource).is_none() {
+            return Err(not_found(resource.kind, &input.resource_arn));
+        }
+
         let attached = store.resource_policies.policies(&held_under);
 
         // "A token to start the list": the id of the policy the previous page stopped at.

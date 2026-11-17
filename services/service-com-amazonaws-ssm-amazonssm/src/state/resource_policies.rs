@@ -28,10 +28,15 @@
 //!   changed in any way hashes to a different one, and a caller holding an obsolete hash
 //!   is refused.
 //!
-//! The document is stored in the one layout an attached policy is reported in
-//! (`service_common::iam_policy::canonical_document`, applied by the handlers), so a read
-//! reports what the write persisted rather than the caller's own bytes, and the hash a
-//! write answered is the hash a later read reports.
+//! The document is stored the one way a policy STORE renders an IAM policy document
+//! (`service_common::iam_policy_rendering`, applied by the handler that writes it): the
+//! whitespace between its JSON tokens is gone, an element the policy language types as
+//! "String or Array of strings" is written as that string where the caller submitted a
+//! one-element array of one string, and an account principal named by its account id alone
+//! is written as that account's root ARN. Everything else is the caller's own — member
+//! order, the statement array, every other value's type and spelling, every byte inside a
+//! string literal — and the rendering is a fixed point, so a caller that puts back the
+//! document it read stores the same bytes and reads the same hash ([`policy_hash`]).
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,17 +95,31 @@ pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
 pub const INVALID_PARAMETER: &str = "One or more parameters specified for the call aren't \
      valid. Verify the parameters and their values and try again.";
 
-/// What `MalformedResourcePolicyDocumentException` says of a document that is not a
-/// resource policy: "the specified policy document is malformed or invalid".
-pub const MALFORMED_POLICY_DOCUMENT: &str = "The specified policy document is malformed or invalid.";
+/// What `MalformedResourcePolicyDocumentException` says of a text that is not a readable
+/// policy document: the resource-policy plane reports that the document could not be
+/// parsed, and names nothing from the request.
+pub const MALFORMED_POLICY_DOCUMENT: &str = "Policy is malformed and cannot be parsed";
 
 /// What `ResourcePolicyConflictException` says: "the hash provided in the call doesn't
 /// match the stored hash".
 pub const POLICY_HASH_MISMATCH: &str = "The hash provided in the call doesn't match the stored hash.";
 
-/// What `ResourcePolicyNotFoundException` says: "no policies with the specified policy ID
-/// and hash could be found".
-pub const POLICY_NOT_FOUND: &str = "No policies with the specified policy ID and hash could be found.";
+/// What `ResourcePolicyNotFoundException` says of a `PolicyId`/`PolicyHash` pair that
+/// addresses no policy on the resource: the pair IS the address, so the sentence names all
+/// three values the call used to look one up, each taken from the request.
+#[must_use]
+pub fn policy_not_found_message(resource_arn: &str, policy_id: &str, policy_hash: &str) -> String {
+    format!(
+        "Resource policy for resource {resource_arn} with policy ID {policy_id} and policy \
+         hash {policy_hash} does not exist"
+    )
+}
+
+/// What a `PutResourcePolicy` on a parameter that is not advanced is refused with: "to
+/// share a parameter, it must be in the advanced parameter tier"
+/// (`smithy_query(query="doc",shape="PutResourcePolicy")`), worded as the resource-policy
+/// plane words it — fixed text naming nothing from the request.
+pub const ONLY_ADVANCED_PARAMETERS_SHAREABLE: &str = "Only advanced parameters can be shared";
 
 /// What `ResourcePolicyLimitExceededException` says of a resource already holding the one
 /// policy an OpsItemGroup may have: "only one policy can be attached to `OpsItemGroup`".
@@ -122,10 +141,22 @@ pub fn too_many_policies() -> String {
     format!("This emulator holds at most {MAX_RESOURCE_POLICIES} resource policies at once.")
 }
 
-/// What `ResourceNotFoundException` says of an ARN naming a resource this account does not
-/// hold, which is the sentence the modelled error itself carries: "the specified parameter
-/// to be shared could not be found".
-pub const RESOURCE_NOT_FOUND: &str = "The specified parameter to be shared could not be found.";
+/// What `ResourceNotFoundException` says of an ARN that resolves to no resource this
+/// account holds at this endpoint, worded for the KIND of resource the ARN names.
+///
+/// A parameter is refused by Parameter Store's own not-found sentence, which names the ARN
+/// the request carried; every other resource a policy can be attached to is refused by the
+/// resource-policy plane's own sentence, which says the same thing of a resource of any
+/// type. Only the ARN varies, and it is echoed from the request's `ResourceArn`.
+#[must_use]
+pub fn resource_not_found_message(kind: PolicyResourceKind, resource_arn: &str) -> String {
+    match kind {
+        PolicyResourceKind::Parameter => format!("Parameter {resource_arn} not found"),
+        PolicyResourceKind::Document | PolicyResourceKind::OpsItemGroup => format!(
+            "Resource with ARN {resource_arn} does not exist or you are not the owner."
+        ),
+    }
+}
 
 /// Which kind of Systems Manager resource a resource-policy request addresses.
 ///
@@ -244,6 +275,71 @@ pub fn parse_policy_resource(resource_arn: &str) -> Option<PolicyResource<'_>> {
     })
 }
 
+/// The key a policy names an ACCOUNT principal under — the `AWS` type of a
+/// `Principal`/`NotPrincipal` map, as opposed to the `Service`, `Federated` and
+/// `CanonicalUser` types, whose values name no account and are reported as they were
+/// submitted.
+pub const ACCOUNT_PRINCIPAL: &str = "AWS";
+
+/// The resource a resource-policy call found at the ARN it was given.
+///
+/// A policy is attached to a resource that EXISTS, so every one of the three operations
+/// resolves its `ResourceArn` against the store that OWNS that resource before it reads or
+/// writes the policy store — a parameter against the parameter store, a document against
+/// the document store. An `OpsItemGroup` is the account's own OpsCenter grouping rather
+/// than a resource anything creates, so there is nothing to look up for one: the model
+/// publishes no grammar for it and no operation of this service creates one, so an id is
+/// taken as naming the group it spells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyHolder {
+    /// The account's OpsCenter operational-work-item group of that id.
+    OpsItemGroup,
+    /// The parameter the ARN names, in the `ParameterTier` it is served in.
+    Parameter {
+        /// A `ParameterTier` value, as [`super::resolve_tier`] resolved it.
+        tier: String,
+    },
+    /// The document the ARN names.
+    Document,
+}
+
+impl PolicyHolder {
+    /// Whether a resource policy may be attached to this resource at all.
+    ///
+    /// Only a parameter is gated: "to share a parameter, it must be in the advanced
+    /// parameter tier" (`smithy_query(query="doc",shape="PutResourcePolicy")`), so a
+    /// parameter in any other tier cannot carry one, and what a write is refused with says
+    /// so ([`ONLY_ADVANCED_PARAMETERS_SHAREABLE`]).
+    #[must_use]
+    pub fn may_hold_a_policy(&self) -> bool {
+        match self {
+            Self::Parameter { tier } => tier == super::TIER_ADVANCED,
+            Self::OpsItemGroup | Self::Document => true,
+        }
+    }
+}
+
+/// The resource `resource` names at `region`'s endpoint, or `None` when this account holds
+/// none of that name — which is what each operation's `ResourceNotFoundException` reports
+/// ([`resource_not_found_message`]).
+#[must_use]
+pub fn resolve_holder(
+    store: &super::ComAmazonawsSsmAmazonssmState,
+    region: &str,
+    resource: &PolicyResource<'_>,
+) -> Option<PolicyHolder> {
+    match resource.kind {
+        PolicyResourceKind::OpsItemGroup => Some(PolicyHolder::OpsItemGroup),
+        PolicyResourceKind::Parameter => {
+            let tier = store.parameter(region, resource.name)?.latest()?.tier.clone();
+            Some(PolicyHolder::Parameter { tier })
+        }
+        PolicyResourceKind::Document => store
+            .resolve_document(region, resource.name)
+            .map(|_| PolicyHolder::Document),
+    }
+}
+
 /// The `PolicyHash` of a policy document: the digest of the document as it is stored,
 /// rendered lowercase hexadecimal.
 ///
@@ -263,7 +359,8 @@ pub struct ResourcePolicyRecord {
     /// `PolicyId`: minted when the policy is attached, and the value an update or a
     /// delete addresses this policy by.
     pub policy_id: String,
-    /// The policy document, in the layout it is reported in.
+    /// The policy document as it is reported: the submitted text in the store's own
+    /// rendering of it (see this module's docs).
     pub policy: String,
     /// `PolicyHash`: [`policy_hash`] of [`Self::policy`].
     pub policy_hash: String,

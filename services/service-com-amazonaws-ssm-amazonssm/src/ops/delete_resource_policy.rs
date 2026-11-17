@@ -151,6 +151,18 @@ fn invalid_parameter(members: &[&str]) -> DeleteResourcePolicyError {
     .into()
 }
 
+/// The modelled refusal for an ARN that resolves to no resource this endpoint holds,
+/// worded for the kind of resource the ARN names and naming that ARN.
+fn not_found(
+    kind: policies::PolicyResourceKind,
+    resource_arn: &str,
+) -> DeleteResourcePolicyError {
+    DeleteResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(policies::resource_not_found_message(kind, resource_arn)),
+    })
+    .into()
+}
+
 /// The `DeleteResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -201,14 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         if !resource.is_local(&region) {
-            return Err(
-                DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(policies::RESOURCE_NOT_FOUND.to_string()),
-                    },
-                )
-                .into(),
-            );
+            return Err(not_found(resource.kind, &input.resource_arn));
         }
 
         // A resource's policies are held under the Region whose endpoint the request
@@ -218,11 +223,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held_under = resource.key(&region);
         let mut store = state.lock();
 
+        // The resource is resolved FIRST, against the store that owns it
+        // ([`policies::resolve_holder`]): an ARN naming a parameter or a document this
+        // account does not hold names no resource to detach a policy from, which is a
+        // different answer — and a different class — from a resource that holds no policy
+        // of that id and hash.
+        if policies::resolve_holder(&store, &region, &resource).is_none() {
+            return Err(not_found(resource.kind, &input.resource_arn));
+        }
+
         // The policy this call removes is the one BOTH its id and its hash name on that
         // resource — looked up and removed in one step, so an unknown id and an obsolete
-        // hash are the same answer: "no policies with the specified policy ID and hash
-        // could be found" is one refusal over the pair, and neither names a policy nor
-        // removes one.
+        // hash are the same answer: the pair is ONE address, and a pair naming no policy
+        // is refused as one, naming all three values it looked up by and removing nothing.
         //
         // `DeletionMode` "applies only to the Document resource type" and chooses what
         // becomes of that document's SHARING, which this service holds nothing of yet
@@ -235,14 +248,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.policy_hash,
         );
         if !removed {
-            return Err(
-                DeleteResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
-                    ResourcePolicyNotFoundException {
-                        message: Some(policies::POLICY_NOT_FOUND.to_string()),
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::resource_policy_not_found(
+                policies::policy_not_found_message(
+                    &input.resource_arn,
+                    &input.policy_id,
+                    &input.policy_hash,
+                ),
+            ));
         }
 
         Ok(DeleteResourcePolicyOutput {})

@@ -23,6 +23,12 @@
 //! and an OpsItemGroup holds at most
 //! [`crate::state::resource_policies::MAX_OPS_ITEM_GROUP_POLICIES`] policy.
 //!
+//! A policy is attached to a resource that EXISTS, and a parameter only "to share a
+//! parameter, it must be in the advanced parameter tier": the ARN is resolved against the
+//! store that owns the resource it names before anything is written
+//! ([`crate::state::resource_policies::resolve_holder`]), and a parameter in any other tier
+//! is refused rather than shared.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,22 +192,23 @@ fn invalid_parameter(members: &[&str]) -> PutResourcePolicyError {
 
 /// The modelled refusal for an ARN naming a resource this endpoint holds none of — one of
 /// another account or Region, or one whose parameter or document this account never
-/// created.
-fn not_found() -> PutResourcePolicyError {
+/// created — worded for the kind of resource the ARN names and naming that ARN.
+fn not_found(kind: policies::PolicyResourceKind, resource_arn: &str) -> PutResourcePolicyError {
     PutResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(policies::RESOURCE_NOT_FOUND.to_string()),
+        message: Some(policies::resource_not_found_message(kind, resource_arn)),
     })
     .into()
 }
 
 /// The modelled refusal for a `Policy` that is not a resource-policy document.
+///
+/// Worded through the error channel rather than the modelled shape: this plane carries the
+/// diagnostic of this refusal in a lowercase `message`
+/// ([`crate::scaffolded::Scaffolded::malformed_resource_policy_document`]).
 fn malformed_document() -> PutResourcePolicyError {
-    PutResourcePolicyErrorModeled::MalformedResourcePolicyDocumentException(
-        MalformedResourcePolicyDocumentException {
-            message: Some(policies::MALFORMED_POLICY_DOCUMENT.to_string()),
-        },
+    crate::scaffolded::Scaffolded::malformed_resource_policy_document(
+        policies::MALFORMED_POLICY_DOCUMENT,
     )
-    .into()
 }
 
 /// The modelled refusal for a `PolicyHash` that is not the stored policy's.
@@ -212,12 +219,19 @@ fn hash_mismatch() -> PutResourcePolicyError {
     .into()
 }
 
-/// The modelled refusal for a `PolicyId` the resource holds no policy under.
-fn policy_not_found() -> PutResourcePolicyError {
-    PutResourcePolicyErrorModeled::ResourcePolicyNotFoundException(ResourcePolicyNotFoundException {
-        message: Some(policies::POLICY_NOT_FOUND.to_string()),
-    })
-    .into()
+/// The modelled refusal for a `PolicyId` the resource holds no policy under, naming the
+/// address the call looked one up by. Worded through the error channel for the same reason
+/// as [`malformed_document`].
+fn policy_not_found(
+    resource_arn: &str,
+    policy_id: &str,
+    policy_hash: &str,
+) -> PutResourcePolicyError {
+    crate::scaffolded::Scaffolded::resource_policy_not_found(policies::policy_not_found_message(
+        resource_arn,
+        policy_id,
+        policy_hash,
+    ))
 }
 
 /// The modelled refusal for a request that would exceed one of the two documented
@@ -289,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reachable here, as every other name-taking operation of this service reads one.
         let region = crate::state::request_region(ctx.parts());
         if !resource.is_local(&region) {
-            return Err(not_found());
+            return Err(not_found(resource.kind, &input.resource_arn));
         }
 
         // The size limit is measured over the document as it was submitted, and applied
@@ -310,33 +324,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(malformed_document());
         }
 
-        // Stored in the one layout an attached policy is reported in, so two callers who
-        // submit the same policy written differently read the same text — and the same
-        // hash — back.
-        let stored = ::service_common::iam_policy::canonical_document(&input.policy);
+        // Stored the one way a policy STORE renders the IAM policy document it was handed
+        // ([`::service_common::iam_policy_rendering::rendered_rewriting`]): the whitespace
+        // between the document's JSON tokens is gone, an element the policy language types
+        // as "String or Array of strings" is written as the string it names where the
+        // caller submitted a one-element array of one string, and an ACCOUNT principal
+        // named by its account id alone is written as that account's root ARN — the other
+        // spelling of the very same principal. Everything else is the caller's own: member
+        // order, the statement array, every other value's type and spelling, and every byte
+        // inside a string literal. The rendering is a fixed point, so a caller that puts
+        // back the document it read stores the same bytes and reads the same hash.
+        let stored = ::service_common::iam_policy_rendering::rendered_rewriting(
+            &input.policy,
+            &::service_common::iam_policy_rendering::ElementValues {
+                element: policies::ACCOUNT_PRINCIPAL,
+                written_as: &::service_common::iam_policy_principals::account_root_principal,
+            },
+        );
 
         let held_under = resource.key(&region);
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
         // A policy is attached to a resource that EXISTS: an ARN naming a parameter or a
-        // document this account does not hold names nothing to share. An OpsItemGroup is
-        // the account's own OpsCenter grouping rather than a resource anything creates, so
-        // there is nothing to look up for one — and nothing to hold its id to either: the
-        // model publishes no grammar for it and no operation of this service creates one,
-        // so an id is taken as naming the group it spells rather than refused, and the one
-        // policy a group may hold is enforced per group below.
-        let resource_exists = match resource.kind {
-            policies::PolicyResourceKind::Parameter => {
-                store.parameter(&region, resource.name).is_some()
-            }
-            policies::PolicyResourceKind::Document => {
-                store.resolve_document(&region, resource.name).is_some()
-            }
-            policies::PolicyResourceKind::OpsItemGroup => true,
+        // document this account does not hold names nothing to share, which is the target
+        // store's answer rather than the policy store's
+        // ([`policies::resolve_holder`]). The one policy an OpsItemGroup may hold is
+        // enforced per group below.
+        let Some(holder) = policies::resolve_holder(&store, &region, &resource) else {
+            return Err(not_found(resource.kind, &input.resource_arn));
         };
-        if !resource_exists {
-            return Err(not_found());
+
+        // "To share a parameter, it must be in the advanced parameter tier": a parameter
+        // served in any other tier cannot carry a resource policy at all, so the write is
+        // refused before anything is stored.
+        if !holder.may_hold_a_policy() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                policies::ONLY_ADVANCED_PARAMETERS_SHAREABLE,
+            ));
         }
 
         // An absent member and an empty one name the same thing here: neither names a
@@ -353,7 +378,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .policy(&held_under, policy_id)
                     .map(|held| held.policy_hash.clone());
                 let Some(attached) = attached else {
-                    return Err(policy_not_found());
+                    return Err(policy_not_found(
+                        &input.resource_arn,
+                        policy_id,
+                        policy_hash,
+                    ));
                 };
                 if attached != policy_hash {
                     return Err(hash_mismatch());
@@ -363,7 +392,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .replace(&held_under, policy_id, stored)
                 {
                     Some(written) => written,
-                    None => return Err(policy_not_found()),
+                    None => {
+                        return Err(policy_not_found(
+                            &input.resource_arn,
+                            policy_id,
+                            policy_hash,
+                        ))
+                    }
                 }
             }
             // Neither named: a new policy, under an id this call mints.

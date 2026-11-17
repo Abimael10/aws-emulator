@@ -6,10 +6,21 @@
 //! The rules under test:
 //!
 //! * **a policy is attached to the resource its `ResourceArn` names, under a `PolicyId`
-//!   the service mints, and a read of that resource reports the document that was
-//!   persisted with the `PolicyHash` the write answered;**
-//! * **the hash is the document's own digest, so the same document always hashes to the
-//!   same value and a document changed in any way hashes to a different one;**
+//!   the service mints, and a read of that resource reports the policy store's own
+//!   rendering of the document that was put — the whitespace between its JSON tokens gone,
+//!   a one-element "String or Array of strings" element written as that string, an account
+//!   principal named by its id written as that account's root ARN, and every other byte the
+//!   caller's — with the `PolicyHash` the write answered;**
+//! * **that rendering is a fixed point, and the hash is its digest, so one grant written
+//!   two ways reads back as one text under one hash and a document changed in any other way
+//!   hashes to a different one;**
+//! * **every one of the three operations resolves its `ResourceArn` against the store that
+//!   OWNS the resource it names before it touches the policy store, so an ARN naming no
+//!   such resource is refused `ResourceNotFoundException` — worded for the kind of resource
+//!   the ARN names and naming that ARN — rather than read as a resource holding no
+//!   policy;**
+//! * **only an advanced-tier parameter can carry a resource policy, so a put against a
+//!   parameter in any other tier is refused `ValidationException`;**
 //! * **a rewrite proceeds only against the policy version the caller last read: it takes
 //!   both the `PolicyId` and the stored `PolicyHash`, an obsolete hash is refused
 //!   `ResourcePolicyConflictException`, an unknown id `ResourcePolicyNotFoundException`
@@ -33,9 +44,9 @@
 //! created through its own operation.
 //!
 //! The tables' rows differ along what the rules generalise over: which kind of resource
-//! holds the policy, the shape and spelling of the document, which of the id/hash pair a
-//! call carries, how many policies a resource holds and how a document fails to be a
-//! policy.
+//! holds the policy, the tier a parameter is served in, the shape and spelling of the
+//! document, which of the id/hash pair a call carries, how many policies a resource holds
+//! and how a document fails to be a policy.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -49,6 +60,45 @@ const MAX_POLICY_SIZE: usize = 1024;
 /// How many policies one OpsItemGroup holds: "only one policy can be attached to
 /// `OpsItemGroup`" (the same error).
 const MAX_OPS_ITEM_GROUP_POLICIES: usize = 1;
+
+/// The `ParameterTier` values the model's enum declares
+/// (`smithy_query(query="shape",shape="ParameterTier")`: Standard, Advanced,
+/// Intelligent-Tiering).
+const TIER_STANDARD: &str = "Standard";
+
+/// See [`TIER_STANDARD`]. The one tier a parameter carrying a resource policy may be in.
+const TIER_ADVANCED: &str = "Advanced";
+
+/// See [`TIER_STANDARD`].
+const TIER_INTELLIGENT_TIERING: &str = "Intelligent-Tiering";
+
+/// What a put against a parameter that is not advanced is refused with: "to share a
+/// parameter, it must be in the advanced parameter tier"
+/// (`smithy_query(query="doc",shape="PutResourcePolicy")`). Fixed text, no variable part.
+const ONLY_ADVANCED_MESSAGE: &str = "Only advanced parameters can be shared";
+
+/// What a `Policy` that cannot be read is refused with. Fixed text, no variable part.
+const MALFORMED_POLICY_MESSAGE: &str = "Policy is malformed and cannot be parsed";
+
+/// What an ARN naming a parameter this account does not hold is refused with: the ARN is
+/// the request's own.
+fn parameter_not_found_message(resource_arn: &str) -> String {
+    format!("Parameter {resource_arn} not found")
+}
+
+/// What an ARN naming any other resource this account does not hold is refused with.
+fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource with ARN {resource_arn} does not exist or you are not the owner.")
+}
+
+/// What a `PolicyId`/`PolicyHash` pair addressing no stored policy is refused with: the
+/// pair is the address, so all three values the lookup used are named.
+fn policy_not_found_message(resource_arn: &str, policy_id: &str, policy_hash: &str) -> String {
+    format!(
+        "Resource policy for resource {resource_arn} with policy ID {policy_id} and policy \
+         hash {policy_hash} does not exist"
+    )
+}
 
 // The store also refuses a create past `state::resource_policies::MAX_RESOURCE_POLICIES`,
 // a ceiling on how many policy records one emulator process holds. No AWS condition
@@ -179,29 +229,35 @@ fn is_policy_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Whether two policy documents say the same thing, whatever layout each is written in —
-/// which is what a client that re-reads what it wrote compares.
-fn same_document(left: &str, right: &str) -> bool {
-    let parse = |text: &str| serde_json::from_str::<Value>(text).ok();
-    parse(left).is_some() && parse(left) == parse(right)
-}
-
 /// The `Policy` text of one reported entry.
 fn policy_text(entry: &Value) -> String {
     entry["Policy"].as_str().unwrap_or_default().to_string()
 }
 
-/// Create the parameter `name` through Parameter Store's own operation.
+/// Create the parameter `name` in the advanced tier, which is the tier a parameter must be
+/// in to carry a resource policy ("to share a parameter, it must be in the advanced
+/// parameter tier").
 async fn create_parameter(router: &MultiServiceRouter, case: &str, name: &str) {
+    create_parameter_in_tier(router, case, name, TIER_ADVANCED).await;
+}
+
+/// [`create_parameter`] in a tier of the row's choosing, through Parameter Store's own
+/// operation.
+async fn create_parameter_in_tier(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    tier: &str,
+) {
     let (status, response) = call(
         router,
         "PutParameter",
-        &json!({ "Name": name, "Value": "attached", "Type": "String" }),
+        &json!({ "Name": name, "Value": "attached", "Type": "String", "Tier": tier }),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: PutParameter {name} must succeed, got {status} {response}"
+        "case {case:?}: PutParameter {name} in {tier} must succeed, got {status} {response}"
     );
 }
 
@@ -235,6 +291,10 @@ struct AttachRow {
     holder: Holder,
     /// The document attached, in the layout the caller wrote it.
     policy: &'static str,
+    /// The text a read must report: [`Self::policy`] with the whitespace between its JSON
+    /// tokens dropped, written out so the row states it rather than recomputing it the way
+    /// the handler does.
+    reported: &'static str,
 }
 
 /// A policy written compactly, one with whitespace and a statement written as the object
@@ -254,7 +314,28 @@ const INDENTED_POLICY: &str = r#"{
     ]
 }"#;
 
+/// [`INDENTED_POLICY`] as a read reports it: the same tokens, in the same order, with the
+/// whitespace between them gone.
+const INDENTED_POLICY_REPORTED: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"ShareParameter","Effect":"Allow","Principal":{"AWS":["arn:aws:iam::111122223333:root","arn:aws:iam::444455556666:root"]},"Action":["ssm:GetParameter","ssm:GetParameters"],"Resource":"*"}]}"#;
+
 const SINGLE_STATEMENT_POLICY: &str = r#"{"Statement":{"Effect":"Allow","Principal":"*","Action":"ssm:GetDocument"}}"#;
+
+/// A policy naming the account to share with by its ACCOUNT ID — the other spelling of the
+/// principal a root ARN names.
+const ACCOUNT_ID_PRINCIPAL_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"ShareWithAccount","Effect":"Allow","Principal":{"AWS":"111122223333"},"Action":"ssm:GetOpsItem","Resource":"*"}]}"#;
+
+/// [`ACCOUNT_ID_PRINCIPAL_POLICY`] as a read reports it: the account written as its root
+/// ARN.
+const ACCOUNT_ID_PRINCIPAL_POLICY_REPORTED: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"ShareWithAccount","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"ssm:GetOpsItem","Resource":"*"}]}"#;
+
+/// A policy writing each of its "String or Array of strings" elements as a one-element
+/// array of one string — the other spelling of the bare string.
+const ONE_ELEMENT_LIST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"OneElementLists","Effect":"Allow","Principal":{"AWS":["arn:aws:iam::111122223333:root"]},"Action":["ssm:GetOpsItem"],"Resource":["*"]}]}"#;
+
+/// [`ONE_ELEMENT_LIST_POLICY`] as a read reports it: each one-element list written as the
+/// string it holds. The `Statement` array keeps its brackets — a one-statement policy is
+/// still a list of statements.
+const ONE_ELEMENT_LIST_POLICY_REPORTED: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"OneElementLists","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Action":"ssm:GetOpsItem","Resource":"*"}]}"#;
 
 const DENY_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":"arn:aws:iam::111122223333:root"},"NotAction":"ssm:GetOpsItem","Resource":"*"}]}"#;
 
@@ -263,31 +344,49 @@ const ATTACH_ROWS: &[AttachRow] = &[
         case: "an OpsItemGroup, a compact one-statement policy",
         holder: Holder::OpsItemGroup("default"),
         policy: COMPACT_POLICY,
+        reported: COMPACT_POLICY,
     },
     AttachRow {
         case: "another OpsItemGroup, a policy written with a deny and the complement elements",
         holder: Holder::OpsItemGroup("team-oncall"),
         policy: DENY_POLICY,
+        reported: DENY_POLICY,
     },
     AttachRow {
         case: "a plain parameter, an indented policy naming two principals and two actions",
         holder: Holder::Parameter("shared-parameter"),
         policy: INDENTED_POLICY,
+        reported: INDENTED_POLICY_REPORTED,
     },
     AttachRow {
         case: "a hierarchy parameter",
         holder: Holder::Parameter("/demo/db/password"),
         policy: COMPACT_POLICY,
+        reported: COMPACT_POLICY,
     },
     AttachRow {
         case: "a document, one statement written as the object itself",
         holder: Holder::Document("SharedCommandDocument"),
         policy: SINGLE_STATEMENT_POLICY,
+        reported: SINGLE_STATEMENT_POLICY,
+    },
+    AttachRow {
+        case: "an OpsItemGroup, the account named by its id",
+        holder: Holder::OpsItemGroup("account-id-principal"),
+        policy: ACCOUNT_ID_PRINCIPAL_POLICY,
+        reported: ACCOUNT_ID_PRINCIPAL_POLICY_REPORTED,
+    },
+    AttachRow {
+        case: "an advanced parameter, every value element written as a one-element list",
+        holder: Holder::Parameter("one-element-lists"),
+        policy: ONE_ELEMENT_LIST_POLICY,
+        reported: ONE_ELEMENT_LIST_POLICY_REPORTED,
     },
 ];
 
 /// A put attaches the policy to the resource its ARN names and a read of that resource
-/// reports what was persisted — the same id, the same hash and the same document.
+/// reports what was persisted — the same id, the same hash and the document with only the
+/// whitespace between its tokens dropped.
 #[tokio::test]
 async fn a_put_attaches_a_policy_that_a_read_reports_back() {
     let router = router();
@@ -330,10 +429,10 @@ async fn a_put_attaches_a_policy_that_a_read_reports_back() {
             row.case
         );
         let read_back = policy_text(entry);
-        assert!(
-            same_document(row.policy, &read_back),
-            "case {:?}: expected the read to report the submitted document, got {read_back:?}",
-            row.case
+        assert_eq!(
+            read_back, row.reported,
+            "case {:?}: expected the read to report {:?}, got {read_back:?}",
+            row.case, row.reported
         );
 
         assert!(
@@ -341,7 +440,40 @@ async fn a_put_attaches_a_policy_that_a_read_reports_back() {
             "case {:?}: expected a fresh PolicyId, got {policy_id} again after {minted:?}",
             row.case
         );
-        minted.push(policy_id);
+        minted.push(policy_id.clone());
+
+        // The rendering is a FIXED POINT: putting back the document the read reported
+        // stores the same bytes under the same hash, so a client that reconciles what it
+        // read never sees a difference to re-put.
+        let (status, response) = put(
+            &router,
+            &json!({
+                "ResourceArn": resource_arn,
+                "Policy": read_back,
+                "PolicyId": policy_id,
+                "PolicyHash": policy_hash,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: re-putting the reported document must succeed, got {status} {response}",
+            row.case
+        );
+        assert_eq!(
+            response["PolicyHash"].as_str(),
+            Some(policy_hash.as_str()),
+            "case {:?}: expected the re-put to leave the hash at {policy_hash}, got {response}",
+            row.case
+        );
+        let reread = policies_of(&router, row.case, &resource_arn).await;
+        assert_eq!(
+            policy_text(&reread[0]),
+            row.reported,
+            "case {:?}: expected the re-put to store the same bytes, got {:?}",
+            row.case,
+            reread[0]
+        );
     }
 }
 
@@ -349,7 +481,9 @@ async fn a_put_attaches_a_policy_that_a_read_reports_back() {
 struct HashRow {
     case: &'static str,
     policy: &'static str,
-    /// Whether this document is the same document as [`COMPACT_POLICY`].
+    /// Whether this document is stored as the same text as [`COMPACT_POLICY`] — which is
+    /// what is hashed, so two spellings of one document share a hash and any change to the
+    /// document itself does not.
     same_as_reference: bool,
 }
 
@@ -360,10 +494,20 @@ const HASH_ROWS: &[HashRow] = &[
         same_as_reference: true,
     },
     HashRow {
-        case: "the same document written with whitespace between its tokens",
+        case: "the same statements written with whitespace between their tokens",
         policy: r#"{ "Version" : "2012-10-17" , "Statement" : [ { "Sid" : "Share" ,
             "Effect" : "Allow" , "Principal" : { "AWS" : "arn:aws:iam::111122223333:root" } ,
             "Action" : "ssm:GetOpsItem" , "Resource" : "*" } ] }"#,
+        same_as_reference: true,
+    },
+    HashRow {
+        case: "the same grant with the account named by its id rather than its root ARN",
+        policy: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Share","Effect":"Allow","Principal":{"AWS":"111122223333"},"Action":"ssm:GetOpsItem","Resource":"*"}]}"#,
+        same_as_reference: true,
+    },
+    HashRow {
+        case: "the same grant with each value element written as a one-element list",
+        policy: r#"{"Version":"2012-10-17","Statement":[{"Sid":"Share","Effect":"Allow","Principal":{"AWS":["arn:aws:iam::111122223333:root"]},"Action":["ssm:GetOpsItem"],"Resource":["*"]}]}"#,
         same_as_reference: true,
     },
     HashRow {
@@ -383,9 +527,9 @@ const HASH_ROWS: &[HashRow] = &[
     },
 ];
 
-/// The `PolicyHash` is the document's own digest: the same document always hashes to the
-/// same value, whatever layout it arrived in, and a document changed in any way hashes to
-/// a different one.
+/// The `PolicyHash` is the digest of the document AS STORED: one document written two ways
+/// hashes to one value, because only the whitespace between its tokens differs and that is
+/// not stored, and a document changed in any other way hashes to a different one.
 #[tokio::test]
 async fn the_policy_hash_is_the_documents_own_digest() {
     let router = router();
@@ -599,8 +743,8 @@ async fn an_update_proceeds_only_against_the_stored_policy_version() {
         );
         let expected_document = if row.code.is_none() { &rewritten } else { &updated };
         let read_back = policy_text(&reported[0]);
-        assert!(
-            same_document(expected_document, &read_back),
+        assert_eq!(
+            &read_back, expected_document,
             "case {:?}: expected the stored document to be {expected_document}, got {read_back:?}",
             row.case
         );
@@ -837,6 +981,13 @@ async fn a_policy_that_is_not_a_resource_policy_document_is_refused() {
             (400, "MalformedResourcePolicyDocumentException"),
             "case {case:?}: expected a malformed-document refusal, got {status} {response}"
         );
+        // The diagnostic travels in a lowercase `message`, which is where this plane words
+        // this refusal, and says the document could not be parsed whatever broke it.
+        assert_eq!(
+            response["message"].as_str(),
+            Some(MALFORMED_POLICY_MESSAGE),
+            "case {case:?}: expected the malformed-document wording, got {response}"
+        );
         let reported = policies_of(&router, case, &resource_arn).await;
         assert!(
             reported.is_empty(),
@@ -907,33 +1058,32 @@ async fn a_resource_arn_naming_no_policy_holding_resource_is_refused() {
     }
 }
 
-/// The sentence `ResourceNotFoundException` carries, which is the one the model documents
-/// for that error (`smithy_query(query="shape",shape="ResourceNotFoundException")`: "the
-/// specified parameter to be shared could not be found").
-const RESOURCE_NOT_FOUND_MESSAGE: &str = "The specified parameter to be shared could not be found.";
-
 /// An ARN naming a parameter or a document this account does not hold names nothing to
-/// share, and the same ARN works once the resource is created.
+/// share, and the same ARN works once the resource is created. The refusal is worded for
+/// the KIND of resource the ARN names and echoes that ARN.
 #[tokio::test]
 async fn an_arn_naming_a_resource_this_account_does_not_hold_is_not_found() {
     let router = router();
 
-    let rows: [(&str, String); 3] = [
+    let rows: [(&str, String, String); 3] = [
         (
             "a parameter nobody created",
             parameter_arn("never-created"),
+            parameter_not_found_message(&parameter_arn("never-created")),
         ),
         (
             "a hierarchy parameter nobody created",
             parameter_arn("/missing/path/value"),
+            parameter_not_found_message(&parameter_arn("/missing/path/value")),
         ),
         (
             "a document nobody created",
             document_arn("NeverCreatedDocument"),
+            resource_not_found_message(&document_arn("NeverCreatedDocument")),
         ),
     ];
 
-    for (case, resource_arn) in &rows {
+    for (case, resource_arn, expected) in &rows {
         let (status, response) = put(
             &router,
             &json!({ "ResourceArn": resource_arn, "Policy": COMPACT_POLICY }),
@@ -947,8 +1097,8 @@ async fn an_arn_naming_a_resource_this_account_does_not_hold_is_not_found() {
         );
         assert_eq!(
             response["Message"].as_str(),
-            Some(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the modelled not-found sentence, got {response}"
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {response}"
         );
     }
 
@@ -965,6 +1115,320 @@ async fn an_arn_naming_a_resource_this_account_does_not_hold_is_not_found() {
     assert!(
         is_policy_hash(&policy_hash),
         "expected the put to succeed once the parameter exists, got {policy_hash:?}"
+    );
+}
+
+/// A `PolicyId` and a `PolicyHash` nothing issued, so the pair addresses no stored policy
+/// whatever the resource holds.
+const FABRICATED_POLICY_ID: &str = "fabricated-policy-id";
+
+/// See [`FABRICATED_POLICY_ID`].
+const FABRICATED_POLICY_HASH: &str = "fabricated-policy-hash";
+
+/// What a refusal row's `ResourceArn` names, and what has to exist first.
+enum RefusalTarget {
+    /// A parameter of this name that nobody creates.
+    MissingParameter(&'static str),
+    /// A document of this name that nobody creates.
+    MissingDocument(&'static str),
+    /// An advanced parameter of this name, created before the call.
+    ExistingParameter(&'static str),
+    /// A document of this name, created before the call.
+    ExistingDocument(&'static str),
+    /// The account's OpsCenter group of this id — nothing creates one, so it always
+    /// resolves.
+    OpsItemGroup(&'static str),
+}
+
+/// What a refusal row's call carries beyond its `ResourceArn`.
+enum RefusalCall {
+    /// A readable policy document: the put that would attach one.
+    Policy,
+    /// Nothing: the read.
+    Read,
+    /// The fabricated id/hash pair — the delete's required members, and the pair a put
+    /// names an update with.
+    FabricatedPair,
+}
+
+/// Which message a refusal row expects, built from the values the call carried.
+enum RefusalMessage {
+    /// Parameter Store's own not-found sentence.
+    Parameter,
+    /// The resource-policy plane's not-found sentence, for a resource of any other type.
+    Resource,
+    /// The sentence naming the ARN, id and hash a policy lookup used.
+    Policy,
+}
+
+/// Which member a refusal's message travels in. This service's modelled error shapes
+/// declare `Message`; the resource-policy plane words its policy-not-found and
+/// malformed-document refusals in a lowercase `message` instead.
+enum MessageMember {
+    Upper,
+    Lower,
+}
+
+/// One row of the refusal-wording suite.
+struct RefusalRow {
+    case: &'static str,
+    operation: &'static str,
+    target: RefusalTarget,
+    call: RefusalCall,
+    code: &'static str,
+    message: RefusalMessage,
+    member: MessageMember,
+}
+
+const REFUSAL_ROWS: &[RefusalRow] = &[
+    RefusalRow {
+        case: "a read of a document that was never created",
+        operation: "GetResourcePolicies",
+        target: RefusalTarget::MissingDocument("ProbeAbsentDocument"),
+        call: RefusalCall::Read,
+        code: "ResourceNotFoundException",
+        message: RefusalMessage::Resource,
+        member: MessageMember::Upper,
+    },
+    RefusalRow {
+        case: "a read of a parameter that was never created",
+        operation: "GetResourcePolicies",
+        target: RefusalTarget::MissingParameter("probe-absent-parameter"),
+        call: RefusalCall::Read,
+        code: "ResourceNotFoundException",
+        message: RefusalMessage::Parameter,
+        member: MessageMember::Upper,
+    },
+    RefusalRow {
+        case: "a delete against a parameter that was never created",
+        operation: "DeleteResourcePolicy",
+        target: RefusalTarget::MissingParameter("probe-absent-delete-parameter"),
+        call: RefusalCall::FabricatedPair,
+        code: "ResourceNotFoundException",
+        message: RefusalMessage::Parameter,
+        member: MessageMember::Upper,
+    },
+    RefusalRow {
+        case: "a delete against a document that was never created",
+        operation: "DeleteResourcePolicy",
+        target: RefusalTarget::MissingDocument("ProbeAbsentDeleteDocument"),
+        call: RefusalCall::FabricatedPair,
+        code: "ResourceNotFoundException",
+        message: RefusalMessage::Resource,
+        member: MessageMember::Upper,
+    },
+    RefusalRow {
+        case: "a put against a parameter that was never created",
+        operation: "PutResourcePolicy",
+        target: RefusalTarget::MissingParameter("probe-absent-put-parameter"),
+        call: RefusalCall::Policy,
+        code: "ResourceNotFoundException",
+        message: RefusalMessage::Parameter,
+        member: MessageMember::Upper,
+    },
+    RefusalRow {
+        case: "a delete of a pair no policy on an existing parameter carries",
+        operation: "DeleteResourcePolicy",
+        target: RefusalTarget::ExistingParameter("probe-delete-parameter"),
+        call: RefusalCall::FabricatedPair,
+        code: "ResourcePolicyNotFoundException",
+        message: RefusalMessage::Policy,
+        member: MessageMember::Lower,
+    },
+    RefusalRow {
+        case: "a delete of a pair no policy on an existing document carries",
+        operation: "DeleteResourcePolicy",
+        target: RefusalTarget::ExistingDocument("ProbeDeleteDocument"),
+        call: RefusalCall::FabricatedPair,
+        code: "ResourcePolicyNotFoundException",
+        message: RefusalMessage::Policy,
+        member: MessageMember::Lower,
+    },
+    RefusalRow {
+        case: "a delete of a pair no policy on an OpsItemGroup carries",
+        operation: "DeleteResourcePolicy",
+        target: RefusalTarget::OpsItemGroup("probe-delete-group"),
+        call: RefusalCall::FabricatedPair,
+        code: "ResourcePolicyNotFoundException",
+        message: RefusalMessage::Policy,
+        member: MessageMember::Lower,
+    },
+    RefusalRow {
+        case: "a put naming an update no policy of the resource answers to",
+        operation: "PutResourcePolicy",
+        target: RefusalTarget::ExistingParameter("probe-update-parameter"),
+        call: RefusalCall::FabricatedPair,
+        code: "ResourcePolicyNotFoundException",
+        message: RefusalMessage::Policy,
+        member: MessageMember::Lower,
+    },
+];
+
+/// Every one of the three operations resolves its `ResourceArn` against the store that owns
+/// the resource it names BEFORE it looks at the policy store, so a missing resource and a
+/// missing policy are two different classes — and each refusal carries the wording of its
+/// own class, in the member that class puts it in, built from the values the request
+/// carried.
+#[tokio::test]
+async fn a_refusal_names_the_class_and_the_values_the_call_carried() {
+    for row in REFUSAL_ROWS {
+        // A router per row, so what each call finds is only what that row created.
+        let router = router();
+        let resource_arn = match row.target {
+            RefusalTarget::MissingParameter(name) => parameter_arn(name),
+            RefusalTarget::MissingDocument(name) => document_arn(name),
+            RefusalTarget::ExistingParameter(name) => {
+                create_parameter(&router, row.case, name).await;
+                parameter_arn(name)
+            }
+            RefusalTarget::ExistingDocument(name) => {
+                create_document(&router, row.case, name).await;
+                document_arn(name)
+            }
+            RefusalTarget::OpsItemGroup(id) => ops_item_group_arn(id),
+        };
+
+        let mut body = json!({ "ResourceArn": resource_arn });
+        let fields = body.as_object_mut().expect("the request body is an object");
+        match row.call {
+            RefusalCall::Read => {}
+            RefusalCall::Policy => {
+                fields.insert("Policy".into(), json!(COMPACT_POLICY));
+            }
+            RefusalCall::FabricatedPair => {
+                if row.operation == "PutResourcePolicy" {
+                    fields.insert("Policy".into(), json!(COMPACT_POLICY));
+                }
+                fields.insert("PolicyId".into(), json!(FABRICATED_POLICY_ID));
+                fields.insert("PolicyHash".into(), json!(FABRICATED_POLICY_HASH));
+            }
+        }
+
+        let (status, response) = call(&router, row.operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected HTTP 400, got {status} {response}",
+            row.case
+        );
+        let code = error_code(&response);
+        assert_eq!(
+            code, row.code,
+            "case {:?}: expected {}, got {code} {response}",
+            row.case, row.code
+        );
+
+        let expected = match row.message {
+            RefusalMessage::Parameter => parameter_not_found_message(&resource_arn),
+            RefusalMessage::Resource => resource_not_found_message(&resource_arn),
+            RefusalMessage::Policy => policy_not_found_message(
+                &resource_arn,
+                FABRICATED_POLICY_ID,
+                FABRICATED_POLICY_HASH,
+            ),
+        };
+        let (carries, empty) = match row.member {
+            MessageMember::Upper => ("Message", "message"),
+            MessageMember::Lower => ("message", "Message"),
+        };
+        assert_eq!(
+            response[carries].as_str(),
+            Some(expected.as_str()),
+            "case {:?}: expected {expected:?} in {carries}, got {response}",
+            row.case
+        );
+        assert!(
+            response[empty].is_null(),
+            "case {:?}: expected the refusal to carry no {empty} member, got {response}",
+            row.case
+        );
+    }
+}
+
+/// Only an advanced-tier parameter can carry a resource policy: a put against a parameter
+/// in any other tier is refused and attaches nothing, and the same parameter can be shared
+/// once its tier is upgraded. The rows are every `ParameterTier` the model declares.
+#[tokio::test]
+async fn only_an_advanced_tier_parameter_can_carry_a_policy() {
+    let router = router();
+
+    // `Intelligent-Tiering` is resolved when the parameter is written, against the options
+    // that require an advanced parameter (a value over the standard tier's limit, a
+    // parameter policy, a Region already past the parameter quota). A short `String` value
+    // needs none of them, so that parameter is served in the standard tier — and cannot be
+    // shared either.
+    for (case, tier, shareable) in [
+        ("the standard tier", TIER_STANDARD, false),
+        (
+            "intelligent tiering, resolved to the standard tier",
+            TIER_INTELLIGENT_TIERING,
+            false,
+        ),
+        ("the advanced tier", TIER_ADVANCED, true),
+    ] {
+        let name = format!("tier-{}", tier.to_lowercase());
+        create_parameter_in_tier(&router, case, &name, tier).await;
+        let resource_arn = parameter_arn(&name);
+
+        let (status, response) = put(
+            &router,
+            &json!({ "ResourceArn": resource_arn, "Policy": COMPACT_POLICY }),
+        )
+        .await;
+        if shareable {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: an advanced parameter must take a policy, got {status} {response}"
+            );
+            let reported = policies_of(&router, case, &resource_arn).await;
+            assert_eq!(
+                reported.len(),
+                1,
+                "case {case:?}: expected the policy to be attached, got {reported:?}"
+            );
+            continue;
+        }
+        let code = error_code(&response);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected a tier refusal, got {status} {response}"
+        );
+        assert_eq!(
+            response["message"].as_str(),
+            Some(ONLY_ADVANCED_MESSAGE),
+            "case {case:?}: expected the tier-refusal wording, got {response}"
+        );
+        let reported = policies_of(&router, case, &resource_arn).await;
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected a refused put to attach nothing, got {reported:?}"
+        );
+    }
+
+    // The refusal is about the TIER: the standard parameter above takes the same policy
+    // once it is upgraded to the advanced tier.
+    let name = format!("tier-{}", TIER_STANDARD.to_lowercase());
+    let (status, response) = call(
+        &router,
+        "PutParameter",
+        &json!({
+            "Name": name,
+            "Value": "attached",
+            "Type": "String",
+            "Tier": TIER_ADVANCED,
+            "Overwrite": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the tier upgrade must succeed, got {status} {response}"
+    );
+    let resource_arn = parameter_arn(&name);
+    let (_, policy_hash) = attach(&router, "the upgraded parameter", &resource_arn, COMPACT_POLICY).await;
+    assert!(
+        is_policy_hash(&policy_hash),
+        "expected the upgraded parameter to take the policy, got {policy_hash:?}"
     );
 }
 
