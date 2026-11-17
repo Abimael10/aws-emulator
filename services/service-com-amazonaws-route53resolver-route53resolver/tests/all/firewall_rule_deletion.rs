@@ -14,6 +14,11 @@
 //! "is the only operation that succeeds against a rule whose Status is
 //! CREATION_FAILED".
 //!
+//! Because a rule the service holds is deletable, the teardown order the DNS
+//! Firewall plane documents runs to completion: a group's rules go first, then
+//! the group, then the domain lists its rules matched against — and each step
+//! releases what the next one is refused for.
+//!
 //! Every case goes over the wire the service actually speaks (awsJson1_1,
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
 //! same router the emulator mounts, so what is asserted is the HTTP behaviour
@@ -26,13 +31,16 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    FIREWALL_RULE_DOMAIN_LIST_MEMBER, FIREWALL_RULE_STATUS_CREATING,
-    FIREWALL_RULE_STATUS_CREATION_FAILED, FIREWALL_RULE_THREAT_PROTECTION_MEMBER,
-    PROVISIONING_DELAY, RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
+    FIREWALL_DOMAIN_REDIRECTION_INSPECT, FIREWALL_RULE_DOMAIN_LIST_MEMBER,
+    FIREWALL_RULE_STATUS_CREATING, FIREWALL_RULE_STATUS_CREATION_FAILED,
+    FIREWALL_RULE_THREAT_PROTECTION_MEMBER, PROVISIONING_DELAY,
+    RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE, RSLVR_CODE_FIREWALL_RULE_NOT_FOUND,
 };
 
+use super::firewall_domain_imports::settle as settled_domain_list;
 use super::harness::{
-    call, emulator, error_type, ok, string_member, traced_message, without_status,
+    call, emulator, error_type, ok, parse_time, settled_rule_group, string_member, traced_message,
+    without_status,
 };
 
 /// An id of the shape this service mints for a rule group or a domain list that
@@ -77,6 +85,12 @@ async fn domain_list(router: &MultiServiceRouter, name: &str) -> String {
     )
 }
 
+/// The `CreatorRequestId` [`create_rule`] carries for the rule `name`, so a
+/// case that asserts the id a rule reports names it the one way.
+fn creator_request_id(name: &str) -> String {
+    format!("rule-{name}")
+}
+
 /// Create one rule from the members `members` states and answer it as the
 /// create reported it.
 async fn create_rule(router: &MultiServiceRouter, name: &str, members: Value) -> Value {
@@ -85,7 +99,10 @@ async fn create_rule(router: &MultiServiceRouter, name: &str, members: Value) ->
         .as_object_mut()
         .expect("a rule's members are stated as an object");
     object.insert("Name".to_string(), json!(name));
-    object.insert("CreatorRequestId".to_string(), json!(format!("rule-{name}")));
+    object.insert(
+        "CreatorRequestId".to_string(),
+        json!(creator_request_id(name)),
+    );
     let created = ok(router, "CreateFirewallRule", request).await;
     created
         .get("FirewallRule")
@@ -189,6 +206,16 @@ fn refusal_message(body: &Value) -> String {
 fn rule_not_found_message(group_id: &str, member: &str, match_source_id: &str) -> String {
     format!(
         r#"[{RSLVR_CODE_FIREWALL_RULE_NOT_FOUND}] Can’t locate the rule for the Firewall rule group ID: "{group_id}" and {member} "{match_source_id}"."#
+    )
+}
+
+/// The message Route 53 Resolver answers when the rule group a delete names
+/// still holds a rule: the service error code for that fault, the sentence
+/// naming the group the request addressed, and the sentence telling the caller
+/// what to do first — the rules go before the group they are in.
+fn rule_group_has_rule_message(group_id: &str) -> String {
+    format!(
+        r#"[{RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE}] The DNS Firewall rule group has an associated rule: "{group_id}".  Delete the rule and try again later."#
     )
 }
 
@@ -706,4 +733,349 @@ async fn a_rule_is_deleted_in_every_lifecycle_state_it_reports() {
         0,
         "every rule the group held was deleted, so it holds none"
     );
+}
+
+/// Every member of the deleted rule's projection the operation reports for a
+/// rule of this kind, as `FirewallRule`'s members name them
+/// (`smithy_query(query="shape",shape="FirewallRule")`): the group that held
+/// it, the members `created` stated, the `CreatorRequestId` the create carried,
+/// the instants it carries, and the source it matched on — a domain list, with
+/// the redirection action that applies to the redirection chain of a
+/// domain-list rule, or the id a rule matching a built-in detector carries
+/// instead.
+fn assert_projection(case: &str, deleted: &Value, group_id: &str, name: &str, created: &Value) {
+    assert_eq!(
+        string_member(deleted, "FirewallRuleGroupId"),
+        group_id,
+        "case {case:?}: the deleted rule must report the group that held it, got {deleted}"
+    );
+    assert_eq!(
+        string_member(deleted, "Name"),
+        name,
+        "case {case:?}: the deleted rule must report the name it was created with, got {deleted}"
+    );
+    assert_eq!(
+        deleted.get("Priority"),
+        created.get("Priority"),
+        "case {case:?}: the deleted rule must report the Priority it was created with, got \
+         {deleted}"
+    );
+    assert_eq!(
+        deleted.get("Action"),
+        created.get("Action"),
+        "case {case:?}: the deleted rule must report the Action it was created with, got {deleted}"
+    );
+    assert_eq!(
+        string_member(deleted, "CreatorRequestId"),
+        creator_request_id(name),
+        "case {case:?}: the deleted rule must report the CreatorRequestId its create carried, \
+         got {deleted}"
+    );
+    for member in ["CreationTime", "ModificationTime"] {
+        parse_time(case, member, &string_member(deleted, member));
+    }
+    match created.get("FirewallDomainListId") {
+        Some(domain_list_id) => {
+            assert_eq!(
+                deleted.get("FirewallDomainListId"),
+                Some(domain_list_id),
+                "case {case:?}: the deleted rule must report the domain list it matched \
+                 against, got {deleted}"
+            );
+            // `FirewallDomainRedirectionAction`'s documented default applies to
+            // a rule whose create named none.
+            assert_eq!(
+                string_member(deleted, "FirewallDomainRedirectionAction"),
+                created
+                    .get("FirewallDomainRedirectionAction")
+                    .and_then(Value::as_str)
+                    .unwrap_or(FIREWALL_DOMAIN_REDIRECTION_INSPECT),
+                "case {case:?}: a deleted domain-list rule must report its \
+                 FirewallDomainRedirectionAction, got {deleted}"
+            );
+        }
+        None => assert!(
+            !string_member(deleted, "FirewallThreatProtectionId").is_empty(),
+            "case {case:?}: a deleted rule matching no domain list must report the \
+             FirewallThreatProtectionId it was minted with, got {deleted}"
+        ),
+    }
+}
+
+/// One deployment the documented teardown order is run against.
+struct TeardownRow {
+    case: &'static str,
+    /// The domains each domain list of the deployment holds: one entry per
+    /// list, so a row spans a list with content of its own and an empty one.
+    lists: &'static [&'static [&'static str]],
+    /// The rules the deployment holds, built from the ids the service minted
+    /// for those lists: `(the rule's name, the members its create carries
+    /// beside its name and its group)`.
+    rules: fn(&[String]) -> Vec<(&'static str, Value)>,
+}
+
+/// The deployments: they differ in how many rules one group holds, the sources
+/// those rules match on (one list each, one list shared and told apart by the
+/// query type, a built-in detector matching no list at all), the query types
+/// they evaluate, and the members they carry.
+fn teardown_rows() -> Vec<TeardownRow> {
+    vec![
+        TeardownRow {
+            case: "one alerting rule matching one domain list",
+            lists: &[&["alerted.example.com"]],
+            rules: |lists| {
+                vec![(
+                    "teardown-alert",
+                    json!({
+                        "FirewallDomainListId": lists[0],
+                        "Priority": 100,
+                        "Action": "ALERT",
+                    }),
+                )]
+            },
+        },
+        TeardownRow {
+            case: "two rules, each matching a domain list of its own",
+            lists: &[&["overridden.example.com"], &[]],
+            rules: |lists| {
+                vec![
+                    (
+                        "teardown-override",
+                        json!({
+                            "FirewallDomainListId": lists[0],
+                            "Priority": 100,
+                            "Action": "BLOCK",
+                            "BlockResponse": "OVERRIDE",
+                            "BlockOverrideDomain": "sinkhole.example.com",
+                            "BlockOverrideDnsType": "CNAME",
+                            "BlockOverrideTtl": 60,
+                            "FirewallDomainRedirectionAction": "TRUST_REDIRECTION_DOMAIN",
+                            "Qtype": "AAAA",
+                        }),
+                    ),
+                    (
+                        "teardown-allow",
+                        json!({
+                            "FirewallDomainListId": lists[1],
+                            "Priority": 200,
+                            "Action": "ALLOW",
+                            "Qtype": "MX",
+                        }),
+                    ),
+                ]
+            },
+        },
+        TeardownRow {
+            case: "three rules: two telling one shared list apart by query type, \
+                   and one matching a built-in detector",
+            lists: &[&["shared.example.com", "second.example.com"]],
+            rules: |lists| {
+                vec![
+                    (
+                        "teardown-shared-txt",
+                        json!({
+                            "FirewallDomainListId": lists[0],
+                            "Priority": 100,
+                            "Action": "ALERT",
+                            "Qtype": "TXT",
+                        }),
+                    ),
+                    (
+                        "teardown-shared-any",
+                        json!({
+                            "FirewallDomainListId": lists[0],
+                            "Priority": 200,
+                            "Action": "BLOCK",
+                            "BlockResponse": "NXDOMAIN",
+                        }),
+                    ),
+                    (
+                        "teardown-detector",
+                        json!({
+                            "DnsThreatProtection": "DGA",
+                            "ConfidenceThreshold": "HIGH",
+                            "Priority": 300,
+                            "Action": "ALERT",
+                        }),
+                    ),
+                ]
+            },
+        },
+    ]
+}
+
+/// A rule the service holds is deletable, so the teardown order the DNS
+/// Firewall plane documents runs to completion: every rule of the group is
+/// removed one at a time — each delete answered HTTP 200 with the deleted
+/// rule's whole projection — and only then the group, and only then the domain
+/// lists its rules matched against. While the group still holds a rule its own
+/// delete is refused with the service's coded sentence for that fault, and the
+/// very same call is served once the last rule is gone.
+#[tokio::test]
+async fn the_documented_teardown_order_runs_to_completion() {
+    for (index, TeardownRow { case, lists, rules }) in teardown_rows().into_iter().enumerate() {
+        let router = emulator();
+        let group = rule_group(&router, &format!("teardown-group-{index}")).await;
+
+        let mut list_ids = Vec::new();
+        for (ordinal, domains) in lists.iter().enumerate() {
+            let id = domain_list(&router, &format!("teardown-list-{index}-{ordinal}")).await;
+            if !domains.is_empty() {
+                ok(
+                    &router,
+                    "UpdateFirewallDomains",
+                    json!({
+                        "FirewallDomainListId": id,
+                        "Operation": "ADD",
+                        "Domains": domains,
+                    }),
+                )
+                .await;
+            }
+            list_ids.push(id);
+        }
+
+        let rules = rules(&list_ids);
+        for (name, members) in &rules {
+            let mut body = members.clone();
+            body.as_object_mut()
+                .expect("a rule's members are stated as an object")
+                .insert("FirewallRuleGroupId".to_string(), json!(group));
+            create_rule(&router, name, body).await;
+        }
+
+        let mut remaining = i64::try_from(rules.len()).expect("a small rule count");
+        assert_eq!(
+            rule_count(&router, &group).await,
+            remaining,
+            "case {case:?}: the group's RuleCount must count every rule created into it"
+        );
+
+        for (name, members) in &rules {
+            // A group that still holds a rule still filters DNS traffic, so
+            // its own delete is refused and the rules go first.
+            let (status, refusal) = call(
+                &router,
+                "DeleteFirewallRuleGroup",
+                json!({ "FirewallRuleGroupId": group }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a group still holding a rule must refuse its delete with HTTP \
+                 400, got {status}: {refusal}"
+            );
+            assert!(
+                error_type(&refusal).contains("ConflictException"),
+                "case {case:?}: expected ConflictException, got {refusal}"
+            );
+            let message = refusal_message(&refusal);
+            assert_eq!(
+                message,
+                rule_group_has_rule_message(&group),
+                "case {case:?}: the refusal must state the service's sentence for a group that \
+                 still holds a rule, naming the group, got {message:?}"
+            );
+
+            // The rule the caller holds is deleted, and the answer carries the
+            // rule exactly as the group held it.
+            let held = held_rule(&router, &group, case, name).await;
+            let (status, body) =
+                call(&router, "DeleteFirewallRule", naming(&group, &held)).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the delete of the rule {name:?} the group holds must answer \
+                 HTTP 200, got {status}: {body}"
+            );
+            let deleted = body.get("FirewallRule").unwrap_or_else(|| {
+                panic!("case {case:?}: the delete must answer with the rule it deleted, got {body}")
+            });
+            assert_eq!(
+                without_status(deleted),
+                without_status(&held),
+                "case {case:?}: the deleted rule must be reported as the group held it"
+            );
+            assert_projection(case, deleted, &group, name, members);
+
+            remaining -= 1;
+            assert_eq!(
+                rule_count(&router, &group).await,
+                remaining,
+                "case {case:?}: the group's RuleCount must count exactly the rules left"
+            );
+        }
+
+        // The last rule is gone, so the very same group delete is served.
+        settled_rule_group(&router, &group, case).await;
+        let deleted_group = ok(
+            &router,
+            "DeleteFirewallRuleGroup",
+            json!({ "FirewallRuleGroupId": group }),
+        )
+        .await;
+        assert_eq!(
+            string_member(
+                deleted_group
+                    .get("FirewallRuleGroup")
+                    .unwrap_or_else(|| panic!("case {case:?}: the delete answers the group")),
+                "Id"
+            ),
+            group,
+            "case {case:?}: the delete must answer with the group it took out, got \
+             {deleted_group}"
+        );
+        let (status, missing) = call(
+            &router,
+            "GetFirewallRuleGroup",
+            json!({ "FirewallRuleGroupId": group }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the deleted group must be reported missing, got {status}: {missing}"
+        );
+        assert!(
+            error_type(&missing).contains("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException for the deleted group, got \
+             {missing}"
+        );
+
+        // And then the lists those rules matched against, which no rule
+        // references any more.
+        for list in &list_ids {
+            settled_domain_list(&router, list, case).await;
+            let deleted_list = ok(
+                &router,
+                "DeleteFirewallDomainList",
+                json!({ "FirewallDomainListId": list }),
+            )
+            .await;
+            assert_eq!(
+                string_member(
+                    deleted_list
+                        .get("FirewallDomainList")
+                        .unwrap_or_else(|| panic!("case {case:?}: the delete answers the list")),
+                    "Id"
+                ),
+                *list,
+                "case {case:?}: the delete must answer with the list it took out, got \
+                 {deleted_list}"
+            );
+            let (status, missing) = call(
+                &router,
+                "GetFirewallDomainList",
+                json!({ "FirewallDomainListId": list }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the deleted list must be reported missing, got {status}: {missing}"
+            );
+            assert!(
+                error_type(&missing).contains("ResourceNotFoundException"),
+                "case {case:?}: expected ResourceNotFoundException for the deleted list, got \
+                 {missing}"
+            );
+        }
+    }
 }

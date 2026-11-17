@@ -16,7 +16,9 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_firehose_firehose_20150804 as firehose;
 use service_com_amazonaws_kinesis_kinesis_20131202 as kinesis;
 use service_com_amazonaws_route53profiles_route53profiles as profiles;
-use service_com_amazonaws_route53resolver_route53resolver::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE;
+use service_com_amazonaws_route53resolver_route53resolver::state::{
+    FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE, FIREWALL_RULE_GROUP_STATUS_COMPLETE,
+};
 use service_com_amazonaws_route53resolver_route53resolver::EmulatedService;
 use service_com_amazonaws_s3_amazons3 as s3;
 use smithy_server_runtime::MultiServiceRouter;
@@ -732,11 +734,11 @@ pub fn tracing_chain(index: u32) -> (String, String) {
     (format!("Root={root};Sampled=0"), root)
 }
 
-/// How long [`settled_association`] waits before it looks again.
+/// How long the polls below wait before they look again.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// How long [`settled_association`] keeps looking before it gives up: generous,
-/// so how fast the host runs never decides the outcome.
+/// How long they keep looking before they give up: generous, so how fast the
+/// host runs never decides the outcome.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Look at the DNS Firewall rule-group association `id` again until the change
@@ -765,6 +767,34 @@ pub async fn settled_association(router: &MultiServiceRouter, id: &str, case: &s
         assert!(
             Instant::now() < deadline,
             "case {case:?}: the association must settle, it still reports {status:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Look at the DNS Firewall rule group `id` again until the change in flight
+/// has settled, so a case that needs a settled one reads a settled one — the
+/// rule-group twin of [`settled_association`], waiting on the CONDITION the
+/// group REPORTS and never on a span of the clock.
+pub async fn settled_rule_group(router: &MultiServiceRouter, id: &str, case: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = ok(
+            router,
+            "GetFirewallRuleGroup",
+            serde_json::json!({ "FirewallRuleGroupId": id }),
+        )
+        .await;
+        let group = read
+            .get("FirewallRuleGroup")
+            .unwrap_or_else(|| panic!("case {case:?}: the read answers a rule group, got {read}"));
+        let status = string_member(group, "Status");
+        if status == FIREWALL_RULE_GROUP_STATUS_COMPLETE {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the rule group must settle, it still reports {status:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
