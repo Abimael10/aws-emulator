@@ -15,7 +15,13 @@
 //! from the connection request and a `REQUEST` authorizer in front of it decides it first:
 //! `401` when an identity source is absent (the authorizer not invoked at all), `403` when
 //! its function denies, and otherwise the context it returned reaches every later call's
-//! event.**
+//! event. Every one of those invocations is made by the gateway as its OWN service principal
+//! (`apigateway.amazonaws.com`), so it is made only where the FUNCTION's resource-based policy
+//! allows that principal `lambda:InvokeFunction` with the route's own `execute-api` ARN
+//! (`{api-id}/{stage}/{route-key}`) as the `aws:SourceArn` such a grant may be narrowed by: an
+//! invocation the policy does not admit is NEVER MADE, and the call produced no reply — the
+//! handshake refused `500` for the connection request, the gateway's own
+//! `Internal server error` frame for a message.**
 //!
 //! Nothing here is a value this emulator fills in: every assertion is on something a
 //! function RAN and returned, which is why AWS Lambda is mounted beside this service on one
@@ -34,7 +40,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::http_api_backend_dispatch::given_function;
+use crate::http_api_backend_dispatch::{
+    gateway_may_invoke, given_function, given_ungranted_function, granted, revoked,
+};
 use crate::websocket_transport_data_plane::{exchanged_reply, handshake_at, ClientSocket};
 
 /// The Region every control-plane request below is signed for.
@@ -983,4 +991,389 @@ async fn a_request_authorizer_decides_the_handshake_and_its_context_reaches_the_
             }
         }
     }
+}
+
+/// What one row of the grant tables below puts on the route's function before a client dials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    /// Nothing at all: the function carries no resource policy.
+    None,
+    /// `lambda:InvokeFunction` to the gateway, naming no source.
+    AnySource,
+    /// The same, narrowed to a source ARN the row builds from the api it created.
+    Narrowed(Source),
+    /// `lambda:InvokeFunction` to ANOTHER service principal.
+    OtherPrincipal,
+    /// Another action to the gateway.
+    OtherAction,
+    /// The unnarrowed grant, added and then revoked again.
+    Revoked,
+}
+
+/// Which `aws:SourceArn` a narrowed grant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Every stage and route of THIS api.
+    ThisApiWildcard,
+    /// This route exactly: this api, this stage, this route key.
+    ThisRoute,
+    /// Another route of this api.
+    AnotherRoute,
+    /// Another api altogether.
+    AnotherApi,
+}
+
+impl Source {
+    /// The ARN this source names, for the api `api_id`, the route `route_key` and the account
+    /// the emulator serves.
+    ///
+    /// The form is the `execute-api` resource ARN of a WEBSOCKET route —
+    /// `arn:aws:execute-api:{region}:{account}:{api-id}/{stage}/{route-key}` — the same value
+    /// the connection request's authorizer event names as its `methodArn`, asserted above in
+    /// `a_request_authorizer_decides_the_handshake_and_its_context_travels`.
+    fn arn(self, api_id: &str, route_key: &str) -> String {
+        let account = engine::emulator_account_id();
+        let resource = match self {
+            Self::ThisApiWildcard => format!("{api_id}/*/*"),
+            Self::ThisRoute => format!("{api_id}/{STAGE}/{route_key}"),
+            Self::AnotherRoute => format!("{api_id}/{STAGE}/$disconnect"),
+            Self::AnotherApi => "otherapi00/*/*".to_string(),
+        };
+        format!("arn:aws:execute-api:{REGION}:{account}:{resource}")
+    }
+}
+
+/// Put `grant` on `function` for the route `route_key` of `api_id`.
+async fn given_grant(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+    api_id: &str,
+    route_key: &str,
+    grant: Grant,
+) {
+    match grant {
+        Grant::None => {}
+        Grant::AnySource => gateway_may_invoke(emulator, case, function, None).await,
+        Grant::Narrowed(source) => {
+            let arn = source.arn(api_id, route_key);
+            gateway_may_invoke(emulator, case, function, Some(&arn)).await;
+        }
+        Grant::OtherPrincipal => {
+            granted(
+                emulator,
+                case,
+                function,
+                "lambda:InvokeFunction",
+                "events.amazonaws.com",
+                None,
+            )
+            .await;
+        }
+        Grant::OtherAction => {
+            granted(
+                emulator,
+                case,
+                function,
+                "lambda:GetFunction",
+                "apigateway.amazonaws.com",
+                None,
+            )
+            .await;
+        }
+        Grant::Revoked => {
+            gateway_may_invoke(emulator, case, function, None).await;
+            revoked(
+                emulator,
+                case,
+                function,
+                "lambda:InvokeFunction",
+                "apigateway.amazonaws.com",
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+/// Take the grant for the gateway's unnarrowed `lambda:InvokeFunction` back off `function`.
+async fn revoke_gateway_grant(emulator: &MultiServiceRouter, case: &str, function: &str) {
+    revoked(
+        emulator,
+        case,
+        function,
+        "lambda:InvokeFunction",
+        "apigateway.amazonaws.com",
+        None,
+    )
+    .await;
+}
+
+/// One row of the grant tables: what the function carries, and whether the gateway's
+/// invocation is admitted.
+struct GrantRow {
+    case: &'static str,
+    grant: Grant,
+    admitted: bool,
+}
+
+/// The grants every table row below spans: no policy at all, a grant naming no source, a grant
+/// narrowed to the api with wildcards, to this route exactly, to ANOTHER route of the same api
+/// and to another api altogether, a grant to another service principal, a grant of another
+/// action, and a grant that is REVOKED again.
+const GRANT_ROWS: &[GrantRow] = &[
+    GrantRow {
+        // The recorded case: the function the connection request's route fronts carries no
+        // grant for the gateway at all.
+        case: "a function carrying no resource policy at all",
+        grant: Grant::None,
+        admitted: false,
+    },
+    GrantRow {
+        case: "a grant to the gateway naming no source",
+        grant: Grant::AnySource,
+        admitted: true,
+    },
+    GrantRow {
+        case: "a grant narrowed to every stage and route of this api",
+        grant: Grant::Narrowed(Source::ThisApiWildcard),
+        admitted: true,
+    },
+    GrantRow {
+        case: "a grant narrowed to this route exactly",
+        grant: Grant::Narrowed(Source::ThisRoute),
+        admitted: true,
+    },
+    GrantRow {
+        case: "a grant narrowed to another route of this api",
+        grant: Grant::Narrowed(Source::AnotherRoute),
+        admitted: false,
+    },
+    GrantRow {
+        case: "a grant narrowed to another api altogether",
+        grant: Grant::Narrowed(Source::AnotherApi),
+        admitted: false,
+    },
+    GrantRow {
+        case: "a grant to another service principal",
+        grant: Grant::OtherPrincipal,
+        admitted: false,
+    },
+    GrantRow {
+        case: "a grant of another action to the gateway",
+        grant: Grant::OtherAction,
+        admitted: false,
+    },
+    GrantRow {
+        case: "a grant that was added and then revoked",
+        grant: Grant::Revoked,
+        admitted: false,
+    },
+];
+
+/// The CONNECTION REQUEST's own function: it is invoked only where its resource policy admits
+/// the gateway, and a handshake whose invocation was not made is refused `500` with the
+/// deployment package never run.
+///
+/// Whether the function RAN is read from its own side effect — the record it writes to the
+/// queue — so a refused row asserts that nothing ran rather than merely that the client was
+/// refused.
+#[tokio::test]
+async fn a_connect_routes_function_is_invoked_only_where_its_policy_admits_the_gateway() {
+    for (index, row) in GRANT_ROWS.iter().enumerate() {
+        let case = row.case;
+        let (emulator, engine) = emulator();
+        let queue = given_queue(&emulator, case).await;
+        let function = format!("connect-grant-{index}");
+        let arn = given_ungranted_function(
+            &emulator,
+            &engine,
+            case,
+            &function,
+            &recording_handler("$connect", &queue, "{\"statusCode\": 200}"),
+        )
+        .await;
+        let api = given_api(&emulator, case).await;
+        given_route(&emulator, case, &api.api_id, "$connect", &arn, false, None).await;
+        given_stage(&emulator, case, &api.api_id).await;
+        given_grant(
+            &emulator,
+            case,
+            &function,
+            &api.api_id,
+            "$connect",
+            row.grant,
+        )
+        .await;
+
+        let opened = handshake_at(case, &api.authority, &format!("/{STAGE}")).await;
+        if row.admitted {
+            assert!(
+                opened.is_ok(),
+                "case {case:?}: expected the handshake to complete once the function's policy \
+                 admits the gateway, got {:?}",
+                opened.as_ref().err()
+            );
+            // The record proves the deployment package ran for the connection request.
+            recorded_event(&emulator, case, &queue, "$connect").await;
+            continue;
+        }
+        let refused = opened.err();
+        assert_eq!(
+            refused,
+            Some(INTERNAL_SERVER_ERROR),
+            "case {case:?}: expected {INTERNAL_SERVER_ERROR} for an invocation the function's \
+             policy does not admit, got {refused:?}"
+        );
+        // The connection request's invocation is synchronous — the handshake is answered after
+        // the function would have returned — so the queue AT THIS INSTANT says whether the
+        // deployment package ran at all.
+        let records = drained(&emulator, case, &queue).await;
+        assert!(
+            records.is_empty(),
+            "case {case:?}: expected no invocation of the function at all, got {records:?}"
+        );
+    }
+}
+
+/// The same grant decides a MESSAGE's route: the frame's function is invoked only where its
+/// policy admits the gateway, and a message whose invocation was not made reads the gateway's
+/// own `Internal server error` frame.
+///
+/// The api holds no `$connect` route, so the handshake completes whatever the message route's
+/// function is granted — which is what leaves the grant as the only difference between rows.
+#[tokio::test]
+async fn a_message_routes_function_is_invoked_only_where_its_policy_admits_the_gateway() {
+    for (index, row) in GRANT_ROWS.iter().enumerate() {
+        let case = row.case;
+        let (emulator, engine) = emulator();
+        let queue = given_queue(&emulator, case).await;
+        let function = format!("message-grant-{index}");
+        let arn = given_ungranted_function(
+            &emulator,
+            &engine,
+            case,
+            &function,
+            &recording_handler(
+                "sendmessage",
+                &queue,
+                "{\"statusCode\": 200, \"body\": \"served\"}",
+            ),
+        )
+        .await;
+        let api = given_api(&emulator, case).await;
+        given_route(
+            &emulator,
+            case,
+            &api.api_id,
+            "sendmessage",
+            &arn,
+            true,
+            None,
+        )
+        .await;
+        given_stage(&emulator, case, &api.api_id).await;
+        given_grant(
+            &emulator,
+            case,
+            &function,
+            &api.api_id,
+            "sendmessage",
+            row.grant,
+        )
+        .await;
+
+        let mut socket = handshake_at(case, &api.authority, &format!("/{STAGE}"))
+            .await
+            .unwrap_or_else(|status| {
+                panic!(
+                    "case {case:?}: an api with no $connect route completes the handshake, got \
+                     {status}"
+                )
+            });
+        let reply = exchanged_reply(case, &mut socket, r#"{"action":"sendmessage"}"#).await;
+        if row.admitted {
+            assert_eq!(
+                reply, "served",
+                "case {case:?}: expected the function's own reply, got {reply:?}"
+            );
+            recorded_event(&emulator, case, &queue, "sendmessage").await;
+            continue;
+        }
+        let frame: Value = serde_json::from_str(&reply).unwrap_or_else(|error| {
+            panic!("case {case:?}: expected the gateway's own frame, got {reply:?}: {error}")
+        });
+        assert_eq!(
+            member(&frame, "/message"),
+            json!("Internal server error"),
+            "case {case:?}: expected the gateway's own sentence, got {frame}"
+        );
+        let records = drained(&emulator, case, &queue).await;
+        assert!(
+            records.is_empty(),
+            "case {case:?}: expected no invocation of the function at all, got {records:?}"
+        );
+    }
+}
+
+/// The grant decides the NEXT handshake, in both directions: the policy is read from Lambda per
+/// invocation rather than held by this service, so adding the permission makes a refused
+/// connection request complete and revoking it makes a completing one refuse — with no
+/// redeploy of the stage and no change to the api.
+#[tokio::test]
+async fn a_permission_added_or_revoked_decides_the_next_connection_request() {
+    let case = "the grant is added and revoked while the stage serves";
+    let (emulator, engine) = emulator();
+    let queue = given_queue(&emulator, case).await;
+    let function = "connect-grant-lifecycle";
+    let arn = given_ungranted_function(
+        &emulator,
+        &engine,
+        case,
+        function,
+        &recording_handler("$connect", &queue, "{\"statusCode\": 200}"),
+    )
+    .await;
+    let api = given_api(&emulator, case).await;
+    given_route(&emulator, case, &api.api_id, "$connect", &arn, false, None).await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    // Before the grant: refused, and nothing ran.
+    let refused = handshake_at(case, &api.authority, &format!("/{STAGE}"))
+        .await
+        .err();
+    assert_eq!(
+        refused,
+        Some(INTERNAL_SERVER_ERROR),
+        "case {case:?}: expected {INTERNAL_SERVER_ERROR} before the permission exists, got \
+         {refused:?}"
+    );
+    let records = drained(&emulator, case, &queue).await;
+    assert!(
+        records.is_empty(),
+        "case {case:?}: expected no invocation before the permission exists, got {records:?}"
+    );
+
+    // Added: the next handshake is admitted by the function itself.
+    gateway_may_invoke(&emulator, case, function, None).await;
+    let opened = handshake_at(case, &api.authority, &format!("/{STAGE}")).await;
+    assert!(
+        opened.is_ok(),
+        "case {case:?}: expected the handshake to complete once the permission exists, got {:?}",
+        opened.as_ref().err()
+    );
+    recorded_event(&emulator, case, &queue, "$connect").await;
+    drop(opened);
+
+    // Revoked: the next handshake is refused again.
+    revoke_gateway_grant(&emulator, case, function).await;
+    let refused = handshake_at(case, &api.authority, &format!("/{STAGE}"))
+        .await
+        .err();
+    assert_eq!(
+        refused,
+        Some(INTERNAL_SERVER_ERROR),
+        "case {case:?}: expected {INTERNAL_SERVER_ERROR} once the permission is revoked, got \
+         {refused:?}"
+    );
 }

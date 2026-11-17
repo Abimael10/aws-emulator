@@ -14,7 +14,11 @@
 //!   RUN through Lambda's own modelled `Invoke` over the in-process transport the api's
 //!   socket was opened with, and its answer is read back as the structured response
 //!   ([`crate::service::invoke::proxy_response::websocket_reply`]) — so the status that
-//!   decides the call and the payload a two-way route sends back are the function's own.
+//!   decides the call and the payload a two-way route sends back are the function's own. The
+//!   invocation is made as API Gateway's OWN service principal, so it is made only where the
+//!   function's resource-based policy admits that principal for this route's `execute-api`
+//!   ARN ([`lambda::invocation_admitted`]); an invocation it does not admit is never made, and
+//!   the route produced no reply.
 //! * `MOCK` is answered from the integration's own records ([`super::dispatch::mock_reply`]).
 //! * `AWS` — the non-proxy integration — relays what its own request template RENDERS to the
 //!   backend, and reads the backend's answer back through the selected integration response's
@@ -228,6 +232,24 @@ async fn lambda_proxy(
     let payload = ::serde_json::to_vec(&event).map_err(|error| {
         Unserved::Unperformable(format!("the event for this call could not be stated: {error}"))
     })?;
+    // The gateway invokes the function as ITS OWN service principal, so what admits the
+    // invocation is the FUNCTION's resource-based policy, narrowed to the route this call was
+    // served by ([`lambda::invocation_admitted`]) — the same grant the HTTP data plane's proxy
+    // integration is admitted by, taken here over the `execute-api` ARN of a WebSocket route
+    // (`{api-id}/{stage}/{route-key}`). An invocation the policy does not admit is NEVER MADE,
+    // so this route reaches no backend at all.
+    let source_arn = crate::service::invoke::request_authorizer::websocket_route_arn(
+        &connection.region,
+        &connection.api_id,
+        &connection.stage_name,
+        &selected.route_key,
+    );
+    if !lambda::invocation_admitted(callback, &target, &source_arn).await {
+        return Err(Unserved::Unperformable(format!(
+            "this route's function allows the gateway no invocation of it for {source_arn}, so \
+             none was made"
+        )));
+    }
     // An invocation the backend never answered is the integration's own failure: it was not
     // delivered, it was refused before anything ran, or it overran the integration's deadline.
     let ran = lambda::invoke_function(callback, &target, payload, deadline(integration))
