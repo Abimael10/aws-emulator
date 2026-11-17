@@ -40,13 +40,17 @@ use crate::workspace_lockfile_covers_every_manifest::{
 
 /// How many `[[package]]` records a read of the committed lock must return before a check
 /// over it means anything: this workspace locks hundreds, so a smaller number is a reader
-/// that stopped early rather than a lock that is in order.
-const LEAST_EXPECTED_PACKAGES: usize = 100;
+/// that stopped early rather than a lock that is in order. The same floor serves
+/// `workspace_lockfile_is_closed_over_its_edges`, which reads the same records.
+pub(crate) const LEAST_EXPECTED_PACKAGES: usize = 100;
 
 /// The lock's entries for the crates built out of this checkout — the workspace's members and
 /// the vendored path dependencies — keyed by crate name. They carry no source, and a crate
 /// name is locked once among them.
-fn source_free_entries(entries: &[LockEntry]) -> BTreeMap<String, LockEntry> {
+///
+/// `workspace_lockfile_is_closed_over_its_edges` pairs the path dependencies among them with
+/// their own manifests, so this one view of the lock's source-free records serves both.
+pub(crate) fn source_free_entries(entries: &[LockEntry]) -> BTreeMap<String, LockEntry> {
     entries
         .iter()
         .filter(|entry| entry.source.is_none())
