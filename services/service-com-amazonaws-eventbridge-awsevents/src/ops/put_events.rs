@@ -179,6 +179,17 @@ use api_destination::*;
 pub(crate) mod queue_sends;
 pub(crate) use queue_sends::QueueSends;
 
+/// The Amazon ECS half of the delivery pass: the `RunTask` a rule makes when an
+/// event it matched reaches a target naming an ECS cluster.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason
+/// the api-destination module above gives.
+#[path = "put_events/ecs_task.rs"]
+mod ecs_task;
+// The items it holds are this module's own, for the reason the api-destination
+// glob above gives.
+use ecs_task::*;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -1668,6 +1679,11 @@ pub(crate) struct CompiledTarget {
     /// `None` for a target carrying no `SqsParameters`, which is every standard
     /// queue: such a message belongs to no group.
     message_group_id: Option<String>,
+    /// `Target$EcsParameters`: "the Amazon ECS task definition and task count to
+    /// be used, if the event target is an Amazon ECS task" — the whole of what
+    /// the `RunTask` an ECS cluster target is invoked by is made of
+    /// ([`ecs_task::run`]). `None` for a target that is not one.
+    ecs_parameters: Option<EcsParameters>,
 }
 
 impl CompiledTarget {
@@ -1823,6 +1839,7 @@ pub(crate) fn compiled_targets(
                 .sqs_parameters
                 .as_ref()
                 .and_then(|parameters| parameters.message_group_id.clone()),
+            ecs_parameters: target.raw.ecs_parameters.clone(),
         })
         .collect()
 }
@@ -2073,9 +2090,11 @@ pub(crate) async fn deliver(
             rule: handover.rule,
             target_id: &target.id,
             action: kind.action(),
-            resource: &target.arn,
+            // The resource that action is performed ON, which is the target's own
+            // ARN for every kind but one ([`TargetKind::action_resource`]).
+            resource: kind.action_resource(handover),
         };
-        match role_refusal(stores.iam, role_arn, handover.rule_arn, &attempt) {
+        match kind.role_bars(stores.iam, role_arn, handover, &attempt) {
             Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
             // "Input: valid JSON text passed to the target": what a target is
             // handed is a JSON document, so an input this delivery rendered that
@@ -2873,6 +2892,10 @@ enum TargetKind {
     /// the target receives as the record's data, which that stream then buffers
     /// and delivers to its own destination.
     DeliveryStream,
+    /// An Amazon ECS cluster: `ecs:RunTask` running the task the target's
+    /// `EcsParameters` describe in that cluster, with what the target receives as
+    /// the run's `overrides` (see [`ecs_task::run`]).
+    EcsTask,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -2996,6 +3019,10 @@ impl TargetKind {
             {
                 Some(Self::DeliveryStream)
             }
+            // A cluster's ARN names the cluster directly (`cluster/<name>`): a
+            // resource addressing something WITHIN a cluster (one of its tasks,
+            // one of its services) is not a cluster, so no task is run for it.
+            ECS_ARN_NAMESPACE if ecs_task::cluster_in_arn(arn).is_some() => Some(Self::EcsTask),
             _ => None,
         }
     }
@@ -3017,6 +3044,41 @@ impl TargetKind {
             Self::Pipeline => "codepipeline:StartPipelineExecution",
             Self::LogGroup => crate::state::log_group_target::PUT_LOG_EVENTS_ACTION,
             Self::DeliveryStream => "firehose:PutRecord",
+            Self::EcsTask => crate::state::ecs_target::RUN_TASK_ACTION,
+        }
+    }
+
+    /// The RESOURCE the action [`Self::action`] names is performed ON, which is
+    /// what a grant in force on the target's role has to cover.
+    ///
+    /// The target's own ARN for every kind but one: an `ecs:RunTask` is performed
+    /// on the TASK DEFINITION the run names — the resource type Amazon ECS
+    /// publishes for that action — with the cluster the task is placed in carried
+    /// as a condition key instead ([`ecs_task::run_resource`]).
+    fn action_resource<'a>(self, handover: &Handover<'a>) -> &'a str {
+        match self {
+            Self::EcsTask => ecs_task::run_resource(handover),
+            _ => handover.target.arn.as_str(),
+        }
+    }
+
+    /// Why the policies in force on the target's role bar this invocation, or
+    /// `None` when nothing of the kind can be shown.
+    ///
+    /// The shared decision for every kind AWS invokes under that role
+    /// ([`role_refusal`]), which an ECS task run takes with the cluster it places
+    /// into published as a condition key
+    /// ([`ecs_task::run_authorization_refusal`]).
+    fn role_bars(
+        self,
+        iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+        role_arn: Option<&str>,
+        handover: &Handover<'_>,
+        attempt: &crate::state::DeliveryAttempt<'_>,
+    ) -> Option<(String, String)> {
+        match self {
+            Self::EcsTask => ecs_task::run_authorization_refusal(iam, role_arn, handover, attempt),
+            _ => role_refusal(iam, role_arn, handover.rule_arn, attempt),
         }
     }
 
@@ -3248,6 +3310,14 @@ impl TargetKind {
                     )),
                 }
             }
+            Self::EcsTask => {
+                // Reading the delivered text back as the run's overrides is CPU
+                // work on this worker: yielding first gives a cancellation or
+                // shutdown signal somewhere to land before it starts, as the
+                // stream branch above does.
+                ::tokio::task::yield_now().await;
+                ecs_task::run(callback, clients, stores, region, handover, body).await
+            }
         })
     }
 
@@ -3264,6 +3334,7 @@ impl TargetKind {
             Self::Pipeline => CODEPIPELINE_ARN_NAMESPACE,
             Self::LogGroup => crate::state::log_group_target::LOGS_ARN_NAMESPACE,
             Self::DeliveryStream => FIREHOSE_ARN_NAMESPACE,
+            Self::EcsTask => ECS_ARN_NAMESPACE,
         }
     }
 }
@@ -4617,6 +4688,7 @@ pub(crate) struct Clients {
     codepipeline: Option<(String, ::aws_sdk_codepipeline::Client)>,
     logs: Option<(String, ::aws_sdk_cloudwatchlogs::Client)>,
     firehose: Option<(String, ::aws_sdk_firehose::Client)>,
+    ecs: Option<(String, ::aws_sdk_ecs::Client)>,
     /// What each queue this request has already handed an event to answered when
     /// the attributes that decide a delivery to it were read, keyed by that
     /// queue's url. `None` under a url is a queue that did not answer the read,
@@ -4634,6 +4706,11 @@ pub(crate) struct Clients {
     /// The same, for each FUNCTION this request has invoked: the resource-based
     /// policy that decides the invocation ([`function_policy`]).
     function_policies: ::std::collections::BTreeMap<String, Option<Option<String>>>,
+    /// The same, for each TASK DEFINITION this request has run an ECS target's
+    /// task of: the roles a run of that revision HANDS Amazon ECS, which decide
+    /// whether the target's role may make the run at all
+    /// ([`ecs_task::task_definition_roles`]).
+    task_definition_roles: ::std::collections::BTreeMap<String, TaskDefinitionRoles>,
 }
 
 /// Build the clients the same way: over the in-process callback into this
@@ -4690,6 +4767,7 @@ impl Clients {
     // Amazon CloudWatch Logs publishes its endpoint and signs under `logs`.
     callback_client!(logs, aws_sdk_cloudwatchlogs, "logs");
     callback_client!(firehose, aws_sdk_firehose, "firehose");
+    callback_client!(ecs, aws_sdk_ecs, "ecs");
 
     /// The attributes that decide a delivery to the queue at `queue_url`, read
     /// through that queue's own `GetQueueAttributes` on first use and then
@@ -4750,6 +4828,23 @@ impl Clients {
         let read = function_policy(client, function_arn).await;
         self.function_policies
             .insert(function_arn.to_string(), read.clone());
+        read
+    }
+
+    /// The roles a run of the task-definition revision `task_definition` names
+    /// hands Amazon ECS, read once per revision per request for the reason
+    /// [`Self::queue_attributes`] gives.
+    async fn task_definition_roles(
+        &mut self,
+        client: &::aws_sdk_ecs::Client,
+        task_definition: &str,
+    ) -> TaskDefinitionRoles {
+        if let Some(held) = self.task_definition_roles.get(task_definition) {
+            return held.clone();
+        }
+        let read = task_definition_roles(client, task_definition).await;
+        self.task_definition_roles
+            .insert(task_definition.to_string(), read.clone());
         read
     }
 }

@@ -23,11 +23,14 @@
 //!
 //! The table spans the class rather than one case: its rows differ along the
 //! SERVICE the target belongs to — one whose invocation this emulator makes
-//! (Step Functions), one it makes none for (Amazon ECS), one whose own service
-//! is not mounted here (Amazon Data Firehose) and one reached under the target's
+//! (Step Functions), one it makes none for (AWS Batch), one whose own service
+//! is not mounted here (Amazon Data Firehose, Amazon ECS) and one reached under
+//! the target's
 //! own policy (Amazon SQS) — along whether the role is assumable, and along
 //! whether it carries any permissions at all. WHICH rule the assume is made for
-//! is `target_role_trust_conditions`' table.
+//! is `target_role_trust_conditions`' table. What an ECS target's role has to be
+//! ALLOWED for its run to be made is the router's own
+//! `eventbridge_ecs_task_target` suite, where that service is mounted.
 //!
 //! The harness (the router with EventBridge, SQS, Step Functions, IAM and
 //! CloudWatch on one engine, and the rule/queue/role fixtures) is the one
@@ -72,8 +75,13 @@ enum Target {
     DeliveryStream,
     /// An Amazon ECS task: another target AWS invokes under that role, named by
     /// the CLUSTER it runs on with the task definition in the target's own
-    /// parameter block, and with no invocation here either.
+    /// parameter block, whose own service is not mounted beside EventBridge
+    /// here either.
     EcsTask,
+    /// An AWS Batch job queue: a target AWS invokes under that role, named by
+    /// the job QUEUE with the job in the target's own parameter block, and one
+    /// this emulator makes no invocation for.
+    JobQueue,
     /// A Step Functions state machine: a target AWS invokes under that role and
     /// this emulator does invoke.
     StateMachine,
@@ -133,8 +141,8 @@ fn rows() -> Vec<Row> {
             expected: Expect::DeadLettered,
         },
         Row {
-            case: "an ECS task definition under a role this service can assume",
-            target: Target::EcsTask,
+            case: "a Batch job queue under a role this service can assume",
+            target: Target::JobQueue,
             trusts: EVENTS_PRINCIPAL,
             allows: Some("*"),
             expected: Expect::NotAttempted,
@@ -143,8 +151,8 @@ fn rows() -> Vec<Row> {
             // The role is assumable and allows nothing: the permission step is
             // about the call, and there is no call here to judge, so nothing is
             // refused and nothing is dead-lettered.
-            case: "an ECS task definition under an assumable role carrying no permissions",
-            target: Target::EcsTask,
+            case: "a Batch job queue under an assumable role carrying no permissions",
+            target: Target::JobQueue,
             trusts: EVENTS_PRINCIPAL,
             allows: None,
             expected: Expect::NotAttempted,
@@ -189,6 +197,10 @@ async fn given_target(emulator: &Emulator, target: Target) -> (String, Option<St
         ),
         Target::EcsTask => (
             format!("arn:aws:ecs:{REGION}:{account}:cluster/orders"),
+            None,
+        ),
+        Target::JobQueue => (
+            format!("arn:aws:batch:{REGION}:{account}:job-queue/orders"),
             None,
         ),
         Target::StateMachine => (
@@ -249,6 +261,12 @@ async fn a_role_this_service_cannot_assume_dead_letters_the_event_whatever_the_t
             // An ECS target names the cluster and carries the task it runs in its
             // parameter block, so both are written for it.
             target["EcsParameters"] = json!({ "TaskDefinitionArn": task_definition_arn() });
+        }
+        if row.target == Target::JobQueue {
+            // A Batch target names the queue and carries the job it submits in its
+            // own parameter block, both of whose members are required.
+            target["BatchParameters"] =
+                json!({ "JobDefinition": "orders:1", "JobName": "orders" });
         }
         given_rule(&emulator, RULE_NAME, json!([target])).await;
 

@@ -4861,6 +4861,12 @@ pub mod target_account;
 /// `iam:PassRole` pass every operation that takes a role ARN makes.
 pub mod pass_role;
 
+/// What the policies in force on a rule target's role have to say before an
+/// Amazon ECS task target of that rule is run: the `ecs:RunTask` it performs on
+/// the task definition, in the cluster it places into, and the `iam:PassRole` of
+/// each role it hands Amazon ECS.
+pub mod ecs_target;
+
 /// The customer managed key an EVENT BUS is configured with, and whether that
 /// key's own policy lets this service use it — asked by every writer of a bus's
 /// `KmsKeyIdentifier`.

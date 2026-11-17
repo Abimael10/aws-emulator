@@ -77,6 +77,11 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 # over the same in-process callback: the stream then buffers the record and
 # delivers it to its own destination.
 aws-sdk-firehose = { version = "1", default-features = false }
+# An Amazon ECS cluster target is delivered to by RUNNING the task its
+# `EcsParameters` describe in that cluster (`RunTask`), over the same in-process
+# callback; the revision that run hands its roles over from is read back through
+# `DescribeTaskDefinition`.
+aws-sdk-ecs = { version = "1", default-features = false }
 # `FailedInvocations`, the metric EventBridge counts an undeliverable event on,
 # is appended to the CloudWatch store in the SAME shared engine (the `AWS/Events`
 # namespace). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
