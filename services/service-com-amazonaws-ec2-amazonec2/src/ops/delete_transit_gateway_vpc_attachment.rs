@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachment still joining them: one already on its way out, or one the lifecycle has
         // finished with, attaches nothing, and a second delete of it is refused with the
         // attachment family's own `IncorrectState` rather than restarting the clock on it.
-        if !attachment_state_admits_deletion(record.view.state()) {
+        if !state::transit_gateway_attachment_state_admits_deletion(record.view.state()) {
             return Err(state::transit_gateway_attachment_invalid_state(
                 attachment_id,
             ));
@@ -239,24 +239,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// id in it comes from the REQUEST.
 const TRANSIT_GATEWAY_VPC_ATTACHMENT_RESOURCE_NAME: &str = "Transit Gateway VPC Attachment";
 
-/// Whether a VPC attachment in `attachment_state` still attaches its VPC, so a delete has
-/// something to take away.
-///
-/// The states that admit no delete are the ones in which the attachment joins nothing any more:
-/// the terminal members of `TransitGatewayAttachmentState`
-/// (`smithy_query(query="shape",shape="TransitGatewayAttachmentState")`) that are not "in
-/// service" — deleted, rejected and failed, which
-/// [`crate::state::transit_gateway_attachment_is_finished`] is the one definition of — and the
-/// transient states on the way to each of them, which an earlier call has already started and
-/// which a second call cannot start again.
-fn attachment_state_admits_deletion(attachment_state: Option<&str>) -> bool {
-    !crate::state::transit_gateway_attachment_is_finished(attachment_state)
-        && !matches!(
-            attachment_state,
-            Some(
-                crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETING
-                    | crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTING
-                    | crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILING
-            )
-        )
-}

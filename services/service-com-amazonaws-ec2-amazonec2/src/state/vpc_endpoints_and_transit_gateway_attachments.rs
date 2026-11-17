@@ -891,6 +891,28 @@ pub fn transit_gateway_attachment_is_finished(attachment_state: Option<&str>) ->
     )
 }
 
+/// Whether an attachment in `attachment_state` still attaches what it joins, so a delete has
+/// something to take away.
+///
+/// The states that admit no delete are the ones in which the attachment joins nothing any more —
+/// [`transit_gateway_attachment_is_finished`] — and the transient states on the way to each of
+/// them, which an earlier call has already started and which a second call cannot start again.
+///
+/// The ONE definition of it, for every delete of an attachment of any kind
+/// (`DeleteTransitGatewayVpcAttachment`, `DeleteTransitGatewayConnect`), so a state added to
+/// `TransitGatewayAttachmentState` cannot be admitted by one of them and refused by another.
+pub fn transit_gateway_attachment_state_admits_deletion(attachment_state: Option<&str>) -> bool {
+    !transit_gateway_attachment_is_finished(attachment_state)
+        && !matches!(
+            attachment_state,
+            Some(
+                TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETING
+                    | TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTING
+                    | TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILING
+            )
+        )
+}
+
 /// `pendingAcceptance` as the OTHER state enum spells it:
 /// `TransitGatewayClientVpnAttachment$State` targets `TransitGatewayAttachmentStatusType`,
 /// whose members are hyphenated (`pending-acceptance`, `pending`, `rejected`, `available`,
@@ -1563,6 +1585,27 @@ impl ComAmazonawsEc2Amazonec2State {
             }) => attachment.transit_gateway_id.as_deref(),
             _ => None,
         }
+    }
+
+    /// The ids of the Connect peers of the Connect attachment `attachment_id` whose deletion has
+    /// NOT settled — a peer still being created, in service, or on its way out — in the order the
+    /// store holds them.
+    ///
+    /// "You must first delete any Connect peers for the attachment"
+    /// (`DeleteTransitGatewayConnect`): a peer peers OVER the attachment, so while one of them is
+    /// anything but `deleted` the attachment is still carrying it. The terminal `deleted` of
+    /// `TransitGatewayConnectPeerState` is the only state in which a peer carries nothing any
+    /// more, which is the same line [`Self::transit_gateway_connect_peer_holds_allocations`] draws
+    /// for what a peer still holds of its transit gateway.
+    pub fn non_deleted_connect_peers_of(&self, attachment_id: &str) -> Vec<&str> {
+        self.transit_gateway_connect_peers
+            .values()
+            .filter(|record| {
+                record.view.transit_gateway_attachment_id.as_deref() == Some(attachment_id)
+                    && record.view.state.as_deref() != Some(CONNECT_PEER_STATE_DELETED)
+            })
+            .filter_map(|record| record.view.transit_gateway_connect_peer_id.as_deref())
+            .collect()
     }
 
     /// Whether `peer` still HOLDS the allocations it was given out of the transit gateway
@@ -2726,6 +2769,27 @@ pub fn decide_transit_gateway_attachment<E>(
 /// `<Kind> '<id>' is in the '<state>' state.` ([`incorrect_state_of`]).
 pub fn transit_gateway_attachment_invalid_state<E>(attachment_id: &str) -> Scaffolded<E> {
     incorrect_state(format!("{attachment_id} is in invalid state"))
+}
+
+/// Refuse the delete of a Connect attachment that still has Connect peers on it: HTTP 400
+/// `IncorrectState`, `Connect <attachment-id> has non-deleted connect peers: <peer-ids>.`
+///
+/// "You must first delete any Connect peers for the attachment"
+/// (`DeleteTransitGatewayConnect`), so the refusal names what the caller has to delete FIRST
+/// rather than only the state the attachment is in: the attachment id comes from the request and
+/// the peer ids from the store ([`ComAmazonawsEc2Amazonec2State::non_deleted_connect_peers_of`]),
+/// which is why this is not worded through the family's own state sentence
+/// ([`transit_gateway_attachment_invalid_state`]) — a caller that cannot see which peers are in
+/// the way cannot act on the refusal. Several peers are named in the order the store holds them,
+/// separated the way a sentence lists ids.
+pub fn connect_attachment_has_non_deleted_peers<E>(
+    attachment_id: &str,
+    peer_ids: &[&str],
+) -> Scaffolded<E> {
+    incorrect_state(format!(
+        "Connect {attachment_id} has non-deleted connect peers: {peers}.",
+        peers = peer_ids.join(", "),
+    ))
 }
 
 /// The server error a handler answers when the attachment this module just resolved for it

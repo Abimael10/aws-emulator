@@ -14,6 +14,8 @@
 // class by class over tables of requests. Declared FIRST for the reason the note below gives:
 // the sorted neighbourhood and the tail of this file are where every new ec2 suite inserts
 // its lines.
+#[path = "all/delete_transit_gateway_connect.rs"]
+mod delete_transit_gateway_connect;
 #[path = "all/network_and_group_refusal_sentences.rs"]
 mod network_and_group_refusal_sentences;
 // The propagation route tables one transit gateway attachment's routes propagate into.
