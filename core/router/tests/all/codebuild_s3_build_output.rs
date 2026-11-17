@@ -52,7 +52,12 @@ const POLL_PAUSE: Duration = Duration::from_millis(20);
 /// The emulator for this suite: CodeBuild, S3 and IAM on ONE engine, exactly as the router
 /// mounts them, with request authentication off so each call carries a credential scope
 /// (which names the Region and the service) without a computed signature.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` here and on the helpers below: `codebuild_s3_source_version_pinning.rs` drives
+/// the SAME three services over the same wire, and `tests/all/main.rs` is one crate root, so
+/// that suite shares this harness rather than growing a second copy of it — the reason
+/// [`crate::query_wire`] exists for the XML readers.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -71,7 +76,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Dispatch one request addressed to `signing_name`, the way a signed SDK call is.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     signing_name: &str,
     method: &str,
@@ -101,7 +106,11 @@ async fn send(
 }
 
 /// One awsJson1_1 call to CodeBuild, answered with the HTTP status and the JSON body.
-async fn codebuild(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn codebuild(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let (status, bytes) = send(
         router,
         "codebuild",
@@ -123,7 +132,7 @@ async fn codebuild(router: &MultiServiceRouter, operation: &str, body: Value) ->
 }
 
 /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite is signed for.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let (status, body) = send(
         router,
         "s3",
@@ -177,7 +186,7 @@ async fn object_bytes(router: &MultiServiceRouter, bucket: &str, key: &str) -> O
 /// Create an IAM role CodeBuild can assume and hand back its ARN: a project's `serviceRole`
 /// is resolved against the account's IAM, so the role has to exist and trust the service
 /// before a project can be stored at all.
-async fn codebuild_role(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn codebuild_role(router: &MultiServiceRouter, name: &str) -> String {
     let document = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -263,7 +272,7 @@ async fn settled_build(router: &MultiServiceRouter, project: &str) -> Value {
 }
 
 /// Poll `BatchGetBuilds` for `id` until the build reports itself complete.
-async fn settled(router: &MultiServiceRouter, id: &str) -> Value {
+pub(crate) async fn settled(router: &MultiServiceRouter, id: &str) -> Value {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     let mut last = Value::Null;
     while Instant::now() < deadline {
