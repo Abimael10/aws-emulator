@@ -11,18 +11,22 @@
 //! > `destinationArn` names — in either published form of a log-group ARN, the group itself or
 //! > everything under it — and that record is the stage's `format` with its literal text
 //! > passed through VERBATIM and each `$context.<member>` reference replaced by the value for
-//! > THAT request (the id the answer was reported under, the verb, the matched resource path,
-//! > the stage, the decimal status the stage answered with), a reference this plane produces
-//! > no value for rendered as the one-character placeholder a field with no value carries.
-//! > The integration type that produced the answer decides none of this: a `MOCK` method,
-//! > which needs no backend at all, is logged exactly as any other.
+//! > THAT request (the id the answer was reported under, the verb the CLIENT SENT, the matched
+//! > resource path, the stage, the decimal status the stage answered with), a reference this
+//! > plane produces no value for rendered as the one-character placeholder a field with no
+//! > value carries. The integration type that produced the answer decides none of this: a
+//! > `MOCK` method, which needs no backend at all, is logged exactly as any other, and neither
+//! > does WHICH method answered: a request served by the resource's `ANY` catch-all is logged
+//! > under its own verb, because `ANY` is the name a method is configured under rather than a
+//! > verb a request carries.
 //!
 //! The sibling `stage_access_logging` suite spans the destinations and outcomes of a stage
 //! whose method is run by AWS Lambda; what this suite adds is the RENDERING itself over a
 //! table of formats — a JSON one carrying literal members beside its references, a line whose
 //! only `$` opens no reference, and one naming members this plane has no value for — crossed
-//! with both forms of the destination ARN and with two methods the stage answers with
-//! different statuses, on the one integration type that reaches no backend.
+//! with both forms of the destination ARN and with the methods the stage answers with — two
+//! explicit verbs answering with different statuses and the `ANY` catch-all that answers a
+//! verb neither of them names — on the one integration type that reaches no backend.
 //!
 //! Only a cross-service suite can pin this: the api, its stage and the logging configuration
 //! are API Gateway's, the role the account logs under is AWS IAM's, and the group a record
@@ -56,6 +60,15 @@ const RESOURCE_PATH: &str = "/ping";
 const ROLE_NAME: &str = "apigw-access-logs";
 const ROLE_PATH: &str = "/service-role/";
 const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
+
+/// The verb no method of its own serves, so the resource's `ANY` catch-all answers it: what
+/// the record then names is this verb, not the catch-all's name.
+const CATCH_ALL_VERB: &str = "PUT";
+
+/// The catch-all's own verb and the body it answers with, which every verb but the two
+/// explicit ones below reaches.
+const ANY_VERB: &str = "ANY";
+const ANY_BODY: &str = r#"{"any":true}"#;
 
 /// The two methods the stage serves, each a `MOCK` integration — "for testing without
 /// actually invoking the backend" (`IntegrationType`) — so what is logged is a stage's own
@@ -142,6 +155,20 @@ fn rows() -> Vec<Row> {
             path: RESOURCE_PATH,
             status: 201,
             expected: "POST /ping 201 {requestId}",
+        },
+        Row {
+            case: "a request the resource's ANY catch-all answered, logged under its own verb",
+            group: "/apigw/access/catch-all",
+            everything_under: false,
+            format: JSON_FORMAT,
+            verb: CATCH_ALL_VERB,
+            path: RESOURCE_PATH,
+            status: 200,
+            expected: concat!(
+                r#"{"marker":"pinned-literal","requestId":"{requestId}","#,
+                r#""httpMethod":"PUT","status":"200","#,
+                r#""resourcePath":"/ping","stage":"live"}"#
+            ),
         },
         Row {
             case: "a format whose literal text carries a dollar that opens no reference",
@@ -278,6 +305,27 @@ async fn deployed(gateway: &Gateway) -> String {
         CREATED_VERB,
         CREATED_STATUS,
         json!({ "responseTemplates": json_template(CREATED_BODY) }),
+    )
+    .await;
+    // The catch-all beside them, so a row can be answered by a method that is not the one its
+    // verb names — which is what tells the verb a record NAMES from the method that answered.
+    put_method(
+        gateway,
+        &api,
+        &resource,
+        ANY_VERB,
+        json!({ "authorizationType": "NONE" }),
+    )
+    .await;
+    put_integration(gateway, &api, &resource, ANY_VERB, json!({ "type": "MOCK" })).await;
+    method_response(gateway, &api, &resource, ANY_VERB, SERVED_STATUS, json!({})).await;
+    integration_response(
+        gateway,
+        &api,
+        &resource,
+        ANY_VERB,
+        SERVED_STATUS,
+        json!({ "responseTemplates": json_template(ANY_BODY) }),
     )
     .await;
     deploy(gateway, &api, STAGE).await;

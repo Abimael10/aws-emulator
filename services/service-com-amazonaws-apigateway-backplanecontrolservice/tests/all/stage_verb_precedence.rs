@@ -13,7 +13,10 @@
 //! > HAS is a separate question the control plane answers: `GetMethod` for a verb the
 //! > resource carries no method for is `NotFoundException` (404) however the stage serves
 //! > that verb, and a deployment made after the explicit method is deleted serves its verb
-//! > from `ANY`.
+//! > from `ANY`. WHAT the serving method reports about the request's HTTP method is the verb
+//! > the CLIENT sent (`$context.httpMethod` is "the HTTP method used"): `ANY` is the name a
+//! > method is configured under, the stand-in for every verb, so no request is ever reported
+//! > as having been sent with it.
 //!
 //! The rows span what that rule generalises over: the verb (two explicit ones, and every
 //! other verb `PutMethod` admits, served by `ANY`), and the resource before and after the
@@ -131,6 +134,89 @@ async fn deploy(gateway: &Gateway, api: &str) {
         "setup CreateDeployment({STAGE}): expected 201, got {} with {:?}",
         answer.status, answer.body
     );
+}
+
+/// The response template of a `MOCK` method that renders the call's own HTTP method, with
+/// `route` naming which of the resource's two methods served the request: the one value tells
+/// WHICH method answered and WHAT verb it reports, which is the pair under test.
+///
+/// `$context.httpMethod` is "the HTTP method used", so the value it renders is the verb the
+/// CLIENT sent — never the `ANY` catch-all, which is the name a method is configured under
+/// rather than a verb any request carries.
+fn context_verb_template(route: &str) -> String {
+    format!("{{\"route\": \"{route}\", \"verb\": \"$context.httpMethod\"}}")
+}
+
+/// The body the method serving `route` answers a request of `verb` with, once its template has
+/// been rendered against that request.
+fn rendered_context_verb(route: &str, verb: &str) -> String {
+    format!("{{\"route\": \"{route}\", \"verb\": \"{verb}\"}}")
+}
+
+#[tokio::test]
+async fn a_served_request_renders_the_verb_it_was_sent_with_whichever_method_serves_it() {
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "verb-precedence-context").await;
+    let collection = resource_under(&gateway, &api, &root, COLLECTION_SEGMENT).await;
+    let item = resource_under(&gateway, &api, &collection, ITEM_SEGMENT).await;
+
+    // One explicit method and the catch-all, each rendering the call's own verb: so a verb the
+    // catch-all serves is rendered by the SAME reference that an explicit method's request
+    // renders it by, and the two answers differ only in which method answered.
+    mock_method(
+        &gateway,
+        &api,
+        &item,
+        "GET",
+        &context_verb_template("explicit"),
+    )
+    .await;
+    mock_method(&gateway, &api, &item, "ANY", &context_verb_template("any")).await;
+    deploy(&gateway, &api).await;
+
+    let path = format!("/{STAGE}/{COLLECTION_SEGMENT}/dua-1");
+
+    // Rows: every verb the resource can be reached by — the one with a method of its own and
+    // every one the catch-all serves. Each is answered by its own method and renders its OWN
+    // verb.
+    for verb in VERBS {
+        let route = if *verb == "GET" { "explicit" } else { "any" };
+        let expected = rendered_context_verb(route, verb);
+        let (status, body) = invoke(&gateway, &api, verb, &path).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (200, expected.as_str()),
+            "case {verb:?}: expected the serving method to render the request's own verb, got \
+             ({status}, {body:?})"
+        );
+    }
+
+    // The explicit method is deleted and the deletion deployed: the verb that had its own
+    // method is now served by the catch-all, and what it renders is still that verb — the
+    // method that serves a request does not change what the request was sent as.
+    let deleted = gateway
+        .call(
+            "DELETE",
+            &format!("/restapis/{api}/resources/{item}/methods/GET"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "setup DeleteMethod(GET): expected 204, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    deploy(&gateway, &api).await;
+    for verb in VERBS {
+        let expected = rendered_context_verb("any", verb);
+        let (status, body) = invoke(&gateway, &api, verb, &path).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (200, expected.as_str()),
+            "case \"{verb} once every verb is the catch-all's\": expected the request's own \
+             verb, got ({status}, {body:?})"
+        );
+    }
 }
 
 #[tokio::test]

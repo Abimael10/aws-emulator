@@ -331,10 +331,10 @@ fn planned<Eng: Send + Sync + 'static>(
     let (stage_name, resource_path) = super::split_stage(resolved.invoke_path)?;
     let stage = api.stages.get(stage_name)?;
     // WHICH deployed method the request reached, where it reached one: the access log names
-    // the resource path of the matched method and the verb it was served under, and the
-    // execution log is gated by the settings in force for exactly that method. A request
-    // that matched none — a path this deployment does not carry — is still a request the
-    // stage answered, so it is logged under the path and verb the CLIENT addressed.
+    // the resource path of the matched method, and the execution log is gated by the settings
+    // in force for exactly that method. A request that matched none — a path this deployment
+    // does not carry — is still a request the stage answered, so it is logged under the path
+    // and verb the CLIENT addressed.
     let deployment = api.deployments.get(&stage.deployment_id);
     let matched = deployment.and_then(|deployment| {
         let path = super::match_resource_path(deployment, &resource_path)?;
@@ -342,11 +342,17 @@ fn planned<Eng: Send + Sync + 'static>(
         Some((path, verb))
     });
     let (matched_path, verb) = matched.unwrap_or((resource_path.as_str(), req.method()));
+    // The verb the CLIENT SENT, which is what a log says about the request's HTTP method:
+    // `$context.httpMethod` of the access-log format (rendered by `call_context`) and the
+    // execution log's own method line. It is NOT the `verb` above, which names the deployed
+    // METHOD that served the request — the `ANY` catch-all for a verb the resource carries no
+    // method of its own for, which is a configured name rather than a verb any request
+    // carries.
+    let request_verb = crate::ops::put_method::wire_verb(req.method());
     let status = response.status().as_u16();
     let mut context = super::call_context(
         &api.id,
         stage_name,
-        verb,
         matched_path,
         // What the CLIENT addressed within the api, which `$context.path` reports
         // stage-qualified: a parameterised resource's template is `matched_path`, and the
@@ -396,7 +402,7 @@ fn planned<Eng: Send + Sync + 'static>(
                     req,
                     response,
                     request_id,
-                    verb,
+                    &request_verb,
                     matched_path,
                     deployment
                         .and_then(|deployment| {
@@ -499,6 +505,7 @@ fn trace(
     req: &RtRequest,
     response: &RtResponse,
     request_id: &str,
+    // The verb the CLIENT SENT, which is the request's own HTTP method; see the caller.
     verb: &str,
     resource_path: &str,
     integration_type: Option<&str>,

@@ -1813,7 +1813,6 @@ async fn serving<Eng: Send + Sync + 'static>(
                     context: call_context(
                         &api.id,
                         &stage.stage_name,
-                        verb,
                         matched_path,
                         // The path the CLIENT addressed within the api, which
                         // `$context.path` reports stage-qualified: the template
@@ -4219,11 +4218,17 @@ fn request_host_of(req: &RtRequest) -> Option<String> {
 /// template reads a signed-in user by, `$context.authorizer.claims.sub`) and a custom
 /// authorizer's own values under `authorizer.<key>`. A method whose authorization publishes
 /// none adds no member, so such a reference stays unrendered.
-#[allow(clippy::too_many_arguments)]
+///
+/// `httpMethod` is the verb the CLIENT SENT, read off the request here rather than taken
+/// from the method that serves it: "the HTTP method used" is a value of the call, and the
+/// verbs it may be are the HTTP methods a request can carry. The [`ANY_METHOD`] catch-all is
+/// not one of them — it is the name a method is CONFIGURED under, the stand-in for every verb
+/// (the same reading [`http_integration`] applies to an integration's own `httpMethod`) — so
+/// a request served by it renders its own verb, exactly as one served by a method of that
+/// verb does.
 fn call_context(
     api_id: &str,
     stage: &str,
-    verb: &str,
     resource_path: &str,
     request_path: &str,
     req: &RtRequest,
@@ -4233,7 +4238,7 @@ fn call_context(
     let mut context: BTreeMap<String, String> = [
         ("apiId", api_id.to_string()),
         ("stage", stage.to_string()),
-        ("httpMethod", verb.to_string()),
+        ("httpMethod", wire_verb(req.method())),
         ("resourcePath", resource_path.to_string()),
         ("path", stage_qualified_path(stage, request_path)),
         ("accountId", ::engine::emulator_account_id().to_string()),
