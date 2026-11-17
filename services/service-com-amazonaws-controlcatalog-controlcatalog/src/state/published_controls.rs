@@ -327,9 +327,15 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     // --- AWS Config managed rules: detective controls -----------------------
     ControlSeed {
         slug: "account-part-of-organizations",
-        name: "Checks whether an Amazon Web Services account is part of an organization",
-        description: "Reports an account that is not a member of an Amazon Web Services \
-                      organization, so organization-wide governance cannot reach it.",
+        name: "Rule checks whether AWS account is part of AWS Organizations",
+        // The implementing AWS Config managed rule's own published description, which is
+        // what the catalog publishes for a control it publishes under a `CONFIG.…`
+        // designator: its first sentence is the control's published name, followed by the
+        // rule's own compliance criterion.
+        description: "Checks if an AWS account is part of AWS Organizations. The rule is \
+                      NON_COMPLIANT if an AWS account is not part of AWS Organizations or \
+                      AWS Organizations master account ID does not match rule parameter \
+                      MasterAccountId.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
@@ -351,15 +357,20 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         ],
     },
     ControlSeed {
-        slug: "cloud-trail-enabled",
-        name: "Checks whether CloudTrail is enabled in an Amazon Web Services account",
-        description: "Reports an account that records no management events through a \
+        slug: "detect-cloud-trail-enabled-on-shared-accounts",
+        name: "Detect whether CloudTrail is enabled on shared accounts",
+        description: "Detects whether CloudTrail is enabled on shared accounts. The rule \
+                      is NON_COMPLIANT if a shared account of the organization's security \
+                      organizational unit records no management events through a \
                       CloudTrail trail.",
         behavior: DETECTIVE,
         severity: HIGH,
+        // One AWS Config managed rule backs this Control Tower control and the
+        // member-account one below: two published controls over one implementation, each
+        // governing a different scope.
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("CLOUD_TRAIL_ENABLED"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_SHARED_ACCOUNTS"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
@@ -376,13 +387,14 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "detect-cloud-trail-enabled-on-member-accounts",
-        name: "Detect whether CloudTrail is enabled in a member account",
-        description: "Reports a member account of the organization that records no \
+        name: "Detect whether CloudTrail is enabled on member accounts",
+        description: "Detects whether CloudTrail is enabled on member accounts. The rule \
+                      is NON_COMPLIANT if a member account of the organization records no \
                       management events through a CloudTrail trail.",
         behavior: DETECTIVE,
         severity: HIGH,
-        // The same Config rule backs this Control Tower control and the Config-rule
-        // control above: two published controls, one implementation.
+        // The same Config rule backs this Control Tower control and the shared-account
+        // one above: two published controls, one implementation.
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("CLOUD_TRAIL_ENABLED"),
         control_tower_identifier: Some("AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_MEMBER_ACCOUNTS"),
@@ -430,15 +442,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "cloud-trail-log-file-validation-enabled",
-        name: "Checks whether CloudTrail log file validation is enabled",
-        description: "Reports a CloudTrail trail that publishes no digest files, so log \
-                      tampering cannot be detected.",
+        name: "Checks whether AWS CloudTrail creates a signed digest file with logs",
+        description: "Checks whether AWS CloudTrail creates a signed digest file with \
+                      logs. AWS recommends that the file validation must be enabled on all \
+                      trails. The rule is noncompliant if the validation is not enabled.",
         behavior: DETECTIVE,
-        severity: MEDIUM,
+        severity: HIGH,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.CLOUDTRAIL.DT.9"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -615,18 +628,21 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "iam-root-access-key-check",
-        name: "Checks whether the root user has an access key",
-        description: "Reports an account whose root user holds an access key.",
+        name: "Checks if the root user access key is available",
+        description: "Checks if the root user access key is available. The rule is \
+                      COMPLIANT if the user access key does not exist.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("IAM_ROOT_ACCESS_KEY_CHECK"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.IAM.DT.13"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         parameters: NO_PARAMETERS,
-        governed_resources: &["AWS::IAM::AccessKey"],
+        // The account's own root-user credentials, which no available resource type
+        // represents, so the catalog publishes the list empty.
+        governed_resources: NO_GOVERNED_RESOURCES,
         governed_providers: AWS,
         implements: "privileged-access-approval",
         frameworks: &[
@@ -638,13 +654,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "iam-user-mfa-enabled",
-        name: "Checks whether every IAM user has multi-factor authentication enabled",
-        description: "Reports an IAM user with no multi-factor authentication device.",
+        name: "Disallow access to IAM users without MFA",
+        // Control Tower's own published description for the control it publishes, which
+        // is what the catalog publishes for a control carrying an `AWS-GR_…` designator.
+        description: "Reduces the risk of unauthorized access by disallowing access to \
+                      IAM users that have no multi-factor authentication (MFA) device.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("IAM_USER_MFA_ENABLED"),
-        control_tower_identifier: None,
+        control_tower_identifier: Some("AWS-GR_IAM_USER_MFA_ENABLED"),
         designators: NO_DESIGNATORS,
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
@@ -688,15 +707,18 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "iam-password-policy",
-        name: "Checks whether the account password policy meets the required strength",
-        description: "Reports an account whose IAM password policy is weaker than the \
-                      implementing rule requires.",
+        name: "Checks if the account password policy for IAM users meets the specified \
+               requirements",
+        description: "Checks if the account password policy for IAM users meets the \
+                      specified requirements indicated in the parameters. The rule is \
+                      NON_COMPLIANT if the account password policy does not meet the \
+                      specified requirements.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("IAM_PASSWORD_POLICY"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.IAM.DT.1"],
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
         // The strength thresholds are the implementing rule's input parameters; see
@@ -715,9 +737,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "encrypted-volumes",
-        name: "Checks whether an attached Amazon EBS volume is encrypted",
-        description: "Reports an Amazon EBS volume that is attached to an instance and not \
-                      encrypted.",
+        name: "Enable encryption for EBS volumes attached to EC2 instances",
+        description: "Secure your data by encrypting the EBS volumes attached to your EC2 \
+                      instances.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -768,9 +790,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "incoming-ssh-disabled",
-        name: "Checks whether a security group allows unrestricted SSH ingress",
-        description: "Reports a security group that allows inbound traffic to port 22 from \
-                      any address.",
+        name: "Disallow Internet connection via SSH",
+        // Control Tower publishes this control and the one over remote console ports it
+        // sits beside with one description, naming the service each removes connectivity
+        // to.
+        description: "Reduces a server's exposure to risk by removing unfettered \
+                      connectivity to remote console services such as SSH.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
@@ -843,15 +868,17 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "guardduty-enabled-centralized",
-        name: "Checks whether Amazon GuardDuty is enabled and centrally managed",
-        description: "Reports an account where Amazon GuardDuty is not enabled or is not \
-                      administered from the organization's delegated account.",
+        name: "Checks whether Amazon GuardDuty is enabled in your AWS account and region",
+        description: "Checks whether Amazon GuardDuty is enabled in your AWS account and \
+                      region. If you provide an AWS account for centralization, the rule \
+                      evaluates the Amazon GuardDuty results in the centralized account. \
+                      The rule is COMPLIANT when Amazon GuardDuty is enabled.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("GUARDDUTY_ENABLED_CENTRALIZED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.GUARDDUTY.DT.9"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -867,15 +894,20 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "cloudwatch-log-group-encrypted",
-        name: "Checks whether a CloudWatch log group is encrypted with a KMS key",
-        description: "Reports a CloudWatch Logs log group that is not encrypted with a KMS \
-                      key.",
+        // The implementing rule's own published title and description, reproduced as the
+        // rule publishes them (its wording, not this crate's).
+        name: "Checks if a log group in Amazon CloudWatch Logs is encrypted with a AWS Key \
+               Management Service (KMS) managed Customer Master Keys (CMK)",
+        description: "Checks if a log group in Amazon CloudWatch Logs is encrypted with a \
+                      AWS Key Management Service (KMS) managed Customer Master Keys (CMK). \
+                      The rule is NON_COMPLIANT if no AWS KMS CMK is configured on the log \
+                      groups.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("CLOUDWATCH_LOG_GROUP_ENCRYPTED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.LOGS.DT.1"],
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -2345,6 +2377,65 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
         identifier: "4tf01viblttjxqhu35yz90vw1",
         release_time: None,
     },
+    // The AWS Config-implemented controls the catalog publishes under a `CONFIG.…`
+    // designator and the Control Tower controls an AWS Config managed rule implements,
+    // including the TWO controls published over one rule (`CLOUD_TRAIL_ENABLED`), each
+    // under its own identifier because each governs a different scope.
+    PublishedCatalogRecord {
+        slug: "account-part-of-organizations",
+        identifier: "4x11tie7h25sws4g7ilakhcb7",
+        release_time: Some(1_594_166_400),
+    },
+    PublishedCatalogRecord {
+        slug: "cloudwatch-log-group-encrypted",
+        identifier: "497wrm2xnk1wxlf4obrdo7mej",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "detect-cloud-trail-enabled-on-member-accounts",
+        identifier: "8sdhbqfe2fsmh3b1i2b24xaic",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "detect-cloud-trail-enabled-on-shared-accounts",
+        identifier: "1ln29qglgkigm9ajfka6u2p2u",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "cloud-trail-log-file-validation-enabled",
+        identifier: "85z4kpyxbo5nepzfwbfwwxjx7",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "encrypted-volumes",
+        identifier: "503uicglhjkokaajywfpt6ros",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "guardduty-enabled-centralized",
+        identifier: "9xv17a25orapqa36e19o5b8lp",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "iam-password-policy",
+        identifier: "dmb52g7tw004w9iede1pgb1fj",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "iam-root-access-key-check",
+        identifier: "9utgo6tl86bg3e9jaq073vmqw",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "iam-user-mfa-enabled",
+        identifier: "7z1uzm6s8qk7ym7m0sm56cq0u",
+        release_time: None,
+    },
+    PublishedCatalogRecord {
+        slug: "incoming-ssh-disabled",
+        identifier: "6rilu41n0gb9w6mxrkyewoer4",
+        release_time: None,
+    },
 ];
 
 /// The published catalog record of the control `slug` names, or `None` when this catalog
@@ -2548,7 +2639,7 @@ pub(super) const RELATED_CONTROLS: &[(&str, &str, &str)] = &[
     // and both implement `enable-centralized-logging`: the same check on two surfaces,
     // so either one satisfies the objective on its own.
     (
-        "cloud-trail-enabled",
+        "detect-cloud-trail-enabled-on-shared-accounts",
         "detect-cloud-trail-enabled-on-member-accounts",
         "ALTERNATIVE",
     ),

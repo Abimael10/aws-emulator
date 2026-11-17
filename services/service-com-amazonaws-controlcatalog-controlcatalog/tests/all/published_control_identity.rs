@@ -22,6 +22,10 @@
 //!    control over an AWS Config managed rule that takes input parameters accepts them
 //!    (`OPTIONAL`), one over a rule that takes none supports none (`NONE`), and a
 //!    control deployed as a policy or a hook summarises its exemption parameters.
+//! 4. `CreateTime` is the instant the catalog publishes as the control's release time, so
+//!    a control the catalog records one for is served with THAT instant. The whole of a
+//!    control's published text and dating is `all/published_control_release_record.rs`;
+//!    here it is asserted for the identity this suite records.
 //!
 //! Each test is a TABLE spanning the class rather than one control picked by hand: the
 //! rows differ in designator family (`CONFIG.…`, `AWS-GR_…`, `CT.…`, `SH.…`),
@@ -192,7 +196,135 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
         governed_resources: &["AWS::IAM::User"],
         implementation: (SECURITY_HUB_CONTROL, "IAM.5"),
     },
+    // The AWS Config-implemented controls the catalog publishes under a `CONFIG.…`
+    // designator, and the Control Tower controls an AWS Config managed rule implements.
+    // They span both designator families over one implementing surface, a control whose
+    // governed-resource list the catalog publishes empty because no available resource
+    // type represents what it governs, every severity the catalog ranks them at, and the
+    // TWO controls published over one Config rule (`CLOUD_TRAIL_ENABLED`), one per
+    // governed scope.
+    PublishedControl {
+        alias: "CONFIG.ACCOUNT.DT.1",
+        identifier: "4x11tie7h25sws4g7ilakhcb7",
+        name: "Rule checks whether AWS account is part of AWS Organizations",
+        severity: "HIGH",
+        parameter_requirement_summary: "OPTIONAL",
+        // An account's membership of an organization has no resource type of its own.
+        governed_resources: &[],
+        implementation: (CONFIG_RULE, "ACCOUNT_PART_OF_ORGANIZATIONS"),
+    },
+    PublishedControl {
+        alias: "CONFIG.LOGS.DT.1",
+        identifier: "497wrm2xnk1wxlf4obrdo7mej",
+        name: "Checks if a log group in Amazon CloudWatch Logs is encrypted with a AWS Key \
+               Management Service (KMS) managed Customer Master Keys (CMK)",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::Logs::LogGroup"],
+        implementation: (CONFIG_RULE, "CLOUDWATCH_LOG_GROUP_ENCRYPTED"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_MEMBER_ACCOUNTS",
+        identifier: "8sdhbqfe2fsmh3b1i2b24xaic",
+        name: "Detect whether CloudTrail is enabled on member accounts",
+        severity: "HIGH",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::CloudTrail::Trail"],
+        implementation: (CONFIG_RULE, "CLOUD_TRAIL_ENABLED"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_SHARED_ACCOUNTS",
+        identifier: "1ln29qglgkigm9ajfka6u2p2u",
+        name: "Detect whether CloudTrail is enabled on shared accounts",
+        severity: "HIGH",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::CloudTrail::Trail"],
+        implementation: (CONFIG_RULE, "CLOUD_TRAIL_ENABLED"),
+    },
+    PublishedControl {
+        alias: "CONFIG.CLOUDTRAIL.DT.9",
+        identifier: "85z4kpyxbo5nepzfwbfwwxjx7",
+        name: "Checks whether AWS CloudTrail creates a signed digest file with logs",
+        severity: "HIGH",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::CloudTrail::Trail"],
+        implementation: (CONFIG_RULE, "CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_ENCRYPTED_VOLUMES",
+        identifier: "503uicglhjkokaajywfpt6ros",
+        name: "Enable encryption for EBS volumes attached to EC2 instances",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::EC2::Volume"],
+        implementation: (CONFIG_RULE, "ENCRYPTED_VOLUMES"),
+    },
+    PublishedControl {
+        alias: "CONFIG.GUARDDUTY.DT.9",
+        identifier: "9xv17a25orapqa36e19o5b8lp",
+        name: "Checks whether Amazon GuardDuty is enabled in your AWS account and region",
+        severity: "HIGH",
+        parameter_requirement_summary: "OPTIONAL",
+        governed_resources: &["AWS::GuardDuty::Detector"],
+        implementation: (CONFIG_RULE, "GUARDDUTY_ENABLED_CENTRALIZED"),
+    },
+    PublishedControl {
+        alias: "CONFIG.IAM.DT.1",
+        identifier: "dmb52g7tw004w9iede1pgb1fj",
+        name: "Checks if the account password policy for IAM users meets the specified \
+               requirements",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "OPTIONAL",
+        // The account's own password policy, which no available resource type represents.
+        governed_resources: &[],
+        implementation: (CONFIG_RULE, "IAM_PASSWORD_POLICY"),
+    },
+    PublishedControl {
+        alias: "CONFIG.IAM.DT.13",
+        identifier: "9utgo6tl86bg3e9jaq073vmqw",
+        name: "Checks if the root user access key is available",
+        severity: "CRITICAL",
+        parameter_requirement_summary: "NONE",
+        // The account's own root-user credentials, which no available resource type
+        // represents.
+        governed_resources: &[],
+        implementation: (CONFIG_RULE, "IAM_ROOT_ACCESS_KEY_CHECK"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_IAM_USER_MFA_ENABLED",
+        identifier: "7z1uzm6s8qk7ym7m0sm56cq0u",
+        name: "Disallow access to IAM users without MFA",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::IAM::User"],
+        implementation: (CONFIG_RULE, "IAM_USER_MFA_ENABLED"),
+    },
+    PublishedControl {
+        alias: "AWS-GR_RESTRICTED_SSH",
+        identifier: "6rilu41n0gb9w6mxrkyewoer4",
+        name: "Disallow Internet connection via SSH",
+        severity: "HIGH",
+        parameter_requirement_summary: "NONE",
+        governed_resources: &["AWS::EC2::SecurityGroup"],
+        implementation: (CONFIG_RULE, "INCOMING_SSH_DISABLED"),
+    },
 ];
+
+/// The instant the catalog publishes as a control's release time (`CreateTime`), in
+/// seconds since the Unix epoch, for the control this suite's table records one for:
+/// `(identifier, release instant)`.
+///
+/// Source: the Control Catalog's own published control list, which dates each control it
+/// publishes with the instant that control was released as a governance capability. The
+/// wider rule — every control's published text and instant, and controls released
+/// together carrying ONE instant — is owned by `all/published_control_release_record.rs`;
+/// this row is here because the identity it belongs to is this suite's subject.
+const PUBLISHED_RELEASE_INSTANTS: &[(&str, i64)] = &[("4x11tie7h25sws4g7ilakhcb7", 1_594_166_400)];
+
+/// Page sizes the filtered walks below are driven with: the service's own default, one
+/// control per page, a partial page and the modeled maximum of `MaxListControlsResults`
+/// (`@range 1..100`).
+const PAGE_SIZES: [Option<u32>; 4] = [None, Some(1), Some(7), Some(100)];
 
 /// What a control's parameter summary must be, for controls beyond the identity table
 /// above: `(designator, ParameterRequirementSummary)`.
@@ -482,5 +614,140 @@ async fn every_served_control_carries_its_own_catalog_identifier() {
             identifiers.insert(identifier.to_string()),
             "case {arn}: two controls must not share one catalog identifier"
         );
+    }
+}
+
+/// An `Implementations.Identifiers` filter — the request a client makes when it walks the
+/// catalog one implementing rule at a time — serves EXACTLY the controls the catalog
+/// publishes over that implementation, each under the catalog's own ARN: no control the
+/// catalog publishes is dropped and none the catalog does not publish is added, whatever
+/// page size walks the filtered set.
+#[tokio::test]
+async fn an_implementation_filter_serves_exactly_the_catalogs_controls_over_it() {
+    let emulator = Emulator::new();
+
+    // The table's controls grouped by the implementation they are published over, which
+    // is the whole set the catalog publishes over each of these implementations.
+    let mut per_implementation: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for row in PUBLISHED_CONTROLS {
+        per_implementation
+            .entry(row.implementation.1)
+            .or_default()
+            .insert(catalog_arn(row.identifier));
+    }
+    let shared = per_implementation
+        .values()
+        .filter(|arns| arns.len() > 1)
+        .count();
+    assert!(
+        shared >= 2,
+        "case catalog: the table must span more than one implementation published under \
+         several controls for that half of the rule to be tested, got {shared}"
+    );
+
+    for (identifier, expected) in &per_implementation {
+        let body = format!(r#"{{"Filter":{{"Implementations":{{"Identifiers":["{identifier}"]}}}}}}"#);
+        for page_size in PAGE_SIZES {
+            let case = format!("{identifier} maxResults={page_size:?}");
+            let selected = drain(&emulator, "/list-controls", "Controls", page_size, &body).await;
+            let served: BTreeSet<String> = selected
+                .iter()
+                .map(|control| {
+                    control["Arn"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {case}: a served control carries its ARN, got {control:?}")
+                        })
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                &served, expected,
+                "case {case}: expected exactly the catalog's controls over this \
+                 implementation, got {served:?}"
+            );
+
+            // Each ARN the page carries resolves to the same control, so a client that
+            // harvested it from the filtered page can read the control back by it.
+            for arn in &served {
+                let read_back = emulator
+                    .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+                    .await;
+                assert_eq!(
+                    read_back["Arn"].as_str(),
+                    Some(arn.as_str()),
+                    "case {case}: GetControl must resolve {arn}, got {read_back:?}"
+                );
+                assert_eq!(
+                    read_back["Implementation"]["Identifier"].as_str(),
+                    Some(*identifier),
+                    "case {case}: GetControl must report the implementing surface the \
+                     filter selected, got {read_back:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A control the catalog records a release instant for is served with THAT instant, by
+/// `ListControls` whatever the page size and by `GetControl`: `CreateTime` is the
+/// published instant the control was released, not a value minted per read.
+#[tokio::test]
+async fn a_published_control_is_dated_with_the_catalogs_release_instant() {
+    let emulator = Emulator::new();
+
+    /// The `CreateTime` of a served control, in whole seconds since the Unix epoch.
+    fn create_time(case: &str, control: &Value) -> i64 {
+        let seconds = control["CreateTime"].as_f64().unwrap_or_else(|| {
+            panic!(
+                "case {case}: CreateTime must be a timestamp, got {:?}",
+                control["CreateTime"]
+            )
+        });
+        assert!(
+            seconds > 0.0 && seconds.fract() == 0.0,
+            "case {case}: CreateTime must be a whole-second instant after the epoch, got \
+             {seconds}"
+        );
+        seconds as i64
+    }
+
+    for page_size in PAGE_SIZES {
+        let controls = drain(&emulator, "/list-controls", "Controls", page_size, "{}").await;
+        let indexed: BTreeMap<String, Value> = controls
+            .into_iter()
+            .map(|control| {
+                let arn = control["Arn"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {control:?}: a control carries its ARN"))
+                    .to_string();
+                (arn, control)
+            })
+            .collect();
+
+        for (identifier, release_time) in PUBLISHED_RELEASE_INSTANTS {
+            let arn = catalog_arn(identifier);
+            let case = format!("{identifier} maxResults={page_size:?}");
+            let summary = indexed
+                .get(&arn)
+                .unwrap_or_else(|| panic!("case {case}: the catalog must publish {arn}"));
+            assert_eq!(
+                create_time(&case, summary),
+                *release_time,
+                "case {case}: expected the control's published release instant \
+                 {release_time}, got {:?}",
+                summary["CreateTime"]
+            );
+
+            let read_back = emulator
+                .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+                .await;
+            assert_eq!(
+                create_time(&case, &read_back),
+                *release_time,
+                "case {case}: GetControl must report the same release instant, got \
+                 {read_back:?}"
+            );
+        }
     }
 }
