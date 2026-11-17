@@ -36,7 +36,11 @@
 //!   metric namespace the service accepts is served past the constraint walk — as it is for the
 //!   other three metric operations a namespace is submitted to — and
 //!   `PutMetricStream` through [`RefusingAValueFirst`], so the two members CloudWatch judges
-//!   as parameter VALUES are judged before the model's own shape checks.
+//!   as parameter VALUES are judged before the model's own shape checks, and every operation
+//!   whose model declares none of this service's parameter faults and whose input carries a
+//!   bounded COLLECTION through [`StatingTheSubmittedCollection`], so a collection over its
+//!   modelled maximum is refused in the request-validation class, quoting the collection the
+//!   request carried.
 //!   The key itself is read through the protocol THIS REQUEST is served in, so a call in any
 //!   of the three protocols this service's model declares is served by the same wrappers.
 //! - `override_refusal` — how this service words a request the framework refused
@@ -69,12 +73,14 @@ use std::sync::Arc;
 pub mod authorization;
 pub mod query_compatible_errors;
 pub mod request_protocol;
+pub mod submitted_collection_refusal;
 
 use authorization::AuthorizedByIam;
 use query_compatible_errors::{
     QueryCompatibleErrors, MISSING_PARAMETER, PARAMETER_VALUE, VALIDATION,
 };
 use request_protocol::{ReportingTheRequestId, TheProtocolOfTheRequest};
+use submitted_collection_refusal::StatingTheSubmittedCollection;
 
 /// This service's model-derived half as it is SERVED: the generated entry, serving each
 /// request in the protocol that request itself names, under the error envelope an `awsQuery`
@@ -115,7 +121,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// service enforces ([`JudgingTheValuesThisServiceEnforces`]), the metric-stream writer
     /// whose own parameter-value rules are judged ahead of the boundary walk
     /// ([`RefusingAValueFirst`]), and the widget renderer whose per-call PAYLOAD limit is judged
-    /// on the body the client sent ([`RefusingAnOversizedPayload`]). Each is built from the SAME
+    /// on the body the client sent ([`RefusingAnOversizedPayload`]), and the operations whose
+    /// model declares none of this service's parameter faults and whose input carries a bounded
+    /// COLLECTION, which state the collection a refused request carried
+    /// ([`StatingTheSubmittedCollection`]). Each is built from the SAME
     /// shared engine as the generated table's and keyed by the routing key the protocol resolves,
     /// so the operation served is the modelled one, and each is METERED ([`Metering`]) like every
     /// other operation of this service and answers a failure under the class this
@@ -128,6 +137,29 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// inside [`QueryCompatibleErrors`], for the same reason: naming the class of a failure is
     /// owed by every answer, whichever layer built it.
     metered: TheWayEveryOperationIsServed<Eng, TheModelledOperation>,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `$table`, each served the way
+/// every operation of this service is ([`served`]) and each wrapped in
+/// [`StatingTheSubmittedCollection`], keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+///
+/// A macro rather than a loop because each operation is its own TYPE: the wrapper reads the
+/// request through the wrapped operation's own input schema, which only a type can name.
+macro_rules! stating_the_submitted_collection {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                served(
+                    &$engine,
+                    StatingTheSubmittedCollection::new(
+                        crate::ops::$module::$operation::new(Arc::clone(&$engine)),
+                    ),
+                ),
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -319,6 +351,31 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     coded_member_fault,
                 ),
             ),
+        );
+        // Every operation whose model declares NONE of this service's parameter faults and
+        // whose input carries a collection with a modelled maximum: such an operation refuses a
+        // collection over that maximum in the request-validation class, quoting the collection
+        // the request carried ([`submitted_collection_refusal`], which holds that rule). The
+        // operations left out of this list are the ones it cannot reach — either their model
+        // declares a parameter fault, so a collection over its cap is one of THOSE
+        // ([`collection_cap_refusal`], which the seam behind this list words), or their input
+        // declares no bounded collection at all, so there is no collection to refuse.
+        stating_the_submitted_collection!(
+            overridden,
+            engine,
+            delete_alarms::DeleteAlarms,
+            describe_alarms::DescribeAlarms,
+            describe_alarms_for_metric::DescribeAlarmsForMetric,
+            disable_alarm_actions::DisableAlarmActions,
+            enable_alarm_actions::EnableAlarmActions,
+            put_alarm_mute_rule::PutAlarmMuteRule,
+            put_composite_alarm::PutCompositeAlarm,
+            put_log_alarm::PutLogAlarm,
+            put_metric_alarm::PutMetricAlarm,
+            start_o_tel_enrichment::StartOTelEnrichment,
+            update_o_tel_enrichment::UpdateOTelEnrichment,
+            create_resource_metrics_configuration::CreateResourceMetricsConfiguration,
+            update_resource_metrics_configuration::UpdateResourceMetricsConfiguration,
         );
         Self {
             metered: the_way_every_operation_is_served(Arc::clone(&engine), TheModelledOperation),
@@ -795,9 +852,13 @@ fn is_scalar_enum_violation(violation: &aws_smithy_schema_server::Violation) -> 
 ///
 /// Keyed on the CLASS of violation alone — a maximum length broken by a value the walk rendered
 /// as a collection's SIZE, which is a rendering no caller can send for a scalar member — so it
-/// holds for every collection of every operation whose refusals this service words, at any
-/// depth: the statistics a metric read asks for and the dimension set it names are the recorded
-/// cases.
+/// holds for every collection, at any depth, of every operation that REACHES it: the statistics
+/// a metric read asks for and the dimension set it names are the recorded cases. WHICH
+/// operations those are is the point, because the class of a boundary refusal is a property of
+/// the OPERATION: an operation whose model declares this service's parameter faults reaches
+/// here, where one that declares none states the collection it was sent under the
+/// request-validation class instead ([`submitted_collection_refusal`], which holds that half of
+/// the rule).
 fn collection_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
     let aws_smithy_schema_server::ViolationKind::MaxLength(declared) = violation.kind else {
         return None;

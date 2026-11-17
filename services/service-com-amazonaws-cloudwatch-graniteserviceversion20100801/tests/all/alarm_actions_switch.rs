@@ -244,9 +244,10 @@ async fn a_name_no_alarm_carries_is_ignored() {
         }
     }
 
-    // One name past the modelled bound is refused, so nothing is written: a collection over its
-    // cap is a parameter VALUE this service cannot use, named with the cap it broke
-    // (`crate::metric_read_refusal_classes` holds that rule and the sentence).
+    // One name past the modelled bound is refused, so nothing is written: this operation's model
+    // declares none of this service's parameter faults, so a collection over the maximum its
+    // member declares is refused in the request-validation class, quoting the collection the
+    // request carried (`crate::request_refusal_classes` holds that rule and the clause).
     let past_bound: Vec<String> = (0..=MAX_ALARM_NAMES)
         .map(|index| format!("absent-{index}"))
         .collect();
@@ -264,12 +265,18 @@ async fn a_name_no_alarm_carries_is_ignored() {
     );
     assert_eq!(
         error_code(&body),
-        "InvalidParameterValueException",
-        "a list past the modelled maximum is refused as the value it is, got {body}"
+        "ValidationException",
+        "a collection past its modelled maximum is refused in the request-validation class, \
+         got {body}"
     );
     assert_eq!(
         error_message(&body),
-        format!("The collection AlarmNames must not have a size greater than {MAX_ALARM_NAMES}."),
-        "the refusal names the collection and the cap it broke, got {body}"
+        format!(
+            "1 validation error detected: Value '[{}]' at 'alarmNames' failed to satisfy \
+             constraint: Member must have length less than or equal to {MAX_ALARM_NAMES}",
+            past_bound.join(", ")
+        ),
+        "the refusal quotes the collection the request carried and names the maximum it broke, \
+         got {body}"
     );
 }

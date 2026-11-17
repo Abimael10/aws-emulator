@@ -24,12 +24,16 @@
 //!   caller may not take**, storing no tag either way;
 //! * **the dashboard operations refuse a field that breaks its own rule naming the field and
 //!   the rule it broke**, and `PutDashboard` STORES a body whose widget kind it does not
-//!   render while reporting that widget back as a validation message.
+//!   render while reporting that widget back as a validation message;
+//! * **a COLLECTION longer than the maximum its member declares is refused in the
+//!   request-validation class, quoting the collection the request carried**, on every operation
+//!   whose model declares none of this service's parameter faults — while a collection AT that
+//!   maximum is served and read back, and the refused write stores nothing.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, call, error_code, error_message, ok};
+use crate::harness::{build_router, call, error_code, error_message, merged, metric_alarm_request, ok};
 
 /// A metric alarm a state force and a tag write can be made against.
 async fn given_alarm(router: &MultiServiceRouter, name: &str) {
@@ -553,4 +557,282 @@ async fn a_widget_kind_this_service_does_not_render_is_reported_and_the_body_is_
             "case {case:?}: a warned body must still be stored, got {got}"
         );
     }
+}
+
+/// The modelled maximum of a collection, and the member path a refusal names it at, as the
+/// model declares them
+/// (`smithy_query(query="operation",operation="PutAlarmMuteRule,PutMetricAlarm,DeleteAlarms,DescribeAlarms,DisableAlarmActions,DescribeAlarmsForMetric")`):
+/// `MuteTargets$AlarmNames` and every `AlarmNames` list hold up to 100, a `ResourceList` of
+/// alarm actions up to 5, and a metric's `Dimensions` up to 30.
+const ALARM_NAMES_MAX: usize = 100;
+const ACTIONS_MAX: usize = 5;
+const DIMENSIONS_MAX: usize = 30;
+
+/// The clause AWS states for a collection longer than its modelled maximum: the collection the
+/// request carried, the member path it arrived on, and that maximum.
+fn over_the_maximum(submitted: &str, member: &str, maximum: usize) -> String {
+    format!(
+        "1 validation error detected: Value '{submitted}' at '{member}' failed to satisfy \
+         constraint: Member must have length less than or equal to {maximum}"
+    )
+}
+
+/// `count` alarm names, as a caller that targets or lists that many sends them.
+fn alarm_names(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("alarm-{index}")).collect()
+}
+
+/// `count` action ARNs, as a caller that attaches that many actions sends them.
+fn actions(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("arn:aws:sns:us-east-1:000000000000:topic-{index}"))
+        .collect()
+}
+
+/// `count` dimensions, as a caller that names that many sends them.
+fn dimensions(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| json!({"Name": format!("D{index}"), "Value": "v"}))
+        .collect()
+}
+
+/// How a list of strings is quoted inside a clause: the elements comma-and-space joined inside
+/// square brackets.
+fn quoted(elements: &[String]) -> String {
+    format!("[{}]", elements.join(", "))
+}
+
+#[tokio::test]
+async fn a_collection_over_its_modelled_maximum_is_the_request_validation_class() {
+    let router = build_router();
+
+    // The rows differ along the operation, which member carries the collection, the DEPTH it
+    // sits at (a member of the request, and a member of a structure inside it), the modelled
+    // maximum it broke, what its elements are (a name, an ARN, a structure) and whether the
+    // operation reads or writes — every one of them an operation whose model declares none of
+    // this service's parameter faults, so every one carries the request-validation class and
+    // the clause AWS states, quoting the collection the request carried.
+    let names = alarm_names(ALARM_NAMES_MAX + 1);
+    let too_many_actions = actions(ACTIONS_MAX + 1);
+    let too_many_dimensions = dimensions(DIMENSIONS_MAX + 1);
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "the alarm names a mute rule targets, one past the hundred it may name",
+            "PutAlarmMuteRule",
+            json!({
+                "Name": "over-targeted",
+                "Rule": {"Schedule": {"Expression": "cron(0 2 * * *)", "Duration": "PT1H"}},
+                "MuteTargets": {"AlarmNames": names},
+            }),
+            over_the_maximum(&quoted(&names), "muteTargets.alarmNames", ALARM_NAMES_MAX),
+        ),
+        (
+            "the actions a metric alarm takes, one past the five it may take",
+            "PutMetricAlarm",
+            merged(
+                metric_alarm_request("over-actioned"),
+                &json!({"AlarmActions": too_many_actions}),
+            ),
+            over_the_maximum(&quoted(&too_many_actions), "alarmActions", ACTIONS_MAX),
+        ),
+        (
+            "the actions a composite alarm takes while it has no data",
+            "PutCompositeAlarm",
+            json!({
+                "AlarmName": "over-actioned-composite",
+                "AlarmRule": "ALARM(child)",
+                "InsufficientDataActions": too_many_actions,
+            }),
+            over_the_maximum(
+                &quoted(&too_many_actions),
+                "insufficientDataActions",
+                ACTIONS_MAX,
+            ),
+        ),
+        (
+            "the alarm names a delete lists",
+            "DeleteAlarms",
+            json!({"AlarmNames": names}),
+            over_the_maximum(&quoted(&names), "alarmNames", ALARM_NAMES_MAX),
+        ),
+        (
+            "the alarm names an action switch lists",
+            "DisableAlarmActions",
+            json!({"AlarmNames": names}),
+            over_the_maximum(&quoted(&names), "alarmNames", ALARM_NAMES_MAX),
+        ),
+        (
+            "the alarm names the other action switch lists",
+            "EnableAlarmActions",
+            json!({"AlarmNames": names}),
+            over_the_maximum(&quoted(&names), "alarmNames", ALARM_NAMES_MAX),
+        ),
+        (
+            "the alarm names a listing is narrowed to",
+            "DescribeAlarms",
+            json!({"AlarmNames": names}),
+            over_the_maximum(&quoted(&names), "alarmNames", ALARM_NAMES_MAX),
+        ),
+        (
+            "the dimensions a metric's alarms are looked up by, as structures",
+            "DescribeAlarmsForMetric",
+            json!({
+                "Namespace": "Custom/Refusals",
+                "MetricName": "Latency",
+                "Dimensions": too_many_dimensions,
+            }),
+            over_the_maximum(
+                &format!(
+                    "[{}]",
+                    (0..=DIMENSIONS_MAX)
+                        .map(|index| format!("Dimension(name=D{index}, value=v)"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                ),
+                "dimensions",
+                DIMENSIONS_MAX,
+            ),
+        ),
+    ];
+
+    for (case, operation, request, expected) in rows {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 in the request-validation class, got {status} \
+             with {body}"
+        );
+        let got = error_message(&body);
+        assert_eq!(
+            got, expected,
+            "case {case:?}: expected {expected:?}, got {got:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_collection_at_its_modelled_maximum_is_served_and_a_refused_one_writes_nothing() {
+    let router = build_router();
+    let targets = alarm_names(ALARM_NAMES_MAX);
+
+    // A collection AT its maximum is the request the refusal above is about the entry past: it
+    // is accepted and READ BACK, for the two kinds of collection the rows differ along — the
+    // hundred alarm names a mute rule may target and the five actions an alarm may take.
+    ok(
+        &router,
+        "PutAlarmMuteRule",
+        &json!({
+            "Name": "fully-targeted",
+            "Rule": {"Schedule": {"Expression": "cron(0 2 * * *)", "Duration": "PT1H"}},
+            "MuteTargets": {"AlarmNames": targets},
+        }),
+    )
+    .await;
+    let read = ok(
+        &router,
+        "GetAlarmMuteRule",
+        &json!({"AlarmMuteRuleName": "fully-targeted"}),
+    )
+    .await;
+    assert_eq!(
+        read["MuteTargets"]["AlarmNames"].as_array().map(Vec::len),
+        Some(ALARM_NAMES_MAX),
+        "case \"a mute rule at its maximum\": expected the {ALARM_NAMES_MAX} stored targets, \
+         got {read}"
+    );
+    let filled = actions(ACTIONS_MAX);
+    ok(
+        &router,
+        "PutMetricAlarm",
+        &merged(
+            metric_alarm_request("fully-actioned"),
+            &json!({"AlarmActions": filled}),
+        ),
+    )
+    .await;
+
+    // A refused write stores nothing: the name the refused create carried holds no rule.
+    let (status, body) = call(
+        &router,
+        "PutAlarmMuteRule",
+        &json!({
+            "Name": "never-created",
+            "Rule": {"Schedule": {"Expression": "cron(0 2 * * *)", "Duration": "PT1H"}},
+            "MuteTargets": {"AlarmNames": alarm_names(ALARM_NAMES_MAX + 1)},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"a refused create\": expected HTTP 400, got {status} with {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "GetAlarmMuteRule",
+        &json!({"AlarmMuteRuleName": "never-created"}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"a refused create\": a refused write must store nothing, got {status} with {body}"
+    );
+
+    // A refused UPDATE leaves the stored rule exactly as the accepted write left it, and a
+    // further update to a different hundred targets REPLACES them.
+    let (status, body) = call(
+        &router,
+        "PutAlarmMuteRule",
+        &json!({
+            "Name": "fully-targeted",
+            "Rule": {"Schedule": {"Expression": "cron(0 3 * * *)", "Duration": "PT2H"}},
+            "MuteTargets": {"AlarmNames": alarm_names(ALARM_NAMES_MAX + 1)},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"a refused update\": expected HTTP 400, got {status} with {body}"
+    );
+    let read = ok(
+        &router,
+        "GetAlarmMuteRule",
+        &json!({"AlarmMuteRuleName": "fully-targeted"}),
+    )
+    .await;
+    assert_eq!(
+        (
+            read["MuteTargets"]["AlarmNames"].as_array().map(Vec::len),
+            read["Rule"]["Schedule"]["Duration"].as_str(),
+        ),
+        (Some(ALARM_NAMES_MAX), Some("PT1H")),
+        "case \"a refused update\": the stored targets and duration must be untouched, got {read}"
+    );
+    let replacements: Vec<String> = (0..ALARM_NAMES_MAX)
+        .map(|index| format!("other-alarm-{index}"))
+        .collect();
+    ok(
+        &router,
+        "PutAlarmMuteRule",
+        &json!({
+            "Name": "fully-targeted",
+            "Rule": {"Schedule": {"Expression": "cron(0 2 * * *)", "Duration": "PT1H"}},
+            "MuteTargets": {"AlarmNames": replacements},
+        }),
+    )
+    .await;
+    let read = ok(
+        &router,
+        "GetAlarmMuteRule",
+        &json!({"AlarmMuteRuleName": "fully-targeted"}),
+    )
+    .await;
+    assert_eq!(
+        read["MuteTargets"]["AlarmNames"].as_array().and_then(|targets| targets
+            .first()
+            .and_then(Value::as_str)),
+        Some("other-alarm-0"),
+        "case \"an accepted update\": expected the new targets stored, got {read}"
+    );
 }
