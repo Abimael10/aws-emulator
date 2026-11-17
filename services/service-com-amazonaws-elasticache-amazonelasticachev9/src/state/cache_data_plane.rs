@@ -32,6 +32,13 @@
 //!
 //! The socket's life is the cache's: the handle lives on the store under the cache's own
 //! key, and dropping it (the delete) closes the port and severs every connection on it.
+//!
+//! The same RESP server also answers the connections an IN-PROCESS client of this emulator
+//! opens to the published address ([`::service_common::dialable_data_planes`]): a cache
+//! endpoint is reachable only from inside the VPC the cache was placed in, so the client
+//! that reads the endpoint out of the control plane and dials it is code this emulator
+//! itself runs — the handler of a function attached to that VPC — and what answers it is
+//! this cache's own server over this cache's own keyspace, not a second one.
 
 pub mod access_control;
 pub mod commands;
@@ -60,6 +67,11 @@ pub struct ServedEndpoint {
 /// The keyspace handle shared between the cache's state record and every session on its
 /// socket.
 pub type SharedKeyspace = Arc<Mutex<Keyspace>>;
+
+/// The SigV4 signing name of this service, which is what the in-process register names as
+/// the service answering at an address this service opened a listener at
+/// (`smithy_query(query="service_info")`: `sigv4Name: elasticache`).
+const SIGNING_NAME: &str = "elasticache";
 
 /// Lock a keyspace, recovering from a poisoned lock the way the engine's own state handle
 /// does: one session that panicked must not wedge the cache for every later client.
@@ -94,6 +106,12 @@ pub struct CacheDataPlane {
     keyspace: SharedKeyspace,
     /// The socket itself. Never read: it is held because dropping it closes the port.
     _listener: ::emulator_server::ResourceListener,
+    /// The record that makes the published address one an IN-PROCESS client of this
+    /// emulator can open a RESP session on — the same RESP server as the socket's, over
+    /// this same keyspace. Never read: it is held because dropping it withdraws the
+    /// address, exactly as dropping the listener closes the port. `None` on an engine that
+    /// vends no such register.
+    _dialable: Option<::service_common::dialable_data_planes::OpenedPlanes>,
 }
 
 impl std::fmt::Debug for CacheDataPlane {
@@ -593,6 +611,12 @@ fn group_member<'store>(
 /// (`engine.listeners().tcp`), and a cache without it is served in the clear
 /// (`tcp_plaintext`). The core owns the socket, the bind interface, the port range, the
 /// certificate and the connection caps in both cases.
+///
+/// The address the socket answers on is also recorded as one this emulator serves in
+/// process (`service_common::dialable_data_planes`), so a client of this emulator that
+/// cannot open a host socket — the code of a Lambda function attached to the cache's VPC,
+/// which is the only vantage point a VPC-only cache endpoint is reachable from — opens its
+/// connection to the published address and is served by this same RESP server.
 pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
@@ -603,12 +627,29 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
     let listeners = shared.listeners();
     let keyspace = keyspace.unwrap_or_else(|| Arc::new(Mutex::new(Keyspace::default())));
-    let handler = resp_wire::RespWire::new(resp_wire::CacheSocket {
+    // ONE RESP server per cache, served at BOTH ends of its address: the socket the core
+    // accepts a client's connections on, and the connections an IN-PROCESS client of this
+    // emulator opens to the address the control plane publishes
+    // (`service_common::dialable_data_planes`). A cache endpoint is reachable only from
+    // inside the VPC it was placed in, so the client that reads it out of the control plane
+    // and dials it is code this emulator itself runs — a function attached to that VPC —
+    // and both ends are the same server over the same keyspace.
+    let served = Arc::new(resp_wire::RespWire::new(resp_wire::CacheSocket {
         state: state.clone(),
         identity,
         keyspace: Arc::clone(&keyspace),
         next_connection_id: Arc::new(AtomicU64::new(1)),
-    });
+    }));
+    // The handshake an in-process connection meets at byte 0: a cache with in-transit
+    // encryption is terminated by the CORE on its socket, so the core's own server runs the
+    // handshake on the pipe too; a cache served in the clear negotiates nothing.
+    let upgrader = if tls { listeners.tls_upgrader().ok() } else { None };
+    // A cache whose TLS the core could not prepare at all is served on its SOCKET only: a
+    // plaintext plane recorded for an address a client opens a handshake on would answer
+    // that handshake with RESP bytes instead of failing cleanly, which is the one thing a
+    // published address must never do.
+    let in_process = !tls || upgrader.is_some();
+    let handler = ::service_common::dialable_data_planes::SharedHandler(Arc::clone(&served));
     // Opened on a task of its OWN, so a runtime that cannot bind a socket at all — one
     // built with no IO driver, which is what a host driving this emulator in process may
     // hand a request — leaves this create without an address of its own instead of taking
@@ -628,10 +669,22 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     let host = ::service_common::data_plane_addressing::host_only(&authority).to_string();
     let port = ::service_common::data_plane_addressing::addressed_port(Some(&authority))
         .unwrap_or_else(|| i32::from(listener.port()));
+    // The published address is now recorded as one this emulator SERVES, so an in-process
+    // client dialling it reaches this cache's own RESP server instead of being answered as
+    // a client of an address nothing listens at. The record goes with the handle, exactly
+    // as the port goes with the listener.
+    let dialable = in_process
+        .then(|| ::service_common::dialable_data_planes::DialablePlanes::of(engine))
+        .flatten()
+        .map(|planes| {
+            let plane = ::service_common::dialable_data_planes::served_in_process(served, upgrader);
+            planes.opening([authority], SIGNING_NAME, &plane)
+        });
     Some(CacheDataPlane {
         endpoint: ServedEndpoint { host, port },
         keyspace,
         _listener: listener,
+        _dialable: dialable,
     })
 }
 
